@@ -1,0 +1,13 @@
+# Version management tasks
+
+["version:print"]
+description = "Print git-derived version"
+run = "uv run python scripts/release.py get-version"
+
+["version:set"]
+description = "Set a new version for the project (by default uses git-derived version)"
+run = "uv run python scripts/release.py set-version"
+
+["version:reset"]
+description = "Reset Cargo.toml and Cargo.lock to git state"
+run = "uv run python scripts/release.py reset-version"

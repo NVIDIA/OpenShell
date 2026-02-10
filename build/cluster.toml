@@ -1,0 +1,53 @@
+# Cluster bootstrap and deploy tasks
+
+[cluster]
+description = "Build and deploy local k3s cluster with Navigator"
+depends = ["docker:build:cluster"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLUSTER_NAME=${CLUSTER_NAME:-navigator}
+
+# Deploy the cluster using the locally built image
+nav cluster admin deploy --name "${CLUSTER_NAME}" --update-kube-config
+
+echo ""
+echo "Cluster '${CLUSTER_NAME}' is ready."
+echo "KUBECONFIG has been updated."
+"""
+
+["cluster:deploy"]
+description = "Deploy changes to existing cluster (upgrades helm release, images pulled from registry)"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+CLUSTER_NAME=${CLUSTER_NAME:-navigator}
+CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+REGISTRY=${NAVIGATOR_REGISTRY:-d1i0nduu2f6qxk.cloudfront.net/navigator}
+IMAGE_TAG=${IMAGE_TAG:-latest}
+
+# Check if cluster container is running
+if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
+  echo "Error: Cluster container '${CONTAINER_NAME}' is not running."
+  echo "Start the cluster first with: mise run cluster"
+  exit 1
+fi
+
+echo "Upgrading helm release (images will be pulled from ${REGISTRY})..."
+helm upgrade navigator deploy/helm/navigator \
+  --namespace navigator \
+  --set image.repository=${REGISTRY}/server \
+  --set image.tag=${IMAGE_TAG} \
+  --set image.pullPolicy=Always \
+  --set server.sandboxImage=${REGISTRY}/sandbox:${IMAGE_TAG} \
+  --set gateway.tls.jobImage=${REGISTRY}/pki-job:${IMAGE_TAG} \
+  --wait
+
+echo "Restarting deployment to pick up new images..."
+kubectl rollout restart deployment/navigator -n navigator
+kubectl rollout status deployment/navigator -n navigator
+
+echo "Deploy complete!"
+"""

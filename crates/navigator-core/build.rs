@@ -1,5 +1,4 @@
 use std::env;
-use std::path::PathBuf;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Use bundled protoc from protobuf-src
@@ -16,16 +15,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/sandbox.proto",
         "../../proto/test.proto",
     ];
-    let out_dir = PathBuf::from("src/proto");
-
-    // Ensure the output directory exists
-    std::fs::create_dir_all(&out_dir)?;
 
     // Configure tonic-build
     tonic_build::configure()
         .build_server(true)
         .build_client(true)
-        .out_dir(&out_dir)
         .compile_protos(&proto_files, &["../../proto"])?;
 
     // Tell cargo to rerun if the proto file changes

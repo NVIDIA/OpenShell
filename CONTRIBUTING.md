@@ -75,6 +75,9 @@ crates/
 python/                  # Python bindings
 proto/                   # Protocol buffer definitions
 architecture/            # Architecture documentation and design plans
+build/                   # mise task definitions and build scripts
+├── *.toml               # Task includes (loaded by mise.toml task_config)
+└── scripts/             # Shared build scripts used by tasks
 deploy/
 ├── docker/              # Dockerfiles and build artifacts
 ├── helm/navigator/      # Navigator Helm chart

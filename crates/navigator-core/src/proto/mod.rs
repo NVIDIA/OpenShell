@@ -10,7 +10,7 @@
     rust_2018_idioms
 )]
 pub mod navigator {
-    include!("navigator.v1.rs");
+    include!(concat!(env!("OUT_DIR"), "/navigator.v1.rs"));
 }
 
 #[allow(
@@ -22,7 +22,7 @@ pub mod navigator {
 )]
 pub mod datamodel {
     pub mod v1 {
-        include!("navigator.datamodel.v1.rs");
+        include!(concat!(env!("OUT_DIR"), "/navigator.datamodel.v1.rs"));
     }
 }
 
@@ -35,7 +35,7 @@ pub mod datamodel {
 )]
 pub mod sandbox {
     pub mod v1 {
-        include!("navigator.sandbox.v1.rs");
+        include!(concat!(env!("OUT_DIR"), "/navigator.sandbox.v1.rs"));
     }
 }
 
@@ -47,7 +47,7 @@ pub mod sandbox {
     rust_2018_idioms
 )]
 pub mod test {
-    include!("navigator.test.v1.rs");
+    include!(concat!(env!("OUT_DIR"), "/navigator.test.v1.rs"));
 }
 
 pub use datamodel::v1::*;

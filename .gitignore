@@ -31,7 +31,6 @@ __pycache__/
 
 # Distribution / packaging
 .Python
-build/
 develop-eggs/
 dist/
 downloads/
@@ -149,10 +148,6 @@ Desktop.ini
 # =============================================================================
 # Project-specific
 # =============================================================================
-
-# Generated protobuf code (keep the module file, ignore generated)
-crates/navigator-core/src/proto/*.rs
-!crates/navigator-core/src/proto/mod.rs
 
 # Local configuration
 *.local

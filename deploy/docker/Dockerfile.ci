@@ -27,8 +27,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Install mise
 RUN curl https://mise.run | sh
 
-# Copy mise.toml and install all tools
+# Copy mise.toml and build task includes, then install all tools
 COPY mise.toml /opt/mise/mise.toml
+COPY build/ /opt/mise/build/
 WORKDIR /opt/mise
 RUN mise trust /opt/mise/mise.toml && mise install
 

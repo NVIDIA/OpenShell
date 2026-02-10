@@ -87,7 +87,7 @@ This approach follows k3s documentation: "Manually specified resolver configurat
 
 ## Build Tasks (mise)
 
-All builds use mise tasks defined in `mise.toml`:
+All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`):
 
 | Task                            | Description                         |
 | ------------------------------- | ----------------------------------- |

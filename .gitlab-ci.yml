@@ -2,6 +2,14 @@ stages:
   - build-ci-image
   - lint
   - test
+  - publish
+
+workflow:
+  rules:
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_MERGE_REQUEST_IID
+    - if: $CI_COMMIT_BRANCH
 
 variables:
   CARGO_TERM_COLOR: "always"
@@ -38,9 +46,8 @@ build_ci_image:
     DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_BUILDKIT: "1"
   before_script: []  # Override default before_script (docker:24 doesn't have uv)
-  rules:
-    - when: manual
-      allow_failure: true
+  when: manual
+  allow_failure: true
   script:
     - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
     - |
@@ -82,3 +89,31 @@ python_test:
   stage: test
   script:
     - mise run test:python
+
+# =============================================================================
+# Publish Jobs (main branch only)
+# =============================================================================
+publish_ecr_images:
+  stage: publish
+  services:
+    - docker:24-dind
+  variables:
+    DOCKER_HOST: tcp://docker:2376
+    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_TLS_VERIFY: "1"
+    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_BUILDKIT: "1"
+  rules:
+    - if: $CI_COMMIT_BRANCH == "main"
+  before_script:
+    - uv sync --frozen
+    # Install Docker CLI (CI image has mise/helm but no Docker client)
+    - curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | tar xz --strip-components=1 -C /usr/local/bin docker/docker
+    # Install AWS CLI
+    - apt-get update -qq && apt-get install -y -qq unzip >/dev/null
+    - curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+    - unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
+    # Authenticate to ECR
+    - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
+  script:
+    - mise run docker:publish:cluster:multiarch

@@ -1,0 +1,32 @@
+# CI, pre-commit, and sandbox runner tasks
+
+[all]
+description = "Build, lint, and test everything"
+depends = ["fmt:check", "clippy", "test", "python:lint"]
+
+["pre-commit"]
+description = "Pre-commit checks (format, lint, and tests)"
+depends = ["fmt:check", "clippy", "python:lint", "test:rust", "test:python"]
+
+[sandbox]
+description = "Run the sandbox container with an interactive shell"
+depends = ["docker:build:sandbox"]
+run = """
+TTY_FLAG=""
+if [ -t 0 ]; then
+  TTY_FLAG="-it"
+fi
+CMD=("$@")
+if [ "$#" -eq 0 ]; then
+  CMD=("/bin/bash")
+fi
+docker run ${TTY_FLAG} \
+  --cap-add=SYS_ADMIN \
+  --cap-add=NET_ADMIN \
+  -v ${PWD}/dev-sandbox-policy.yaml:/var/navigator/policy.yaml:ro \
+  -v ${PWD}/tmp:/sandbox/tmp \
+  -e HOME=/sandbox \
+  -w /sandbox \
+  -e NAVIGATOR_SANDBOX_POLICY=/var/navigator/policy.yaml \
+  navigator-sandbox:${IMAGE_TAG:-dev} -i "${CMD[@]}"
+"""

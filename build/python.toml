@@ -1,0 +1,40 @@
+# Python development, build, lint, and format tasks
+
+["python:dev"]
+description = "Install Python package in development mode (builds CLI binary)"
+run = "uv sync --group dev && uv pip install ."
+
+["python:build"]
+description = "Build Python wheel with CLI binary (native)"
+run = "uv run maturin build --release"
+
+["python:build:linux-x86"]
+description = "Build Python wheel for Linux x86_64"
+run = """
+docker run --rm --platform linux/amd64 -v $(pwd):/io -w /io \
+  ghcr.io/pyo3/maturin build --release
+"""
+
+["python:build:linux-arm"]
+description = "Build Python wheel for Linux aarch64"
+run = """
+docker run --rm --platform linux/arm64 -v $(pwd):/io -w /io \
+  ghcr.io/pyo3/maturin build --release
+"""
+
+["python:build:all"]
+description = "Build Python wheels for all platforms"
+depends = ["python:build", "python:build:linux-x86", "python:build:linux-arm"]
+
+["python:lint"]
+description = "Lint Python code with ruff"
+env = { UV_NO_SYNC = "1" }
+run = "uv run ruff check {{vars.python_paths}}"
+
+["python:fmt"]
+description = "Format Python code with ruff"
+run = "uv run ruff format {{vars.python_paths}}"
+
+["python:typecheck"]
+description = "Type check Python code with ty"
+run = "uv run ty check {{vars.python_paths}}"

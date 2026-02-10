@@ -1,0 +1,29 @@
+# Rust build, check, lint, and format tasks
+
+[build]
+description = "Build all Rust crates"
+run = "cargo build --workspace"
+
+["build:release"]
+description = "Build all Rust crates in release mode"
+run = "cargo build --workspace --release"
+
+[check]
+description = "Check all Rust crates for errors"
+run = "cargo check --workspace"
+
+[clippy]
+description = "Run Clippy lints"
+run = "cargo clippy --workspace --all-targets"
+
+[fmt]
+description = "Format Rust code"
+run = "cargo fmt --all"
+
+["fmt:check"]
+description = "Check Rust formatting"
+run = "cargo fmt --all -- --check"
+
+[clean]
+description = "Clean build artifacts"
+run = "cargo clean"

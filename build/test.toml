@@ -1,0 +1,14 @@
+# Test tasks (Rust + Python)
+
+[test]
+description = "Run all tests (Rust + Python)"
+depends = ["test:rust", "test:python"]
+
+["test:rust"]
+description = "Run Rust tests"
+run = "cargo test --workspace"
+
+["test:python"]
+description = "Run Python tests"
+env = { UV_NO_SYNC = "1" }
+run = "uv run pytest python/"
