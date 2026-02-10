@@ -48,12 +48,10 @@ enum NetworkMode {
 
 // Proxy configuration for network policy.
 message ProxyPolicy {
-  // Unix socket path for a local proxy (preferred for strict seccomp rules).
-  string unix_socket = 1;
+  // Fields 1 and 3 reserved (previously unix_socket and allow_hosts).
+  reserved 1, 3;
   // TCP address for a local HTTP proxy (loopback-only).
   string http_addr = 2;
-  // Allowed hostnames for proxy traffic. Empty means allow all.
-  repeated string allow_hosts = 3;
 }
 
 // Landlock policy configuration.

@@ -120,7 +120,6 @@ The sandbox exports proxy configuration to the child process:
 
 - `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`: Set to `http://10.200.0.1:3128` (with netns) or
   `http://127.0.0.1:3128` (without netns)
-- `NAVIGATOR_PROXY_SOCKET`: Path to Unix socket if configured
 
 ## Process Privileges
 

@@ -1,110 +1,84 @@
-//! Simple HTTP CONNECT proxy with host allowlist.
+//! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+use crate::identity::BinaryIdentityCache;
+use crate::opa::OpaEngine;
 use crate::policy::ProxyPolicy;
 use miette::{IntoDiagnostic, Result};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU32;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream, UnixListener, UnixStream};
+use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 
+/// Result of a proxy CONNECT policy decision.
+struct ConnectDecision {
+    allowed: bool,
+    /// Resolved binary path.
+    binary: Option<PathBuf>,
+    /// PID owning the socket.
+    binary_pid: Option<u32>,
+    /// Ancestor binary paths from process tree walk.
+    ancestors: Vec<PathBuf>,
+    /// Cmdline-derived absolute paths (for script detection).
+    cmdline_paths: Vec<PathBuf>,
+    /// Name of the matched policy rule (allow only).
+    matched_policy: Option<String>,
+    /// Deny reason or error context.
+    reason: String,
+}
+
 #[derive(Debug)]
 pub struct ProxyHandle {
-    socket_path: Option<String>,
     #[allow(dead_code)]
     http_addr: Option<SocketAddr>,
     join: JoinHandle<()>,
 }
 
 impl ProxyHandle {
-    /// Start the proxy with the default bind address from policy.
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-    pub async fn start(policy: &ProxyPolicy) -> Result<Self> {
-        Self::start_with_bind_addr(policy, None).await
-    }
-
-    /// Start the proxy with an optional override bind address.
+    /// Start the proxy with OPA engine for policy evaluation.
     ///
-    /// If `bind_addr` is provided, it overrides `policy.http_addr` and the proxy
-    /// binds to that address (used for network namespace veth interface).
-    /// If `bind_addr` is None, falls back to policy settings.
+    /// The proxy uses OPA for network decisions with process-identity binding
+    /// via `/proc/net/tcp`.
     pub async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
+        opa_engine: Arc<OpaEngine>,
+        identity_cache: Arc<BinaryIdentityCache>,
+        entrypoint_pid: Arc<AtomicU32>,
     ) -> Result<Self> {
-        let allow_hosts = Arc::new(
-            policy
-                .allow_hosts
-                .iter()
-                .map(|host| host.trim().to_ascii_lowercase())
-                .filter(|host| !host.is_empty())
-                .collect::<Vec<_>>(),
-        );
-
         // Use override bind_addr or fall back to policy http_addr
         let http_addr = bind_addr.or(policy.http_addr);
 
-        if let Some(http_addr) = http_addr {
-            // Only enforce loopback restriction when not using network namespace override
-            if bind_addr.is_none() && !http_addr.ip().is_loopback() {
-                return Err(miette::miette!(
-                    "Proxy http_addr must be loopback-only: {http_addr}"
-                ));
-            }
-            let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
-            let local_addr = listener.local_addr().into_diagnostic()?;
-            info!(addr = %local_addr, "Proxy listening (tcp)");
+        let http_addr = http_addr.ok_or_else(|| {
+            miette::miette!("Proxy policy must set http_addr or provide a bind address")
+        })?;
 
-            let join = tokio::spawn(async move {
-                loop {
-                    match listener.accept().await {
-                        Ok((stream, _addr)) => {
-                            let allow_hosts = allow_hosts.clone();
-                            tokio::spawn(async move {
-                                if let Err(err) = handle_tcp_connection(stream, allow_hosts).await {
-                                    warn!(error = %err, "Proxy connection error");
-                                }
-                            });
-                        }
-                        Err(err) => {
-                            warn!(error = %err, "Proxy accept error");
-                            break;
-                        }
-                    }
-                }
-            });
-
-            return Ok(Self {
-                socket_path: None,
-                http_addr: Some(local_addr),
-                join,
-            });
+        // Only enforce loopback restriction when not using network namespace override
+        if bind_addr.is_none() && !http_addr.ip().is_loopback() {
+            return Err(miette::miette!(
+                "Proxy http_addr must be loopback-only: {http_addr}"
+            ));
         }
 
-        let socket_path = policy
-            .unix_socket
-            .as_ref()
-            .ok_or_else(|| miette::miette!("Proxy policy must set http_addr or unix_socket"))?
-            .to_string_lossy()
-            .to_string();
-
-        ensure_socket_dir(&socket_path)?;
-        cleanup_socket(&socket_path).await?;
-
-        let listener = UnixListener::bind(&socket_path).into_diagnostic()?;
-        info!(socket = %socket_path, "Proxy listening (unix)");
+        let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
+        let local_addr = listener.local_addr().into_diagnostic()?;
+        info!(addr = %local_addr, "Proxy listening (tcp)");
 
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _addr)) => {
-                        let allow_hosts = allow_hosts.clone();
+                        let opa = opa_engine.clone();
+                        let cache = identity_cache.clone();
+                        let spid = entrypoint_pid.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_unix_connection(stream, allow_hosts).await {
+                            if let Err(err) = handle_tcp_connection(stream, opa, cache, spid).await
+                            {
                                 warn!(error = %err, "Proxy connection error");
                             }
                         });
@@ -118,8 +92,7 @@ impl ProxyHandle {
         });
 
         Ok(Self {
-            socket_path: Some(socket_path),
-            http_addr: None,
+            http_addr: Some(local_addr),
             join,
         })
     }
@@ -133,39 +106,21 @@ impl ProxyHandle {
 impl Drop for ProxyHandle {
     fn drop(&mut self) {
         self.join.abort();
-        if let Some(path) = self.socket_path.take() {
-            let _ = std::fs::remove_file(path);
-        }
     }
 }
 
-fn ensure_socket_dir(socket_path: &str) -> Result<()> {
-    let parent = Path::new(socket_path).parent().ok_or_else(|| {
-        miette::miette!("Proxy socket path has no parent directory: {socket_path}")
-    })?;
-    std::fs::create_dir_all(parent).into_diagnostic()?;
-    Ok(())
-}
-
-async fn cleanup_socket(socket_path: &str) -> Result<()> {
-    if tokio::fs::try_exists(socket_path).await.into_diagnostic()? {
-        tokio::fs::remove_file(socket_path)
-            .await
-            .into_diagnostic()?;
-    }
-    Ok(())
-}
-
-async fn handle_unix_connection(
-    mut client: UnixStream,
-    allow_hosts: Arc<Vec<String>>,
+async fn handle_tcp_connection(
+    mut client: TcpStream,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
 
     loop {
         if used == buf.len() {
-            respond_unix(
+            respond(
                 &mut client,
                 b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
             )
@@ -192,27 +147,85 @@ async fn handle_unix_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        respond_unix(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await?;
+        respond(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await?;
         return Ok(());
     }
 
     let (host, port) = parse_target(target)?;
     let host_lc = host.to_ascii_lowercase();
 
-    if !is_allowed(&host_lc, &allow_hosts) {
-        info!(host = %host_lc, port, "Proxy denied host");
-        respond_unix(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+    let peer_addr = client.peer_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
+
+    // Evaluate OPA policy
+    let decision = evaluate_opa_tcp(
+        peer_addr,
+        &opa_engine,
+        &identity_cache,
+        &entrypoint_pid,
+        &host_lc,
+        port,
+    );
+
+    // Unified log line: one info! per CONNECT with full context
+    let action = if decision.allowed { "allow" } else { "deny" };
+    let binary_str = decision
+        .binary
+        .as_ref()
+        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
+    let pid_str = decision
+        .binary_pid
+        .map_or_else(|| "-".to_string(), |p| p.to_string());
+    let ancestors_str = if decision.ancestors.is_empty() {
+        "-".to_string()
+    } else {
+        decision
+            .ancestors
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    };
+    let cmdline_str = if decision.cmdline_paths.is_empty() {
+        "-".to_string()
+    } else {
+        decision
+            .cmdline_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let policy_str = decision.matched_policy.as_deref().unwrap_or("-");
+
+    info!(
+        src_addr = %peer_addr.ip(),
+        src_port = peer_addr.port(),
+        proxy_addr = %local_addr,
+        dst_host = %host_lc,
+        dst_port = port,
+        binary = %binary_str,
+        binary_pid = %pid_str,
+        ancestors = %ancestors_str,
+        cmdline = %cmdline_str,
+        action = %action,
+        engine = "opa",
+        policy = %policy_str,
+        reason = %decision.reason,
+        "CONNECT",
+    );
+
+    if !decision.allowed {
+        respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
     }
 
-    info!(host = %host_lc, port, "Proxy allowed host");
     let mut upstream = TcpStream::connect((host.as_str(), port))
         .await
         .into_diagnostic()?;
 
-    respond_unix(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+    respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
-    debug!(host = %host, port, "Proxy tunnel established");
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .into_diagnostic()?;
@@ -220,65 +233,141 @@ async fn handle_unix_connection(
     Ok(())
 }
 
-async fn handle_tcp_connection(mut client: TcpStream, allow_hosts: Arc<Vec<String>>) -> Result<()> {
-    let mut buf = vec![0u8; MAX_HEADER_BYTES];
-    let mut used = 0usize;
+/// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
+#[cfg(target_os = "linux")]
+fn evaluate_opa_tcp(
+    peer_addr: SocketAddr,
+    engine: &OpaEngine,
+    identity_cache: &BinaryIdentityCache,
+    entrypoint_pid: &AtomicU32,
+    host: &str,
+    port: u16,
+) -> ConnectDecision {
+    use crate::opa::NetworkInput;
+    use std::sync::atomic::Ordering;
 
-    loop {
-        if used == buf.len() {
-            respond_tcp(
-                &mut client,
-                b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n",
-            )
-            .await?;
-            return Ok(());
+    let pid = entrypoint_pid.load(Ordering::Acquire);
+    if pid == 0 {
+        return ConnectDecision {
+            allowed: false,
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            matched_policy: None,
+            reason: "entrypoint process not yet spawned".into(),
+        };
+    }
+
+    let peer_port = peer_addr.port();
+    let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
+        Ok(r) => r,
+        Err(e) => {
+            return ConnectDecision {
+                allowed: false,
+                binary: None,
+                binary_pid: None,
+                ancestors: vec![],
+                cmdline_paths: vec![],
+                matched_policy: None,
+                reason: format!("failed to resolve peer binary: {e}"),
+            };
         }
+    };
 
-        let n = client.read(&mut buf[used..]).await.into_diagnostic()?;
-        if n == 0 {
-            return Ok(());
+    // TOFU verify the immediate binary
+    let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
+        Ok(h) => h,
+        Err(e) => {
+            return ConnectDecision {
+                allowed: false,
+                binary: Some(bin_path),
+                binary_pid: Some(binary_pid),
+                ancestors: vec![],
+                cmdline_paths: vec![],
+                matched_policy: None,
+                reason: format!("binary integrity check failed: {e}"),
+            };
         }
-        used += n;
+    };
 
-        if buf[..used].windows(4).any(|win| win == b"\r\n\r\n") {
-            break;
+    // Walk the process tree upward to collect ancestor binaries
+    let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
+
+    // TOFU verify each ancestor binary
+    for ancestor in &ancestors {
+        if let Err(e) = identity_cache.verify_or_cache(ancestor) {
+            return ConnectDecision {
+                allowed: false,
+                binary: Some(bin_path),
+                binary_pid: Some(binary_pid),
+                ancestors: ancestors.clone(),
+                cmdline_paths: vec![],
+                matched_policy: None,
+                reason: format!(
+                    "ancestor integrity check failed for {}: {e}",
+                    ancestor.display()
+                ),
+            };
         }
     }
 
-    let request = String::from_utf8_lossy(&buf[..used]);
-    let mut lines = request.split("\r\n");
-    let request_line = lines.next().unwrap_or("");
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or("");
-    let target = parts.next().unwrap_or("");
+    // Collect cmdline paths for script-based binary detection.
+    // Excludes exe paths already captured in bin_path/ancestors to avoid duplicates.
+    let mut exclude = ancestors.clone();
+    exclude.push(bin_path.clone());
+    let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
 
-    if method != "CONNECT" {
-        respond_tcp(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await?;
-        return Ok(());
+    let input = NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: bin_path.clone(),
+        binary_sha256: bin_hash,
+        ancestors: ancestors.clone(),
+        cmdline_paths: cmdline_paths.clone(),
+    };
+
+    match engine.evaluate_network(&input) {
+        Ok(decision) => ConnectDecision {
+            allowed: decision.allowed,
+            binary: Some(bin_path),
+            binary_pid: Some(binary_pid),
+            ancestors,
+            cmdline_paths,
+            matched_policy: decision.matched_policy,
+            reason: decision.reason,
+        },
+        Err(e) => ConnectDecision {
+            allowed: false,
+            binary: Some(bin_path),
+            binary_pid: Some(binary_pid),
+            ancestors,
+            cmdline_paths,
+            matched_policy: None,
+            reason: format!("policy evaluation error: {e}"),
+        },
     }
+}
 
-    let (host, port) = parse_target(target)?;
-    let host_lc = host.to_ascii_lowercase();
-
-    if !is_allowed(&host_lc, &allow_hosts) {
-        info!(host = %host_lc, port, "Proxy denied host");
-        respond_tcp(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
+/// Non-Linux stub: OPA identity binding requires /proc.
+#[cfg(not(target_os = "linux"))]
+fn evaluate_opa_tcp(
+    _peer_addr: SocketAddr,
+    _engine: &OpaEngine,
+    _identity_cache: &BinaryIdentityCache,
+    _entrypoint_pid: &AtomicU32,
+    _host: &str,
+    _port: u16,
+) -> ConnectDecision {
+    ConnectDecision {
+        allowed: false,
+        binary: None,
+        binary_pid: None,
+        ancestors: vec![],
+        cmdline_paths: vec![],
+        matched_policy: None,
+        reason: "identity binding unavailable on this platform".into(),
     }
-
-    info!(host = %host_lc, port, "Proxy allowed host");
-    let mut upstream = TcpStream::connect((host.as_str(), port))
-        .await
-        .into_diagnostic()?;
-
-    respond_tcp(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-
-    debug!(host = %host, port, "Proxy tunnel established");
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .into_diagnostic()?;
-
-    Ok(())
 }
 
 fn parse_target(target: &str) -> Result<(String, u16)> {
@@ -291,147 +380,7 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
     Ok((host.to_string(), port))
 }
 
-fn is_allowed(host: &str, allow_hosts: &[String]) -> bool {
-    if allow_hosts.is_empty() {
-        return true;
-    }
-
-    for entry in allow_hosts {
-        if entry.starts_with('.') {
-            if host.ends_with(entry) {
-                return true;
-            }
-            continue;
-        }
-
-        if host == entry {
-            return true;
-        }
-
-        let suffix = format!(".{entry}");
-        if host.ends_with(&suffix) {
-            return true;
-        }
-    }
-
-    false
-}
-
-async fn respond_unix(client: &mut UnixStream, bytes: &[u8]) -> Result<()> {
+async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
-}
-
-async fn respond_tcp(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
-    client.write_all(bytes).await.into_diagnostic()?;
-    Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    #[cfg(target_os = "linux")]
-    use super::ProxyHandle;
-    use super::is_allowed;
-    #[cfg(target_os = "linux")]
-    use crate::policy::ProxyPolicy;
-    #[cfg(target_os = "linux")]
-    use std::net::SocketAddr;
-    #[cfg(target_os = "linux")]
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    #[cfg(target_os = "linux")]
-    use tokio::net::{TcpListener, TcpStream};
-    #[cfg(target_os = "linux")]
-    use tokio::time::{Duration, sleep};
-
-    #[cfg(target_os = "linux")]
-    fn temp_socket_addr() -> SocketAddr {
-        SocketAddr::from(([127, 0, 0, 1], 0))
-    }
-
-    #[cfg(target_os = "linux")]
-    async fn connect_with_retry(addr: SocketAddr) -> TcpStream {
-        let mut attempts = 0;
-        loop {
-            match TcpStream::connect(addr).await {
-                Ok(stream) => return stream,
-                Err(err) if attempts < 20 => {
-                    attempts += 1;
-                    let _ = err;
-                    sleep(Duration::from_millis(10)).await;
-                }
-                Err(err) => panic!("Failed to connect to proxy socket: {err}"),
-            }
-        }
-    }
-
-    #[test]
-    fn allowlist_matches_expected_hosts() {
-        let allow_hosts = vec![
-            "api.anthropic.com".to_string(),
-            ".openai.com".to_string(),
-            "example.com".to_string(),
-        ];
-
-        assert!(is_allowed("api.anthropic.com", &allow_hosts));
-        assert!(is_allowed("sub.openai.com", &allow_hosts));
-        assert!(is_allowed("example.com", &allow_hosts));
-        assert!(is_allowed("foo.example.com", &allow_hosts));
-        assert!(!is_allowed("openai.com", &allow_hosts));
-        assert!(!is_allowed("google.com", &allow_hosts));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn proxy_denies_disallowed_host() {
-        let policy = ProxyPolicy {
-            unix_socket: None,
-            http_addr: Some(temp_socket_addr()),
-            allow_hosts: vec!["localhost".to_string()],
-        };
-
-        let proxy = ProxyHandle::start(&policy).await.unwrap();
-        let addr = proxy.http_addr().expect("missing http addr");
-        let mut stream = connect_with_retry(addr).await;
-
-        stream
-            .write_all(b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n")
-            .await
-            .unwrap();
-
-        let mut response = [0u8; 128];
-        let n = stream.read(&mut response).await.unwrap();
-        let text = String::from_utf8_lossy(&response[..n]);
-        assert!(text.contains("403"));
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn proxy_allows_allowed_host() {
-        let policy = ProxyPolicy {
-            unix_socket: None,
-            http_addr: Some(temp_socket_addr()),
-            allow_hosts: vec!["localhost".to_string()],
-        };
-
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let accept_task = tokio::spawn(async move {
-            let _ = listener.accept().await.unwrap();
-        });
-
-        let proxy = ProxyHandle::start(&policy).await.unwrap();
-        let addr = proxy.http_addr().expect("missing http addr");
-        let mut stream = connect_with_retry(addr).await;
-
-        let request = format!("CONNECT localhost:{port} HTTP/1.1\r\nHost: localhost\r\n\r\n");
-        stream.write_all(request.as_bytes()).await.unwrap();
-
-        let mut response = [0u8; 128];
-        let n = stream.read(&mut response).await.unwrap();
-        let text = String::from_utf8_lossy(&response[..n]);
-        assert!(text.contains("200"));
-
-        accept_task.await.unwrap();
-    }
 }

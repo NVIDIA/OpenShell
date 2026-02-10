@@ -1170,11 +1170,7 @@ struct DevNetworkPolicy {
 #[serde(deny_unknown_fields)]
 struct DevProxyPolicy {
     #[serde(default)]
-    unix_socket: Option<String>,
-    #[serde(default)]
     http_addr: Option<String>,
-    #[serde(default)]
-    allow_hosts: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1213,9 +1209,7 @@ fn load_dev_sandbox_policy() -> Result<SandboxPolicy> {
         .network
         .proxy
         .map(|proxy| navigator_core::proto::ProxyPolicy {
-            unix_socket: proxy.unix_socket.unwrap_or_default(),
             http_addr: proxy.http_addr.unwrap_or_default(),
-            allow_hosts: proxy.allow_hosts,
         });
 
     let landlock_compat = match raw.landlock.compatibility.as_str() {
@@ -1307,11 +1301,7 @@ struct NetworkYaml {
 #[derive(Serialize)]
 struct ProxyYaml {
     #[serde(skip_serializing_if = "String::is_empty")]
-    unix_socket: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
     http_addr: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    allow_hosts: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1345,9 +1335,7 @@ fn policy_to_yaml(policy: &SandboxPolicy) -> PolicyYaml {
         .to_string();
 
         let proxy = net.proxy.as_ref().map(|p| ProxyYaml {
-            unix_socket: p.unix_socket.clone(),
             http_addr: p.http_addr.clone(),
-            allow_hosts: p.allow_hosts.clone(),
         });
 
         NetworkYaml { mode, proxy }

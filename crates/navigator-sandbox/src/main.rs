@@ -31,11 +31,6 @@ struct Args {
     #[arg(long, short = 'i')]
     interactive: bool,
 
-    /// Path to YAML policy file for sandbox configuration.
-    /// Mutually exclusive with --sandbox-id (gRPC mode).
-    #[arg(long, env = "NAVIGATOR_SANDBOX_POLICY")]
-    policy: Option<String>,
-
     /// Sandbox ID for fetching policy via gRPC from Navigator server.
     /// Requires --navigator-endpoint to be set.
     #[arg(long, env = "NAVIGATOR_SANDBOX_ID")]
@@ -45,6 +40,16 @@ struct Args {
     /// Required when using --sandbox-id.
     #[arg(long, env = "NAVIGATOR_ENDPOINT")]
     navigator_endpoint: Option<String>,
+
+    /// Path to Rego policy file for OPA-based network access control.
+    /// Requires --rego-data to also be set.
+    #[arg(long, env = "NAVIGATOR_REGO_POLICY")]
+    rego_policy: Option<String>,
+
+    /// Path to Rego data file containing network policies and sandbox config.
+    /// Requires --rego-policy to also be set.
+    #[arg(long, env = "NAVIGATOR_REGO_DATA")]
+    rego_data: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = "NAVIGATOR_LOG_LEVEL")]
@@ -117,9 +122,10 @@ async fn main() -> Result<()> {
         args.workdir,
         args.timeout,
         args.interactive,
-        args.policy,
         args.sandbox_id,
         args.navigator_endpoint,
+        args.rego_policy,
+        args.rego_data,
         args.ssh_listen_addr,
         args.ssh_handshake_secret,
         args.ssh_handshake_skew_secs,

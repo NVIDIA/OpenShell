@@ -67,7 +67,13 @@ FROM base AS coding-agents
 RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs npm && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g @anthropic-ai/claude-code opencode-ai @openai/codex
+# Install Claude CLI via native installer (npm method is deprecated)
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && cp /root/.local/bin/claude /usr/local/bin/claude \
+    && chmod 755 /usr/local/bin/claude
+
+# Install OpenCode CLI and Codex CLI (OpenAI)
+RUN npm install -g opencode-ai @openai/codex
 
 # Stage 5: Final image
 FROM coding-agents AS final

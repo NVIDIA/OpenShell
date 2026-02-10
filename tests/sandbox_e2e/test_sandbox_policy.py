@@ -9,7 +9,8 @@ import time
 
 import pytest
 
-POLICY_PATH = os.environ.get("NAVIGATOR_SANDBOX_POLICY", "/var/navigator/policy.yaml")
+REGO_POLICY = os.environ.get("NAVIGATOR_REGO_POLICY", "/var/navigator/policy.rego")
+REGO_DATA = os.environ.get("NAVIGATOR_REGO_DATA", "/var/navigator/policy-data.rego")
 SANDBOX_BIN = os.environ.get("NAVIGATOR_SANDBOX_BIN", "/usr/local/bin/navigator-sandbox")
 LOG_PATH = "/var/log/navigator.log"
 PROXY_ADDR = ("127.0.0.1", 3128)
@@ -17,7 +18,7 @@ PROXY_URL = "http://127.0.0.1:3128"
 
 
 def run_sandbox(command: list[str], workdir: str | None = "/sandbox") -> subprocess.CompletedProcess[str]:
-    args = [SANDBOX_BIN, "--policy", POLICY_PATH]
+    args = [SANDBOX_BIN, "--rego-policy", REGO_POLICY, "--rego-data", REGO_DATA]
     if workdir is not None:
         args += ["--workdir", workdir]
     args += command

@@ -88,9 +88,6 @@ impl ProcessHandle {
                     "Network mode is set to proxy but no proxy configuration was provided"
                 )
             })?;
-            if let Some(unix_socket) = &proxy.unix_socket {
-                cmd.env("NAVIGATOR_PROXY_SOCKET", unix_socket);
-            }
             // When using network namespace, set proxy URL to the veth host IP
             if netns_fd.is_some() {
                 // The proxy is on 10.200.0.1:3128 (or configured port)
@@ -179,9 +176,6 @@ impl ProcessHandle {
                     "Network mode is set to proxy but no proxy configuration was provided"
                 )
             })?;
-            if let Some(unix_socket) = &proxy.unix_socket {
-                cmd.env("NAVIGATOR_PROXY_SOCKET", unix_socket);
-            }
             if let Some(http_addr) = proxy.http_addr {
                 let proxy_url = format!("http://{http_addr}");
                 cmd.env("ALL_PROXY", &proxy_url)

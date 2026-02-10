@@ -1,50 +1,24 @@
 //! Sandbox policy configuration.
 
-use miette::{IntoDiagnostic, Result};
 use navigator_core::proto::{
     self, FilesystemPolicy as ProtoFilesystemPolicy, LandlockCompatibility as ProtoLandlockCompat,
     LandlockPolicy as ProtoLandlockPolicy, NetworkMode as ProtoNetworkMode,
     NetworkPolicy as ProtoNetworkPolicy, ProcessPolicy as ProtoProcessPolicy,
     SandboxPolicy as ProtoSandboxPolicy,
 };
-use serde::Deserialize;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct SandboxPolicy {
-    #[serde(default = "default_policy_version")]
     pub version: u32,
-
-    #[serde(default)]
     pub filesystem: FilesystemPolicy,
-
-    #[serde(default)]
     pub network: NetworkPolicy,
-
-    #[serde(default)]
     pub landlock: LandlockPolicy,
-
-    #[serde(default)]
     pub process: ProcessPolicy,
 }
 
-impl SandboxPolicy {
-    /// Load a sandbox policy from a YAML file.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error if the file cannot be read or parsed.
-    pub fn from_path(path: &Path) -> Result<Self> {
-        let contents = std::fs::read_to_string(path).into_diagnostic()?;
-        let policy: Self = serde_yaml::from_str(&contents).into_diagnostic()?;
-        Ok(policy)
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct FilesystemPolicy {
     /// Read-only directory allow list.
     pub read_only: Vec<PathBuf>,
@@ -66,8 +40,7 @@ impl Default for FilesystemPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct NetworkPolicy {
     pub mode: NetworkMode,
     pub proxy: Option<ProxyPolicy>,
@@ -82,8 +55,7 @@ impl Default for NetworkPolicy {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Default)]
 pub enum NetworkMode {
     #[default]
     Block,
@@ -91,28 +63,18 @@ pub enum NetworkMode {
     Allow,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[derive(Debug, Clone)]
 pub struct ProxyPolicy {
-    /// Unix socket path for a local proxy (preferred for strict seccomp rules).
-    pub unix_socket: Option<PathBuf>,
-
     /// TCP address for a local HTTP proxy (loopback-only).
     pub http_addr: Option<SocketAddr>,
-
-    /// Allowed hostnames for proxy traffic. Empty means allow all.
-    #[serde(default)]
-    pub allow_hosts: Vec<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct LandlockPolicy {
     pub compatibility: LandlockCompatibility,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(default, deny_unknown_fields)]
+#[derive(Debug, Clone, Default)]
 pub struct ProcessPolicy {
     /// User name to run the sandboxed process as.
     pub run_as_user: Option<String>,
@@ -121,16 +83,11 @@ pub struct ProcessPolicy {
     pub run_as_group: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Default)]
 pub enum LandlockCompatibility {
     #[default]
     BestEffort,
     HardRequirement,
-}
-
-const fn default_policy_version() -> u32 {
-    1
 }
 
 // ============================================================================
@@ -181,17 +138,11 @@ impl TryFrom<ProtoNetworkPolicy> for NetworkPolicy {
         };
 
         let proxy = proto.proxy.map(|p| ProxyPolicy {
-            unix_socket: if p.unix_socket.is_empty() {
-                None
-            } else {
-                Some(PathBuf::from(p.unix_socket))
-            },
             http_addr: if p.http_addr.is_empty() {
                 None
             } else {
                 p.http_addr.parse().ok()
             },
-            allow_hosts: p.allow_hosts,
         });
 
         Ok(Self { mode, proxy })

@@ -33,9 +33,11 @@ hex = "0.4"
 russh = "0.57"
 rand_core = "0.6"
 
+# OPA policy evaluation (no default features — full-opa pulls in opa-runtime which requires git in build)
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
+
 # Serialization
-serde = { workspace = true }
-serde_yaml = { workspace = true }
+serde_json = { workspace = true }
 
 # Logging
 tracing = { workspace = true }
@@ -52,6 +54,9 @@ libc = "0.2"
 landlock = "0.4"
 seccompiler = "0.5"
 uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
 
 [lints]
 workspace = true

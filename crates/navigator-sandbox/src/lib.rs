@@ -3,20 +3,26 @@
 //! This crate provides process sandboxing and monitoring capabilities.
 
 mod grpc_client;
+mod identity;
+pub mod opa;
 mod policy;
 mod process;
+pub mod procfs;
 mod proxy;
 mod sandbox;
 mod ssh;
 
 use miette::{IntoDiagnostic, Result};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, error, info};
 
-use crate::policy::NetworkMode;
-use crate::policy::SandboxPolicy;
+use crate::identity::BinaryIdentityCache;
+use crate::opa::OpaEngine;
+use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
@@ -27,15 +33,16 @@ pub use process::{ProcessHandle, ProcessStatus};
 /// # Errors
 ///
 /// Returns an error if the command fails to start or encounters a fatal error.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::similar_names)]
 pub async fn run_sandbox(
     command: Vec<String>,
     workdir: Option<String>,
     timeout_secs: u64,
     interactive: bool,
-    policy_path: Option<String>,
     sandbox_id: Option<String>,
     navigator_endpoint: Option<String>,
+    rego_policy: Option<String>,
+    rego_data: Option<String>,
     ssh_listen_addr: Option<String>,
     ssh_handshake_secret: Option<String>,
     ssh_handshake_skew_secs: u64,
@@ -46,8 +53,14 @@ pub async fn run_sandbox(
         .split_first()
         .ok_or_else(|| miette::miette!("No command specified"))?;
 
-    // Load policy - either via gRPC or from local file
-    let policy = load_policy(policy_path, sandbox_id, navigator_endpoint).await?;
+    // Load policy and initialize OPA engine
+    let (policy, opa_engine) =
+        load_policy(sandbox_id, navigator_endpoint, rego_policy, rego_data).await?;
+
+    // Create identity cache for SHA256 TOFU when OPA is active
+    let identity_cache = opa_engine
+        .as_ref()
+        .map(|_| Arc::new(BinaryIdentityCache::new()));
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
@@ -96,15 +109,27 @@ pub async fn run_sandbox(
     #[allow(clippy::no_effect_underscore_binding)]
     let _netns: Option<()> = None;
 
+    // Shared PID: set after process spawn so the proxy can look up
+    // the entrypoint process's /proc/net/tcp for identity binding.
+    let entrypoint_pid = Arc::new(AtomicU32::new(0));
+
     let _proxy = if matches!(policy.network.mode, NetworkMode::Proxy) {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
 
-        // If we have a network namespace, bind to the veth host IP
+        let engine = opa_engine.clone().ok_or_else(|| {
+            miette::miette!("Proxy mode requires an OPA engine (--rego-policy and --rego-data)")
+        })?;
+
+        let cache = identity_cache.clone().ok_or_else(|| {
+            miette::miette!("Proxy mode requires an identity cache (OPA engine must be configured)")
+        })?;
+
+        // If we have a network namespace, bind to the veth host IP so sandboxed
+        // processes can reach the proxy via TCP.
         #[cfg(target_os = "linux")]
         let bind_addr = netns.as_ref().map(|ns| {
-            // Use the host IP with the configured port (or default 3128)
             let port = proxy_policy.http_addr.map_or(3128, |addr| addr.port());
             SocketAddr::new(ns.host_ip(), port)
         });
@@ -112,7 +137,16 @@ pub async fn run_sandbox(
         #[cfg(not(target_os = "linux"))]
         let bind_addr: Option<SocketAddr> = None;
 
-        Some(ProxyHandle::start_with_bind_addr(proxy_policy, bind_addr).await?)
+        Some(
+            ProxyHandle::start_with_bind_addr(
+                proxy_policy,
+                bind_addr,
+                engine,
+                cache,
+                entrypoint_pid.clone(),
+            )
+            .await?,
+        )
     } else {
         None
     };
@@ -130,6 +164,8 @@ pub async fn run_sandbox(
     #[cfg(not(target_os = "linux"))]
     let mut handle = ProcessHandle::spawn(program, args, workdir.as_deref(), interactive, &policy)?;
 
+    // Store the entrypoint PID so the proxy can resolve TCP peer identity
+    entrypoint_pid.store(handle.pid(), Ordering::Release);
     info!(pid = handle.pid(), "Process started");
 
     // Wait for process with optional timeout
@@ -152,18 +188,44 @@ pub async fn run_sandbox(
     Ok(status.code())
 }
 
-/// Load sandbox policy from either gRPC or local file.
+/// Load sandbox policy from Rego files or gRPC.
 ///
 /// Priority:
-/// 1. If `sandbox_id` and `navigator_endpoint` are provided, fetch via gRPC
-/// 2. If `policy_path` is provided (or `NAVIGATOR_SANDBOX_POLICY` env var), load from file
+/// 1. If `rego_policy` and `rego_data` are provided, load OPA engine from Rego files
+/// 2. If `sandbox_id` and `navigator_endpoint` are provided, fetch via gRPC
 /// 3. Otherwise, return an error
 async fn load_policy(
-    policy_path: Option<String>,
     sandbox_id: Option<String>,
     navigator_endpoint: Option<String>,
-) -> Result<SandboxPolicy> {
-    // Try gRPC mode first if both sandbox_id and endpoint are provided
+    rego_policy: Option<String>,
+    rego_data: Option<String>,
+) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
+    // Rego mode: load OPA engine and extract sandbox config from Rego data
+    if let (Some(policy_file), Some(data_file)) = (&rego_policy, &rego_data) {
+        info!(
+            rego_policy = %policy_file,
+            rego_data = %data_file,
+            "Loading OPA policy engine"
+        );
+        let engine = OpaEngine::from_files(
+            std::path::Path::new(policy_file),
+            std::path::Path::new(data_file),
+        )?;
+        let config = engine.query_sandbox_config()?;
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: config.filesystem,
+            network: NetworkPolicy {
+                mode: NetworkMode::Proxy,
+                proxy: Some(ProxyPolicy { http_addr: None }),
+            },
+            landlock: config.landlock,
+            process: config.process,
+        };
+        return Ok((policy, Some(Arc::new(engine))));
+    }
+
+    // gRPC mode
     if let (Some(id), Some(endpoint)) = (&sandbox_id, &navigator_endpoint) {
         info!(
             sandbox_id = %id,
@@ -171,22 +233,15 @@ async fn load_policy(
             "Fetching sandbox policy via gRPC"
         );
         let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
-        return SandboxPolicy::try_from(proto_policy);
-    }
-
-    // Fall back to file-based policy loading
-    let policy_path = policy_path.or_else(|| std::env::var("NAVIGATOR_SANDBOX_POLICY").ok());
-
-    if let Some(path) = policy_path {
-        info!(policy_path = %path, "Loading sandbox policy from file");
-        return SandboxPolicy::from_path(std::path::Path::new(&path));
+        let policy = SandboxPolicy::try_from(proto_policy)?;
+        return Ok((policy, None));
     }
 
     // No policy source available
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
-         - --sandbox-id and --navigator-endpoint (or NAVIGATOR_SANDBOX_ID and NAVIGATOR_ENDPOINT env vars)\n\
-         - --policy (or NAVIGATOR_SANDBOX_POLICY env var)"
+         - --rego-policy and --rego-data (or NAVIGATOR_REGO_POLICY and NAVIGATOR_REGO_DATA env vars)\n\
+         - --sandbox-id and --navigator-endpoint (or NAVIGATOR_SANDBOX_ID and NAVIGATOR_ENDPOINT env vars)"
     ))
 }
 

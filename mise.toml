@@ -144,11 +144,14 @@ fi
 docker run ${TTY_FLAG} \
   --cap-add=SYS_ADMIN \
   --cap-add=NET_ADMIN \
-  -v ${PWD}/dev-sandbox-policy.yaml:/var/navigator/policy.yaml:ro \
+  --cap-add=SYS_PTRACE \
+  -v ${PWD}/dev-sandbox-policy.rego:/var/navigator/policy.rego:ro \
+  -v ${PWD}/dev-sandbox-policy-data.rego:/var/navigator/policy-data.rego:ro \
   -v ${PWD}/tmp:/sandbox/tmp \
   -e HOME=/sandbox \
   -w /sandbox \
-  -e NAVIGATOR_SANDBOX_POLICY=/var/navigator/policy.yaml \
+  -e NAVIGATOR_REGO_POLICY=/var/navigator/policy.rego \
+  -e NAVIGATOR_REGO_DATA=/var/navigator/policy-data.rego \
   navigator-sandbox:${IMAGE_TAG:-dev} -i "${CMD[@]}"
 """
 
