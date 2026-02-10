@@ -10,7 +10,9 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
-    DeployOptions, default_local_kubeconfig_path, print_kubeconfig, update_local_kubeconfig,
+    DeployOptions, RemoteOptions, clear_active_cluster, default_local_kubeconfig_path,
+    get_cluster_metadata, list_clusters, load_active_cluster, print_kubeconfig,
+    remove_cluster_metadata, save_active_cluster, update_local_kubeconfig,
 };
 use navigator_core::proto::{
     CreateSandboxRequest, DeleteSandboxRequest, GetSandboxRequest, HealthRequest,
@@ -19,6 +21,7 @@ use navigator_core::proto::{
 };
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -115,6 +118,7 @@ impl LogDisplay {
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&LogDisplay>) {
     let lines = [
         format!("{}", "Created sandbox:".cyan().bold()),
+        String::new(),
         format!("  {} {}", "Id:".dimmed(), sandbox.id),
         format!("  {} {}", "Name:".dimmed(), sandbox.name),
         format!("  {} {}", "Namespace:".dimmed(), sandbox.namespace),
@@ -143,10 +147,250 @@ fn format_phase_label(phase: &str) -> String {
     format!("{} {colored}", "Phase:".dimmed())
 }
 
+const CLUSTER_DEPLOY_LOG_LINES: usize = 15;
+
+/// Return the current terminal width, falling back to 80 columns.
+fn term_width() -> usize {
+    crossterm::terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
+}
+
+/// Build a horizontal rule of `─` characters with an optional centered label.
+fn horizontal_rule(label: Option<&str>, width: usize) -> String {
+    match label {
+        Some(text) => {
+            let text_with_pad = format!(" {text} ");
+            let text_len = text_with_pad.len();
+            if width <= text_len {
+                return text_with_pad;
+            }
+            let remaining = width - text_len;
+            let left = remaining / 2;
+            let right = remaining - left;
+            format!("{}{}{}", "─".repeat(left), text_with_pad, "─".repeat(right),)
+        }
+        None => "─".repeat(width),
+    }
+}
+
+/// Truncate a string to fit within the given column width.
+///
+/// If the string is longer than `max_width`, it is cut and an ellipsis (`…`)
+/// is appended so the total visible width equals `max_width`.
+fn truncate_to_width(s: &str, max_width: usize) -> String {
+    if max_width == 0 {
+        return String::new();
+    }
+    // Fast path: ASCII-only check via byte length (covers the vast majority of log lines).
+    if s.len() <= max_width {
+        return s.to_string();
+    }
+    // The string is longer than the budget. We need to truncate.
+    // Walk by chars to handle multi-byte UTF-8 correctly.
+    let mut end = 0;
+    for (count, (idx, ch)) in s.char_indices().enumerate() {
+        if count + 1 > max_width.saturating_sub(1) {
+            break;
+        }
+        end = idx + ch.len_utf8();
+    }
+    format!("{}…", &s[..end])
+}
+
+struct ClusterDeployLogPanel {
+    mp: MultiProgress,
+    name: String,
+    location: String,
+    status: String,
+    current_step: Option<String>,
+    spinner: ProgressBar,
+    completed_steps: Vec<ProgressBar>,
+    top_border: Option<ProgressBar>,
+    log_lines: Vec<ProgressBar>,
+    bottom_border: Option<ProgressBar>,
+    buffer: VecDeque<String>,
+}
+
+impl ClusterDeployLogPanel {
+    fn new(name: &str, location: &str) -> Self {
+        let mp = MultiProgress::new();
+
+        let spinner = mp.add(ProgressBar::new_spinner());
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        spinner.enable_steady_tick(Duration::from_millis(120));
+
+        let panel = Self {
+            mp,
+            name: name.to_string(),
+            location: location.to_string(),
+            status: "Starting bootstrap".to_string(),
+            current_step: None,
+            spinner,
+            completed_steps: Vec::new(),
+            top_border: None,
+            log_lines: Vec::with_capacity(CLUSTER_DEPLOY_LOG_LINES),
+            bottom_border: None,
+            buffer: VecDeque::with_capacity(CLUSTER_DEPLOY_LOG_LINES),
+        };
+        panel.update_spinner_message();
+        panel
+    }
+
+    fn push_log(&mut self, line: String) {
+        let line = line.trim().to_string();
+        if line.is_empty() {
+            return;
+        }
+
+        if let Some(status) = line.strip_prefix("[status] ") {
+            self.handle_status(status.to_string());
+            return;
+        }
+
+        self.ensure_log_panel();
+
+        if self.buffer.len() == CLUSTER_DEPLOY_LOG_LINES {
+            self.buffer.pop_front();
+        }
+        self.buffer.push_back(line);
+        self.render();
+    }
+
+    fn handle_status(&mut self, status: String) {
+        if is_progress_status(&status) {
+            if let Some(step) = &self.current_step {
+                self.status = format!("{step} ({status})");
+            } else {
+                self.status = status;
+            }
+            self.update_spinner_message();
+            return;
+        }
+
+        if let Some(previous_step) = self.current_step.replace(status.clone()) {
+            self.push_completed_step(&previous_step, true);
+        }
+
+        self.status = status;
+        self.update_spinner_message();
+    }
+
+    fn ensure_log_panel(&mut self) {
+        if self.top_border.is_some() {
+            return;
+        }
+
+        let line_style =
+            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar());
+
+        let width = term_width();
+
+        let top_border = self.mp.add(ProgressBar::new(0));
+        top_border.set_style(line_style.clone());
+        top_border.set_message(
+            horizontal_rule(Some("Container Logs"), width)
+                .cyan()
+                .to_string(),
+        );
+
+        for _ in 0..CLUSTER_DEPLOY_LOG_LINES {
+            let line = self.mp.add(ProgressBar::new(0));
+            line.set_style(line_style.clone());
+            line.set_message(String::new());
+            self.log_lines.push(line);
+        }
+
+        let bottom_border = self.mp.add(ProgressBar::new(0));
+        bottom_border.set_style(line_style);
+        bottom_border.set_message(horizontal_rule(None, width).cyan().to_string());
+
+        self.top_border = Some(top_border);
+        self.bottom_border = Some(bottom_border);
+    }
+
+    fn push_completed_step(&mut self, step: &str, success: bool) {
+        if step.is_empty() {
+            return;
+        }
+
+        let symbol = if success {
+            "✓".green().bold().to_string()
+        } else {
+            "x".red().bold().to_string()
+        };
+
+        let line_style =
+            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar());
+        let bar = self.mp.insert_before(&self.spinner, ProgressBar::new(0));
+        bar.set_style(line_style);
+        bar.set_message(format!("{symbol} {step}"));
+        self.completed_steps.push(bar);
+    }
+
+    fn update_spinner_message(&self) {
+        self.spinner.set_message(format!(
+            "Bootstrapping {} cluster {}: {}",
+            self.location,
+            self.name,
+            self.status.dimmed()
+        ));
+    }
+
+    fn finish_success(&mut self) {
+        if let Some(step) = self.current_step.take() {
+            self.push_completed_step(&step, true);
+        }
+        self.finish_all_bars();
+        self.spinner.finish_and_clear();
+    }
+
+    fn finish_failure(&mut self) {
+        if let Some(step) = self.current_step.take() {
+            self.push_completed_step(&step, false);
+        }
+        self.finish_all_bars();
+        self.spinner.finish_and_clear();
+    }
+
+    /// Finish all progress bars so they are preserved when `MultiProgress` is dropped.
+    fn finish_all_bars(&self) {
+        for bar in &self.completed_steps {
+            bar.finish();
+        }
+        if let Some(top_border) = &self.top_border {
+            top_border.finish();
+        }
+        for bar in &self.log_lines {
+            bar.finish();
+        }
+        if let Some(bottom_border) = &self.bottom_border {
+            bottom_border.finish();
+        }
+    }
+
+    fn render(&self) {
+        let width = term_width();
+        for (idx, bar) in self.log_lines.iter().enumerate() {
+            let line = self.buffer.get(idx).map(String::as_str).unwrap_or_default();
+            bar.set_message(truncate_to_width(line, width));
+        }
+    }
+}
+
+fn is_progress_status(status: &str) -> bool {
+    status.starts_with("Exported ")
+        || status.starts_with("Downloading:")
+        || status.starts_with("Extracting:")
+}
+
 /// Show cluster status.
 #[allow(clippy::branches_sharing_code)]
 pub async fn cluster_status(server: &str, tls: &TlsOptions) -> Result<()> {
-    println!("{}", "Server Status".bold().cyan());
+    println!("{}", "Server Status".cyan().bold());
     println!();
     println!("  {} {}", "Server:".dimmed(), server);
 
@@ -196,6 +440,78 @@ pub async fn cluster_status(server: &str, tls: &TlsOptions) -> Result<()> {
     Ok(())
 }
 
+/// Set the active cluster.
+pub fn cluster_use(name: &str) -> Result<()> {
+    // Verify the cluster exists
+    get_cluster_metadata(name).ok_or_else(|| {
+        miette::miette!(
+            "No cluster metadata found for '{name}'.\n\
+             Deploy a cluster first with: nav cluster admin deploy --name {name}\n\
+             Or list available clusters: nav cluster list"
+        )
+    })?;
+
+    save_active_cluster(name)?;
+    eprintln!("{} Active cluster set to '{name}'", "✓".green().bold());
+    Ok(())
+}
+
+/// List all provisioned clusters.
+pub fn cluster_list() -> Result<()> {
+    let clusters = list_clusters()?;
+    let active = load_active_cluster();
+
+    if clusters.is_empty() {
+        println!("No clusters found.");
+        println!();
+        println!(
+            "Deploy a cluster with: {}",
+            "nav cluster admin deploy".dimmed()
+        );
+        return Ok(());
+    }
+
+    // Calculate column widths
+    let name_width = clusters
+        .iter()
+        .map(|c| c.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let endpoint_width = clusters
+        .iter()
+        .map(|c| c.gateway_endpoint.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    // Print header
+    println!(
+        "  {:<name_width$}  {:<endpoint_width$}  {}",
+        "NAME".bold(),
+        "ENDPOINT".bold(),
+        "TYPE".bold(),
+    );
+
+    // Print rows
+    for cluster in &clusters {
+        let is_active = active.as_deref() == Some(&cluster.name);
+        let marker = if is_active { "*" } else { " " };
+        let cluster_type = if cluster.is_remote { "remote" } else { "local" };
+        let line = format!(
+            "{marker} {:<name_width$}  {:<endpoint_width$}  {cluster_type}",
+            cluster.name, cluster.gateway_endpoint,
+        );
+        if is_active {
+            println!("{}", line.green());
+        } else {
+            println!("{line}");
+        }
+    }
+
+    Ok(())
+}
+
 async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {
     let base = server.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
@@ -227,47 +543,373 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     Ok(Some(resp.status()))
 }
 
-/// Provision or start a local cluster.
+/// Prompt the user to choose how to handle an existing cluster deployment.
+///
+/// Returns `true` to recreate (destroy and start fresh), `false` to reuse.
+fn prompt_existing_cluster(
+    name: &str,
+    info: &navigator_bootstrap::ExistingClusterInfo,
+) -> Result<bool> {
+    let status = if info.container_running {
+        "running"
+    } else if info.container_exists {
+        "stopped"
+    } else {
+        "volume only"
+    };
+
+    eprintln!("• Existing cluster '{name}' detected ({status})");
+    if let Some(image) = &info.container_image {
+        eprintln!("  {} {}", "Image:".dimmed(), image);
+    }
+    eprintln!();
+
+    eprint!("Destroy and recreate from scratch? [y/N] ");
+    std::io::stderr().flush().ok();
+
+    let mut input = String::new();
+    std::io::stdin()
+        .read_line(&mut input)
+        .into_diagnostic()
+        .wrap_err("failed to read user input")?;
+
+    let choice = input.trim().to_lowercase();
+    Ok(choice == "y" || choice == "yes")
+}
+
+/// Deploy a cluster with the rich progress panel (interactive) or simple
+/// logging (non-interactive). Returns the [`ClusterHandle`] on success.
+///
+/// This is the shared deploy UX used by both `cluster admin deploy` and
+/// the auto-bootstrap path in `sandbox create`.
+pub(crate) async fn deploy_cluster_with_panel(
+    options: DeployOptions,
+    name: &str,
+    location: &str,
+) -> Result<navigator_bootstrap::ClusterHandle> {
+    let interactive = std::io::stderr().is_terminal();
+
+    if interactive {
+        let panel = std::sync::Arc::new(std::sync::Mutex::new(ClusterDeployLogPanel::new(
+            name, location,
+        )));
+        let panel_clone = std::sync::Arc::clone(&panel);
+        let result = navigator_bootstrap::deploy_cluster_with_logs(options, move |line| {
+            if let Ok(mut p) = panel_clone.lock() {
+                p.push_log(line);
+            }
+        })
+        .await;
+
+        let mut panel = std::sync::Arc::try_unwrap(panel)
+            .ok()
+            .expect("panel arc should have single owner after deploy")
+            .into_inner()
+            .expect("panel mutex should not be poisoned");
+        match result {
+            Ok(handle) => {
+                panel.finish_success();
+                Ok(handle)
+            }
+            Err(err) => {
+                panel.finish_failure();
+                eprintln!(
+                    "{} {} {name}",
+                    "x".red().bold(),
+                    "Cluster failed:".red().bold(),
+                );
+                Err(err)
+            }
+        }
+    } else {
+        eprintln!("Deploying {location} cluster {name}...");
+        let handle = navigator_bootstrap::deploy_cluster_with_logs(options, |line| {
+            if let Some(status) = line.strip_prefix("[status] ") {
+                eprintln!("  {status}");
+            } else {
+                eprintln!("  {line}");
+            }
+        })
+        .await?;
+        eprintln!("Cluster {name} ready.");
+        Ok(handle)
+    }
+}
+
+/// Print post-deploy summary showing the cluster name and gateway endpoint.
+pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::ClusterHandle) {
+    eprintln!(
+        "{} {} {name}",
+        "✓".green().bold(),
+        "Cluster ready:".green().bold(),
+    );
+    eprintln!(
+        "  {} {}",
+        "Gateway endpoint:".dimmed(),
+        handle.gateway_endpoint()
+    );
+    eprintln!();
+}
+
+/// Provision or start a cluster (local or remote).
 pub async fn cluster_admin_deploy(
     name: &str,
     update_kube_config: bool,
     get_kubeconfig: bool,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
 ) -> Result<()> {
-    eprintln!("Deploying cluster {name}...");
-    let options = DeployOptions::new(name);
-    let handle = navigator_bootstrap::deploy_cluster(options).await?;
-    eprintln!("Cluster {name} ready.");
+    let is_remote = remote.is_some();
+    let location = if is_remote { "remote" } else { "local" };
+
+    let mut options = DeployOptions::new(name);
+    if let Some(dest) = remote {
+        let mut remote_opts = RemoteOptions::new(dest);
+        if let Some(key) = ssh_key {
+            remote_opts = remote_opts.with_ssh_key(key);
+        }
+        options = options.with_remote(remote_opts);
+    }
+
+    let interactive = std::io::stderr().is_terminal();
+
+    // Check for existing cluster and prompt user if found
+    if interactive {
+        let remote_opts = remote.map(|dest| {
+            let mut opts = RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                opts = opts.with_ssh_key(key);
+            }
+            opts
+        });
+        if let Some(info) =
+            navigator_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
+        {
+            let recreate = prompt_existing_cluster(name, &info)?;
+            if recreate {
+                eprintln!("• Destroying existing cluster...");
+                let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref())?;
+                handle.destroy().await?;
+                eprintln!("{} Cluster destroyed, starting fresh.", "✓".green().bold());
+                eprintln!();
+            }
+            // If reusing, the deploy flow will handle stale node cleanup automatically
+        }
+    }
+
+    let handle = deploy_cluster_with_panel(options, name, location).await?;
 
     if update_kube_config {
         let target_path = default_local_kubeconfig_path()?;
-        update_local_kubeconfig(name, &target_path)?;
-        eprintln!("Updated kubeconfig at {}", target_path.display());
+        // For remote clusters, the name includes "-remote" suffix
+        let kubeconfig_name = if is_remote {
+            format!("{name}-remote")
+        } else {
+            name.to_string()
+        };
+        update_local_kubeconfig(&kubeconfig_name, &target_path)?;
+        eprintln!(
+            "{} Updated kubeconfig at {}",
+            "✓".green().bold(),
+            target_path.display()
+        );
     }
 
     if get_kubeconfig {
-        print_kubeconfig(name)?;
+        let kubeconfig_name = if is_remote {
+            format!("{name}-remote")
+        } else {
+            name.to_string()
+        };
+        print_kubeconfig(&kubeconfig_name)?;
     }
 
-    eprintln!("Stored kubeconfig: {}", handle.kubeconfig_path().display());
+    print_deploy_summary(name, &handle);
+
+    // Auto-activate: set this cluster as the active cluster.
+    save_active_cluster(name)?;
+    eprintln!("{} Active cluster set to '{name}'", "✓".green().bold());
+
     Ok(())
 }
 
-/// Stop a local cluster.
-pub async fn cluster_admin_stop(name: &str) -> Result<()> {
-    eprintln!("Stopping cluster {name}...");
-    let handle = navigator_bootstrap::cluster_handle(name)?;
+/// Resolve the remote SSH destination for a cluster.
+///
+/// If `remote_override` is provided, use it. Otherwise, look up the remote
+/// host from stored cluster metadata. Returns `None` for local clusters.
+fn resolve_remote(name: &str, remote_override: Option<&str>) -> Option<String> {
+    if let Some(r) = remote_override {
+        return Some(r.to_string());
+    }
+    let metadata = get_cluster_metadata(name)?;
+    if metadata.is_remote {
+        metadata.remote_host
+    } else {
+        None
+    }
+}
+
+/// Stop a cluster.
+pub async fn cluster_admin_stop(
+    name: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+) -> Result<()> {
+    let resolved_remote = resolve_remote(name, remote);
+    let remote_opts = resolved_remote.as_deref().map(|dest| {
+        let mut opts = RemoteOptions::new(dest);
+        if let Some(key) = ssh_key {
+            opts = opts.with_ssh_key(key);
+        }
+        opts
+    });
+
+    eprintln!("• Stopping cluster {name}...");
+    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref())?;
     handle.stop().await?;
-    eprintln!("Cluster {name} stopped.");
+    eprintln!("{} Cluster {name} stopped.", "✓".green().bold());
     Ok(())
 }
 
-/// Destroy a local cluster and its state.
-pub async fn cluster_admin_destroy(name: &str) -> Result<()> {
-    eprintln!("Destroying cluster {name}...");
-    let handle = navigator_bootstrap::cluster_handle(name)?;
+/// Destroy a cluster and its state.
+pub async fn cluster_admin_destroy(
+    name: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+) -> Result<()> {
+    let resolved_remote = resolve_remote(name, remote);
+    let remote_opts = resolved_remote.as_deref().map(|dest| {
+        let mut opts = RemoteOptions::new(dest);
+        if let Some(key) = ssh_key {
+            opts = opts.with_ssh_key(key);
+        }
+        opts
+    });
+
+    eprintln!("• Destroying cluster {name}...");
+    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref())?;
     handle.destroy().await?;
-    eprintln!("Cluster {name} destroyed.");
+
+    // Clean up metadata and active cluster reference
+    if let Err(err) = remove_cluster_metadata(name) {
+        tracing::debug!("failed to remove cluster metadata: {err}");
+    }
+    if load_active_cluster().as_deref() == Some(name)
+        && let Err(err) = clear_active_cluster()
+    {
+        tracing::debug!("failed to clear active cluster: {err}");
+    }
+
+    eprintln!("{} Cluster {name} destroyed.", "✓".green().bold());
     Ok(())
+}
+
+/// Show cluster deployment details.
+pub fn cluster_admin_info(name: &str) -> Result<()> {
+    let metadata = get_cluster_metadata(name).ok_or_else(|| {
+        miette::miette!(
+            "No cluster metadata found for '{name}'.\n\
+             Deploy a cluster first with: nav cluster admin deploy --name {name}"
+        )
+    })?;
+
+    let kubeconfig_path = navigator_bootstrap::stored_kubeconfig_path(name)?;
+
+    println!("{}", "Cluster Info".cyan().bold());
+    println!();
+    println!("  {} {}", "Cluster:".dimmed(), metadata.name);
+    println!(
+        "  {} {}",
+        "Gateway endpoint:".dimmed(),
+        metadata.gateway_endpoint
+    );
+    println!(
+        "  {} {}",
+        "Stored kubeconfig:".dimmed(),
+        kubeconfig_path.display()
+    );
+
+    if metadata.is_remote {
+        if let Some(ref host) = metadata.remote_host {
+            println!("  {} {host}", "Remote host:".dimmed());
+        }
+        if let Some(ref resolved) = metadata.resolved_host {
+            println!("  {} {resolved}", "Resolved host:".dimmed());
+        }
+
+        if let Some(ref host) = metadata.remote_host {
+            println!();
+            println!("{}", "SSH tunnel for kubectl access:".dimmed());
+            println!("  nav cluster admin tunnel --name {name}");
+            println!("Or manually:");
+            println!("  ssh -L 6443:127.0.0.1:6443 {host}");
+        }
+    }
+
+    Ok(())
+}
+
+/// Print or start an SSH tunnel for kubectl access to a remote cluster.
+pub fn cluster_admin_tunnel(
+    name: &str,
+    remote_override: Option<&str>,
+    ssh_key: Option<&str>,
+    print_command: bool,
+) -> Result<()> {
+    let remote = resolve_remote(name, remote_override).ok_or_else(|| {
+        miette::miette!(
+            "Cluster '{name}' is not a remote cluster (no SSH destination found).\n\
+             SSH tunnels are only needed for remote clusters."
+        )
+    })?;
+
+    let ssh_cmd = ssh_key.map_or_else(
+        || format!("ssh -L 6443:127.0.0.1:6443 -N {remote}"),
+        |key| format!("ssh -i {key} -L 6443:127.0.0.1:6443 -N {remote}"),
+    );
+
+    if print_command {
+        println!("{ssh_cmd}");
+        return Ok(());
+    }
+
+    eprintln!("Starting SSH tunnel to {remote}...");
+    eprintln!("Press Ctrl+C to stop the tunnel.");
+    eprintln!();
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg(&ssh_cmd)
+        .status()
+        .into_diagnostic()
+        .wrap_err("failed to start SSH tunnel")?;
+
+    if !status.success() {
+        return Err(miette::miette!("SSH tunnel exited with status: {}", status));
+    }
+
+    Ok(())
+}
+
+/// Create a sandbox when no cluster is configured.
+///
+/// Offers to bootstrap a new cluster first, then delegates to [`sandbox_create`].
+pub async fn sandbox_create_with_bootstrap(
+    sync: bool,
+    keep: bool,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+    command: &[String],
+) -> Result<()> {
+    if !crate::bootstrap::confirm_bootstrap()? {
+        return Err(miette::miette!(
+            "No active cluster.\n\
+             Set one with: nav cluster use <name>\n\
+             Or deploy a new cluster: nav cluster admin deploy"
+        ));
+    }
+    let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+    sandbox_create(&server, sync, keep, remote, ssh_key, command, &tls).await
 }
 
 /// Create a sandbox with default settings.
@@ -275,10 +917,29 @@ pub async fn sandbox_create(
     server: &str,
     sync: bool,
     keep: bool,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
     command: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
+    // Try connecting to the cluster. If it fails due to an unreachable cluster,
+    // offer to bootstrap a local one and retry.
+    let (mut client, effective_server, effective_tls) = match grpc_client(server, tls).await {
+        Ok(c) => (c, server.to_string(), tls.clone()),
+        Err(err) => {
+            if !crate::bootstrap::should_attempt_bootstrap(&err, tls) {
+                return Err(err);
+            }
+            if !crate::bootstrap::confirm_bootstrap()? {
+                return Err(err);
+            }
+            let (new_tls, new_server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+            let c = grpc_client(&new_server, &new_tls)
+                .await
+                .wrap_err("bootstrap succeeded but failed to connect to cluster")?;
+            (c, new_server, new_tls)
+        }
+    };
 
     let policy = load_dev_sandbox_policy()?;
     let request = CreateSandboxRequest {
@@ -420,20 +1081,38 @@ pub async fn sandbox_create(
                 let repo_root = git_repo_root()?;
                 let files = git_sync_files(&repo_root)?;
                 if !files.is_empty() {
-                    sandbox_rsync(server, &sandbox_id, &repo_root, &files, tls).await?;
+                    sandbox_rsync(
+                        &effective_server,
+                        &sandbox_id,
+                        &repo_root,
+                        &files,
+                        &effective_tls,
+                    )
+                    .await?;
                 }
             }
 
             if command.is_empty() {
-                return sandbox_connect(server, &sandbox_id, tls).await;
+                return sandbox_connect(&effective_server, &sandbox_id, &effective_tls).await;
             }
 
-            let exec_result = sandbox_exec(server, &sandbox_id, command, interactive, tls).await;
+            let exec_result = sandbox_exec(
+                &effective_server,
+                &sandbox_id,
+                command,
+                interactive,
+                &effective_tls,
+            )
+            .await;
 
             if !interactive
                 && !keep
-                && let Err(err) =
-                    sandbox_delete(server, std::slice::from_ref(&sandbox_id), tls).await
+                && let Err(err) = sandbox_delete(
+                    &effective_server,
+                    std::slice::from_ref(&sandbox_id),
+                    &effective_tls,
+                )
+                .await
             {
                 if exec_result.is_ok() {
                     return Err(err);
@@ -578,7 +1257,8 @@ pub async fn sandbox_get(server: &str, id: &str, tls: &TlsOptions) -> Result<()>
         .sandbox
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
-    println!("Sandbox:");
+    println!("{}", "Sandbox:".cyan().bold());
+    println!();
     println!("  {} {}", "Id:".dimmed(), sandbox.id);
     println!("  {} {}", "Name:".dimmed(), sandbox.name);
     println!("  {} {}", "Namespace:".dimmed(), sandbox.namespace);
@@ -746,7 +1426,8 @@ fn print_yaml_line(line: &str) {
 
 /// Print sandbox policy as YAML with dimmed keys.
 fn print_sandbox_policy(policy: &SandboxPolicy) {
-    println!("Policy:");
+    println!("{}", "Policy:".cyan().bold());
+    println!();
     let policy_yaml = policy_to_yaml(policy);
     if let Ok(yaml_str) = serde_yaml::to_string(&policy_yaml) {
         // Indent the YAML output and skip the initial "---" line
@@ -850,9 +1531,9 @@ pub async fn sandbox_delete(server: &str, ids: &[String], tls: &TlsOptions) -> R
 
         let deleted = response.into_inner().deleted;
         if deleted {
-            println!("Deleted sandbox {id}");
+            println!("{} Deleted sandbox {id}", "✓".green().bold());
         } else {
-            println!("Sandbox {id} not found");
+            println!("{} Sandbox {id} not found", "!".yellow());
         }
     }
 

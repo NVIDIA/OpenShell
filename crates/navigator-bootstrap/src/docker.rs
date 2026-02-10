@@ -1,0 +1,564 @@
+use crate::RemoteOptions;
+use crate::constants::{NETWORK_NAME, container_name, volume_name};
+use crate::image::{pull_registry, pull_registry_password, pull_registry_username};
+use bollard::API_DEFAULT_VERSION;
+use bollard::Docker;
+use bollard::errors::Error as BollardError;
+use bollard::models::{
+    ContainerCreateBody, HostConfig, NetworkCreateRequest, PortBinding, VolumeCreateRequest,
+};
+use bollard::query_parameters::{
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
+    RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions,
+};
+use futures::StreamExt;
+use miette::{IntoDiagnostic, Result, WrapErr};
+use std::collections::HashMap;
+use std::path::Path;
+
+/// Platform information for a Docker daemon host.
+#[derive(Debug, Clone)]
+pub struct HostPlatform {
+    /// CPU architecture (e.g., "amd64", "arm64")
+    pub arch: String,
+    /// Operating system (e.g., "linux")
+    pub os: String,
+}
+
+impl HostPlatform {
+    /// Return the platform string in the format `os/arch` (e.g., `linux/amd64`).
+    pub fn platform_string(&self) -> String {
+        format!("{}/{}", self.os, self.arch)
+    }
+}
+
+/// Query the Docker daemon for the host platform (architecture and OS).
+pub async fn get_host_platform(docker: &Docker) -> Result<HostPlatform> {
+    let version = docker
+        .version()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to query Docker daemon version")?;
+
+    let arch = version
+        .arch
+        .ok_or_else(|| miette::miette!("Docker daemon did not report architecture"))?;
+    let os = version
+        .os
+        .ok_or_else(|| miette::miette!("Docker daemon did not report OS"))?;
+
+    Ok(HostPlatform {
+        arch: normalize_arch(&arch),
+        os: os.to_lowercase(),
+    })
+}
+
+/// Normalize architecture names to Docker convention.
+///
+/// Docker uses `amd64` / `arm64` / `arm` etc., but some systems may report
+/// `x86_64` or `aarch64` instead.
+pub fn normalize_arch(arch: &str) -> String {
+    match arch {
+        "x86_64" => "amd64".to_string(),
+        "aarch64" => "arm64".to_string(),
+        other => other.to_lowercase(),
+    }
+}
+
+/// Create an SSH Docker client from remote options.
+pub fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> {
+    // Ensure destination has ssh:// prefix
+    let ssh_url = if remote.destination.starts_with("ssh://") {
+        remote.destination.clone()
+    } else {
+        format!("ssh://{}", remote.destination)
+    };
+
+    Docker::connect_with_ssh(
+        &ssh_url,
+        600, // timeout in seconds (10 minutes for large image transfers)
+        API_DEFAULT_VERSION,
+        remote.ssh_key.clone(),
+    )
+    .into_diagnostic()
+    .wrap_err_with(|| format!("failed to connect to remote Docker daemon at {ssh_url}"))
+}
+
+pub async fn ensure_network(docker: &Docker) -> Result<()> {
+    match docker
+        .inspect_network(NETWORK_NAME, None::<InspectNetworkOptions>)
+        .await
+    {
+        Ok(_) => return Ok(()),
+        Err(err) if is_not_found(&err) => {}
+        Err(err) => return Err(err).into_diagnostic(),
+    }
+
+    docker
+        .create_network(NetworkCreateRequest {
+            name: NETWORK_NAME.to_string(),
+            driver: Some("bridge".to_string()),
+            attachable: Some(true),
+            ..Default::default()
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to create Docker network")?;
+    Ok(())
+}
+
+pub async fn ensure_volume(docker: &Docker, name: &str) -> Result<()> {
+    match docker.inspect_volume(name).await {
+        Ok(_) => return Ok(()),
+        Err(err) if is_not_found(&err) => {}
+        Err(err) => return Err(err).into_diagnostic(),
+    }
+
+    docker
+        .create_volume(VolumeCreateRequest {
+            name: Some(name.to_string()),
+            ..Default::default()
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to create Docker volume")?;
+    Ok(())
+}
+
+pub async fn ensure_image(docker: &Docker, image_ref: &str) -> Result<()> {
+    match docker.inspect_image(image_ref).await {
+        Ok(_) => return Ok(()),
+        Err(err) if is_not_found(&err) => {}
+        Err(err) => return Err(err).into_diagnostic(),
+    }
+
+    // For local-only images (no registry prefix), give a clear error instead
+    // of attempting a pull from Docker Hub that will always fail.
+    if crate::image::is_local_image_ref(image_ref) {
+        return Err(miette::miette!(
+            "Image '{}' not found locally. This looks like a locally-built image \
+             (no registry prefix). Build it first with `mise run docker:build:cluster`.",
+            image_ref,
+        ));
+    }
+
+    let options = CreateImageOptions {
+        from_image: Some(image_ref.to_string()),
+        ..Default::default()
+    };
+    let mut stream = docker.create_image(Some(options), None, None);
+    while let Some(result) = stream.next().await {
+        result.into_diagnostic()?;
+    }
+    Ok(())
+}
+
+pub async fn ensure_container(
+    docker: &Docker,
+    name: &str,
+    image_ref: &str,
+    extra_sans: &[String],
+    ssh_gateway_host: Option<&str>,
+) -> Result<()> {
+    let container_name = container_name(name);
+
+    // Check if the container already exists
+    match docker
+        .inspect_container(&container_name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(info) => {
+            // Container exists — verify it is using the expected image.
+            // Resolve the desired image ref to its content-addressable ID so we
+            // can compare against the container's image field (which Docker
+            // stores as an ID).
+            let desired_id = docker
+                .inspect_image(image_ref)
+                .await
+                .ok()
+                .and_then(|img| img.id);
+
+            let container_image_id = info.image;
+
+            let image_matches = match (&desired_id, &container_image_id) {
+                (Some(desired), Some(current)) => desired == current,
+                _ => false,
+            };
+
+            if image_matches {
+                return Ok(());
+            }
+
+            // Image changed — remove the stale container so we can recreate it
+            tracing::info!(
+                "Container {} exists but uses a different image (container={}, desired={}), recreating",
+                container_name,
+                container_image_id.as_deref().map_or("unknown", truncate_id),
+                desired_id.as_deref().map_or("unknown", truncate_id),
+            );
+
+            let _ = docker.stop_container(&container_name, None).await;
+            docker
+                .remove_container(
+                    &container_name,
+                    Some(RemoveContainerOptions {
+                        force: true,
+                        ..Default::default()
+                    }),
+                )
+                .await
+                .into_diagnostic()
+                .wrap_err("failed to remove stale container")?;
+        }
+        Err(err) if is_not_found(&err) => {
+            // Container does not exist — will create below
+        }
+        Err(err) => return Err(err).into_diagnostic(),
+    }
+
+    let mut port_bindings = HashMap::new();
+    port_bindings.insert(
+        "6443/tcp".to_string(),
+        Some(vec![PortBinding {
+            host_ip: Some("0.0.0.0".to_string()),
+            host_port: Some("6443".to_string()),
+        }]),
+    );
+    port_bindings.insert(
+        "80/tcp".to_string(),
+        Some(vec![PortBinding {
+            host_ip: Some("0.0.0.0".to_string()),
+            host_port: Some("80".to_string()),
+        }]),
+    );
+    port_bindings.insert(
+        "30051/tcp".to_string(),
+        Some(vec![PortBinding {
+            host_ip: Some("0.0.0.0".to_string()),
+            host_port: Some("8080".to_string()),
+        }]),
+    );
+    port_bindings.insert(
+        "443/tcp".to_string(),
+        Some(vec![PortBinding {
+            host_ip: Some("0.0.0.0".to_string()),
+            host_port: Some("443".to_string()),
+        }]),
+    );
+
+    let exposed_ports = vec![
+        "6443/tcp".to_string(),
+        "80/tcp".to_string(),
+        "30051/tcp".to_string(),
+        "443/tcp".to_string(),
+    ];
+
+    let host_config = HostConfig {
+        privileged: Some(true),
+        port_bindings: Some(port_bindings),
+        binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
+        network_mode: Some(NETWORK_NAME.to_string()),
+        // Add host.docker.internal mapping for DNS resolution
+        // This allows the entrypoint script to configure CoreDNS to use the host gateway
+        extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
+        ..Default::default()
+    };
+
+    let mut cmd = vec![
+        "server".to_string(),
+        "--disable=traefik".to_string(),
+        "--tls-san=127.0.0.1".to_string(),
+        "--tls-san=localhost".to_string(),
+        "--tls-san=host.docker.internal".to_string(),
+    ];
+    for san in extra_sans {
+        cmd.push(format!("--tls-san={san}"));
+    }
+
+    // Pass extra SANs, SSH gateway config, and registry credentials to the
+    // entrypoint so they can be injected into the HelmChart manifest and
+    // k3s registries.yaml.
+    let mut env_vars: Vec<String> = vec![
+        format!("REGISTRY_HOST={}", pull_registry()),
+        format!("REGISTRY_USERNAME={}", pull_registry_username()),
+        format!("REGISTRY_PASSWORD={}", pull_registry_password()),
+    ];
+    if !extra_sans.is_empty() {
+        env_vars.push(format!("EXTRA_SANS={}", extra_sans.join(",")));
+    }
+    if let Some(host) = ssh_gateway_host {
+        env_vars.push(format!("SSH_GATEWAY_HOST={host}"));
+        // The NodePort is mapped to host:8080, so the SSH gateway port for
+        // remote clusters is also 8080.
+        env_vars.push("SSH_GATEWAY_PORT=8080".to_string());
+    }
+    let env = Some(env_vars);
+
+    let config = ContainerCreateBody {
+        image: Some(image_ref.to_string()),
+        cmd: Some(cmd),
+        env,
+        exposed_ports: Some(exposed_ports),
+        host_config: Some(host_config),
+        ..Default::default()
+    };
+
+    docker
+        .create_container(
+            Some(CreateContainerOptions {
+                name: Some(container_name),
+                platform: String::new(),
+            }),
+            config,
+        )
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to create cluster container")?;
+    Ok(())
+}
+
+pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {
+    let container_name = container_name(name);
+    let response = docker
+        .start_container(&container_name, None::<StartContainerOptions>)
+        .await;
+    match response {
+        Ok(()) => Ok(()),
+        Err(err) if is_conflict(&err) => Ok(()),
+        Err(err) => Err(err)
+            .into_diagnostic()
+            .wrap_err("failed to start cluster container"),
+    }
+}
+
+pub async fn stop_container(docker: &Docker, container_name: &str) -> Result<()> {
+    let response = docker.stop_container(container_name, None).await;
+    match response {
+        Ok(()) => Ok(()),
+        Err(err) if is_conflict(&err) => Ok(()),
+        Err(err) if is_not_found(&err) => Ok(()),
+        Err(err) => Err(err).into_diagnostic(),
+    }
+}
+
+pub async fn destroy_cluster_resources(
+    docker: &Docker,
+    name: &str,
+    kubeconfig_path: &Path,
+) -> Result<()> {
+    let container_name = container_name(name);
+    let volume_name = volume_name(name);
+
+    let _ = stop_container(docker, &container_name).await;
+
+    let remove_container = docker
+        .remove_container(
+            &container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    if let Err(err) = remove_container
+        && !is_not_found(&err)
+    {
+        return Err(err).into_diagnostic();
+    }
+
+    let remove_volume = docker
+        .remove_volume(&volume_name, Some(RemoveVolumeOptions { force: true }))
+        .await;
+    if let Err(err) = remove_volume
+        && !is_not_found(&err)
+    {
+        return Err(err).into_diagnostic();
+    }
+
+    let _ = std::fs::remove_file(kubeconfig_path);
+
+    cleanup_network_if_unused(docker).await?;
+    Ok(())
+}
+
+pub async fn cleanup_network_if_unused(docker: &Docker) -> Result<()> {
+    let network = docker
+        .inspect_network(NETWORK_NAME, None::<InspectNetworkOptions>)
+        .await;
+    let network = match network {
+        Ok(info) => info,
+        Err(err) if is_not_found(&err) => return Ok(()),
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    if let Some(containers) = network.containers
+        && !containers.is_empty()
+    {
+        return Ok(());
+    }
+
+    docker
+        .remove_network(NETWORK_NAME)
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to remove Docker network")?;
+    Ok(())
+}
+
+fn is_not_found(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 404,
+            ..
+        }
+    )
+}
+
+/// Check whether a container is still running.
+/// Returns `Ok(())` if running, or an `Err` with the exit status if the container has stopped.
+pub async fn check_container_running(docker: &Docker, container_name: &str) -> Result<()> {
+    let inspect = docker
+        .inspect_container(container_name, None::<InspectContainerOptions>)
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to inspect container")?;
+
+    let state = inspect.state.as_ref();
+    let running = state.and_then(|s| s.running).unwrap_or(false);
+    if running {
+        return Ok(());
+    }
+
+    let status = state
+        .and_then(|s| s.status.as_ref())
+        .map_or_else(|| "unknown".to_string(), |s| format!("{s:?}"));
+    let exit_code = state.and_then(|s| s.exit_code).unwrap_or(-1);
+    let error_msg = state.and_then(|s| s.error.as_deref()).unwrap_or("");
+    let oom = state.and_then(|s| s.oom_killed).unwrap_or(false);
+
+    let mut detail = format!("container exited (status={status}, exit_code={exit_code})");
+    if !error_msg.is_empty() {
+        use std::fmt::Write;
+        let _ = write!(detail, ", error={error_msg}");
+    }
+    if oom {
+        detail.push_str(", OOMKilled=true");
+    }
+
+    Err(miette::miette!(detail))
+}
+
+/// Truncate an image ID for display (e.g., `sha256:abcdef1234...` -> `sha256:abcdef1234ab`).
+fn truncate_id(id: &str) -> &str {
+    const DISPLAY_LEN: usize = "sha256:".len() + 12;
+    if id.len() > DISPLAY_LEN {
+        &id[..DISPLAY_LEN]
+    } else {
+        id
+    }
+}
+
+/// Information about an existing cluster deployment.
+#[derive(Debug, Clone)]
+pub struct ExistingClusterInfo {
+    /// Whether the container exists.
+    pub container_exists: bool,
+    /// Whether the container is currently running.
+    pub container_running: bool,
+    /// Whether the persistent volume exists.
+    pub volume_exists: bool,
+    /// The image used by the existing container (if any).
+    pub container_image: Option<String>,
+}
+
+/// Check whether a cluster with the given name already exists.
+///
+/// Returns `None` if no cluster resources exist, or `Some(info)` with
+/// details about the existing deployment.
+pub async fn check_existing_cluster(
+    docker: &Docker,
+    name: &str,
+) -> Result<Option<ExistingClusterInfo>> {
+    let container_name = container_name(name);
+    let vol_name = volume_name(name);
+
+    let volume_exists = match docker.inspect_volume(&vol_name).await {
+        Ok(_) => true,
+        Err(err) if is_not_found(&err) => false,
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    let (container_exists, container_running, container_image) = match docker
+        .inspect_container(&container_name, None::<InspectContainerOptions>)
+        .await
+    {
+        Ok(info) => {
+            let running = info.state.as_ref().and_then(|s| s.running).unwrap_or(false);
+            let image = info.config.and_then(|c| c.image);
+            (true, running, image)
+        }
+        Err(err) if is_not_found(&err) => (false, false, None),
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    if !container_exists && !volume_exists {
+        return Ok(None);
+    }
+
+    Ok(Some(ExistingClusterInfo {
+        container_exists,
+        container_running,
+        volume_exists,
+        container_image,
+    }))
+}
+
+fn is_conflict(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 409,
+            ..
+        }
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_arch_x86_64() {
+        assert_eq!(normalize_arch("x86_64"), "amd64");
+    }
+
+    #[test]
+    fn normalize_arch_aarch64() {
+        assert_eq!(normalize_arch("aarch64"), "arm64");
+    }
+
+    #[test]
+    fn normalize_arch_passthrough_amd64() {
+        assert_eq!(normalize_arch("amd64"), "amd64");
+    }
+
+    #[test]
+    fn normalize_arch_passthrough_arm64() {
+        assert_eq!(normalize_arch("arm64"), "arm64");
+    }
+
+    #[test]
+    fn normalize_arch_uppercase() {
+        assert_eq!(normalize_arch("ARM64"), "arm64");
+    }
+
+    #[test]
+    fn host_platform_string() {
+        let platform = HostPlatform {
+            arch: "arm64".to_string(),
+            os: "linux".to_string(),
+        };
+        assert_eq!(platform.platform_string(), "linux/arm64");
+    }
+}

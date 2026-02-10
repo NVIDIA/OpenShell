@@ -1,37 +1,41 @@
 # syntax=docker/dockerfile:1.4
 # Supervisor container for navigator
-# Multi-stage build for smaller final image
+# Multi-stage build with cross-compilation support for multi-arch
 
-# Stage 1: Rust builder
-FROM rust:1.88-slim AS rust-builder
+# Stage 1: Rust builder (runs on build platform, cross-compiles for target)
+FROM --platform=$BUILDPLATFORM rust:1.88-slim AS rust-builder
 ARG RUST_BUILD_PROFILE=debug
+ARG TARGETARCH
+ARG BUILDARCH
 
-# Install build dependencies for protobuf-src
+# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake \
-    g++ \
-    make \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
+    cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
+
+# Install cross-compilation toolchain + Rust target (no-ops for native builds)
+COPY deploy/docker/cross-build.sh /usr/local/bin/
+RUN . cross-build.sh && install_cross_toolchain && add_rust_target
 
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY proto/ proto/
+
+# Build with cross-compilation support
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/build/target \
+    . cross-build.sh && \
     if [ "$RUST_BUILD_PROFILE" = "release" ]; then \
-        cargo build --release --package navigator-sandbox; \
+        cargo_cross_build --release -p navigator-sandbox; \
     else \
-        cargo build --package navigator-sandbox; \
+        cargo_cross_build -p navigator-sandbox; \
     fi && \
     mkdir -p /build/out && \
-    cp /build/target/${RUST_BUILD_PROFILE}/navigator-sandbox /build/out/
+    cp "$(cross_output_dir "$RUST_BUILD_PROFILE")/navigator-sandbox" /build/out/
 
-# Stage 2: Python base
+# Stage 2: Python base (uses target platform)
 FROM python:3.12-slim AS base
 
-# Set environment variables
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
@@ -40,13 +44,8 @@ WORKDIR /sandbox
 # Install system dependencies
 # iproute2 is needed for network namespace management (ip netns, veth pairs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    curl \
-    dnsutils \
-    iproute2 \
-    iputils-ping \
-    net-tools \
-    netcat-openbsd \
-    traceroute \
+    curl dnsutils iproute2 iputils-ping \
+    net-tools netcat-openbsd traceroute \
     && rm -rf /var/lib/apt/lists/*
 
 # Create supervisor and sandbox users/groups
@@ -56,10 +55,8 @@ RUN groupadd -r supervisor && useradd -r -g supervisor -s /usr/sbin/nologin supe
 # Stage 3: Python dependencies builder
 FROM base AS builder
 
-# Install uv
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Install dependencies into a virtual environment
 RUN uv venv /app/.venv && \
     uv sync --frozen --no-dev --no-install-project 2>/dev/null || \
     uv sync --no-dev --no-install-project 2>/dev/null || true
@@ -67,35 +64,25 @@ RUN uv venv /app/.venv && \
 # Stage 4: Coding agents layer
 FROM base AS coding-agents
 
-# Install Node.js for npm-based CLI tools (Claude, OpenCode)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    nodejs \
-    npm \
-    && rm -rf /var/lib/apt/lists/*
+    nodejs npm && rm -rf /var/lib/apt/lists/*
 
-# Install Claude CLI (Anthropic), OpenCode CLI, and Codex CLI (OpenAI)
 RUN npm install -g @anthropic-ai/claude-code opencode-ai @openai/codex
 
 # Stage 5: Final image
 FROM coding-agents AS final
 ARG RUST_BUILD_PROFILE=debug
 
-# Copy Python virtual environment and uv
 COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
-
-# Copy navigator-sandbox binary from Rust builder
 COPY --from=rust-builder /build/out/navigator-sandbox /usr/local/bin/
 
-# Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
-# Create policy mount location, sandbox workspace, and log file
 RUN mkdir -p /var/navigator /sandbox /var/log && \
     touch /var/log/navigator.log && \
     chown supervisor:supervisor /var/log/navigator.log && \
     chmod 0664 /var/log/navigator.log && \
     chown sandbox:sandbox /sandbox
 
-# Set navigator-sandbox as the entrypoint
 ENTRYPOINT ["navigator-sandbox"]

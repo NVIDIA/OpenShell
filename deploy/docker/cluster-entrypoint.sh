@@ -1,5 +1,5 @@
 #!/bin/sh
-# Entrypoint script for navigator-cluster image
+# Entrypoint script for navigator-cluster image.
 #
 # This script configures DNS resolution for k3s when running in Docker.
 #
@@ -85,6 +85,31 @@ nameserver 8.8.4.4
 EOF
 fi
 
+# ---------------------------------------------------------------------------
+# Generate k3s private registry configuration
+# ---------------------------------------------------------------------------
+# Write registries.yaml so k3s/containerd can authenticate when pulling
+# component images from the distribution registry at runtime.
+# Credentials are passed as environment variables by the bootstrap code.
+REGISTRIES_YAML="/etc/rancher/k3s/registries.yaml"
+if [ -n "$REGISTRY_HOST" ] && [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_PASSWORD" ]; then
+    echo "Configuring registry credentials for distribution registry"
+    cat > "$REGISTRIES_YAML" <<REGEOF
+mirrors:
+  "${REGISTRY_HOST}":
+    endpoint:
+      - "https://${REGISTRY_HOST}"
+
+configs:
+  "${REGISTRY_HOST}":
+    auth:
+      username: ${REGISTRY_USERNAME}
+      password: ${REGISTRY_PASSWORD}
+REGEOF
+else
+    echo "Warning: REGISTRY_HOST, REGISTRY_USERNAME, or REGISTRY_PASSWORD not set; skipping registry config"
+fi
+
 # Copy bundled manifests to k3s manifests directory.
 # These are stored in /opt/navigator/manifests/ because the volume mount
 # on /var/lib/rancher/k3s overwrites any files baked into that path.
@@ -93,7 +118,53 @@ if [ -d "/opt/navigator/manifests" ]; then
     cp /opt/navigator/manifests/*.yaml /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
 fi
 
-# Execute k3s with the custom resolv-conf
-# The --resolv-conf flag tells k3s to use our DNS configuration instead of /etc/resolv.conf
-# Per k3s docs: "Manually specified resolver configuration files are not subject to viability checks"
+# Inject SSH gateway host/port into the HelmChart manifest so the navigator
+# server returns the correct address to CLI clients for SSH proxy CONNECT.
+HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
+if [ -f "$HELMCHART" ]; then
+    if [ -n "$SSH_GATEWAY_HOST" ]; then
+        echo "Setting SSH gateway host: $SSH_GATEWAY_HOST"
+        sed -i "s|__SSH_GATEWAY_HOST__|${SSH_GATEWAY_HOST}|g" "$HELMCHART"
+    else
+        # Clear the placeholder so the default (127.0.0.1) is used
+        sed -i "s|sshGatewayHost: __SSH_GATEWAY_HOST__|sshGatewayHost: \"\"|g" "$HELMCHART"
+    fi
+    if [ -n "$SSH_GATEWAY_PORT" ]; then
+        echo "Setting SSH gateway port: $SSH_GATEWAY_PORT"
+        sed -i "s|__SSH_GATEWAY_PORT__|${SSH_GATEWAY_PORT}|g" "$HELMCHART"
+    else
+        # Clear the placeholder so the default (8080) is used
+        sed -i "s|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g" "$HELMCHART"
+    fi
+fi
+
+# If EXTRA_SANS is set (comma-separated list), inject them into the HelmChart
+# manifest so the gateway PKI job includes them in the TLS certificate.
+if [ -n "$EXTRA_SANS" ]; then
+    HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
+    if [ -f "$HELMCHART" ]; then
+        echo "Injecting extra TLS SANs: $EXTRA_SANS"
+        # Build a YAML list from the comma-separated string.
+        # e.g. "160.211.47.2,my.host.com" -> "['160.211.47.2','my.host.com']"  (flow style)
+        # We use sed-friendly single-quoted flow style to keep it on one line.
+        yaml_list="["
+        first=1
+        IFS=','
+        for san in $EXTRA_SANS; do
+            san=$(echo "$san" | xargs)
+            [ -z "$san" ] && continue
+            if [ "$first" = "1" ]; then
+                yaml_list="${yaml_list}'${san}'"
+                first=0
+            else
+                yaml_list="${yaml_list},'${san}'"
+            fi
+        done
+        unset IFS
+        yaml_list="${yaml_list}]"
+        sed -i "s|extraSANs: \[\]|extraSANs: ${yaml_list}|g" "$HELMCHART"
+    fi
+fi
+
+# Execute k3s with explicit resolv-conf.
 exec /bin/k3s "$@" --resolv-conf="$RESOLV_CONF"

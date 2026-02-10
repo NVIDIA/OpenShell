@@ -131,10 +131,13 @@ impl ProcessHandle {
                         }
                     }
 
-                    sandbox::apply(&policy, workdir.as_deref())
+                    // Drop privileges before applying sandbox restrictions.
+                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
+                    // which may be blocked by Landlock.
+                    drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    drop_privileges(&policy)
+                    sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     Ok(())
@@ -204,10 +207,13 @@ impl ProcessHandle {
                         libc::setpgid(0, 0);
                     }
 
-                    sandbox::apply(&policy, workdir.as_deref())
+                    // Drop privileges before applying sandbox restrictions.
+                    // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
+                    // which may be blocked by Landlock.
+                    drop_privileges(&policy)
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-                    drop_privileges(&policy)
+                    sandbox::apply(&policy, workdir.as_deref())
                         .map_err(|err| std::io::Error::other(err.to_string()))?;
 
                     Ok(())

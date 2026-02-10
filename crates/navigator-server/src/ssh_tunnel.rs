@@ -139,7 +139,13 @@ async fn handle_tunnel(
 
     info!(sandbox_id = %sandbox_id, "SSH tunnel established");
     let mut upgraded = TokioIo::new(upgraded);
-    let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await?;
+    // Discard the result entirely – connection-close errors are expected when
+    // the SSH session ends and do not represent a failure worth propagating.
+    let _ = tokio::io::copy_bidirectional(&mut upgraded, &mut upstream).await;
+    // Gracefully shut down the write-half of the upgraded connection so the
+    // client receives a clean EOF instead of a TCP RST.  This gives SSH time
+    // to read any remaining protocol data (e.g. exit-status) from its buffer.
+    let _ = AsyncWriteExt::shutdown(&mut upgraded).await;
     Ok(())
 }
 

@@ -1,17 +1,19 @@
 # syntax=docker/dockerfile:1.4
 # Navigator Server Docker image
-# Multi-stage build for smaller final image
+# Multi-stage build with cross-compilation support for multi-arch
 
-# Stage 1: Rust builder
-FROM rust:1.88-slim AS builder
+# Stage 1: Rust builder (runs on build platform, cross-compiles for target)
+FROM --platform=$BUILDPLATFORM rust:1.88-slim AS builder
+ARG TARGETARCH
+ARG BUILDARCH
 
-# Install build dependencies for protobuf-src
+# Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake \
-    g++ \
-    make \
-    protobuf-compiler \
-    && rm -rf /var/lib/apt/lists/*
+    cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
+
+# Install cross-compilation toolchain + Rust target (no-ops for native builds)
+COPY deploy/docker/cross-build.sh /usr/local/bin/
+RUN . cross-build.sh && install_cross_toolchain && add_rust_target
 
 WORKDIR /build
 
@@ -21,19 +23,21 @@ COPY crates/navigator-cli/Cargo.toml crates/navigator-cli/Cargo.toml
 COPY crates/navigator-core/Cargo.toml crates/navigator-core/Cargo.toml
 COPY crates/navigator-sandbox/Cargo.toml crates/navigator-sandbox/Cargo.toml
 COPY crates/navigator-server/Cargo.toml crates/navigator-server/Cargo.toml
+COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
 
 # Create dummy source files to build dependencies
-RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-sandbox/src crates/navigator-server/src && \
+RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
     echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
     echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
     echo "fn main() {}" > crates/navigator-server/src/main.rs && \
-    touch crates/navigator-core/src/lib.rs
+    touch crates/navigator-core/src/lib.rs && \
+    touch crates/navigator-bootstrap/src/lib.rs
 
 # Copy proto files needed for build
 COPY proto/ proto/
 
 # Build dependencies only (cached unless Cargo.toml/lock changes)
-RUN cargo build --release --package navigator-server 2>/dev/null || true
+RUN . cross-build.sh && cargo_cross_build --release -p navigator-server 2>/dev/null || true
 
 # Copy actual source code
 COPY crates/ crates/
@@ -42,39 +46,31 @@ COPY crates/ crates/
 RUN touch crates/navigator-server/src/main.rs
 
 # Build the actual application
-RUN cargo build --release --package navigator-server && \
-    cp /build/target/release/navigator-server /build/navigator-server
+RUN . cross-build.sh && \
+    cargo_cross_build --release -p navigator-server && \
+    cp "$(cross_output_dir release)/navigator-server" /build/navigator-server
 
-# Stage 2: Runtime
+# Stage 2: Runtime (uses target platform)
 FROM debian:bookworm-slim AS runtime
 
-# Install runtime dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    ca-certificates && rm -rf /var/lib/apt/lists/*
 
-# Create non-root user
 RUN useradd --create-home --user-group navigator
 
 WORKDIR /app
 
-# Copy binary from builder
 COPY --from=builder /build/navigator-server /usr/local/bin/
 
 # Copy migrations to the build-time manifest directory expected by sqlx
 RUN mkdir -p /build/crates/navigator-server
 COPY crates/navigator-server/migrations /build/crates/navigator-server/migrations
 
-# Switch to non-root user
 USER navigator
-
-# Expose gRPC/HTTP port
 EXPOSE 8080
 
-# Health check
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8080/healthz || exit 1
 
-# Run server binding to all interfaces
 ENTRYPOINT ["navigator-server"]
 CMD ["--port", "8080"]

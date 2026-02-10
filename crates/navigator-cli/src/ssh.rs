@@ -33,9 +33,17 @@ async fn ssh_session_config(server: &str, id: &str, tls: &TlsOptions) -> Result<
         .wrap_err("failed to resolve navigator executable")?;
     let exe_command = shell_escape(&exe.to_string_lossy());
 
+    // If the server returned a loopback gateway address, override it with the
+    // cluster endpoint's host. This handles the case where the server defaults
+    // to 127.0.0.1 but the cluster is actually running on a remote host.
+    #[allow(clippy::cast_possible_truncation)]
+    let gateway_port_u16 = session.gateway_port as u16;
+    let (gateway_host, gateway_port) =
+        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
+
     let gateway_url = format!(
         "{}://{}:{}{}",
-        session.gateway_scheme, session.gateway_host, session.gateway_port, session.connect_path
+        session.gateway_scheme, gateway_host, gateway_port, session.connect_path
     );
     let proxy_command = format!(
         "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {}",
@@ -43,6 +51,33 @@ async fn ssh_session_config(server: &str, id: &str, tls: &TlsOptions) -> Result<
     );
 
     Ok(SshSessionConfig { proxy_command })
+}
+
+/// If the server-provided gateway host is a loopback address, use the host
+/// from the cluster endpoint instead so the CLI connects to the right machine.
+fn resolve_ssh_gateway(gateway_host: &str, gateway_port: u16, cluster_url: &str) -> (String, u16) {
+    let is_loopback = gateway_host == "127.0.0.1"
+        || gateway_host == "0.0.0.0"
+        || gateway_host == "localhost"
+        || gateway_host == "::1";
+
+    if !is_loopback {
+        return (gateway_host.to_string(), gateway_port);
+    }
+
+    // Try to extract the host from the cluster URL
+    if let Ok(url) = url::Url::parse(cluster_url)
+        && let Some(host) = url.host_str()
+    {
+        // Only override if the cluster endpoint is not also a loopback address
+        let cluster_is_loopback =
+            host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
+        if !cluster_is_loopback {
+            return (host.to_string(), gateway_port);
+        }
+    }
+
+    (gateway_host.to_string(), gateway_port)
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
@@ -254,17 +289,38 @@ pub async fn sandbox_ssh_proxy(
         ));
     }
 
-    let (mut reader, mut writer) = tokio::io::split(stream);
-    let mut stdin = tokio::io::stdin();
-    let mut stdout = tokio::io::stdout();
+    let (reader, writer) = tokio::io::split(stream);
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
 
-    tokio::try_join!(
-        tokio::io::copy(&mut stdin, &mut writer),
-        tokio::io::copy(&mut reader, &mut stdout)
-    )
-    .into_diagnostic()?;
+    // Spawn both copy directions as independent tasks.  Using separate spawned
+    // tasks (instead of try_join!/select!) ensures that when one direction
+    // completes or errors, the other continues independently until it also
+    // finishes.  This is critical: when the remote side closes the connection,
+    // we must keep the stdin→gateway copy alive so SSH can finish sending its
+    // protocol-close packets, and vice-versa.
+    let to_remote = tokio::spawn(copy_ignoring_errors(stdin, writer));
+    let from_remote = tokio::spawn(copy_ignoring_errors(reader, stdout));
+    let _ = from_remote.await;
+    // Once the remote→stdout direction is done, SSH has received all the data
+    // it needs.  Drop the stdin→gateway task – SSH will close its pipe when
+    // it's done regardless.
+    to_remote.abort();
 
     Ok(())
+}
+
+/// Copy all bytes from `reader` to `writer`, flushing on completion.
+/// Errors are intentionally discarded – connection teardown errors are
+/// expected during normal SSH session shutdown.
+async fn copy_ignoring_errors<R, W>(mut reader: R, mut writer: W)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let _ = tokio::io::copy(&mut reader, &mut writer).await;
+    let _ = AsyncWriteExt::flush(&mut writer).await;
+    let _ = AsyncWriteExt::shutdown(&mut writer).await;
 }
 
 async fn connect_gateway(
@@ -320,3 +376,50 @@ async fn read_connect_status(stream: &mut dyn ProxyStream) -> Result<u16> {
 trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_ssh_gateway_keeps_non_loopback() {
+        let (host, port) = resolve_ssh_gateway("10.0.0.5", 8080, "https://spark.local");
+        assert_eq!(host, "10.0.0.5");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_overrides_loopback_with_cluster_host() {
+        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://spark.local");
+        assert_eq!(host, "spark.local");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_overrides_zeros_with_cluster_host() {
+        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://10.0.0.5:443");
+        assert_eq!(host, "10.0.0.5");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_overrides_localhost() {
+        let (host, port) = resolve_ssh_gateway("localhost", 8080, "https://remote-host:443");
+        assert_eq!(host, "remote-host");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_no_override_when_cluster_is_also_loopback() {
+        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
+    }
+
+    #[test]
+    fn resolve_ssh_gateway_handles_invalid_cluster_url() {
+        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "not-a-url");
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 8080);
+    }
+}

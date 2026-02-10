@@ -4,8 +4,71 @@ use clap::{CommandFactory, Parser, Subcommand};
 use miette::Result;
 use std::path::PathBuf;
 
+use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
 use navigator_cli::run;
 use navigator_cli::tls::{TlsOptions, is_https};
+
+/// Resolved cluster context: name + gateway endpoint.
+struct ClusterContext {
+    /// The cluster name (used for TLS cert directory, metadata lookup, etc.).
+    name: String,
+    /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
+    endpoint: String,
+}
+
+/// Resolve the cluster name to a [`ClusterContext`] with the gateway endpoint.
+///
+/// Resolution priority:
+/// 1. `--cluster` flag (explicit name)
+/// 2. `NAVIGATOR_CLUSTER` environment variable
+/// 3. Active cluster from `~/.config/navigator/active_cluster`
+///
+/// Once the name is determined, loads the cluster metadata to get the endpoint.
+fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
+    let name = cluster_flag
+        .clone()
+        .or_else(|| {
+            std::env::var("NAVIGATOR_CLUSTER")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .or_else(load_active_cluster)
+        .ok_or_else(|| {
+            miette::miette!(
+                "No active cluster.\n\
+                 Set one with: nav cluster use <name>\n\
+                 Or deploy a new cluster: nav cluster admin deploy"
+            )
+        })?;
+
+    let metadata = load_cluster_metadata(&name).map_err(|_| {
+        miette::miette!(
+            "Unknown cluster '{name}'.\n\
+             Deploy it first: nav cluster admin deploy --name {name}\n\
+             Or list available clusters: nav cluster list"
+        )
+    })?;
+
+    Ok(ClusterContext {
+        name: metadata.name,
+        endpoint: metadata.gateway_endpoint,
+    })
+}
+
+/// Resolve only the cluster name (without requiring metadata to exist).
+///
+/// Used by admin commands that operate on a cluster by name but may not need
+/// the gateway endpoint (e.g., `cluster admin deploy` creates the cluster).
+fn resolve_cluster_name(cluster_flag: &Option<String>) -> Option<String> {
+    cluster_flag
+        .clone()
+        .or_else(|| {
+            std::env::var("NAVIGATOR_CLUSTER")
+                .ok()
+                .filter(|v| !v.trim().is_empty())
+        })
+        .or_else(load_active_cluster)
+}
 
 /// Navigator CLI - agent execution and management.
 #[derive(Parser, Debug)]
@@ -17,15 +80,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Cluster address to connect to.
-    #[arg(
-        long,
-        short,
-        default_value = "https://127.0.0.1",
-        global = true,
-        env = "NAVIGATOR_CLUSTER"
-    )]
-    cluster: String,
+    /// Cluster name to operate on (resolved from stored metadata).
+    #[arg(long, short, global = true, env = "NAVIGATOR_CLUSTER")]
+    cluster: Option<String>,
 
     /// Path to TLS CA certificate (PEM).
     #[arg(long, env = "NAVIGATOR_TLS_CA", global = true)]
@@ -87,6 +144,15 @@ enum ClusterCommands {
     /// Show server status and information.
     Status,
 
+    /// Set the active cluster.
+    Use {
+        /// Cluster name to make active.
+        name: String,
+    },
+
+    /// List all provisioned clusters.
+    List,
+
     /// Manage local development cluster lifecycle.
     Admin {
         #[command(subcommand)]
@@ -96,7 +162,7 @@ enum ClusterCommands {
 
 #[derive(Subcommand, Debug)]
 enum ClusterAdminCommands {
-    /// Provision or start a local cluster.
+    /// Provision or start a cluster (local or remote).
     Deploy {
         /// Cluster name.
         #[arg(long, default_value = "navigator")]
@@ -109,20 +175,70 @@ enum ClusterAdminCommands {
         /// Print stored kubeconfig to stdout.
         #[arg(long)]
         get_kubeconfig: bool,
+
+        /// SSH destination for remote deployment (e.g., user@hostname).
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote deployment.
+        #[arg(long)]
+        ssh_key: Option<String>,
     },
 
-    /// Stop a local cluster (preserves state).
+    /// Stop a cluster (preserves state).
     Stop {
-        /// Cluster name.
-        #[arg(long, default_value = "navigator")]
-        name: String,
+        /// Cluster name (defaults to active cluster).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Override SSH destination (auto-resolved from cluster metadata).
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote cluster.
+        #[arg(long)]
+        ssh_key: Option<String>,
     },
 
-    /// Destroy a local cluster and its state.
+    /// Destroy a cluster and its state.
     Destroy {
-        /// Cluster name.
-        #[arg(long, default_value = "navigator")]
-        name: String,
+        /// Cluster name (defaults to active cluster).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Override SSH destination (auto-resolved from cluster metadata).
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote cluster.
+        #[arg(long)]
+        ssh_key: Option<String>,
+    },
+
+    /// Show cluster deployment details.
+    Info {
+        /// Cluster name (defaults to active cluster).
+        #[arg(long)]
+        name: Option<String>,
+    },
+
+    /// Print or start an SSH tunnel for kubectl access to a remote cluster.
+    Tunnel {
+        /// Cluster name (defaults to active cluster).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Override SSH destination (auto-resolved from cluster metadata).
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key.
+        #[arg(long)]
+        ssh_key: Option<String>,
+
+        /// Only print the SSH command instead of running it.
+        #[arg(long)]
+        print_command: bool,
     },
 }
 
@@ -137,6 +253,14 @@ enum SandboxCommands {
         /// Keep the sandbox alive after non-interactive commands.
         #[arg(long)]
         keep: bool,
+
+        /// SSH destination for remote bootstrap (e.g., user@hostname).
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote bootstrap.
+        #[arg(long)]
+        ssh_key: Option<String>,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(trailing_var_arg = true)]
@@ -187,12 +311,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let tls = TlsOptions::new(cli.tls_ca, cli.tls_cert, cli.tls_key);
 
-    if !is_https(&cli.cluster)? && !cli.allow_insecure_access {
-        return Err(miette::miette!(
-            "https is required; set NAVIGATOR_CLUSTER=https://... or use --allow-insecure-access"
-        ));
-    }
-
     // Set up logging based on verbosity
     let log_level = match cli.verbose {
         0 => "warn",
@@ -211,45 +329,155 @@ async fn main() -> Result<()> {
     match cli.command {
         Some(Commands::Cluster { command }) => match command {
             ClusterCommands::Status => {
-                run::cluster_status(&cli.cluster, &tls).await?;
+                let ctx = resolve_cluster(&cli.cluster)?;
+                let endpoint = &ctx.endpoint;
+                if !is_https(endpoint)? && !cli.allow_insecure_access {
+                    return Err(miette::miette!(
+                        "https is required; use --allow-insecure-access to connect over http"
+                    ));
+                }
+                let tls = tls.with_cluster_name(&ctx.name);
+                run::cluster_status(endpoint, &tls).await?;
+            }
+            ClusterCommands::Use { name } => {
+                run::cluster_use(&name)?;
+            }
+            ClusterCommands::List => {
+                run::cluster_list()?;
             }
             ClusterCommands::Admin { command } => match command {
                 ClusterAdminCommands::Deploy {
                     name,
                     update_kube_config,
                     get_kubeconfig,
+                    remote,
+                    ssh_key,
                 } => {
-                    run::cluster_admin_deploy(&name, update_kube_config, get_kubeconfig).await?;
+                    run::cluster_admin_deploy(
+                        &name,
+                        update_kube_config,
+                        get_kubeconfig,
+                        remote.as_deref(),
+                        ssh_key.as_deref(),
+                    )
+                    .await?;
                 }
-                ClusterAdminCommands::Stop { name } => {
-                    run::cluster_admin_stop(&name).await?;
+                ClusterAdminCommands::Stop {
+                    name,
+                    remote,
+                    ssh_key,
+                } => {
+                    let name = name
+                        .or_else(|| resolve_cluster_name(&cli.cluster))
+                        .unwrap_or_else(|| "navigator".to_string());
+                    run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
                 }
-                ClusterAdminCommands::Destroy { name } => {
-                    run::cluster_admin_destroy(&name).await?;
+                ClusterAdminCommands::Destroy {
+                    name,
+                    remote,
+                    ssh_key,
+                } => {
+                    let name = name
+                        .or_else(|| resolve_cluster_name(&cli.cluster))
+                        .unwrap_or_else(|| "navigator".to_string());
+                    run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref())
+                        .await?;
+                }
+                ClusterAdminCommands::Info { name } => {
+                    let name = name
+                        .or_else(|| resolve_cluster_name(&cli.cluster))
+                        .unwrap_or_else(|| "navigator".to_string());
+                    run::cluster_admin_info(&name)?;
+                }
+                ClusterAdminCommands::Tunnel {
+                    name,
+                    remote,
+                    ssh_key,
+                    print_command,
+                } => {
+                    let name = name
+                        .or_else(|| resolve_cluster_name(&cli.cluster))
+                        .unwrap_or_else(|| "navigator".to_string());
+                    run::cluster_admin_tunnel(
+                        &name,
+                        remote.as_deref(),
+                        ssh_key.as_deref(),
+                        print_command,
+                    )?;
                 }
             },
         },
-        Some(Commands::Sandbox { command }) => match command {
-            SandboxCommands::Create {
-                sync,
-                keep,
-                command,
-            } => {
-                run::sandbox_create(&cli.cluster, sync, keep, &command, &tls).await?;
+        Some(Commands::Sandbox { command }) => {
+            match command {
+                SandboxCommands::Create {
+                    sync,
+                    keep,
+                    remote,
+                    ssh_key,
+                    command,
+                } => {
+                    // For `sandbox create`, a missing cluster is not fatal — the
+                    // bootstrap flow inside `sandbox_create` can deploy one.
+                    match resolve_cluster(&cli.cluster) {
+                        Ok(ctx) => {
+                            let endpoint = &ctx.endpoint;
+                            if !is_https(endpoint)? && !cli.allow_insecure_access {
+                                return Err(miette::miette!(
+                                    "https is required; use --allow-insecure-access to connect over http"
+                                ));
+                            }
+                            let tls = tls.with_cluster_name(&ctx.name);
+                            run::sandbox_create(
+                                endpoint,
+                                sync,
+                                keep,
+                                remote.as_deref(),
+                                ssh_key.as_deref(),
+                                &command,
+                                &tls,
+                            )
+                            .await?;
+                        }
+                        Err(_) => {
+                            // No cluster configured — go straight to bootstrap.
+                            run::sandbox_create_with_bootstrap(
+                                sync,
+                                keep,
+                                remote.as_deref(),
+                                ssh_key.as_deref(),
+                                &command,
+                            )
+                            .await?;
+                        }
+                    }
+                }
+                other => {
+                    let ctx = resolve_cluster(&cli.cluster)?;
+                    let endpoint = &ctx.endpoint;
+                    if !is_https(endpoint)? && !cli.allow_insecure_access {
+                        return Err(miette::miette!(
+                            "https is required; use --allow-insecure-access to connect over http"
+                        ));
+                    }
+                    let tls = tls.with_cluster_name(&ctx.name);
+                    match other {
+                        SandboxCommands::Create { .. } => unreachable!(),
+                        SandboxCommands::Get { id } => {
+                            run::sandbox_get(endpoint, &id, &tls).await?;
+                        }
+                        SandboxCommands::List { limit, offset, ids } => {
+                            run::sandbox_list(endpoint, limit, offset, ids, &tls).await?;
+                        }
+                        SandboxCommands::Delete { ids } => {
+                            run::sandbox_delete(endpoint, &ids, &tls).await?;
+                        }
+                        SandboxCommands::Connect { id } => {
+                            run::sandbox_connect(endpoint, &id, &tls).await?;
+                        }
+                    }
+                }
             }
-            SandboxCommands::Get { id } => {
-                run::sandbox_get(&cli.cluster, &id, &tls).await?;
-            }
-            SandboxCommands::List { limit, offset, ids } => {
-                run::sandbox_list(&cli.cluster, limit, offset, ids, &tls).await?;
-            }
-            SandboxCommands::Delete { ids } => {
-                run::sandbox_delete(&cli.cluster, &ids, &tls).await?;
-            }
-            SandboxCommands::Connect { id } => {
-                run::sandbox_connect(&cli.cluster, &id, &tls).await?;
-            }
-        },
+        }
         Some(Commands::SshProxy {
             gateway,
             sandbox_id,

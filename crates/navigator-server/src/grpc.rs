@@ -153,6 +153,29 @@ impl Navigator for NavigatorService {
 
         // Spawn producer task.
         tokio::spawn(async move {
+            // Subscribe to all buses BEFORE reading the initial snapshot to avoid
+            // missing notifications that fire between the snapshot read and subscribe.
+            let mut status_rx = if follow_status {
+                Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut log_rx = if follow_logs {
+                Some(state.tracing_log_bus.subscribe(&sandbox_id))
+            } else {
+                None
+            };
+            let mut platform_rx = if follow_events {
+                Some(
+                    state
+                        .tracing_log_bus
+                        .platform_event_bus
+                        .subscribe(&sandbox_id),
+                )
+            } else {
+                None
+            };
+
             // Always start with a snapshot if present.
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => {
@@ -197,27 +220,6 @@ impl Navigator for NavigatorService {
                     }
                 }
             }
-
-            let mut status_rx = if follow_status {
-                Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
-            } else {
-                None
-            };
-            let mut log_rx = if follow_logs {
-                Some(state.tracing_log_bus.subscribe(&sandbox_id))
-            } else {
-                None
-            };
-            let mut platform_rx = if follow_events {
-                Some(
-                    state
-                        .tracing_log_bus
-                        .platform_event_bus
-                        .subscribe(&sandbox_id),
-                )
-            } else {
-                None
-            };
 
             loop {
                 tokio::select! {

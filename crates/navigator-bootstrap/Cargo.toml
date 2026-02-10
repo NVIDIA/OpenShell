@@ -8,14 +8,16 @@ rust-version.workspace = true
 
 [dependencies]
 base64 = "0.22"
-bollard = "0.16"
+bollard = { version = "0.20", features = ["ssh"] }
 bytes = { workspace = true }
 futures = { workspace = true }
 miette = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
 tar = "0.4"
 tokio = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true

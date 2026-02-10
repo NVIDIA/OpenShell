@@ -4,6 +4,7 @@ version: 1
 filesystem:
   include_workdir: true
   read_only:
+    - /etc
     - /usr
     - /lib
   read_write:

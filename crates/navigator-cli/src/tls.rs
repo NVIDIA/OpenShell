@@ -6,6 +6,7 @@ use rustls::{
 };
 use std::io::Cursor;
 use std::path::PathBuf;
+use std::time::Duration;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 #[derive(Clone, Debug, Default)]
@@ -13,19 +14,42 @@ pub struct TlsOptions {
     ca: Option<PathBuf>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
+    /// Cluster name for resolving default cert directory.
+    cluster_name: Option<String>,
 }
 
 impl TlsOptions {
     pub fn new(ca: Option<PathBuf>, cert: Option<PathBuf>, key: Option<PathBuf>) -> Self {
-        Self { ca, cert, key }
+        Self {
+            ca,
+            cert,
+            key,
+            cluster_name: None,
+        }
     }
 
     pub fn has_any(&self) -> bool {
         self.ca.is_some() || self.cert.is_some() || self.key.is_some()
     }
 
-    fn with_default_paths(&self, server: &str) -> Self {
-        let base = default_tls_dir(server);
+    /// Set the cluster name for cert directory resolution.
+    #[must_use]
+    pub fn with_cluster_name(&self, name: &str) -> Self {
+        Self {
+            ca: self.ca.clone(),
+            cert: self.cert.clone(),
+            key: self.key.clone(),
+            cluster_name: Some(name.to_string()),
+        }
+    }
+
+    #[must_use]
+    pub fn with_default_paths(&self, server: &str) -> Self {
+        let base = self
+            .cluster_name
+            .as_deref()
+            .and_then(tls_dir_for_cluster)
+            .or_else(|| default_tls_dir(server));
         Self {
             ca: self
                 .ca
@@ -39,6 +63,7 @@ impl TlsOptions {
                 .key
                 .clone()
                 .or_else(|| base.as_ref().map(|dir| dir.join("tls.key"))),
+            cluster_name: self.cluster_name.clone(),
         }
     }
 }
@@ -49,6 +74,16 @@ pub struct TlsMaterials {
     key: Vec<u8>,
 }
 
+/// Resolve the TLS cert directory for a known cluster name.
+fn tls_dir_for_cluster(name: &str) -> Option<PathBuf> {
+    let safe_name = sanitize_name(name);
+    let base = xdg_config_dir().ok()?.join("navigator").join("clusters");
+    Some(base.join(safe_name).join("mtls"))
+}
+
+/// Fallback TLS directory resolution from a server URL.
+///
+/// Used when no cluster name is set (e.g., `SshProxy` which receives a raw URL).
 fn default_tls_dir(server: &str) -> Option<PathBuf> {
     let mut name = std::env::var("NAVIGATOR_CLUSTER_NAME")
         .ok()
@@ -169,7 +204,11 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
 }
 
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClient<Channel>> {
-    let mut endpoint = Endpoint::from_shared(server.to_string()).into_diagnostic()?;
+    let mut endpoint = Endpoint::from_shared(server.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
     if is_https(server)? {
         let materials = require_tls_materials(server, tls)?;
         let tls_config = build_tonic_tls_config(&materials);

@@ -154,6 +154,10 @@ CLI bundle is automatically copied into `~/.config/navigator/clusters/<name>/mtl
 `<name>` comes from `NAVIGATOR_CLUSTER_NAME` or the host in `NAVIGATOR_CLUSTER` (localhost
 defaults to `navigator`).
 
+### Debugging Cluster Issues
+
+If a cluster fails to start or is unhealthy after `nav cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.claude/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
+
 ### Docker Build Tasks
 
 ```bash
@@ -214,10 +218,38 @@ mise run clean           # Clean build artifacts
 
 ## Code Style
 
-- **Rust**: Formatted with `rustfmt`, linted with Clippy (pedantic + nursery)
-- **Python**: Formatted and linted with `ruff`, type-checked with `ty`
+• **Rust**: Formatted with `rustfmt`, linted with Clippy (pedantic + nursery)
+• **Python**: Formatted and linted with `ruff`, type-checked with `ty`
 
 Run `mise run all` before committing to check everything (runs `fmt:check`, `clippy`, `test`, `python:lint`).
+
+## CLI Output Style
+
+When printing structured output from CLI commands, follow these conventions:
+
+• **Blank line after headings**: Always print an empty line between a heading and its key-value fields. This improves readability in the terminal.
+• **Indented fields**: Key-value fields should be indented with 2 spaces.
+• **Dimmed keys**: Use `.dimmed()` for field labels (e.g., `"Id:".dimmed()`).
+• **Colored headings**: Use `.cyan().bold()` for primary headings.
+
+**Good:**
+
+```
+Created sandbox:
+
+  Id: cddeeb6d-a4d3-4158-a4d1-bd931f743700
+  Name: sandbox-cddeeb6d
+  Namespace: navigator
+```
+
+**Bad** (no blank line after heading):
+
+```
+Created sandbox:
+  Id: cddeeb6d-a4d3-4158-a4d1-bd931f743700
+  Name: sandbox-cddeeb6d
+  Namespace: navigator
+```
 
 ## Commit Messages
 

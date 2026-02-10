@@ -542,6 +542,18 @@ fn sandbox_template_to_k8s(
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
 
+    // The sandbox process needs SYS_ADMIN (for seccomp filter installation and
+    // network namespace creation) and NET_ADMIN (for network namespace veth setup).
+    // This mirrors the capabilities used by `mise run sandbox`.
+    container.insert(
+        "securityContext".to_string(),
+        serde_json::json!({
+            "capabilities": {
+                "add": ["SYS_ADMIN", "NET_ADMIN"]
+            }
+        }),
+    );
+
     if let Some(resources) = struct_to_json(&template.resources) {
         container.insert("resources".to_string(), resources);
     }

@@ -61,6 +61,14 @@ spec:
               value: {{ .Values.server.sandboxImage | quote }}
             - name: NAVIGATOR_GRPC_ENDPOINT
               value: {{ .Values.server.grpcEndpoint | quote }}
+            {{- if .Values.server.sshGatewayHost }}
+            - name: NAVIGATOR_SSH_GATEWAY_HOST
+              value: {{ .Values.server.sshGatewayHost | quote }}
+            {{- end }}
+            {{- if .Values.server.sshGatewayPort }}
+            - name: NAVIGATOR_SSH_GATEWAY_PORT
+              value: {{ .Values.server.sshGatewayPort | quote }}
+            {{- end }}
           volumeMounts:
             - name: navigator-data
               mountPath: /var/navigator

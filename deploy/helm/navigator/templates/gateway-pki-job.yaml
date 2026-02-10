@@ -16,10 +16,14 @@ spec:
     spec:
       serviceAccountName: {{ include "navigator.fullname" . }}-gateway-pki
       restartPolicy: OnFailure
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       containers:
         - name: pki
           image: {{ .Values.gateway.tls.jobImage | quote }}
-          imagePullPolicy: IfNotPresent
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
           env:
             - name: NAMESPACE
               value: {{ .Release.Namespace | quote }}
@@ -29,13 +33,14 @@ spec:
               value: {{ .Values.gateway.tls.clientCaSecretName | quote }}
             - name: CLI_SECRET
               value: {{ .Values.gateway.tls.cliSecretName | quote }}
+            - name: EXTRA_SANS
+              value: {{ join "," (.Values.gateway.tls.extraSANs | default list) | quote }}
           command:
             - /bin/sh
             - -c
           args:
             - |
               set -eu
-              apk add --no-cache openssl kubectl >/dev/null
 
               existing=0
               for secret in "$SERVER_SECRET" "$CLIENT_CA_SECRET" "$CLI_SECRET"; do
@@ -76,6 +81,33 @@ spec:
               DNS.5 = host.docker.internal
               IP.1 = 127.0.0.1
               EOF
+
+              # Append extra SANs from EXTRA_SANS env (comma-separated).
+              # IP-like entries become IP.N, others become DNS.N.
+              if [ -n "$EXTRA_SANS" ]; then
+                dns_idx=6
+                ip_idx=2
+                IFS=','
+                for san in $EXTRA_SANS; do
+                  san=$(echo "$san" | xargs)
+                  [ -z "$san" ] && continue
+                  case "$san" in
+                    [0-9]*.[0-9]*.[0-9]*.[0-9]*)
+                      echo "              IP.${ip_idx} = ${san}" >> server-ext.cnf
+                      ip_idx=$((ip_idx + 1))
+                      ;;
+                    *:*) # IPv6
+                      echo "              IP.${ip_idx} = ${san}" >> server-ext.cnf
+                      ip_idx=$((ip_idx + 1))
+                      ;;
+                    *)
+                      echo "              DNS.${dns_idx} = ${san}" >> server-ext.cnf
+                      dns_idx=$((dns_idx + 1))
+                      ;;
+                  esac
+                done
+                unset IFS
+              fi
 
               openssl req -newkey rsa:2048 -nodes -keyout server.key -out server.csr \
                 -subj "/CN=navigator"

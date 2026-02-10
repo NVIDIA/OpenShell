@@ -167,6 +167,7 @@ run = "helm lint deploy/helm/navigator"
 [tasks."docker:build"]
 description = "Build all Docker images"
 depends = [
+  "docker:build:pki-job",
   "docker:build:sandbox",
   "docker:build:server",
   "docker:build:cluster",
@@ -177,6 +178,7 @@ description = "Build the CI Docker image"
 env = { DOCKER_BUILDKIT = "1" }
 run = """
 docker buildx build \
+  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   -f deploy/docker/Dockerfile.ci \
   -t navigator-ci:${IMAGE_TAG:-dev} \
   --load \
@@ -188,6 +190,7 @@ description = "Build the sandbox Docker image"
 env = { DOCKER_BUILDKIT = "1" }
 run = """
 docker buildx build \
+  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   -f deploy/docker/Dockerfile.sandbox \
   -t navigator-sandbox:${IMAGE_TAG:-dev} \
   --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug} \
@@ -200,15 +203,27 @@ description = "Build the server Docker image"
 env = { DOCKER_BUILDKIT = "1" }
 run = """
 docker buildx build \
+  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   -f deploy/docker/Dockerfile.server \
   -t navigator-server:${IMAGE_TAG:-dev} \
   --load \
   .
 """
 
+[tasks."docker:build:pki-job"]
+description = "Build the gateway PKI job image"
+env = { DOCKER_BUILDKIT = "1" }
+run = """
+docker buildx build \
+  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
+  -f deploy/docker/Dockerfile.pki-job \
+  -t navigator-pki-job:${IMAGE_TAG:-dev} \
+  --load \
+  .
+"""
+
 [tasks."docker:build:cluster"]
-description = "Build the airgapped k3s cluster image (includes sandbox + server)"
-depends = ["docker:build:sandbox", "docker:build:server"]
+description = "Build the k3s cluster image (component images pulled at runtime from registry)"
 env = { DOCKER_BUILDKIT = "1" }
 run = """
 #!/usr/bin/env bash
@@ -218,31 +233,25 @@ K3S_VERSION=${K3S_VERSION:-v1.29.8-k3s1}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 ENVOY_GATEWAY_VERSION=${ENVOY_GATEWAY_VERSION:-v1.5.8}
 
-# Create build directories
-mkdir -p deploy/docker/.build/images
+# Create build directory for charts
 mkdir -p deploy/docker/.build/charts
-
-# Export images as Docker tarballs for airgap deployment
-echo "Exporting navigator-sandbox..."
-docker save navigator-sandbox:${IMAGE_TAG} -o deploy/docker/.build/images/navigator-sandbox.tar
-
-echo "Exporting navigator-server..."
-docker save navigator-server:${IMAGE_TAG} -o deploy/docker/.build/images/navigator-server.tar
 
 # Package navigator helm chart
 echo "Packaging navigator helm chart..."
 helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 
-# Download envoy-gateway helm chart for airgap deployment
+# Download envoy-gateway helm chart
 # This chart includes Gateway API CRDs, so we don't need a separate CRDs chart
 echo "Downloading gateway-helm chart..."
 helm pull oci://docker.io/envoyproxy/gateway-helm \
   --version ${ENVOY_GATEWAY_VERSION} \
   --destination deploy/docker/.build/charts/
 
-# Build cluster image
+# Build cluster image (no bundled component images — they are pulled at runtime
+# from the distribution registry; credentials are injected at deploy time)
 echo "Building cluster image..."
 docker buildx build \
+  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   -f deploy/docker/Dockerfile.cluster \
   -t navigator-cluster:${IMAGE_TAG} \
   --build-arg K3S_VERSION=${K3S_VERSION} \
@@ -250,6 +259,160 @@ docker buildx build \
   .
 
 echo "Done! Cluster image: navigator-cluster:${IMAGE_TAG}"
+"""
+
+[tasks."docker:build:cluster:multiarch"]
+description = "Build multi-arch cluster image and push to a registry"
+env = { DOCKER_BUILDKIT = "1" }
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE_TAG=${IMAGE_TAG:-dev}
+K3S_VERSION=${K3S_VERSION:-v1.29.8-k3s1}
+ENVOY_GATEWAY_VERSION=${ENVOY_GATEWAY_VERSION:-v1.5.8}
+PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
+REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
+
+# Ensure a multi-platform builder exists
+if ! docker buildx inspect multiarch >/dev/null 2>&1; then
+  echo "Creating multi-platform buildx builder..."
+  docker buildx create --name multiarch --use --bootstrap
+else
+  docker buildx use multiarch
+fi
+
+# Step 1: Build and push component images as multi-arch manifests.
+# These use cross-compilation in the Dockerfile (BUILDPLATFORM != TARGETPLATFORM)
+# so Rust compiles natively and only the final stage runs on the target arch.
+echo "Building multi-arch component images..."
+for component in sandbox server pki-job; do
+  echo "Building navigator-${component} for ${PLATFORMS}..."
+  BUILD_ARGS=""
+  if [ "$component" = "sandbox" ]; then
+    BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
+  fi
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    -f "deploy/docker/Dockerfile.${component}" \
+    -t "${REGISTRY}/navigator-${component}:${IMAGE_TAG}" \
+    ${BUILD_ARGS} \
+    --push \
+    .
+done
+
+# Step 2: Package helm charts (architecture-independent)
+mkdir -p deploy/docker/.build/charts
+echo "Packaging navigator helm chart..."
+helm package deploy/helm/navigator -d deploy/docker/.build/charts/
+
+echo "Downloading gateway-helm chart..."
+helm pull oci://docker.io/envoyproxy/gateway-helm \
+  --version ${ENVOY_GATEWAY_VERSION} \
+  --destination deploy/docker/.build/charts/
+
+# Step 3: Build and push multi-arch cluster image.
+# Component images are no longer bundled — they are pulled at runtime via
+# the distribution registry; credentials are injected at deploy time.
+echo ""
+echo "Building multi-arch cluster image..."
+docker buildx build \
+  --platform "${PLATFORMS}" \
+  -f deploy/docker/Dockerfile.cluster \
+  -t "${REGISTRY}/navigator-cluster:${IMAGE_TAG}" \
+  --build-arg K3S_VERSION=${K3S_VERSION} \
+  --push \
+  .
+
+echo ""
+echo "Done! Multi-arch images pushed to ${REGISTRY}:"
+echo "  navigator-sandbox:${IMAGE_TAG}"
+echo "  navigator-server:${IMAGE_TAG}"
+echo "  navigator-pki-job:${IMAGE_TAG}"
+echo "  navigator-cluster:${IMAGE_TAG}"
+"""
+
+[tasks."docker:publish:cluster:multiarch"]
+description = "Build and publish multi-arch cluster image to ECR"
+env = { DOCKER_BUILDKIT = "1" }
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+IMAGE_TAG=${IMAGE_TAG:-dev}
+K3S_VERSION=${K3S_VERSION:-v1.29.8-k3s1}
+ENVOY_GATEWAY_VERSION=${ENVOY_GATEWAY_VERSION:-v1.5.8}
+PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
+
+# ECR configuration
+AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-524473328983}
+AWS_REGION=${AWS_REGION:-us-west-2}
+ECR_HOST="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+REGISTRY="${ECR_HOST}/navigator"
+
+
+# Step 1: Build and push component images as multi-arch manifests.
+# These use cross-compilation in the Dockerfile (BUILDPLATFORM != TARGETPLATFORM)
+# so Rust compiles natively and only the final stage runs on the target arch.
+echo "Building multi-arch component images..."
+for component in sandbox server pki-job; do
+  echo "Building ${component} for ${PLATFORMS}..."
+  BUILD_ARGS=""
+  if [ "$component" = "sandbox" ]; then
+    BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
+  fi
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    -f "deploy/docker/Dockerfile.${component}" \
+    -t "${REGISTRY}/${component}:${IMAGE_TAG}" \
+    --provenance=false --sbom=false \
+    ${BUILD_ARGS} \
+    --push \
+    .
+done
+
+# Step 2: Package helm charts (architecture-independent)
+mkdir -p deploy/docker/.build/charts
+echo "Packaging navigator helm chart..."
+helm package deploy/helm/navigator -d deploy/docker/.build/charts/
+
+echo "Downloading gateway-helm chart..."
+helm pull oci://docker.io/envoyproxy/gateway-helm \
+  --version ${ENVOY_GATEWAY_VERSION} \
+  --destination deploy/docker/.build/charts/
+
+# Step 3: Build and push multi-arch cluster image.
+# Component images are no longer bundled — they are pulled at runtime via
+# the distribution registry; credentials are injected at deploy time.
+echo ""
+echo "Building multi-arch cluster image..."
+docker buildx build \
+  --platform "${PLATFORMS}" \
+  -f deploy/docker/Dockerfile.cluster \
+  -t "${REGISTRY}/cluster:${IMAGE_TAG}" \
+  -t "${REGISTRY}/cluster:latest" \
+  --build-arg K3S_VERSION=${K3S_VERSION} \
+  --provenance=false --sbom=false \
+  --push \
+  .
+
+# Step 4: Tag component images with :latest as well.
+# Use --prefer-index=false to carbon-copy the source manifest format instead of
+# wrapping it in an OCI image index (which the registry v3 proxy can't serve).
+for component in sandbox server pki-job; do
+  echo "Tagging ${component}:latest..."
+  docker buildx imagetools create \
+    --prefer-index=false \
+    -t "${REGISTRY}/${component}:latest" \
+    "${REGISTRY}/${component}:${IMAGE_TAG}"
+done
+
+echo ""
+echo "Done! Multi-arch images published to ${REGISTRY}:"
+echo "  ${REGISTRY}/sandbox:${IMAGE_TAG} (+ latest)"
+echo "  ${REGISTRY}/server:${IMAGE_TAG} (+ latest)"
+echo "  ${REGISTRY}/pki-job:${IMAGE_TAG} (+ latest)"
+echo "  ${REGISTRY}/cluster:${IMAGE_TAG} (+ latest)"
 """
 
 # ============================================================================
@@ -274,15 +437,15 @@ echo "KUBECONFIG has been updated."
 """
 
 [tasks."cluster:deploy"]
-description = "Deploy changes to existing cluster (rebuilds images and upgrades helm release)"
-env = { DOCKER_BUILDKIT = "1" }
+description = "Deploy changes to existing cluster (upgrades helm release, images pulled from registry)"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-navigator}
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
-IMAGE_TAG=${IMAGE_TAG:-dev}
+REGISTRY=${NAVIGATOR_REGISTRY:-d1i0nduu2f6qxk.cloudfront.net/navigator}
+IMAGE_TAG=${IMAGE_TAG:-latest}
 
 # Check if cluster container is running
 if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
@@ -291,30 +454,14 @@ if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
   exit 1
 fi
 
-echo "Building navigator-server..."
-docker buildx build \
-  -f deploy/docker/Dockerfile.server \
-  -t navigator-server:${IMAGE_TAG} \
-  --load \
-  .
-
-echo "Building navigator-sandbox..."
-docker buildx build \
-  -f deploy/docker/Dockerfile.sandbox \
-  -t navigator-sandbox:${IMAGE_TAG} \
-  --load \
-  .
-
-echo "Importing images into k3s cluster..."
-docker save navigator-server:${IMAGE_TAG} | docker exec -i ${CONTAINER_NAME} ctr -n k8s.io images import -
-docker save navigator-sandbox:${IMAGE_TAG} | docker exec -i ${CONTAINER_NAME} ctr -n k8s.io images import -
-
-echo "Upgrading helm release..."
+echo "Upgrading helm release (images will be pulled from ${REGISTRY})..."
 helm upgrade navigator deploy/helm/navigator \
   --namespace navigator \
-  --set image.repository=navigator-server \
+  --set image.repository=${REGISTRY}/server \
   --set image.tag=${IMAGE_TAG} \
-  --set server.sandboxImage=navigator-sandbox:${IMAGE_TAG} \
+  --set image.pullPolicy=Always \
+  --set server.sandboxImage=${REGISTRY}/sandbox:${IMAGE_TAG} \
+  --set gateway.tls.jobImage=${REGISTRY}/pki-job:${IMAGE_TAG} \
   --wait
 
 echo "Restarting deployment to pick up new images..."

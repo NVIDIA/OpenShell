@@ -392,8 +392,12 @@ fn spawn_pty_shell(
 
     let runtime = tokio::runtime::Handle::current();
     let runtime_reader = runtime.clone();
-    let runtime_close = runtime.clone();
     let handle_clone = handle.clone();
+    // Signal from the reader thread to the exit thread that all output has
+    // been forwarded.  The exit thread waits for this before sending the
+    // exit-status and closing the channel, ensuring the correct SSH protocol
+    // ordering: data → EOF → exit-status → close.
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -408,10 +412,13 @@ fn spawn_pty_shell(
                 }
             }
         }
-        let close_handle = handle_clone.clone();
-        drop(runtime_close.spawn(async move {
-            let _ = close_handle.close(channel).await;
+        // Send EOF to indicate no more data will be sent on this channel.
+        let eof_handle = handle_clone.clone();
+        drop(runtime_reader.spawn(async move {
+            let _ = eof_handle.eof(channel).await;
         }));
+        // Notify the exit thread that all output has been forwarded.
+        let _ = reader_done_tx.send(());
     });
 
     let handle_exit = handle;
@@ -419,6 +426,10 @@ fn spawn_pty_shell(
     std::thread::spawn(move || {
         let status = child.wait().ok();
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
+        // Wait for the reader thread to finish forwarding all output before
+        // sending exit-status and closing the channel.  This prevents the
+        // race where close() was called before exit_status_request().
+        let _ = reader_done_rx.recv();
         drop(runtime_exit.spawn(async move {
             let _ = handle_exit.exit_status_request(channel, code).await;
             let _ = handle_exit.close(channel).await;
@@ -462,9 +473,12 @@ mod unsafe_pty {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
                 set_controlling_tty(slave_fd)?;
+                // Drop privileges before applying sandbox restrictions.
+                // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
+                // which may be blocked by Landlock.
+                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))?;
                 sandbox::apply(&policy, workdir.as_deref())
                     .map_err(|err| std::io::Error::other(err.to_string()))?;
-                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))?;
                 Ok(())
             });
         }
