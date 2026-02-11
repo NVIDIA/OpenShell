@@ -112,6 +112,9 @@ publish_ecr_images:
     - mkdir -p /usr/local/lib/docker/cli-plugins
     - curl -fsSL https://github.com/docker/buildx/releases/download/v0.21.1/buildx-v0.21.1.linux-amd64 -o /usr/local/lib/docker/cli-plugins/docker-buildx
     - chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+    # Create a Docker context for the TLS-enabled DinD connection so buildx can use it
+    - docker context create dind-context --docker "host=tcp://docker:2376,ca=/certs/client/ca.pem,cert=/certs/client/cert.pem,key=/certs/client/key.pem"
+    - docker context use dind-context
     # Install AWS CLI
     - apt-get update -qq && apt-get install -y -qq unzip >/dev/null
     - curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
