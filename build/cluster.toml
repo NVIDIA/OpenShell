@@ -78,6 +78,8 @@ helm upgrade navigator deploy/helm/navigator \
   --set image.tag=${IMAGE_TAG} \
   --set image.pullPolicy=IfNotPresent \
   --set server.sandboxImage=${REGISTRY}/sandbox:${IMAGE_TAG} \
+  --set gateway.tls.enabled=true \
+  --set gateway.tls.listenerPort=443 \
   --set gateway.tls.jobImage=${REGISTRY}/pki-job:${IMAGE_TAG} \
   --wait
 
