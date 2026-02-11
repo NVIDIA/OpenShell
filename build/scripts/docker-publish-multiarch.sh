@@ -68,6 +68,14 @@ case "$MODE" in
     IMAGE_PREFIX=""
     EXTRA_BUILD_FLAGS="--provenance=false --sbom=false"
     TAG_LATEST=true
+
+    # Ensure a multi-platform builder exists
+    if ! docker buildx inspect multiarch >/dev/null 2>&1; then
+      echo "Creating multi-platform buildx builder..."
+      docker buildx create --name multiarch --use --bootstrap
+    else
+      docker buildx use multiarch
+    fi
     ;;
   *)
     echo "Unknown mode: $MODE (expected 'registry' or 'ecr')" >&2
