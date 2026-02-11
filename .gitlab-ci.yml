@@ -97,11 +97,17 @@ publish_ecr_images:
   stage: publish
   services:
     - docker:24-dind
+  tags:
+    - os/linux
+    - perflab
+    - ran-as/container
+    - size/large
+    - type/docker
   variables:
-    DOCKER_HOST: tcp://docker:2376
-    DOCKER_TLS_CERTDIR: "/certs"
-    DOCKER_TLS_VERIFY: "1"
-    DOCKER_CERT_PATH: "/certs/client"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_TLS_VERIFY: ""
+    DOCKER_CERT_PATH: ""
     DOCKER_BUILDKIT: "1"
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
@@ -119,9 +125,4 @@ publish_ecr_images:
     # Authenticate to ECR
     - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
   script:
-    # Create a Docker context so buildx can create a builder without TLS env var conflicts,
-    # then unset the env vars so buildx reads connection info from the context instead.
-    - docker context create dind-context --docker "host=tcp://docker:2376,ca=/certs/client/ca.pem,cert=/certs/client/cert.pem,key=/certs/client/key.pem"
-    - docker context use dind-context
-    - unset DOCKER_HOST DOCKER_TLS_VERIFY DOCKER_CERT_PATH
     - mise run docker:publish:cluster:multiarch

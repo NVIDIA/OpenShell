@@ -21,9 +21,11 @@ COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY proto/ proto/
 
-# Build with cross-compilation support
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,target=/build/target \
+# Build with cross-compilation support.
+# Cache mounts are keyed by TARGETARCH so parallel multi-platform builds
+# don't corrupt each other's cargo registry or build artifacts.
+RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-${TARGETARCH},target=/build/target \
     . cross-build.sh && \
     if [ "$RUST_BUILD_PROFILE" = "release" ]; then \
         cargo_cross_build --release -p navigator-sandbox; \

@@ -95,10 +95,13 @@ for component in sandbox server pki-job; do
   if [ "$component" = "sandbox" ]; then
     BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
   fi
+  FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
   docker buildx build \
     --platform "${PLATFORMS}" \
     -f "deploy/docker/Dockerfile.${component}" \
-    -t "${REGISTRY}/${IMAGE_PREFIX}${component}:${IMAGE_TAG}" \
+    -t "${FULL_IMAGE}:${IMAGE_TAG}" \
+    --cache-from "type=registry,ref=${FULL_IMAGE}:latest" \
+    --cache-to "type=inline" \
     ${EXTRA_BUILD_FLAGS} \
     ${BUILD_ARGS} \
     --push \
@@ -129,11 +132,14 @@ if [ "$TAG_LATEST" = true ]; then
   CLUSTER_TAGS="${CLUSTER_TAGS} -t ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:latest"
 fi
 
+CLUSTER_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster"
 docker buildx build \
   --platform "${PLATFORMS}" \
   -f deploy/docker/Dockerfile.cluster \
   ${CLUSTER_TAGS} \
   --build-arg K3S_VERSION=${K3S_VERSION} \
+  --cache-from "type=registry,ref=${CLUSTER_IMAGE}:latest" \
+  --cache-to "type=inline" \
   ${EXTRA_BUILD_FLAGS} \
   --push \
   .
