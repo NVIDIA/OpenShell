@@ -6,6 +6,7 @@ mod kubeconfig;
 mod metadata;
 mod mtls;
 mod paths;
+mod push;
 mod runtime;
 
 use bollard::Docker;
@@ -242,6 +243,42 @@ where
         Ok(n) => log(format!("[status] Removed {n} stale node(s)")),
         Err(err) => {
             tracing::debug!("stale node cleanup failed (non-fatal): {err}");
+        }
+    }
+
+    // Push locally-built component images into the k3s containerd runtime.
+    // This is the "push" path for local development — images are exported from
+    // the local Docker daemon and streamed into the cluster's containerd so
+    // k3s can resolve them without pulling from the remote registry.
+    if remote_opts.is_none()
+        && let Ok(push_images_str) = std::env::var("NAVIGATOR_PUSH_IMAGES")
+    {
+        let images: Vec<&str> = push_images_str
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !images.is_empty() {
+            log(format!(
+                "[status] Push mode: importing {} local image(s) into cluster",
+                images.len()
+            ));
+            let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
+            let container = container_name(&name);
+            let on_log_ref = Arc::clone(&on_log);
+            let mut push_log = move |msg: String| {
+                if let Ok(mut f) = on_log_ref.lock() {
+                    f(msg);
+                }
+            };
+            push::push_local_images(
+                &local_docker,
+                &target_docker,
+                &container,
+                &images,
+                &mut push_log,
+            )
+            .await?;
         }
     }
 

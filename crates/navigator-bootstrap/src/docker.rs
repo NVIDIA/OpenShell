@@ -292,6 +292,28 @@ pub async fn ensure_container(
         // remote clusters is also 8080.
         env_vars.push("SSH_GATEWAY_PORT=8080".to_string());
     }
+
+    // Pass image configuration for local development.
+    // When NAVIGATOR_PUSH_IMAGES is set the entrypoint overrides the baked-in
+    // HelmChart manifest so k3s uses the locally-pushed images with
+    // IfNotPresent pull policy instead of pulling from the remote registry.
+    let push_mode = std::env::var("NAVIGATOR_PUSH_IMAGES")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .is_some();
+    if push_mode {
+        let tag = std::env::var("IMAGE_TAG")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .unwrap_or_else(|| "dev".to_string());
+        env_vars.push(format!("IMAGE_TAG={tag}"));
+        env_vars.push("IMAGE_PULL_POLICY=IfNotPresent".to_string());
+    } else if let Ok(tag) = std::env::var("IMAGE_TAG")
+        && !tag.trim().is_empty()
+    {
+        env_vars.push(format!("IMAGE_TAG={tag}"));
+    }
+
     let env = Some(env_vars);
 
     let config = ContainerCreateBody {

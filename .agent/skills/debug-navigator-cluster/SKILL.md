@@ -17,12 +17,13 @@ Diagnose why a navigator cluster failed to start after `nav cluster admin deploy
 4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
-7. Wait for cluster health checks to pass (up to 6 min):
+7. **Push local images** (if `NAVIGATOR_PUSH_IMAGES` is set): Export locally-built component images from the Docker daemon and import them into the k3s containerd runtime via `k3s ctr -n k8s.io images import`. This "push" path is used by `mise run cluster` so the cluster uses locally-built server/sandbox/pki-job images instead of pulling from the remote registry.
+8. Wait for cluster health checks to pass (up to 6 min):
    - k3s API server readiness (`/readyz`)
    - `navigator` deployment available in `navigator` namespace
    - `navigator-gateway` Gateway programmed in `navigator` namespace
    - If TLS enabled: `navigator-cli-client` secret exists with cert data
-8. Extract mTLS credentials if TLS is enabled (up to 3 min)
+9. Extract mTLS credentials if TLS is enabled (up to 3 min)
 
 The default cluster name is `navigator`. The container is `navigator-cluster-{name}`.
 
@@ -141,7 +142,7 @@ docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yam
 
 Common issues:
 
-- **ImagePullBackOff**: The component image failed to pull from the distribution registry. Check that `/etc/rancher/k3s/registries.yaml` exists with correct credentials and that DNS is working (Step 8). The cluster pulls images at runtime from `d1i0nduu2f6qxk.cloudfront.net/navigator/`. The entrypoint script generates this file at container start.
+- **ImagePullBackOff**: The component image failed to pull. When using push mode (`mise run cluster`), verify that images were imported into the k8s.io containerd namespace (see Step 6). When using pull mode (remote deploy or manual `nav cluster admin deploy`), check that `/etc/rancher/k3s/registries.yaml` exists with correct credentials and that DNS is working (Step 8). The remote registry is `d1i0nduu2f6qxk.cloudfront.net/navigator/`.
 - **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
 - **Pending**: Insufficient resources or scheduling constraints.
 
@@ -172,9 +173,24 @@ If ports are missing or conflicting, another process may be using them. Check wi
 ss -tlnp | grep -E ':(6443|80|443|30051)\s'
 ```
 
-### Step 6: Check Registry Configuration
+### Step 6: Check Image Availability
 
-Component images (server, sandbox, pki-job) are pulled at runtime from the distribution registry. The entrypoint script generates `/etc/rancher/k3s/registries.yaml` with the distribution registry credentials at container start. Check that the registry config is correct:
+Component images (server, sandbox, pki-job) can reach k3s containerd via two paths:
+
+**Push mode** (local development via `mise run cluster` or `mise run cluster:deploy`): Images are built locally and imported into the k3s containerd `k8s.io` namespace. The HelmChart is configured with `pullPolicy: IfNotPresent` and uses the `IMAGE_TAG` (default `dev`).
+
+```bash
+# Check if images were imported into containerd (k3s default namespace is k8s.io)
+docker exec navigator-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images ls | grep navigator
+```
+
+If images are missing, re-import with:
+
+```bash
+docker save <image-ref> | docker exec -i navigator-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images import -
+```
+
+**Pull mode** (remote deploy or manual `nav cluster admin deploy` without `NAVIGATOR_PUSH_IMAGES`): Images are pulled from the distribution registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
 
 ```bash
 # Verify registries.yaml exists and has credentials
@@ -253,7 +269,10 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
 | Navigator pods `Pending` | Insufficient CPU/memory for scheduling | Check `kubectl describe pod` for scheduling failures |
 | Navigator pods `CrashLoopBackOff` | Server application error | Check `kubectl logs` on the crashing pod |
-| Navigator pods `ImagePullBackOff` | Registry auth or DNS issue | Check `/etc/rancher/k3s/registries.yaml` credentials and DNS (Step 8) |
+| Navigator pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `k3s ctr -n k8s.io images ls` for component images (Step 6) |
+| Navigator pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `/etc/rancher/k3s/registries.yaml` credentials and DNS (Step 8) |
+| Image import fails (`k3s ctr` exit code != 0) | Corrupt tar stream or containerd not ready | Retry after k3s is fully started; check container logs |
+| Push mode images not found by kubelet | Imported into wrong containerd namespace | Must use `k3s ctr -n k8s.io images import`, not `k3s ctr images import` |
 | Gateway not `Programmed` | Envoy Gateway not ready | Check `envoy-gateway-system` pods and Helm install logs |
 | mTLS secret missing | PKI job failed (often DNS) | Check PKI job logs and DNS resolution (Step 8) |
 | Helm install job failed | Chart values error or dependency issue | Check `helm-install-navigator` job logs in `kube-system` |

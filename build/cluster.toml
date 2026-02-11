@@ -2,12 +2,30 @@
 
 [cluster]
 description = "Build and deploy local k3s cluster with Navigator"
-depends = ["docker:build:cluster"]
+depends = [
+  "docker:build:cluster",
+  "docker:build:server",
+  "docker:build:sandbox",
+  "docker:build:pki-job",
+]
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-navigator}
+IMAGE_TAG=${IMAGE_TAG:-dev}
+REGISTRY=${NAVIGATOR_REGISTRY:-d1i0nduu2f6qxk.cloudfront.net/navigator}
+
+# Tag locally-built component images with distribution registry paths.
+# These tags match what the HelmChart manifest expects, so when the
+# bootstrap code imports them into k3s containerd the pods can resolve
+# images locally without pulling from the network.
+for component in server sandbox pki-job; do
+  docker tag "navigator-${component}:${IMAGE_TAG}" "${REGISTRY}/${component}:${IMAGE_TAG}"
+done
+
+# Tell the bootstrap code which images to push into k3s containerd.
+export NAVIGATOR_PUSH_IMAGES="${REGISTRY}/server:${IMAGE_TAG},${REGISTRY}/sandbox:${IMAGE_TAG},${REGISTRY}/pki-job:${IMAGE_TAG}"
 
 # Deploy the cluster using the locally built image
 nav cluster admin deploy --name "${CLUSTER_NAME}" --update-kube-config
@@ -18,7 +36,12 @@ echo "KUBECONFIG has been updated."
 """
 
 ["cluster:deploy"]
-description = "Deploy changes to existing cluster (upgrades helm release, images pulled from registry)"
+description = "Build and deploy changes to existing cluster using local images"
+depends = [
+  "docker:build:server",
+  "docker:build:sandbox",
+  "docker:build:pki-job",
+]
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
@@ -26,7 +49,7 @@ set -euo pipefail
 CLUSTER_NAME=${CLUSTER_NAME:-navigator}
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
 REGISTRY=${NAVIGATOR_REGISTRY:-d1i0nduu2f6qxk.cloudfront.net/navigator}
-IMAGE_TAG=${IMAGE_TAG:-latest}
+IMAGE_TAG=${IMAGE_TAG:-dev}
 
 # Check if cluster container is running
 if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
@@ -35,12 +58,25 @@ if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
   exit 1
 fi
 
-echo "Upgrading helm release (images will be pulled from ${REGISTRY})..."
+# Tag locally-built images with distribution registry paths
+for component in server sandbox pki-job; do
+  docker tag "navigator-${component}:${IMAGE_TAG}" "${REGISTRY}/${component}:${IMAGE_TAG}"
+done
+
+# Import images into k3s containerd
+echo "Importing local component images into cluster..."
+docker save \
+  "${REGISTRY}/server:${IMAGE_TAG}" \
+  "${REGISTRY}/sandbox:${IMAGE_TAG}" \
+  "${REGISTRY}/pki-job:${IMAGE_TAG}" \
+  | docker exec -i "${CONTAINER_NAME}" ctr -a /run/k3s/containerd/containerd.sock images import -
+
+echo "Upgrading helm release to use local images..."
 helm upgrade navigator deploy/helm/navigator \
   --namespace navigator \
   --set image.repository=${REGISTRY}/server \
   --set image.tag=${IMAGE_TAG} \
-  --set image.pullPolicy=Always \
+  --set image.pullPolicy=IfNotPresent \
   --set server.sandboxImage=${REGISTRY}/sandbox:${IMAGE_TAG} \
   --set gateway.tls.jobImage=${REGISTRY}/pki-job:${IMAGE_TAG} \
   --wait

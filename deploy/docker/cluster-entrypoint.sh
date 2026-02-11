@@ -118,9 +118,31 @@ if [ -d "/opt/navigator/manifests" ]; then
     cp /opt/navigator/manifests/*.yaml /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
 fi
 
+# ---------------------------------------------------------------------------
+# Override image tag and pull policy for local development
+# ---------------------------------------------------------------------------
+# When IMAGE_TAG is set, replace the default ":latest" tag on all component
+# images in the HelmChart manifest so k3s deploys the locally-pushed versions.
+# When IMAGE_PULL_POLICY is set, override the default "Always" so k3s uses
+# images already present in containerd instead of pulling from the registry.
+HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
+if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
+    echo "Overriding component image tag to: ${IMAGE_TAG}"
+    # server image tag (standalone value field)
+    sed -i "s|tag: latest|tag: ${IMAGE_TAG}|" "$HELMCHART"
+    # sandbox image (inline tag in image reference)
+    sed -i "s|sandbox:latest|sandbox:${IMAGE_TAG}|" "$HELMCHART"
+    # pki-job image (inline tag in image reference)
+    sed -i "s|pki-job:latest|pki-job:${IMAGE_TAG}|" "$HELMCHART"
+fi
+
+if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then
+    echo "Overriding image pull policy to: ${IMAGE_PULL_POLICY}"
+    sed -i "s|pullPolicy: Always|pullPolicy: ${IMAGE_PULL_POLICY}|" "$HELMCHART"
+fi
+
 # Inject SSH gateway host/port into the HelmChart manifest so the navigator
 # server returns the correct address to CLI clients for SSH proxy CONNECT.
-HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
 if [ -f "$HELMCHART" ]; then
     if [ -n "$SSH_GATEWAY_HOST" ]; then
         echo "Setting SSH gateway host: $SSH_GATEWAY_HOST"
