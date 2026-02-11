@@ -107,8 +107,11 @@ publish_ecr_images:
     - if: $CI_COMMIT_BRANCH == "main"
   before_script:
     - uv sync --frozen
-    # Install Docker CLI (CI image has mise/helm but no Docker client)
+    # Install Docker CLI + buildx plugin (CI image has mise/helm but no Docker client)
     - curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | tar xz --strip-components=1 -C /usr/local/bin docker/docker
+    - mkdir -p /usr/local/lib/docker/cli-plugins
+    - curl -fsSL https://github.com/docker/buildx/releases/download/v0.21.1/buildx-v0.21.1.linux-amd64 -o /usr/local/lib/docker/cli-plugins/docker-buildx
+    - chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
     # Install AWS CLI
     - apt-get update -qq && apt-get install -y -qq unzip >/dev/null
     - curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
