@@ -200,12 +200,12 @@ async fn load_policy(
     rego_policy: Option<String>,
     rego_data: Option<String>,
 ) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
-    // Rego mode: load OPA engine and extract sandbox config from Rego data
+    // Rego mode: load OPA engine and extract sandbox config from Rego files (dev override)
     if let (Some(policy_file), Some(data_file)) = (&rego_policy, &rego_data) {
         info!(
             rego_policy = %policy_file,
             rego_data = %data_file,
-            "Loading OPA policy engine"
+            "Loading OPA policy engine from rego files"
         );
         let engine = OpaEngine::from_files(
             std::path::Path::new(policy_file),
@@ -225,7 +225,7 @@ async fn load_policy(
         return Ok((policy, Some(Arc::new(engine))));
     }
 
-    // gRPC mode
+    // gRPC mode: fetch typed proto policy, construct OPA engine from baked rules + proto data
     if let (Some(id), Some(endpoint)) = (&sandbox_id, &navigator_endpoint) {
         info!(
             sandbox_id = %id,
@@ -233,8 +233,18 @@ async fn load_policy(
             "Fetching sandbox policy via gRPC"
         );
         let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
+
+        // Build OPA engine from baked-in rules + typed proto data
+        let opa_engine = if proto_policy.network_policies.is_empty() {
+            info!("No network policies in proto, skipping OPA engine");
+            None
+        } else {
+            info!("Creating OPA engine from proto policy data");
+            Some(Arc::new(OpaEngine::from_proto(&proto_policy)?))
+        };
+
         let policy = SandboxPolicy::try_from(proto_policy)?;
-        return Ok((policy, None));
+        return Ok((policy, opa_engine));
     }
 
     // No policy source available

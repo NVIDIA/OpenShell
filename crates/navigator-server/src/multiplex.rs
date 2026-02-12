@@ -12,7 +12,7 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use navigator_core::proto::navigator_server::NavigatorServer;
+use navigator_core::proto::{inference_server::InferenceServer, navigator_server::NavigatorServer};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::ServiceExt;
 
-use crate::{NavigatorService, ServerState, http_router};
+use crate::{NavigatorService, ServerState, http_router, inference::InferenceService};
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -41,7 +41,9 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let grpc_service = NavigatorServer::new(NavigatorService::new(self.state.clone()));
+        let navigator = NavigatorServer::new(NavigatorService::new(self.state.clone()));
+        let inference = InferenceServer::new(InferenceService::new(self.state.clone()));
+        let grpc_service = GrpcRouter::new(navigator, inference);
         let http_service = http_router(self.state.clone());
 
         let service = MultiplexedService::new(grpc_service, http_service);
@@ -51,6 +53,59 @@ impl MultiplexService {
             .await?;
 
         Ok(())
+    }
+}
+
+/// Combined gRPC service that routes between Navigator and Inference services
+/// based on the request path prefix.
+#[derive(Clone)]
+pub struct GrpcRouter<N, I> {
+    navigator: N,
+    inference: I,
+}
+
+impl<N, I> GrpcRouter<N, I> {
+    fn new(navigator: N, inference: I) -> Self {
+        Self {
+            navigator,
+            inference,
+        }
+    }
+}
+
+const INFERENCE_PATH_PREFIX: &str = "/navigator.inference.v1.Inference/";
+
+impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
+where
+    N: tower::Service<Request<B>> + Clone + Send + 'static,
+    N::Response: Send,
+    N::Future: Send,
+    N::Error: Send,
+    I: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    I::Future: Send,
+    B: Send + 'static,
+{
+    type Response = N::Response;
+    type Error = N::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<B>) -> Self::Future {
+        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
+
+        if is_inference {
+            let mut svc = self.inference.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else {
+            let mut svc = self.navigator.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        }
     }
 }
 

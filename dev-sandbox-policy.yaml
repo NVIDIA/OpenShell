@@ -1,0 +1,49 @@
+version: 1
+
+inference:
+  allowed_routing_hints:
+    - local
+
+# --- Sandbox setup configuration (queried once at startup) ---
+
+filesystem:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+  read_write:
+    - /sandbox
+    - /tmp
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# --- Network policies (queried per-CONNECT request) ---
+#
+# Each named policy maps a set of allowed (binary, endpoint) pairs.
+# Binary identity is resolved via /proc/net/tcp inode lookup + /proc/{pid}/exe.
+# Ancestors (/proc/{pid}/status PPid walk) and cmdline paths are also matched.
+# SHA256 integrity is enforced in Rust via trust-on-first-use, not here.
+
+network_policies:
+  claude_code:
+    name: claude_code
+    endpoints:
+      - { host: api.anthropic.com, port: 443 }
+      - { host: statsig.anthropic.com, port: 443 }
+      - { host: sentry.io, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: platform.claude.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+  gitlab:
+    name: gitlab
+    endpoints:
+      - { host: gitlab.com, port: 443 }
+      - { host: gitlab.mycorp.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/glab }

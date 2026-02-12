@@ -2,6 +2,7 @@
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
+use navigator_router::Router;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
@@ -122,7 +123,11 @@ async fn main() -> Result<()> {
         config = config.with_ssh_handshake_secret(secret);
     }
 
+    let router = Router::new().map_err(|e| miette::miette!("failed to initialize router: {e}"))?;
+
     info!(bind = %config.bind_address, "Starting Navigator server");
 
-    run_server(config, tracing_log_bus).await.into_diagnostic()
+    run_server(config, tracing_log_bus, Some(router))
+        .await
+        .into_diagnostic()
 }

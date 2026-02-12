@@ -6,8 +6,14 @@
 
 use crate::policy::{FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy};
 use miette::Result;
+use navigator_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+
+/// Baked-in rego rules for OPA policy evaluation.
+/// These rules define the network access decision logic and static config
+/// passthroughs. They reference `data.sandbox.*` for policy data.
+const BAKED_POLICY_RULES: &str = include_str!("../../../dev-sandbox-policy.rego");
 
 /// Result of evaluating a network access request against OPA policy.
 pub struct PolicyDecision {
@@ -62,7 +68,7 @@ impl OpaEngine {
         })
     }
 
-    /// Load policy and data from strings (for future gRPC bundles).
+    /// Load policy and data from strings.
     pub fn from_strings(policy: &str, data: &str) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
@@ -70,6 +76,26 @@ impl OpaEngine {
             .map_err(|e| miette::miette!("{e}"))?;
         engine
             .add_policy("data.rego".into(), data.into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        Ok(Self {
+            engine: Mutex::new(engine),
+        })
+    }
+
+    /// Create OPA engine from a typed proto policy.
+    ///
+    /// Uses baked-in rego rules and converts the proto's typed fields to JSON
+    /// data under the `sandbox` key (matching `data.sandbox.*` references in
+    /// the rego rules).
+    pub fn from_proto(proto: &ProtoSandboxPolicy) -> Result<Self> {
+        let data_json = proto_to_opa_data_json(proto);
+
+        let mut engine = regorus::Engine::new();
+        engine
+            .add_policy("policy.rego".into(), BAKED_POLICY_RULES.into())
+            .map_err(|e| miette::miette!("{e}"))?;
+        engine
+            .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
@@ -283,15 +309,155 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     }
 }
 
+/// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
+///
+/// The rego rules reference `data.sandbox.*`, so we wrap everything under a
+/// `"sandbox"` key. The structure matches the rego data package expectations:
+/// - `data.sandbox.filesystem_policy`
+/// - `data.sandbox.landlock`
+/// - `data.sandbox.process`
+/// - `data.sandbox.network_policies`
+fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
+    let filesystem_policy = proto.filesystem.as_ref().map_or_else(
+        || {
+            serde_json::json!({
+                "include_workdir": true,
+                "read_only": [],
+                "read_write": [],
+            })
+        },
+        |fs| {
+            serde_json::json!({
+                "include_workdir": fs.include_workdir,
+                "read_only": fs.read_only,
+                "read_write": fs.read_write,
+            })
+        },
+    );
+
+    let landlock = proto.landlock.as_ref().map_or_else(
+        || serde_json::json!({"compatibility": "best_effort"}),
+        |ll| serde_json::json!({"compatibility": ll.compatibility}),
+    );
+
+    let process = proto.process.as_ref().map_or_else(
+        || {
+            serde_json::json!({
+                "run_as_user": "",
+                "run_as_group": "",
+            })
+        },
+        |p| {
+            serde_json::json!({
+                "run_as_user": p.run_as_user,
+                "run_as_group": p.run_as_group,
+            })
+        },
+    );
+
+    let network_policies: serde_json::Map<String, serde_json::Value> = proto
+        .network_policies
+        .iter()
+        .map(|(key, rule)| {
+            let endpoints: Vec<serde_json::Value> = rule
+                .endpoints
+                .iter()
+                .map(|e| serde_json::json!({"host": e.host, "port": e.port}))
+                .collect();
+            let binaries: Vec<serde_json::Value> = rule
+                .binaries
+                .iter()
+                .map(|b| serde_json::json!({"path": b.path}))
+                .collect();
+            (
+                key.clone(),
+                serde_json::json!({
+                    "name": rule.name,
+                    "endpoints": endpoints,
+                    "binaries": binaries,
+                }),
+            )
+        })
+        .collect();
+
+    serde_json::json!({
+        "sandbox": {
+            "filesystem_policy": filesystem_policy,
+            "landlock": landlock,
+            "process": process,
+            "network_policies": network_policies,
+        }
+    })
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use navigator_core::proto::{
+        FilesystemPolicy as ProtoFs, LandlockPolicy as ProtoLl, NetworkBinary, NetworkEndpoint,
+        NetworkPolicyRule, ProcessPolicy as ProtoProc, SandboxPolicy as ProtoSandboxPolicy,
+    };
 
     const TEST_POLICY: &str = include_str!("../../../dev-sandbox-policy.rego");
     const TEST_DATA: &str = include_str!("../../../dev-sandbox-policy-data.rego");
 
     fn test_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, TEST_DATA).expect("Failed to load test policy")
+    }
+
+    fn test_proto() -> ProtoSandboxPolicy {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "claude_code".to_string(),
+            NetworkPolicyRule {
+                name: "claude_code".to_string(),
+                endpoints: vec![
+                    NetworkEndpoint {
+                        host: "api.anthropic.com".to_string(),
+                        port: 443,
+                    },
+                    NetworkEndpoint {
+                        host: "statsig.anthropic.com".to_string(),
+                        port: 443,
+                    },
+                ],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/local/bin/claude".to_string(),
+                }],
+            },
+        );
+        network_policies.insert(
+            "gitlab".to_string(),
+            NetworkPolicyRule {
+                name: "gitlab".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "gitlab.com".to_string(),
+                    port: 443,
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/glab".to_string(),
+                }],
+            },
+        );
+        ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec!["/usr".to_string(), "/lib".to_string()],
+                read_write: vec!["/sandbox".to_string(), "/tmp".to_string()],
+            }),
+            landlock: Some(ProtoLl {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+            inference: None,
+        }
     }
 
     #[test]
@@ -765,5 +931,59 @@ network_policies := {
             "Expected glob to match cmdline path, got deny: {}",
             decision.reason
         );
+    }
+
+    #[test]
+    fn from_proto_allows_matching_request() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+        let input = NetworkInput {
+            host: "api.anthropic.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Expected allow from proto-based engine, got deny: {}",
+            decision.reason
+        );
+        assert_eq!(decision.matched_policy.as_deref(), Some("claude_code"));
+    }
+
+    #[test]
+    fn from_proto_denies_unmatched_request() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+        let input = NetworkInput {
+            host: "evil.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn from_proto_extracts_sandbox_config() {
+        let proto = test_proto();
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+        let config = engine.query_sandbox_config().unwrap();
+        assert!(config.filesystem.include_workdir);
+        assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
+        assert!(
+            config
+                .filesystem
+                .read_write
+                .contains(&PathBuf::from("/tmp"))
+        );
+        assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
+        assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
     }
 }

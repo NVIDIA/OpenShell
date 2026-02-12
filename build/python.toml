@@ -38,3 +38,20 @@ run = "uv run ruff format {{vars.python_paths}}"
 ["python:typecheck"]
 description = "Type check Python code with ty"
 run = "uv run ty check {{vars.python_paths}}"
+
+["python:proto"]
+description = "Generate Python protobuf stubs from .proto files"
+env = { UV_NO_SYNC = "1" }
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+uv run python -m grpc_tools.protoc \
+  -Iproto \
+  --python_out=python/navigator/_proto \
+  --pyi_out=python/navigator/_proto \
+  --grpc_python_out=python/navigator/_proto \
+  proto/inference.proto
+# Fix absolute imports in generated gRPC stubs to use relative imports
+sed -i '' 's/^import inference_pb2/from . import inference_pb2/' \
+  python/navigator/_proto/inference_pb2_grpc.py
+"""

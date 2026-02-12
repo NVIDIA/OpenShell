@@ -1,0 +1,128 @@
+syntax = "proto3";
+
+package navigator.inference.v1;
+
+option java_multiple_files = true;
+option java_package = "com.anthropic.navigator.inference.v1";
+
+// Inference service provides LLM completion capabilities.
+service Inference {
+  // Send a completion request routed by the server's inference router.
+  rpc Completion(CompletionRequest) returns (CompletionResponse);
+
+  // Create a new inference route.
+  rpc CreateInferenceRoute(CreateInferenceRouteRequest) returns (InferenceRouteResponse);
+
+  // Update an existing inference route.
+  rpc UpdateInferenceRoute(UpdateInferenceRouteRequest) returns (InferenceRouteResponse);
+
+  // Delete an inference route.
+  rpc DeleteInferenceRoute(DeleteInferenceRouteRequest) returns (DeleteInferenceRouteResponse);
+
+  // List inference routes.
+  rpc ListInferenceRoutes(ListInferenceRoutesRequest) returns (ListInferenceRoutesResponse);
+}
+
+message InferenceRouteSpec {
+  string routing_hint = 1;
+  string base_url = 2;
+  string protocol = 3;
+  string api_key = 4;
+  string model_id = 5;
+  bool enabled = 6;
+}
+
+// Inference route model stored by Navigator.
+message InferenceRoute {
+  string id = 1;
+  InferenceRouteSpec spec = 2;
+}
+
+message CreateInferenceRouteRequest {
+  InferenceRouteSpec route = 1;
+}
+
+message UpdateInferenceRouteRequest {
+  string id = 1;
+  InferenceRouteSpec route = 2;
+}
+
+message DeleteInferenceRouteRequest {
+  string id = 1;
+}
+
+message DeleteInferenceRouteResponse {
+  bool deleted = 1;
+}
+
+message ListInferenceRoutesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+}
+
+message ListInferenceRoutesResponse {
+  repeated InferenceRoute routes = 1;
+}
+
+message InferenceRouteResponse {
+  InferenceRoute route = 1;
+}
+
+// Completion request.
+message CompletionRequest {
+  // Routing hint tells the router what kind of inference to use (e.g. "frontier", "local").
+  // The router resolves this to a specific model and backend.
+  string routing_hint = 1;
+  // Chat messages for the completion.
+  repeated ChatMessage messages = 2;
+  // Sampling temperature.
+  optional float temperature = 3;
+  // Maximum number of tokens to generate.
+  optional int32 max_tokens = 4;
+  // Nucleus sampling parameter.
+  optional float top_p = 5;
+}
+
+// A single chat message.
+message ChatMessage {
+  // Message role (e.g. "system", "user", "assistant").
+  string role = 1;
+  // Message content.
+  string content = 2;
+  // Optional model reasoning content when provided by upstream.
+  optional string reasoning_content = 3;
+}
+
+// Completion response.
+message CompletionResponse {
+  // Unique completion ID.
+  string id = 1;
+  // The actual model that served the request (resolved by router).
+  string model = 2;
+  // Creation timestamp (unix seconds).
+  int64 created = 3;
+  // Completion choices.
+  repeated CompletionChoice choices = 4;
+  // Token usage statistics.
+  CompletionUsage usage = 5;
+}
+
+// A single completion choice.
+message CompletionChoice {
+  // Choice index.
+  int32 index = 1;
+  // The generated message.
+  ChatMessage message = 2;
+  // Reason the generation stopped (e.g. "stop", "length").
+  string finish_reason = 3;
+}
+
+// Token usage statistics.
+message CompletionUsage {
+  // Number of tokens in the prompt.
+  int32 prompt_tokens = 1;
+  // Number of tokens in the completion.
+  int32 completion_tokens = 2;
+  // Total tokens used.
+  int32 total_tokens = 3;
+}

@@ -13,6 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "../../proto/navigator.proto",
         "../../proto/datamodel.proto",
         "../../proto/sandbox.proto",
+        "../../proto/inference.proto",
         "../../proto/test.proto",
     ];
 

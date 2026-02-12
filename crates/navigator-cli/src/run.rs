@@ -1,6 +1,8 @@
 //! CLI command implementations.
 
-use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
+use crate::tls::{
+    TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
+};
 use bytes::Bytes;
 use futures::StreamExt;
 use http_body_util::Full;
@@ -15,9 +17,11 @@ use navigator_bootstrap::{
     remove_cluster_metadata, save_active_cluster, update_local_kubeconfig,
 };
 use navigator_core::proto::{
-    CreateSandboxRequest, DeleteSandboxRequest, GetSandboxRequest, HealthRequest,
-    LandlockCompatibility, ListSandboxesRequest, NetworkMode, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, WatchSandboxRequest,
+    CreateInferenceRouteRequest, CreateSandboxRequest, DeleteInferenceRouteRequest,
+    DeleteSandboxRequest, GetSandboxRequest, HealthRequest, InferenceRoute, InferenceRouteSpec,
+    ListInferenceRoutesRequest, ListSandboxesRequest, NetworkBinary, NetworkEndpoint,
+    NetworkPolicyRule, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec,
+    UpdateInferenceRouteRequest, WatchSandboxRequest,
 };
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
@@ -1140,42 +1144,40 @@ pub async fn sandbox_create(
     }
 }
 
+/// Default sandbox policy YAML, baked in at compile time.
+const DEFAULT_SANDBOX_POLICY_YAML: &str = include_str!("../../../dev-sandbox-policy.yaml");
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DevSandboxPolicyFile {
     version: u32,
-    filesystem: DevFilesystemPolicy,
-    network: DevNetworkPolicy,
-    landlock: DevLandlockPolicy,
-    process: DevProcessPolicy,
+    #[serde(default)]
+    inference: Option<DevInferencePolicy>,
+    #[serde(default)]
+    filesystem: Option<DevFilesystemPolicy>,
+    #[serde(default)]
+    landlock: Option<DevLandlockPolicy>,
+    #[serde(default)]
+    process: Option<DevProcessPolicy>,
+    #[serde(default)]
+    network_policies: std::collections::HashMap<String, DevNetworkPolicyRule>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct DevFilesystemPolicy {
+    #[serde(default)]
     include_workdir: bool,
+    #[serde(default)]
     read_only: Vec<String>,
+    #[serde(default)]
     read_write: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct DevNetworkPolicy {
-    mode: String,
-    #[serde(default)]
-    proxy: Option<DevProxyPolicy>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevProxyPolicy {
-    #[serde(default)]
-    http_addr: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct DevLandlockPolicy {
+    #[serde(default)]
     compatibility: String,
 }
 
@@ -1183,58 +1185,110 @@ struct DevLandlockPolicy {
 #[serde(deny_unknown_fields)]
 struct DevProcessPolicy {
     #[serde(default)]
-    run_as_user: Option<String>,
+    run_as_user: String,
     #[serde(default)]
-    run_as_group: Option<String>,
+    run_as_group: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevInferencePolicy {
+    #[serde(default)]
+    allowed_routing_hints: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevNetworkPolicyRule {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    endpoints: Vec<DevNetworkEndpoint>,
+    #[serde(default)]
+    binaries: Vec<DevNetworkBinary>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevNetworkEndpoint {
+    host: String,
+    port: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevNetworkBinary {
+    path: String,
 }
 
 fn load_dev_sandbox_policy() -> Result<SandboxPolicy> {
-    let policy_path = std::env::var("NAVIGATOR_SANDBOX_POLICY")
-        .unwrap_or_else(|_| "dev-sandbox-policy.yaml".to_string());
-    let path = Path::new(&policy_path);
-    let contents = std::fs::read_to_string(path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?;
+    let contents = match std::env::var("NAVIGATOR_SANDBOX_POLICY") {
+        Ok(policy_path) => {
+            let path = Path::new(&policy_path);
+            std::fs::read_to_string(path)
+                .into_diagnostic()
+                .wrap_err_with(|| {
+                    format!("failed to read sandbox policy from {}", path.display())
+                })?
+        }
+        Err(_) => DEFAULT_SANDBOX_POLICY_YAML.to_string(),
+    };
     let raw: DevSandboxPolicyFile = serde_yaml::from_str(&contents)
         .into_diagnostic()
         .wrap_err("failed to parse sandbox policy yaml")?;
 
-    let network_mode = match raw.network.mode.as_str() {
-        "proxy" => NetworkMode::Proxy as i32,
-        "allow" => NetworkMode::Allow as i32,
-        _ => NetworkMode::Block as i32,
-    };
-
-    let proxy = raw
-        .network
-        .proxy
-        .map(|proxy| navigator_core::proto::ProxyPolicy {
-            http_addr: proxy.http_addr.unwrap_or_default(),
-        });
-
-    let landlock_compat = match raw.landlock.compatibility.as_str() {
-        "hard_requirement" => LandlockCompatibility::HardRequirement as i32,
-        _ => LandlockCompatibility::BestEffort as i32,
-    };
+    let network_policies = raw
+        .network_policies
+        .into_iter()
+        .map(|(key, rule)| {
+            let proto_rule = NetworkPolicyRule {
+                name: if rule.name.is_empty() {
+                    key.clone()
+                } else {
+                    rule.name
+                },
+                endpoints: rule
+                    .endpoints
+                    .into_iter()
+                    .map(|e| NetworkEndpoint {
+                        host: e.host,
+                        port: e.port,
+                    })
+                    .collect(),
+                binaries: rule
+                    .binaries
+                    .into_iter()
+                    .map(|b| NetworkBinary { path: b.path })
+                    .collect(),
+            };
+            (key, proto_rule)
+        })
+        .collect();
 
     Ok(SandboxPolicy {
         version: raw.version,
-        filesystem: Some(navigator_core::proto::FilesystemPolicy {
-            read_only: raw.filesystem.read_only,
-            read_write: raw.filesystem.read_write,
-            include_workdir: raw.filesystem.include_workdir,
+        filesystem: raw
+            .filesystem
+            .map(|fs| navigator_core::proto::FilesystemPolicy {
+                include_workdir: fs.include_workdir,
+                read_only: fs.read_only,
+                read_write: fs.read_write,
+            }),
+        landlock: raw
+            .landlock
+            .map(|ll| navigator_core::proto::LandlockPolicy {
+                compatibility: ll.compatibility,
+            }),
+        process: raw.process.map(|p| navigator_core::proto::ProcessPolicy {
+            run_as_user: p.run_as_user,
+            run_as_group: p.run_as_group,
         }),
-        network: Some(navigator_core::proto::NetworkPolicy {
-            mode: network_mode,
-            proxy,
-        }),
-        landlock: Some(navigator_core::proto::LandlockPolicy {
-            compatibility: landlock_compat,
-        }),
-        process: Some(navigator_core::proto::ProcessPolicy {
-            run_as_user: raw.process.run_as_user.unwrap_or_default(),
-            run_as_group: raw.process.run_as_group.unwrap_or_default(),
-        }),
+        network_policies,
+        inference: raw
+            .inference
+            .map(|inf| navigator_core::proto::InferencePolicy {
+                allowed_routing_hints: inf.allowed_routing_hints,
+            }),
     })
 }
 
@@ -1273,13 +1327,21 @@ pub async fn sandbox_get(server: &str, id: &str, tls: &TlsOptions) -> Result<()>
 struct PolicyYaml {
     version: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
-    filesystem: Option<FilesystemYaml>,
+    inference: Option<InferenceYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    network: Option<NetworkYaml>,
+    filesystem: Option<FilesystemYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     landlock: Option<LandlockYaml>,
     #[serde(skip_serializing_if = "Option::is_none")]
     process: Option<ProcessYaml>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    network_policies: std::collections::BTreeMap<String, NetworkPolicyRuleYaml>,
+}
+
+#[derive(Serialize)]
+struct InferenceYaml {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    allowed_routing_hints: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1289,19 +1351,6 @@ struct FilesystemYaml {
     read_only: Vec<String>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     read_write: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct NetworkYaml {
-    mode: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    proxy: Option<ProxyYaml>,
-}
-
-#[derive(Serialize)]
-struct ProxyYaml {
-    #[serde(skip_serializing_if = "String::is_empty")]
-    http_addr: String,
 }
 
 #[derive(Serialize)]
@@ -1317,38 +1366,39 @@ struct ProcessYaml {
     run_as_group: String,
 }
 
+#[derive(Serialize)]
+struct NetworkPolicyRuleYaml {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    endpoints: Vec<NetworkEndpointYaml>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    binaries: Vec<NetworkBinaryYaml>,
+}
+
+#[derive(Serialize)]
+struct NetworkEndpointYaml {
+    host: String,
+    port: u32,
+}
+
+#[derive(Serialize)]
+struct NetworkBinaryYaml {
+    path: String,
+}
+
 /// Convert proto policy to serializable YAML structure.
 fn policy_to_yaml(policy: &SandboxPolicy) -> PolicyYaml {
+    let inference = policy.inference.as_ref().map(|inf| InferenceYaml {
+        allowed_routing_hints: inf.allowed_routing_hints.clone(),
+    });
+
     let filesystem = policy.filesystem.as_ref().map(|fs| FilesystemYaml {
         include_workdir: fs.include_workdir,
         read_only: fs.read_only.clone(),
         read_write: fs.read_write.clone(),
     });
 
-    let network = policy.network.as_ref().map(|net| {
-        let mode = match NetworkMode::try_from(net.mode) {
-            Ok(NetworkMode::Block) => "block",
-            Ok(NetworkMode::Proxy) => "proxy",
-            Ok(NetworkMode::Allow) => "allow",
-            _ => "unspecified",
-        }
-        .to_string();
-
-        let proxy = net.proxy.as_ref().map(|p| ProxyYaml {
-            http_addr: p.http_addr.clone(),
-        });
-
-        NetworkYaml { mode, proxy }
-    });
-
-    let landlock = policy.landlock.as_ref().map(|ll| {
-        let compatibility = match LandlockCompatibility::try_from(ll.compatibility) {
-            Ok(LandlockCompatibility::BestEffort) => "best_effort",
-            Ok(LandlockCompatibility::HardRequirement) => "hard_requirement",
-            _ => "unspecified",
-        }
-        .to_string();
-        LandlockYaml { compatibility }
+    let landlock = policy.landlock.as_ref().map(|ll| LandlockYaml {
+        compatibility: ll.compatibility.clone(),
     });
 
     let process = policy.process.as_ref().and_then(|p| {
@@ -1362,12 +1412,38 @@ fn policy_to_yaml(policy: &SandboxPolicy) -> PolicyYaml {
         }
     });
 
+    let network_policies = policy
+        .network_policies
+        .iter()
+        .map(|(key, rule)| {
+            let yaml_rule = NetworkPolicyRuleYaml {
+                endpoints: rule
+                    .endpoints
+                    .iter()
+                    .map(|e| NetworkEndpointYaml {
+                        host: e.host.clone(),
+                        port: e.port,
+                    })
+                    .collect(),
+                binaries: rule
+                    .binaries
+                    .iter()
+                    .map(|b| NetworkBinaryYaml {
+                        path: b.path.clone(),
+                    })
+                    .collect(),
+            };
+            (key.clone(), yaml_rule)
+        })
+        .collect();
+
     PolicyYaml {
         version: policy.version,
+        inference,
         filesystem,
-        network,
         landlock,
         process,
+        network_policies,
     }
 }
 
@@ -1526,6 +1602,134 @@ pub async fn sandbox_delete(server: &str, ids: &[String], tls: &TlsOptions) -> R
     }
 
     Ok(())
+}
+
+pub async fn inference_route_create(
+    server: &str,
+    routing_hint: &str,
+    base_url: &str,
+    protocol: &str,
+    api_key: &str,
+    model_id: &str,
+    enabled: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .create_inference_route(CreateInferenceRouteRequest {
+            route: Some(InferenceRouteSpec {
+                routing_hint: routing_hint.to_string(),
+                base_url: base_url.to_string(),
+                protocol: protocol.to_string(),
+                api_key: api_key.to_string(),
+                model_id: model_id.to_string(),
+                enabled,
+            }),
+        })
+        .await
+        .into_diagnostic()?;
+
+    if let Some(route) = response.into_inner().route {
+        println!("{} Created route {}", "✓".green().bold(), route.id);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn inference_route_update(
+    server: &str,
+    id: &str,
+    routing_hint: &str,
+    base_url: &str,
+    protocol: &str,
+    api_key: &str,
+    model_id: &str,
+    enabled: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .update_inference_route(UpdateInferenceRouteRequest {
+            id: id.to_string(),
+            route: Some(InferenceRouteSpec {
+                routing_hint: routing_hint.to_string(),
+                base_url: base_url.to_string(),
+                protocol: protocol.to_string(),
+                api_key: api_key.to_string(),
+                model_id: model_id.to_string(),
+                enabled,
+            }),
+        })
+        .await
+        .into_diagnostic()?;
+
+    if let Some(route) = response.into_inner().route {
+        println!("{} Updated route {}", "✓".green().bold(), route.id);
+    }
+    Ok(())
+}
+
+pub async fn inference_route_delete(server: &str, ids: &[String], tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_inference_client(server, tls).await?;
+    for id in ids {
+        let response = client
+            .delete_inference_route(DeleteInferenceRouteRequest { id: id.clone() })
+            .await
+            .into_diagnostic()?;
+        if response.into_inner().deleted {
+            println!("{} Deleted route {id}", "✓".green().bold());
+        } else {
+            println!("{} Route {id} not found", "!".yellow());
+        }
+    }
+    Ok(())
+}
+
+pub async fn inference_route_list(
+    server: &str,
+    limit: u32,
+    offset: u32,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .list_inference_routes(ListInferenceRoutesRequest { limit, offset })
+        .await
+        .into_diagnostic()?;
+    let routes = response.into_inner().routes;
+
+    if routes.is_empty() {
+        println!("No inference routes found");
+        return Ok(());
+    }
+
+    println!(
+        "{:<36}  {:<16}  {:<40}  {:<30}  {:<8}",
+        "ID".bold(),
+        "HINT".bold(),
+        "BASE URL".bold(),
+        "MODEL".bold(),
+        "ENABLED".bold()
+    );
+    for route in routes {
+        print_route_row(&route);
+    }
+
+    Ok(())
+}
+
+fn print_route_row(route: &InferenceRoute) {
+    let Some(spec) = route.spec.as_ref() else {
+        println!(
+            "{:<36}  {:<16}  {:<40}  {:<30}  {:<8}",
+            route.id, "<missing>", "", "", "false"
+        );
+        return;
+    };
+    println!(
+        "{:<36}  {:<16}  {:<40}  {:<30}  {:<8}",
+        route.id, spec.routing_hint, spec.base_url, spec.model_id, spec.enabled
+    );
 }
 
 fn git_repo_root() -> Result<PathBuf> {

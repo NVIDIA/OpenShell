@@ -123,6 +123,12 @@ enum Commands {
         command: SandboxCommands,
     },
 
+    /// Manage inference configuration.
+    Inference {
+        #[command(subcommand)]
+        command: InferenceCommands,
+    },
+
     /// SSH proxy (used by `ProxyCommand`).
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
@@ -302,6 +308,56 @@ enum SandboxCommands {
     },
 }
 
+#[derive(Subcommand, Debug)]
+enum InferenceCommands {
+    /// Create an inference route.
+    Create {
+        #[arg(long)]
+        routing_hint: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long, default_value = "openai_chat_completions")]
+        protocol: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model_id: String,
+        #[arg(long)]
+        disabled: bool,
+    },
+
+    /// Update an inference route.
+    Update {
+        id: String,
+        #[arg(long)]
+        routing_hint: String,
+        #[arg(long)]
+        base_url: String,
+        #[arg(long, default_value = "openai_chat_completions")]
+        protocol: String,
+        #[arg(long)]
+        api_key: String,
+        #[arg(long)]
+        model_id: String,
+        #[arg(long)]
+        disabled: bool,
+    },
+
+    /// Delete inference routes.
+    Delete {
+        #[arg(required = true, num_args = 1.., value_name = "ID")]
+        ids: Vec<String>,
+    },
+
+    /// List inference routes.
+    List {
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+    },
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     rustls::crypto::aws_lc_rs::default_provider()
@@ -475,6 +531,67 @@ async fn main() -> Result<()> {
                             run::sandbox_connect(endpoint, &id, &tls).await?;
                         }
                     }
+                }
+            }
+        }
+        Some(Commands::Inference { command }) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let endpoint = &ctx.endpoint;
+            if !is_https(endpoint)? && !cli.allow_insecure_access {
+                return Err(miette::miette!(
+                    "https is required; use --allow-insecure-access to connect over http"
+                ));
+            }
+            let tls = tls.with_cluster_name(&ctx.name);
+
+            match command {
+                InferenceCommands::Create {
+                    routing_hint,
+                    base_url,
+                    protocol,
+                    api_key,
+                    model_id,
+                    disabled,
+                } => {
+                    run::inference_route_create(
+                        endpoint,
+                        &routing_hint,
+                        &base_url,
+                        &protocol,
+                        &api_key,
+                        &model_id,
+                        !disabled,
+                        &tls,
+                    )
+                    .await?;
+                }
+                InferenceCommands::Update {
+                    id,
+                    routing_hint,
+                    base_url,
+                    protocol,
+                    api_key,
+                    model_id,
+                    disabled,
+                } => {
+                    run::inference_route_update(
+                        endpoint,
+                        &id,
+                        &routing_hint,
+                        &base_url,
+                        &protocol,
+                        &api_key,
+                        &model_id,
+                        !disabled,
+                        &tls,
+                    )
+                    .await?;
+                }
+                InferenceCommands::Delete { ids } => {
+                    run::inference_route_delete(endpoint, &ids, &tls).await?;
+                }
+                InferenceCommands::List { limit, offset } => {
+                    run::inference_route_list(endpoint, limit, offset, &tls).await?;
                 }
             }
         }

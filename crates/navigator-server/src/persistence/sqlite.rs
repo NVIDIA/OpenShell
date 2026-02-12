@@ -19,6 +19,7 @@ impl SqliteStore {
 
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
+            .min_connections(max_connections)
             .connect(url)
             .await
             .map_err(|e| map_db_error(&e))?;

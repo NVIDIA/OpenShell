@@ -1,4 +1,5 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
+use navigator_core::proto::inference_client::InferenceClient;
 use navigator_core::proto::navigator_client::NavigatorClient;
 use rustls::{
     RootCertStore,
@@ -216,4 +217,22 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClie
     }
     let channel = endpoint.connect().await.into_diagnostic()?;
     Ok(NavigatorClient::new(channel))
+}
+
+pub async fn grpc_inference_client(
+    server: &str,
+    tls: &TlsOptions,
+) -> Result<InferenceClient<Channel>> {
+    let mut endpoint = Endpoint::from_shared(server.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
+    if is_https(server)? {
+        let materials = require_tls_materials(server, tls)?;
+        let tls_config = build_tonic_tls_config(&materials);
+        endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
+    }
+    let channel = endpoint.connect().await.into_diagnostic()?;
+    Ok(InferenceClient::new(channel))
 }

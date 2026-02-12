@@ -20,6 +20,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ crates/
 COPY proto/ proto/
+COPY dev-sandbox-policy.rego ./
 
 # Build with cross-compilation support.
 # Cache mounts are keyed by TARGETARCH so parallel multi-platform builds
@@ -59,9 +60,16 @@ FROM base AS builder
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
+# Copy project files for dependency resolution
+COPY pyproject.toml uv.lock ./
+
+# Install dependencies into a virtual environment
 RUN uv venv /app/.venv && \
     uv sync --frozen --no-dev --no-install-project 2>/dev/null || \
     uv sync --no-dev --no-install-project 2>/dev/null || true
+
+# Install navigator SDK dependencies (grpcio, protobuf)
+RUN uv pip install --python /app/.venv/bin/python --no-cache-dir grpcio protobuf
 
 # Stage 4: Coding agents layer
 FROM base AS coding-agents
@@ -85,6 +93,10 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=rust-builder /build/out/navigator-sandbox /usr/local/bin/
 
+# Copy navigator Python SDK into the virtual environment
+COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
+
+# Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
 RUN mkdir -p /var/navigator /sandbox /var/log && \

@@ -1,10 +1,8 @@
 //! Sandbox policy configuration.
 
 use navigator_core::proto::{
-    self, FilesystemPolicy as ProtoFilesystemPolicy, LandlockCompatibility as ProtoLandlockCompat,
-    LandlockPolicy as ProtoLandlockPolicy, NetworkMode as ProtoNetworkMode,
-    NetworkPolicy as ProtoNetworkPolicy, ProcessPolicy as ProtoProcessPolicy,
-    SandboxPolicy as ProtoSandboxPolicy,
+    FilesystemPolicy as ProtoFilesystemPolicy, LandlockPolicy as ProtoLandlockPolicy,
+    ProcessPolicy as ProtoProcessPolicy, SandboxPolicy as ProtoSandboxPolicy,
 };
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -98,17 +96,24 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
     type Error = miette::Report;
 
     fn try_from(proto: ProtoSandboxPolicy) -> Result<Self, Self::Error> {
+        // Derive network mode from presence of network_policies:
+        // if there are network policies, use proxy mode; otherwise block.
+        let network = if proto.network_policies.is_empty() {
+            NetworkPolicy::default()
+        } else {
+            NetworkPolicy {
+                mode: NetworkMode::Proxy,
+                proxy: Some(ProxyPolicy { http_addr: None }),
+            }
+        };
+
         Ok(Self {
             version: proto.version,
             filesystem: proto
                 .filesystem
                 .map(FilesystemPolicy::from)
                 .unwrap_or_default(),
-            network: proto
-                .network
-                .map(NetworkPolicy::try_from)
-                .transpose()?
-                .unwrap_or_default(),
+            network,
             landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
         })
@@ -125,35 +130,12 @@ impl From<ProtoFilesystemPolicy> for FilesystemPolicy {
     }
 }
 
-impl TryFrom<ProtoNetworkPolicy> for NetworkPolicy {
-    type Error = miette::Report;
-
-    fn try_from(proto: ProtoNetworkPolicy) -> Result<Self, Self::Error> {
-        let mode = match proto::NetworkMode::try_from(proto.mode) {
-            Ok(ProtoNetworkMode::Proxy) => NetworkMode::Proxy,
-            Ok(ProtoNetworkMode::Allow) => NetworkMode::Allow,
-            Ok(ProtoNetworkMode::Block | ProtoNetworkMode::Unspecified) | Err(_) => {
-                NetworkMode::Block
-            }
-        };
-
-        let proxy = proto.proxy.map(|p| ProxyPolicy {
-            http_addr: if p.http_addr.is_empty() {
-                None
-            } else {
-                p.http_addr.parse().ok()
-            },
-        });
-
-        Ok(Self { mode, proxy })
-    }
-}
-
 impl From<ProtoLandlockPolicy> for LandlockPolicy {
     fn from(proto: ProtoLandlockPolicy) -> Self {
-        let compatibility = match proto::LandlockCompatibility::try_from(proto.compatibility) {
-            Ok(ProtoLandlockCompat::HardRequirement) => LandlockCompatibility::HardRequirement,
-            _ => LandlockCompatibility::BestEffort,
+        let compatibility = if proto.compatibility == "hard_requirement" {
+            LandlockCompatibility::HardRequirement
+        } else {
+            LandlockCompatibility::BestEffort
         };
         Self { compatibility }
     }

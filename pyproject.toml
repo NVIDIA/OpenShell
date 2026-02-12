@@ -8,6 +8,10 @@ dynamic = ["version"]
 description = "Navigator is the runtime environment for autonomous agents"
 readme = "README.md"
 requires-python = ">=3.12"
+dependencies = [
+    "grpcio>=1.60",
+    "protobuf>=4.25",
+]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
@@ -26,6 +30,7 @@ dev = [
     "ty>=0.0.1a6",
     "maturin>=1.5,<2.0",
     "setuptools-scm>=8",
+    "grpcio-tools>=1.60",
 ]
 
 [tool.uv]
@@ -43,6 +48,7 @@ python-source = "python"
 [tool.ruff]
 target-version = "py312"
 line-length = 88
+exclude = ["python/navigator/_proto"]
 
 [tool.ruff.lint]
 select = [
