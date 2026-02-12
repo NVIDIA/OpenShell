@@ -28,8 +28,34 @@ struct ConnectDecision {
     cmdline_paths: Vec<PathBuf>,
     /// Name of the matched policy rule (allow only).
     matched_policy: Option<String>,
+    /// Which engine made the decision ("opa" or "control_plane").
+    engine: &'static str,
     /// Deny reason or error context.
     reason: String,
+}
+
+/// An endpoint that the proxy always allows without OPA evaluation.
+/// Used for infrastructure endpoints like the navigator control plane.
+#[derive(Debug, Clone)]
+pub struct AllowedEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+/// Parse a URL like `http://host:port` into an `AllowedEndpoint`.
+///
+/// Strips the scheme and extracts host + port. Returns `None` if the
+/// URL can't be parsed.
+pub fn parse_endpoint_url(url: &str) -> Option<AllowedEndpoint> {
+    let without_scheme = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let (host, port_str) = without_scheme.rsplit_once(':')?;
+    let port: u16 = port_str.parse().ok()?;
+    Some(AllowedEndpoint {
+        host: host.to_ascii_lowercase(),
+        port,
+    })
 }
 
 #[derive(Debug)]
@@ -43,13 +69,16 @@ impl ProxyHandle {
     /// Start the proxy with OPA engine for policy evaluation.
     ///
     /// The proxy uses OPA for network decisions with process-identity binding
-    /// via `/proc/net/tcp`.
+    /// via `/proc/net/tcp`. Connections to `control_plane_endpoints` are always
+    /// allowed without OPA evaluation — these are infrastructure endpoints
+    /// (like the navigator server) that the sandbox needs to function.
     pub async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
         opa_engine: Arc<OpaEngine>,
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
+        control_plane_endpoints: Vec<AllowedEndpoint>,
     ) -> Result<Self> {
         // Use override bind_addr or fall back to policy http_addr
         let http_addr = bind_addr.or(policy.http_addr);
@@ -69,6 +98,7 @@ impl ProxyHandle {
         let local_addr = listener.local_addr().into_diagnostic()?;
         info!(addr = %local_addr, "Proxy listening (tcp)");
 
+        let cp_endpoints = Arc::new(control_plane_endpoints);
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -76,8 +106,10 @@ impl ProxyHandle {
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
+                        let cp = cp_endpoints.clone();
                         tokio::spawn(async move {
-                            if let Err(err) = handle_tcp_connection(stream, opa, cache, spid).await
+                            if let Err(err) =
+                                handle_tcp_connection(stream, opa, cache, spid, cp).await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -114,6 +146,7 @@ async fn handle_tcp_connection(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    control_plane_endpoints: Arc<Vec<AllowedEndpoint>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -157,15 +190,34 @@ async fn handle_tcp_connection(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    // Evaluate OPA policy
-    let decision = evaluate_opa_tcp(
-        peer_addr,
-        &opa_engine,
-        &identity_cache,
-        &entrypoint_pid,
-        &host_lc,
-        port,
-    );
+    // Allow control plane endpoints (e.g. navigator server) without OPA evaluation.
+    // These are infrastructure endpoints the sandbox needs to function.
+    let is_control_plane = control_plane_endpoints
+        .iter()
+        .any(|ep| ep.host == host_lc && ep.port == port);
+
+    let decision = if is_control_plane {
+        ConnectDecision {
+            allowed: true,
+            binary: None,
+            binary_pid: None,
+            ancestors: vec![],
+            cmdline_paths: vec![],
+            matched_policy: Some("control_plane".into()),
+            engine: "control_plane",
+            reason: String::new(),
+        }
+    } else {
+        // Evaluate OPA policy with process-identity binding
+        evaluate_opa_tcp(
+            peer_addr,
+            &opa_engine,
+            &identity_cache,
+            &entrypoint_pid,
+            &host_lc,
+            port,
+        )
+    };
 
     // Unified log line: one info! per CONNECT with full context
     let action = if decision.allowed { "allow" } else { "deny" };
@@ -209,7 +261,7 @@ async fn handle_tcp_connection(
         ancestors = %ancestors_str,
         cmdline = %cmdline_str,
         action = %action,
-        engine = "opa",
+        engine = %decision.engine,
         policy = %policy_str,
         reason = %decision.reason,
         "CONNECT",
@@ -255,6 +307,7 @@ fn evaluate_opa_tcp(
             ancestors: vec![],
             cmdline_paths: vec![],
             matched_policy: None,
+            engine: "opa",
             reason: "entrypoint process not yet spawned".into(),
         };
     }
@@ -270,6 +323,7 @@ fn evaluate_opa_tcp(
                 ancestors: vec![],
                 cmdline_paths: vec![],
                 matched_policy: None,
+                engine: "opa",
                 reason: format!("failed to resolve peer binary: {e}"),
             };
         }
@@ -286,6 +340,7 @@ fn evaluate_opa_tcp(
                 ancestors: vec![],
                 cmdline_paths: vec![],
                 matched_policy: None,
+                engine: "opa",
                 reason: format!("binary integrity check failed: {e}"),
             };
         }
@@ -304,6 +359,7 @@ fn evaluate_opa_tcp(
                 ancestors: ancestors.clone(),
                 cmdline_paths: vec![],
                 matched_policy: None,
+                engine: "opa",
                 reason: format!(
                     "ancestor integrity check failed for {}: {e}",
                     ancestor.display()
@@ -335,6 +391,7 @@ fn evaluate_opa_tcp(
             ancestors,
             cmdline_paths,
             matched_policy: decision.matched_policy,
+            engine: "opa",
             reason: decision.reason,
         },
         Err(e) => ConnectDecision {
@@ -344,6 +401,7 @@ fn evaluate_opa_tcp(
             ancestors,
             cmdline_paths,
             matched_policy: None,
+            engine: "opa",
             reason: format!("policy evaluation error: {e}"),
         },
     }
@@ -366,6 +424,7 @@ fn evaluate_opa_tcp(
         ancestors: vec![],
         cmdline_paths: vec![],
         matched_policy: None,
+        engine: "opa",
         reason: "identity binding unavailable on this platform".into(),
     }
 }

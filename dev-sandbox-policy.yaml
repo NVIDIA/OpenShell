@@ -47,3 +47,4 @@ network_policies:
       - { host: gitlab.mycorp.com, port: 443 }
     binaries:
       - { path: /usr/bin/glab }
+

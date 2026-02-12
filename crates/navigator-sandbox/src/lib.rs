@@ -54,6 +54,7 @@ pub async fn run_sandbox(
         .ok_or_else(|| miette::miette!("No command specified"))?;
 
     // Load policy and initialize OPA engine
+    let navigator_endpoint_for_proxy = navigator_endpoint.clone();
     let (policy, opa_engine) =
         load_policy(sandbox_id, navigator_endpoint, rego_policy, rego_data).await?;
 
@@ -65,28 +66,9 @@ pub async fn run_sandbox(
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
 
-    if let Some(listen_addr) = ssh_listen_addr {
-        let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
-        let policy_clone = policy.clone();
-        let workdir_clone = workdir.clone();
-        let secret = ssh_handshake_secret.unwrap_or_default();
-        tokio::spawn(async move {
-            if let Err(err) = ssh::run_ssh_server(
-                addr,
-                policy_clone,
-                workdir_clone,
-                secret,
-                ssh_handshake_skew_secs,
-            )
-            .await
-            {
-                tracing::error!(error = %err, "SSH server failed");
-            }
-        });
-    }
-
     // Create network namespace for proxy mode (Linux only)
-    // This must be created before the proxy so the proxy can bind to the veth IP
+    // This must be created before the proxy AND SSH server so that SSH
+    // sessions can enter the namespace for network isolation.
     #[cfg(target_os = "linux")]
     let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
         match NetworkNamespace::create() {
@@ -137,6 +119,14 @@ pub async fn run_sandbox(
         #[cfg(not(target_os = "linux"))]
         let bind_addr: Option<SocketAddr> = None;
 
+        // Build the control plane allowlist: the navigator endpoint is always
+        // allowed so sandbox processes can reach the server for inference.
+        let control_plane_endpoints = navigator_endpoint_for_proxy
+            .as_deref()
+            .and_then(proxy::parse_endpoint_url)
+            .into_iter()
+            .collect::<Vec<_>>();
+
         Some(
             ProxyHandle::start_with_bind_addr(
                 proxy_policy,
@@ -144,12 +134,75 @@ pub async fn run_sandbox(
                 engine,
                 cache,
                 entrypoint_pid.clone(),
+                control_plane_endpoints,
             )
             .await?,
         )
     } else {
         None
     };
+
+    // Compute the proxy URL and netns fd for SSH sessions.
+    // SSH shell processes need both to enforce network policy:
+    // - netns_fd: enter the network namespace via setns() so all traffic
+    //   goes through the veth pair (hard enforcement, non-bypassable)
+    // - proxy_url: set HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars so
+    //   cooperative tools (curl, etc.) route through the CONNECT proxy
+    #[cfg(target_os = "linux")]
+    let ssh_netns_fd = netns.as_ref().and_then(|ns| ns.ns_fd());
+
+    #[cfg(not(target_os = "linux"))]
+    let ssh_netns_fd: Option<i32> = None;
+
+    let ssh_proxy_url = if matches!(policy.network.mode, NetworkMode::Proxy) {
+        #[cfg(target_os = "linux")]
+        {
+            netns.as_ref().map(|ns| {
+                let port = policy
+                    .network
+                    .proxy
+                    .as_ref()
+                    .and_then(|p| p.http_addr)
+                    .map_or(3128, |addr| addr.port());
+                format!("http://{}:{port}", ns.host_ip())
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            policy
+                .network
+                .proxy
+                .as_ref()
+                .and_then(|p| p.http_addr)
+                .map(|addr| format!("http://{addr}"))
+        }
+    } else {
+        None
+    };
+
+    if let Some(listen_addr) = ssh_listen_addr {
+        let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
+        let policy_clone = policy.clone();
+        let workdir_clone = workdir.clone();
+        let secret = ssh_handshake_secret.unwrap_or_default();
+        let proxy_url = ssh_proxy_url;
+        let netns_fd = ssh_netns_fd;
+        tokio::spawn(async move {
+            if let Err(err) = ssh::run_ssh_server(
+                addr,
+                policy_clone,
+                workdir_clone,
+                secret,
+                ssh_handshake_skew_secs,
+                netns_fd,
+                proxy_url,
+            )
+            .await
+            {
+                tracing::error!(error = %err, "SSH server failed");
+            }
+        });
+    }
 
     #[cfg(target_os = "linux")]
     let mut handle = ProcessHandle::spawn(

@@ -28,6 +28,8 @@ pub async fn run_ssh_server(
     workdir: Option<String>,
     handshake_secret: String,
     handshake_skew_secs: u64,
+    netns_fd: Option<RawFd>,
+    proxy_url: Option<String>,
 ) -> Result<()> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
@@ -48,6 +50,7 @@ pub async fn run_ssh_server(
         let policy = policy.clone();
         let workdir = workdir.clone();
         let secret = handshake_secret.clone();
+        let proxy_url = proxy_url.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -58,6 +61,8 @@ pub async fn run_ssh_server(
                 workdir,
                 &secret,
                 handshake_skew_secs,
+                netns_fd,
+                proxy_url,
             )
             .await
             {
@@ -75,6 +80,8 @@ async fn handle_connection(
     workdir: Option<String>,
     secret: &str,
     handshake_skew_secs: u64,
+    netns_fd: Option<RawFd>,
+    proxy_url: Option<String>,
 ) -> Result<()> {
     let mut line = String::new();
     read_line(&mut stream, &mut line).await?;
@@ -85,7 +92,7 @@ async fn handle_connection(
     stream.write_all(b"OK\n").await.into_diagnostic()?;
     info!(peer = %peer, "SSH handshake accepted");
 
-    let handler = SshHandler::new(policy, workdir);
+    let handler = SshHandler::new(policy, workdir, netns_fd, proxy_url);
     russh::server::run_stream(config, stream, handler)
         .await
         .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
@@ -152,16 +159,25 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
 struct SshHandler {
     policy: SandboxPolicy,
     workdir: Option<String>,
+    netns_fd: Option<RawFd>,
+    proxy_url: Option<String>,
     input_sender: Option<mpsc::Sender<Vec<u8>>>,
     pty_master: Option<std::fs::File>,
     pty_request: Option<PtyRequest>,
 }
 
 impl SshHandler {
-    fn new(policy: SandboxPolicy, workdir: Option<String>) -> Self {
+    fn new(
+        policy: SandboxPolicy,
+        workdir: Option<String>,
+        netns_fd: Option<RawFd>,
+        proxy_url: Option<String>,
+    ) -> Self {
         Self {
             policy,
             workdir,
+            netns_fd,
+            proxy_url,
             input_sender: None,
             pty_master: None,
             pty_request: None,
@@ -288,6 +304,8 @@ impl SshHandler {
             &pty,
             handle,
             channel,
+            self.netns_fd,
+            self.proxy_url.clone(),
         )?;
         self.pty_master = Some(pty_master);
         self.input_sender = Some(input_sender);
@@ -323,6 +341,8 @@ fn spawn_pty_shell(
     pty: &PtyRequest,
     handle: Handle,
     channel: ChannelId,
+    netns_fd: Option<RawFd>,
+    proxy_url: Option<String>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
@@ -368,13 +388,32 @@ fn spawn_pty_shell(
         .env("USER", "sandbox")
         .env("TERM", term);
 
+    // Set proxy environment variables so cooperative tools (curl, wget, etc.)
+    // route traffic through the CONNECT proxy for OPA policy evaluation.
+    // Both uppercase and lowercase variants are needed: curl/wget use uppercase,
+    // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy first.
+    if let Some(ref url) = proxy_url {
+        cmd.env("HTTP_PROXY", url)
+            .env("HTTPS_PROXY", url)
+            .env("ALL_PROXY", url)
+            .env("http_proxy", url)
+            .env("https_proxy", url)
+            .env("grpc_proxy", url);
+    }
+
     if let Some(dir) = workdir.as_deref() {
         cmd.current_dir(dir);
     }
 
     #[cfg(unix)]
     {
-        unsafe_pty::install_pre_exec(&mut cmd, policy.clone(), workdir.clone(), slave_fd);
+        unsafe_pty::install_pre_exec(
+            &mut cmd,
+            policy.clone(),
+            workdir.clone(),
+            slave_fd,
+            netns_fd,
+        );
     }
 
     let mut child = cmd.spawn()?;
@@ -468,11 +507,28 @@ mod unsafe_pty {
         policy: SandboxPolicy,
         workdir: Option<String>,
         slave_fd: RawFd,
+        netns_fd: Option<RawFd>,
     ) {
         unsafe {
             cmd.pre_exec(move || {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
                 set_controlling_tty(slave_fd)?;
+
+                // Enter network namespace before dropping privileges.
+                // This ensures SSH shell processes are isolated to the same
+                // network namespace as the entrypoint, forcing all traffic
+                // through the veth pair and CONNECT proxy.
+                #[cfg(target_os = "linux")]
+                if let Some(fd) = netns_fd {
+                    let result = libc::setns(fd, libc::CLONE_NEWNET);
+                    if result != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                let _ = netns_fd;
+
                 // Drop privileges before applying sandbox restrictions.
                 // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
                 // which may be blocked by Landlock.

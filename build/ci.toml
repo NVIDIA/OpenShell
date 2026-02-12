@@ -23,6 +23,7 @@ fi
 docker run ${TTY_FLAG} \
   --cap-add=SYS_ADMIN \
   --cap-add=NET_ADMIN \
+  --cap-add=SYS_PTRACE \
   -v ${PWD}/dev-sandbox-policy.yaml:/var/navigator/policy.yaml:ro \
   -v ${PWD}/tmp:/sandbox/tmp \
   -e HOME=/sandbox \

@@ -93,14 +93,22 @@ impl ProcessHandle {
                 // The proxy is on 10.200.0.1:3128 (or configured port)
                 let port = proxy.http_addr.map_or(3128, |addr| addr.port());
                 let proxy_url = format!("http://10.200.0.1:{port}");
+                // Both uppercase and lowercase variants: curl/wget use uppercase,
+                // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy.
                 cmd.env("ALL_PROXY", &proxy_url)
                     .env("HTTP_PROXY", &proxy_url)
-                    .env("HTTPS_PROXY", &proxy_url);
+                    .env("HTTPS_PROXY", &proxy_url)
+                    .env("http_proxy", &proxy_url)
+                    .env("https_proxy", &proxy_url)
+                    .env("grpc_proxy", &proxy_url);
             } else if let Some(http_addr) = proxy.http_addr {
                 let proxy_url = format!("http://{http_addr}");
                 cmd.env("ALL_PROXY", &proxy_url)
                     .env("HTTP_PROXY", &proxy_url)
-                    .env("HTTPS_PROXY", &proxy_url);
+                    .env("HTTPS_PROXY", &proxy_url)
+                    .env("http_proxy", &proxy_url)
+                    .env("https_proxy", &proxy_url)
+                    .env("grpc_proxy", &proxy_url);
             }
         }
 

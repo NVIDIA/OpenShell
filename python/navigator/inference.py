@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 
 import grpc
@@ -7,6 +8,8 @@ import grpc
 from navigator._proto import inference_pb2, inference_pb2_grpc
 
 SANDBOX_ID_HEADER = "x-sandbox-id"
+ENDPOINT_ENV = "NAVIGATOR_ENDPOINT"
+SANDBOX_ID_ENV = "NAVIGATOR_SANDBOX_ID"
 
 
 @dataclass
@@ -42,8 +45,28 @@ class CompletionResponse:
 class Inference:
     """Client for the Navigator Inference gRPC service."""
 
-    def __init__(self, endpoint: str, *, sandbox_id: str = "") -> None:
-        self._channel = grpc.insecure_channel(endpoint)
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        *,
+        sandbox_id: str | None = None,
+    ) -> None:
+        endpoint = endpoint or os.environ.get(ENDPOINT_ENV, "")
+        if not endpoint:
+            raise ValueError(f"endpoint must be provided or set via ${ENDPOINT_ENV}")
+        sandbox_id = (
+            sandbox_id if sandbox_id is not None else os.environ.get(SANDBOX_ID_ENV, "")
+        )
+
+        # grpc.insecure_channel expects host:port, not a URL with scheme.
+        # Strip http:// prefix if present to avoid malformed CONNECT targets
+        # when gRPC routes through an HTTP proxy.
+        target = endpoint
+        for prefix in ("http://", "https://"):
+            if target.startswith(prefix):
+                target = target[len(prefix) :]
+                break
+        self._channel = grpc.insecure_channel(target)
         self._stub = inference_pb2_grpc.InferenceStub(self._channel)
         self._sandbox_id = sandbox_id
 

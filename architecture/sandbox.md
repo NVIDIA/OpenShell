@@ -108,6 +108,12 @@ The implementation lives in `crates/navigator-sandbox/src/sandbox/linux/netns.rs
 
 - `CAP_SYS_ADMIN`: Required for creating namespaces and mount operations
 - `CAP_NET_ADMIN`: Required for creating veth pairs and configuring interfaces
+- `CAP_SYS_PTRACE`: Required for the CONNECT proxy to read `/proc/<pid>/fd/` and
+  `/proc/<pid>/exe` of sandbox-user processes. The proxy resolves binary identity by mapping
+  TCP socket inodes (from `/proc/<entrypoint>/net/tcp{,6}`) to process file descriptors,
+  then reading the executable symlink. Without this capability, the kernel blocks access to
+  `/proc/<pid>/fd/` for processes running as a different user (the proxy runs as root,
+  sandboxed processes run as the `sandbox` user).
 - `iproute2` package: Provides the `ip` command for namespace/interface setup
 
 If namespace creation fails (e.g., missing capabilities), the sandbox logs a warning and continues
@@ -118,8 +124,11 @@ production deployments should ensure capabilities are granted.
 
 The sandbox exports proxy configuration to the child process:
 
-- `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`: Set to `http://10.200.0.1:3128` (with netns) or
-  `http://127.0.0.1:3128` (without netns)
+- `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY`: Uppercase variants for curl, wget, and similar tools
+- `http_proxy` / `https_proxy` / `grpc_proxy`: Lowercase variants for gRPC C-core (libgrpc),
+  which checks lowercase first
+
+All set to `http://10.200.0.1:3128` (with netns) or `http://127.0.0.1:3128` (without netns).
 
 ## Process Privileges
 

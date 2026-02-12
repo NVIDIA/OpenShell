@@ -152,7 +152,11 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
     paths
 }
 
-/// Parse `/proc/<pid>/net/tcp` to find the socket inode for a given local port.
+/// Parse `/proc/<pid>/net/tcp` (and `/proc/<pid>/net/tcp6`) to find the socket
+/// inode for a given local port.
+///
+/// Checks both IPv4 and IPv6 tables because some clients (notably gRPC C-core)
+/// use AF_INET6 sockets with IPv4-mapped addresses even for IPv4 connections.
 ///
 /// Format of `/proc/net/tcp`:
 /// ```text
@@ -164,41 +168,49 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 /// - Inode is field index 9 (0-indexed)
 #[cfg(target_os = "linux")]
 fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
-    let path = format!("/proc/{pid}/net/tcp");
-    let content = std::fs::read_to_string(&path).into_diagnostic()?;
-
-    for line in content.lines().skip(1) {
-        let fields: Vec<&str> = line.split_whitespace().collect();
-        if fields.len() < 10 {
-            continue;
-        }
-
-        // Parse local_address to extract port
-        let local_addr = fields[1];
-        let local_port = match local_addr.split_once(':') {
-            Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
-            None => continue,
+    // Check IPv4 first (most common), then IPv6.
+    for suffix in &["tcp", "tcp6"] {
+        let path = format!("/proc/{pid}/net/{suffix}");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => continue,
         };
 
-        // Check state is ESTABLISHED (01)
-        let state = fields[3];
-        if state != "01" {
-            continue;
-        }
-
-        if local_port == peer_port {
-            let inode: u64 = fields[9]
-                .parse()
-                .map_err(|_| miette::miette!("Failed to parse inode from {}", fields[9]))?;
-            if inode == 0 {
+        for line in content.lines().skip(1) {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            if fields.len() < 10 {
                 continue;
             }
-            return Ok(inode);
+
+            // Parse local_address to extract port.
+            // IPv4 format: AABBCCDD:PORT
+            // IPv6 format: 00000000000000000000000000000000:PORT
+            let local_addr = fields[1];
+            let local_port = match local_addr.rsplit_once(':') {
+                Some((_, port_hex)) => u16::from_str_radix(port_hex, 16).unwrap_or(0),
+                None => continue,
+            };
+
+            // Check state is ESTABLISHED (01)
+            let state = fields[3];
+            if state != "01" {
+                continue;
+            }
+
+            if local_port == peer_port {
+                let inode: u64 = fields[9]
+                    .parse()
+                    .map_err(|_| miette::miette!("Failed to parse inode from {}", fields[9]))?;
+                if inode == 0 {
+                    continue;
+                }
+                return Ok(inode);
+            }
         }
     }
 
     Err(miette::miette!(
-        "No ESTABLISHED TCP connection found for port {} in /proc/{}/net/tcp",
+        "No ESTABLISHED TCP connection found for port {} in /proc/{}/net/tcp{{,6}}",
         peer_port,
         pid
     ))
