@@ -1,7 +1,8 @@
 use navigator_cli::tls::{TlsOptions, grpc_client};
 use navigator_core::proto::{
-    CreateSshSessionRequest, CreateSshSessionResponse, HealthRequest, HealthResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
+    CreateSshSessionRequest, CreateSshSessionResponse, ExecSandboxEvent, ExecSandboxRequest,
+    HealthRequest, HealthResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    ServiceStatus,
     navigator_server::{Navigator, NavigatorServer},
 };
 use rcgen::{
@@ -9,6 +10,7 @@ use rcgen::{
 };
 use tempfile::tempdir;
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::{
     Response, Status,
@@ -69,8 +71,8 @@ impl Navigator for TestNavigator {
         &self,
         _request: tonic::Request<navigator_core::proto::CreateSandboxRequest>,
     ) -> Result<Response<navigator_core::proto::SandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "create_sandbox not implemented in test",
+        Ok(Response::new(
+            navigator_core::proto::SandboxResponse::default(),
         ))
     }
 
@@ -78,15 +80,17 @@ impl Navigator for TestNavigator {
         &self,
         _request: tonic::Request<navigator_core::proto::GetSandboxRequest>,
     ) -> Result<Response<navigator_core::proto::SandboxResponse>, Status> {
-        Err(Status::unimplemented("get_sandbox not implemented in test"))
+        Ok(Response::new(
+            navigator_core::proto::SandboxResponse::default(),
+        ))
     }
 
     async fn list_sandboxes(
         &self,
         _request: tonic::Request<navigator_core::proto::ListSandboxesRequest>,
     ) -> Result<Response<navigator_core::proto::ListSandboxesResponse>, Status> {
-        Err(Status::unimplemented(
-            "list_sandboxes not implemented in test",
+        Ok(Response::new(
+            navigator_core::proto::ListSandboxesResponse::default(),
         ))
     }
 
@@ -94,8 +98,8 @@ impl Navigator for TestNavigator {
         &self,
         _request: tonic::Request<navigator_core::proto::DeleteSandboxRequest>,
     ) -> Result<Response<navigator_core::proto::DeleteSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "delete_sandbox not implemented in test",
+        Ok(Response::new(
+            navigator_core::proto::DeleteSandboxResponse { deleted: true },
         ))
     }
 
@@ -103,8 +107,8 @@ impl Navigator for TestNavigator {
         &self,
         _request: tonic::Request<navigator_core::proto::GetSandboxPolicyRequest>,
     ) -> Result<Response<navigator_core::proto::GetSandboxPolicyResponse>, Status> {
-        Err(Status::unimplemented(
-            "get_sandbox_policy not implemented in test",
+        Ok(Response::new(
+            navigator_core::proto::GetSandboxPolicyResponse::default(),
         ))
     }
 
@@ -112,31 +116,40 @@ impl Navigator for TestNavigator {
         &self,
         _request: tonic::Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        Err(Status::unimplemented(
-            "create_ssh_session not implemented in test",
-        ))
+        Ok(Response::new(CreateSshSessionResponse::default()))
     }
 
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        Err(Status::unimplemented(
-            "revoke_ssh_session not implemented in test",
-        ))
+        Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
     type WatchSandboxStream = tokio_stream::wrappers::ReceiverStream<
         Result<navigator_core::proto::SandboxStreamEvent, Status>,
     >;
+    type ExecSandboxStream =
+        tokio_stream::wrappers::ReceiverStream<Result<ExecSandboxEvent, Status>>;
 
     async fn watch_sandbox(
         &self,
         _request: tonic::Request<navigator_core::proto::WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        Err(Status::unimplemented(
-            "watch_sandbox not implemented in test",
-        ))
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
+    }
+
+    async fn exec_sandbox(
+        &self,
+        _request: tonic::Request<ExecSandboxRequest>,
+    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(Response::new(tokio_stream::wrappers::ReceiverStream::new(
+            rx,
+        )))
     }
 }
 

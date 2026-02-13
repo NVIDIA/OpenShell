@@ -7,15 +7,16 @@ use hyper_util::{
 };
 use navigator_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, GetSandboxPolicyRequest, GetSandboxPolicyResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListSandboxesRequest, ListSandboxesResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceStatus, WatchSandboxRequest,
+    DeleteSandboxResponse, ExecSandboxEvent, ExecSandboxRequest, GetSandboxPolicyRequest,
+    GetSandboxPolicyResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    ListSandboxesRequest, ListSandboxesResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, WatchSandboxRequest,
     navigator_client::NavigatorClient,
     navigator_server::{Navigator, NavigatorServer},
 };
 use navigator_server::{MultiplexedService, health_router};
 use tokio::net::TcpListener;
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Response, Status};
 
@@ -38,72 +39,68 @@ impl Navigator for TestNavigator {
         &self,
         _request: tonic::Request<CreateSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "create_sandbox not implemented in test",
-        ))
+        Ok(Response::new(SandboxResponse::default()))
     }
 
     async fn get_sandbox(
         &self,
         _request: tonic::Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        Err(Status::unimplemented("get_sandbox not implemented in test"))
+        Ok(Response::new(SandboxResponse::default()))
     }
 
     async fn list_sandboxes(
         &self,
         _request: tonic::Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
-        Err(Status::unimplemented(
-            "list_sandboxes not implemented in test",
-        ))
+        Ok(Response::new(ListSandboxesResponse::default()))
     }
 
     async fn delete_sandbox(
         &self,
         _request: tonic::Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        Err(Status::unimplemented(
-            "delete_sandbox not implemented in test",
-        ))
+        Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
     async fn get_sandbox_policy(
         &self,
         _request: tonic::Request<GetSandboxPolicyRequest>,
     ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
-        Err(Status::unimplemented(
-            "get_sandbox_policy not implemented in test",
-        ))
+        Ok(Response::new(GetSandboxPolicyResponse::default()))
     }
 
     async fn create_ssh_session(
         &self,
         _request: tonic::Request<CreateSshSessionRequest>,
     ) -> Result<Response<CreateSshSessionResponse>, Status> {
-        Err(Status::unimplemented(
-            "create_ssh_session not implemented in test",
-        ))
+        Ok(Response::new(CreateSshSessionResponse::default()))
     }
 
     async fn revoke_ssh_session(
         &self,
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
-        Err(Status::unimplemented(
-            "revoke_ssh_session not implemented in test",
-        ))
+        Ok(Response::new(RevokeSshSessionResponse::default()))
     }
 
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
+    type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
 
     async fn watch_sandbox(
         &self,
         _request: tonic::Request<WatchSandboxRequest>,
     ) -> Result<Response<Self::WatchSandboxStream>, Status> {
-        Err(Status::unimplemented(
-            "watch_sandbox not implemented in test",
-        ))
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn exec_sandbox(
+        &self,
+        _request: tonic::Request<ExecSandboxRequest>,
+    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        let (_tx, rx) = mpsc::channel(1);
+        Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
 

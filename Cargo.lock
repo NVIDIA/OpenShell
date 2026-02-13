@@ -2678,6 +2678,7 @@ dependencies = [
  "prost",
  "prost-types",
  "rcgen",
+ "russh",
  "rustls",
  "rustls-pemfile",
  "serde",

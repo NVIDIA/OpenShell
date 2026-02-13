@@ -10,5 +10,12 @@ run = "cargo test --workspace"
 
 ["test:python"]
 description = "Run Python tests"
+depends = ["python:proto"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run pytest python/"
+
+["test:e2e:sandbox"]
+description = "Run sandbox end-to-end tests"
+depends = ["python:proto"]
+env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
+run = "uv run pytest -o python_files='test_*.py' e2e/python"

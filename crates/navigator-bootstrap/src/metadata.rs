@@ -23,7 +23,10 @@ pub struct ClusterMetadata {
 
 pub fn create_cluster_metadata(name: &str, remote: Option<&RemoteOptions>) -> ClusterMetadata {
     let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
-        || ("https://127.0.0.1".to_string(), false, None, None),
+        || {
+            let host = local_gateway_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            (format!("https://{host}"), false, None, None)
+        },
         |opts| {
             // Extract the host portion from the SSH destination, then resolve it
             // via `ssh -G` to get the actual hostname/IP (handles SSH config aliases).
@@ -46,6 +49,33 @@ pub fn create_cluster_metadata(name: &str, remote: Option<&RemoteOptions>) -> Cl
         remote_host,
         resolved_host,
     }
+}
+
+pub(crate) fn local_gateway_host() -> Option<String> {
+    std::env::var("DOCKER_HOST")
+        .ok()
+        .and_then(|value| local_gateway_host_from_docker_host(&value))
+}
+
+pub(crate) fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> {
+    let target = docker_host.strip_prefix("tcp://")?;
+    let authority = target.split('/').next()?;
+    if authority.is_empty() {
+        return None;
+    }
+
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    }
+    .trim();
+
+    if host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+        return None;
+    }
+
+    Some(host.to_string())
 }
 
 fn stored_metadata_path(name: &str) -> Result<PathBuf> {
@@ -267,6 +297,24 @@ mod tests {
         assert!(!meta.is_remote);
         assert!(meta.remote_host.is_none());
         assert!(meta.resolved_host.is_none());
+    }
+
+    #[test]
+    fn local_gateway_host_from_docker_host_tcp_service_name() {
+        let host = local_gateway_host_from_docker_host("tcp://docker:2375");
+        assert_eq!(host.as_deref(), Some("docker"));
+    }
+
+    #[test]
+    fn local_gateway_host_from_docker_host_tcp_loopback() {
+        let host = local_gateway_host_from_docker_host("tcp://127.0.0.1:2375");
+        assert!(host.is_none());
+    }
+
+    #[test]
+    fn local_gateway_host_from_docker_host_unix_socket() {
+        let host = local_gateway_host_from_docker_host("unix:///var/run/docker.sock");
+        assert!(host.is_none());
     }
 
     #[test]

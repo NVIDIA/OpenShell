@@ -18,8 +18,7 @@ variables:
 default:
   image: $CI_IMAGE
   tags:
-    - os/linux
-    - type/docker
+    - agent-dev-kit-build
 
 cache:
   key: "$CI_COMMIT_REF_SLUG"
@@ -40,8 +39,7 @@ build_ci_image:
   services:
     - docker:24-dind
   tags:
-    - os/linux
-    - type/docker
+    - agent-dev-kit-build
   variables:
     DOCKER_TLS_CERTDIR: "/certs"
     DOCKER_BUILDKIT: "1"
@@ -90,6 +88,30 @@ python_test:
   script:
     - mise run test:python
 
+python_e2e_sandbox_test:
+  stage: test
+  services:
+    - docker:24-dind
+  tags:
+    - agent-dev-kit-build
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_TLS_VERIFY: ""
+    DOCKER_CERT_PATH: ""
+  before_script:
+    - uv sync --frozen
+    - apt-get update -qq && apt-get install -y -qq socat >/dev/null
+    - curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | tar xz --strip-components=1 -C /usr/local/bin docker/docker
+    - mkdir -p /usr/local/lib/docker/cli-plugins
+    - curl -fsSL https://github.com/docker/buildx/releases/download/v0.21.1/buildx-v0.21.1.linux-amd64 -o /usr/local/lib/docker/cli-plugins/docker-buildx
+    - chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+  script:
+    - socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
+    - sleep 1
+    - mise run cluster
+    - mise run test:e2e:sandbox
+
 # =============================================================================
 # Publish Jobs (main branch only)
 # =============================================================================
@@ -98,11 +120,7 @@ publish_ecr_images:
   services:
     - docker:24-dind
   tags:
-    - os/linux
-    - perflab
-    - ran-as/container
-    - size/large
-    - type/docker
+    - agent-dev-kit-build
   variables:
     DOCKER_HOST: tcp://docker:2375
     DOCKER_TLS_CERTDIR: ""

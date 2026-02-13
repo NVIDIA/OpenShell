@@ -126,10 +126,49 @@ fi
 # When IMAGE_PULL_POLICY is set, override the default "Always" so k3s uses
 # images already present in containerd instead of pulling from the registry.
 HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
+
+# In push mode, use the exact image references that were imported into cluster
+# containerd so the Helm release cannot drift back to remote ":latest" tags.
+if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
+    server_image=""
+    sandbox_image=""
+    pki_job_image=""
+    old_ifs="$IFS"
+    IFS=','
+    for ref in $PUSH_IMAGE_REFS; do
+        case "$ref" in
+            */server:*) server_image="$ref" ;;
+            */sandbox:*) sandbox_image="$ref" ;;
+            */pki-job:*) pki_job_image="$ref" ;;
+        esac
+    done
+    IFS="$old_ifs"
+
+    if [ -n "$server_image" ]; then
+        server_repo="${server_image%:*}"
+        server_tag="${server_image##*:}"
+        echo "Setting server image repository: ${server_repo}"
+        echo "Setting server image tag: ${server_tag}"
+        sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${server_repo}|" "$HELMCHART"
+        sed -i -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${server_tag}\"|" "$HELMCHART"
+    fi
+
+    if [ -n "$sandbox_image" ]; then
+        echo "Setting sandbox image: ${sandbox_image}"
+        sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${sandbox_image}|" "$HELMCHART"
+    fi
+
+    if [ -n "$pki_job_image" ]; then
+        echo "Setting pki job image: ${pki_job_image}"
+        sed -i -E "s|jobImage:[[:space:]]*[^[:space:]]+|jobImage: ${pki_job_image}|" "$HELMCHART"
+    fi
+fi
+
 if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
     echo "Overriding component image tag to: ${IMAGE_TAG}"
     # server image tag (standalone value field)
-    sed -i "s|tag: latest|tag: ${IMAGE_TAG}|" "$HELMCHART"
+    # Handle both quoted and unquoted defaults: tag: "latest" / tag: latest
+    sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
     # sandbox image (inline tag in image reference)
     sed -i "s|sandbox:latest|sandbox:${IMAGE_TAG}|" "$HELMCHART"
     # pki-job image (inline tag in image reference)

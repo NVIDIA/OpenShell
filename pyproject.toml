@@ -9,6 +9,7 @@ description = "Navigator is the runtime environment for autonomous agents"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "cloudpickle>=3.0",
     "grpcio>=1.60",
     "protobuf>=4.25",
 ]

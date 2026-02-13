@@ -351,6 +351,49 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
     Ok(count)
 }
 
+/// Restart the navigator deployment so pods resolve freshly imported local images.
+pub async fn restart_navigator_deployment(docker: &Docker, name: &str) -> Result<()> {
+    let container_name = container_name(name);
+
+    let (restart_output, restart_exit) = exec_capture_with_exit(
+        docker,
+        &container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout restart deployment/navigator -n navigator"
+            ),
+        ],
+    )
+    .await?;
+    if restart_exit != 0 {
+        return Err(miette::miette!(
+            "failed to restart navigator deployment (exit code {restart_exit})\n{restart_output}"
+        ));
+    }
+
+    let (status_output, status_exit) = exec_capture_with_exit(
+        docker,
+        &container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status deployment/navigator -n navigator --timeout=180s"
+            ),
+        ],
+    )
+    .await?;
+    if status_exit != 0 {
+        return Err(miette::miette!(
+            "navigator rollout status failed (exit code {status_exit})\n{status_output}"
+        ));
+    }
+
+    Ok(())
+}
+
 fn is_valid_kubeconfig(output: &str) -> bool {
     output.contains("apiVersion:") && output.contains("clusters:")
 }

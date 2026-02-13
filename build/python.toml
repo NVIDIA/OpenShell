@@ -2,14 +2,17 @@
 
 ["python:dev"]
 description = "Install Python package in development mode (builds CLI binary)"
+depends = ["python:proto"]
 run = "uv sync --group dev && uv pip install ."
 
 ["python:build"]
 description = "Build Python wheel with CLI binary (native)"
+depends = ["python:proto"]
 run = "uv run maturin build --release"
 
 ["python:build:linux-x86"]
 description = "Build Python wheel for Linux x86_64"
+depends = ["python:proto"]
 run = """
 docker run --rm --platform linux/amd64 -v $(pwd):/io -w /io \
   ghcr.io/pyo3/maturin build --release
@@ -17,6 +20,7 @@ docker run --rm --platform linux/amd64 -v $(pwd):/io -w /io \
 
 ["python:build:linux-arm"]
 description = "Build Python wheel for Linux aarch64"
+depends = ["python:proto"]
 run = """
 docker run --rm --platform linux/arm64 -v $(pwd):/io -w /io \
   ghcr.io/pyo3/maturin build --release
@@ -28,6 +32,7 @@ depends = ["python:build", "python:build:linux-x86", "python:build:linux-arm"]
 
 ["python:lint"]
 description = "Lint Python code with ruff"
+depends = ["python:proto"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run ruff check {{vars.python_paths}}"
 
@@ -37,6 +42,7 @@ run = "uv run ruff format {{vars.python_paths}}"
 
 ["python:typecheck"]
 description = "Type check Python code with ty"
+depends = ["python:proto"]
 run = "uv run ty check {{vars.python_paths}}"
 
 ["python:proto"]
@@ -50,8 +56,42 @@ uv run python -m grpc_tools.protoc \
   --python_out=python/navigator/_proto \
   --pyi_out=python/navigator/_proto \
   --grpc_python_out=python/navigator/_proto \
-  proto/inference.proto
-# Fix absolute imports in generated gRPC stubs to use relative imports
-sed -i '' 's/^import inference_pb2/from . import inference_pb2/' \
-  python/navigator/_proto/inference_pb2_grpc.py
+  proto/inference.proto \
+  proto/navigator.proto \
+  proto/datamodel.proto \
+  proto/sandbox.proto
+# Fix absolute imports in generated stubs to use package-relative imports
+uv run python - <<'PY'
+from pathlib import Path
+
+replacements = {
+    "python/navigator/_proto/inference_pb2_grpc.py": [
+        ("import inference_pb2", "from . import inference_pb2"),
+    ],
+    "python/navigator/_proto/navigator_pb2_grpc.py": [
+        ("import navigator_pb2", "from . import navigator_pb2"),
+        ("import sandbox_pb2", "from . import sandbox_pb2"),
+    ],
+    "python/navigator/_proto/navigator_pb2.py": [
+        ("import datamodel_pb2", "from . import datamodel_pb2"),
+        ("import sandbox_pb2", "from . import sandbox_pb2"),
+    ],
+    "python/navigator/_proto/datamodel_pb2.py": [
+        ("import sandbox_pb2", "from . import sandbox_pb2"),
+    ],
+    "python/navigator/_proto/datamodel_pb2_grpc.py": [
+        ("import datamodel_pb2", "from . import datamodel_pb2"),
+    ],
+    "python/navigator/_proto/sandbox_pb2_grpc.py": [
+        ("import sandbox_pb2", "from . import sandbox_pb2"),
+    ],
+}
+
+for path, rules in replacements.items():
+    file_path = Path(path)
+    text = file_path.read_text()
+    for before, after in rules:
+        text = text.replace(before, after)
+    file_path.write_text(text)
+PY
 """

@@ -25,6 +25,13 @@ Diagnose why a navigator cluster failed to start after `nav cluster admin deploy
    - If TLS enabled: `navigator-cli-client` secret exists with cert data
 9. Extract mTLS credentials if TLS is enabled (up to 3 min)
 
+For local deploys, metadata endpoint selection now depends on Docker connectivity:
+
+- default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1`
+- TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>` for non-loopback hosts
+
+The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validation succeeds.
+
 The default cluster name is `navigator`. The container is `navigator-cluster-{name}`.
 
 ## Prerequisites
@@ -173,6 +180,8 @@ If ports are missing or conflicting, another process may be using them. Check wi
 ss -tlnp | grep -E ':(6443|80|443|30051)\s'
 ```
 
+If using Docker-in-Docker (`DOCKER_HOST=tcp://docker:2375`), verify metadata points at `https://docker` (not `https://127.0.0.1`).
+
 ### Step 6: Check Image Availability
 
 Component images (server, sandbox, pki-job) can reach k3s containerd via two paths:
@@ -279,9 +288,11 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
 | SSH connection failed (remote) | SSH key/host/Docker issues | Test `ssh <host> docker ps` manually |
 | Port conflict | Another service on 6443/80/443/30051 | Stop conflicting service or change port mapping |
+| gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
 | DNS failures inside container | Entrypoint DNS detection failed | Check `/etc/rancher/k3s/resolv.conf` and container startup logs |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
 | Stale NotReady nodes from previous deploys | Volume reused across container recreations | The deploy flow now auto-cleans stale nodes; if it still fails, manually delete NotReady nodes (see Step 3) or choose "Recreate" when prompted |
+| gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `navigator-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
 
 ## Remote Cluster Debugging
 

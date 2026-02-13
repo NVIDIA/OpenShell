@@ -57,6 +57,7 @@ The server container runs the Navigator orchestration service.
 - Exposes gRPC/HTTP on port 8080
 - Health checks at `/healthz`
 - SQLx migrations copied from source
+- Uses an embedded Rust SSH client (`russh`) for sandbox exec
 
 ### navigator-cluster
 
@@ -79,6 +80,7 @@ An airgapped k3s image with all components pre-loaded for single-container deplo
 When running k3s in Docker, the container's `/etc/resolv.conf` contains Docker's internal DNS (127.0.0.11), which is not reachable from k3s pods. While k3s auto-detects this and falls back to 8.8.8.8, external UDP traffic doesn't work reliably on Docker Desktop.
 
 The `cluster-entrypoint.sh` script solves this by:
+
 1. Detecting the Docker host gateway IP from `/etc/hosts` (requires `--add-host=host.docker.internal:host-gateway`)
 2. Writing a custom resolv.conf with the host gateway as the nameserver
 3. Passing `--resolv-conf` to k3s to use this configuration

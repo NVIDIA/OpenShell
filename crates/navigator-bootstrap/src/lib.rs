@@ -21,10 +21,13 @@ use crate::docker::{
 };
 use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
 use crate::metadata::{
-    create_cluster_metadata, extract_host_from_ssh_destination, resolve_ssh_hostname,
+    create_cluster_metadata, extract_host_from_ssh_destination, local_gateway_host,
+    resolve_ssh_hostname,
 };
 use crate::mtls::fetch_and_store_cli_mtls;
-use crate::runtime::{clean_stale_nodes, wait_for_cluster_ready, wait_for_kubeconfig};
+use crate::runtime::{
+    clean_stale_nodes, restart_navigator_deployment, wait_for_cluster_ready, wait_for_kubeconfig,
+};
 
 pub use crate::docker::ExistingClusterInfo;
 pub use crate::kubeconfig::{
@@ -198,7 +201,10 @@ where
     // address to CLI clients for SSH proxy CONNECT requests.
     let (extra_sans, ssh_gateway_host): (Vec<String>, Option<String>) =
         remote_opts.as_ref().map_or_else(
-            || (Vec::new(), None),
+            || {
+                let sans = local_gateway_host().into_iter().collect();
+                (sans, None)
+            },
             |opts| {
                 let ssh_host = extract_host_from_ssh_destination(&opts.destination);
                 let resolved = resolve_ssh_hostname(&ssh_host);
@@ -279,6 +285,9 @@ where
                 &mut push_log,
             )
             .await?;
+
+            log("[status] Restarting navigator deployment to pick up imported images".to_string());
+            restart_navigator_deployment(&target_docker, &name).await?;
         }
     }
 

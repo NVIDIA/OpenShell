@@ -155,12 +155,13 @@ For the target daemon (local or remote):
 
 1. Ensure bridge network `navigator-cluster` (attachable, bridge driver).
 2. Ensure volume `navigator-cluster-{name}`.
-3. Compute extra TLS SANs for remote deploys:
+3. Compute extra TLS SANs:
+   - For local deploys, when `DOCKER_HOST` is a non-loopback `tcp://` endpoint (for example `tcp://docker:2375` in CI), add that host as an extra SAN.
    - Resolve the SSH host via `ssh -G` to get the canonical hostname/IP.
    - Add resolved host (and original SSH host if different) as extra `--tls-san` arguments.
    - Set container env vars `EXTRA_SANS`, `SSH_GATEWAY_HOST`, `SSH_GATEWAY_PORT=8080`.
 4. Ensure container `navigator-cluster-{name}` with:
-   - k3s server command: `server --disable=traefik --tls-san=127.0.0.1 --tls-san=localhost --tls-san=host.docker.internal` (plus extra SANs for remote).
+   - k3s server command: `server --disable=traefik --tls-san=127.0.0.1 --tls-san=localhost --tls-san=host.docker.internal` (plus computed extra SANs).
    - privileged mode,
    - bind mount of volume to `/var/lib/rancher/k3s`,
    - network mode `navigator-cluster`,
@@ -212,7 +213,7 @@ Write is performed atomically through temp + backup directory swap.
 
 Bootstrap writes metadata JSON for the cluster:
 
-- local: endpoint `https://127.0.0.1`, `is_remote=false`
+- local: endpoint `https://127.0.0.1` by default, or `https://{docker_host}` when `DOCKER_HOST` is a non-loopback `tcp://` endpoint; `is_remote=false`
 - remote: endpoint `https://{resolved_host}`, `is_remote=true`, plus SSH destination and resolved host
 
 Metadata fields:
@@ -303,6 +304,9 @@ nav cluster admin tunnel --name <name> --remote user@host
 | `NAV_GATEWAY_TLS_ENABLED` | Overrides HelmChart manifest for TLS enabled check |
 | `XDG_CONFIG_HOME` | Base config directory (default: `$HOME/.config`) |
 | `KUBECONFIG` | Target kubeconfig path for merge (first colon-separated path; default: `$HOME/.kube/config`) |
+
+When `NAVIGATOR_PUSH_IMAGES` is enabled, the entrypoint rewrites HelmChart image tags from `latest` to `IMAGE_TAG` and now handles both quoted and unquoted `tag: latest` formats.
+In push mode, bootstrap also passes exact imported image refs (`server`, `sandbox`, `pki-job`) to the entrypoint, which rewrites Helm values to those refs directly before the tag/pull-policy overrides. Image import uses the `k8s.io` containerd namespace so kubelet resolves the pushed refs without falling back to pulled registry tags. After import, bootstrap restarts `deployment/navigator` and waits for rollout completion so running pods pick up the imported image references.
 
 Container-level env vars set for remote deploys:
 

@@ -6,18 +6,26 @@ use crate::persistence::ObjectType;
 use futures::future;
 use navigator_core::proto::{
     CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, GetSandboxPolicyRequest, GetSandboxPolicyResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListSandboxesRequest, ListSandboxesResponse,
+    DeleteSandboxResponse, ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest,
+    ExecSandboxStderr, ExecSandboxStdout, GetSandboxPolicyRequest, GetSandboxPolicyResponse,
+    GetSandboxRequest, HealthRequest, HealthResponse, ListSandboxesRequest, ListSandboxesResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
     ServiceStatus, SshSession, WatchSandboxRequest, navigator_server::Navigator,
 };
 use navigator_core::proto::{Sandbox, SandboxPhase};
 use prost::Message;
+use std::future::Future;
 use std::sync::Arc;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
 use tracing::{info, warn};
+
+use russh::ChannelMsg;
+use russh::client::AuthResult;
 
 use crate::ServerState;
 
@@ -127,6 +135,7 @@ impl Navigator for NavigatorService {
     }
 
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;
+    type ExecSandboxStream = ReceiverStream<Result<ExecSandboxEvent, Status>>;
 
     async fn watch_sandbox(
         &self,
@@ -490,6 +499,63 @@ impl Navigator for NavigatorService {
         }))
     }
 
+    async fn exec_sandbox(
+        &self,
+        request: Request<ExecSandboxRequest>,
+    ) -> Result<Response<Self::ExecSandboxStream>, Status> {
+        let req = request.into_inner();
+        if req.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        if req.command.is_empty() {
+            return Err(Status::invalid_argument("command is required"));
+        }
+        if req.environment.keys().any(|key| !is_valid_env_key(key)) {
+            return Err(Status::invalid_argument(
+                "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
+            ));
+        }
+
+        let sandbox = self
+            .state
+            .store
+            .get_message::<Sandbox>(&req.sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        if SandboxPhase::try_from(sandbox.phase).ok() != Some(SandboxPhase::Ready) {
+            return Err(Status::failed_precondition("sandbox is not ready"));
+        }
+
+        let (target_host, target_port) = resolve_sandbox_exec_target(&self.state, &sandbox).await?;
+        let command_str = build_remote_exec_command(&req);
+        let stdin_payload = req.stdin;
+        let timeout_seconds = req.timeout_seconds;
+        let sandbox_id = sandbox.id;
+        let handshake_secret = self.state.config.ssh_handshake_secret.clone();
+
+        let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
+        tokio::spawn(async move {
+            if let Err(err) = stream_exec_over_ssh(
+                tx,
+                &sandbox_id,
+                &target_host,
+                target_port,
+                &command_str,
+                stdin_payload,
+                timeout_seconds,
+                &handshake_secret,
+            )
+            .await
+            {
+                warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandbox failed");
+            }
+        });
+
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
     async fn revoke_ssh_session(
         &self,
         request: Request<RevokeSshSessionRequest>,
@@ -538,4 +604,358 @@ fn resolve_gateway(config: &navigator_core::Config) -> (String, u16) {
         config.ssh_gateway_port
     };
     (host, port)
+}
+
+async fn resolve_sandbox_exec_target(
+    state: &ServerState,
+    sandbox: &Sandbox,
+) -> Result<(String, u16), Status> {
+    if let Some(status) = sandbox.status.as_ref()
+        && !status.agent_pod.is_empty()
+    {
+        match state.sandbox_client.agent_pod_ip(&status.agent_pod).await {
+            Ok(Some(ip)) => {
+                return Ok((ip.to_string(), state.config.sandbox_ssh_port));
+            }
+            Ok(None) => {
+                return Err(Status::failed_precondition(
+                    "sandbox agent pod IP is not available",
+                ));
+            }
+            Err(err) => {
+                return Err(Status::internal(format!(
+                    "failed to resolve agent pod IP: {err}"
+                )));
+            }
+        }
+    }
+
+    if sandbox.name.is_empty() {
+        return Err(Status::failed_precondition("sandbox has no name"));
+    }
+
+    Ok((
+        format!(
+            "{}.{}.svc.cluster.local",
+            sandbox.name, state.config.sandbox_namespace
+        ),
+        state.config.sandbox_ssh_port,
+    ))
+}
+
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let safe = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
+    if safe {
+        return value.to_string();
+    }
+    let escaped = value.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
+}
+
+fn build_remote_exec_command(req: &ExecSandboxRequest) -> String {
+    let mut parts = Vec::new();
+    let mut env_entries = req.environment.iter().collect::<Vec<_>>();
+    env_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    for (key, value) in env_entries {
+        parts.push(format!("{key}={}", shell_escape(value)));
+    }
+    parts.extend(req.command.iter().map(|arg| shell_escape(arg)));
+    let command = parts.join(" ");
+    if req.workdir.is_empty() {
+        command
+    } else {
+        format!("cd {} && {command}", shell_escape(&req.workdir))
+    }
+}
+
+fn is_valid_env_key(key: &str) -> bool {
+    let mut bytes = key.bytes();
+    let Some(first) = bytes.next() else {
+        return false;
+    };
+    if !(first == b'_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
+}
+
+async fn stream_exec_over_ssh(
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+    sandbox_id: &str,
+    target_host: &str,
+    target_port: u16,
+    command: &str,
+    stdin_payload: Vec<u8>,
+    timeout_seconds: u32,
+    handshake_secret: &str,
+) -> Result<(), Status> {
+    info!(
+        sandbox_id = %sandbox_id,
+        target_host = %target_host,
+        target_port,
+        "ExecSandbox command started"
+    );
+
+    let (local_proxy_port, proxy_task) =
+        start_single_use_ssh_proxy(target_host, target_port, handshake_secret)
+            .await
+            .map_err(|e| Status::internal(format!("failed to start ssh proxy: {e}")))?;
+
+    let exec = run_exec_with_russh(local_proxy_port, command, stdin_payload, tx.clone());
+    let exit_code = if timeout_seconds == 0 {
+        exec.await?
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(u64::from(timeout_seconds)),
+            exec,
+        )
+        .await
+        {
+            Ok(result) => result?,
+            Err(_) => {
+                let _ = tx
+                    .send(Ok(ExecSandboxEvent {
+                        payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Exit(
+                            ExecSandboxExit { exit_code: 124 },
+                        )),
+                    }))
+                    .await;
+                let _ = proxy_task.await;
+                return Ok(());
+            }
+        }
+    };
+
+    let _ = proxy_task.await;
+
+    let _ = tx
+        .send(Ok(ExecSandboxEvent {
+            payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Exit(
+                ExecSandboxExit { exit_code },
+            )),
+        }))
+        .await;
+
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SandboxSshClientHandler;
+
+impl russh::client::Handler for SandboxSshClientHandler {
+    type Error = russh::Error;
+
+    fn check_server_key(
+        &mut self,
+        _server_public_key: &russh::keys::PublicKey,
+    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
+        async { Ok(true) }
+    }
+}
+
+async fn run_exec_with_russh(
+    local_proxy_port: u16,
+    command: &str,
+    stdin_payload: Vec<u8>,
+    tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
+) -> Result<i32, Status> {
+    let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
+        .await
+        .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
+
+    let config = Arc::new(russh::client::Config::default());
+    let mut client = russh::client::connect_stream(config, stream, SandboxSshClientHandler)
+        .await
+        .map_err(|e| Status::internal(format!("failed to establish ssh transport: {e}")))?;
+
+    match client
+        .authenticate_none("sandbox")
+        .await
+        .map_err(|e| Status::internal(format!("failed to authenticate ssh session: {e}")))?
+    {
+        AuthResult::Success => {}
+        AuthResult::Failure { .. } => {
+            return Err(Status::permission_denied(
+                "ssh authentication rejected by sandbox",
+            ));
+        }
+    }
+
+    let mut channel = client
+        .channel_open_session()
+        .await
+        .map_err(|e| Status::internal(format!("failed to open ssh channel: {e}")))?;
+
+    channel
+        .exec(true, command.as_bytes())
+        .await
+        .map_err(|e| Status::internal(format!("failed to execute command over ssh: {e}")))?;
+
+    if !stdin_payload.is_empty() {
+        channel
+            .data(std::io::Cursor::new(stdin_payload))
+            .await
+            .map_err(|e| Status::internal(format!("failed to send ssh stdin payload: {e}")))?;
+    }
+
+    channel
+        .eof()
+        .await
+        .map_err(|e| Status::internal(format!("failed to close ssh stdin: {e}")))?;
+
+    let mut exit_code: Option<i32> = None;
+    while let Some(msg) = channel.wait().await {
+        match msg {
+            ChannelMsg::Data { data } => {
+                let _ = tx
+                    .send(Ok(ExecSandboxEvent {
+                        payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Stdout(
+                            ExecSandboxStdout {
+                                data: data.to_vec(),
+                            },
+                        )),
+                    }))
+                    .await;
+            }
+            ChannelMsg::ExtendedData { data, .. } => {
+                let _ = tx
+                    .send(Ok(ExecSandboxEvent {
+                        payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Stderr(
+                            ExecSandboxStderr {
+                                data: data.to_vec(),
+                            },
+                        )),
+                    }))
+                    .await;
+            }
+            ChannelMsg::ExitStatus { exit_status } => {
+                let converted = i32::try_from(exit_status).unwrap_or(i32::MAX);
+                exit_code = Some(converted);
+            }
+            ChannelMsg::Close => break,
+            _ => {}
+        }
+    }
+
+    let _ = channel.close().await;
+    let _ = client
+        .disconnect(russh::Disconnect::ByApplication, "exec complete", "en")
+        .await;
+
+    Ok(exit_code.unwrap_or(1))
+}
+
+async fn start_single_use_ssh_proxy(
+    target_host: &str,
+    target_port: u16,
+    handshake_secret: &str,
+) -> Result<(u16, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
+    let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+    let port = listener.local_addr()?.port();
+    let target_host = target_host.to_string();
+    let handshake_secret = handshake_secret.to_string();
+
+    let task = tokio::spawn(async move {
+        let Ok((mut client_conn, _)) = listener.accept().await else {
+            return;
+        };
+        let Ok(mut sandbox_conn) = TcpStream::connect((target_host.as_str(), target_port)).await
+        else {
+            return;
+        };
+        let Ok(preface) = build_preface(&uuid::Uuid::new_v4().to_string(), &handshake_secret)
+        else {
+            return;
+        };
+        if sandbox_conn.write_all(preface.as_bytes()).await.is_err() {
+            return;
+        }
+        let mut response = String::new();
+        if read_line(&mut sandbox_conn, &mut response).await.is_err() {
+            return;
+        }
+        if response.trim() != "OK" {
+            return;
+        }
+        let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut sandbox_conn).await;
+    });
+
+    Ok((port, task))
+}
+
+fn build_preface(
+    token: &str,
+    secret: &str,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let timestamp = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|_| "time error")?
+            .as_secs(),
+    )
+    .map_err(|_| "time error")?;
+    let nonce = uuid::Uuid::new_v4().to_string();
+    let payload = format!("{token}|{timestamp}|{nonce}");
+    let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
+    Ok(format!("NSSH1 {token} {timestamp} {nonce} {signature}\n"))
+}
+
+async fn read_line(
+    stream: &mut TcpStream,
+    buf: &mut String,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let mut bytes = Vec::new();
+    loop {
+        let mut byte = [0_u8; 1];
+        let n = stream.read(&mut byte).await?;
+        if n == 0 {
+            break;
+        }
+        if byte[0] == b'\n' {
+            break;
+        }
+        bytes.push(byte[0]);
+        if bytes.len() > 1024 {
+            break;
+        }
+    }
+    *buf = String::from_utf8_lossy(&bytes).to_string();
+    Ok(())
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let mut mac = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
+    mac.update(data);
+    let result = mac.finalize().into_bytes();
+    hex::encode(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_valid_env_key;
+
+    #[test]
+    fn env_key_validation_accepts_valid_keys() {
+        assert!(is_valid_env_key("PATH"));
+        assert!(is_valid_env_key("PYTHONPATH"));
+        assert!(is_valid_env_key("_NAVIGATOR_VALUE_1"));
+    }
+
+    #[test]
+    fn env_key_validation_rejects_invalid_keys() {
+        assert!(!is_valid_env_key(""));
+        assert!(!is_valid_env_key("1PATH"));
+        assert!(!is_valid_env_key("BAD-KEY"));
+        assert!(!is_valid_env_key("BAD KEY"));
+        assert!(!is_valid_env_key("X=Y"));
+        assert!(!is_valid_env_key("X;rm -rf /"));
+    }
 }

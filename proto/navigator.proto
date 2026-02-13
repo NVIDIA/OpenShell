@@ -31,6 +31,9 @@ service Navigator {
   // Revoke a previously issued SSH session.
   rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
 
+  // Execute a command in a ready sandbox and stream output.
+  rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+
   // Get sandbox policy by id (called by sandbox entrypoint at startup).
   rpc GetSandboxPolicy(navigator.sandbox.v1.GetSandboxPolicyRequest)
       returns (navigator.sandbox.v1.GetSandboxPolicyResponse);
@@ -132,6 +135,51 @@ message RevokeSshSessionRequest {
 message RevokeSshSessionResponse {
   // True when a session was revoked.
   bool revoked = 1;
+}
+
+// Execute command request.
+message ExecSandboxRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+
+  // Command and arguments.
+  repeated string command = 2;
+
+  // Optional working directory.
+  string workdir = 3;
+
+  // Optional environment overrides.
+  map<string, string> environment = 4;
+
+  // Optional timeout in seconds. 0 means no timeout.
+  uint32 timeout_seconds = 5;
+
+  // Optional stdin payload passed to the command.
+  bytes stdin = 6;
+}
+
+// One stdout chunk from a sandbox exec.
+message ExecSandboxStdout {
+  bytes data = 1;
+}
+
+// One stderr chunk from a sandbox exec.
+message ExecSandboxStderr {
+  bytes data = 1;
+}
+
+// Final exit status for a sandbox exec.
+message ExecSandboxExit {
+  int32 exit_code = 1;
+}
+
+// One event in a sandbox exec stream.
+message ExecSandboxEvent {
+  oneof payload {
+    ExecSandboxStdout stdout = 1;
+    ExecSandboxStderr stderr = 2;
+    ExecSandboxExit exit = 3;
+  }
 }
 
 // SSH session record stored in persistence.

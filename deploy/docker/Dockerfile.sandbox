@@ -68,8 +68,8 @@ RUN uv venv /app/.venv && \
     uv sync --frozen --no-dev --no-install-project 2>/dev/null || \
     uv sync --no-dev --no-install-project 2>/dev/null || true
 
-# Install navigator SDK dependencies (grpcio, protobuf)
-RUN uv pip install --python /app/.venv/bin/python --no-cache-dir grpcio protobuf
+# Install navigator SDK dependencies
+RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grpcio protobuf
 
 # Stage 4: Coding agents layer
 FROM base AS coding-agents

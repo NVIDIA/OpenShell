@@ -306,6 +306,11 @@ pub async fn ensure_container(
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "dev".to_string());
+        if let Ok(images) = std::env::var("NAVIGATOR_PUSH_IMAGES")
+            && !images.trim().is_empty()
+        {
+            env_vars.push(format!("PUSH_IMAGE_REFS={images}"));
+        }
         env_vars.push(format!("IMAGE_TAG={tag}"));
         env_vars.push("IMAGE_PULL_POLICY=IfNotPresent".to_string());
     } else if let Ok(tag) = std::env::var("IMAGE_TAG")

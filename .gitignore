@@ -94,6 +94,10 @@ dmypy.json
 # Cython debug symbols
 cython_debug/
 
+# Generated Python protobuf stubs (keep package marker)
+python/navigator/_proto/*
+!python/navigator/_proto/__init__.py
+
 # =============================================================================
 # IDE / Editor
 # =============================================================================

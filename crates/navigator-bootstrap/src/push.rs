@@ -70,6 +70,8 @@ pub async fn push_local_images(
             "ctr".to_string(),
             "-a".to_string(),
             CONTAINERD_SOCK.to_string(),
+            "-n".to_string(),
+            "k8s.io".to_string(),
             "images".to_string(),
             "import".to_string(),
             IMPORT_TAR_PATH.to_string(),

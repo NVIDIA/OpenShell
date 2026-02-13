@@ -100,7 +100,16 @@ mise run check           # Quick compile check
 mise run test            # All tests (Rust + Python)
 mise run test:rust       # Rust tests only
 mise run test:python     # Python tests only
+mise run test:e2e:sandbox # Sandbox Python e2e tests
 ```
+
+### Python E2E Test Patterns
+
+- Put sandbox SDK e2e tests in `e2e/python/`.
+- Prefer `Sandbox.exec_python(...)` with Python callables over inline `python -c` strings.
+- Define callable helpers inside the test function when possible so they serialize cleanly in sandbox.
+- Keep scenarios focused: one test for happy path and separate tests for negative/policy enforcement behavior.
+- Use `mise run test:e2e:sandbox` to run this suite locally.
 
 ### Linting & Formatting
 
@@ -176,6 +185,10 @@ mise run docker:build:cluster   # Build the airgapped k3s cluster image
 mise run python:dev      # Install Python package in development mode (builds CLI binary)
 mise run python:build    # Build Python wheel with CLI binary
 ```
+
+Python protobuf stubs in `python/navigator/_proto/` are generated artifacts and are gitignored
+(except `__init__.py`). `mise` Python build/test/lint/typecheck tasks run `python:proto`
+automatically, so you generally do not need to generate stubs manually.
 
 ### Publishing
 
