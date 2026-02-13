@@ -96,7 +96,7 @@ COPY mise.toml /opt/mise/mise.toml
 COPY build/ /opt/mise/build/
 WORKDIR /opt/mise
 RUN mise trust /opt/mise/mise.toml && \
-    env -u RUSTC_WRAPPER mise install python rust
+    env -u RUSTC_WRAPPER mise install python rust 'cargo:cargo-edit'
 
 # Install uv directly to avoid GitHub API rate limits in CI image builds
 RUN curl -LsSf https://astral.sh/uv/0.10.2/install.sh | sh
