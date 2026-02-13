@@ -234,27 +234,41 @@ mise run version:set               # Update Cargo.toml with git-derived version 
 mise run version:reset             # Restore Cargo.toml to git state
 ```
 
-**Publishing to Artifactory:**
+**Publishing credentials (one-time setup):**
 
 ```bash
-# Configure credentials (one-time setup).
 echo "
-NAV_DOCKER_USER=$USER
-NAV_DOCKER_TOKEN=$ARTIFACTORY_PASSWORD
 NAV_PYPI_USERNAME=$USER
 NAV_PYPI_PASSWORD=$ARTIFACTORY_PASSWORD" >> .env
-
-# Publish everything
-mise run publish
 ```
+
+Docker publishing in CI uses AWS credentials for ECR. Python publishing uses
+`NAV_PYPI_*` credentials for Artifactory.
+
+**Main branch publish (CI):**
+
+- Publishes Docker multiarch images to ECR as `:dev`, `:latest`, and a versioned dev tag.
+
+**Tag release publish (CI):**
+
+- Push a semver tag (`vX.Y.Z`) to trigger release jobs.
+- CI publishes Docker multiarch images to ECR as `:X.Y.Z` (no `:latest`).
+- CI publishes Linux Python wheels to Artifactory and creates GitLab release notes.
 
 **Tagging a release:**
 
 ```bash
 git tag v0.1.1
 git push --tags
-# CI will build and publish, or manually:
-mise run publish
+# CI will build and publish Docker + Linux Python wheels.
+```
+
+**Local macOS wheel publish (arm64):**
+
+```bash
+# After CI tag publish, on a Mac:
+git checkout v0.1.1
+mise run python:publish:macos
 ```
 
 ### Cleaning

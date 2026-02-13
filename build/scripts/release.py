@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import os
 import re
 import subprocess
@@ -21,7 +22,7 @@ class Versions:
 
 
 def _repo_root() -> Path:
-    return Path(__file__).resolve().parents[1]
+    return Path(__file__).resolve().parents[2]
 
 
 def _run(cmd: list[str], *, env: dict[str, str] | None = None) -> None:
@@ -64,15 +65,6 @@ def _compute_versions() -> Versions:
     )
 
 
-def _docker_image_name(
-    image: str,
-    registry: str | None,
-    namespace: str | None,
-) -> str:
-    parts = [p for p in [registry, namespace, image] if p]
-    return "/".join(parts)
-
-
 def _cargo_files_clean() -> bool:
     """Check if Cargo.toml and Cargo.lock have no uncommitted changes."""
     status = _git(["status", "--porcelain", "Cargo.toml", "Cargo.lock"])
@@ -97,45 +89,9 @@ def reset_version() -> None:
     _run(["git", "checkout", "--", "Cargo.toml", "Cargo.lock"])
 
 
-def docker_tag(images: list[str], version: str | None = None) -> None:
-    if version is None:
-        version = _compute_versions().docker
-    namespace = os.getenv("NAV_DOCKER_NAMESPACE")
-    registry = os.getenv("NAV_DOCKER_REGISTRY")
-
-    for image in images:
-        full_tag = _docker_image_name(image, registry, namespace)
-        _run(["docker", "tag", image, f"{full_tag}:{version}"])
-        print(f"{full_tag}:{version}")
-
-
-def docker_push(
-    images: list[str], push_latest: bool, version: str | None = None
+def python_publish(
+    version: str | None = None, wheel_glob: str = "navigator-*.whl"
 ) -> None:
-    if version is None:
-        version = _compute_versions().docker
-    registry = os.getenv("NAV_DOCKER_REGISTRY")
-    namespace = os.getenv("NAV_DOCKER_NAMESPACE")
-
-    user = os.getenv("NAV_DOCKER_USER")
-    token = os.getenv("NAV_DOCKER_TOKEN")
-
-    if user and token and registry:
-        _run(["docker", "login", registry, "-u", user, "-p", token])
-    else:
-        raise SystemExit(
-            "Auth is not set up for publishing to Docker registry, see CONTRIBUTING.md for details."
-        )
-
-    for image in images:
-        full_tag = _docker_image_name(image, registry, namespace)
-        _run(["docker", "push", f"{full_tag}:{version}"])
-        if push_latest:
-            _run(["docker", "tag", f"{full_tag}:{version}", f"{full_tag}:latest"])
-            _run(["docker", "push", f"{full_tag}:latest"])
-
-
-def python_publish(version: str | None = None) -> None:
     if version is None:
         version = _compute_versions().python
 
@@ -156,7 +112,9 @@ def python_publish(version: str | None = None) -> None:
     wheels_dir.mkdir(parents=True, exist_ok=True)
 
     wheel_paths = sorted(
-        p for p in wheels_dir.glob("navigator-*.whl") if f"-{version}-" in p.name
+        p
+        for p in wheels_dir.glob("*.whl")
+        if f"-{version}-" in p.name and fnmatch.fnmatch(p.name, wheel_glob)
     )
 
     if not wheel_paths:
@@ -194,12 +152,6 @@ def get_version(format: str) -> None:
         print(f"GIT_SHA={versions.git_sha}")
 
 
-def release(images: list[str]) -> None:
-    docker_tag(images)
-    docker_push(images, push_latest=True)
-    python_publish()
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Navigator release tooling.")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -226,34 +178,17 @@ def build_parser() -> argparse.ArgumentParser:
         "reset-version", help="Reset Cargo.toml and Cargo.lock to git state."
     )
 
-    docker_tag_parser = sub.add_parser(
-        "docker-tag", help="Tag docker images for release."
-    )
-    docker_tag_parser.add_argument("images", nargs="+", help="Image names to tag.")
-    docker_tag_parser.add_argument(
-        "--version", help="Version to tag (defaults to computed version)."
-    )
-
-    docker_push_parser = sub.add_parser("docker-push", help="Push docker images.")
-    docker_push_parser.add_argument("images", nargs="+", help="Image names to push.")
-    docker_push_parser.add_argument(
-        "--version", help="Version to push (defaults to computed version)."
-    )
-    docker_push_parser.add_argument(
-        "--push-latest",
-        action="store_true",
-        help="Also push :latest tag.",
-    )
-
     python_publish_parser = sub.add_parser(
         "python-publish", help="Publish python wheel."
     )
     python_publish_parser.add_argument(
         "--version", help="Version to publish (defaults to computed version)."
     )
-
-    release_parser = sub.add_parser("release", help="Build and publish all artifacts.")
-    release_parser.add_argument("images", nargs="+", help="Image names to release.")
+    python_publish_parser.add_argument(
+        "--wheel-glob",
+        default="navigator-*.whl",
+        help="Filename glob for wheels to publish (defaults to all navigator wheels).",
+    )
 
     return parser
 
@@ -275,14 +210,8 @@ def main() -> None:
         set_version(version=args.version)
     elif args.command == "reset-version":
         reset_version()
-    elif args.command == "docker-tag":
-        docker_tag(args.images, version=args.version)
-    elif args.command == "docker-push":
-        docker_push(args.images, push_latest=args.push_latest, version=args.version)
     elif args.command == "python-publish":
-        python_publish(version=args.version)
-    elif args.command == "release":
-        release(args.images)
+        python_publish(version=args.version, wheel_glob=args.wheel_glob)
 
 
 if __name__ == "__main__":

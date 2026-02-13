@@ -3,7 +3,7 @@
 #
 # Usage:
 #   docker-publish-multiarch.sh --mode registry   # Push to DOCKER_REGISTRY
-#   docker-publish-multiarch.sh --mode ecr         # Push to ECR with :latest tags
+#   docker-publish-multiarch.sh --mode ecr         # Push to ECR
 #
 # Environment:
 #   IMAGE_TAG                - Image tag (default: dev)
@@ -11,6 +11,8 @@
 #   ENVOY_GATEWAY_VERSION    - Envoy Gateway chart version (set by mise.toml [env])
 #   DOCKER_PLATFORMS         - Target platforms (default: linux/amd64,linux/arm64)
 #   RUST_BUILD_PROFILE       - Rust build profile for sandbox (default: release)
+#   TAG_LATEST               - If true, add/update :latest tag (default: false)
+#   EXTRA_DOCKER_TAGS        - Additional tags to add (comma or space separated)
 #
 # Registry mode env:
 #   DOCKER_REGISTRY          - Registry URL (required, e.g. ghcr.io/myorg)
@@ -42,7 +44,18 @@ fi
 IMAGE_TAG=${IMAGE_TAG:-dev}
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
 EXTRA_BUILD_FLAGS=""
-TAG_LATEST=false
+TAG_LATEST=${TAG_LATEST:-false}
+EXTRA_DOCKER_TAGS_RAW=${EXTRA_DOCKER_TAGS:-}
+EXTRA_TAGS=()
+
+if [[ -n "${EXTRA_DOCKER_TAGS_RAW}" ]]; then
+  EXTRA_DOCKER_TAGS_RAW=${EXTRA_DOCKER_TAGS_RAW//,/ }
+  for tag in ${EXTRA_DOCKER_TAGS_RAW}; do
+    if [[ -n "${tag}" ]]; then
+      EXTRA_TAGS+=("${tag}")
+    fi
+  done
+fi
 
 # ---------------------------------------------------------------------------
 # Mode-specific configuration
@@ -67,7 +80,6 @@ case "$MODE" in
     REGISTRY="${ECR_HOST}/navigator"
     IMAGE_PREFIX=""
     EXTRA_BUILD_FLAGS="--provenance=false --sbom=false"
-    TAG_LATEST=true
 
     # Ensure a multi-platform builder exists
     if ! docker buildx inspect multiarch >/dev/null 2>&1; then
@@ -127,16 +139,11 @@ helm pull oci://docker.io/envoyproxy/gateway-helm \
 # ---------------------------------------------------------------------------
 echo ""
 echo "Building multi-arch cluster image..."
-CLUSTER_TAGS="-t ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:${IMAGE_TAG}"
-if [ "$TAG_LATEST" = true ]; then
-  CLUSTER_TAGS="${CLUSTER_TAGS} -t ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:latest"
-fi
-
 CLUSTER_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster"
 docker buildx build \
   --platform "${PLATFORMS}" \
   -f deploy/docker/Dockerfile.cluster \
-  ${CLUSTER_TAGS} \
+  -t "${CLUSTER_IMAGE}:${IMAGE_TAG}" \
   --build-arg K3S_VERSION=${K3S_VERSION} \
   --cache-from "type=registry,ref=${CLUSTER_IMAGE}:latest" \
   --cache-to "type=inline" \
@@ -145,17 +152,28 @@ docker buildx build \
   .
 
 # ---------------------------------------------------------------------------
-# Step 4 (ECR only): Tag component images with :latest.
+# Step 4: Apply additional tags by copying manifests.
 # Use --prefer-index=false to carbon-copy the source manifest format instead of
 # wrapping it in an OCI image index (which the registry v3 proxy can't serve).
 # ---------------------------------------------------------------------------
+TAGS_TO_APPLY=("${EXTRA_TAGS[@]}")
 if [ "$TAG_LATEST" = true ]; then
-  for component in sandbox server pki-job; do
-    echo "Tagging ${IMAGE_PREFIX}${component}:latest..."
-    docker buildx imagetools create \
-      --prefer-index=false \
-      -t "${REGISTRY}/${IMAGE_PREFIX}${component}:latest" \
-      "${REGISTRY}/${IMAGE_PREFIX}${component}:${IMAGE_TAG}"
+  TAGS_TO_APPLY+=("latest")
+fi
+
+if [ ${#TAGS_TO_APPLY[@]} -gt 0 ]; then
+  for component in sandbox server pki-job cluster; do
+    FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}${component}"
+    for tag in "${TAGS_TO_APPLY[@]}"; do
+      if [ "${tag}" = "${IMAGE_TAG}" ]; then
+        continue
+      fi
+      echo "Tagging ${FULL_IMAGE}:${tag}..."
+      docker buildx imagetools create \
+        --prefer-index=false \
+        -t "${FULL_IMAGE}:${tag}" \
+        "${FULL_IMAGE}:${IMAGE_TAG}"
+    done
   done
 fi
 
@@ -167,4 +185,7 @@ echo "  ${REGISTRY}/${IMAGE_PREFIX}pki-job:${IMAGE_TAG}"
 echo "  ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:${IMAGE_TAG}"
 if [ "$TAG_LATEST" = true ]; then
   echo "  (all also tagged :latest)"
+fi
+if [ ${#EXTRA_TAGS[@]} -gt 0 ]; then
+  echo "  (all also tagged: ${EXTRA_TAGS[*]})"
 fi

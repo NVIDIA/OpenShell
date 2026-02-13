@@ -32,8 +32,6 @@ SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
 # Artifact registries
 NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local"
-NAV_DOCKER_REGISTRY = "artifactory.nvidia.com"
-NAV_DOCKER_NAMESPACE = "sw-navigator-docker-local"
 
 # Shared build constants (overridable via environment)
 K3S_VERSION = "{{env.K3S_VERSION | default(value='v1.29.8-k3s1')}}"
@@ -42,7 +40,7 @@ DOCKER_BUILDKIT = "1"
 
 [vars]
 # Python paths to include in formatting/linting
-python_paths = "python/ scripts/*.py"
+python_paths = "python/ build/scripts/*.py"
 
 [task_config]
 includes = ["build/*.toml"]

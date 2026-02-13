@@ -10,25 +10,75 @@ description = "Build Python wheel with CLI binary (native)"
 depends = ["python:proto"]
 run = "uv run maturin build --release"
 
-["python:build:linux-x86"]
-description = "Build Python wheel for Linux x86_64"
+["python:build:multiarch"]
+description = "Build Python wheels for Linux amd64/arm64 with buildx"
 depends = ["python:proto"]
 run = """
-docker run --rm --platform linux/amd64 -v $(pwd):/io -w /io \
-  ghcr.io/pyo3/maturin build --release
+#!/usr/bin/env bash
+set -euo pipefail
+
+PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
+VERSION=${NAVIGATOR_VERSION:-}
+if [ -z "$VERSION" ]; then
+  VERSION=$(uv run python build/scripts/release.py get-version --python)
+fi
+VERSION_ARGS=(--build-arg "NAVIGATOR_VERSION=${VERSION}")
+
+if ! docker buildx inspect multiarch >/dev/null 2>&1; then
+  echo "Creating multi-platform buildx builder..."
+  docker buildx create --name multiarch --use --bootstrap
+else
+  docker buildx use multiarch
+fi
+
+mkdir -p target/wheels
+
+for platform in ${PLATFORMS//,/ }; do
+  echo "Building wheel for ${platform}..."
+  docker buildx build \
+    --builder multiarch \
+    --platform "${platform}" \
+    -f deploy/docker/Dockerfile.python-wheels \
+    --target wheels \
+    "${VERSION_ARGS[@]}" \
+    --output type=local,dest=target/wheels \
+    .
+done
+
+ls -la target/wheels/*.whl
 """
 
-["python:build:linux-arm"]
-description = "Build Python wheel for Linux aarch64"
+["python:build:macos"]
+description = "Build Python wheel for macOS arm64"
 depends = ["python:proto"]
 run = """
-docker run --rm --platform linux/arm64 -v $(pwd):/io -w /io \
-  ghcr.io/pyo3/maturin build --release
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$(uname -s)" != "Darwin" ]; then
+  echo "Skipping macOS wheel build on non-macOS host"
+  exit 0
+fi
+
+# Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
+if command -v sccache >/dev/null 2>&1; then
+  export RUSTC_WRAPPER="$(command -v sccache)"
+else
+  unset RUSTC_WRAPPER || true
+fi
+
+mkdir -p target/wheels
+
+rustup target add aarch64-apple-darwin
+
+uv run maturin build --release --target aarch64-apple-darwin --out target/wheels
+
+ls -la target/wheels/*.whl
 """
 
 ["python:build:all"]
-description = "Build Python wheels for all platforms"
-depends = ["python:build", "python:build:linux-x86", "python:build:linux-arm"]
+description = "Build Python wheels for Linux and macOS"
+depends = ["python:build", "python:build:multiarch", "python:build:macos"]
 
 ["python:lint"]
 description = "Lint Python code with ruff"
