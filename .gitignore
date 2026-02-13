@@ -182,3 +182,6 @@ deploy/docker/.build/
 
 # Local mise settings
 mise.local.toml
+
+# Ignore plans for now
+architecture/plans
