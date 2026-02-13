@@ -60,20 +60,20 @@ We now rely on installing Claude as a native binary, so the policy can directly 
 | Network isolation | `crates/navigator-sandbox/src/sandbox/linux/netns.rs` | Network namespace + veth pair forces all traffic through proxy |
 | Syscall filtering | `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs` | Blocks AF_INET/AF_INET6 direct socket creation in non-Allow mode |
 | Orchestration | `crates/navigator-sandbox/src/lib.rs` | `run_sandbox()` → load policy → prepare fs → create netns → start proxy → spawn process |
-| CLI | `crates/navigator-sandbox/src/main.rs` | `--policy <yaml>` or `--rego-policy` + `--rego-data` or `--sandbox-id` + `--navigator-endpoint` (gRPC) |
+| CLI | `crates/navigator-sandbox/src/main.rs` | `--policy-rules` + `--policy-data` or `--sandbox-id` + `--navigator-endpoint` (gRPC) |
 | Proto | `proto/sandbox.proto` | `SandboxPolicy`, `ProxyPolicy.allow_hosts` as repeated string |
 
 ## Architectural Decisions
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| OPA runtime | **Embedded via `regorus` crate** (`regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }`). Thread safety: `Mutex<regorus::Engine>` because `eval` requires `&mut self`. | Pure-Rust OPA evaluator. No sidecar process, no latency penalty, no new failure domain. Self-contained proxy. |
+| OPA runtime | **Embedded via `regorus` crate** (`regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }`). Thread safety: `Mutex<regorus::Engine>` because `eval` requires `&mut self`. | Pure-Rust OPA evaluator. No sidecar process, no latency penalty, no new failure domain. Self-contained proxy. |
 | Process identity | **`/proc/<pid>/exe` readlink (fail-closed) + ancestor walk.** No fallback to `argv[0]` — if the exe symlink is unreadable the request is denied. Requires same-user or `CAP_SYS_PTRACE`. Cmdline paths are collected as a low-trust convenience signal (see Security Considerations). | Required by threat model — agent code must not reach binary-restricted endpoints. `argv[0]` is trivially spoofable and must never be used as a trusted identity source. |
 | Parent-chain matching | **Implemented.** Ancestor walk via `/proc/<pid>/status` PPid chain with 64-depth safety limit. Stops at sandbox root PID or PID 1. | Enables policies like "allow Python subprocess spawned by glab to reach gitlab.com". |
 | Cmdline path extraction | **Implemented.** Captures absolute paths from `/proc/<pid>/cmdline` for interpreter-based apps. The interpreter is the exe; the script path appears in cmdline. **Caveat:** cmdline is a convenience heuristic, not a security boundary — `argv` is writable by the owning process. Also, npm-style wrappers that `exec` into the interpreter may not leave the wrapper path in the final process's cmdline (e.g. `exec node cli.mjs` replaces the shell, so cmdline shows `node cli.mjs` not the wrapper path). For npm tools, prefer matching the interpreter binary directly (e.g. `/usr/bin/node`) or use glob patterns on module paths. | Covers shebang scripts and tools that pass script paths via argv. Not relied upon as a security boundary — namespace isolation is the primary control. |
 | Glob patterns | **Implemented.** `glob.match(pattern, ["/"], path)` in Rego via regorus `glob` feature. `*` matches within a path segment, `**` across segments. `["/"]` delimiter prevents `*` from crossing `/` boundaries. | Enables policies like `"/usr/bin/*"` to match any binary in a directory without listing each one. |
 | SHA256 enforcement | **Trust-on-first-use (TOFU)** | Policy lists binary paths only. Proxy hashes on first use, caches, enforces for sandbox lifetime. No build-pipeline coupling. |
-| Policy loading | **`--rego-policy` + `--rego-data` CLI flags** | Explicit, no auto-detection. Falls back to `--policy` (YAML) when absent. |
+| Policy loading | **`--policy-rules` + `--policy-data` CLI flags** | Explicit, no auto-detection. Rego rules file + YAML data file. |
 | gRPC policy fetch | **Deferred, but API designed for it** | `OpaEngine::reload()` method ready for future hot-reload from navigator gateway. |
 
 ## Request Flow (TCP via Network Namespace + OPA)
@@ -98,7 +98,7 @@ In `crates/navigator-sandbox/Cargo.toml`:
 
 ```toml
 # OPA policy evaluation (no default features — full-opa pulls in opa-runtime which requires git in build)
-regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob"] }
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
 ```
 
 Existing deps already provide: `sha2` (0.10), `hex` (0.4), `tokio` (workspace),
@@ -115,19 +115,19 @@ pub struct OpaEngine {
 }
 
 impl OpaEngine {
-    /// Load policy and data from `.rego` file paths.
+    /// Load policy from a `.rego` rules file and data from a YAML file.
     pub fn from_files(policy_path: &Path, data_path: &Path) -> Result<Self>;
 
-    /// Load policy and data from strings (for future gRPC bundles).
-    pub fn from_strings(policy: &str, data: &str) -> Result<Self>;
+    /// Load policy rules and data from strings (data is YAML).
+    pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self>;
 
     /// Evaluate a network access request.
     /// Returns PolicyDecision { allowed, reason, matched_policy }.
     pub fn evaluate_network(&self, input: &NetworkInput) -> Result<PolicyDecision>;
 
-    /// Reload policy and data from strings (for future gRPC hot-reload).
+    /// Reload policy and data from strings (data is YAML, for future gRPC hot-reload).
     /// Replaces the entire engine atomically.
-    pub fn reload(&self, policy: &str, data: &str) -> Result<()>;
+    pub fn reload(&self, policy: &str, data_yaml: &str) -> Result<()>;
 
     /// Query static policy data (filesystem, landlock, process config).
     /// Used at startup to extract sandbox setup configuration from Rego data.
@@ -279,19 +279,19 @@ struct ConnectDecision {
 
 ### Modified: `crates/navigator-sandbox/src/lib.rs`
 
-`run_sandbox()` accepts `rego_policy` and `rego_data` parameters. When provided,
+`run_sandbox()` accepts `policy_rules` and `policy_data` parameters. When provided,
 `load_policy()` initializes the OPA engine and identity cache:
 
 ```rust
 pub async fn run_sandbox(
     // ... existing params ...
-    rego_policy: Option<String>,
-    rego_data: Option<String>,
+    policy_rules: Option<String>,
+    policy_data: Option<String>,
     // ... rest ...
 ) -> Result<i32> {
     let (policy, opa_engine) = load_policy(
-        policy_path, sandbox_id, navigator_endpoint,
-        rego_policy, rego_data,
+        sandbox_id, navigator_endpoint,
+        policy_rules, policy_data,
     ).await?;
 
     let identity_cache = opa_engine.as_ref().map(|_| {
@@ -307,7 +307,7 @@ pub async fn run_sandbox(
 }
 ```
 
-`load_policy()` priority: Rego files → gRPC → YAML → error.
+`load_policy()` priority: local files (rego rules + YAML data) → gRPC → error.
 
 ### Modified: `crates/navigator-sandbox/src/main.rs`
 
@@ -315,14 +315,14 @@ CLI flags:
 
 ```rust
 /// Path to Rego policy file for OPA-based network access control.
-/// Requires --rego-data to also be set.
-#[arg(long, env = "NAVIGATOR_REGO_POLICY")]
-rego_policy: Option<String>,
+/// Requires --policy-data to also be set.
+#[arg(long, env = "NAVIGATOR_POLICY_RULES")]
+policy_rules: Option<String>,
 
-/// Path to Rego data file containing network policies and sandbox config.
-/// Requires --rego-policy to also be set.
-#[arg(long, env = "NAVIGATOR_REGO_DATA")]
-rego_data: Option<String>,
+/// Path to YAML data file containing network policies and sandbox config.
+/// Requires --policy-rules to also be set.
+#[arg(long, env = "NAVIGATOR_POLICY_DATA")]
+policy_data: Option<String>,
 ```
 
 ## Rego Policy
@@ -348,13 +348,10 @@ Endpoint matching is host (case-insensitive via `lower()` on both sides) + port.
 
 | Path | Policy source | Identity binding | OPA evaluation |
 |------|--------------|------------------|----------------|
-| `--policy <file.yaml>` | YAML file | No | No (legacy `is_allowed`) |
-| `--sandbox-id` + `--navigator-endpoint` | gRPC protobuf | No | No (legacy) |
-| `--rego-policy` + `--rego-data` | Rego files | Yes | Yes |
+| `--sandbox-id` + `--navigator-endpoint` | gRPC protobuf | Yes | Yes |
+| `--policy-rules` + `--policy-data` | Rego rules + YAML data files | Yes | Yes |
 
-- YAML and gRPC paths continue to work unchanged — no breaking changes.
-- Rego path is new and opt-in.
-- YAML does not gain identity binding (intentional — migrate to Rego for that).
+Both paths use the OPA engine for network policy evaluation with process identity binding.
 
 ## Testing
 
@@ -423,7 +420,8 @@ These items are explicitly deferred:
 
 ## References
 
-- Dev policy: [`dev-sandbox-policy.rego`](/dev-sandbox-policy.rego), [`dev-sandbox-policy-data.rego`](/dev-sandbox-policy-data.rego)
+- Dev policy rules: [`dev-sandbox-policy.rego`](/dev-sandbox-policy.rego)
+- Dev policy data: [`dev-sandbox-policy.yaml`](/dev-sandbox-policy.yaml)
 - OPA engine: [`crates/navigator-sandbox/src/opa.rs`](/crates/navigator-sandbox/src/opa.rs)
 - Process identity: [`crates/navigator-sandbox/src/procfs.rs`](/crates/navigator-sandbox/src/procfs.rs)
 - Binary integrity: [`crates/navigator-sandbox/src/identity.rs`](/crates/navigator-sandbox/src/identity.rs)

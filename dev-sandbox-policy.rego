@@ -4,11 +4,11 @@ default allow_network = false
 
 # --- Static policy data passthrough (queried at sandbox startup) ---
 
-filesystem_policy := data.sandbox.filesystem_policy
+filesystem_policy := data.filesystem_policy
 
-landlock_policy := data.sandbox.landlock
+landlock_policy := data.landlock
 
-process_policy := data.sandbox.process
+process_policy := data.process
 
 # --- Network access decision (queried per-CONNECT request) ---
 
@@ -33,7 +33,7 @@ deny_reason := reason if {
 	not network_policy_for_request
 	endpoint_misses := [r |
 		some name
-		policy := data.sandbox.network_policies[name]
+		policy := data.network_policies[name]
 		not endpoint_allowed(policy, input.network)
 		r := sprintf("endpoint %s:%d not in policy '%s'", [input.network.host, input.network.port, name])
 	]
@@ -41,7 +41,7 @@ deny_reason := reason if {
 	cmdline_str := concat(", ", input.exec.cmdline_paths)
 	binary_misses := [r |
 		some name
-		policy := data.sandbox.network_policies[name]
+		policy := data.network_policies[name]
 		endpoint_allowed(policy, input.network)
 		not binary_allowed(policy, input.exec)
 		r := sprintf("binary '%s' (ancestors: [%s], cmdline: [%s]) not allowed in policy '%s'", [input.exec.path, ancestors_str, cmdline_str, name])
@@ -54,14 +54,14 @@ deny_reason := reason if {
 deny_reason := "no network policies defined" if {
 	input.network
 	input.exec
-	count(data.sandbox.network_policies) == 0
+	count(data.network_policies) == 0
 }
 
 # --- Matched policy name (for audit logging) ---
 
 matched_network_policy := name if {
 	some name
-	policy := data.sandbox.network_policies[name]
+	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 }
@@ -73,7 +73,7 @@ matched_network_policy := name if {
 # This is intentional — well-authored policies should have disjoint coverage.
 network_policy_for_request := policy if {
 	some name
-	policy := data.sandbox.network_policies[name]
+	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 }

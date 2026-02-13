@@ -1154,7 +1154,7 @@ struct DevSandboxPolicyFile {
     #[serde(default)]
     inference: Option<DevInferencePolicy>,
     #[serde(default)]
-    filesystem: Option<DevFilesystemPolicy>,
+    filesystem_policy: Option<DevFilesystemPolicy>,
     #[serde(default)]
     landlock: Option<DevLandlockPolicy>,
     #[serde(default)]
@@ -1268,7 +1268,7 @@ fn load_dev_sandbox_policy() -> Result<SandboxPolicy> {
     Ok(SandboxPolicy {
         version: raw.version,
         filesystem: raw
-            .filesystem
+            .filesystem_policy
             .map(|fs| navigator_core::proto::FilesystemPolicy {
                 include_workdir: fs.include_workdir,
                 read_only: fs.read_only,

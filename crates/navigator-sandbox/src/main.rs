@@ -42,14 +42,14 @@ struct Args {
     navigator_endpoint: Option<String>,
 
     /// Path to Rego policy file for OPA-based network access control.
-    /// Requires --rego-data to also be set.
-    #[arg(long, env = "NAVIGATOR_REGO_POLICY")]
-    rego_policy: Option<String>,
+    /// Requires --policy-data to also be set.
+    #[arg(long, env = "NAVIGATOR_POLICY_RULES")]
+    policy_rules: Option<String>,
 
-    /// Path to Rego data file containing network policies and sandbox config.
-    /// Requires --rego-policy to also be set.
-    #[arg(long, env = "NAVIGATOR_REGO_DATA")]
-    rego_data: Option<String>,
+    /// Path to YAML data file containing network policies and sandbox config.
+    /// Requires --policy-rules to also be set.
+    #[arg(long, env = "NAVIGATOR_POLICY_DATA")]
+    policy_data: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "warn", env = "NAVIGATOR_LOG_LEVEL")]
@@ -124,8 +124,8 @@ async fn main() -> Result<()> {
         args.interactive,
         args.sandbox_id,
         args.navigator_endpoint,
-        args.rego_policy,
-        args.rego_data,
+        args.policy_rules,
+        args.policy_data,
         args.ssh_listen_addr,
         args.ssh_handshake_secret,
         args.ssh_handshake_skew_secs,

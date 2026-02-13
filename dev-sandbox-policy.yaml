@@ -1,16 +1,16 @@
 version: 1
 
-inference:
-  allowed_routing_hints:
-    - local
-
 # --- Sandbox setup configuration (queried once at startup) ---
 
-filesystem:
+filesystem_policy:
   include_workdir: true
   read_only:
     - /usr
     - /lib
+    - /proc/self
+    - /dev/urandom
+    - /app
+    - /etc
   read_write:
     - /sandbox
     - /tmp
@@ -48,3 +48,6 @@ network_policies:
     binaries:
       - { path: /usr/bin/glab }
 
+inference:
+  allowed_routing_hints:
+    - local

@@ -54,28 +54,34 @@ pub struct OpaEngine {
 }
 
 impl OpaEngine {
-    /// Load policy and data from `.rego` file paths.
+    /// Load policy from a `.rego` rules file and data from a YAML file.
     pub fn from_files(policy_path: &Path, data_path: &Path) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
+        let path_str = data_path.to_string_lossy().to_string();
+        let data_value = regorus::Value::from_yaml_file(&path_str).map_err(|e| {
+            miette::miette!("failed to load YAML data from {}: {e}", data_path.display())
+        })?;
         engine
-            .add_policy_from_file(data_path)
+            .add_data(data_value)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
         })
     }
 
-    /// Load policy and data from strings.
-    pub fn from_strings(policy: &str, data: &str) -> Result<Self> {
+    /// Load policy rules and data from strings (data is YAML).
+    pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
+        let data_value =
+            regorus::Value::from_yaml_str(data_yaml).map_err(|e| miette::miette!("{e}"))?;
         engine
-            .add_policy("data.rego".into(), data.into())
+            .add_data(data_value)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
@@ -165,17 +171,19 @@ impl OpaEngine {
         })
     }
 
-    /// Reload policy and data from strings.
+    /// Reload policy and data from strings (data is YAML).
     ///
     /// Designed for future gRPC hot-reload from the navigator gateway.
     /// Replaces the entire engine atomically.
-    pub fn reload(&self, policy: &str, data: &str) -> Result<()> {
+    pub fn reload(&self, policy: &str, data_yaml: &str) -> Result<()> {
         let mut new_engine = regorus::Engine::new();
         new_engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
+        let data_value =
+            regorus::Value::from_yaml_str(data_yaml).map_err(|e| miette::miette!("{e}"))?;
         new_engine
-            .add_policy("data.rego".into(), data.into())
+            .add_data(data_value)
             .map_err(|e| miette::miette!("{e}"))?;
 
         let mut engine = self
@@ -311,12 +319,12 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
 
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
 ///
-/// The rego rules reference `data.sandbox.*`, so we wrap everything under a
-/// `"sandbox"` key. The structure matches the rego data package expectations:
-/// - `data.sandbox.filesystem_policy`
-/// - `data.sandbox.landlock`
-/// - `data.sandbox.process`
-/// - `data.sandbox.network_policies`
+/// The rego rules reference `data.*` directly, so the JSON structure has
+/// top-level keys matching the data expectations:
+/// - `data.filesystem_policy`
+/// - `data.landlock`
+/// - `data.process`
+/// - `data.network_policies`
 fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
@@ -381,12 +389,10 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
         .collect();
 
     serde_json::json!({
-        "sandbox": {
-            "filesystem_policy": filesystem_policy,
-            "landlock": landlock,
-            "process": process,
-            "network_policies": network_policies,
-        }
+        "filesystem_policy": filesystem_policy,
+        "landlock": landlock,
+        "process": process,
+        "network_policies": network_policies,
     })
     .to_string()
 }
@@ -401,10 +407,10 @@ mod tests {
     };
 
     const TEST_POLICY: &str = include_str!("../../../dev-sandbox-policy.rego");
-    const TEST_DATA: &str = include_str!("../../../dev-sandbox-policy-data.rego");
+    const TEST_DATA_YAML: &str = include_str!("../../../dev-sandbox-policy.yaml");
 
     fn test_engine() -> OpaEngine {
-        OpaEngine::from_strings(TEST_POLICY, TEST_DATA).expect("Failed to load test policy")
+        OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).expect("Failed to load test policy")
     }
 
     fn test_proto() -> ProtoSandboxPolicy {
@@ -645,13 +651,18 @@ mod tests {
         assert!(decision.allowed);
 
         // Reload with a policy that has no network policies (deny all)
-        let empty_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {}
-"#;
+        let empty_data = r"
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+network_policies: {}
+";
         engine.reload(TEST_POLICY, empty_data).unwrap();
 
         let decision = engine.evaluate_network(&input).unwrap();
@@ -745,17 +756,13 @@ network_policies := {}
     fn glob_pattern_matches_binary() {
         // Test with a policy that uses glob patterns
         let glob_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {
-    "glob_test": {
-        "name": "glob_test",
-        "endpoints": [{"host": "example.com", "port": 443}],
-        "binaries": [{"path": "/usr/bin/*"}],
-    },
-}
+network_policies:
+  glob_test:
+    name: glob_test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: "/usr/bin/*" }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
         let input = NetworkInput {
@@ -777,17 +784,13 @@ network_policies := {
     #[test]
     fn glob_pattern_matches_ancestor() {
         let glob_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {
-    "glob_test": {
-        "name": "glob_test",
-        "endpoints": [{"host": "example.com", "port": 443}],
-        "binaries": [{"path": "/usr/local/bin/*"}],
-    },
-}
+network_policies:
+  glob_test:
+    name: glob_test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: "/usr/local/bin/*" }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
         let input = NetworkInput {
@@ -810,17 +813,13 @@ network_policies := {
     fn glob_pattern_no_cross_segment() {
         // * should NOT match across / boundaries
         let glob_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {
-    "glob_test": {
-        "name": "glob_test",
-        "endpoints": [{"host": "example.com", "port": 443}],
-        "binaries": [{"path": "/usr/bin/*"}],
-    },
-}
+network_policies:
+  glob_test:
+    name: glob_test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: "/usr/bin/*" }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
         let input = NetworkInput {
@@ -839,19 +838,15 @@ network_policies := {
     fn cmdline_path_matches_script_binary() {
         // Simulates: node runs /usr/local/bin/my-tool (a script with shebang)
         // exe = /usr/bin/node, cmdline contains /usr/local/bin/my-tool
-        let cmdline_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {
-    "script_test": {
-        "name": "script_test",
-        "endpoints": [{"host": "example.com", "port": 443}],
-        "binaries": [{"path": "/usr/local/bin/my-tool"}],
-    },
-}
-"#;
+        let cmdline_data = r"
+network_policies:
+  script_test:
+    name: script_test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/my-tool }
+";
         let engine = OpaEngine::from_strings(TEST_POLICY, cmdline_data).unwrap();
         let input = NetworkInput {
             host: "example.com".into(),
@@ -872,19 +867,15 @@ network_policies := {
 
     #[test]
     fn cmdline_path_no_match_denied() {
-        let cmdline_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {
-    "script_test": {
-        "name": "script_test",
-        "endpoints": [{"host": "example.com", "port": 443}],
-        "binaries": [{"path": "/usr/local/bin/my-tool"}],
-    },
-}
-"#;
+        let cmdline_data = r"
+network_policies:
+  script_test:
+    name: script_test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/my-tool }
+";
         let engine = OpaEngine::from_strings(TEST_POLICY, cmdline_data).unwrap();
         let input = NetworkInput {
             host: "example.com".into(),
@@ -904,17 +895,13 @@ network_policies := {
     #[test]
     fn cmdline_glob_pattern_matches() {
         let glob_data = r#"
-package sandbox
-filesystem_policy := {"include_workdir": true, "read_only": [], "read_write": []}
-landlock := {"compatibility": "best_effort"}
-process := {"run_as_user": "sandbox", "run_as_group": "sandbox"}
-network_policies := {
-    "glob_test": {
-        "name": "glob_test",
-        "endpoints": [{"host": "example.com", "port": 443}],
-        "binaries": [{"path": "/usr/local/bin/*"}],
-    },
-}
+network_policies:
+  glob_test:
+    name: glob_test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: "/usr/local/bin/*" }
 "#;
         let engine = OpaEngine::from_strings(TEST_POLICY, glob_data).unwrap();
         let input = NetworkInput {

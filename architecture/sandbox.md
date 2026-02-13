@@ -18,17 +18,19 @@ Sandboxing is driven by a required policy configuration. There are two ways to p
    variables. The sandbox will fetch its policy from the Navigator server at startup via the
    `GetSandboxPolicy` RPC.
 
-2. **File mode** (local development): Provide a YAML policy file via `--policy` or
-   `NAVIGATOR_SANDBOX_POLICY`.
+2. **File mode** (local development): Provide rego rules + YAML data files via
+   `--policy-rules` + `--policy-data` (or `NAVIGATOR_POLICY_RULES` / `NAVIGATOR_POLICY_DATA`
+   env vars).
 
-The policy schema includes:
+The policy schema (defined in `dev-sandbox-policy.yaml`) includes:
 
-- `filesystem`: read-only and read-write allow lists, plus optional inclusion of the workdir. Any directories under `read_write` will automatically be created if they do not exist.
-- `network`: mode (`allow`, `block`, `proxy`) and optional proxy configuration.
+- `filesystem_policy`: read-only and read-write allow lists, plus optional inclusion of the workdir. Any directories under `read_write` will automatically be created if they do not exist.
 - `landlock`: compatibility behavior (`best_effort` or `hard_requirement`).
 - `process`: optional `run_as_user`/`run_as_group` to drop privileges for the child process.
+- `inference`: allowed routing hints for inference access control.
+- `network_policies`: per-binary network access rules with endpoint and binary identity matching.
 
-See `docs/sandbox-policy.yaml` for an example policy.
+See `dev-sandbox-policy.yaml` for the full example.
 
 ## Dynamic Policy Loading (gRPC Mode)
 

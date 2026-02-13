@@ -28,7 +28,7 @@ struct ConnectDecision {
     cmdline_paths: Vec<PathBuf>,
     /// Name of the matched policy rule (allow only).
     matched_policy: Option<String>,
-    /// Which engine made the decision ("opa" or "control_plane").
+    /// Which engine made the decision ("opa" or "`control_plane`").
     engine: &'static str,
     /// Deny reason or error context.
     reason: String,

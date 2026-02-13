@@ -40,7 +40,7 @@ The sandbox container runs untrusted agent code in isolation.
 **Key features:**
 
 - Multi-user isolation: `supervisor` (privileged) and `sandbox` (restricted) users
-- Policy file mount at `/var/navigator/policy.yaml`
+- Policy files mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data)
 - Debug or release builds via `RUST_BUILD_PROFILE` arg
 
 ### navigator-server

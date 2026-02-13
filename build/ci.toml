@@ -11,23 +11,25 @@ depends = ["fmt:check", "clippy", "python:lint", "test:rust", "test:python"]
 [sandbox]
 description = "Run the sandbox container with an interactive shell"
 depends = ["docker:build:sandbox"]
+raw = true
+usage = 'arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"'
 run = """
+#!/usr/bin/env bash
 TTY_FLAG=""
 if [ -t 0 ]; then
   TTY_FLAG="-it"
 fi
-CMD=("$@")
-if [ "$#" -eq 0 ]; then
-  CMD=("/bin/bash")
-fi
+CMD=(${usage_command:-/bin/bash})
 docker run ${TTY_FLAG} \
   --cap-add=SYS_ADMIN \
   --cap-add=NET_ADMIN \
   --cap-add=SYS_PTRACE \
-  -v ${PWD}/dev-sandbox-policy.yaml:/var/navigator/policy.yaml:ro \
+  -v ${PWD}/dev-sandbox-policy.rego:/var/navigator/policy.rego:ro \
+  -v ${PWD}/dev-sandbox-policy.yaml:/var/navigator/data.yaml:ro \
   -v ${PWD}/tmp:/sandbox/tmp \
   -e HOME=/sandbox \
   -w /sandbox \
-  -e NAVIGATOR_SANDBOX_POLICY=/var/navigator/policy.yaml \
-  navigator-sandbox:${IMAGE_TAG:-dev} -i "${CMD[@]}"
+  -e NAVIGATOR_POLICY_RULES=/var/navigator/policy.rego \
+  -e NAVIGATOR_POLICY_DATA=/var/navigator/data.yaml \
+  navigator-sandbox:${IMAGE_TAG:-dev} -i -- ${CMD[@]}
 """

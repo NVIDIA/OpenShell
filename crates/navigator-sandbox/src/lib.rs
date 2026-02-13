@@ -41,8 +41,8 @@ pub async fn run_sandbox(
     interactive: bool,
     sandbox_id: Option<String>,
     navigator_endpoint: Option<String>,
-    rego_policy: Option<String>,
-    rego_data: Option<String>,
+    policy_rules: Option<String>,
+    policy_data: Option<String>,
     ssh_listen_addr: Option<String>,
     ssh_handshake_secret: Option<String>,
     ssh_handshake_skew_secs: u64,
@@ -56,7 +56,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
     let (policy, opa_engine) =
-        load_policy(sandbox_id, navigator_endpoint, rego_policy, rego_data).await?;
+        load_policy(sandbox_id, navigator_endpoint, policy_rules, policy_data).await?;
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -241,24 +241,24 @@ pub async fn run_sandbox(
     Ok(status.code())
 }
 
-/// Load sandbox policy from Rego files or gRPC.
+/// Load sandbox policy from local files or gRPC.
 ///
 /// Priority:
-/// 1. If `rego_policy` and `rego_data` are provided, load OPA engine from Rego files
+/// 1. If `policy_rules` and `policy_data` are provided, load OPA engine from local files
 /// 2. If `sandbox_id` and `navigator_endpoint` are provided, fetch via gRPC
 /// 3. Otherwise, return an error
 async fn load_policy(
     sandbox_id: Option<String>,
     navigator_endpoint: Option<String>,
-    rego_policy: Option<String>,
-    rego_data: Option<String>,
+    policy_rules: Option<String>,
+    policy_data: Option<String>,
 ) -> Result<(SandboxPolicy, Option<Arc<OpaEngine>>)> {
-    // Rego mode: load OPA engine and extract sandbox config from Rego files (dev override)
-    if let (Some(policy_file), Some(data_file)) = (&rego_policy, &rego_data) {
+    // File mode: load OPA engine from rego rules + YAML data (dev override)
+    if let (Some(policy_file), Some(data_file)) = (&policy_rules, &policy_data) {
         info!(
-            rego_policy = %policy_file,
-            rego_data = %data_file,
-            "Loading OPA policy engine from rego files"
+            policy_rules = %policy_file,
+            policy_data = %data_file,
+            "Loading OPA policy engine from local files"
         );
         let engine = OpaEngine::from_files(
             std::path::Path::new(policy_file),
@@ -303,7 +303,7 @@ async fn load_policy(
     // No policy source available
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
-         - --rego-policy and --rego-data (or NAVIGATOR_REGO_POLICY and NAVIGATOR_REGO_DATA env vars)\n\
+         - --policy-rules and --policy-data (or NAVIGATOR_POLICY_RULES and NAVIGATOR_POLICY_DATA env vars)\n\
          - --sandbox-id and --navigator-endpoint (or NAVIGATOR_SANDBOX_ID and NAVIGATOR_ENDPOINT env vars)"
     ))
 }
