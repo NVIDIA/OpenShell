@@ -25,7 +25,6 @@ htmlcov
 
 # Build/dist artifacts
 dist
-build
 *.egg
 
 # Kubernetes/local dev

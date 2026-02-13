@@ -150,7 +150,38 @@ The project uses the Navigator CLI to provision a local k3s-in-container cluster
 
 ```bash
 mise run cluster          # Build and deploy local k3s cluster with Navigator
-mise run cluster:deploy   # Deploy changes to existing cluster (rebuilds images and upgrades helm release)
+mise run cluster:deploy   # Fast deploy: rebuild changed components and skip unnecessary helm work
+mise run cluster:push:server    # Push local server image to configured pull registry
+mise run cluster:push:sandbox   # Push local sandbox image to configured pull registry
+mise run cluster:push:pki-job   # Push local pki-job image to configured pull registry
+mise run cluster:deploy:pull    # Force full pull-mode deploy flow
+mise run cluster:push           # Legacy image-import fallback workflow
+```
+
+Default local cluster workflow uses pull mode with a local Docker registry at `127.0.0.1:5000`.
+You can override repository settings with:
+
+- `IMAGE_REPO_BASE` (for example `127.0.0.1:5000/navigator`)
+- `NAVIGATOR_REGISTRY_HOST`, `NAVIGATOR_REGISTRY_NAMESPACE`
+- `NAVIGATOR_REGISTRY_ENDPOINT` (optional mirror endpoint override, e.g. `host.docker.internal:5000`)
+- `NAVIGATOR_REGISTRY_USERNAME`, `NAVIGATOR_REGISTRY_PASSWORD`
+- `NAVIGATOR_REGISTRY_INSECURE=true|false`
+
+Useful env flags for fast deploy:
+
+- `FORCE_HELM_UPGRADE=1` - run Helm upgrade even when chart files are unchanged
+- `DEPLOY_FAST_HELM_WAIT=1` - wait for Helm upgrade completion (`helm --wait`)
+- `DEPLOY_FAST_MODE=full` - force full component rebuild behavior through fast deploy
+- `DOCKER_BUILD_CACHE_DIR=.cache/buildkit` - local BuildKit cache directory used by component image builds
+
+GitLab Container Registry mapping (CI or shared dev):
+
+```bash
+export NAVIGATOR_REGISTRY_HOST=${CI_REGISTRY}
+export NAVIGATOR_REGISTRY_NAMESPACE=${CI_PROJECT_PATH}
+export NAVIGATOR_REGISTRY_USERNAME=${CI_REGISTRY_USER}
+export NAVIGATOR_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD}
+export IMAGE_REPO_BASE=${CI_REGISTRY}/${CI_PROJECT_PATH}
 ```
 
 The cluster exposes ports 80/443 for gateway traffic and 6443 for the Kubernetes API.
@@ -168,7 +199,7 @@ defaults to `navigator`).
 
 ### Debugging Cluster Issues
 
-If a cluster fails to start or is unhealthy after `nav cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.claude/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
+If a cluster fails to start or is unhealthy after `nav cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.agent/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
 
 ### Docker Build Tasks
 

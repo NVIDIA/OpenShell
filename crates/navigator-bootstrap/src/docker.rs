@@ -16,6 +16,26 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
 use std::path::Path;
 
+const REGISTRY_NAMESPACE_DEFAULT: &str = "navigator";
+
+const REGISTRY_MODE_EXTERNAL: &str = "external";
+
+fn env_non_empty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+fn env_bool(key: &str) -> Option<bool> {
+    env_non_empty(key).map(|value| {
+        matches!(
+            value.to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        )
+    })
+}
+
 /// Platform information for a Docker daemon host.
 #[derive(Debug, Clone)]
 pub struct HostPlatform {
@@ -245,7 +265,6 @@ pub async fn ensure_container(
             host_port: Some("443".to_string()),
         }]),
     );
-
     let exposed_ports = vec![
         "6443/tcp".to_string(),
         "80/tcp".to_string(),
@@ -278,11 +297,43 @@ pub async fn ensure_container(
     // Pass extra SANs, SSH gateway config, and registry credentials to the
     // entrypoint so they can be injected into the HelmChart manifest and
     // k3s registries.yaml.
+    let registry_host = env_non_empty("NAVIGATOR_REGISTRY_HOST").unwrap_or_else(pull_registry);
+    let registry_namespace = env_non_empty("NAVIGATOR_REGISTRY_NAMESPACE")
+        .unwrap_or_else(|| REGISTRY_NAMESPACE_DEFAULT.to_string());
+    let image_repo_base = env_non_empty("IMAGE_REPO_BASE")
+        .or_else(|| env_non_empty("NAVIGATOR_IMAGE_REPO_BASE"))
+        .unwrap_or_else(|| format!("{registry_host}/{registry_namespace}"));
+    let registry_insecure = env_bool("NAVIGATOR_REGISTRY_INSECURE").unwrap_or(false);
+    let registry_endpoint = env_non_empty("NAVIGATOR_REGISTRY_ENDPOINT");
+
+    let registry_username = env_non_empty("NAVIGATOR_REGISTRY_USERNAME").or_else(|| {
+        if registry_host == pull_registry() {
+            Some(pull_registry_username())
+        } else {
+            None
+        }
+    });
+    let registry_password = env_non_empty("NAVIGATOR_REGISTRY_PASSWORD").or_else(|| {
+        if registry_host == pull_registry() {
+            Some(pull_registry_password())
+        } else {
+            None
+        }
+    });
+
     let mut env_vars: Vec<String> = vec![
-        format!("REGISTRY_HOST={}", pull_registry()),
-        format!("REGISTRY_USERNAME={}", pull_registry_username()),
-        format!("REGISTRY_PASSWORD={}", pull_registry_password()),
+        format!("REGISTRY_MODE={REGISTRY_MODE_EXTERNAL}"),
+        format!("REGISTRY_HOST={registry_host}"),
+        format!("REGISTRY_INSECURE={registry_insecure}"),
+        format!("IMAGE_REPO_BASE={image_repo_base}"),
     ];
+    if let Some(endpoint) = registry_endpoint {
+        env_vars.push(format!("REGISTRY_ENDPOINT={endpoint}"));
+    }
+    if let (Some(username), Some(password)) = (registry_username, registry_password) {
+        env_vars.push(format!("REGISTRY_USERNAME={username}"));
+        env_vars.push(format!("REGISTRY_PASSWORD={password}"));
+    }
     if !extra_sans.is_empty() {
         env_vars.push(format!("EXTRA_SANS={}", extra_sans.join(",")));
     }

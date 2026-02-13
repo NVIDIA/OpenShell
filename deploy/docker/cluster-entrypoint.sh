@@ -92,13 +92,25 @@ fi
 # component images from the distribution registry at runtime.
 # Credentials are passed as environment variables by the bootstrap code.
 REGISTRIES_YAML="/etc/rancher/k3s/registries.yaml"
-if [ -n "$REGISTRY_HOST" ] && [ -n "$REGISTRY_USERNAME" ] && [ -n "$REGISTRY_PASSWORD" ]; then
-    echo "Configuring registry credentials for distribution registry"
+if [ -n "${REGISTRY_HOST:-}" ]; then
+    REGISTRY_SCHEME="https"
+    REGISTRY_ENDPOINT="${REGISTRY_ENDPOINT:-${REGISTRY_HOST}}"
+    insecure_value=$(printf '%s' "${REGISTRY_INSECURE:-false}" | tr '[:upper:]' '[:lower:]')
+    if [ "$insecure_value" = "true" ] || [ "$insecure_value" = "1" ] || [ "$insecure_value" = "yes" ] || [ "$insecure_value" = "on" ]; then
+        REGISTRY_SCHEME="http"
+    fi
+
+    echo "Configuring registry mirror for ${REGISTRY_HOST} via ${REGISTRY_ENDPOINT} (${REGISTRY_SCHEME})"
     cat > "$REGISTRIES_YAML" <<REGEOF
 mirrors:
   "${REGISTRY_HOST}":
     endpoint:
-      - "https://${REGISTRY_HOST}"
+      - "${REGISTRY_SCHEME}://${REGISTRY_ENDPOINT}"
+
+REGEOF
+
+    if [ -n "${REGISTRY_USERNAME:-}" ] && [ -n "${REGISTRY_PASSWORD:-}" ]; then
+        cat >> "$REGISTRIES_YAML" <<REGEOF
 
 configs:
   "${REGISTRY_HOST}":
@@ -106,8 +118,9 @@ configs:
       username: ${REGISTRY_USERNAME}
       password: ${REGISTRY_PASSWORD}
 REGEOF
+    fi
 else
-    echo "Warning: REGISTRY_HOST, REGISTRY_USERNAME, or REGISTRY_PASSWORD not set; skipping registry config"
+    echo "Warning: REGISTRY_HOST not set; skipping registry config"
 fi
 
 # Copy bundled manifests to k3s manifests directory.
@@ -115,7 +128,10 @@ fi
 # on /var/lib/rancher/k3s overwrites any files baked into that path.
 if [ -d "/opt/navigator/manifests" ]; then
     echo "Copying bundled manifests to k3s..."
-    cp /opt/navigator/manifests/*.yaml /var/lib/rancher/k3s/server/manifests/ 2>/dev/null || true
+    for manifest in /opt/navigator/manifests/*.yaml; do
+        [ ! -f "$manifest" ] && continue
+        cp "$manifest" /var/lib/rancher/k3s/server/manifests/
+    done
 fi
 
 # ---------------------------------------------------------------------------
@@ -126,6 +142,14 @@ fi
 # When IMAGE_PULL_POLICY is set, override the default "Always" so k3s uses
 # images already present in containerd instead of pulling from the registry.
 HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
+
+if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
+    target_tag="${IMAGE_TAG:-latest}"
+    echo "Setting image repository base: ${IMAGE_REPO_BASE}"
+    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/server|" "$HELMCHART"
+    sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${IMAGE_REPO_BASE}/sandbox:${target_tag}|" "$HELMCHART"
+    sed -i -E "s|jobImage:[[:space:]]*[^[:space:]]+|jobImage: ${IMAGE_REPO_BASE}/pki-job:${target_tag}|" "$HELMCHART"
+fi
 
 # In push mode, use the exact image references that were imported into cluster
 # containerd so the Helm release cannot drift back to remote ":latest" tags.

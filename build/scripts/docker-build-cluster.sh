@@ -9,6 +9,22 @@
 set -euo pipefail
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
+DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}
+CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/cluster"
+
+mkdir -p "${CACHE_PATH}"
+
+CACHE_ARGS=()
+if [[ -n "${CI:-}" ]]; then
+  echo "CI environment detected; skipping local build cache export options."
+elif docker buildx inspect 2>/dev/null | grep -q "Driver: docker-container"; then
+  CACHE_ARGS=(
+    --cache-from "type=local,src=${CACHE_PATH}"
+    --cache-to "type=local,dest=${CACHE_PATH},mode=max"
+  )
+else
+  echo "Buildx driver does not support local cache export; skipping local build cache options."
+fi
 
 # Create build directory for charts
 mkdir -p deploy/docker/.build/charts
@@ -29,6 +45,7 @@ helm pull oci://docker.io/envoyproxy/gateway-helm \
 echo "Building cluster image..."
 docker buildx build \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
+  "${CACHE_ARGS[@]}" \
   -f deploy/docker/Dockerfile.cluster \
   -t navigator-cluster:${IMAGE_TAG} \
   --build-arg K3S_VERSION=${K3S_VERSION} \

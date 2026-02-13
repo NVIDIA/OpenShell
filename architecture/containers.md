@@ -110,6 +110,34 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`):
 | `K3S_VERSION`        | `v1.29.8-k3s1` | k3s version for cluster image           |
 | `CLUSTER_NAME`       | `navigator`    | Name for local cluster deployment       |
 
+### Build Caching
+
+Container builds use Docker BuildKit local caches under `.cache/buildkit/`:
+
+- `build/scripts/docker-build-component.sh` stores per-component caches in `.cache/buildkit/<component>`
+- `build/scripts/docker-build-cluster.sh` stores the cluster image cache in `.cache/buildkit/cluster`
+- Rust-heavy Dockerfiles use BuildKit cache mounts for cargo registry and target directories keyed by image and target architecture, with `sharing=locked` to avoid concurrent cache corruption in parallel CI builds
+- When the active buildx driver is `docker` (instead of `docker-container`), local cache import/export flags are skipped automatically because that driver cannot export local caches
+
+In CI, caching `.cache/buildkit/` between pipeline runs avoids recompiling unchanged Rust dependencies and reduces repeated image rebuild time.
+
+The `python_e2e_sandbox_test` job does not use a localhost registry. It tags and pushes component images to the GitLab project registry (`$CI_REGISTRY_IMAGE`) and configures cluster bootstrap to pull from that remote registry with CI credentials.
+
+The `build_ci_image` job also publishes and reuses a registry-backed BuildKit cache at `$CI_REGISTRY_IMAGE/ci:buildcache`, so layer cache survives across runners and pipelines even when local cache directories are cold.
+
+Rust lint/test jobs also cache `.cache/sccache/` and `target/` with keys derived from `Cargo.lock` and Rust task config files (scoped per runner architecture) so branches can reuse compilation artifacts. CI sets `CARGO_INCREMENTAL=0` to favor deterministic clean builds over incremental metadata churn.
+
+### CI Runner Image
+
+`deploy/docker/Dockerfile.ci` pre-installs tools used by pipeline jobs so they do not download at runtime:
+
+- Docker CLI and buildx plugin for DinD-based image build/publish jobs
+- AWS CLI v2 for ECR authentication and image publishing
+- `uv` installed directly from Astral's installer script (avoids GitHub API rate-limit failures during image builds)
+- `sccache` installed on amd64 CI images (skipped on arm64 where the pinned aqua package is unavailable)
+- `socat` for Docker socket forwarding in sandbox e2e tests
+- The CI image build context must include `build/` because `Dockerfile.ci` copies build task includes from that directory
+
 ## Helm Chart
 
 The Navigator Helm chart (`deploy/helm/navigator/`) deploys the server to Kubernetes.

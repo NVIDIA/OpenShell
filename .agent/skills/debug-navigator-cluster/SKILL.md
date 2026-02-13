@@ -17,7 +17,7 @@ Diagnose why a navigator cluster failed to start after `nav cluster admin deploy
 4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
-7. **Push local images** (if `NAVIGATOR_PUSH_IMAGES` is set): Export locally-built component images from the Docker daemon and import them into the k3s containerd runtime via `k3s ctr -n k8s.io images import`. This "push" path is used by `mise run cluster` so the cluster uses locally-built server/sandbox/pki-job images instead of pulling from the remote registry.
+7. **Prepare local images** (if `NAVIGATOR_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
 8. Wait for cluster health checks to pass (up to 6 min):
    - k3s API server readiness (`/readyz`)
    - `navigator` deployment available in `navigator` namespace
@@ -149,7 +149,7 @@ docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yam
 
 Common issues:
 
-- **ImagePullBackOff**: The component image failed to pull. When using push mode (`mise run cluster`), verify that images were imported into the k8s.io containerd namespace (see Step 6). When using pull mode (remote deploy or manual `nav cluster admin deploy`), check that `/etc/rancher/k3s/registries.yaml` exists with correct credentials and that DNS is working (Step 8). The remote registry is `d1i0nduu2f6qxk.cloudfront.net/navigator/`.
+- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 6). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `d1i0nduu2f6qxk.cloudfront.net/navigator/`.
 - **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
 - **Pending**: Insufficient resources or scheduling constraints.
 
@@ -184,9 +184,19 @@ If using Docker-in-Docker (`DOCKER_HOST=tcp://docker:2375`), verify metadata poi
 
 ### Step 6: Check Image Availability
 
-Component images (server, sandbox, pki-job) can reach k3s containerd via two paths:
+Component images (server, sandbox, pki-job) can reach kubelet via two paths:
 
-**Push mode** (local development via `mise run cluster` or `mise run cluster:deploy`): Images are built locally and imported into the k3s containerd `k8s.io` namespace. The HelmChart is configured with `pullPolicy: IfNotPresent` and uses the `IMAGE_TAG` (default `dev`).
+**Local/external pull mode** (default local via `mise run cluster`): Images are built locally, tagged to the configured local registry base (default `127.0.0.1:5000/navigator/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`).
+
+```bash
+# Verify image refs currently used by navigator deployment
+docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get deploy navigator -o jsonpath="{.spec.template.spec.containers[*].image}"'
+
+# Verify registry mirror/auth endpoint configuration
+docker exec navigator-cluster-<name> cat /etc/rancher/k3s/registries.yaml
+```
+
+**Legacy push mode** (`mise run cluster:push`): Images are imported into the k3s containerd `k8s.io` namespace.
 
 ```bash
 # Check if images were imported into containerd (k3s default namespace is k8s.io)
@@ -199,7 +209,7 @@ If images are missing, re-import with:
 docker save <image-ref> | docker exec -i navigator-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images import -
 ```
 
-**Pull mode** (remote deploy or manual `nav cluster admin deploy` without `NAVIGATOR_PUSH_IMAGES`): Images are pulled from the distribution registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
+**External pull mode** (remote deploy, or local with `NAVIGATOR_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
 
 ```bash
 # Verify registries.yaml exists and has credentials
@@ -209,7 +219,7 @@ docker exec navigator-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull d1i0nduu2f6qxk.cloudfront.net/navigator/pki-job:latest'
 ```
 
-If `registries.yaml` is missing or has wrong credentials, the cluster image may need to be rebuilt. The file should contain auth for `d1i0nduu2f6qxk.cloudfront.net`.
+If `registries.yaml` is missing or has wrong values, verify env wiring (`NAVIGATOR_REGISTRY_HOST`, `NAVIGATOR_REGISTRY_INSECURE`, username/password for authenticated registries).
 
 ### Step 7: Check mTLS / PKI
 

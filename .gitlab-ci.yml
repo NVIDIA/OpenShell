@@ -13,7 +13,12 @@ workflow:
 
 variables:
   CARGO_TERM_COLOR: "always"
+  CARGO_INCREMENTAL: "0"
   CI_IMAGE: $CI_REGISTRY_IMAGE/ci:latest
+  CI_IMAGE_CACHE: $CI_REGISTRY_IMAGE/ci:buildcache
+  MISE_AUTO_INSTALL: "0"
+  MISE_TASK_RUN_AUTO_INSTALL: "0"
+  MISE_NOT_FOUND_AUTO_INSTALL: "0"
 
 default:
   image: $CI_IMAGE
@@ -21,14 +26,74 @@ default:
     - agent-dev-kit-build
 
 cache:
-  key: "$CI_COMMIT_REF_SLUG"
-  paths:
-    - target/
-    - .venv/
+  - key:
+      files:
+        - uv.lock
+    paths:
+      - .venv/
+      - .cache/uv/
+  - key:
+      files:
+        - Cargo.lock
+      prefix: "sccache-$CI_RUNNER_EXECUTABLE_ARCH"
+    paths:
+      - .cache/sccache/
+  - key:
+      files:
+        - Cargo.lock
+        - build/rust.toml
+      prefix: "target-$CI_RUNNER_EXECUTABLE_ARCH"
+    paths:
+      - target/
+  - key: "buildkit-$CI_COMMIT_REF_SLUG"
+    paths:
+      - .cache/buildkit/
 
-# Install Python dependencies (cached in .venv/)
-before_script:
-  - uv sync --frozen
+.rust_job_rules:
+  rules:
+    - changes:
+        - Cargo.toml
+        - Cargo.lock
+        - crates/**/*
+        - proto/**/*
+        - build/rust.toml
+        - build/test.toml
+        - build/ci.toml
+        - mise.toml
+        - .gitlab-ci.yml
+    - when: never
+
+.python_job_rules:
+  rules:
+    - changes:
+        - pyproject.toml
+        - uv.lock
+        - python/**/*
+        - scripts/**/*
+        - proto/**/*
+        - build/python.toml
+        - build/test.toml
+        - build/ci.toml
+        - mise.toml
+        - .gitlab-ci.yml
+    - when: never
+
+.e2e_job_rules:
+  rules:
+    - changes:
+        - e2e/**/*
+        - deploy/docker/**/*
+        - deploy/helm/**/*
+        - deploy/kube/**/*
+        - build/cluster.toml
+        - build/docker.toml
+        - build/test.toml
+        - build/scripts/**/*
+        - crates/**/*
+        - proto/**/*
+        - mise.toml
+        - .gitlab-ci.yml
+    - when: never
 
 # =============================================================================
 # CI Image Build (runs only when dependencies change)
@@ -38,40 +103,58 @@ build_ci_image:
   image: docker:24
   services:
     - docker:24-dind
+  cache: []
   tags:
     - agent-dev-kit-build
   variables:
-    DOCKER_TLS_CERTDIR: "/certs"
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOCKER_TLS_VERIFY: ""
+    DOCKER_CERT_PATH: ""
     DOCKER_BUILDKIT: "1"
   before_script: []  # Override default before_script (docker:24 doesn't have uv)
-  when: manual
-  allow_failure: true
+  rules:
+    - changes:
+        - deploy/docker/Dockerfile.ci
+        - mise.toml
+        - build/**/*
+        - .gitlab-ci.yml
+    - when: never
   script:
-    - docker login -u $CI_REGISTRY_USER -p $CI_REGISTRY_PASSWORD $CI_REGISTRY
+    - until docker info >/dev/null 2>&1; do sleep 1; done
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+    - docker buildx create --use --name ci-builder || docker buildx use ci-builder
     - |
-      docker build \
-        --cache-from $CI_IMAGE \
+      docker buildx build \
+        --pull \
+        --cache-from type=registry,ref=$CI_IMAGE \
+        --cache-to type=registry,ref=$CI_IMAGE_CACHE,mode=max \
         --build-arg BUILDKIT_INLINE_CACHE=1 \
         -f deploy/docker/Dockerfile.ci \
         -t $CI_IMAGE \
+        --push \
         .
-    - docker push $CI_IMAGE
 
 # =============================================================================
 # Lint Jobs
 # =============================================================================
 fmt_check:
+  extends: .rust_job_rules
   stage: lint
   script:
     - mise run fmt:check
 
 clippy:
+  extends: .rust_job_rules
   stage: lint
   script:
     - mise run clippy
 
 python_lint:
+  extends: .python_job_rules
   stage: lint
+  before_script:
+    - uv sync --frozen
   script:
     - mise run python:lint
 
@@ -79,16 +162,21 @@ python_lint:
 # Test Jobs
 # =============================================================================
 rust_test:
+  extends: .rust_job_rules
   stage: test
   script:
     - mise run test:rust
 
 python_test:
+  extends: .python_job_rules
   stage: test
+  before_script:
+    - uv sync --frozen
   script:
     - mise run test:python
 
 python_e2e_sandbox_test:
+  extends: .e2e_job_rules
   stage: test
   services:
     - docker:24-dind
@@ -99,13 +187,12 @@ python_e2e_sandbox_test:
     DOCKER_TLS_CERTDIR: ""
     DOCKER_TLS_VERIFY: ""
     DOCKER_CERT_PATH: ""
+    IMAGE_TAG: "$CI_COMMIT_SHA"
+    IMAGE_REPO_BASE: "$CI_REGISTRY_IMAGE"
+    NAVIGATOR_REGISTRY_INSECURE: "false"
   before_script:
     - uv sync --frozen
-    - apt-get update -qq && apt-get install -y -qq socat >/dev/null
-    - curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | tar xz --strip-components=1 -C /usr/local/bin docker/docker
-    - mkdir -p /usr/local/lib/docker/cli-plugins
-    - curl -fsSL https://github.com/docker/buildx/releases/download/v0.21.1/buildx-v0.21.1.linux-amd64 -o /usr/local/lib/docker/cli-plugins/docker-buildx
-    - chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
   script:
     - socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
     - sleep 1
@@ -131,15 +218,6 @@ publish_ecr_images:
     - if: $CI_COMMIT_BRANCH == "main"
   before_script:
     - uv sync --frozen
-    # Install Docker CLI + buildx plugin (CI image has mise/helm but no Docker client)
-    - curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-27.5.1.tgz | tar xz --strip-components=1 -C /usr/local/bin docker/docker
-    - mkdir -p /usr/local/lib/docker/cli-plugins
-    - curl -fsSL https://github.com/docker/buildx/releases/download/v0.21.1/buildx-v0.21.1.linux-amd64 -o /usr/local/lib/docker/cli-plugins/docker-buildx
-    - chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
-    # Install AWS CLI
-    - apt-get update -qq && apt-get install -y -qq unzip >/dev/null
-    - curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
-    - unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install && rm -rf /tmp/aws /tmp/awscliv2.zip
     # Authenticate to ECR
     - aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
   script:
