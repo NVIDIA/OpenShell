@@ -1,8 +1,10 @@
 use navigator_cli::tls::{TlsOptions, grpc_client};
 use navigator_core::proto::{
-    CreateSshSessionRequest, CreateSshSessionResponse, ExecSandboxEvent, ExecSandboxRequest,
-    HealthRequest, HealthResponse, RevokeSshSessionRequest, RevokeSshSessionResponse,
-    ServiceStatus,
+    CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    DeleteProviderRequest, DeleteProviderResponse, ExecSandboxEvent, ExecSandboxRequest,
+    GetProviderRequest, HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, ServiceStatus,
+    UpdateProviderRequest,
     navigator_server::{Navigator, NavigatorServer},
 };
 use rcgen::{
@@ -124,6 +126,51 @@ impl Navigator for TestNavigator {
         _request: tonic::Request<RevokeSshSessionRequest>,
     ) -> Result<Response<RevokeSshSessionResponse>, Status> {
         Ok(Response::new(RevokeSshSessionResponse::default()))
+    }
+
+    async fn create_provider(
+        &self,
+        _request: tonic::Request<CreateProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        Err(Status::unimplemented(
+            "create_provider not implemented in test",
+        ))
+    }
+
+    async fn get_provider(
+        &self,
+        _request: tonic::Request<GetProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        Err(Status::unimplemented(
+            "get_provider not implemented in test",
+        ))
+    }
+
+    async fn list_providers(
+        &self,
+        _request: tonic::Request<ListProvidersRequest>,
+    ) -> Result<Response<ListProvidersResponse>, Status> {
+        Err(Status::unimplemented(
+            "list_providers not implemented in test",
+        ))
+    }
+
+    async fn update_provider(
+        &self,
+        _request: tonic::Request<UpdateProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        Err(Status::unimplemented(
+            "update_provider not implemented in test",
+        ))
+    }
+
+    async fn delete_provider(
+        &self,
+        _request: tonic::Request<DeleteProviderRequest>,
+    ) -> Result<Response<DeleteProviderResponse>, Status> {
+        Err(Status::unimplemented(
+            "delete_provider not implemented in test",
+        ))
     }
 
     type WatchSandboxStream = tokio_stream::wrappers::ReceiverStream<

@@ -6,6 +6,7 @@
 #   K3S_VERSION              - k3s version (set by mise.toml [env])
 #   ENVOY_GATEWAY_VERSION    - Envoy Gateway chart version (set by mise.toml [env])
 #   DOCKER_PLATFORM          - Target platform (optional)
+#   DOCKER_BUILDER           - Buildx builder name (default: auto-select)
 set -euo pipefail
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
@@ -14,16 +15,24 @@ CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/cluster"
 
 mkdir -p "${CACHE_PATH}"
 
+# Select builder — prefer native "docker" driver for local single-arch builds
+# to avoid slow tarball export from the docker-container driver.
+BUILDER_ARGS=()
+if [[ -n "${DOCKER_BUILDER:-}" ]]; then
+  BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
+elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
+  _ctx=$(docker context inspect --format '{{.Name}}' 2>/dev/null || echo default)
+  BUILDER_ARGS=(--builder "${_ctx}")
+fi
+
 CACHE_ARGS=()
 if [[ -n "${CI:-}" ]]; then
   echo "CI environment detected; skipping local build cache export options."
-elif docker buildx inspect 2>/dev/null | grep -q "Driver: docker-container"; then
+elif docker buildx inspect "${BUILDER_ARGS[@]}" 2>/dev/null | grep -q "Driver: docker-container"; then
   CACHE_ARGS=(
     --cache-from "type=local,src=${CACHE_PATH}"
     --cache-to "type=local,dest=${CACHE_PATH},mode=max"
   )
-else
-  echo "Buildx driver does not support local cache export; skipping local build cache options."
 fi
 
 # Create build directory for charts
@@ -44,6 +53,7 @@ helm pull oci://docker.io/envoyproxy/gateway-helm \
 # from the distribution registry; credentials are injected at deploy time)
 echo "Building cluster image..."
 docker buildx build \
+  "${BUILDER_ARGS[@]}" \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   "${CACHE_ARGS[@]}" \
   -f deploy/docker/Dockerfile.cluster \

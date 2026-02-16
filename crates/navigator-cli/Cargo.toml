@@ -14,8 +14,11 @@ path = "src/main.rs"
 [dependencies]
 navigator-bootstrap = { path = "../navigator-bootstrap" }
 navigator-core = { path = "../navigator-core" }
+navigator-providers = { path = "../navigator-providers" }
 serde = { workspace = true }
+serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+prost-types = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true }

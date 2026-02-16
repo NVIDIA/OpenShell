@@ -113,35 +113,37 @@ uv run python -m grpc_tools.protoc \
 # Fix absolute imports in generated stubs to use package-relative imports
 uv run python - <<'PY'
 from pathlib import Path
+import re
 
-replacements = {
+line_rewrites = {
     "python/navigator/_proto/inference_pb2_grpc.py": [
-        ("import inference_pb2", "from . import inference_pb2"),
+        (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
     ],
     "python/navigator/_proto/navigator_pb2_grpc.py": [
-        ("import navigator_pb2", "from . import navigator_pb2"),
-        ("import sandbox_pb2", "from . import sandbox_pb2"),
+        (r"^import navigator_pb2 as navigator__pb2$", "from . import navigator_pb2 as navigator__pb2"),
+        (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/navigator/_proto/navigator_pb2.py": [
-        ("import datamodel_pb2", "from . import datamodel_pb2"),
-        ("import sandbox_pb2", "from . import sandbox_pb2"),
+        (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+        (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/navigator/_proto/datamodel_pb2.py": [
-        ("import sandbox_pb2", "from . import sandbox_pb2"),
+        (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
     "python/navigator/_proto/datamodel_pb2_grpc.py": [
-        ("import datamodel_pb2", "from . import datamodel_pb2"),
+        (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
     ],
     "python/navigator/_proto/sandbox_pb2_grpc.py": [
-        ("import sandbox_pb2", "from . import sandbox_pb2"),
+        (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
 }
 
-for path, rules in replacements.items():
+for path, rules in line_rewrites.items():
     file_path = Path(path)
     text = file_path.read_text()
-    for before, after in rules:
-        text = text.replace(before, after)
+    text = text.replace("from . from . import", "from . import")
+    for pattern, replacement in rules:
+        text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
     file_path.write_text(text)
 PY
 """

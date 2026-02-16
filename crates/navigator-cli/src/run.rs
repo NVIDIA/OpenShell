@@ -4,6 +4,7 @@ use crate::tls::{
     TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
+use dialoguer::Confirm;
 use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
@@ -16,20 +17,26 @@ use navigator_bootstrap::{
     get_cluster_metadata, list_clusters, load_active_cluster, print_kubeconfig,
     remove_cluster_metadata, save_active_cluster, update_local_kubeconfig,
 };
+use navigator_core::proto::navigator_client::NavigatorClient;
 use navigator_core::proto::{
-    CreateInferenceRouteRequest, CreateSandboxRequest, DeleteInferenceRouteRequest,
-    DeleteSandboxRequest, GetSandboxRequest, HealthRequest, InferenceRoute, InferenceRouteSpec,
-    ListInferenceRoutesRequest, ListSandboxesRequest, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec,
-    UpdateInferenceRouteRequest, WatchSandboxRequest,
+    CreateInferenceRouteRequest, CreateProviderRequest, CreateSandboxRequest,
+    DeleteInferenceRouteRequest, DeleteProviderRequest, DeleteSandboxRequest, GetProviderRequest,
+    GetSandboxRequest, HealthRequest, InferenceRoute, InferenceRouteSpec,
+    ListInferenceRoutesRequest, ListProvidersRequest, ListSandboxesRequest, NetworkBinary,
+    NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox, SandboxPhase, SandboxPolicy,
+    SandboxSpec, UpdateInferenceRouteRequest, UpdateProviderRequest, WatchSandboxRequest,
+};
+use navigator_providers::{
+    ProviderRegistry, detect_provider_from_command, normalize_provider_type,
 };
 use owo_colors::OwoColorize;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
+use tonic::{Code, transport::Channel};
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{sandbox_connect, sandbox_exec, sandbox_rsync, sandbox_ssh_proxy};
@@ -121,6 +128,7 @@ impl LogDisplay {
 
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&LogDisplay>) {
     let lines = [
+        String::new(),
         format!("{}", "Created sandbox:".cyan().bold()),
         String::new(),
         format!("  {} {}", "Id:".dimmed(), sandbox.id),
@@ -904,6 +912,7 @@ pub async fn sandbox_create_with_bootstrap(
     keep: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
+    providers: &[String],
     command: &[String],
 ) -> Result<()> {
     if !crate::bootstrap::confirm_bootstrap()? {
@@ -914,16 +923,21 @@ pub async fn sandbox_create_with_bootstrap(
         ));
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
-    sandbox_create(&server, sync, keep, remote, ssh_key, command, &tls).await
+    sandbox_create(
+        &server, sync, keep, remote, ssh_key, providers, command, &tls,
+    )
+    .await
 }
 
 /// Create a sandbox with default settings.
+#[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create(
     server: &str,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
+    providers: &[String],
     command: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -946,10 +960,21 @@ pub async fn sandbox_create(
         }
     };
 
+    let required_providers = required_provider_types(command, providers);
+    let configured_providers = ensure_required_providers(&mut client, &required_providers).await?;
+
     let policy = load_dev_sandbox_policy()?;
+    let mut environment = HashMap::new();
+    if !configured_providers.is_empty() {
+        environment.insert(
+            "NAVIGATOR_PROVIDER_TYPES".to_string(),
+            configured_providers.join(","),
+        );
+    }
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             policy: Some(policy),
+            environment,
             ..SandboxSpec::default()
         }),
     };
@@ -961,7 +986,7 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let sandbox_id = sandbox.id.clone();
+    let sandbox_name = sandbox.name.clone();
 
     // Set up display
     let mut display = if interactive {
@@ -1088,7 +1113,7 @@ pub async fn sandbox_create(
                 if !files.is_empty() {
                     sandbox_rsync(
                         &effective_server,
-                        &sandbox_id,
+                        &sandbox_name,
                         &repo_root,
                         &files,
                         &effective_tls,
@@ -1098,12 +1123,12 @@ pub async fn sandbox_create(
             }
 
             if command.is_empty() {
-                return sandbox_connect(&effective_server, &sandbox_id, &effective_tls).await;
+                return sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await;
             }
 
             let exec_result = sandbox_exec(
                 &effective_server,
-                &sandbox_id,
+                &sandbox_name,
                 command,
                 interactive,
                 &effective_tls,
@@ -1114,7 +1139,7 @@ pub async fn sandbox_create(
                 && !keep
                 && let Err(err) = sandbox_delete(
                     &effective_server,
-                    std::slice::from_ref(&sandbox_id),
+                    std::slice::from_ref(&sandbox_name),
                     &effective_tls,
                 )
                 .await
@@ -1122,7 +1147,7 @@ pub async fn sandbox_create(
                 if exec_result.is_ok() {
                     return Err(err);
                 }
-                eprintln!("Failed to delete sandbox {sandbox_id}: {err}");
+                eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
             }
 
             exec_result
@@ -1161,7 +1186,7 @@ struct DevSandboxPolicyFile {
     #[serde(default)]
     process: Option<DevProcessPolicy>,
     #[serde(default)]
-    network_policies: std::collections::HashMap<String, DevNetworkPolicyRule>,
+    network_policies: HashMap<String, DevNetworkPolicyRule>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1293,12 +1318,14 @@ fn load_dev_sandbox_policy() -> Result<SandboxPolicy> {
     })
 }
 
-/// Fetch a sandbox by id.
-pub async fn sandbox_get(server: &str, id: &str, tls: &TlsOptions) -> Result<()> {
+/// Fetch a sandbox by name.
+pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
     let response = client
-        .get_sandbox(GetSandboxRequest { id: id.to_string() })
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
         .await
         .into_diagnostic()?;
     let sandbox = response
@@ -1584,24 +1611,437 @@ pub async fn sandbox_list(
     Ok(())
 }
 
-/// Delete a sandbox by id.
-pub async fn sandbox_delete(server: &str, ids: &[String], tls: &TlsOptions) -> Result<()> {
+/// Delete a sandbox by name.
+pub async fn sandbox_delete(server: &str, names: &[String], tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
-    for id in ids {
+    for name in names {
         let response = client
-            .delete_sandbox(DeleteSandboxRequest { id: id.clone() })
+            .delete_sandbox(DeleteSandboxRequest { name: name.clone() })
             .await
             .into_diagnostic()?;
 
         let deleted = response.into_inner().deleted;
         if deleted {
-            println!("{} Deleted sandbox {id}", "✓".green().bold());
+            println!("{} Deleted sandbox {name}", "✓".green().bold());
         } else {
-            println!("{} Sandbox {id} not found", "!".yellow());
+            println!("{} Sandbox {name} not found", "!".yellow());
         }
     }
 
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn required_provider_types(command: &[String], providers: &[String]) -> Vec<String> {
+    let mut required = Vec::new();
+    let mut seen = HashSet::new();
+
+    if let Some(inferred) = detect_provider_from_command(command)
+        && seen.insert(inferred.to_string())
+    {
+        required.push(inferred.to_string());
+    }
+
+    for provider in providers {
+        let normalized = normalize_provider_type(provider)
+            .map_or_else(|| provider.to_ascii_lowercase(), str::to_string);
+        if seen.insert(normalized.clone()) {
+            required.push(normalized);
+        }
+    }
+
+    required
+}
+
+async fn ensure_required_providers(
+    client: &mut NavigatorClient<Channel>,
+    required_types: &[String],
+) -> Result<Vec<String>> {
+    if required_types.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut existing_types = HashSet::new();
+    let mut offset = 0_u32;
+    let limit = 100_u32;
+
+    loop {
+        let response = client
+            .list_providers(ListProvidersRequest { limit, offset })
+            .await
+            .into_diagnostic()?;
+        let providers = response.into_inner().providers;
+        for provider in &providers {
+            if !provider.r#type.is_empty() {
+                existing_types.insert(provider.r#type.to_ascii_lowercase());
+            }
+        }
+
+        if providers.len() < limit as usize {
+            break;
+        }
+        offset = offset.saturating_add(limit);
+    }
+
+    let missing = required_types
+        .iter()
+        .filter(|provider_type| !existing_types.contains(&provider_type.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let mut configured_types = required_types
+        .iter()
+        .filter(|provider_type| existing_types.contains(&provider_type.to_ascii_lowercase()))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return Ok(configured_types);
+    }
+
+    if !std::io::stdin().is_terminal() {
+        return Err(miette::miette!(
+            "missing required providers: {}. Create them first with `nav provider create --type <type> --name <name> --from-existing`, or set them up manually from inside the sandbox",
+            missing.join(", ")
+        ));
+    }
+
+    let registry = ProviderRegistry::new();
+    for provider_type in missing {
+        eprintln!("Missing provider: {provider_type}");
+        let should_create = Confirm::new()
+            .with_prompt("Create from local credentials?")
+            .default(true)
+            .interact()
+            .into_diagnostic()?;
+
+        if !should_create {
+            eprintln!("{} Skipping provider '{provider_type}'", "!".yellow(),);
+            continue;
+        }
+
+        let discovered = registry.discover_existing(&provider_type).map_err(|err| {
+            miette::miette!("failed to discover provider '{provider_type}': {err}")
+        })?;
+        let Some(discovered) = discovered else {
+            eprintln!(
+                "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
+                "!".yellow(),
+                provider_type
+            );
+            continue;
+        };
+
+        let mut created = false;
+        for attempt in 0..5 {
+            let name = if attempt == 0 {
+                provider_type.clone()
+            } else {
+                format!("{provider_type}-{attempt}")
+            };
+
+            let request = CreateProviderRequest {
+                provider: Some(Provider {
+                    id: String::new(),
+                    name: name.clone(),
+                    r#type: provider_type.clone(),
+                    credentials: discovered.credentials.clone(),
+                    config: discovered.config.clone(),
+                }),
+            };
+
+            match client.create_provider(request).await {
+                Ok(response) => {
+                    let provider = response
+                        .into_inner()
+                        .provider
+                        .ok_or_else(|| miette::miette!("provider missing from response"))?;
+                    eprintln!(
+                        "{} Created provider {} ({}) from existing local state",
+                        "✓".green().bold(),
+                        provider.name,
+                        provider.r#type
+                    );
+                    configured_types.push(provider_type.clone());
+                    created = true;
+                    break;
+                }
+                Err(status) if status.code() == Code::AlreadyExists => {}
+                Err(status) => {
+                    return Err(miette::miette!(
+                        "failed to create provider for type '{provider_type}': {status}"
+                    ));
+                }
+            }
+        }
+
+        if !created {
+            return Err(miette::miette!(
+                "failed to create provider for type '{provider_type}' after name retries"
+            ));
+        }
+    }
+
+    Ok(configured_types)
+}
+
+fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        let Some((key, value)) = item.split_once('=') else {
+            return Err(miette::miette!("{flag} expects KEY=VALUE, got '{item}'"));
+        };
+
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(miette::miette!("{flag} key cannot be empty"));
+        }
+
+        map.insert(key.to_string(), value.to_string());
+    }
+
+    Ok(map)
+}
+
+pub async fn provider_create(
+    server: &str,
+    name: &str,
+    provider_type: &str,
+    from_existing: bool,
+    credentials: &[String],
+    config: &[String],
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let provider_type = normalize_provider_type(provider_type)
+        .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
+        .to_string();
+
+    let mut credential_map = parse_key_value_pairs(credentials, "--credential")?;
+    let mut config_map = parse_key_value_pairs(config, "--config")?;
+
+    if from_existing {
+        let registry = ProviderRegistry::new();
+        let discovered = registry
+            .discover_existing(&provider_type)
+            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+        let Some(discovered) = discovered else {
+            return Err(miette::miette!(
+                "no existing local credentials/config found for provider type '{provider_type}'"
+            ));
+        };
+
+        for (key, value) in discovered.credentials {
+            credential_map.entry(key).or_insert(value);
+        }
+        for (key, value) in discovered.config {
+            config_map.entry(key).or_insert(value);
+        }
+    }
+
+    let response = client
+        .create_provider(CreateProviderRequest {
+            provider: Some(Provider {
+                id: String::new(),
+                name: name.to_string(),
+                r#type: provider_type,
+                credentials: credential_map,
+                config: config_map,
+            }),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let provider = response
+        .into_inner()
+        .provider
+        .ok_or_else(|| miette::miette!("provider missing from response"))?;
+
+    println!("{} Created provider {}", "✓".green().bold(), provider.name);
+    Ok(())
+}
+
+pub async fn provider_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_provider(GetProviderRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let provider = response
+        .into_inner()
+        .provider
+        .ok_or_else(|| miette::miette!("provider missing from response"))?;
+
+    let credential_keys = provider.credentials.keys().cloned().collect::<Vec<_>>();
+    let config_keys = provider.config.keys().cloned().collect::<Vec<_>>();
+
+    println!("{}", "Provider:".cyan().bold());
+    println!();
+    println!("  {} {}", "Id:".dimmed(), provider.id);
+    println!("  {} {}", "Name:".dimmed(), provider.name);
+    println!("  {} {}", "Type:".dimmed(), provider.r#type);
+    println!(
+        "  {} {}",
+        "Credential keys:".dimmed(),
+        if credential_keys.is_empty() {
+            "<none>".to_string()
+        } else {
+            credential_keys.join(", ")
+        }
+    );
+    println!(
+        "  {} {}",
+        "Config keys:".dimmed(),
+        if config_keys.is_empty() {
+            "<none>".to_string()
+        } else {
+            config_keys.join(", ")
+        }
+    );
+
+    Ok(())
+}
+
+pub async fn provider_list(
+    server: &str,
+    limit: u32,
+    offset: u32,
+    names_only: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .list_providers(ListProvidersRequest { limit, offset })
+        .await
+        .into_diagnostic()?;
+    let providers = response.into_inner().providers;
+
+    if providers.is_empty() {
+        if !names_only {
+            println!("No providers found.");
+        }
+        return Ok(());
+    }
+
+    if names_only {
+        for provider in providers {
+            println!("{}", provider.name);
+        }
+        return Ok(());
+    }
+
+    let name_width = providers
+        .iter()
+        .map(|provider| provider.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let type_width = providers
+        .iter()
+        .map(|provider| provider.r#type.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+
+    println!(
+        "{:<name_width$}  {:<type_width$}  {:<16}  {}",
+        "NAME".bold(),
+        "TYPE".bold(),
+        "CREDENTIAL_KEYS".bold(),
+        "CONFIG_KEYS".bold(),
+    );
+
+    for provider in providers {
+        println!(
+            "{:<name_width$}  {:<type_width$}  {:<16}  {}",
+            provider.name,
+            provider.r#type,
+            provider.credentials.len(),
+            provider.config.len(),
+        );
+    }
+
+    Ok(())
+}
+
+pub async fn provider_update(
+    server: &str,
+    name: &str,
+    provider_type: &str,
+    from_existing: bool,
+    credentials: &[String],
+    config: &[String],
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let provider_type = normalize_provider_type(provider_type)
+        .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
+        .to_string();
+
+    let mut credential_map = parse_key_value_pairs(credentials, "--credential")?;
+    let mut config_map = parse_key_value_pairs(config, "--config")?;
+
+    if from_existing {
+        let registry = ProviderRegistry::new();
+        let discovered = registry
+            .discover_existing(&provider_type)
+            .map_err(|err| miette::miette!("failed to discover existing provider data: {err}"))?;
+        let Some(discovered) = discovered else {
+            return Err(miette::miette!(
+                "no existing local credentials/config found for provider type '{provider_type}'"
+            ));
+        };
+
+        for (key, value) in discovered.credentials {
+            credential_map.entry(key).or_insert(value);
+        }
+        for (key, value) in discovered.config {
+            config_map.entry(key).or_insert(value);
+        }
+    }
+
+    let response = client
+        .update_provider(UpdateProviderRequest {
+            provider: Some(Provider {
+                id: String::new(),
+                name: name.to_string(),
+                r#type: provider_type,
+                credentials: credential_map,
+                config: config_map,
+            }),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let provider = response
+        .into_inner()
+        .provider
+        .ok_or_else(|| miette::miette!("provider missing from response"))?;
+
+    println!("{} Updated provider {}", "✓".green().bold(), provider.name);
+    Ok(())
+}
+
+pub async fn provider_delete(server: &str, names: &[String], tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    for name in names {
+        let response = client
+            .delete_provider(DeleteProviderRequest { name: name.clone() })
+            .await
+            .into_diagnostic()?;
+        if response.into_inner().deleted {
+            println!("{} Deleted provider {name}", "✓".green().bold());
+        } else {
+            println!("{} Provider {name} not found", "!".yellow());
+        }
+    }
     Ok(())
 }
 
@@ -1619,6 +2059,7 @@ pub async fn inference_route_create(
     let mut client = grpc_inference_client(server, tls).await?;
     let response = client
         .create_inference_route(CreateInferenceRouteRequest {
+            name: String::new(), // auto-generate
             route: Some(InferenceRouteSpec {
                 routing_hint: routing_hint.to_string(),
                 base_url: base_url.to_string(),
@@ -1632,7 +2073,7 @@ pub async fn inference_route_create(
         .into_diagnostic()?;
 
     if let Some(route) = response.into_inner().route {
-        println!("{} Created route {}", "✓".green().bold(), route.id);
+        println!("{} Created route {}", "✓".green().bold(), route.name);
     }
     Ok(())
 }
@@ -1640,7 +2081,7 @@ pub async fn inference_route_create(
 #[allow(clippy::too_many_arguments)]
 pub async fn inference_route_update(
     server: &str,
-    id: &str,
+    name: &str,
     routing_hint: &str,
     base_url: &str,
     protocol: &str,
@@ -1652,7 +2093,7 @@ pub async fn inference_route_update(
     let mut client = grpc_inference_client(server, tls).await?;
     let response = client
         .update_inference_route(UpdateInferenceRouteRequest {
-            id: id.to_string(),
+            name: name.to_string(),
             route: Some(InferenceRouteSpec {
                 routing_hint: routing_hint.to_string(),
                 base_url: base_url.to_string(),
@@ -1666,22 +2107,26 @@ pub async fn inference_route_update(
         .into_diagnostic()?;
 
     if let Some(route) = response.into_inner().route {
-        println!("{} Updated route {}", "✓".green().bold(), route.id);
+        println!("{} Updated route {}", "✓".green().bold(), route.name);
     }
     Ok(())
 }
 
-pub async fn inference_route_delete(server: &str, ids: &[String], tls: &TlsOptions) -> Result<()> {
+pub async fn inference_route_delete(
+    server: &str,
+    names: &[String],
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_inference_client(server, tls).await?;
-    for id in ids {
+    for name in names {
         let response = client
-            .delete_inference_route(DeleteInferenceRouteRequest { id: id.clone() })
+            .delete_inference_route(DeleteInferenceRouteRequest { name: name.clone() })
             .await
             .into_diagnostic()?;
         if response.into_inner().deleted {
-            println!("{} Deleted route {id}", "✓".green().bold());
+            println!("{} Deleted route {name}", "✓".green().bold());
         } else {
-            println!("{} Route {id} not found", "!".yellow());
+            println!("{} Route {name} not found", "!".yellow());
         }
     }
     Ok(())
@@ -1706,8 +2151,8 @@ pub async fn inference_route_list(
     }
 
     println!(
-        "{:<36}  {:<16}  {:<40}  {:<30}  {:<8}",
-        "ID".bold(),
+        "{:<12}  {:<16}  {:<40}  {:<30}  {:<8}",
+        "NAME".bold(),
         "HINT".bold(),
         "BASE URL".bold(),
         "MODEL".bold(),
@@ -1723,14 +2168,14 @@ pub async fn inference_route_list(
 fn print_route_row(route: &InferenceRoute) {
     let Some(spec) = route.spec.as_ref() else {
         println!(
-            "{:<36}  {:<16}  {:<40}  {:<30}  {:<8}",
-            route.id, "<missing>", "", "", "false"
+            "{:<12}  {:<16}  {:<40}  {:<30}  {:<8}",
+            route.name, "<missing>", "", "", "false"
         );
         return;
     };
     println!(
-        "{:<36}  {:<16}  {:<40}  {:<30}  {:<8}",
-        route.id, spec.routing_hint, spec.base_url, spec.model_id, spec.enabled
+        "{:<12}  {:<16}  {:<40}  {:<30}  {:<8}",
+        route.name, spec.routing_hint, spec.base_url, spec.model_id, spec.enabled
     );
 }
 

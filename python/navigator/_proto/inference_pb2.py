@@ -24,7 +24,7 @@ _sym_db = _symbol_database.Default()
 
 
 
-DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0finference.proto\x12\x16navigator.inference.v1\"\x82\x01\n\x12InferenceRouteSpec\x12\x14\n\x0crouting_hint\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61se_url\x18\x02 \x01(\t\x12\x10\n\x08protocol\x18\x03 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x04 \x01(\t\x12\x10\n\x08model_id\x18\x05 \x01(\t\x12\x0f\n\x07\x65nabled\x18\x06 \x01(\x08\"V\n\x0eInferenceRoute\x12\n\n\x02id\x18\x01 \x01(\t\x12\x38\n\x04spec\x18\x02 \x01(\x0b\x32*.navigator.inference.v1.InferenceRouteSpec\"X\n\x1b\x43reateInferenceRouteRequest\x12\x39\n\x05route\x18\x01 \x01(\x0b\x32*.navigator.inference.v1.InferenceRouteSpec\"d\n\x1bUpdateInferenceRouteRequest\x12\n\n\x02id\x18\x01 \x01(\t\x12\x39\n\x05route\x18\x02 \x01(\x0b\x32*.navigator.inference.v1.InferenceRouteSpec\")\n\x1b\x44\x65leteInferenceRouteRequest\x12\n\n\x02id\x18\x01 \x01(\t\"/\n\x1c\x44\x65leteInferenceRouteResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\";\n\x1aListInferenceRoutesRequest\x12\r\n\x05limit\x18\x01 \x01(\r\x12\x0e\n\x06offset\x18\x02 \x01(\r\"U\n\x1bListInferenceRoutesResponse\x12\x36\n\x06routes\x18\x01 \x03(\x0b\x32&.navigator.inference.v1.InferenceRoute\"O\n\x16InferenceRouteResponse\x12\x35\n\x05route\x18\x01 \x01(\x0b\x32&.navigator.inference.v1.InferenceRoute\"\xd0\x01\n\x11\x43ompletionRequest\x12\x14\n\x0crouting_hint\x18\x01 \x01(\t\x12\x35\n\x08messages\x18\x02 \x03(\x0b\x32#.navigator.inference.v1.ChatMessage\x12\x18\n\x0btemperature\x18\x03 \x01(\x02H\x00\x88\x01\x01\x12\x17\n\nmax_tokens\x18\x04 \x01(\x05H\x01\x88\x01\x01\x12\x12\n\x05top_p\x18\x05 \x01(\x02H\x02\x88\x01\x01\x42\x0e\n\x0c_temperatureB\r\n\x0b_max_tokensB\x08\n\x06_top_p\"b\n\x0b\x43hatMessage\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x1e\n\x11reasoning_content\x18\x03 \x01(\tH\x00\x88\x01\x01\x42\x14\n\x12_reasoning_content\"\xb3\x01\n\x12\x43ompletionResponse\x12\n\n\x02id\x18\x01 \x01(\t\x12\r\n\x05model\x18\x02 \x01(\t\x12\x0f\n\x07\x63reated\x18\x03 \x01(\x03\x12\x39\n\x07\x63hoices\x18\x04 \x03(\x0b\x32(.navigator.inference.v1.CompletionChoice\x12\x36\n\x05usage\x18\x05 \x01(\x0b\x32\'.navigator.inference.v1.CompletionUsage\"n\n\x10\x43ompletionChoice\x12\r\n\x05index\x18\x01 \x01(\x05\x12\x34\n\x07message\x18\x02 \x01(\x0b\x32#.navigator.inference.v1.ChatMessage\x12\x15\n\rfinish_reason\x18\x03 \x01(\t\"Y\n\x0f\x43ompletionUsage\x12\x15\n\rprompt_tokens\x18\x01 \x01(\x05\x12\x19\n\x11\x63ompletion_tokens\x18\x02 \x01(\x05\x12\x14\n\x0ctotal_tokens\x18\x03 \x01(\x05\x32\xee\x04\n\tInference\x12\x63\n\nCompletion\x12).navigator.inference.v1.CompletionRequest\x1a*.navigator.inference.v1.CompletionResponse\x12{\n\x14\x43reateInferenceRoute\x12\x33.navigator.inference.v1.CreateInferenceRouteRequest\x1a..navigator.inference.v1.InferenceRouteResponse\x12{\n\x14UpdateInferenceRoute\x12\x33.navigator.inference.v1.UpdateInferenceRouteRequest\x1a..navigator.inference.v1.InferenceRouteResponse\x12\x81\x01\n\x14\x44\x65leteInferenceRoute\x12\x33.navigator.inference.v1.DeleteInferenceRouteRequest\x1a\x34.navigator.inference.v1.DeleteInferenceRouteResponse\x12~\n\x13ListInferenceRoutes\x12\x32.navigator.inference.v1.ListInferenceRoutesRequest\x1a\x33.navigator.inference.v1.ListInferenceRoutesResponseB(\n$com.anthropic.navigator.inference.v1P\x01\x62\x06proto3')
+DESCRIPTOR = _descriptor_pool.Default().AddSerializedFile(b'\n\x0finference.proto\x12\x16navigator.inference.v1\"\x82\x01\n\x12InferenceRouteSpec\x12\x14\n\x0crouting_hint\x18\x01 \x01(\t\x12\x10\n\x08\x62\x61se_url\x18\x02 \x01(\t\x12\x10\n\x08protocol\x18\x03 \x01(\t\x12\x0f\n\x07\x61pi_key\x18\x04 \x01(\t\x12\x10\n\x08model_id\x18\x05 \x01(\t\x12\x0f\n\x07\x65nabled\x18\x06 \x01(\x08\"d\n\x0eInferenceRoute\x12\n\n\x02id\x18\x01 \x01(\t\x12\x38\n\x04spec\x18\x02 \x01(\x0b\x32*.navigator.inference.v1.InferenceRouteSpec\x12\x0c\n\x04name\x18\x03 \x01(\t\"f\n\x1b\x43reateInferenceRouteRequest\x12\x39\n\x05route\x18\x01 \x01(\x0b\x32*.navigator.inference.v1.InferenceRouteSpec\x12\x0c\n\x04name\x18\x02 \x01(\t\"f\n\x1bUpdateInferenceRouteRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\x12\x39\n\x05route\x18\x02 \x01(\x0b\x32*.navigator.inference.v1.InferenceRouteSpec\"+\n\x1b\x44\x65leteInferenceRouteRequest\x12\x0c\n\x04name\x18\x01 \x01(\t\"/\n\x1c\x44\x65leteInferenceRouteResponse\x12\x0f\n\x07\x64\x65leted\x18\x01 \x01(\x08\";\n\x1aListInferenceRoutesRequest\x12\r\n\x05limit\x18\x01 \x01(\r\x12\x0e\n\x06offset\x18\x02 \x01(\r\"U\n\x1bListInferenceRoutesResponse\x12\x36\n\x06routes\x18\x01 \x03(\x0b\x32&.navigator.inference.v1.InferenceRoute\"O\n\x16InferenceRouteResponse\x12\x35\n\x05route\x18\x01 \x01(\x0b\x32&.navigator.inference.v1.InferenceRoute\"\xd0\x01\n\x11\x43ompletionRequest\x12\x14\n\x0crouting_hint\x18\x01 \x01(\t\x12\x35\n\x08messages\x18\x02 \x03(\x0b\x32#.navigator.inference.v1.ChatMessage\x12\x18\n\x0btemperature\x18\x03 \x01(\x02H\x00\x88\x01\x01\x12\x17\n\nmax_tokens\x18\x04 \x01(\x05H\x01\x88\x01\x01\x12\x12\n\x05top_p\x18\x05 \x01(\x02H\x02\x88\x01\x01\x42\x0e\n\x0c_temperatureB\r\n\x0b_max_tokensB\x08\n\x06_top_p\"b\n\x0b\x43hatMessage\x12\x0c\n\x04role\x18\x01 \x01(\t\x12\x0f\n\x07\x63ontent\x18\x02 \x01(\t\x12\x1e\n\x11reasoning_content\x18\x03 \x01(\tH\x00\x88\x01\x01\x42\x14\n\x12_reasoning_content\"\xb3\x01\n\x12\x43ompletionResponse\x12\n\n\x02id\x18\x01 \x01(\t\x12\r\n\x05model\x18\x02 \x01(\t\x12\x0f\n\x07\x63reated\x18\x03 \x01(\x03\x12\x39\n\x07\x63hoices\x18\x04 \x03(\x0b\x32(.navigator.inference.v1.CompletionChoice\x12\x36\n\x05usage\x18\x05 \x01(\x0b\x32\'.navigator.inference.v1.CompletionUsage\"n\n\x10\x43ompletionChoice\x12\r\n\x05index\x18\x01 \x01(\x05\x12\x34\n\x07message\x18\x02 \x01(\x0b\x32#.navigator.inference.v1.ChatMessage\x12\x15\n\rfinish_reason\x18\x03 \x01(\t\"Y\n\x0f\x43ompletionUsage\x12\x15\n\rprompt_tokens\x18\x01 \x01(\x05\x12\x19\n\x11\x63ompletion_tokens\x18\x02 \x01(\x05\x12\x14\n\x0ctotal_tokens\x18\x03 \x01(\x05\x32\xee\x04\n\tInference\x12\x63\n\nCompletion\x12).navigator.inference.v1.CompletionRequest\x1a*.navigator.inference.v1.CompletionResponse\x12{\n\x14\x43reateInferenceRoute\x12\x33.navigator.inference.v1.CreateInferenceRouteRequest\x1a..navigator.inference.v1.InferenceRouteResponse\x12{\n\x14UpdateInferenceRoute\x12\x33.navigator.inference.v1.UpdateInferenceRouteRequest\x1a..navigator.inference.v1.InferenceRouteResponse\x12\x81\x01\n\x14\x44\x65leteInferenceRoute\x12\x33.navigator.inference.v1.DeleteInferenceRouteRequest\x1a\x34.navigator.inference.v1.DeleteInferenceRouteResponse\x12~\n\x13ListInferenceRoutes\x12\x32.navigator.inference.v1.ListInferenceRoutesRequest\x1a\x33.navigator.inference.v1.ListInferenceRoutesResponseB(\n$com.anthropic.navigator.inference.v1P\x01\x62\x06proto3')
 
 _globals = globals()
 _builder.BuildMessageAndEnumDescriptors(DESCRIPTOR, _globals)
@@ -35,31 +35,31 @@ if not _descriptor._USE_C_DESCRIPTORS:
   _globals['_INFERENCEROUTESPEC']._serialized_start=44
   _globals['_INFERENCEROUTESPEC']._serialized_end=174
   _globals['_INFERENCEROUTE']._serialized_start=176
-  _globals['_INFERENCEROUTE']._serialized_end=262
-  _globals['_CREATEINFERENCEROUTEREQUEST']._serialized_start=264
-  _globals['_CREATEINFERENCEROUTEREQUEST']._serialized_end=352
-  _globals['_UPDATEINFERENCEROUTEREQUEST']._serialized_start=354
-  _globals['_UPDATEINFERENCEROUTEREQUEST']._serialized_end=454
-  _globals['_DELETEINFERENCEROUTEREQUEST']._serialized_start=456
-  _globals['_DELETEINFERENCEROUTEREQUEST']._serialized_end=497
-  _globals['_DELETEINFERENCEROUTERESPONSE']._serialized_start=499
-  _globals['_DELETEINFERENCEROUTERESPONSE']._serialized_end=546
-  _globals['_LISTINFERENCEROUTESREQUEST']._serialized_start=548
-  _globals['_LISTINFERENCEROUTESREQUEST']._serialized_end=607
-  _globals['_LISTINFERENCEROUTESRESPONSE']._serialized_start=609
-  _globals['_LISTINFERENCEROUTESRESPONSE']._serialized_end=694
-  _globals['_INFERENCEROUTERESPONSE']._serialized_start=696
-  _globals['_INFERENCEROUTERESPONSE']._serialized_end=775
-  _globals['_COMPLETIONREQUEST']._serialized_start=778
-  _globals['_COMPLETIONREQUEST']._serialized_end=986
-  _globals['_CHATMESSAGE']._serialized_start=988
-  _globals['_CHATMESSAGE']._serialized_end=1086
-  _globals['_COMPLETIONRESPONSE']._serialized_start=1089
-  _globals['_COMPLETIONRESPONSE']._serialized_end=1268
-  _globals['_COMPLETIONCHOICE']._serialized_start=1270
-  _globals['_COMPLETIONCHOICE']._serialized_end=1380
-  _globals['_COMPLETIONUSAGE']._serialized_start=1382
-  _globals['_COMPLETIONUSAGE']._serialized_end=1471
-  _globals['_INFERENCE']._serialized_start=1474
-  _globals['_INFERENCE']._serialized_end=2096
+  _globals['_INFERENCEROUTE']._serialized_end=276
+  _globals['_CREATEINFERENCEROUTEREQUEST']._serialized_start=278
+  _globals['_CREATEINFERENCEROUTEREQUEST']._serialized_end=380
+  _globals['_UPDATEINFERENCEROUTEREQUEST']._serialized_start=382
+  _globals['_UPDATEINFERENCEROUTEREQUEST']._serialized_end=484
+  _globals['_DELETEINFERENCEROUTEREQUEST']._serialized_start=486
+  _globals['_DELETEINFERENCEROUTEREQUEST']._serialized_end=529
+  _globals['_DELETEINFERENCEROUTERESPONSE']._serialized_start=531
+  _globals['_DELETEINFERENCEROUTERESPONSE']._serialized_end=578
+  _globals['_LISTINFERENCEROUTESREQUEST']._serialized_start=580
+  _globals['_LISTINFERENCEROUTESREQUEST']._serialized_end=639
+  _globals['_LISTINFERENCEROUTESRESPONSE']._serialized_start=641
+  _globals['_LISTINFERENCEROUTESRESPONSE']._serialized_end=726
+  _globals['_INFERENCEROUTERESPONSE']._serialized_start=728
+  _globals['_INFERENCEROUTERESPONSE']._serialized_end=807
+  _globals['_COMPLETIONREQUEST']._serialized_start=810
+  _globals['_COMPLETIONREQUEST']._serialized_end=1018
+  _globals['_CHATMESSAGE']._serialized_start=1020
+  _globals['_CHATMESSAGE']._serialized_end=1118
+  _globals['_COMPLETIONRESPONSE']._serialized_start=1121
+  _globals['_COMPLETIONRESPONSE']._serialized_end=1300
+  _globals['_COMPLETIONCHOICE']._serialized_start=1302
+  _globals['_COMPLETIONCHOICE']._serialized_end=1412
+  _globals['_COMPLETIONUSAGE']._serialized_start=1414
+  _globals['_COMPLETIONUSAGE']._serialized_end=1503
+  _globals['_INFERENCE']._serialized_start=1506
+  _globals['_INFERENCE']._serialized_end=2128
 # @@protoc_insertion_point(module_scope)

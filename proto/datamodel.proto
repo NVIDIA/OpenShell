@@ -67,3 +67,15 @@ enum SandboxPhase {
   SANDBOX_PHASE_DELETING = 4;
   SANDBOX_PHASE_UNKNOWN = 5;
 }
+
+// Provider model stored by Navigator.
+message Provider {
+  string id = 1;
+  string name = 2;
+  // Canonical provider type slug (for example: "claude", "gitlab").
+  string type = 3;
+  // Secret values used for authentication.
+  map<string, string> credentials = 4;
+  // Non-secret provider configuration.
+  map<string, string> config = 5;
+}

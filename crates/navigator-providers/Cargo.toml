@@ -1,0 +1,16 @@
+[package]
+name = "navigator-providers"
+description = "Provider discovery and registry for Navigator"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+navigator-core = { path = "../navigator-core" }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

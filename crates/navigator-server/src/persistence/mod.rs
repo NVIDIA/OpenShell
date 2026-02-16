@@ -5,6 +5,7 @@ mod sqlite;
 
 use navigator_core::{Error, Result};
 use prost::Message;
+use rand::Rng;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub use postgres::PostgresStore;
@@ -15,6 +16,7 @@ pub use sqlite::SqliteStore;
 pub struct ObjectRecord {
     pub object_type: String,
     pub id: String,
+    pub name: String,
     pub payload: Vec<u8>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -37,6 +39,19 @@ pub trait ObjectId {
     fn object_id(&self) -> &str;
 }
 
+/// Trait for extracting an object name from a message instance.
+pub trait ObjectName {
+    fn object_name(&self) -> &str;
+}
+
+/// Generate a random 6-character lowercase alphabetic name.
+pub fn generate_name() -> String {
+    let mut rng = rand::rng();
+    (0..6)
+        .map(|_| rng.random_range(b'a'..=b'z') as char)
+        .collect()
+}
+
 impl Store {
     /// Connect to a persistence store based on the database URL.
     pub async fn connect(url: &str) -> Result<Self> {
@@ -56,14 +71,14 @@ impl Store {
     }
 
     /// Insert or update an object.
-    pub async fn put(&self, object_type: &str, id: &str, payload: &[u8]) -> Result<()> {
+    pub async fn put(&self, object_type: &str, id: &str, name: &str, payload: &[u8]) -> Result<()> {
         match self {
-            Self::Postgres(store) => store.put(object_type, id, payload).await,
-            Self::Sqlite(store) => store.put(object_type, id, payload).await,
+            Self::Postgres(store) => store.put(object_type, id, name, payload).await,
+            Self::Sqlite(store) => store.put(object_type, id, name, payload).await,
         }
     }
 
-    /// Fetch an object by key.
+    /// Fetch an object by id.
     pub async fn get(&self, object_type: &str, id: &str) -> Result<Option<ObjectRecord>> {
         match self {
             Self::Postgres(store) => store.get(object_type, id).await,
@@ -71,11 +86,27 @@ impl Store {
         }
     }
 
-    /// Delete an object by key.
+    /// Fetch an object by name within an object type.
+    pub async fn get_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectRecord>> {
+        match self {
+            Self::Postgres(store) => store.get_by_name(object_type, name).await,
+            Self::Sqlite(store) => store.get_by_name(object_type, name).await,
+        }
+    }
+
+    /// Delete an object by id.
     pub async fn delete(&self, object_type: &str, id: &str) -> Result<bool> {
         match self {
             Self::Postgres(store) => store.delete(object_type, id).await,
             Self::Sqlite(store) => store.delete(object_type, id).await,
+        }
+    }
+
+    /// Delete an object by name within an object type.
+    pub async fn delete_by_name(&self, object_type: &str, name: &str) -> Result<bool> {
+        match self {
+            Self::Postgres(store) => store.delete_by_name(object_type, name).await,
+            Self::Sqlite(store) => store.delete_by_name(object_type, name).await,
         }
     }
 
@@ -92,22 +123,41 @@ impl Store {
         }
     }
 
-    /// Insert or update a protobuf message using its inferred object type and id.
-    pub async fn put_message<T: Message + ObjectType + ObjectId>(&self, message: &T) -> Result<()> {
+    /// Insert or update a protobuf message using its inferred object type, id, and name.
+    pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName>(
+        &self,
+        message: &T,
+    ) -> Result<()> {
         self.put(
             T::object_type(),
             message.object_id(),
+            message.object_name(),
             &message.encode_to_vec(),
         )
         .await
     }
 
-    /// Fetch and decode a protobuf message using its inferred object type.
+    /// Fetch and decode a protobuf message by id.
     pub async fn get_message<T: Message + Default + ObjectType>(
         &self,
         id: &str,
     ) -> Result<Option<T>> {
         let record = self.get(T::object_type(), id).await?;
+        let Some(record) = record else {
+            return Ok(None);
+        };
+
+        T::decode(record.payload.as_slice())
+            .map(Some)
+            .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))
+    }
+
+    /// Fetch and decode a protobuf message by name.
+    pub async fn get_message_by_name<T: Message + Default + ObjectType>(
+        &self,
+        name: &str,
+    ) -> Result<Option<T>> {
+        let record = self.get_by_name(T::object_type(), name).await?;
         let Some(record) = record else {
             return Ok(None);
         };

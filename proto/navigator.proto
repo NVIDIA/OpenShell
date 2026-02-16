@@ -8,7 +8,7 @@ import "sandbox.proto";
 option java_multiple_files = true;
 option java_package = "com.anthropic.navigator.v1";
 
-// Navigator service provides agent execution and management capabilities.
+// Navigator service provides sandbox, provider, and runtime management capabilities.
 service Navigator {
   // Check the health of the service.
   rpc Health(HealthRequest) returns (HealthResponse);
@@ -16,13 +16,13 @@ service Navigator {
   // Create a new sandbox.
   rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
 
-  // Fetch a sandbox by id.
+  // Fetch a sandbox by name.
   rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
 
   // List sandboxes.
   rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
 
-  // Delete a sandbox by id.
+  // Delete a sandbox by name.
   rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
 
   // Create a short-lived SSH session for a sandbox.
@@ -33,6 +33,21 @@ service Navigator {
 
   // Execute a command in a ready sandbox and stream output.
   rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+
+  // Create a provider.
+  rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
+
+  // Fetch a provider by name.
+  rpc GetProvider(GetProviderRequest) returns (ProviderResponse);
+
+  // List providers.
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+
+  // Update an existing provider by name.
+  rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
+
+  // Delete a provider by name.
+  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
 
   // Get sandbox policy by id (called by sandbox entrypoint at startup).
   rpc GetSandboxPolicy(navigator.sandbox.v1.GetSandboxPolicyRequest)
@@ -66,7 +81,8 @@ message CreateSandboxRequest {
 
 // Get sandbox request.
 message GetSandboxRequest {
-  string id = 1;
+  // Sandbox name (canonical lookup key).
+  string name = 1;
 }
 
 // List sandboxes request.
@@ -77,7 +93,8 @@ message ListSandboxesRequest {
 
 // Delete sandbox request.
 message DeleteSandboxRequest {
-  string id = 1;
+  // Sandbox name (canonical lookup key).
+  string name = 1;
 }
 
 // Sandbox response.
@@ -198,6 +215,9 @@ message SshSession {
 
   // Revoked flag.
   bool revoked = 5;
+
+  // Human-friendly name (auto-generated if not provided).
+  string name = 6;
 }
 
 // Watch sandbox request.
@@ -265,6 +285,47 @@ message PlatformEvent {
 
 message SandboxStreamWarning {
   string message = 1;
+}
+
+// Create provider request.
+message CreateProviderRequest {
+  navigator.datamodel.v1.Provider provider = 1;
+}
+
+// Get provider request.
+message GetProviderRequest {
+  string name = 1;
+}
+
+// List providers request.
+message ListProvidersRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+}
+
+// Update provider request.
+message UpdateProviderRequest {
+  navigator.datamodel.v1.Provider provider = 1;
+}
+
+// Delete provider request.
+message DeleteProviderRequest {
+  string name = 1;
+}
+
+// Provider response.
+message ProviderResponse {
+  navigator.datamodel.v1.Provider provider = 1;
+}
+
+// List providers response.
+message ListProvidersResponse {
+  repeated navigator.datamodel.v1.Provider providers = 1;
+}
+
+// Delete provider response.
+message DeleteProviderResponse {
+  bool deleted = 1;
 }
 
 // Service status enum.

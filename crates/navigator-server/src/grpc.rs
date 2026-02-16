@@ -2,15 +2,18 @@
 
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
-use crate::persistence::ObjectType;
+use crate::persistence::{ObjectId, ObjectName, ObjectType, generate_name};
 use futures::future;
 use navigator_core::proto::{
-    CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse, DeleteSandboxRequest,
-    DeleteSandboxResponse, ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest,
-    ExecSandboxStderr, ExecSandboxStdout, GetSandboxPolicyRequest, GetSandboxPolicyResponse,
-    GetSandboxRequest, HealthRequest, HealthResponse, ListSandboxesRequest, ListSandboxesResponse,
+    CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
+    DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
+    ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    GetProviderRequest, GetSandboxPolicyRequest, GetSandboxPolicyResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceStatus, SshSession, WatchSandboxRequest, navigator_server::Navigator,
+    ServiceStatus, SshSession, UpdateProviderRequest, WatchSandboxRequest,
+    navigator_server::Navigator,
 };
 use navigator_core::proto::{Sandbox, SandboxPhase};
 use prost::Message;
@@ -317,11 +320,15 @@ impl Navigator for NavigatorService {
         &self,
         request: Request<GetSandboxRequest>,
     ) -> Result<Response<SandboxResponse>, Status> {
-        let id = request.into_inner().id;
+        let name = request.into_inner().name;
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
         let sandbox = self
             .state
             .store
-            .get_message::<Sandbox>(&id)
+            .get_message_by_name::<Sandbox>(&name)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
@@ -362,17 +369,23 @@ impl Navigator for NavigatorService {
         &self,
         request: Request<DeleteSandboxRequest>,
     ) -> Result<Response<DeleteSandboxResponse>, Status> {
-        let id = request.into_inner().id;
+        let name = request.into_inner().name;
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
         let sandbox = self
             .state
             .store
-            .get_message::<Sandbox>(&id)
+            .get_message_by_name::<Sandbox>(&name)
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?;
 
         let Some(mut sandbox) = sandbox else {
             return Err(Status::not_found("sandbox not found"));
         };
+
+        let id = sandbox.id.clone();
 
         sandbox.phase = SandboxPhase::Deleting as i32;
         self.state
@@ -409,6 +422,76 @@ impl Navigator for NavigatorService {
             "DeleteSandbox request completed successfully"
         );
         Ok(Response::new(DeleteSandboxResponse { deleted }))
+    }
+
+    async fn create_provider(
+        &self,
+        request: Request<CreateProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        let req = request.into_inner();
+        let provider = req
+            .provider
+            .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        let provider = create_provider_record(self.state.store.as_ref(), provider).await?;
+
+        Ok(Response::new(ProviderResponse {
+            provider: Some(provider),
+        }))
+    }
+
+    async fn get_provider(
+        &self,
+        request: Request<GetProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        let name = request.into_inner().name;
+        let provider = get_provider_record(self.state.store.as_ref(), &name).await?;
+
+        Ok(Response::new(ProviderResponse {
+            provider: Some(provider),
+        }))
+    }
+
+    async fn list_providers(
+        &self,
+        request: Request<ListProvidersRequest>,
+    ) -> Result<Response<ListProvidersResponse>, Status> {
+        let request = request.into_inner();
+        let (limit, offset) = (
+            if request.limit == 0 {
+                100
+            } else {
+                request.limit
+            },
+            request.offset,
+        );
+        let providers = list_provider_records(self.state.store.as_ref(), limit, offset).await?;
+
+        Ok(Response::new(ListProvidersResponse { providers }))
+    }
+
+    async fn update_provider(
+        &self,
+        request: Request<UpdateProviderRequest>,
+    ) -> Result<Response<ProviderResponse>, Status> {
+        let req = request.into_inner();
+        let provider = req
+            .provider
+            .ok_or_else(|| Status::invalid_argument("provider is required"))?;
+        let provider = update_provider_record(self.state.store.as_ref(), provider).await?;
+
+        Ok(Response::new(ProviderResponse {
+            provider: Some(provider),
+        }))
+    }
+
+    async fn delete_provider(
+        &self,
+        request: Request<DeleteProviderRequest>,
+    ) -> Result<Response<DeleteProviderResponse>, Status> {
+        let name = request.into_inner().name;
+        let deleted = delete_provider_record(self.state.store.as_ref(), &name).await?;
+
+        Ok(Response::new(DeleteProviderResponse { deleted }))
     }
 
     async fn get_sandbox_policy(
@@ -472,6 +555,7 @@ impl Navigator for NavigatorService {
             created_at_ms: current_time_ms()
                 .map_err(|e| Status::internal(format!("timestamp generation failed: {e}")))?,
             revoked: false,
+            name: generate_name(),
         };
 
         self.state
@@ -935,9 +1019,153 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
     hex::encode(result)
 }
 
+// ---------------------------------------------------------------------------
+// Provider CRUD
+// ---------------------------------------------------------------------------
+
+async fn create_provider_record(
+    store: &crate::persistence::Store,
+    mut provider: Provider,
+) -> Result<Provider, Status> {
+    if provider.name.is_empty() {
+        provider.name = generate_name();
+    }
+    if provider.r#type.trim().is_empty() {
+        return Err(Status::invalid_argument("provider.type is required"));
+    }
+
+    let existing = store
+        .get_message_by_name::<Provider>(&provider.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?;
+
+    if existing.is_some() {
+        return Err(Status::already_exists("provider already exists"));
+    }
+
+    provider.id = uuid::Uuid::new_v4().to_string();
+
+    store
+        .put_message(&provider)
+        .await
+        .map_err(|e| Status::internal(format!("persist provider failed: {e}")))?;
+
+    Ok(provider)
+}
+
+async fn get_provider_record(
+    store: &crate::persistence::Store,
+    name: &str,
+) -> Result<Provider, Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+
+    store
+        .get_message_by_name::<Provider>(name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+        .ok_or_else(|| Status::not_found("provider not found"))
+}
+
+async fn list_provider_records(
+    store: &crate::persistence::Store,
+    limit: u32,
+    offset: u32,
+) -> Result<Vec<Provider>, Status> {
+    let records = store
+        .list(Provider::object_type(), limit, offset)
+        .await
+        .map_err(|e| Status::internal(format!("list providers failed: {e}")))?;
+
+    let mut providers = Vec::with_capacity(records.len());
+    for record in records {
+        let provider = Provider::decode(record.payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode provider failed: {e}")))?;
+        providers.push(provider);
+    }
+
+    Ok(providers)
+}
+
+async fn update_provider_record(
+    store: &crate::persistence::Store,
+    provider: Provider,
+) -> Result<Provider, Status> {
+    if provider.name.is_empty() {
+        return Err(Status::invalid_argument("provider.name is required"));
+    }
+    if provider.r#type.trim().is_empty() {
+        return Err(Status::invalid_argument("provider.type is required"));
+    }
+
+    let existing = store
+        .get_message_by_name::<Provider>(&provider.name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?;
+
+    let Some(existing) = existing else {
+        return Err(Status::not_found("provider not found"));
+    };
+
+    let updated = Provider {
+        id: existing.id,
+        name: existing.name,
+        r#type: provider.r#type,
+        credentials: provider.credentials,
+        config: provider.config,
+    };
+
+    store
+        .put_message(&updated)
+        .await
+        .map_err(|e| Status::internal(format!("persist provider failed: {e}")))?;
+
+    Ok(updated)
+}
+
+async fn delete_provider_record(
+    store: &crate::persistence::Store,
+    name: &str,
+) -> Result<bool, Status> {
+    if name.is_empty() {
+        return Err(Status::invalid_argument("name is required"));
+    }
+
+    store
+        .delete_by_name(Provider::object_type(), name)
+        .await
+        .map_err(|e| Status::internal(format!("delete provider failed: {e}")))
+}
+
+impl ObjectType for Provider {
+    fn object_type() -> &'static str {
+        "provider"
+    }
+}
+
+impl ObjectId for Provider {
+    fn object_id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl ObjectName for Provider {
+    fn object_name(&self) -> &str {
+        &self.name
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::is_valid_env_key;
+    use super::{
+        create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
+        list_provider_records, update_provider_record,
+    };
+    use crate::persistence::Store;
+    use navigator_core::proto::Provider;
+    use std::collections::HashMap;
+    use tonic::Code;
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -954,5 +1182,130 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    fn provider_with_values(name: &str, provider_type: &str) -> Provider {
+        Provider {
+            id: String::new(),
+            name: name.to_string(),
+            r#type: provider_type.to_string(),
+            credentials: [
+                ("API_TOKEN".to_string(), "token-123".to_string()),
+                ("SECONDARY".to_string(), "secondary-token".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            config: [
+                ("endpoint".to_string(), "https://example.com".to_string()),
+                ("region".to_string(), "us-west".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn provider_crud_round_trip_and_semantics() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let created = provider_with_values("gitlab-local", "gitlab");
+        let persisted = create_provider_record(&store, created.clone())
+            .await
+            .unwrap();
+        assert_eq!(persisted.name, "gitlab-local");
+        assert_eq!(persisted.r#type, "gitlab");
+        assert!(!persisted.id.is_empty());
+        let provider_id = persisted.id.clone();
+
+        let duplicate_err = create_provider_record(&store, created).await.unwrap_err();
+        assert_eq!(duplicate_err.code(), Code::AlreadyExists);
+
+        let loaded = get_provider_record(&store, "gitlab-local").await.unwrap();
+        assert_eq!(loaded.id, provider_id);
+
+        let listed = list_provider_records(&store, 100, 0).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "gitlab-local");
+
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "gitlab-local".to_string(),
+                r#type: "gitlab".to_string(),
+                credentials: std::iter::once((
+                    "API_TOKEN".to_string(),
+                    "rotated-token".to_string(),
+                ))
+                .collect(),
+                config: std::iter::once(("endpoint".to_string(), "https://gitlab.com".to_string()))
+                    .collect(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(updated.id, provider_id);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"rotated-token".to_string())
+        );
+
+        let deleted = delete_provider_record(&store, "gitlab-local")
+            .await
+            .unwrap();
+        assert!(deleted);
+
+        let deleted_again = delete_provider_record(&store, "gitlab-local")
+            .await
+            .unwrap();
+        assert!(!deleted_again);
+
+        let missing = get_provider_record(&store, "gitlab-local")
+            .await
+            .unwrap_err();
+        assert_eq!(missing.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn provider_validation_errors() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let create_missing_type = create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "bad-provider".to_string(),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(create_missing_type.code(), Code::InvalidArgument);
+
+        let get_err = get_provider_record(&store, "").await.unwrap_err();
+        assert_eq!(get_err.code(), Code::InvalidArgument);
+
+        let delete_err = delete_provider_record(&store, "").await.unwrap_err();
+        assert_eq!(delete_err.code(), Code::InvalidArgument);
+
+        let update_missing_err = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "missing".to_string(),
+                r#type: "gitlab".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(update_missing_err.code(), Code::NotFound);
     }
 }

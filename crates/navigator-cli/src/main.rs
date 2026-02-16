@@ -1,6 +1,6 @@
 //! Navigator CLI - command-line interface for Navigator.
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use miette::Result;
 use std::path::PathBuf;
 
@@ -129,6 +129,12 @@ enum Commands {
         command: InferenceCommands,
     },
 
+    /// Manage provider configuration.
+    Provider {
+        #[command(subcommand)]
+        command: ProviderCommands,
+    },
+
     /// SSH proxy (used by `ProxyCommand`).
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
@@ -142,6 +148,107 @@ enum Commands {
         /// SSH session token.
         #[arg(long)]
         token: String,
+    },
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProviderType {
+    Claude,
+    Opencode,
+    Codex,
+    Openclaw,
+    Gitlab,
+    Github,
+    Outlook,
+}
+
+impl CliProviderType {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Opencode => "opencode",
+            Self::Codex => "codex",
+            Self::Openclaw => "openclaw",
+            Self::Gitlab => "gitlab",
+            Self::Github => "github",
+            Self::Outlook => "outlook",
+        }
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum ProviderCommands {
+    /// Create a provider config.
+    Create {
+        /// Provider name.
+        #[arg(long)]
+        name: String,
+
+        /// Provider type.
+        #[arg(long = "type", value_enum)]
+        provider_type: CliProviderType,
+
+        /// Load provider credentials/config from existing local state.
+        #[arg(long)]
+        from_existing: bool,
+
+        /// Provider credential key/value pair.
+        #[arg(long = "credential", value_name = "KEY=VALUE")]
+        credentials: Vec<String>,
+
+        /// Provider config key/value pair.
+        #[arg(long = "config", value_name = "KEY=VALUE")]
+        config: Vec<String>,
+    },
+
+    /// Fetch a provider by name.
+    Get {
+        /// Provider name.
+        name: String,
+    },
+
+    /// List providers.
+    List {
+        /// Maximum number of providers to return.
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+
+        /// Offset into the provider list.
+        #[arg(long, default_value_t = 0)]
+        offset: u32,
+
+        /// Print only provider names, one per line.
+        #[arg(long)]
+        names: bool,
+    },
+
+    /// Update an existing provider config.
+    Update {
+        /// Provider name.
+        name: String,
+
+        /// Provider type.
+        #[arg(long = "type", value_enum)]
+        provider_type: CliProviderType,
+
+        /// Load provider credentials/config from existing local state.
+        #[arg(long)]
+        from_existing: bool,
+
+        /// Provider credential key/value pair.
+        #[arg(long = "credential", value_name = "KEY=VALUE")]
+        credentials: Vec<String>,
+
+        /// Provider config key/value pair.
+        #[arg(long = "config", value_name = "KEY=VALUE")]
+        config: Vec<String>,
+    },
+
+    /// Delete providers by name.
+    Delete {
+        /// Provider names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
     },
 }
 
@@ -268,15 +375,19 @@ enum SandboxCommands {
         #[arg(long)]
         ssh_key: Option<String>,
 
+        /// Additional provider types required for this sandbox.
+        #[arg(long = "provider", value_enum)]
+        providers: Vec<CliProviderType>,
+
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
     },
 
-    /// Fetch a sandbox by id.
+    /// Fetch a sandbox by name.
     Get {
-        /// Sandbox id.
-        id: String,
+        /// Sandbox name.
+        name: String,
     },
 
     /// List sandboxes.
@@ -294,17 +405,17 @@ enum SandboxCommands {
         ids: bool,
     },
 
-    /// Delete a sandbox by id.
+    /// Delete a sandbox by name.
     Delete {
-        /// Sandbox ids.
-        #[arg(required = true, num_args = 1.., value_name = "ID")]
-        ids: Vec<String>,
+        /// Sandbox names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
     },
 
     /// Connect to a sandbox.
     Connect {
-        /// Sandbox id.
-        id: String,
+        /// Sandbox name.
+        name: String,
     },
 }
 
@@ -328,7 +439,8 @@ enum InferenceCommands {
 
     /// Update an inference route.
     Update {
-        id: String,
+        /// Route name.
+        name: String,
         #[arg(long)]
         routing_hint: String,
         #[arg(long)]
@@ -345,8 +457,9 @@ enum InferenceCommands {
 
     /// Delete inference routes.
     Delete {
-        #[arg(required = true, num_args = 1.., value_name = "ID")]
-        ids: Vec<String>,
+        /// Route names.
+        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        names: Vec<String>,
     },
 
     /// List inference routes.
@@ -470,8 +583,15 @@ async fn main() -> Result<()> {
                     keep,
                     remote,
                     ssh_key,
+                    providers,
                     command,
                 } => {
+                    let provider_types = providers
+                        .iter()
+                        .map(CliProviderType::as_str)
+                        .map(str::to_string)
+                        .collect::<Vec<_>>();
+
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_cluster(&cli.cluster) {
@@ -489,6 +609,7 @@ async fn main() -> Result<()> {
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
+                                &provider_types,
                                 &command,
                                 &tls,
                             )
@@ -501,6 +622,7 @@ async fn main() -> Result<()> {
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
+                                &provider_types,
                                 &command,
                             )
                             .await?;
@@ -518,17 +640,17 @@ async fn main() -> Result<()> {
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
                         SandboxCommands::Create { .. } => unreachable!(),
-                        SandboxCommands::Get { id } => {
-                            run::sandbox_get(endpoint, &id, &tls).await?;
+                        SandboxCommands::Get { name } => {
+                            run::sandbox_get(endpoint, &name, &tls).await?;
                         }
                         SandboxCommands::List { limit, offset, ids } => {
                             run::sandbox_list(endpoint, limit, offset, ids, &tls).await?;
                         }
-                        SandboxCommands::Delete { ids } => {
-                            run::sandbox_delete(endpoint, &ids, &tls).await?;
+                        SandboxCommands::Delete { names } => {
+                            run::sandbox_delete(endpoint, &names, &tls).await?;
                         }
-                        SandboxCommands::Connect { id } => {
-                            run::sandbox_connect(endpoint, &id, &tls).await?;
+                        SandboxCommands::Connect { name } => {
+                            run::sandbox_connect(endpoint, &name, &tls).await?;
                         }
                     }
                 }
@@ -566,7 +688,7 @@ async fn main() -> Result<()> {
                     .await?;
                 }
                 InferenceCommands::Update {
-                    id,
+                    name,
                     routing_hint,
                     base_url,
                     protocol,
@@ -576,7 +698,7 @@ async fn main() -> Result<()> {
                 } => {
                     run::inference_route_update(
                         endpoint,
-                        &id,
+                        &name,
                         &routing_hint,
                         &base_url,
                         &protocol,
@@ -587,11 +709,73 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                InferenceCommands::Delete { ids } => {
-                    run::inference_route_delete(endpoint, &ids, &tls).await?;
+                InferenceCommands::Delete { names } => {
+                    run::inference_route_delete(endpoint, &names, &tls).await?;
                 }
                 InferenceCommands::List { limit, offset } => {
                     run::inference_route_list(endpoint, limit, offset, &tls).await?;
+                }
+            }
+        }
+        Some(Commands::Provider { command }) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let endpoint = &ctx.endpoint;
+            if !is_https(endpoint)? && !cli.allow_insecure_access {
+                return Err(miette::miette!(
+                    "https is required; use --allow-insecure-access to connect over http"
+                ));
+            }
+            let tls = tls.with_cluster_name(&ctx.name);
+
+            match command {
+                ProviderCommands::Create {
+                    name,
+                    provider_type,
+                    from_existing,
+                    credentials,
+                    config,
+                } => {
+                    run::provider_create(
+                        endpoint,
+                        &name,
+                        provider_type.as_str(),
+                        from_existing,
+                        &credentials,
+                        &config,
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProviderCommands::Get { name } => {
+                    run::provider_get(endpoint, &name, &tls).await?;
+                }
+                ProviderCommands::List {
+                    limit,
+                    offset,
+                    names,
+                } => {
+                    run::provider_list(endpoint, limit, offset, names, &tls).await?;
+                }
+                ProviderCommands::Update {
+                    name,
+                    provider_type,
+                    from_existing,
+                    credentials,
+                    config,
+                } => {
+                    run::provider_update(
+                        endpoint,
+                        &name,
+                        provider_type.as_str(),
+                        from_existing,
+                        &credentials,
+                        &config,
+                        &tls,
+                    )
+                    .await?;
+                }
+                ProviderCommands::Delete { names } => {
+                    run::provider_delete(endpoint, &names, &tls).await?;
                 }
             }
         }

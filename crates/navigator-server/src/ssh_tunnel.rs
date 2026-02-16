@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectType};
+use crate::persistence::{ObjectId, ObjectName, ObjectType};
 
 const HEADER_SANDBOX_ID: &str = "x-sandbox-id";
 const HEADER_TOKEN: &str = "x-sandbox-token";
@@ -225,6 +225,12 @@ impl ObjectType for SshSession {
 impl ObjectId for SshSession {
     fn object_id(&self) -> &str {
         &self.id
+    }
+}
+
+impl ObjectName for SshSession {
+    fn object_name(&self) -> &str {
+        &self.name
     }
 }
 

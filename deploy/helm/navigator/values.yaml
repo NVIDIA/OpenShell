@@ -47,8 +47,7 @@ affinity: {}
 server:
   logLevel: info
   sandboxNamespace: navigator
-  dbUrl: "sqlite::memory:?cache=shared"
-  initImage: "busybox:1.36"
+  dbUrl: "sqlite:/var/navigator/navigator.db"
   sandboxImage: "d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest"
   # gRPC endpoint for sandboxes to callback to Navigator (must be reachable from pods)
   grpcEndpoint: "http://navigator.navigator.svc.cluster.local:8080"

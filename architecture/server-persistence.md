@@ -8,13 +8,21 @@ database URL scheme.
 
 Supported backends:
 - Postgres (`postgres://` or `postgresql://`)
-- SQLite (`sqlite:`)
+- SQLite (`sqlite:`) — file-backed (default) or in-memory
 
 The server requires a database URL. The CLI enforces `--db-url` / `NAVIGATOR_DB_URL`, and
 `run_server` will reject an empty value.
 
-Example in-memory SQLite URL:
-`sqlite::memory:?cache=shared`
+The default database URL is `sqlite:/var/navigator/navigator.db`, which stores data on a persistent
+volume. In-memory SQLite (`sqlite::memory:?cache=shared`) can be used for ephemeral environments
+but data will be lost on pod restart.
+
+## Deployment Storage
+
+The Navigator server runs as a **StatefulSet** with a `volumeClaimTemplate` that provisions a 1Gi
+`ReadWriteOnce` PersistentVolumeClaim mounted at `/var/navigator`. On k3s clusters this uses the
+built-in `local-path-provisioner` StorageClass. The SQLite database file is stored at
+`/var/navigator/navigator.db` and survives pod restarts and rescheduling.
 
 ## Data Model
 

@@ -12,7 +12,7 @@ use tracing::{info, warn};
 
 use crate::{
     ServerState,
-    persistence::{ObjectId, ObjectType, Store},
+    persistence::{ObjectId, ObjectName, ObjectType, Store, generate_name},
 };
 
 const SANDBOX_ID_HEADER: &str = "x-sandbox-id";
@@ -37,6 +37,12 @@ impl ObjectType for InferenceRoute {
 impl ObjectId for InferenceRoute {
     fn object_id(&self) -> &str {
         &self.id
+    }
+}
+
+impl ObjectName for InferenceRoute {
+    fn object_name(&self) -> &str {
+        &self.name
     }
 }
 
@@ -133,14 +139,32 @@ impl Inference for InferenceService {
         &self,
         request: Request<navigator_core::proto::CreateInferenceRouteRequest>,
     ) -> Result<Response<InferenceRouteResponse>, Status> {
-        let spec = request
-            .into_inner()
+        let req = request.into_inner();
+        let spec = req
             .route
             .ok_or_else(|| Status::invalid_argument("route is required"))?;
         validate_route_spec(&spec)?;
 
+        let name = if req.name.is_empty() {
+            generate_name()
+        } else {
+            req.name
+        };
+
+        let existing = self
+            .state
+            .store
+            .get_message_by_name::<InferenceRoute>(&name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
+
+        if existing.is_some() {
+            return Err(Status::already_exists("route already exists"));
+        }
+
         let route = InferenceRoute {
             id: uuid::Uuid::new_v4().to_string(),
+            name,
             spec: Some(spec),
         };
 
@@ -158,26 +182,29 @@ impl Inference for InferenceService {
         request: Request<UpdateInferenceRouteRequest>,
     ) -> Result<Response<InferenceRouteResponse>, Status> {
         let request = request.into_inner();
-        if request.id.is_empty() {
-            return Err(Status::invalid_argument("id is required"));
+        if request.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
         let spec = request
             .route
             .ok_or_else(|| Status::invalid_argument("route is required"))?;
         validate_route_spec(&spec)?;
 
-        let exists = self
+        let existing = self
             .state
             .store
-            .get_message::<InferenceRoute>(&request.id)
+            .get_message_by_name::<InferenceRoute>(&request.name)
             .await
             .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
-        if exists.is_none() {
-            return Err(Status::not_found("route not found"));
-        }
 
+        let Some(existing) = existing else {
+            return Err(Status::not_found("route not found"));
+        };
+
+        // Preserve the stored id; update payload fields only.
         let route = InferenceRoute {
-            id: request.id,
+            id: existing.id,
+            name: existing.name,
             spec: Some(spec),
         };
 
@@ -194,15 +221,15 @@ impl Inference for InferenceService {
         &self,
         request: Request<DeleteInferenceRouteRequest>,
     ) -> Result<Response<DeleteInferenceRouteResponse>, Status> {
-        let id = request.into_inner().id;
-        if id.is_empty() {
-            return Err(Status::invalid_argument("id is required"));
+        let name = request.into_inner().name;
+        if name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
         }
 
         let deleted = self
             .state
             .store
-            .delete(InferenceRoute::object_type(), &id)
+            .delete_by_name(InferenceRoute::object_type(), &name)
             .await
             .map_err(|e| Status::internal(format!("delete route failed: {e}")))?;
 
@@ -313,9 +340,10 @@ mod tests {
     use super::*;
     use navigator_core::proto::InferenceRouteSpec;
 
-    fn make_route(id: &str, routing_hint: &str, enabled: bool) -> InferenceRoute {
+    fn make_route(id: &str, name: &str, routing_hint: &str, enabled: bool) -> InferenceRoute {
         InferenceRoute {
             id: id.to_string(),
+            name: name.to_string(),
             spec: Some(InferenceRouteSpec {
                 routing_hint: routing_hint.to_string(),
                 base_url: "https://example.com/v1".to_string(),
@@ -347,13 +375,13 @@ mod tests {
             .await
             .expect("store should connect");
 
-        let route_disabled = make_route("r-1", "local", false);
+        let route_disabled = make_route("r-1", "route-a", "local", false);
         store
             .put_message(&route_disabled)
             .await
             .expect("disabled route should persist");
 
-        let route_enabled = make_route("r-2", "local", true);
+        let route_enabled = make_route("r-2", "route-b", "local", true);
         store
             .put_message(&route_enabled)
             .await
@@ -373,7 +401,7 @@ mod tests {
             .await
             .expect("store should connect");
 
-        let route = make_route("r-1", "frontier", true);
+        let route = make_route("r-1", "route-c", "frontier", true);
         store
             .put_message(&route)
             .await

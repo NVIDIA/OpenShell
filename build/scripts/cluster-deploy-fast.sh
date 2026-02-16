@@ -219,8 +219,15 @@ fi
 if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   rollout_start=$(date +%s)
   echo "Restarting deployment to pick up updated images..."
-  kubectl rollout restart deployment/navigator -n navigator
-  kubectl rollout status deployment/navigator -n navigator
+  if kubectl get statefulset/navigator -n navigator >/dev/null 2>&1; then
+    kubectl rollout restart statefulset/navigator -n navigator
+    kubectl rollout status statefulset/navigator -n navigator
+  elif kubectl get deployment/navigator -n navigator >/dev/null 2>&1; then
+    kubectl rollout restart deployment/navigator -n navigator
+    kubectl rollout status deployment/navigator -n navigator
+  else
+    echo "Warning: no navigator workload found to roll out in namespace 'navigator'."
+  fi
   rollout_end=$(date +%s)
   log_duration "Rollout" "${rollout_start}" "${rollout_end}"
 else

@@ -36,19 +36,25 @@ message InferenceRouteSpec {
 message InferenceRoute {
   string id = 1;
   InferenceRouteSpec spec = 2;
+  // Human-friendly name, unique per object type. Auto-generated if not provided.
+  string name = 3;
 }
 
 message CreateInferenceRouteRequest {
   InferenceRouteSpec route = 1;
+  // Optional name. If empty, a random 6-char name is generated.
+  string name = 2;
 }
 
 message UpdateInferenceRouteRequest {
-  string id = 1;
+  // Route name (canonical lookup key).
+  string name = 1;
   InferenceRouteSpec route = 2;
 }
 
 message DeleteInferenceRouteRequest {
-  string id = 1;
+  // Route name (canonical lookup key).
+  string name = 1;
 }
 
 message DeleteInferenceRouteResponse {

@@ -1,10 +1,11 @@
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ include "navigator.fullname" . }}
   labels:
     {{- include "navigator.labels" . | nindent 4 }}
 spec:
+  serviceName: {{ include "navigator.fullname" . }}
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
@@ -28,19 +29,6 @@ spec:
       serviceAccountName: {{ include "navigator.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
-      initContainers:
-        - name: init-db
-          image: {{ .Values.server.initImage | quote }}
-          command:
-            - sh
-            - -c
-            - "mkdir -p /var/navigator && chmod 0770 /var/navigator"
-          securityContext:
-            runAsUser: 0
-            runAsGroup: 0
-          volumeMounts:
-            - name: navigator-data
-              mountPath: /var/navigator
       containers:
         - name: {{ .Chart.Name }}
           securityContext:
@@ -102,6 +90,11 @@ spec:
       tolerations:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      volumes:
-        - name: navigator-data
-          emptyDir: {}
+  volumeClaimTemplates:
+    - metadata:
+        name: navigator-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

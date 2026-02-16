@@ -2,7 +2,7 @@
 
 use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
 use miette::{IntoDiagnostic, Result, WrapErr};
-use navigator_core::proto::CreateSshSessionRequest;
+use navigator_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
 use rustls::pki_types::ServerName;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
@@ -18,11 +18,27 @@ struct SshSessionConfig {
     proxy_command: String,
 }
 
-async fn ssh_session_config(server: &str, id: &str, tls: &TlsOptions) -> Result<SshSessionConfig> {
+async fn ssh_session_config(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+) -> Result<SshSessionConfig> {
     let mut client = grpc_client(server, tls).await?;
+
+    // Resolve sandbox name to id.
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
     let response = client
         .create_ssh_session(CreateSshSessionRequest {
-            sandbox_id: id.to_string(),
+            sandbox_id: sandbox.id,
         })
         .await
         .into_diagnostic()?;
@@ -95,8 +111,8 @@ fn ssh_base_command(proxy_command: &str) -> Command {
 }
 
 /// Connect to a sandbox via SSH.
-pub async fn sandbox_connect(server: &str, id: &str, tls: &TlsOptions) -> Result<()> {
-    let session = ssh_session_config(server, id, tls).await?;
+pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let session = ssh_session_config(server, name, tls).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
     command
@@ -133,7 +149,7 @@ pub async fn sandbox_connect(server: &str, id: &str, tls: &TlsOptions) -> Result
 /// Execute a command in a sandbox via SSH.
 pub async fn sandbox_exec(
     server: &str,
-    id: &str,
+    name: &str,
     command: &[String],
     tty: bool,
     tls: &TlsOptions,
@@ -142,7 +158,7 @@ pub async fn sandbox_exec(
         return Err(miette::miette!("no command provided"));
     }
 
-    let session = ssh_session_config(server, id, tls).await?;
+    let session = ssh_session_config(server, name, tls).await?;
     let mut ssh = ssh_base_command(&session.proxy_command);
 
     if tty {
@@ -182,7 +198,7 @@ pub async fn sandbox_exec(
 /// Sync local files into the sandbox using rsync over SSH.
 pub async fn sandbox_rsync(
     server: &str,
-    id: &str,
+    name: &str,
     repo_root: &Path,
     files: &[String],
     tls: &TlsOptions,
@@ -191,7 +207,7 @@ pub async fn sandbox_rsync(
         return Ok(());
     }
 
-    let session = ssh_session_config(server, id, tls).await?;
+    let session = ssh_session_config(server, name, tls).await?;
 
     let ssh_command = format!(
         "ssh -o {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null",

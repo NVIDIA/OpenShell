@@ -66,6 +66,7 @@ hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
 russh = "0.57"
+rand = "0.9"
 
 [dev-dependencies]
 hyper-rustls = "0.27"

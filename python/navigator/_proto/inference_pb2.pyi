@@ -23,32 +23,36 @@ class InferenceRouteSpec(_message.Message):
     def __init__(self, routing_hint: _Optional[str] = ..., base_url: _Optional[str] = ..., protocol: _Optional[str] = ..., api_key: _Optional[str] = ..., model_id: _Optional[str] = ..., enabled: bool = ...) -> None: ...
 
 class InferenceRoute(_message.Message):
-    __slots__ = ("id", "spec")
+    __slots__ = ("id", "spec", "name")
     ID_FIELD_NUMBER: _ClassVar[int]
     SPEC_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
     id: str
     spec: InferenceRouteSpec
-    def __init__(self, id: _Optional[str] = ..., spec: _Optional[_Union[InferenceRouteSpec, _Mapping]] = ...) -> None: ...
+    name: str
+    def __init__(self, id: _Optional[str] = ..., spec: _Optional[_Union[InferenceRouteSpec, _Mapping]] = ..., name: _Optional[str] = ...) -> None: ...
 
 class CreateInferenceRouteRequest(_message.Message):
-    __slots__ = ("route",)
+    __slots__ = ("route", "name")
     ROUTE_FIELD_NUMBER: _ClassVar[int]
+    NAME_FIELD_NUMBER: _ClassVar[int]
     route: InferenceRouteSpec
-    def __init__(self, route: _Optional[_Union[InferenceRouteSpec, _Mapping]] = ...) -> None: ...
+    name: str
+    def __init__(self, route: _Optional[_Union[InferenceRouteSpec, _Mapping]] = ..., name: _Optional[str] = ...) -> None: ...
 
 class UpdateInferenceRouteRequest(_message.Message):
-    __slots__ = ("id", "route")
-    ID_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ("name", "route")
+    NAME_FIELD_NUMBER: _ClassVar[int]
     ROUTE_FIELD_NUMBER: _ClassVar[int]
-    id: str
+    name: str
     route: InferenceRouteSpec
-    def __init__(self, id: _Optional[str] = ..., route: _Optional[_Union[InferenceRouteSpec, _Mapping]] = ...) -> None: ...
+    def __init__(self, name: _Optional[str] = ..., route: _Optional[_Union[InferenceRouteSpec, _Mapping]] = ...) -> None: ...
 
 class DeleteInferenceRouteRequest(_message.Message):
-    __slots__ = ("id",)
-    ID_FIELD_NUMBER: _ClassVar[int]
-    id: str
-    def __init__(self, id: _Optional[str] = ...) -> None: ...
+    __slots__ = ("name",)
+    NAME_FIELD_NUMBER: _ClassVar[int]
+    name: str
+    def __init__(self, name: _Optional[str] = ...) -> None: ...
 
 class DeleteInferenceRouteResponse(_message.Message):
     __slots__ = ("deleted",)

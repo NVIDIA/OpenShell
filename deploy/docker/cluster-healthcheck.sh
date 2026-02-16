@@ -5,8 +5,8 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
 kubectl get --raw='/readyz' >/dev/null 2>&1 || exit 1
 
-kubectl -n navigator get deployment/navigator >/dev/null 2>&1 || exit 1
-kubectl -n navigator wait --for=condition=available deployment/navigator --timeout=1s >/dev/null 2>&1 || exit 1
+kubectl -n navigator get statefulset/navigator >/dev/null 2>&1 || exit 1
+kubectl -n navigator wait --for=jsonpath='{.status.readyReplicas}'=1 statefulset/navigator --timeout=1s >/dev/null 2>&1 || exit 1
 
 kubectl -n navigator get gateway/navigator-gateway >/dev/null 2>&1 || exit 1
 kubectl -n navigator wait --for=condition=Programmed gateway/navigator-gateway --timeout=1s >/dev/null 2>&1 || exit 1

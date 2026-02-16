@@ -1,8 +1,9 @@
 use super::{ObjectRecord, current_time_ms, map_db_error, map_migrate_error};
 use navigator_core::Result;
-use sqlx::sqlite::SqlitePoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
+use std::str::FromStr;
 
 #[derive(Debug, Clone)]
 pub struct SqliteStore {
@@ -17,10 +18,14 @@ impl SqliteStore {
             5
         };
 
+        let options = SqliteConnectOptions::from_str(url)
+            .map_err(|e| map_db_error(&e))?
+            .create_if_missing(true);
+
         let pool = SqlitePoolOptions::new()
             .max_connections(max_connections)
             .min_connections(max_connections)
-            .connect(url)
+            .connect_with(options)
             .await
             .map_err(|e| map_db_error(&e))?;
 
@@ -40,19 +45,22 @@ impl SqliteStore {
             .map_err(|e| map_migrate_error(&e))
     }
 
-    pub async fn put(&self, object_type: &str, id: &str, payload: &[u8]) -> Result<()> {
+    pub async fn put(&self, object_type: &str, id: &str, name: &str, payload: &[u8]) -> Result<()> {
         let now_ms = current_time_ms()?;
 
         sqlx::query(
             r#"
-INSERT INTO "objects" ("object_type", "id", "payload", "created_at_ms", "updated_at_ms")
-VALUES (?1, ?2, ?3, ?4, ?4)
-ON CONFLICT ("object_type", "id")
-DO UPDATE SET "payload" = excluded."payload", "updated_at_ms" = excluded."updated_at_ms"
+INSERT INTO "objects" ("object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms")
+VALUES (?1, ?2, ?3, ?4, ?5, ?5)
+ON CONFLICT ("id") DO UPDATE SET
+    "payload" = excluded."payload",
+    "updated_at_ms" = excluded."updated_at_ms"
+WHERE "objects"."object_type" = excluded."object_type"
 "#,
         )
         .bind(object_type)
         .bind(id)
+        .bind(name)
         .bind(payload)
         .bind(now_ms)
         .execute(&self.pool)
@@ -64,7 +72,7 @@ DO UPDATE SET "payload" = excluded."payload", "updated_at_ms" = excluded."update
     pub async fn get(&self, object_type: &str, id: &str) -> Result<Option<ObjectRecord>> {
         let row = sqlx::query(
             r#"
-SELECT "object_type", "id", "payload", "created_at_ms", "updated_at_ms"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms"
 FROM "objects"
 WHERE "object_type" = ?1 AND "id" = ?2
 "#,
@@ -78,6 +86,31 @@ WHERE "object_type" = ?1 AND "id" = ?2
         Ok(row.map(|row| ObjectRecord {
             object_type: row.get("object_type"),
             id: row.get("id"),
+            name: row.get("name"),
+            payload: row.get("payload"),
+            created_at_ms: row.get("created_at_ms"),
+            updated_at_ms: row.get("updated_at_ms"),
+        }))
+    }
+
+    pub async fn get_by_name(&self, object_type: &str, name: &str) -> Result<Option<ObjectRecord>> {
+        let row = sqlx::query(
+            r#"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms"
+FROM "objects"
+WHERE "object_type" = ?1 AND "name" = ?2
+"#,
+        )
+        .bind(object_type)
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(row.map(|row| ObjectRecord {
+            object_type: row.get("object_type"),
+            id: row.get("id"),
+            name: row.get("name"),
             payload: row.get("payload"),
             created_at_ms: row.get("created_at_ms"),
             updated_at_ms: row.get("updated_at_ms"),
@@ -99,6 +132,21 @@ WHERE "object_type" = ?1 AND "id" = ?2
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn delete_by_name(&self, object_type: &str, name: &str) -> Result<bool> {
+        let result = sqlx::query(
+            r#"
+DELETE FROM "objects"
+WHERE "object_type" = ?1 AND "name" = ?2
+"#,
+        )
+        .bind(object_type)
+        .bind(name)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
     pub async fn list(
         &self,
         object_type: &str,
@@ -107,10 +155,10 @@ WHERE "object_type" = ?1 AND "id" = ?2
     ) -> Result<Vec<ObjectRecord>> {
         let rows = sqlx::query(
             r#"
-SELECT "object_type", "id", "payload", "created_at_ms", "updated_at_ms"
+SELECT "object_type", "id", "name", "payload", "created_at_ms", "updated_at_ms"
 FROM "objects"
 WHERE "object_type" = ?1
-ORDER BY "created_at_ms" ASC, "id" ASC
+ORDER BY "created_at_ms" ASC, "name" ASC
 LIMIT ?2 OFFSET ?3
 "#,
         )
@@ -126,6 +174,7 @@ LIMIT ?2 OFFSET ?3
             .map(|row| ObjectRecord {
                 object_type: row.get("object_type"),
                 id: row.get("id"),
+                name: row.get("name"),
                 payload: row.get("payload"),
                 created_at_ms: row.get("created_at_ms"),
                 updated_at_ms: row.get("updated_at_ms"),

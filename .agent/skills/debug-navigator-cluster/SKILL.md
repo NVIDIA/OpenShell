@@ -20,7 +20,7 @@ Diagnose why a navigator cluster failed to start after `nav cluster admin deploy
 7. **Prepare local images** (if `NAVIGATOR_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
 8. Wait for cluster health checks to pass (up to 6 min):
    - k3s API server readiness (`/readyz`)
-   - `navigator` deployment available in `navigator` namespace
+    - `navigator` statefulset ready in `navigator` namespace
    - `navigator-gateway` Gateway programmed in `navigator` namespace
    - If TLS enabled: `navigator-cli-client` secret exists with cert data
 9. Extract mTLS credentials if TLS is enabled (up to 3 min)
@@ -129,19 +129,19 @@ If `/readyz` fails, k3s is still starting or has crashed. Check container logs (
 
 If pods are in `CrashLoopBackOff`, `ImagePullBackOff`, or `Pending`, investigate those pods specifically.
 
-### Step 4: Check Navigator Server Deployment
+### Step 4: Check Navigator Server StatefulSet
 
-The Navigator server is deployed via a HelmChart CR. Check its status:
+The Navigator server is deployed via a HelmChart CR as a StatefulSet with persistent storage. Check its status:
 
 ```bash
-# Deployment status
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get deployment/navigator -o wide'
+# StatefulSet status
+docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get statefulset/navigator -o wide'
 
 # Navigator pod logs
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator logs deployment/navigator --tail=100'
+docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator logs statefulset/navigator --tail=100'
 
-# Describe deployment for events
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator describe deployment/navigator'
+# Describe statefulset for events
+docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator describe statefulset/navigator'
 
 # Helm install job logs (the job that installs the Navigator chart)
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n kube-system logs -l job-name=helm-install-navigator --tail=200'
@@ -286,7 +286,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
 | Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `docker logs` and `docker inspect` for details |
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
-| Navigator pods `Pending` | Insufficient CPU/memory for scheduling | Check `kubectl describe pod` for scheduling failures |
+| Navigator pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | Check `kubectl describe pod` for scheduling failures and `kubectl get pvc -n navigator` for volume status |
 | Navigator pods `CrashLoopBackOff` | Server application error | Check `kubectl logs` on the crashing pod |
 | Navigator pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `k3s ctr -n k8s.io images ls` for component images (Step 6) |
 | Navigator pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `/etc/rancher/k3s/registries.yaml` credentials and DNS (Step 8) |
@@ -364,8 +364,8 @@ run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get pods -A -o wide" 2>&1
 echo "=== Failing Pods ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded" 2>&1
 
-echo "=== Navigator Deployment ==="
-run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n navigator get deployment/navigator -o wide" 2>&1
+echo "=== Navigator StatefulSet ==="
+run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n navigator get statefulset/navigator -o wide" 2>&1
 
 echo "=== Navigator Gateway ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n navigator get gateway/navigator-gateway" 2>&1

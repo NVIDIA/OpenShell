@@ -140,28 +140,7 @@ build_ci_image:
 # =============================================================================
 # Lint Jobs
 # =============================================================================
-fmt_check:
-  extends: .rust_job_rules
-  stage: lint
-  rules:
-    - if: $CI_COMMIT_TAG
-      when: never
-    - when: on_success
-  script:
-    - mise run fmt:check
-
-clippy:
-  extends: .rust_job_rules
-  stage: lint
-  rules:
-    - if: $CI_COMMIT_TAG
-      when: never
-    - when: on_success
-  script:
-    - mise run clippy
-
-python_lint:
-  extends: .python_job_rules
+lint:
   stage: lint
   rules:
     - if: $CI_COMMIT_TAG
@@ -170,7 +149,7 @@ python_lint:
   before_script:
     - uv sync --frozen
   script:
-    - mise run python:lint
+    - mise run lint
 
 # =============================================================================
 # Test Jobs
@@ -183,7 +162,7 @@ rust_test:
       when: never
     - when: on_success
   script:
-    - mise run test:rust
+    - PATH="/root/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" /root/.cargo/bin/cargo test --workspace
 
 python_test:
   extends: .python_job_rules
@@ -195,7 +174,53 @@ python_test:
   before_script:
     - uv sync --frozen
   script:
-    - mise run test:python
+    - |
+      uv run python -m grpc_tools.protoc \
+        -Iproto \
+        --python_out=python/navigator/_proto \
+        --pyi_out=python/navigator/_proto \
+        --grpc_python_out=python/navigator/_proto \
+        proto/inference.proto \
+        proto/navigator.proto \
+        proto/datamodel.proto \
+        proto/sandbox.proto
+    - |
+      uv run python - <<'PY'
+      from pathlib import Path
+      import re
+
+      line_rewrites = {
+          "python/navigator/_proto/inference_pb2_grpc.py": [
+              (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
+          ],
+          "python/navigator/_proto/navigator_pb2_grpc.py": [
+              (r"^import navigator_pb2 as navigator__pb2$", "from . import navigator_pb2 as navigator__pb2"),
+              (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
+          ],
+          "python/navigator/_proto/navigator_pb2.py": [
+              (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+              (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
+          ],
+          "python/navigator/_proto/datamodel_pb2.py": [
+              (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
+          ],
+          "python/navigator/_proto/datamodel_pb2_grpc.py": [
+              (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
+          ],
+          "python/navigator/_proto/sandbox_pb2_grpc.py": [
+              (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
+          ],
+      }
+
+      for path, rules in line_rewrites.items():
+          file_path = Path(path)
+          text = file_path.read_text()
+          text = text.replace("from . from . import", "from . import")
+          for pattern, replacement in rules:
+              text = re.sub(pattern, replacement, text, flags=re.MULTILINE)
+          file_path.write_text(text)
+      PY
+    - uv run pytest python/
 
 python_e2e_sandbox_test:
   extends: .e2e_job_rules
@@ -222,8 +247,8 @@ python_e2e_sandbox_test:
   script:
     - socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
     - sleep 1
-    - mise run cluster
-    - mise run test:e2e:sandbox
+    - mise run --no-prepare cluster
+    - mise run --no-prepare test:e2e:sandbox
 
 # =============================================================================
 # Publish Jobs

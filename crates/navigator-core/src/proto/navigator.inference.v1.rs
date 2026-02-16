@@ -21,23 +21,31 @@ pub struct InferenceRoute {
     pub id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub spec: ::core::option::Option<InferenceRouteSpec>,
+    /// Human-friendly name, unique per object type. Auto-generated if not provided.
+    #[prost(string, tag = "3")]
+    pub name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct CreateInferenceRouteRequest {
     #[prost(message, optional, tag = "1")]
     pub route: ::core::option::Option<InferenceRouteSpec>,
+    /// Optional name. If empty, a random 6-char name is generated.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpdateInferenceRouteRequest {
+    /// Route name (canonical lookup key).
     #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
+    pub name: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub route: ::core::option::Option<InferenceRouteSpec>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeleteInferenceRouteRequest {
+    /// Route name (canonical lookup key).
     #[prost(string, tag = "1")]
-    pub id: ::prost::alloc::string::String,
+    pub name: ::prost::alloc::string::String,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct DeleteInferenceRouteResponse {

@@ -1,6 +1,6 @@
 //! Kubernetes sandbox integration.
 
-use crate::persistence::{ObjectId, ObjectType, Store};
+use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
 use futures::{StreamExt, TryStreamExt};
 use k8s_openapi::api::core::v1::Pod;
 use kube::api::{Api, ApiResource, DeleteParams, PostParams};
@@ -194,6 +194,12 @@ impl ObjectType for Sandbox {
 impl ObjectId for Sandbox {
     fn object_id(&self) -> &str {
         &self.id
+    }
+}
+
+impl ObjectName for Sandbox {
+    fn object_name(&self) -> &str {
+        &self.name
     }
 }
 

@@ -1,12 +1,16 @@
 # CI, pre-commit, and sandbox runner tasks
 
+[lint]
+description = "Run all linters (fmt, clippy, ruff)"
+depends = ["fmt:check", "clippy", "python:lint"]
+
 [all]
 description = "Build, lint, and test everything"
-depends = ["fmt:check", "clippy", "test", "python:lint"]
+depends = ["lint", "test"]
 
 ["pre-commit"]
 description = "Pre-commit checks (format, lint, and tests)"
-depends = ["fmt:check", "clippy", "python:lint", "test:rust", "test:python"]
+depends = ["lint", "test:rust", "test:python"]
 
 [sandbox]
 description = "Run the sandbox container with an interactive shell"
