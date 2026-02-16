@@ -13,6 +13,7 @@ use std::sync::Mutex;
 
 /// Thread-safe cache of binary SHA256 hashes for TOFU enforcement.
 pub struct BinaryIdentityCache {
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     hashes: Mutex<HashMap<PathBuf, String>>,
 }
 
@@ -28,6 +29,7 @@ impl BinaryIdentityCache {
     /// - First call for a given path: computes SHA256, caches it, returns the hash.
     /// - Subsequent calls: computes SHA256, compares with cached value.
     ///   Returns `Ok(hash)` if it matches, `Err` if the hash changed (binary tampered).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub fn verify_or_cache(&self, path: &Path) -> Result<String> {
         let current_hash = procfs::file_sha256(path)?;
         let mut hashes = self

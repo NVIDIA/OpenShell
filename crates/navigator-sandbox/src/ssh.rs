@@ -72,6 +72,7 @@ pub async fn run_ssh_server(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     mut stream: tokio::net::TcpStream,
     peer: SocketAddr,
@@ -334,6 +335,7 @@ impl Default for PtyRequest {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
     workdir: Option<String>,

@@ -51,25 +51,26 @@ pub fn create_cluster_metadata(name: &str, remote: Option<&RemoteOptions>) -> Cl
     }
 }
 
-pub(crate) fn local_gateway_host() -> Option<String> {
+pub fn local_gateway_host() -> Option<String> {
     std::env::var("DOCKER_HOST")
         .ok()
         .and_then(|value| local_gateway_host_from_docker_host(&value))
 }
 
-pub(crate) fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> {
+pub fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> {
     let target = docker_host.strip_prefix("tcp://")?;
     let authority = target.split('/').next()?;
     if authority.is_empty() {
         return None;
     }
 
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split(']').next().unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or("")
-    }
-    .trim();
+    let host = authority
+        .strip_prefix('[')
+        .map_or_else(
+            || authority.split(':').next().unwrap_or(""),
+            |rest| rest.split(']').next().unwrap_or(""),
+        )
+        .trim();
 
     if host.is_empty() || host == "localhost" || host == "127.0.0.1" || host == "::1" {
         return None;

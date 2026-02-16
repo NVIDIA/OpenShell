@@ -110,7 +110,7 @@ impl Inference for InferenceService {
             ));
         }
 
-        let router = self.state.router.as_ref().ok_or_else(|| {
+        let inference_router = self.state.router.as_ref().ok_or_else(|| {
             Status::unavailable("inference router is not configured on this server")
         })?;
 
@@ -121,7 +121,7 @@ impl Inference for InferenceService {
             "processing inference completion request"
         );
 
-        let response = router
+        let response = inference_router
             .completion_with_candidates(&req, &routes)
             .await
             .map_err(router_error_to_status)?;
@@ -238,6 +238,7 @@ impl Inference for InferenceService {
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_route_spec(spec: &navigator_core::proto::InferenceRouteSpec) -> Result<(), Status> {
     if spec.routing_hint.trim().is_empty() {
         return Err(Status::invalid_argument("route.routing_hint is required"));

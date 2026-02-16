@@ -14,7 +14,6 @@ use navigator_core::proto::{
 };
 use navigator_core::proto::{Sandbox, SandboxPhase};
 use prost::Message;
-use std::future::Future;
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -684,6 +683,7 @@ fn is_valid_env_key(key: &str) -> bool {
     bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn stream_exec_over_ssh(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
     sandbox_id: &str,
@@ -709,26 +709,23 @@ async fn stream_exec_over_ssh(
     let exec = run_exec_with_russh(local_proxy_port, command, stdin_payload, tx.clone());
     let exit_code = if timeout_seconds == 0 {
         exec.await?
+    } else if let Ok(result) = tokio::time::timeout(
+        std::time::Duration::from_secs(u64::from(timeout_seconds)),
+        exec,
+    )
+    .await
+    {
+        result?
     } else {
-        match tokio::time::timeout(
-            std::time::Duration::from_secs(u64::from(timeout_seconds)),
-            exec,
-        )
-        .await
-        {
-            Ok(result) => result?,
-            Err(_) => {
-                let _ = tx
-                    .send(Ok(ExecSandboxEvent {
-                        payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Exit(
-                            ExecSandboxExit { exit_code: 124 },
-                        )),
-                    }))
-                    .await;
-                let _ = proxy_task.await;
-                return Ok(());
-            }
-        }
+        let _ = tx
+            .send(Ok(ExecSandboxEvent {
+                payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Exit(
+                    ExecSandboxExit { exit_code: 124 },
+                )),
+            }))
+            .await;
+        let _ = proxy_task.await;
+        return Ok(());
     };
 
     let _ = proxy_task.await;
@@ -750,11 +747,11 @@ struct SandboxSshClientHandler;
 impl russh::client::Handler for SandboxSshClientHandler {
     type Error = russh::Error;
 
-    fn check_server_key(
+    async fn check_server_key(
         &mut self,
         _server_public_key: &russh::keys::PublicKey,
-    ) -> impl Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(true) }
+    ) -> Result<bool, Self::Error> {
+        Ok(true)
     }
 }
 

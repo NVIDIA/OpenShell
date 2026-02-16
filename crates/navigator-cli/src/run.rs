@@ -1604,6 +1604,7 @@ pub async fn sandbox_delete(server: &str, ids: &[String], tls: &TlsOptions) -> R
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn inference_route_create(
     server: &str,
     routing_hint: &str,

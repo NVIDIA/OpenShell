@@ -40,9 +40,9 @@ impl Router {
     }
 
     pub fn from_config(config: &RouterConfig) -> Result<Self, RouterError> {
-        let routes = config.resolve_routes()?;
+        let resolved = config.resolve_routes()?;
         let mut router = Self::new()?;
-        router.routes = routes;
+        router.routes = resolved;
         Ok(router)
     }
 
