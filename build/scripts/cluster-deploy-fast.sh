@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLUSTER_NAME=${CLUSTER_NAME:-navigator}
+CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
 IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NAVIGATOR_REGISTRY:-localhost:5000/navigator}}
 IMAGE_TAG=${IMAGE_TAG:-dev}

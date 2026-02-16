@@ -393,9 +393,10 @@ fn is_progress_status(status: &str) -> bool {
 
 /// Show cluster status.
 #[allow(clippy::branches_sharing_code)]
-pub async fn cluster_status(server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
     println!("{}", "Server Status".cyan().bold());
     println!();
+    println!("  {} {}", "Cluster:".dimmed(), cluster_name);
     println!("  {} {}", "Server:".dimmed(), server);
 
     // Try to connect and get health

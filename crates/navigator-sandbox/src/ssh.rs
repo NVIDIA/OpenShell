@@ -46,6 +46,7 @@ pub async fn run_ssh_server(
 
     loop {
         let (stream, peer) = listener.accept().await.into_diagnostic()?;
+        stream.set_nodelay(true).into_diagnostic()?;
         let config = config.clone();
         let policy = policy.clone();
         let workdir = workdir.clone();

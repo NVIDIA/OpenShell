@@ -128,6 +128,7 @@ async fn handle_tunnel(
         ConnectTarget::Ip(addr) => TcpStream::connect(addr).await?,
         ConnectTarget::Host(host, port) => TcpStream::connect((host.as_str(), port)).await?,
     };
+    upstream.set_nodelay(true)?;
     let preface = build_preface(token, secret)?;
     upstream.write_all(preface.as_bytes()).await?;
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLUSTER_NAME=${CLUSTER_NAME:-navigator}
+CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then

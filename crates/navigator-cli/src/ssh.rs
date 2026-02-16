@@ -330,6 +330,7 @@ async fn connect_gateway(
     tls: &TlsOptions,
 ) -> Result<Box<dyn ProxyStream>> {
     let tcp = TcpStream::connect((host, port)).await.into_diagnostic()?;
+    tcp.set_nodelay(true).into_diagnostic()?;
     if scheme.eq_ignore_ascii_case("https") {
         let materials = require_tls_materials(&format!("https://{host}:{port}"), tls)?;
         let config = build_rustls_config(&materials)?;

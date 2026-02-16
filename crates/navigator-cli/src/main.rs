@@ -393,7 +393,7 @@ async fn main() -> Result<()> {
                     ));
                 }
                 let tls = tls.with_cluster_name(&ctx.name);
-                run::cluster_status(endpoint, &tls).await?;
+                run::cluster_status(&ctx.name, endpoint, &tls).await?;
             }
             ClusterCommands::Use { name } => {
                 run::cluster_use(&name)?;
