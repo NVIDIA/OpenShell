@@ -672,8 +672,7 @@ pub async fn cluster_admin_deploy(
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    let is_remote = remote.is_some();
-    let location = if is_remote { "remote" } else { "local" };
+    let location = if remote.is_some() { "remote" } else { "local" };
 
     let mut options = DeployOptions::new(name);
     if let Some(dest) = remote {
@@ -714,13 +713,7 @@ pub async fn cluster_admin_deploy(
 
     if update_kube_config {
         let target_path = default_local_kubeconfig_path()?;
-        // For remote clusters, the name includes "-remote" suffix
-        let kubeconfig_name = if is_remote {
-            format!("{name}-remote")
-        } else {
-            name.to_string()
-        };
-        update_local_kubeconfig(&kubeconfig_name, &target_path)?;
+        update_local_kubeconfig(name, &target_path)?;
         eprintln!(
             "{} Updated kubeconfig at {}",
             "✓".green().bold(),
@@ -729,12 +722,7 @@ pub async fn cluster_admin_deploy(
     }
 
     if get_kubeconfig {
-        let kubeconfig_name = if is_remote {
-            format!("{name}-remote")
-        } else {
-            name.to_string()
-        };
-        print_kubeconfig(&kubeconfig_name)?;
+        print_kubeconfig(name)?;
     }
 
     print_deploy_summary(name, &handle);
