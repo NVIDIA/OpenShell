@@ -253,7 +253,7 @@ python_e2e_sandbox_test:
 # =============================================================================
 # Publish Jobs
 # =============================================================================
-publish_ecr_images:
+publish_main_artifacts:
   stage: publish
   services:
     - docker:24-dind
