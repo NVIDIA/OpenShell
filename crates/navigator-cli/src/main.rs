@@ -157,6 +157,8 @@ enum CliProviderType {
     Opencode,
     Codex,
     Openclaw,
+    Generic,
+    Nvidia,
     Gitlab,
     Github,
     Outlook,
@@ -169,6 +171,8 @@ impl CliProviderType {
             Self::Opencode => "opencode",
             Self::Codex => "codex",
             Self::Openclaw => "openclaw",
+            Self::Generic => "generic",
+            Self::Nvidia => "nvidia",
             Self::Gitlab => "gitlab",
             Self::Github => "github",
             Self::Outlook => "outlook",
@@ -189,11 +193,15 @@ enum ProviderCommands {
         provider_type: CliProviderType,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "credentials")]
         from_existing: bool,
 
-        /// Provider credential key/value pair.
-        #[arg(long = "credential", value_name = "KEY=VALUE")]
+        /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
+        #[arg(
+            long = "credential",
+            value_name = "KEY[=VALUE]",
+            conflicts_with = "from_existing"
+        )]
         credentials: Vec<String>,
 
         /// Provider config key/value pair.
@@ -232,11 +240,15 @@ enum ProviderCommands {
         provider_type: CliProviderType,
 
         /// Load provider credentials/config from existing local state.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "credentials")]
         from_existing: bool,
 
-        /// Provider credential key/value pair.
-        #[arg(long = "credential", value_name = "KEY=VALUE")]
+        /// Provider credential pair (`KEY=VALUE`) or env lookup key (`KEY`).
+        #[arg(
+            long = "credential",
+            value_name = "KEY[=VALUE]",
+            conflicts_with = "from_existing"
+        )]
         credentials: Vec<String>,
 
         /// Provider config key/value pair.

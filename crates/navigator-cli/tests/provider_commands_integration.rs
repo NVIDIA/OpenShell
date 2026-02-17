@@ -5,7 +5,8 @@ use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     Provider, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
@@ -17,6 +18,37 @@ use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 use tonic::{Response, Status};
+
+struct EnvVarGuard {
+    key: &'static str,
+    original: Option<String>,
+}
+
+#[allow(unsafe_code)]
+impl EnvVarGuard {
+    fn set(key: &'static str, value: &str) -> Self {
+        let original = std::env::var(key).ok();
+        unsafe {
+            std::env::set_var(key, value);
+        }
+        Self { key, original }
+    }
+}
+
+#[allow(unsafe_code)]
+impl Drop for EnvVarGuard {
+    fn drop(&mut self) {
+        if let Some(value) = &self.original {
+            unsafe {
+                std::env::set_var(self.key, value);
+            }
+        } else {
+            unsafe {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct ProviderState {
@@ -73,6 +105,15 @@ impl Navigator for TestNavigator {
         _request: tonic::Request<GetSandboxPolicyRequest>,
     ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
         Ok(Response::new(GetSandboxPolicyResponse::default()))
+    }
+
+    async fn get_sandbox_provider_environment(
+        &self,
+        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+        Ok(Response::new(
+            GetSandboxProviderEnvironmentResponse::default(),
+        ))
     }
 
     async fn create_ssh_session(
@@ -259,7 +300,7 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
 }
 
 #[tokio::test]
-async fn provider_create_rejects_invalid_key_value_flags() {
+async fn provider_create_rejects_key_only_credentials_without_local_env_value() {
     let addr = run_server().await;
     let endpoint = format!("http://127.0.0.1:{}", addr.port());
     let tls = TlsOptions::default();
@@ -277,7 +318,133 @@ async fn provider_create_rejects_invalid_key_value_flags() {
     .expect_err("invalid key=value should fail");
 
     assert!(
-        err.to_string().contains("--credential expects KEY=VALUE"),
+        err.to_string()
+            .contains("requires local env var 'INVALID_PAIR' to be set to a non-empty value"),
         "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
+    let addr = run_server().await;
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let tls = TlsOptions::default();
+    let _guard = EnvVarGuard::set("NAV_GENERIC_TEST_KEY", "generic-value");
+
+    run::provider_create(
+        &endpoint,
+        "my-generic",
+        "generic",
+        false,
+        &["NAV_GENERIC_TEST_KEY".to_string()],
+        &[],
+        &tls,
+    )
+    .await
+    .expect("provider create");
+
+    let mut client = navigator_cli::tls::grpc_client(&endpoint, &tls)
+        .await
+        .expect("grpc client should connect");
+    let response = client
+        .get_provider(GetProviderRequest {
+            name: "my-generic".to_string(),
+        })
+        .await
+        .expect("get provider should succeed")
+        .into_inner();
+    let provider = response.provider.expect("provider should exist");
+    assert_eq!(provider.r#type, "generic");
+    assert_eq!(
+        provider.credentials.get("NAV_GENERIC_TEST_KEY"),
+        Some(&"generic-value".to_string())
+    );
+}
+
+#[tokio::test]
+async fn provider_create_rejects_combined_from_existing_and_credentials() {
+    let addr = run_server().await;
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let tls = TlsOptions::default();
+
+    let err = run::provider_create(
+        &endpoint,
+        "bad-provider",
+        "claude",
+        true,
+        &["API_KEY=abc".to_string()],
+        &[],
+        &tls,
+    )
+    .await
+    .expect_err("from-existing and credentials should be mutually exclusive");
+
+    assert!(
+        err.to_string()
+            .contains("--from-existing cannot be combined with --credential"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
+    let addr = run_server().await;
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let tls = TlsOptions::default();
+    let _guard = EnvVarGuard::set("NAV_EMPTY_ENV_KEY", "");
+
+    let err = run::provider_create(
+        &endpoint,
+        "bad-provider",
+        "generic",
+        false,
+        &["NAV_EMPTY_ENV_KEY".to_string()],
+        &[],
+        &tls,
+    )
+    .await
+    .expect_err("empty env var should be rejected");
+
+    assert!(
+        err.to_string()
+            .contains("requires local env var 'NAV_EMPTY_ENV_KEY' to be set to a non-empty value"),
+        "unexpected error: {err}"
+    );
+}
+
+#[tokio::test]
+async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
+    let addr = run_server().await;
+    let endpoint = format!("http://127.0.0.1:{}", addr.port());
+    let tls = TlsOptions::default();
+    let _guard = EnvVarGuard::set("NVIDIA_API_KEY", "nvapi-live-test");
+
+    run::provider_create(
+        &endpoint,
+        "my-nvidia",
+        "nvidia",
+        false,
+        &["NVIDIA_API_KEY".to_string()],
+        &[],
+        &tls,
+    )
+    .await
+    .expect("provider create");
+
+    let mut client = navigator_cli::tls::grpc_client(&endpoint, &tls)
+        .await
+        .expect("grpc client should connect");
+    let response = client
+        .get_provider(GetProviderRequest {
+            name: "my-nvidia".to_string(),
+        })
+        .await
+        .expect("get provider should succeed")
+        .into_inner();
+    let provider = response.provider.expect("provider should exist");
+    assert_eq!(provider.r#type, "nvidia");
+    assert_eq!(
+        provider.credentials.get("NVIDIA_API_KEY"),
+        Some(&"nvapi-live-test".to_string())
     );
 }

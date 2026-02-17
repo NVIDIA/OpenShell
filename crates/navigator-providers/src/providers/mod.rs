@@ -1,7 +1,9 @@
 pub mod claude;
 pub mod codex;
+pub mod generic;
 pub mod github;
 pub mod gitlab;
+pub mod nvidia;
 pub mod openclaw;
 pub mod opencode;
 pub mod outlook;

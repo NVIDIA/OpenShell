@@ -10,6 +10,7 @@ use rand_core::OsRng;
 use russh::keys::{Algorithm, PrivateKey};
 use russh::server::{Auth, Handle, Session};
 use russh::{ChannelId, CryptoVec};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
@@ -22,6 +23,7 @@ use tracing::{info, warn};
 
 const PREFACE_MAGIC: &str = "NSSH1";
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_ssh_server(
     listen_addr: SocketAddr,
     policy: SandboxPolicy,
@@ -30,6 +32,7 @@ pub async fn run_ssh_server(
     handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    provider_env: HashMap<String, String>,
 ) -> Result<()> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
@@ -52,6 +55,7 @@ pub async fn run_ssh_server(
         let workdir = workdir.clone();
         let secret = handshake_secret.clone();
         let proxy_url = proxy_url.clone();
+        let provider_env = provider_env.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -64,6 +68,7 @@ pub async fn run_ssh_server(
                 handshake_skew_secs,
                 netns_fd,
                 proxy_url,
+                provider_env,
             )
             .await
             {
@@ -84,6 +89,7 @@ async fn handle_connection(
     handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    provider_env: HashMap<String, String>,
 ) -> Result<()> {
     let mut line = String::new();
     read_line(&mut stream, &mut line).await?;
@@ -94,7 +100,7 @@ async fn handle_connection(
     stream.write_all(b"OK\n").await.into_diagnostic()?;
     info!(peer = %peer, "SSH handshake accepted");
 
-    let handler = SshHandler::new(policy, workdir, netns_fd, proxy_url);
+    let handler = SshHandler::new(policy, workdir, netns_fd, proxy_url, provider_env);
     russh::server::run_stream(config, stream, handler)
         .await
         .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
@@ -163,6 +169,7 @@ struct SshHandler {
     workdir: Option<String>,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    provider_env: HashMap<String, String>,
     input_sender: Option<mpsc::Sender<Vec<u8>>>,
     pty_master: Option<std::fs::File>,
     pty_request: Option<PtyRequest>,
@@ -174,12 +181,14 @@ impl SshHandler {
         workdir: Option<String>,
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
+        provider_env: HashMap<String, String>,
     ) -> Self {
         Self {
             policy,
             workdir,
             netns_fd,
             proxy_url,
+            provider_env,
             input_sender: None,
             pty_master: None,
             pty_request: None,
@@ -308,6 +317,7 @@ impl SshHandler {
             channel,
             self.netns_fd,
             self.proxy_url.clone(),
+            &self.provider_env,
         )?;
         self.pty_master = Some(pty_master);
         self.input_sender = Some(input_sender);
@@ -346,6 +356,7 @@ fn spawn_pty_shell(
     channel: ChannelId,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
@@ -402,6 +413,11 @@ fn spawn_pty_shell(
             .env("http_proxy", url)
             .env("https_proxy", url)
             .env("grpc_proxy", url);
+    }
+
+    // Set provider environment variables (credentials fetched at runtime).
+    for (key, value) in provider_env {
+        cmd.env(key, value);
     }
 
     if let Some(dir) = workdir.as_deref() {

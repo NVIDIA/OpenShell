@@ -101,7 +101,6 @@ binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]
 	not contains(b.path, "*")
-	some ancestor
 	ancestor := exec.ancestors[_]
 	b.path == ancestor
 }
@@ -113,7 +112,6 @@ binary_allowed(policy, exec) if {
 	some b
 	b := policy.binaries[_]
 	not contains(b.path, "*")
-	some cp
 	cp := exec.cmdline_paths[_]
 	b.path == cp
 }

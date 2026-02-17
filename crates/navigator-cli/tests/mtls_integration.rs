@@ -114,6 +114,16 @@ impl Navigator for TestNavigator {
         ))
     }
 
+    async fn get_sandbox_provider_environment(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<navigator_core::proto::GetSandboxProviderEnvironmentResponse>, Status>
+    {
+        Ok(Response::new(
+            navigator_core::proto::GetSandboxProviderEnvironmentResponse::default(),
+        ))
+    }
+
     async fn create_ssh_session(
         &self,
         _request: tonic::Request<CreateSshSessionRequest>,

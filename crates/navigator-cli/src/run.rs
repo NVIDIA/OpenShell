@@ -952,17 +952,10 @@ pub async fn sandbox_create(
     let configured_providers = ensure_required_providers(&mut client, &required_providers).await?;
 
     let policy = load_dev_sandbox_policy()?;
-    let mut environment = HashMap::new();
-    if !configured_providers.is_empty() {
-        environment.insert(
-            "NAVIGATOR_PROVIDER_TYPES".to_string(),
-            configured_providers.join(","),
-        );
-    }
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             policy: Some(policy),
-            environment,
+            providers: configured_providers,
             ..SandboxSpec::default()
         }),
     };
@@ -1642,6 +1635,10 @@ fn required_provider_types(command: &[String], providers: &[String]) -> Vec<Stri
     required
 }
 
+/// Ensure all required provider types exist, creating them interactively if needed.
+///
+/// Returns a list of provider **names** (not type slugs) that were resolved for each
+/// required type. These names are suitable for passing in `SandboxSpec.providers`.
 async fn ensure_required_providers(
     client: &mut NavigatorClient<Channel>,
     required_types: &[String],
@@ -1650,7 +1647,8 @@ async fn ensure_required_providers(
         return Ok(Vec::new());
     }
 
-    let mut existing_types = HashSet::new();
+    // Map from lowercase type -> first provider name found with that type.
+    let mut type_to_name: HashMap<String, String> = HashMap::new();
     let mut offset = 0_u32;
     let limit = 100_u32;
 
@@ -1662,7 +1660,10 @@ async fn ensure_required_providers(
         let providers = response.into_inner().providers;
         for provider in &providers {
             if !provider.r#type.is_empty() {
-                existing_types.insert(provider.r#type.to_ascii_lowercase());
+                let type_lower = provider.r#type.to_ascii_lowercase();
+                type_to_name
+                    .entry(type_lower)
+                    .or_insert_with(|| provider.name.clone());
             }
         }
 
@@ -1674,18 +1675,17 @@ async fn ensure_required_providers(
 
     let missing = required_types
         .iter()
-        .filter(|provider_type| !existing_types.contains(&provider_type.to_ascii_lowercase()))
+        .filter(|t| !type_to_name.contains_key(&t.to_ascii_lowercase()))
         .cloned()
         .collect::<Vec<_>>();
 
-    let mut configured_types = required_types
+    let mut configured_names: Vec<String> = required_types
         .iter()
-        .filter(|provider_type| existing_types.contains(&provider_type.to_ascii_lowercase()))
-        .cloned()
-        .collect::<Vec<_>>();
+        .filter_map(|t| type_to_name.get(&t.to_ascii_lowercase()).cloned())
+        .collect();
 
     if missing.is_empty() {
-        return Ok(configured_types);
+        return Ok(configured_names);
     }
 
     if !std::io::stdin().is_terminal() {
@@ -1706,6 +1706,7 @@ async fn ensure_required_providers(
 
         if !should_create {
             eprintln!("{} Skipping provider '{provider_type}'", "!".yellow(),);
+            eprintln!();
             continue;
         }
 
@@ -1718,6 +1719,7 @@ async fn ensure_required_providers(
                 "!".yellow(),
                 provider_type
             );
+            eprintln!();
             continue;
         };
 
@@ -1751,7 +1753,7 @@ async fn ensure_required_providers(
                         provider.name,
                         provider.r#type
                     );
-                    configured_types.push(provider_type.clone());
+                    configured_names.push(provider.name);
                     created = true;
                     break;
                 }
@@ -1769,9 +1771,11 @@ async fn ensure_required_providers(
                 "failed to create provider for type '{provider_type}' after name retries"
             ));
         }
+
+        eprintln!();
     }
 
-    Ok(configured_types)
+    Ok(configured_names)
 }
 
 fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
@@ -1793,6 +1797,126 @@ fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String,
     Ok(map)
 }
 
+fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
+    let mut map = HashMap::new();
+
+    for item in items {
+        if let Some((key, value)) = item.split_once('=') {
+            let key = key.trim();
+            if key.is_empty() {
+                return Err(miette::miette!("--credential key cannot be empty"));
+            }
+            map.insert(key.to_string(), value.to_string());
+            continue;
+        }
+
+        let key = item.trim();
+        if key.is_empty() {
+            return Err(miette::miette!("--credential key cannot be empty"));
+        }
+
+        let value = std::env::var(key).map_err(|_| {
+            miette::miette!(
+                "--credential {key} requires local env var '{key}' to be set to a non-empty value"
+            )
+        })?;
+
+        if value.trim().is_empty() {
+            return Err(miette::miette!(
+                "--credential {key} requires local env var '{key}' to be set to a non-empty value"
+            ));
+        }
+
+        map.insert(key.to_string(), value);
+    }
+
+    Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_credential_pairs;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    #[allow(unsafe_code)]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_credential_pairs_accepts_key_value_form() {
+        let parsed = parse_credential_pairs(&["API_KEY=abc123".to_string()]).expect("parse");
+        assert_eq!(parsed.get("API_KEY"), Some(&"abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
+
+        let parsed =
+            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
+        assert_eq!(
+            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
+            Some(&"from-env".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
+        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
+
+        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
+            .expect_err("missing env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
+
+        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
+            .expect_err("empty env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
+        ));
+    }
+}
+
 pub async fn provider_create(
     server: &str,
     name: &str,
@@ -1802,13 +1926,19 @@ pub async fn provider_create(
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
+    if from_existing && !credentials.is_empty() {
+        return Err(miette::miette!(
+            "--from-existing cannot be combined with --credential"
+        ));
+    }
+
     let mut client = grpc_client(server, tls).await?;
 
     let provider_type = normalize_provider_type(provider_type)
         .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
         .to_string();
 
-    let mut credential_map = parse_key_value_pairs(credentials, "--credential")?;
+    let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
@@ -1967,13 +2097,19 @@ pub async fn provider_update(
     config: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
+    if from_existing && !credentials.is_empty() {
+        return Err(miette::miette!(
+            "--from-existing cannot be combined with --credential"
+        ));
+    }
+
     let mut client = grpc_client(server, tls).await?;
 
     let provider_type = normalize_provider_type(provider_type)
         .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
         .to_string();
 
-    let mut credential_map = parse_key_value_pairs(credentials, "--credential")?;
+    let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {

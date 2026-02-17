@@ -98,8 +98,13 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`):
 | `mise run docker:build:server`  | Build server image                  |
 | `mise run docker:build:cluster` | Build airgapped cluster image       |
 | `mise run cluster`              | Build and deploy local k3s cluster  |
+| `mise run cluster:deploy`       | Fast deploy changed components only |
 | `mise run sandbox`              | Run sandbox container interactively |
 | `mise run helm:lint`            | Lint the Helm chart                 |
+
+`cluster:deploy` determines what to rebuild from local Git changes (unstaged, staged,
+and untracked files). Changes under `crates/navigator-providers/` trigger both server
+and sandbox image rebuilds because both runtimes depend on provider behavior.
 
 ### Environment Variables
 

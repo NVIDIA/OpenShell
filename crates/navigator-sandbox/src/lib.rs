@@ -18,7 +18,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 use crate::identity::BinaryIdentityCache;
 use crate::opa::OpaEngine;
@@ -55,8 +55,31 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
-    let (policy, opa_engine) =
-        load_policy(sandbox_id, navigator_endpoint, policy_rules, policy_data).await?;
+    let (policy, opa_engine) = load_policy(
+        sandbox_id.clone(),
+        navigator_endpoint.clone(),
+        policy_rules,
+        policy_data,
+    )
+    .await?;
+
+    // Fetch provider environment variables from the server.
+    // This is done after loading the policy so the sandbox can still start
+    // even if provider env fetch fails (graceful degradation).
+    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &navigator_endpoint) {
+        match grpc_client::fetch_provider_environment(endpoint, id).await {
+            Ok(env) => {
+                info!(env_count = env.len(), "Fetched provider environment");
+                env
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to fetch provider environment, continuing without");
+                std::collections::HashMap::new()
+            }
+        }
+    } else {
+        std::collections::HashMap::new()
+    };
 
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
@@ -187,6 +210,7 @@ pub async fn run_sandbox(
         let secret = ssh_handshake_secret.unwrap_or_default();
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
+        let provider_env_clone = provider_env.clone();
         tokio::spawn(async move {
             if let Err(err) = ssh::run_ssh_server(
                 addr,
@@ -196,6 +220,7 @@ pub async fn run_sandbox(
                 ssh_handshake_skew_secs,
                 netns_fd,
                 proxy_url,
+                provider_env_clone,
             )
             .await
             {
@@ -212,10 +237,18 @@ pub async fn run_sandbox(
         interactive,
         &policy,
         netns.as_ref(),
+        &provider_env,
     )?;
 
     #[cfg(not(target_os = "linux"))]
-    let mut handle = ProcessHandle::spawn(program, args, workdir.as_deref(), interactive, &policy)?;
+    let mut handle = ProcessHandle::spawn(
+        program,
+        args,
+        workdir.as_deref(),
+        interactive,
+        &policy,
+        &provider_env,
+    )?;
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
     entrypoint_pid.store(handle.pid(), Ordering::Release);

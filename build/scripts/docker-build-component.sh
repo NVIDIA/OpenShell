@@ -47,6 +47,7 @@ docker buildx build \
   "${CACHE_ARGS[@]}" \
   -f "deploy/docker/Dockerfile.${COMPONENT}" \
   -t "navigator-${COMPONENT}:${IMAGE_TAG}" \
+  --provenance=false \
   "$@" \
   --load \
   .

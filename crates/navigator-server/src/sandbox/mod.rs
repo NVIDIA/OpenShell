@@ -405,24 +405,6 @@ fn sandbox_to_k8s_spec(
         if !spec.log_level.is_empty() {
             root.insert("logLevel".to_string(), serde_json::json!(spec.log_level));
         }
-        if !spec.agent_endpoint.is_empty() {
-            root.insert(
-                "agentEndpoint".to_string(),
-                serde_json::json!(spec.agent_endpoint),
-            );
-        }
-        if !spec.agent_descriptor.is_empty() {
-            root.insert(
-                "agentDescriptor".to_string(),
-                serde_json::json!(spec.agent_descriptor),
-            );
-        }
-        if !spec.agent_version.is_empty() {
-            root.insert(
-                "agentVersion".to_string(),
-                serde_json::json!(spec.agent_version),
-            );
-        }
         if !spec.environment.is_empty() {
             root.insert(
                 "environment".to_string(),

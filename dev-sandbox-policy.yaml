@@ -47,6 +47,14 @@ network_policies:
       - { host: gitlab.mycorp.com, port: 443 }
     binaries:
       - { path: /usr/bin/glab }
+  nvidia:
+    name: nvidia
+    endpoints:
+      - { host: integrate.api.nvidia.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /bin/bash }
+      - { path: /usr/local/bin/opencode }
 
 inference:
   allowed_routing_hints:

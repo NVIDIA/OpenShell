@@ -7,6 +7,7 @@ use crate::sandbox::linux::netns::NetworkNamespace;
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Group, Pid, User};
+use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
@@ -34,6 +35,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         netns: Option<&NetworkNamespace>,
+        provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         Self::spawn_impl(
             program,
@@ -42,6 +44,7 @@ impl ProcessHandle {
             interactive,
             policy,
             netns.and_then(|ns| ns.ns_fd()),
+            provider_env,
         )
     }
 
@@ -57,8 +60,9 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        Self::spawn_impl(program, args, workdir, interactive, policy)
+        Self::spawn_impl(program, args, workdir, interactive, policy, provider_env)
     }
 
     #[cfg(target_os = "linux")]
@@ -69,6 +73,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         netns_fd: Option<RawFd>,
+        provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -77,6 +82,11 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env("NAVIGATOR_SANDBOX", "1");
+
+        // Set provider environment variables (credentials fetched at runtime).
+        for (key, value) in provider_env {
+            cmd.env(key, value);
+        }
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
@@ -165,6 +175,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
         cmd.args(args)
@@ -173,6 +184,11 @@ impl ProcessHandle {
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .env("NAVIGATOR_SANDBOX", "1");
+
+        // Set provider environment variables (credentials fetched at runtime).
+        for (key, value) in provider_env {
+            cmd.env(key, value);
+        }
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);

@@ -8,7 +8,8 @@ use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
-    GetProviderRequest, GetSandboxPolicyRequest, GetSandboxPolicyResponse, GetSandboxRequest,
+    GetProviderRequest, GetSandboxPolicyRequest, GetSandboxPolicyResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
@@ -68,6 +69,19 @@ impl Navigator for NavigatorService {
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
         if spec.policy.is_none() {
             return Err(Status::invalid_argument("spec.policy is required"));
+        }
+
+        // Validate provider names exist (fail fast). Credentials are fetched at
+        // runtime by the sandbox supervisor via GetSandboxProviderEnvironment.
+        for name in &spec.providers {
+            self.state
+                .store
+                .get_message_by_name::<Provider>(name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!("provider '{name}' not found"))
+                })?;
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -526,6 +540,39 @@ impl Navigator for NavigatorService {
         }))
     }
 
+    async fn get_sandbox_provider_environment(
+        &self,
+        request: Request<GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+        let sandbox_id = request.into_inner().sandbox_id;
+
+        let sandbox = self
+            .state
+            .store
+            .get_message::<Sandbox>(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let spec = sandbox
+            .spec
+            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+
+        let environment =
+            resolve_provider_environment(self.state.store.as_ref(), &spec.providers).await?;
+
+        info!(
+            sandbox_id = %sandbox_id,
+            provider_count = spec.providers.len(),
+            env_count = environment.len(),
+            "GetSandboxProviderEnvironment request completed successfully"
+        );
+
+        Ok(Response::new(GetSandboxProviderEnvironmentResponse {
+            environment,
+        }))
+    }
+
     async fn create_ssh_session(
         &self,
         request: Request<CreateSshSessionRequest>,
@@ -754,6 +801,45 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> String {
     } else {
         format!("cd {} && {command}", shell_escape(&req.workdir))
     }
+}
+
+/// Resolve provider credentials into environment variables.
+///
+/// For each provider name in the list, fetches the provider from the store and
+/// collects credential key-value pairs. Returns a map of environment variables
+/// to inject into the sandbox. When duplicate keys appear across providers, the
+/// first provider's value wins.
+async fn resolve_provider_environment(
+    store: &crate::persistence::Store,
+    provider_names: &[String],
+) -> Result<std::collections::HashMap<String, String>, Status> {
+    if provider_names.is_empty() {
+        return Ok(std::collections::HashMap::new());
+    }
+
+    let mut env = std::collections::HashMap::new();
+
+    for name in provider_names {
+        let provider = store
+            .get_message_by_name::<Provider>(name)
+            .await
+            .map_err(|e| Status::internal(format!("failed to fetch provider '{name}': {e}")))?
+            .ok_or_else(|| Status::failed_precondition(format!("provider '{name}' not found")))?;
+
+        for (key, value) in &provider.credentials {
+            if is_valid_env_key(key) {
+                env.entry(key.clone()).or_insert_with(|| value.clone());
+            } else {
+                warn!(
+                    provider_name = %name,
+                    key = %key,
+                    "skipping credential with invalid env var key"
+                );
+            }
+        }
+    }
+
+    Ok(env)
 }
 
 fn is_valid_env_key(key: &str) -> bool {
@@ -1160,7 +1246,7 @@ impl ObjectName for Provider {
 mod tests {
     use super::{
         create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, update_provider_record,
+        list_provider_records, resolve_provider_environment, update_provider_record,
     };
     use crate::persistence::Store;
     use navigator_core::proto::Provider;
@@ -1307,5 +1393,257 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(update_missing_err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_empty_list_returns_empty() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let result = resolve_provider_environment(&store, &[]).await.unwrap();
+        assert!(result.is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_injects_credentials() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let provider = Provider {
+            id: String::new(),
+            name: "claude-local".to_string(),
+            r#type: "claude".to_string(),
+            credentials: [
+                ("ANTHROPIC_API_KEY".to_string(), "sk-abc".to_string()),
+                ("CLAUDE_API_KEY".to_string(), "sk-abc".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            config: std::iter::once((
+                "endpoint".to_string(),
+                "https://api.anthropic.com".to_string(),
+            ))
+            .collect(),
+        };
+        create_provider_record(&store, provider).await.unwrap();
+
+        let result = resolve_provider_environment(&store, &["claude-local".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
+        assert_eq!(result.get("CLAUDE_API_KEY"), Some(&"sk-abc".to_string()));
+        // Config values should NOT be injected.
+        assert!(!result.contains_key("endpoint"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_unknown_name_returns_error() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let err = resolve_provider_environment(&store, &["nonexistent".to_string()])
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::FailedPrecondition);
+        assert!(err.message().contains("nonexistent"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_skips_invalid_credential_keys() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let provider = Provider {
+            id: String::new(),
+            name: "test-provider".to_string(),
+            r#type: "test".to_string(),
+            credentials: [
+                ("VALID_KEY".to_string(), "value".to_string()),
+                ("nested.api_key".to_string(), "should-skip".to_string()),
+                ("bad-key".to_string(), "should-skip".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            config: HashMap::new(),
+        };
+        create_provider_record(&store, provider).await.unwrap();
+
+        let result = resolve_provider_environment(&store, &["test-provider".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(result.get("VALID_KEY"), Some(&"value".to_string()));
+        assert!(!result.contains_key("nested.api_key"));
+        assert!(!result.contains_key("bad-key"));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_multiple_providers_merge() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "claude-local".to_string(),
+                r#type: "claude".to_string(),
+                credentials: std::iter::once((
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-abc".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "gitlab-local".to_string(),
+                r#type: "gitlab".to_string(),
+                credentials: std::iter::once(("GITLAB_TOKEN".to_string(), "glpat-xyz".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(
+            &store,
+            &["claude-local".to_string(), "gitlab-local".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("ANTHROPIC_API_KEY"), Some(&"sk-abc".to_string()));
+        assert_eq!(result.get("GITLAB_TOKEN"), Some(&"glpat-xyz".to_string()));
+    }
+
+    #[tokio::test]
+    async fn resolve_provider_env_first_credential_wins_on_duplicate_key() {
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "provider-a".to_string(),
+                r#type: "claude".to_string(),
+                credentials: std::iter::once(("SHARED_KEY".to_string(), "first-value".to_string()))
+                    .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "provider-b".to_string(),
+                r#type: "gitlab".to_string(),
+                credentials: std::iter::once((
+                    "SHARED_KEY".to_string(),
+                    "second-value".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let result = resolve_provider_environment(
+            &store,
+            &["provider-a".to_string(), "provider-b".to_string()],
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.get("SHARED_KEY"), Some(&"first-value".to_string()));
+    }
+
+    /// Simulates the handler flow: persist a sandbox with providers, then resolve
+    /// provider environment from the sandbox's spec.providers list.
+    #[tokio::test]
+    async fn handler_flow_resolves_credentials_from_sandbox_providers() {
+        use navigator_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        // Create providers.
+        create_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "my-claude".to_string(),
+                r#type: "claude".to_string(),
+                credentials: std::iter::once((
+                    "ANTHROPIC_API_KEY".to_string(),
+                    "sk-test".to_string(),
+                ))
+                .collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Persist a sandbox with providers field set.
+        let sandbox = Sandbox {
+            id: "sandbox-001".to_string(),
+            name: "test-sandbox".to_string(),
+            namespace: "default".to_string(),
+            spec: Some(SandboxSpec {
+                providers: vec!["my-claude".to_string()],
+                ..SandboxSpec::default()
+            }),
+            status: None,
+            phase: SandboxPhase::Ready as i32,
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        // Simulate the handler: fetch sandbox, read spec.providers, resolve.
+        let loaded = store
+            .get_message::<Sandbox>("sandbox-001")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec = loaded.spec.unwrap();
+        let env = resolve_provider_environment(&store, &spec.providers)
+            .await
+            .unwrap();
+
+        assert_eq!(env.get("ANTHROPIC_API_KEY"), Some(&"sk-test".to_string()));
+    }
+
+    /// Handler flow returns empty map when sandbox has no providers.
+    #[tokio::test]
+    async fn handler_flow_returns_empty_when_no_providers() {
+        use navigator_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        let sandbox = Sandbox {
+            id: "sandbox-002".to_string(),
+            name: "empty-sandbox".to_string(),
+            namespace: "default".to_string(),
+            spec: Some(SandboxSpec::default()),
+            status: None,
+            phase: SandboxPhase::Ready as i32,
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        let loaded = store
+            .get_message::<Sandbox>("sandbox-002")
+            .await
+            .unwrap()
+            .unwrap();
+        let spec = loaded.spec.unwrap();
+        let env = resolve_provider_environment(&store, &spec.providers)
+            .await
+            .unwrap();
+
+        assert!(env.is_empty());
+    }
+
+    /// Handler returns not-found when sandbox doesn't exist.
+    #[tokio::test]
+    async fn handler_flow_returns_none_for_unknown_sandbox() {
+        use navigator_core::proto::Sandbox;
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
+        assert!(result.is_none());
     }
 }

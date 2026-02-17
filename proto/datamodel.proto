@@ -18,13 +18,12 @@ message Sandbox {
 // Navigator-level sandbox spec.
 message SandboxSpec {
   string log_level = 1;
-  string agent_endpoint = 2;
-  string agent_descriptor = 3;
-  string agent_version = 4;
   map<string, string> environment = 5;
   SandboxTemplate template = 6;
   // Required sandbox policy configuration.
   navigator.sandbox.v1.SandboxPolicy policy = 7;
+  // Provider names to attach to this sandbox.
+  repeated string providers = 8;
 }
 
 // Sandbox template mapped onto Kubernetes pod template inputs.

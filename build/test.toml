@@ -16,6 +16,6 @@ run = "uv run pytest python/"
 
 ["test:e2e:sandbox"]
 description = "Run sandbox end-to-end tests"
-depends = ["python:proto"]
+depends = ["python:proto", "cluster:deploy"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "uv run pytest -o python_files='test_*.py' e2e/python"

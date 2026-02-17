@@ -20,12 +20,6 @@ pub struct Sandbox {
 pub struct SandboxSpec {
     #[prost(string, tag = "1")]
     pub log_level: ::prost::alloc::string::String,
-    #[prost(string, tag = "2")]
-    pub agent_endpoint: ::prost::alloc::string::String,
-    #[prost(string, tag = "3")]
-    pub agent_descriptor: ::prost::alloc::string::String,
-    #[prost(string, tag = "4")]
-    pub agent_version: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "5")]
     pub environment: ::std::collections::HashMap<
         ::prost::alloc::string::String,
@@ -36,6 +30,9 @@ pub struct SandboxSpec {
     /// Required sandbox policy configuration.
     #[prost(message, optional, tag = "7")]
     pub policy: ::core::option::Option<super::super::sandbox::v1::SandboxPolicy>,
+    /// Provider names to attach to this sandbox.
+    #[prost(string, repeated, tag = "8")]
+    pub providers: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// Sandbox template mapped onto Kubernetes pod template inputs.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -95,6 +92,29 @@ pub struct SandboxCondition {
     pub message: ::prost::alloc::string::String,
     #[prost(string, tag = "5")]
     pub last_transition_time: ::prost::alloc::string::String,
+}
+/// Provider model stored by Navigator.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Provider {
+    #[prost(string, tag = "1")]
+    pub id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    /// Canonical provider type slug (for example: "claude", "gitlab").
+    #[prost(string, tag = "3")]
+    pub r#type: ::prost::alloc::string::String,
+    /// Secret values used for authentication.
+    #[prost(map = "string, string", tag = "4")]
+    pub credentials: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
+    /// Non-secret provider configuration.
+    #[prost(map = "string, string", tag = "5")]
+    pub config: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 /// High-level sandbox lifecycle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]

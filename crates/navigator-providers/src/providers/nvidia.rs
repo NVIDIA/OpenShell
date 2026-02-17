@@ -1,0 +1,40 @@
+use crate::{
+    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
+};
+
+pub struct NvidiaProvider;
+
+pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
+    id: "nvidia",
+    credential_env_vars: &["NVIDIA_API_KEY"],
+    config_paths: &[],
+};
+
+impl ProviderPlugin for NvidiaProvider {
+    fn id(&self) -> &'static str {
+        SPEC.id
+    }
+
+    fn discover_existing(&self) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
+        discover_with_spec(&SPEC, &RealDiscoveryContext)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SPEC;
+    use crate::discover_with_spec;
+    use crate::test_helpers::MockDiscoveryContext;
+
+    #[test]
+    fn discovers_nvidia_env_credentials() {
+        let ctx = MockDiscoveryContext::new().with_env("NVIDIA_API_KEY", "nvapi-123");
+        let discovered = discover_with_spec(&SPEC, &ctx)
+            .expect("discovery")
+            .expect("provider");
+        assert_eq!(
+            discovered.credentials.get("NVIDIA_API_KEY"),
+            Some(&"nvapi-123".to_string())
+        );
+    }
+}

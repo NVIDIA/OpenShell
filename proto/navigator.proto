@@ -53,6 +53,10 @@ service Navigator {
   rpc GetSandboxPolicy(navigator.sandbox.v1.GetSandboxPolicyRequest)
       returns (navigator.sandbox.v1.GetSandboxPolicyResponse);
 
+  // Get provider environment for a sandbox (called by sandbox supervisor at startup).
+  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
+      returns (GetSandboxProviderEnvironmentResponse);
+
   // Watch a sandbox and stream updates.
   //
   // This stream can include:
@@ -326,6 +330,18 @@ message ListProvidersResponse {
 // Delete provider response.
 message DeleteProviderResponse {
   bool deleted = 1;
+}
+
+// Get sandbox provider environment request.
+message GetSandboxProviderEnvironmentRequest {
+  // The sandbox ID.
+  string sandbox_id = 1;
+}
+
+// Get sandbox provider environment response.
+message GetSandboxProviderEnvironmentResponse {
+  // Provider credential environment variables.
+  map<string, string> environment = 1;
 }
 
 // Service status enum.

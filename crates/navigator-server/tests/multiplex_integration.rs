@@ -9,7 +9,8 @@ use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxRequest, HealthRequest, HealthResponse,
+    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
     ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
     ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
@@ -70,6 +71,15 @@ impl Navigator for TestNavigator {
         _request: tonic::Request<GetSandboxPolicyRequest>,
     ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
         Ok(Response::new(GetSandboxPolicyResponse::default()))
+    }
+
+    async fn get_sandbox_provider_environment(
+        &self,
+        _request: tonic::Request<GetSandboxProviderEnvironmentRequest>,
+    ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
+        Ok(Response::new(
+            GetSandboxProviderEnvironmentResponse::default(),
+        ))
     }
 
     async fn create_ssh_session(
