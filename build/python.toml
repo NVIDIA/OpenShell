@@ -55,25 +55,51 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$(uname -s)" != "Darwin" ]; then
-  echo "Skipping macOS wheel build on non-macOS host"
-  exit 0
+if [ "$(uname -s)" = "Darwin" ]; then
+  # Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
+  if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER="$(command -v sccache)"
+  else
+    unset RUSTC_WRAPPER || true
+  fi
+
+  mkdir -p target/wheels
+
+  rustup target add aarch64-apple-darwin
+
+  uv run maturin build --release --target aarch64-apple-darwin --out target/wheels
+else
+  echo "Building macOS wheel via Docker cross-toolchain"
+  mise run python:build:macos:docker
 fi
 
-# Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
-if command -v sccache >/dev/null 2>&1; then
-  export RUSTC_WRAPPER="$(command -v sccache)"
-else
-  unset RUSTC_WRAPPER || true
+ls -la target/wheels/*.whl
+"""
+
+["python:build:macos:docker"]
+description = "Build Python wheel for macOS arm64 from Docker"
+depends = ["python:proto"]
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION=${NAVIGATOR_VERSION:-}
+OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
+if [ -z "$VERSION" ]; then
+  VERSION=$(uv run python build/scripts/release.py get-version --python)
 fi
 
 mkdir -p target/wheels
 
-rustup target add aarch64-apple-darwin
+docker build \
+  -f deploy/docker/Dockerfile.python-wheels-macos \
+  --target wheels \
+  --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
+  --build-arg "NAVIGATOR_VERSION=${VERSION}" \
+  --output type=local,dest=target/wheels \
+  .
 
-uv run maturin build --release --target aarch64-apple-darwin --out target/wheels
-
-ls -la target/wheels/*.whl
+ls -la target/wheels/*macosx*arm64.whl
 """
 
 ["python:build:all"]

@@ -1,0 +1,51 @@
+# syntax=docker/dockerfile:1.6
+
+ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+ARG PYTHON_VERSION=3.12
+
+FROM ${OSXCROSS_IMAGE} AS osxcross
+
+FROM python:${PYTHON_VERSION}-slim AS builder
+
+ARG TARGETARCH
+ARG NAVIGATOR_VERSION
+
+ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/osxcross/lib"
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${NAVIGATOR_VERSION}
+
+COPY --from=osxcross /osxcross /osxcross
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    curl \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+# aws-lc-sys probes with --target=arm64-apple-macosx and clang then looks for
+# arm64-apple-macosx-ld. Provide a linker alias to osxcross ld64.
+RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-macosx-ld
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+RUN rustup target add aarch64-apple-darwin
+RUN pip install --no-cache-dir maturin
+
+WORKDIR /build
+
+ENV CC_aarch64_apple_darwin=oa64-clang
+ENV CXX_aarch64_apple_darwin=oa64-clang++
+ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
+
+COPY . .
+
+RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH},sharing=locked,target=/build/target \
+    maturin build --release --target aarch64-apple-darwin --out /wheels
+
+FROM scratch AS wheels
+COPY --from=builder /wheels/*.whl /

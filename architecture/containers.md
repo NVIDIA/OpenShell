@@ -130,6 +130,8 @@ The `python_e2e_sandbox_test` job does not use a localhost registry. It tags and
 
 The `build_ci_image` job also publishes and reuses a registry-backed BuildKit cache at `$CI_REGISTRY_IMAGE/ci:buildcache`, so layer cache survives across runners and pipelines even when local cache directories are cold.
 
+Publish jobs mirror `crazymax/osxcross:latest` into `$CI_REGISTRY_IMAGE/third_party/osxcross:latest` (when missing) and set `OSXCROSS_IMAGE` so the macOS wheel Docker build consumes the mirrored registry image instead of pulling directly from Docker Hub on each run.
+
 Rust lint/test jobs also cache `.cache/sccache/` and `target/` with keys derived from `Cargo.lock` and Rust task config files (scoped per runner architecture) so branches can reuse compilation artifacts. CI sets `CARGO_INCREMENTAL=0` to favor deterministic clean builds over incremental metadata churn.
 
 ### CI Runner Image

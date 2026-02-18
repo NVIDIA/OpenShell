@@ -35,6 +35,7 @@ mise run version:set
 trap "mise run version:reset" EXIT
 IMAGE_TAG=dev TAG_LATEST=true EXTRA_DOCKER_TAGS="$VERSION_DOCKER" mise run docker:publish:cluster:multiarch
 NAVIGATOR_VERSION="$VERSION_PYTHON" mise run python:build:multiarch
+NAVIGATOR_VERSION="$VERSION_PYTHON" mise run python:build:macos
 uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """
 
@@ -49,5 +50,6 @@ mise run version:set
 trap "mise run version:reset" EXIT
 IMAGE_TAG="$VERSION_DOCKER" TAG_LATEST=false mise run docker:publish:cluster:multiarch
 NAVIGATOR_VERSION="$VERSION_PYTHON" mise run python:build:multiarch
+NAVIGATOR_VERSION="$VERSION_PYTHON" mise run python:build:macos
 uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """

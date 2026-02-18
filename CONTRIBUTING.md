@@ -253,22 +253,24 @@ Docker publishing in CI uses AWS credentials for ECR. Python publishing uses
 
 - Push a semver tag (`vX.Y.Z`) to trigger release jobs.
 - CI publishes Docker multiarch images to ECR as `:X.Y.Z` (no `:latest`).
-- CI publishes Linux Python wheels to Artifactory and creates GitLab release notes.
+- CI publishes Linux + macOS (arm64) Python wheels to Artifactory and creates GitLab release notes.
 
 **Tagging a release:**
 
 ```bash
 git tag v0.1.1
 git push --tags
-# CI will build and publish Docker + Linux Python wheels.
+# CI will build and publish Docker + Linux/macOS Python wheels.
 ```
 
 **Local macOS wheel publish (arm64):**
 
 ```bash
-# After CI tag publish, on a Mac:
-git checkout v0.1.1
+# Native on macOS host:
 mise run python:publish:macos
+
+# Cross-compile from Linux via Docker:
+mise run python:build:macos:docker
 ```
 
 ### Cleaning
