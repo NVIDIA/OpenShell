@@ -55,17 +55,19 @@ pub struct OpaEngine {
 
 impl OpaEngine {
     /// Load policy from a `.rego` rules file and data from a YAML file.
+    ///
+    /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_files(policy_path: &Path, data_path: &Path) -> Result<Self> {
+        let yaml_str = std::fs::read_to_string(data_path).map_err(|e| {
+            miette::miette!("failed to read YAML data from {}: {e}", data_path.display())
+        })?;
         let mut engine = regorus::Engine::new();
         engine
             .add_policy_from_file(policy_path)
             .map_err(|e| miette::miette!("{e}"))?;
-        let path_str = data_path.to_string_lossy().to_string();
-        let data_value = regorus::Value::from_yaml_file(&path_str).map_err(|e| {
-            miette::miette!("failed to load YAML data from {}: {e}", data_path.display())
-        })?;
+        let data_json = preprocess_yaml_data(&yaml_str)?;
         engine
-            .add_data(data_value)
+            .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
@@ -73,15 +75,16 @@ impl OpaEngine {
     }
 
     /// Load policy rules and data from strings (data is YAML).
+    ///
+    /// Preprocesses the YAML data to expand access presets and validate L7 config.
     pub fn from_strings(policy: &str, data_yaml: &str) -> Result<Self> {
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
-        let data_value =
-            regorus::Value::from_yaml_str(data_yaml).map_err(|e| miette::miette!("{e}"))?;
+        let data_json = preprocess_yaml_data(data_yaml)?;
         engine
-            .add_data(data_value)
+            .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
         Ok(Self {
             engine: Mutex::new(engine),
@@ -93,9 +96,31 @@ impl OpaEngine {
     /// Uses baked-in rego rules and converts the proto's typed fields to JSON
     /// data under the `sandbox` key (matching `data.sandbox.*` references in
     /// the rego rules).
+    ///
+    /// Expands access presets and validates L7 config.
     pub fn from_proto(proto: &ProtoSandboxPolicy) -> Result<Self> {
-        let data_json = proto_to_opa_data_json(proto);
+        let data_json_str = proto_to_opa_data_json(proto);
 
+        // Parse back to Value for preprocessing, then re-serialize
+        let mut data: serde_json::Value = serde_json::from_str(&data_json_str)
+            .map_err(|e| miette::miette!("internal: failed to parse proto JSON: {e}"))?;
+
+        // Validate BEFORE expanding presets
+        let (errors, warnings) = crate::l7::validate_l7_policies(&data);
+        for w in &warnings {
+            tracing::warn!(warning = %w, "L7 policy validation warning");
+        }
+        if !errors.is_empty() {
+            return Err(miette::miette!(
+                "L7 policy validation failed:\n{}",
+                errors.join("\n")
+            ));
+        }
+
+        // Expand access presets to explicit rules after validation
+        crate::l7::expand_access_presets(&mut data);
+
+        let data_json = data.to_string();
         let mut engine = regorus::Engine::new();
         engine
             .add_policy("policy.rego".into(), BAKED_POLICY_RULES.into())
@@ -229,6 +254,67 @@ impl OpaEngine {
             process,
         })
     }
+
+    /// Query the L7 endpoint config for a matched policy and host:port.
+    ///
+    /// After L4 evaluation allows a CONNECT, this method queries the Rego data
+    /// to get the full endpoint object for the matched policy. Returns the raw
+    /// `regorus::Value` which can be parsed by `l7::parse_l7_config()`.
+    pub fn query_endpoint_config(&self, input: &NetworkInput) -> Result<Option<regorus::Value>> {
+        let ancestor_strs: Vec<String> = input
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let cmdline_strs: Vec<String> = input
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        let input_json = serde_json::json!({
+            "exec": {
+                "path": input.binary_path.to_string_lossy(),
+                "ancestors": ancestor_strs,
+                "cmdline_paths": cmdline_strs,
+            },
+            "network": {
+                "host": input.host,
+                "port": input.port,
+            }
+        });
+
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+
+        engine
+            .set_input_json(&input_json.to_string())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        let val = engine
+            .eval_rule("data.navigator.sandbox.matched_endpoint_config".into())
+            .map_err(|e| miette::miette!("{e}"))?;
+
+        if val == regorus::Value::Undefined {
+            Ok(None)
+        } else {
+            Ok(Some(val))
+        }
+    }
+
+    /// Clone the inner regorus engine for per-tunnel L7 evaluation.
+    ///
+    /// With the `arc` feature enabled, this shares compiled policy via Arc
+    /// and only duplicates interpreter state (~microseconds). The cloned
+    /// engine can be used without Mutex contention.
+    pub fn clone_engine_for_tunnel(&self) -> Result<regorus::Engine> {
+        let engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        Ok(engine.clone())
+    }
 }
 
 /// Convert a `regorus::Value` to a string, handling various types.
@@ -317,6 +403,29 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     }
 }
 
+/// Preprocess YAML policy data: parse, validate, expand access presets, return JSON.
+fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
+    let mut data: serde_json::Value = serde_yaml::from_str(yaml_str)
+        .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+
+    // Validate BEFORE expanding presets (catches user errors like rules+access)
+    let (errors, warnings) = crate::l7::validate_l7_policies(&data);
+    for w in &warnings {
+        tracing::warn!(warning = %w, "L7 policy validation warning");
+    }
+    if !errors.is_empty() {
+        return Err(miette::miette!(
+            "L7 policy validation failed:\n{}",
+            errors.join("\n")
+        ));
+    }
+
+    // Expand access presets to explicit rules after validation
+    crate::l7::expand_access_presets(&mut data);
+
+    serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
+}
+
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
 ///
 /// The rego rules reference `data.*` directly, so the JSON structure has
@@ -370,7 +479,39 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
             let endpoints: Vec<serde_json::Value> = rule
                 .endpoints
                 .iter()
-                .map(|e| serde_json::json!({"host": e.host, "port": e.port}))
+                .map(|e| {
+                    let mut ep = serde_json::json!({"host": e.host, "port": e.port});
+                    if !e.protocol.is_empty() {
+                        ep["protocol"] = e.protocol.clone().into();
+                    }
+                    if !e.tls.is_empty() {
+                        ep["tls"] = e.tls.clone().into();
+                    }
+                    if !e.enforcement.is_empty() {
+                        ep["enforcement"] = e.enforcement.clone().into();
+                    }
+                    if !e.access.is_empty() {
+                        ep["access"] = e.access.clone().into();
+                    }
+                    if !e.rules.is_empty() {
+                        let rules: Vec<serde_json::Value> = e
+                            .rules
+                            .iter()
+                            .map(|r| {
+                                let a = r.allow.as_ref();
+                                serde_json::json!({
+                                    "allow": {
+                                        "method": a.map_or("", |a| &a.method),
+                                        "path": a.map_or("", |a| &a.path),
+                                        "command": a.map_or("", |a| &a.command),
+                                    }
+                                })
+                            })
+                            .collect();
+                        ep["rules"] = rules.into();
+                    }
+                    ep
+                })
                 .collect();
             let binaries: Vec<serde_json::Value> = rule
                 .binaries
@@ -402,8 +543,8 @@ mod tests {
     use super::*;
 
     use navigator_core::proto::{
-        FilesystemPolicy as ProtoFs, LandlockPolicy as ProtoLl, NetworkBinary, NetworkEndpoint,
-        NetworkPolicyRule, ProcessPolicy as ProtoProc, SandboxPolicy as ProtoSandboxPolicy,
+        FilesystemPolicy as ProtoFs, NetworkBinary, NetworkEndpoint, NetworkPolicyRule,
+        ProcessPolicy as ProtoProc, SandboxPolicy as ProtoSandboxPolicy,
     };
 
     const TEST_POLICY: &str = include_str!("../../../dev-sandbox-policy.rego");
@@ -423,10 +564,12 @@ mod tests {
                     NetworkEndpoint {
                         host: "api.anthropic.com".to_string(),
                         port: 443,
+                        ..Default::default()
                     },
                     NetworkEndpoint {
                         host: "statsig.anthropic.com".to_string(),
                         port: 443,
+                        ..Default::default()
                     },
                 ],
                 binaries: vec![NetworkBinary {
@@ -441,6 +584,7 @@ mod tests {
                 endpoints: vec![NetworkEndpoint {
                     host: "gitlab.com".to_string(),
                     port: 443,
+                    ..Default::default()
                 }],
                 binaries: vec![NetworkBinary {
                     path: "/usr/bin/glab".to_string(),
@@ -454,7 +598,7 @@ mod tests {
                 read_only: vec!["/usr".to_string(), "/lib".to_string()],
                 read_write: vec!["/sandbox".to_string(), "/tmp".to_string()],
             }),
-            landlock: Some(ProtoLl {
+            landlock: Some(navigator_core::proto::LandlockPolicy {
                 compatibility: "best_effort".to_string(),
             }),
             process: Some(ProtoProc {
@@ -972,5 +1116,278 @@ network_policies:
         );
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
+    }
+
+    // ========================================================================
+    // L7 request evaluation tests
+    // ========================================================================
+
+    const L7_TEST_DATA: &str = r#"
+network_policies:
+  rest_api:
+    name: rest_api
+    endpoints:
+      - host: api.example.com
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/repos/**"
+          - allow:
+              method: POST
+              path: "/repos/*/issues"
+    binaries:
+      - { path: /usr/bin/curl }
+  readonly_api:
+    name: readonly_api
+    endpoints:
+      - host: api.readonly.com
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
+  full_api:
+    name: full_api
+    endpoints:
+      - host: api.full.com
+        port: 8080
+        protocol: rest
+        enforcement: audit
+        access: full
+    binaries:
+      - { path: /usr/bin/curl }
+  l4_only:
+    name: l4_only
+    endpoints:
+      - { host: l4only.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: ""
+  run_as_group: ""
+"#;
+
+    fn l7_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, L7_TEST_DATA).expect("Failed to load L7 test data")
+    }
+
+    fn l7_input(host: &str, port: u16, method: &str, path: &str) -> serde_json::Value {
+        serde_json::json!({
+            "network": { "host": host, "port": port },
+            "exec": {
+                "path": "/usr/bin/curl",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": method,
+                "path": path
+            }
+        })
+    }
+
+    fn eval_l7(engine: &OpaEngine, input: &serde_json::Value) -> bool {
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.navigator.sandbox.allow_request".into())
+            .unwrap();
+        val == regorus::Value::from(true)
+    }
+
+    #[test]
+    fn l7_get_allowed_by_rules() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_post_allowed_by_rules() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "POST", "/repos/myorg/issues");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_delete_denied_by_rules() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_get_wrong_path_denied() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "GET", "/admin/settings");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_readonly_preset_allows_get() {
+        let engine = l7_engine();
+        let input = l7_input("api.readonly.com", 8080, "GET", "/anything");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_readonly_preset_allows_head() {
+        let engine = l7_engine();
+        let input = l7_input("api.readonly.com", 8080, "HEAD", "/anything");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_readonly_preset_allows_options() {
+        let engine = l7_engine();
+        let input = l7_input("api.readonly.com", 8080, "OPTIONS", "/anything");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_readonly_preset_denies_post() {
+        let engine = l7_engine();
+        let input = l7_input("api.readonly.com", 8080, "POST", "/anything");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_readonly_preset_denies_delete() {
+        let engine = l7_engine();
+        let input = l7_input("api.readonly.com", 8080, "DELETE", "/anything");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_full_preset_allows_everything() {
+        let engine = l7_engine();
+        for method in &["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD"] {
+            let input = l7_input("api.full.com", 8080, method, "/any/path");
+            assert!(
+                eval_l7(&engine, &input),
+                "{method} should be allowed with full preset"
+            );
+        }
+    }
+
+    #[test]
+    fn l7_method_matching_case_insensitive() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "get", "/repos/myorg/foo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_path_glob_matching() {
+        let engine = l7_engine();
+        // /repos/** should match /repos/org/repo
+        let input = l7_input("api.example.com", 8080, "GET", "/repos/org/repo");
+        assert!(eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_no_request_on_l4_only_endpoint() {
+        // L4-only endpoint should not match L7 allow_request
+        let engine = l7_engine();
+        let input = l7_input("l4only.example.com", 443, "GET", "/anything");
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_wrong_binary_denied_even_with_matching_rules() {
+        let engine = l7_engine();
+        let input = serde_json::json!({
+            "network": { "host": "api.example.com", "port": 8080 },
+            "exec": {
+                "path": "/usr/bin/python3",
+                "ancestors": [],
+                "cmdline_paths": []
+            },
+            "request": {
+                "method": "GET",
+                "path": "/repos/myorg/foo"
+            }
+        });
+        assert!(!eval_l7(&engine, &input));
+    }
+
+    #[test]
+    fn l7_deny_reason_populated() {
+        let engine = l7_engine();
+        let input = l7_input("api.example.com", 8080, "DELETE", "/repos/myorg/foo");
+        let mut eng = engine.engine.lock().unwrap();
+        eng.set_input_json(&input.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.navigator.sandbox.request_deny_reason".into())
+            .unwrap();
+        let reason = match val {
+            regorus::Value::String(s) => s.to_string(),
+            _ => String::new(),
+        };
+        assert!(
+            reason.contains("not permitted"),
+            "Expected deny reason, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn l7_endpoint_config_returned_for_l7_endpoint() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine.query_endpoint_config(&input).unwrap();
+        assert!(config.is_some(), "Expected L7 config for rest endpoint");
+        let config = config.unwrap();
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
+        assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn l7_endpoint_config_none_for_l4_only() {
+        let engine = l7_engine();
+        let input = NetworkInput {
+            host: "l4only.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine.query_endpoint_config(&input).unwrap();
+        assert!(
+            config.is_none(),
+            "Expected no L7 config for L4-only endpoint"
+        );
+    }
+
+    #[test]
+    fn l7_clone_engine_for_tunnel() {
+        let engine = l7_engine();
+        let cloned = engine.clone_engine_for_tunnel().unwrap();
+        // Verify the cloned engine can evaluate
+        let input_json = l7_input("api.example.com", 8080, "GET", "/repos/myorg/foo");
+        let mut eng = cloned;
+        eng.set_input_json(&input_json.to_string()).unwrap();
+        let val = eng
+            .eval_rule("data.navigator.sandbox.allow_request".into())
+            .unwrap();
+        assert_eq!(val, regorus::Value::from(true));
     }
 }

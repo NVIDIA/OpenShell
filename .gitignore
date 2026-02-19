@@ -185,3 +185,6 @@ mise.local.toml
 
 # Ignore plans for now
 architecture/plans
+
+# Claude
+.claude/settings.local.json

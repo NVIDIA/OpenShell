@@ -60,10 +60,36 @@ message NetworkPolicyRule {
   repeated NetworkBinary binaries = 3;
 }
 
-// A network endpoint (host + port).
+// A network endpoint (host + port) with optional L7 inspection config.
 message NetworkEndpoint {
   string host = 1;
   uint32 port = 2;
+  // Application protocol for L7 inspection: "rest", "sql", or "" (L4-only).
+  string protocol = 3;
+  // TLS handling: "terminate" or "passthrough" (default).
+  string tls = 4;
+  // Enforcement mode: "enforce" or "audit" (default).
+  string enforcement = 5;
+  // Access preset shorthand: "read-only", "read-write", "full".
+  // Mutually exclusive with rules.
+  string access = 6;
+  // Explicit L7 rules (mutually exclusive with access).
+  repeated L7Rule rules = 7;
+}
+
+// An L7 policy rule (allow-only).
+message L7Rule {
+  L7Allow allow = 1;
+}
+
+// Allowed action definition for L7 rules.
+message L7Allow {
+  // HTTP method (REST): GET, POST, etc. or "*" for any.
+  string method = 1;
+  // URL path glob pattern (REST): "/repos/**", "**" for any.
+  string path = 2;
+  // SQL command (SQL): SELECT, INSERT, etc. or "*" for any.
+  string command = 3;
 }
 
 // A binary identity for network policy matching.

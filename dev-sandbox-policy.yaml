@@ -33,7 +33,7 @@ network_policies:
   claude_code:
     name: claude_code
     endpoints:
-      - { host: api.anthropic.com, port: 443 }
+      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
       - { host: statsig.anthropic.com, port: 443 }
       - { host: sentry.io, port: 443 }
       - { host: raw.githubusercontent.com, port: 443 }
@@ -55,6 +55,38 @@ network_policies:
       - { path: /usr/bin/curl }
       - { path: /bin/bash }
       - { path: /usr/local/bin/opencode }
+
+  # --- L7 examples (HTTP/REST protocol-aware enforcement) ---
+
+  # Example: REST API with read-only preset (GET, HEAD, OPTIONS only)
+  github_api_readonly:
+    name: github_api_readonly
+    endpoints:
+      - host: api.github.com
+        port: 8080
+        protocol: rest
+        enforcement: audit
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
+
+  # Example: REST API with specific method+path rules
+  internal_api:
+    name: internal_api
+    endpoints:
+      - host: api.internal.svc
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/v1/**"
+          - allow:
+              method: POST
+              path: "/api/v1/data"
+    binaries:
+      - { path: /usr/bin/curl }
 
 inference:
   allowed_routing_hints:

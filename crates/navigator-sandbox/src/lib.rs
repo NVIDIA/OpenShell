@@ -4,6 +4,7 @@
 
 mod grpc_client;
 mod identity;
+pub mod l7;
 pub mod opa;
 mod policy;
 mod process;
@@ -21,6 +22,9 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::identity::BinaryIdentityCache;
+use crate::l7::tls::{
+    CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, write_ca_files,
+};
 use crate::opa::OpaEngine;
 use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
@@ -55,7 +59,7 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
-    let (policy, opa_engine) = load_policy(
+    let (mut policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         navigator_endpoint.clone(),
         policy_rules,
@@ -88,6 +92,44 @@ pub async fn run_sandbox(
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
+
+    // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
+    // The CA cert is written to disk so sandbox processes can trust it.
+    let (tls_state, ca_file_paths) = if matches!(policy.network.mode, NetworkMode::Proxy) {
+        match SandboxCa::generate() {
+            Ok(ca) => {
+                let tls_dir = std::path::Path::new("/etc/navigator-tls");
+                match write_ca_files(&ca, tls_dir) {
+                    Ok(paths) => {
+                        // Make the TLS directory readable under Landlock
+                        policy.filesystem.read_only.push(tls_dir.to_path_buf());
+
+                        let upstream_config = build_upstream_client_config();
+                        let cert_cache = CertCache::new(ca);
+                        let state = Arc::new(ProxyTlsState::new(cert_cache, upstream_config));
+                        info!("TLS termination enabled: ephemeral CA generated");
+                        (Some(state), Some(paths))
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "Failed to write CA files, TLS termination disabled"
+                        );
+                        (None, None)
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Failed to generate ephemeral CA, TLS termination disabled"
+                );
+                (None, None)
+            }
+        }
+    } else {
+        (None, None)
+    };
 
     // Create network namespace for proxy mode (Linux only)
     // This must be created before the proxy AND SSH server so that SSH
@@ -158,6 +200,7 @@ pub async fn run_sandbox(
                 cache,
                 entrypoint_pid.clone(),
                 control_plane_endpoints,
+                tls_state,
             )
             .await?,
         )
@@ -210,6 +253,7 @@ pub async fn run_sandbox(
         let secret = ssh_handshake_secret.unwrap_or_default();
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
+        let ca_paths = ca_file_paths.clone();
         let provider_env_clone = provider_env.clone();
         tokio::spawn(async move {
             if let Err(err) = ssh::run_ssh_server(
@@ -220,6 +264,7 @@ pub async fn run_sandbox(
                 ssh_handshake_skew_secs,
                 netns_fd,
                 proxy_url,
+                ca_paths,
                 provider_env_clone,
             )
             .await
@@ -237,6 +282,7 @@ pub async fn run_sandbox(
         interactive,
         &policy,
         netns.as_ref(),
+        ca_file_paths.as_ref(),
         &provider_env,
     )?;
 
@@ -247,6 +293,7 @@ pub async fn run_sandbox(
         workdir.as_deref(),
         interactive,
         &policy,
+        ca_file_paths.as_ref(),
         &provider_env,
     )?;
 

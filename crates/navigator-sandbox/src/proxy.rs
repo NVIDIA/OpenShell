@@ -1,6 +1,7 @@
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
 use crate::identity::BinaryIdentityCache;
+use crate::l7::tls::ProxyTlsState;
 use crate::opa::OpaEngine;
 use crate::policy::ProxyPolicy;
 use miette::{IntoDiagnostic, Result};
@@ -11,7 +12,7 @@ use std::sync::atomic::AtomicU32;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::task::JoinHandle;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 
@@ -79,6 +80,7 @@ impl ProxyHandle {
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
         control_plane_endpoints: Vec<AllowedEndpoint>,
+        tls_state: Option<Arc<ProxyTlsState>>,
     ) -> Result<Self> {
         // Use override bind_addr or fall back to policy http_addr
         let http_addr = bind_addr.or(policy.http_addr);
@@ -107,9 +109,10 @@ impl ProxyHandle {
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
                         let cp = cp_endpoints.clone();
+                        let tls = tls_state.clone();
                         tokio::spawn(async move {
                             if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, cp).await
+                                handle_tcp_connection(stream, opa, cache, spid, cp, tls).await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -147,6 +150,7 @@ async fn handle_tcp_connection(
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
     control_plane_endpoints: Arc<Vec<AllowedEndpoint>>,
+    tls_state: Option<Arc<ProxyTlsState>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -278,6 +282,137 @@ async fn handle_tcp_connection(
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
+    // Check if endpoint has L7 config for protocol-aware inspection
+    if !is_control_plane
+        && let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port)
+    {
+        // Clone engine for per-tunnel L7 evaluation (cheap: shares compiled policy via Arc)
+        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+            warn!(error = %e, "Failed to clone OPA engine for L7, falling back to L4-only");
+            // This shouldn't happen, but if it does fall through to copy_bidirectional
+            regorus::Engine::new()
+        });
+
+        let ctx = crate::l7::relay::L7EvalContext {
+            host: host_lc.clone(),
+            port,
+            policy_name: decision.matched_policy.clone().unwrap_or_default(),
+            binary_path: decision
+                .binary
+                .as_ref()
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+            cmdline_paths: decision
+                .cmdline_paths
+                .iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect(),
+        };
+
+        if l7_config.tls == crate::l7::TlsMode::Terminate {
+            // TLS termination: MITM decrypt, inspect, re-encrypt
+            if let Some(ref tls) = tls_state {
+                let l7_result = async {
+                    let mut tls_client =
+                        crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                    let mut tls_upstream = crate::l7::tls::tls_connect_upstream(
+                        upstream,
+                        &host_lc,
+                        tls.upstream_config(),
+                    )
+                    .await?;
+                    // No protocol detection needed — ALPN proves HTTP
+                    crate::l7::relay::relay_with_inspection(
+                        &l7_config,
+                        std::sync::Mutex::new(tunnel_engine),
+                        &mut tls_client,
+                        &mut tls_upstream,
+                        &ctx,
+                    )
+                    .await
+                };
+                if let Err(e) = l7_result.await {
+                    if is_benign_relay_error(&e) {
+                        debug!(
+                            host = %host_lc,
+                            port = port,
+                            error = %e,
+                            "TLS L7 connection closed"
+                        );
+                    } else {
+                        warn!(
+                            host = %host_lc,
+                            port = port,
+                            error = %e,
+                            "TLS L7 relay error"
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    host = %host_lc,
+                    port = port,
+                    "TLS termination requested but TLS state not configured, falling back to L4"
+                );
+                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                    .await
+                    .into_diagnostic()?;
+            }
+        } else {
+            // Plaintext: protocol detection via peek on raw TcpStream
+            if l7_config.protocol == crate::l7::L7Protocol::Rest {
+                let mut peek_buf = [0u8; 8];
+                let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
+                if n == 0 {
+                    return Ok(());
+                }
+                if !crate::l7::rest::looks_like_http(&peek_buf[..n]) {
+                    warn!(
+                        host = %host_lc,
+                        port = port,
+                        policy = %ctx.policy_name,
+                        "Expected REST protocol but received non-matching bytes. Connection rejected."
+                    );
+                    return Err(miette::miette!(
+                        "Protocol mismatch: expected HTTP but received non-HTTP bytes"
+                    ));
+                }
+            }
+            if let Err(e) = crate::l7::relay::relay_with_inspection(
+                &l7_config,
+                std::sync::Mutex::new(tunnel_engine),
+                &mut client,
+                &mut upstream,
+                &ctx,
+            )
+            .await
+            {
+                if is_benign_relay_error(&e) {
+                    debug!(
+                        host = %host_lc,
+                        port = port,
+                        error = %e,
+                        "L7 connection closed"
+                    );
+                } else {
+                    warn!(
+                        host = %host_lc,
+                        port = port,
+                        error = %e,
+                        "L7 relay error"
+                    );
+                }
+            }
+        }
+        return Ok(());
+    }
+
+    // L4-only: raw bidirectional copy (existing behavior)
     let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
         .await
         .into_diagnostic()?;
@@ -429,6 +564,40 @@ fn evaluate_opa_tcp(
     }
 }
 
+/// Query L7 endpoint config from the OPA engine for a matched CONNECT decision.
+///
+/// Returns `Some(L7EndpointConfig)` if the matched endpoint has L7 config (protocol field),
+/// `None` for L4-only endpoints.
+fn query_l7_config(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> Option<crate::l7::L7EndpointConfig> {
+    // Only query if L4 allowed and we have a matched policy
+    if !decision.allowed || decision.matched_policy.is_none() {
+        return None;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_l7_config(&val),
+        Ok(None) => None,
+        Err(e) => {
+            warn!(error = %e, "Failed to query L7 endpoint config");
+            None
+        }
+    }
+}
+
 fn parse_target(target: &str) -> Result<(String, u16)> {
     let (host, port_str) = target
         .split_once(':')
@@ -442,4 +611,21 @@ fn parse_target(target: &str) -> Result<(String, u16)> {
 async fn respond(client: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     client.write_all(bytes).await.into_diagnostic()?;
     Ok(())
+}
+
+/// Check if a miette error represents a benign connection close.
+///
+/// TLS handshake EOF, missing `close_notify`, connection resets, and broken
+/// pipes are all normal lifecycle events for proxied connections — not worth
+/// a WARN that interrupts the user's terminal.
+fn is_benign_relay_error(err: &miette::Report) -> bool {
+    const BENIGN: &[&str] = &[
+        "close_notify",
+        "tls handshake eof",
+        "connection reset",
+        "broken pipe",
+        "unexpected eof",
+    ];
+    let msg = err.to_string().to_ascii_lowercase();
+    BENIGN.iter().any(|pat| msg.contains(pat))
 }

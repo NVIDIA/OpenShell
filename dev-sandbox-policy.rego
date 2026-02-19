@@ -126,3 +126,89 @@ binary_allowed(policy, exec) if {
 	p := all_paths[_]
 	glob.match(b.path, ["/"], p)
 }
+
+# ===========================================================================
+# L7 request evaluation (queried per-request within a tunnel)
+# ===========================================================================
+
+default allow_request = false
+
+# L7 request allowed if: L4 policy matches AND the specific endpoint's rules allow the request.
+allow_request if {
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	some ep
+	ep := policy.endpoints[_]
+	lower(ep.host) == lower(input.network.host)
+	ep.port == input.network.port
+	request_allowed_for_endpoint(input.request, ep)
+}
+
+# --- L7 deny reason ---
+
+request_deny_reason := reason if {
+	input.request
+	not allow_request
+	reason := sprintf("%s %s not permitted by policy", [input.request.method, input.request.path])
+}
+
+# --- L7 rule matching: REST method + path ---
+
+request_allowed_for_endpoint(request, endpoint) if {
+	some rule
+	rule := endpoint.rules[_]
+	rule.allow.method
+	method_matches(request.method, rule.allow.method)
+	path_matches(request.path, rule.allow.path)
+}
+
+# --- L7 rule matching: SQL command ---
+
+request_allowed_for_endpoint(request, endpoint) if {
+	some rule
+	rule := endpoint.rules[_]
+	rule.allow.command
+	command_matches(request.command, rule.allow.command)
+}
+
+# Wildcard "*" matches any method; otherwise case-insensitive exact match.
+method_matches(_, "*") if true
+
+method_matches(actual, expected) if {
+	expected != "*"
+	upper(actual) == upper(expected)
+}
+
+# Path matching: "**" matches everything; otherwise glob.match with "/" delimiter.
+path_matches(_, "**") if true
+
+path_matches(actual, pattern) if {
+	pattern != "**"
+	glob.match(pattern, ["/"], actual)
+}
+
+# SQL command matching: "*" matches any; otherwise case-insensitive.
+command_matches(_, "*") if true
+
+command_matches(actual, expected) if {
+	expected != "*"
+	upper(actual) == upper(expected)
+}
+
+# --- Matched endpoint config (for L7 config extraction) ---
+# Returns the raw endpoint object for the matched policy + host:port.
+# Used by Rust to extract L7 config (protocol, tls, enforcement).
+
+matched_endpoint_config := ep if {
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	some ep
+	ep := policy.endpoints[_]
+	lower(ep.host) == lower(input.network.host)
+	ep.port == input.network.port
+	ep.protocol
+}

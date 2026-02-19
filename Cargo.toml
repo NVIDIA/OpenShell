@@ -33,6 +33,8 @@ http-body-util = "0.1"
 tokio-rustls = "0.26"
 rustls = "0.23"
 rustls-pemfile = "2"
+rcgen = { version = "0.13", features = ["crypto", "pem"] }
+webpki-roots = "1"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }

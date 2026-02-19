@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
+use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -32,6 +33,7 @@ pub async fn run_ssh_server(
     handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    ca_file_paths: Option<(PathBuf, PathBuf)>,
     provider_env: HashMap<String, String>,
 ) -> Result<()> {
     let mut rng = OsRng;
@@ -44,6 +46,7 @@ pub async fn run_ssh_server(
     config.keys.push(host_key);
 
     let config = Arc::new(config);
+    let ca_paths = ca_file_paths.map(Arc::new);
     let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
     info!(addr = %listen_addr, "SSH server listening");
 
@@ -55,6 +58,7 @@ pub async fn run_ssh_server(
         let workdir = workdir.clone();
         let secret = handshake_secret.clone();
         let proxy_url = proxy_url.clone();
+        let ca_paths = ca_paths.clone();
         let provider_env = provider_env.clone();
 
         tokio::spawn(async move {
@@ -68,6 +72,7 @@ pub async fn run_ssh_server(
                 handshake_skew_secs,
                 netns_fd,
                 proxy_url,
+                ca_paths,
                 provider_env,
             )
             .await
@@ -89,6 +94,7 @@ async fn handle_connection(
     handshake_skew_secs: u64,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
 ) -> Result<()> {
     let mut line = String::new();
@@ -100,7 +106,14 @@ async fn handle_connection(
     stream.write_all(b"OK\n").await.into_diagnostic()?;
     info!(peer = %peer, "SSH handshake accepted");
 
-    let handler = SshHandler::new(policy, workdir, netns_fd, proxy_url, provider_env);
+    let handler = SshHandler::new(
+        policy,
+        workdir,
+        netns_fd,
+        proxy_url,
+        ca_file_paths,
+        provider_env,
+    );
     russh::server::run_stream(config, stream, handler)
         .await
         .map_err(|err| miette::miette!("ssh stream error: {err}"))?;
@@ -169,6 +182,7 @@ struct SshHandler {
     workdir: Option<String>,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
     input_sender: Option<mpsc::Sender<Vec<u8>>>,
     pty_master: Option<std::fs::File>,
@@ -181,6 +195,7 @@ impl SshHandler {
         workdir: Option<String>,
         netns_fd: Option<RawFd>,
         proxy_url: Option<String>,
+        ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
         provider_env: HashMap<String, String>,
     ) -> Self {
         Self {
@@ -188,6 +203,7 @@ impl SshHandler {
             workdir,
             netns_fd,
             proxy_url,
+            ca_file_paths,
             provider_env,
             input_sender: None,
             pty_master: None,
@@ -317,6 +333,7 @@ impl SshHandler {
             channel,
             self.netns_fd,
             self.proxy_url.clone(),
+            self.ca_file_paths.clone(),
             &self.provider_env,
         )?;
         self.pty_master = Some(pty_master);
@@ -356,6 +373,7 @@ fn spawn_pty_shell(
     channel: ChannelId,
     netns_fd: Option<RawFd>,
     proxy_url: Option<String>,
+    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
     let winsize = Winsize {
@@ -413,6 +431,15 @@ fn spawn_pty_shell(
             .env("http_proxy", url)
             .env("https_proxy", url)
             .env("grpc_proxy", url);
+    }
+
+    // Set TLS trust store env vars so SSH shell processes trust the ephemeral CA
+    if let Some(ref paths) = ca_file_paths {
+        let (ca_cert_path, combined_bundle_path) = paths.as_ref();
+        cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
+            .env("SSL_CERT_FILE", combined_bundle_path)
+            .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
+            .env("CURL_CA_BUNDLE", combined_bundle_path);
     }
 
     // Set provider environment variables (credentials fetched at runtime).

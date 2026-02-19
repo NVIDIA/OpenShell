@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::os::unix::io::RawFd;
+use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::{debug, warn};
@@ -35,6 +36,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         netns: Option<&NetworkNamespace>,
+        ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         Self::spawn_impl(
@@ -44,6 +46,7 @@ impl ProcessHandle {
             interactive,
             policy,
             netns.and_then(|ns| ns.ns_fd()),
+            ca_paths,
             provider_env,
         )
     }
@@ -60,9 +63,18 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
-        Self::spawn_impl(program, args, workdir, interactive, policy, provider_env)
+        Self::spawn_impl(
+            program,
+            args,
+            workdir,
+            interactive,
+            policy,
+            ca_paths,
+            provider_env,
+        )
     }
 
     #[cfg(target_os = "linux")]
@@ -73,6 +85,7 @@ impl ProcessHandle {
         interactive: bool,
         policy: &SandboxPolicy,
         netns_fd: Option<RawFd>,
+        ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
@@ -120,6 +133,14 @@ impl ProcessHandle {
                     .env("https_proxy", &proxy_url)
                     .env("grpc_proxy", &proxy_url);
             }
+        }
+
+        // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
+        if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
+            cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path) // Node.js (additive)
+                .env("SSL_CERT_FILE", combined_bundle_path) // OpenSSL/Python/Go
+                .env("REQUESTS_CA_BUNDLE", combined_bundle_path) // Python requests
+                .env("CURL_CA_BUNDLE", combined_bundle_path); // curl/libcurl
         }
 
         // Set up process group for signal handling (non-interactive mode only).
@@ -175,6 +196,7 @@ impl ProcessHandle {
         workdir: Option<&str>,
         interactive: bool,
         policy: &SandboxPolicy,
+        ca_paths: Option<&(PathBuf, PathBuf)>,
         provider_env: &HashMap<String, String>,
     ) -> Result<Self> {
         let mut cmd = Command::new(program);
@@ -206,6 +228,14 @@ impl ProcessHandle {
                     .env("HTTP_PROXY", &proxy_url)
                     .env("HTTPS_PROXY", &proxy_url);
             }
+        }
+
+        // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
+        if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
+            cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
+                .env("SSL_CERT_FILE", combined_bundle_path)
+                .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
+                .env("CURL_CA_BUNDLE", combined_bundle_path);
         }
 
         // Set up process group for signal handling (non-interactive mode only).

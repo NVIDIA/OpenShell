@@ -36,8 +36,16 @@ rand_core = "0.6"
 # OPA policy evaluation (no default features — full-opa pulls in opa-runtime which requires git in build)
 regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
 
+# TLS
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+webpki-roots = { workspace = true }
+
 # Serialization
 serde_json = { workspace = true }
+serde_yaml = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

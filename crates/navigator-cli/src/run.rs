@@ -1220,6 +1220,33 @@ struct DevNetworkPolicyRule {
 struct DevNetworkEndpoint {
     host: String,
     port: u32,
+    #[serde(default)]
+    protocol: String,
+    #[serde(default)]
+    tls: String,
+    #[serde(default)]
+    enforcement: String,
+    #[serde(default)]
+    access: String,
+    #[serde(default)]
+    rules: Vec<DevL7Rule>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevL7Rule {
+    allow: DevL7Allow,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevL7Allow {
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    command: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1260,6 +1287,21 @@ fn load_dev_sandbox_policy() -> Result<SandboxPolicy> {
                     .map(|e| NetworkEndpoint {
                         host: e.host,
                         port: e.port,
+                        protocol: e.protocol,
+                        tls: e.tls,
+                        enforcement: e.enforcement,
+                        access: e.access,
+                        rules: e
+                            .rules
+                            .into_iter()
+                            .map(|r| navigator_core::proto::L7Rule {
+                                allow: Some(navigator_core::proto::L7Allow {
+                                    method: r.allow.method,
+                                    path: r.allow.path,
+                                    command: r.allow.command,
+                                }),
+                            })
+                            .collect(),
                     })
                     .collect(),
                 binaries: rule
@@ -1387,6 +1429,31 @@ struct NetworkPolicyRuleYaml {
 struct NetworkEndpointYaml {
     host: String,
     port: u32,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    protocol: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    tls: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    enforcement: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    access: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    rules: Vec<L7RuleYaml>,
+}
+
+#[derive(Serialize)]
+struct L7RuleYaml {
+    allow: L7AllowYaml,
+}
+
+#[derive(Serialize)]
+struct L7AllowYaml {
+    #[serde(skip_serializing_if = "String::is_empty")]
+    method: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    path: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    command: String,
 }
 
 #[derive(Serialize)]
@@ -1432,6 +1499,24 @@ fn policy_to_yaml(policy: &SandboxPolicy) -> PolicyYaml {
                     .map(|e| NetworkEndpointYaml {
                         host: e.host.clone(),
                         port: e.port,
+                        protocol: e.protocol.clone(),
+                        tls: e.tls.clone(),
+                        enforcement: e.enforcement.clone(),
+                        access: e.access.clone(),
+                        rules: e
+                            .rules
+                            .iter()
+                            .map(|r| {
+                                let a = r.allow.clone().unwrap_or_default();
+                                L7RuleYaml {
+                                    allow: L7AllowYaml {
+                                        method: a.method,
+                                        path: a.path,
+                                        command: a.command,
+                                    },
+                                }
+                            })
+                            .collect(),
                     })
                     .collect(),
                 binaries: rule

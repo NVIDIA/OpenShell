@@ -115,6 +115,8 @@ async fn main() -> Result<()> {
         vec!["/bin/bash".to_string()]
     };
 
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
     info!(command = ?command, "Starting sandbox");
 
     let exit_code = run_sandbox(
