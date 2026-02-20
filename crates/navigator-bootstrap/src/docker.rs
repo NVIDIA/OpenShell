@@ -9,7 +9,7 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
-    RemoveContainerOptions, RemoveVolumeOptions, StartContainerOptions,
+    RemoveContainerOptions, RemoveImageOptions, RemoveVolumeOptions, StartContainerOptions,
 };
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -427,6 +427,15 @@ pub async fn destroy_cluster_resources(
     let container_name = container_name(name);
     let volume_name = volume_name(name);
 
+    // Capture the container's image reference before removing the container so
+    // we can clean it up afterwards.  This prevents stale images from being
+    // re-used on subsequent deploys.
+    let container_image = docker
+        .inspect_container(&container_name, None::<InspectContainerOptions>)
+        .await
+        .ok()
+        .and_then(|info| info.image);
+
     let _ = stop_container(docker, &container_name).await;
 
     let remove_container = docker
@@ -442,6 +451,28 @@ pub async fn destroy_cluster_resources(
         && !is_not_found(&err)
     {
         return Err(err).into_diagnostic();
+    }
+
+    // Remove the cluster image so the next deploy always pulls the latest
+    // version from the registry instead of reusing a stale local copy.
+    if let Some(ref image_id) = container_image {
+        tracing::debug!("Removing cluster image: {}", image_id);
+        let result = docker
+            .remove_image(
+                image_id,
+                Some(RemoveImageOptions {
+                    force: true,
+                    noprune: true,
+                    ..Default::default()
+                }),
+                None,
+            )
+            .await;
+        if let Err(err) = result
+            && !is_not_found(&err)
+        {
+            tracing::warn!("Failed to remove cluster image {}: {}", image_id, err);
+        }
     }
 
     let remove_volume = docker

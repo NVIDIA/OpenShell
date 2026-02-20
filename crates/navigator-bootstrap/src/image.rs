@@ -252,6 +252,29 @@ pub async fn pull_remote_image(
             format!("failed to tag {registry_image} as {target_repo}:{target_tag} on remote")
         })?;
 
+    // Verify that the pulled image matches the expected architecture.
+    // This catches cases where the registry returned the wrong platform
+    // variant (e.g., amd64 on an arm64 host) which would cause an
+    // "exec format error" at container start time.
+    let inspect = remote
+        .inspect_image(image_ref)
+        .await
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to inspect pulled image {image_ref} on remote"))?;
+
+    let actual_arch = inspect.architecture.as_deref().unwrap_or("unknown");
+    if actual_arch != remote_platform.arch {
+        return Err(miette::miette!(
+            "architecture mismatch: pulled image {image_ref} is {actual_arch} but remote host is {expected}; \
+             try removing stale images on the remote host and re-deploying",
+            expected = remote_platform.arch,
+        ));
+    }
+    info!(
+        "Verified image architecture: {} matches remote host",
+        actual_arch
+    );
+
     on_progress(format!("[status] Image {image_ref} ready on remote host"));
     info!("Remote image pull and tag complete: {}", image_ref);
 
