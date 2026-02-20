@@ -70,7 +70,6 @@ impl ProviderRegistry {
         registry.register(providers::claude::ClaudeProvider);
         registry.register(providers::codex::CodexProvider);
         registry.register(providers::opencode::OpencodeProvider);
-        registry.register(providers::openclaw::OpenclawProvider);
         registry.register(providers::generic::GenericProvider);
         registry.register(providers::nvidia::NvidiaProvider);
         registry.register(providers::gitlab::GitlabProvider);
@@ -113,7 +112,6 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "claude" => Some("claude"),
         "codex" => Some("codex"),
         "opencode" => Some("opencode"),
-        "openclaw" => Some("openclaw"),
         "generic" => Some("generic"),
         "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),

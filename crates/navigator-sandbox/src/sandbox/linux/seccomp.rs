@@ -34,15 +34,11 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
 fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    let mut blocked_domains = vec![
-        libc::AF_NETLINK,
-        libc::AF_PACKET,
-        libc::AF_BLUETOOTH,
-        libc::AF_VSOCK,
-    ];
+    let mut blocked_domains = vec![libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
     if !allow_inet {
         blocked_domains.push(libc::AF_INET);
         blocked_domains.push(libc::AF_INET6);
+        blocked_domains.push(libc::AF_NETLINK);
     }
 
     for domain in blocked_domains {

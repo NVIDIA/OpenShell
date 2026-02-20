@@ -3,11 +3,12 @@
 use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
+use owo_colors::OwoColorize;
 use rustls::pki_types::ServerName;
 use std::io::{IsTerminal, Write};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -16,6 +17,7 @@ use tokio_rustls::TlsConnector;
 
 struct SshSessionConfig {
     proxy_command: String,
+    sandbox_id: String,
 }
 
 async fn ssh_session_config(
@@ -66,7 +68,10 @@ async fn ssh_session_config(
         gateway_url, session.sandbox_id, session.token,
     );
 
-    Ok(SshSessionConfig { proxy_command })
+    Ok(SshSessionConfig {
+        proxy_command,
+        sandbox_id: session.sandbox_id,
+    })
 }
 
 /// If the server-provided gateway host is a loopback address, use the host
@@ -106,7 +111,9 @@ fn ssh_base_command(proxy_command: &str) -> Command {
         .arg("-o")
         .arg("UserKnownHostsFile=/dev/null")
         .arg("-o")
-        .arg("GlobalKnownHostsFile=/dev/null");
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR");
     command
 }
 
@@ -144,6 +151,264 @@ pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Resu
     }
 
     Ok(())
+}
+
+/// Forward a local port to a sandbox via SSH.
+///
+/// When `background` is `true` the SSH process is forked into the background
+/// (using `-f`) and its PID is written to a state file so it can be managed
+/// later via [`stop_forward`] or [`list_forwards`].
+pub async fn sandbox_forward(
+    server: &str,
+    name: &str,
+    port: u16,
+    background: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let session = ssh_session_config(server, name, tls).await?;
+
+    let mut command = ssh_base_command(&session.proxy_command);
+    command
+        .arg("-N")
+        .arg("-L")
+        .arg(format!("{port}:127.0.0.1:{port}"));
+
+    if background {
+        // SSH -f: fork to background after authentication.
+        command.arg("-f");
+    }
+
+    command
+        .arg("sandbox")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    let status = tokio::task::spawn_blocking(move || command.status())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+
+    if !status.success() {
+        return Err(miette::miette!("ssh exited with status {status}"));
+    }
+
+    if background {
+        // SSH has forked — find its PID and record it.
+        if let Some(pid) = find_ssh_forward_pid(&session.sandbox_id, port) {
+            write_forward_pid(name, port, pid, &session.sandbox_id)?;
+        } else {
+            eprintln!(
+                "{} Could not discover backgrounded SSH process; \
+                 forward may be running but is not tracked",
+                "!".yellow(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Forward PID file management
+// ---------------------------------------------------------------------------
+
+/// Base directory for forward PID files.
+fn forward_pid_dir() -> Result<PathBuf> {
+    let base = if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(path)
+    } else {
+        let home = std::env::var("HOME")
+            .into_diagnostic()
+            .wrap_err("HOME is not set")?;
+        PathBuf::from(home).join(".config")
+    };
+    Ok(base.join("navigator").join("forwards"))
+}
+
+/// PID file path for a specific sandbox + port forward.
+fn forward_pid_path(name: &str, port: u16) -> Result<PathBuf> {
+    Ok(forward_pid_dir()?.join(format!("{name}-{port}.pid")))
+}
+
+/// Write a PID file for a background forward.
+fn write_forward_pid(name: &str, port: u16, pid: u32, sandbox_id: &str) -> Result<()> {
+    let dir = forward_pid_dir()?;
+    std::fs::create_dir_all(&dir)
+        .into_diagnostic()
+        .wrap_err("failed to create forwards directory")?;
+    let path = forward_pid_path(name, port)?;
+    std::fs::write(&path, format!("{pid}\t{sandbox_id}"))
+        .into_diagnostic()
+        .wrap_err("failed to write forward PID file")?;
+    Ok(())
+}
+
+/// Find the PID of a backgrounded SSH forward by searching for the matching
+/// SSH process.  Falls back to `pgrep` since SSH `-f` forks a new process
+/// whose PID we cannot capture directly.
+fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
+    // Match the ProxyCommand argument which contains the sandbox ID, plus
+    // the -L port forwarding spec. The ProxyCommand (with --sandbox-id)
+    // appears before -L in the SSH command line.
+    let pattern = format!("ssh.*sandbox-id.*{sandbox_id}.*-L.*{port}:127.0.0.1:{port}");
+    let output = Command::new("pgrep")
+        .arg("-f")
+        .arg(&pattern)
+        .output()
+        .ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // pgrep may return multiple PIDs (e.g., parent + child). Take the last
+    // one, which is typically the backgrounded SSH process.
+    stdout
+        .lines()
+        .rev()
+        .find_map(|l| l.trim().parse::<u32>().ok())
+}
+
+/// Read the PID from a forward PID file.  Returns `None` if the file does not
+/// exist or cannot be parsed.
+struct ForwardPidRecord {
+    pid: u32,
+    sandbox_id: Option<String>,
+}
+
+fn read_forward_pid(name: &str, port: u16) -> Option<ForwardPidRecord> {
+    let path = forward_pid_path(name, port).ok()?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut parts = contents.split_whitespace();
+    let pid = parts.next()?.parse().ok()?;
+    let sandbox_id = parts.next().map(str::to_string);
+    Some(ForwardPidRecord { pid, sandbox_id })
+}
+
+/// Check whether a process is alive.
+fn pid_is_alive(pid: u32) -> bool {
+    // `kill -0 <pid>` checks if we can signal the process without actually
+    // sending a signal.
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> bool {
+    let output = match Command::new("ps")
+        .arg("-ww")
+        .arg("-o")
+        .arg("command=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+    {
+        Ok(output) if output.status.success() => output,
+        _ => return false,
+    };
+
+    let cmd = String::from_utf8_lossy(&output.stdout);
+    let forward_spec = format!("{port}:127.0.0.1:{port}");
+    if !cmd.contains("ssh") || !cmd.contains("ssh-proxy") || !cmd.contains(&forward_spec) {
+        return false;
+    }
+
+    sandbox_id.is_none_or(|id| cmd.contains(id))
+}
+
+/// Stop a background port forward.
+pub fn stop_forward(name: &str, port: u16) -> Result<bool> {
+    let pid_path = forward_pid_path(name, port)?;
+    let Some(record) = read_forward_pid(name, port) else {
+        return Ok(false);
+    };
+    let pid = record.pid;
+
+    if pid_is_alive(pid) {
+        if !pid_matches_forward(pid, port, record.sandbox_id.as_deref()) {
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(false);
+        }
+        let _ = Command::new("kill")
+            .arg(pid.to_string())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        // Give the process a moment to exit.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    let _ = std::fs::remove_file(&pid_path);
+    Ok(true)
+}
+
+/// Stop all forwards for a given sandbox name.
+pub fn stop_forwards_for_sandbox(name: &str) -> Result<Vec<u16>> {
+    let Ok(dir) = forward_pid_dir() else {
+        return Ok(Vec::new());
+    };
+    let prefix = format!("{name}-");
+    let mut stopped = Vec::new();
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if let Some(rest) = file_name.strip_prefix(&prefix)
+            && let Some(port_str) = rest.strip_suffix(".pid")
+            && let Ok(port) = port_str.parse::<u16>()
+            && stop_forward(name, port)?
+        {
+            stopped.push(port);
+        }
+    }
+
+    Ok(stopped)
+}
+
+/// Information about a tracked forward.
+pub struct ForwardInfo {
+    pub sandbox: String,
+    pub port: u16,
+    pub pid: u32,
+    pub alive: bool,
+}
+
+/// List all tracked forwards.
+pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
+    let Ok(dir) = forward_pid_dir() else {
+        return Ok(Vec::new());
+    };
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Ok(Vec::new());
+    };
+
+    let mut forwards = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy().to_string();
+        if let Some(stem) = file_name.strip_suffix(".pid")
+            // Parse "<sandbox>-<port>" — the port is the last segment after '-'.
+            && let Some(dash_pos) = stem.rfind('-')
+            && let Ok(port) = stem[dash_pos + 1..].parse::<u16>()
+            && let Some(record) = read_forward_pid(&stem[..dash_pos], port)
+        {
+            forwards.push(ForwardInfo {
+                sandbox: stem[..dash_pos].to_string(),
+                port,
+                pid: record.pid,
+                alive: pid_is_alive(record.pid),
+            });
+        }
+    }
+
+    forwards.sort_by(|a, b| a.sandbox.cmp(&b.sandbox).then(a.port.cmp(&b.port)));
+    Ok(forwards)
 }
 
 /// Execute a command in a sandbox via SSH.

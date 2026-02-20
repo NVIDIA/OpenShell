@@ -62,6 +62,10 @@ tracing-subscriber = { workspace = true }
 workspace = true
 
 [dev-dependencies]
+futures = { workspace = true }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
+reqwest = { workspace = true }
+serde_json = { workspace = true }
 tempfile = "3"
 tokio-stream = { workspace = true }
+url = { workspace = true }

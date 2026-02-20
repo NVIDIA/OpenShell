@@ -2,6 +2,7 @@
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use miette::Result;
+use owo_colors::OwoColorize;
 use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
@@ -156,7 +157,6 @@ enum CliProviderType {
     Claude,
     Opencode,
     Codex,
-    Openclaw,
     Generic,
     Nvidia,
     Gitlab,
@@ -170,7 +170,6 @@ impl CliProviderType {
             Self::Claude => "claude",
             Self::Opencode => "opencode",
             Self::Codex => "codex",
-            Self::Openclaw => "openclaw",
             Self::Generic => "generic",
             Self::Nvidia => "nvidia",
             Self::Gitlab => "gitlab",
@@ -371,6 +370,10 @@ enum ClusterAdminCommands {
 enum SandboxCommands {
     /// Create a sandbox.
     Create {
+        /// Optional sandbox name (auto-generated when omitted).
+        #[arg(long)]
+        name: Option<String>,
+
         /// Sync local files into the sandbox before running.
         #[arg(long)]
         sync: bool,
@@ -390,6 +393,11 @@ enum SandboxCommands {
         /// Additional provider types required for this sandbox.
         #[arg(long = "provider", value_enum)]
         providers: Vec<CliProviderType>,
+
+        /// Forward a local port to the sandbox after the command finishes.
+        /// Implies --keep for non-interactive commands.
+        #[arg(long)]
+        forward: Option<u16>,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(trailing_var_arg = true)]
@@ -413,8 +421,12 @@ enum SandboxCommands {
         offset: u32,
 
         /// Print only sandbox ids (one per line).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "names")]
         ids: bool,
+
+        /// Print only sandbox names (one per line).
+        #[arg(long, conflicts_with = "ids")]
+        names: bool,
     },
 
     /// Delete a sandbox by name.
@@ -429,6 +441,40 @@ enum SandboxCommands {
         /// Sandbox name.
         name: String,
     },
+
+    /// Manage port forwarding to a sandbox.
+    Forward {
+        #[command(subcommand)]
+        command: ForwardCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ForwardCommands {
+    /// Start forwarding a local port to a sandbox.
+    Start {
+        /// Port to forward (used as both local and remote port).
+        port: u16,
+
+        /// Sandbox name.
+        name: String,
+
+        /// Run the forward in the background and exit immediately.
+        #[arg(short = 'd', long)]
+        background: bool,
+    },
+
+    /// Stop a background port forward.
+    Stop {
+        /// Port that was forwarded.
+        port: u16,
+
+        /// Sandbox name.
+        name: String,
+    },
+
+    /// List active port forwards.
+    List,
 }
 
 #[derive(Subcommand, Debug)]
@@ -591,11 +637,13 @@ async fn main() -> Result<()> {
         Some(Commands::Sandbox { command }) => {
             match command {
                 SandboxCommands::Create {
+                    name,
                     sync,
                     keep,
                     remote,
                     ssh_key,
                     providers,
+                    forward,
                     command,
                 } => {
                     let provider_types = providers
@@ -617,11 +665,13 @@ async fn main() -> Result<()> {
                             let tls = tls.with_cluster_name(&ctx.name);
                             run::sandbox_create(
                                 endpoint,
+                                name.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &provider_types,
+                                forward,
                                 &command,
                                 &tls,
                             )
@@ -630,14 +680,68 @@ async fn main() -> Result<()> {
                         Err(_) => {
                             // No cluster configured — go straight to bootstrap.
                             run::sandbox_create_with_bootstrap(
+                                name.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &provider_types,
+                                forward,
                                 &command,
                             )
                             .await?;
+                        }
+                    }
+                }
+                SandboxCommands::Forward {
+                    command: ForwardCommands::Stop { port, name },
+                } => {
+                    if run::stop_forward(&name, port)? {
+                        eprintln!(
+                            "{} Stopped forward of port {port} for sandbox {name}",
+                            "✓".green().bold(),
+                        );
+                    } else {
+                        eprintln!(
+                            "{} No active forward found for port {port} on sandbox {name}",
+                            "!".yellow(),
+                        );
+                    }
+                }
+                SandboxCommands::Forward {
+                    command: ForwardCommands::List,
+                } => {
+                    let forwards = run::list_forwards()?;
+                    if forwards.is_empty() {
+                        eprintln!("No active forwards.");
+                    } else {
+                        let name_width = forwards
+                            .iter()
+                            .map(|f| f.sandbox.len())
+                            .max()
+                            .unwrap_or(7)
+                            .max(7); // at least as wide as "SANDBOX"
+                        println!(
+                            "{:<width$} {:<8} {:<10} STATUS",
+                            "SANDBOX",
+                            "PORT",
+                            "PID",
+                            width = name_width,
+                        );
+                        for f in &forwards {
+                            let status = if f.alive {
+                                "running".green().to_string()
+                            } else {
+                                "dead".red().to_string()
+                            };
+                            println!(
+                                "{:<width$} {:<8} {:<10} {}",
+                                f.sandbox,
+                                f.port,
+                                f.pid,
+                                status,
+                                width = name_width,
+                            );
                         }
                     }
                 }
@@ -655,8 +759,13 @@ async fn main() -> Result<()> {
                         SandboxCommands::Get { name } => {
                             run::sandbox_get(endpoint, &name, &tls).await?;
                         }
-                        SandboxCommands::List { limit, offset, ids } => {
-                            run::sandbox_list(endpoint, limit, offset, ids, &tls).await?;
+                        SandboxCommands::List {
+                            limit,
+                            offset,
+                            ids,
+                            names,
+                        } => {
+                            run::sandbox_list(endpoint, limit, offset, ids, names, &tls).await?;
                         }
                         SandboxCommands::Delete { names } => {
                             run::sandbox_delete(endpoint, &names, &tls).await?;
@@ -664,6 +773,27 @@ async fn main() -> Result<()> {
                         SandboxCommands::Connect { name } => {
                             run::sandbox_connect(endpoint, &name, &tls).await?;
                         }
+                        SandboxCommands::Forward { command: fwd } => match fwd {
+                            ForwardCommands::Start {
+                                port,
+                                name,
+                                background,
+                            } => {
+                                run::sandbox_forward(endpoint, &name, port, background, &tls)
+                                    .await?;
+                                if background {
+                                    eprintln!(
+                                        "{} Forwarding port {port} to sandbox {name} in the background",
+                                        "✓".green().bold(),
+                                    );
+                                    eprintln!("  Access at: http://127.0.0.1:{port}/");
+                                    eprintln!(
+                                        "  Stop with: navigator sandbox forward stop {port} {name}",
+                                    );
+                                }
+                            }
+                            ForwardCommands::Stop { .. } | ForwardCommands::List => unreachable!(),
+                        },
                     }
                 }
             }

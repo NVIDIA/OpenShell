@@ -292,6 +292,7 @@ async fn handle_applied(
             spec: None,
             status: None,
             phase: SandboxPhase::Unknown as i32,
+            ..Default::default()
         });
 
     // Log phase transitions

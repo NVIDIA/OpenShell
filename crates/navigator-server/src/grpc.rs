@@ -85,7 +85,11 @@ impl Navigator for NavigatorService {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let name = format!("sandbox-{id}");
+        let name = if request.name.is_empty() {
+            format!("sandbox-{id}")
+        } else {
+            request.name.clone()
+        };
         let namespace = self.state.config.sandbox_namespace.clone();
 
         let sandbox = Sandbox {
@@ -95,6 +99,7 @@ impl Navigator for NavigatorService {
             spec: Some(spec),
             status: None,
             phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
         };
 
         self.state.sandbox_index.update_from_sandbox(&sandbox);
@@ -371,8 +376,9 @@ impl Navigator for NavigatorService {
 
         let mut sandboxes = Vec::with_capacity(records.len());
         for record in records {
-            let sandbox = Sandbox::decode(record.payload.as_slice())
+            let mut sandbox = Sandbox::decode(record.payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
+            sandbox.created_at_ms = record.created_at_ms;
             sandboxes.push(sandbox);
         }
 
@@ -1590,6 +1596,7 @@ mod tests {
             }),
             status: None,
             phase: SandboxPhase::Ready as i32,
+            ..Default::default()
         };
         store.put_message(&sandbox).await.unwrap();
 
@@ -1621,6 +1628,7 @@ mod tests {
             spec: Some(SandboxSpec::default()),
             status: None,
             phase: SandboxPhase::Ready as i32,
+            ..Default::default()
         };
         store.put_message(&sandbox).await.unwrap();
 

@@ -57,6 +57,16 @@ To connect to a running sandbox with SSH, use:
 navigator sandbox connect <sandbox-id>
 ```
 
+To forward a local port into a sandbox (e.g., port 18789):
+
+```bash
+navigator sandbox forward start 18789 <sandbox-name>
+```
+
+This opens a local SSH tunnel so connections to `127.0.0.1:18789` on the host
+are forwarded to `127.0.0.1:18789` inside the sandbox. The command stays
+attached until interrupted (Ctrl+C). Add `-d` to run in the background.
+
 Relevant environment variables:
 
 - `NAVIGATOR_SSH_GATEWAY_HOST`, `NAVIGATOR_SSH_GATEWAY_PORT`, `NAVIGATOR_SSH_CONNECT_PATH`

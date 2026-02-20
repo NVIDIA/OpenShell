@@ -138,6 +138,23 @@ The sandbox supervisor can run as a more privileged user while the child process
 privileged account before `exec`. Configure this via `process.run_as_user` and
 `process.run_as_group` in the policy. If unset, the child inherits the supervisor's user/group.
 
+## Zombie Reaping (PID 1 Init Duties)
+
+`navigator-sandbox` runs as PID 1 inside the container. In Linux, when a process exits, its
+parent must call `waitpid()` to collect the exit status; otherwise the process remains as a zombie.
+Orphaned processes (whose parent exits first) are reparented to PID 1, which becomes responsible
+for reaping them.
+
+Coding agents running inside the sandbox (OpenClaw, Claude, Codex) frequently spawn background
+daemons and child processes. When these grandchildren are orphaned, they become PID 1's
+responsibility. Without reaping, they accumulate as zombies for the lifetime of the container.
+
+The sandbox supervisor registers a `SIGCHLD` handler at startup and runs a background reaper task.
+On each signal, it first inspects exited children with `waitid(..., WNOWAIT)` and checks whether
+the PID belongs to a managed child with an explicit waiter (entrypoint or SSH session child). If
+the PID is managed, it leaves the status for that waiter. Otherwise, it reaps the orphaned child.
+This avoids `ECHILD` races with explicit `child.wait()` calls while still collecting orphan zombies.
+
 ## Platform Extensibility
 
 Platform-specific implementations are wired through `crates/navigator-sandbox/src/sandbox/mod.rs`.

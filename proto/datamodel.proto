@@ -13,6 +13,8 @@ message Sandbox {
   SandboxSpec spec = 4;
   SandboxStatus status = 5;
   SandboxPhase phase = 6;
+  // Milliseconds since Unix epoch when the sandbox was created.
+  int64 created_at_ms = 7;
 }
 
 // Navigator-level sandbox spec.

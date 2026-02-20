@@ -102,7 +102,7 @@ elif [[ "${explicit_target}" == "0" ]]; then
       crates/navigator-server/*|deploy/docker/Dockerfile.server)
         build_server=1
         ;;
-      crates/navigator-sandbox/*|deploy/docker/Dockerfile.sandbox|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
+      crates/navigator-sandbox/*|deploy/docker/Dockerfile.sandbox|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
         build_sandbox=1
         ;;
       deploy/docker/Dockerfile.pki-job)
@@ -131,11 +131,14 @@ fi
 
 build_start=$(date +%s)
 
-# Capture the sandbox image ID before rebuild so we can detect if it changed.
-sandbox_image_id_before=""
-if [[ "${build_sandbox}" == "1" ]]; then
-  sandbox_image_id_before=$(docker images -q "navigator-sandbox:${IMAGE_TAG}" 2>/dev/null || true)
-fi
+# Capture image IDs before rebuild so we can detect what changed.
+declare -A image_id_before=()
+for component in server sandbox pki-job; do
+  var="build_${component//-/_}"
+  if [[ "${!var}" == "1" ]]; then
+    image_id_before[${component}]=$(docker images -q "navigator-${component}:${IMAGE_TAG}" 2>/dev/null || true)
+  fi
+done
 
 server_pid=""
 sandbox_pid=""
@@ -174,36 +177,22 @@ build_end=$(date +%s)
 log_duration "Image builds" "${build_start}" "${build_end}"
 
 declare -a pushed_images=()
+declare -a changed_images=()
 
-# Detect whether the sandbox image actually changed by comparing the Docker
-# image ID before and after the build.  This is a content-addressable hash so
-# identical builds produce the same ID regardless of registry digest quirks.
-sandbox_image_changed=0
-if [[ "${build_sandbox}" == "1" ]]; then
-  sandbox_image_id_after=$(docker images -q "navigator-sandbox:${IMAGE_TAG}" 2>/dev/null || true)
-  if [[ -n "${sandbox_image_id_before}" && -n "${sandbox_image_id_after}" \
-        && "${sandbox_image_id_before}" != "${sandbox_image_id_after}" ]]; then
-    sandbox_image_changed=1
-  elif [[ -z "${sandbox_image_id_before}" && -n "${sandbox_image_id_after}" ]]; then
-    # First build — treat as changed
-    sandbox_image_changed=1
+for component in server sandbox pki-job; do
+  var="build_${component//-/_}"
+  if [[ "${!var}" == "1" ]]; then
+    docker tag "navigator-${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}"
+    pushed_images+=("${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}")
+
+    # Detect whether the image actually changed by comparing Docker image IDs.
+    id_after=$(docker images -q "navigator-${component}:${IMAGE_TAG}" 2>/dev/null || true)
+    id_before=${image_id_before[${component}]:-}
+    if [[ -z "${id_before}" || "${id_before}" != "${id_after}" ]]; then
+      changed_images+=("${component}")
+    fi
   fi
-fi
-
-if [[ "${build_server}" == "1" ]]; then
-  docker tag "navigator-server:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/server:${IMAGE_TAG}"
-  pushed_images+=("${IMAGE_REPO_BASE}/server:${IMAGE_TAG}")
-fi
-
-if [[ "${build_sandbox}" == "1" ]]; then
-  docker tag "navigator-sandbox:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}"
-  pushed_images+=("${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}")
-fi
-
-if [[ "${build_pki_job}" == "1" ]]; then
-  docker tag "navigator-pki-job:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/pki-job:${IMAGE_TAG}"
-  pushed_images+=("${IMAGE_REPO_BASE}/pki-job:${IMAGE_TAG}")
-fi
+done
 
 if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   push_start=$(date +%s)
@@ -215,13 +204,15 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   log_duration "Image push" "${push_start}" "${push_end}"
 fi
 
-# If the sandbox image changed, evict the stale copy from k3s's containerd
-# store so new sandbox pods pull the updated image from the registry.
-# Without this, k3s uses its cached copy (imagePullPolicy defaults to
-# IfNotPresent for non-:latest tags) and sandbox pods run stale code.
-if [[ "${sandbox_image_changed}" == "1" ]]; then
-  echo "Sandbox image changed (${sandbox_image_id_before:-<none>} -> ${sandbox_image_id_after}), evicting stale image from k3s..."
-  docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}" >/dev/null 2>&1 || true
+# Evict stale images from k3s's containerd store so new pods pull the
+# updated image from the registry.  Without this, k3s uses its cached copy
+# (imagePullPolicy defaults to IfNotPresent for non-:latest tags) and pods
+# run stale code.
+if [[ "${#changed_images[@]}" -gt 0 ]]; then
+  echo "Evicting stale images from k3s: ${changed_images[*]}"
+  for component in "${changed_images[@]}"; do
+    docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" >/dev/null 2>&1 || true
+  done
 fi
 
 if [[ "${needs_helm_upgrade}" == "1" ]]; then

@@ -96,6 +96,62 @@ sequenceDiagram
   - HMAC is SHA-256 over `token|timestamp|nonce` with the shared secret.
   - Sandbox verifies timestamp is within `ssh_handshake_skew_secs` and HMAC matches.
 
+## Port Forwarding (`sandbox forward start`)
+
+`nav sandbox forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
+on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
+
+### CLI
+
+- Reuses the same `ProxyCommand` path as `sandbox connect`.
+- Invokes OpenSSH with `-N -L <port>:127.0.0.1:<port> sandbox`.
+- By default stays attached in foreground until interrupted (Ctrl+C).
+- With `-d`/`--background`, SSH forks after auth and the CLI exits. The PID is
+  tracked in `~/.config/navigator/forwards/<name>-<port>.pid` along with sandbox id metadata.
+- `nav sandbox forward stop <port> <name>` validates PID ownership and then kills a background forward.
+- `nav sandbox forward list` shows all tracked forwards.
+- `nav sandbox forward stop` and `nav sandbox forward list` are local operations and do not require
+  resolving an active cluster.
+- `nav sandbox create --forward <port>` starts a background forward before connect/exec, including
+  when no trailing command is provided.
+- `nav sandbox delete` auto-stops any active forwards for the deleted sandbox.
+
+### Supervisor `direct-tcpip` handling
+
+The sandbox SSH server (`crates/navigator-sandbox/src/ssh.rs`) implements
+`channel_open_direct_tcpip` from the russh `Handler` trait.
+
+- **Loopback-only**: only `127.0.0.1`, `localhost`, and `::1` destinations are accepted.
+  Non-loopback destinations are rejected (`Ok(false)`) to prevent the sandbox from being
+  used as a generic proxy.
+- **Bridge**: accepted channels spawn a tokio task that connects a `TcpStream` to the
+  target address and uses `copy_bidirectional` between the SSH channel stream and the
+  TCP stream.
+- No additional state is stored on `SshHandler` — the `Channel<Msg>` object from russh is
+  self-contained, so forwarding channels are fully independent of session channels.
+
+### Flow
+
+```mermaid
+sequenceDiagram
+  participant App as Local Application
+  participant SSH as OpenSSH Client
+  participant GW as Gateway (CONNECT)
+  participant SSHD as Sandbox SSH
+  participant SVC as Service in Sandbox
+
+  SSH->>GW: CONNECT /connect/ssh
+  GW->>SSHD: TCP + Preface handshake
+  SSH->>SSHD: direct-tcpip channel (127.0.0.1:port)
+  SSHD->>SVC: TcpStream::connect(127.0.0.1:port)
+  App->>SSH: connect to 127.0.0.1:port (local)
+  SSH->>SSHD: channel data
+  SSHD->>SVC: TCP data
+  SVC-->>SSHD: TCP response
+  SSHD-->>SSH: channel data
+  SSH-->>App: response
+```
+
 ## Authentication Model
 
 - The SSH server accepts any SSH key or none; the gateway handles authorization.

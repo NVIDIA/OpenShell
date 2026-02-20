@@ -39,7 +39,10 @@ use std::time::{Duration, Instant};
 use tonic::{Code, transport::Channel};
 
 // Re-export SSH functions for backward compatibility
-pub use crate::ssh::{sandbox_connect, sandbox_exec, sandbox_rsync, sandbox_ssh_proxy};
+pub use crate::ssh::{list_forwards, stop_forward, stop_forwards_for_sandbox};
+pub use crate::ssh::{
+    sandbox_connect, sandbox_exec, sandbox_forward, sandbox_rsync, sandbox_ssh_proxy,
+};
 
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {
@@ -51,6 +54,51 @@ fn phase_name(phase: i32) -> &'static str {
         Ok(SandboxPhase::Deleting) => "Deleting",
         Ok(SandboxPhase::Unknown) | Err(_) => "Unknown",
     }
+}
+
+/// Format milliseconds since Unix epoch as a `YYYY-MM-DD HH:MM:SS` UTC string.
+fn format_epoch_ms(ms: i64) -> String {
+    use std::time::UNIX_EPOCH;
+
+    let Ok(ms_u64) = u64::try_from(ms) else {
+        return "-".to_string();
+    };
+    let Ok(time) = UNIX_EPOCH
+        .checked_add(Duration::from_millis(ms_u64))
+        .ok_or(())
+    else {
+        return "-".to_string();
+    };
+    let Ok(dur) = time.duration_since(UNIX_EPOCH) else {
+        return "-".to_string();
+    };
+
+    let secs = dur.as_secs();
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+
+    // Convert days since epoch to year-month-day using a basic civil calendar algorithm.
+    let (y, m, d) = civil_from_days(days);
+    format!("{y:04}-{m:02}-{d:02} {hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// Convert days since 1970-01-01 to (year, month, day).
+/// Algorithm from Howard Hinnant's `chrono`-compatible date library.
+fn civil_from_days(days: u64) -> (i64, u64, u64) {
+    let z = days.cast_signed() + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097).cast_unsigned();
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let y = yoe.cast_signed() + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Live-updating display showing spinner with phase and latest log line.
@@ -895,12 +943,15 @@ pub fn cluster_admin_tunnel(
 /// Create a sandbox when no cluster is configured.
 ///
 /// Offers to bootstrap a new cluster first, then delegates to [`sandbox_create`].
+#[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create_with_bootstrap(
+    name: Option<&str>,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
+    forward: Option<u16>,
     command: &[String],
 ) -> Result<()> {
     if !crate::bootstrap::confirm_bootstrap()? {
@@ -912,7 +963,7 @@ pub async fn sandbox_create_with_bootstrap(
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
     sandbox_create(
-        &server, sync, keep, remote, ssh_key, providers, command, &tls,
+        &server, name, sync, keep, remote, ssh_key, providers, forward, command, &tls,
     )
     .await
 }
@@ -921,11 +972,13 @@ pub async fn sandbox_create_with_bootstrap(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create(
     server: &str,
+    name: Option<&str>,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
+    forward: Option<u16>,
     command: &[String],
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -958,6 +1011,7 @@ pub async fn sandbox_create(
             providers: configured_providers,
             ..SandboxSpec::default()
         }),
+        name: name.unwrap_or_default().to_string(),
     };
 
     let response = client.create_sandbox(request).await.into_diagnostic()?;
@@ -1103,6 +1157,26 @@ pub async fn sandbox_create(
                 }
             }
 
+            // If --forward was requested, start the background port forward
+            // *before* running the command so that long-running processes
+            // (e.g. `openclaw gateway`) are reachable immediately.
+            if let Some(port) = forward {
+                sandbox_forward(
+                    &effective_server,
+                    &sandbox_name,
+                    port,
+                    true, // background
+                    &effective_tls,
+                )
+                .await?;
+                eprintln!(
+                    "{} Forwarding port {port} to sandbox {sandbox_name} in the background\n",
+                    "✓".green().bold(),
+                );
+                eprintln!("Access at: http://127.0.0.1:{port}/");
+                eprintln!("Stop with: navigator sandbox forward stop {port} {sandbox_name}",);
+            }
+
             if command.is_empty() {
                 return sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await;
             }
@@ -1115,6 +1189,11 @@ pub async fn sandbox_create(
                 &effective_tls,
             )
             .await;
+
+            if forward.is_some() {
+                exec_result?;
+                return Ok(());
+            }
 
             if !interactive
                 && !keep
@@ -1605,6 +1684,7 @@ pub async fn sandbox_list(
     limit: u32,
     offset: u32,
     ids_only: bool,
+    names_only: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
@@ -1616,7 +1696,7 @@ pub async fn sandbox_list(
 
     let sandboxes = response.into_inner().sandboxes;
     if sandboxes.is_empty() {
-        if !ids_only {
+        if !ids_only && !names_only {
             println!("No sandboxes found.");
         }
         return Ok(());
@@ -1629,13 +1709,14 @@ pub async fn sandbox_list(
         return Ok(());
     }
 
+    if names_only {
+        for sandbox in sandboxes {
+            println!("{}", sandbox.name);
+        }
+        return Ok(());
+    }
+
     // Calculate column widths
-    let id_width = sandboxes
-        .iter()
-        .map(|s| s.id.len())
-        .max()
-        .unwrap_or(2)
-        .max(2);
     let name_width = sandboxes
         .iter()
         .map(|s| s.name.len())
@@ -1648,13 +1729,14 @@ pub async fn sandbox_list(
         .max()
         .unwrap_or(9)
         .max(9);
+    let created_width = 19; // "YYYY-MM-DD HH:MM:SS"
 
     // Print header
     println!(
-        "{:<id_width$}  {:<name_width$}  {:<ns_width$}  {}",
-        "ID".bold(),
+        "{:<name_width$}  {:<ns_width$}  {:<created_width$}  {}",
         "NAME".bold(),
         "NAMESPACE".bold(),
+        "CREATED".bold(),
         "PHASE".bold(),
     );
 
@@ -1668,9 +1750,10 @@ pub async fn sandbox_list(
             Ok(SandboxPhase::Deleting) => phase.dimmed().to_string(),
             _ => phase.to_string(),
         };
+        let created = format_epoch_ms(sandbox.created_at_ms);
         println!(
-            "{:<id_width$}  {:<name_width$}  {:<ns_width$}  {}",
-            sandbox.id, sandbox.name, sandbox.namespace, phase_colored,
+            "{:<name_width$}  {:<ns_width$}  {:<created_width$}  {}",
+            sandbox.name, sandbox.namespace, created, phase_colored,
         );
     }
 
@@ -1682,6 +1765,16 @@ pub async fn sandbox_delete(server: &str, names: &[String], tls: &TlsOptions) ->
     let mut client = grpc_client(server, tls).await?;
 
     for name in names {
+        // Stop any background port forwards for this sandbox before deleting.
+        if let Ok(stopped) = stop_forwards_for_sandbox(name) {
+            for port in stopped {
+                eprintln!(
+                    "{} Stopped forward of port {port} for sandbox {name}",
+                    "✓".green().bold(),
+                );
+            }
+        }
+
         let response = client
             .delete_sandbox(DeleteSandboxRequest { name: name.clone() })
             .await
@@ -1916,90 +2009,6 @@ fn parse_credential_pairs(items: &[String]) -> Result<HashMap<String, String>> {
     }
 
     Ok(map)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_credential_pairs;
-
-    struct EnvVarGuard {
-        key: &'static str,
-        original: Option<String>,
-    }
-
-    #[allow(unsafe_code)]
-    impl EnvVarGuard {
-        fn set(key: &'static str, value: &str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::set_var(key, value);
-            }
-            Self { key, original }
-        }
-
-        fn unset(key: &'static str) -> Self {
-            let original = std::env::var(key).ok();
-            unsafe {
-                std::env::remove_var(key);
-            }
-            Self { key, original }
-        }
-    }
-
-    #[allow(unsafe_code)]
-    impl Drop for EnvVarGuard {
-        fn drop(&mut self) {
-            if let Some(value) = &self.original {
-                unsafe {
-                    std::env::set_var(self.key, value);
-                }
-            } else {
-                unsafe {
-                    std::env::remove_var(self.key);
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn parse_credential_pairs_accepts_key_value_form() {
-        let parsed = parse_credential_pairs(&["API_KEY=abc123".to_string()]).expect("parse");
-        assert_eq!(parsed.get("API_KEY"), Some(&"abc123".to_string()));
-    }
-
-    #[test]
-    fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
-
-        let parsed =
-            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
-        assert_eq!(
-            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
-            Some(&"from-env".to_string())
-        );
-    }
-
-    #[test]
-    fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
-            .expect_err("missing env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
-        ));
-    }
-
-    #[test]
-    fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
-        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
-
-        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
-            .expect_err("empty env should error");
-        assert!(err.to_string().contains(
-            "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
-        ));
-    }
 }
 
 pub async fn provider_create(
@@ -2437,4 +2446,88 @@ fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
     }
 
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_credential_pairs;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<String>,
+    }
+
+    #[allow(unsafe_code)]
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::set_var(key, value);
+            }
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var(key).ok();
+            unsafe {
+                std::env::remove_var(key);
+            }
+            Self { key, original }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.original {
+                unsafe {
+                    std::env::set_var(self.key, value);
+                }
+            } else {
+                unsafe {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn parse_credential_pairs_accepts_key_value_form() {
+        let parsed = parse_credential_pairs(&["API_KEY=abc123".to_string()]).expect("parse");
+        assert_eq!(parsed.get("API_KEY"), Some(&"abc123".to_string()));
+    }
+
+    #[test]
+    fn parse_credential_pairs_reads_value_from_environment_for_key_only_form() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_TEST_KEY", "from-env");
+
+        let parsed =
+            parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_TEST_KEY".to_string()]).expect("parse");
+        assert_eq!(
+            parsed.get("NAV_PARSE_CREDENTIAL_TEST_KEY"),
+            Some(&"from-env".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_credential_pairs_rejects_missing_environment_for_key_only_form() {
+        let _guard = EnvVarGuard::unset("NAV_PARSE_CREDENTIAL_MISSING");
+
+        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_MISSING".to_string()])
+            .expect_err("missing env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_CREDENTIAL_MISSING' to be set to a non-empty value"
+        ));
+    }
+
+    #[test]
+    fn parse_credential_pairs_rejects_empty_environment_for_key_only_form() {
+        let _guard = EnvVarGuard::set("NAV_PARSE_CREDENTIAL_EMPTY", "");
+
+        let err = parse_credential_pairs(&["NAV_PARSE_CREDENTIAL_EMPTY".to_string()])
+            .expect_err("empty env should error");
+        assert!(err.to_string().contains(
+            "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
+        ));
+    }
 }

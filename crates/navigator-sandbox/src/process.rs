@@ -4,6 +4,8 @@ use crate::policy::{NetworkMode, SandboxPolicy};
 use crate::sandbox;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
+#[cfg(target_os = "linux")]
+use crate::{register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::{Group, Pid, User};
@@ -183,6 +185,7 @@ impl ProcessHandle {
 
         let child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
+        register_managed_child(pid);
 
         debug!(pid, program, "Process spawned");
 
@@ -271,6 +274,8 @@ impl ProcessHandle {
 
         let child = cmd.spawn().into_diagnostic()?;
         let pid = child.id().unwrap_or(0);
+        #[cfg(target_os = "linux")]
+        register_managed_child(pid);
 
         debug!(pid, program, "Process spawned");
 
@@ -289,7 +294,10 @@ impl ProcessHandle {
     ///
     /// Returns an error if waiting fails.
     pub async fn wait(&mut self) -> std::io::Result<ProcessStatus> {
-        let status = self.child.wait().await?;
+        let status = self.child.wait().await;
+        #[cfg(target_os = "linux")]
+        unregister_managed_child(self.pid);
+        let status = status?;
         Ok(ProcessStatus::from(status))
     }
 
@@ -325,6 +333,13 @@ impl ProcessHandle {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for ProcessHandle {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        unregister_managed_child(self.pid);
     }
 }
 

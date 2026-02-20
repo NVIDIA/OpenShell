@@ -3,6 +3,8 @@
 use crate::policy::SandboxPolicy;
 use crate::process::drop_privileges;
 use crate::sandbox;
+#[cfg(target_os = "linux")]
+use crate::{register_managed_child, unregister_managed_child};
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
@@ -17,7 +19,7 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
@@ -40,7 +42,7 @@ pub async fn run_ssh_server(
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
     let mut config = russh::server::Config {
-        auth_rejection_time: std::time::Duration::from_secs(1),
+        auth_rejection_time: Duration::from_secs(1),
         ..Default::default()
     };
     config.keys.push(host_key);
@@ -235,6 +237,54 @@ impl russh::server::Handler for SshHandler {
         Ok(true)
     }
 
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: russh::Channel<russh::server::Msg>,
+        host_to_connect: &str,
+        port_to_connect: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        _session: &mut Session,
+    ) -> Result<bool, Self::Error> {
+        // Only allow forwarding to loopback destinations to prevent the
+        // sandbox SSH server from being used as a generic proxy.
+        let is_loopback = host_to_connect == "127.0.0.1"
+            || host_to_connect == "localhost"
+            || host_to_connect == "::1";
+        if !is_loopback {
+            warn!(
+                host = host_to_connect,
+                port = port_to_connect,
+                "direct-tcpip rejected: non-loopback destination"
+            );
+            return Ok(false);
+        }
+
+        let host = host_to_connect.to_string();
+        #[allow(clippy::cast_possible_truncation)]
+        let port = port_to_connect as u16;
+        let netns_fd = self.netns_fd;
+
+        tokio::spawn(async move {
+            let addr = format!("{host}:{port}");
+            let tcp = match connect_in_netns(&addr, netns_fd).await {
+                Ok(stream) => stream,
+                Err(err) => {
+                    warn!(addr = %addr, error = %err, "direct-tcpip: failed to connect");
+                    let _ = channel.close().await;
+                    return;
+                }
+            };
+
+            let mut channel_stream = channel.into_stream();
+            let mut tcp_stream = tcp;
+
+            let _ = tokio::io::copy_bidirectional(&mut channel_stream, &mut tcp_stream).await;
+        });
+
+        Ok(true)
+    }
+
     async fn pty_request(
         &mut self,
         channel: ChannelId,
@@ -340,6 +390,55 @@ impl SshHandler {
         self.input_sender = Some(input_sender);
         Ok(())
     }
+}
+
+/// Connect a TCP stream to `addr` inside the sandbox network namespace.
+///
+/// The SSH supervisor runs in the host network namespace while sandbox child
+/// processes run in an isolated network namespace (with their own loopback).
+/// A plain `TcpStream::connect("127.0.0.1:port")` from the supervisor would
+/// hit the host loopback, not the sandbox loopback where services are listening.
+///
+/// On Linux, we spawn a dedicated OS thread, call `setns` to enter the sandbox
+/// namespace, create the socket there, then convert it to a tokio `TcpStream`.
+/// We use `std::thread::spawn` (not `spawn_blocking`) because `setns` changes
+/// the calling thread's network namespace permanently — a tokio blocking-pool
+/// thread could be reused for unrelated tasks and must not be contaminated.
+/// On non-Linux platforms (no network namespace support), we connect directly.
+async fn connect_in_netns(
+    addr: &str,
+    netns_fd: Option<RawFd>,
+) -> std::io::Result<tokio::net::TcpStream> {
+    #[cfg(target_os = "linux")]
+    if let Some(fd) = netns_fd {
+        let addr = addr.to_string();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let result = (|| -> std::io::Result<std::net::TcpStream> {
+                // Enter the sandbox network namespace on this dedicated thread.
+                // SAFETY: setns is safe to call; this is a dedicated thread that
+                // will exit after the connection is established.
+                #[allow(unsafe_code)]
+                let rc = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                std::net::TcpStream::connect(&addr)
+            })();
+            let _ = tx.send(result);
+        });
+
+        let std_stream = rx
+            .await
+            .map_err(|_| std::io::Error::other("netns connect thread panicked"))??;
+        std_stream.set_nonblocking(true)?;
+        return tokio::net::TcpStream::from_std(std_stream);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    let _ = netns_fd;
+
+    tokio::net::TcpStream::connect(addr).await
 }
 
 #[derive(Clone)]
@@ -463,6 +562,10 @@ fn spawn_pty_shell(
     }
 
     let mut child = cmd.spawn()?;
+    #[cfg(target_os = "linux")]
+    let child_pid = child.id();
+    #[cfg(target_os = "linux")]
+    register_managed_child(child_pid);
     let master_file = master;
 
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
@@ -510,11 +613,18 @@ fn spawn_pty_shell(
     let runtime_exit = runtime;
     std::thread::spawn(move || {
         let status = child.wait().ok();
+        #[cfg(target_os = "linux")]
+        unregister_managed_child(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
         // Wait for the reader thread to finish forwarding all output before
         // sending exit-status and closing the channel.  This prevents the
         // race where close() was called before exit_status_request().
-        let _ = reader_done_rx.recv();
+        //
+        // Use a timeout because a backgrounded grandchild process (e.g.
+        // `nohup daemon &`) may hold the PTY slave open indefinitely,
+        // preventing the reader from reaching EOF.  Two seconds is enough
+        // for any remaining buffered data to drain.
+        let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
         drop(runtime_exit.spawn(async move {
             let _ = handle_exit.exit_status_request(channel, code).await;
             let _ = handle_exit.close(channel).await;

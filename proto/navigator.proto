@@ -81,6 +81,8 @@ message HealthResponse {
 // Create sandbox request.
 message CreateSandboxRequest {
   navigator.datamodel.v1.SandboxSpec spec = 1;
+  // Optional user-supplied sandbox name. When empty the server generates one.
+  string name = 2;
 }
 
 // Get sandbox request.

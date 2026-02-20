@@ -17,6 +17,9 @@ pub struct HealthResponse {
 pub struct CreateSandboxRequest {
     #[prost(message, optional, tag = "1")]
     pub spec: ::core::option::Option<super::datamodel::v1::SandboxSpec>,
+    /// Optional user-supplied sandbox name. When empty the server generates one.
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
 }
 /// Get sandbox request.
 #[derive(Clone, PartialEq, ::prost::Message)]

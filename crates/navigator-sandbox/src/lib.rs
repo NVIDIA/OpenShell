@@ -14,9 +14,13 @@ mod sandbox;
 mod ssh;
 
 use miette::{IntoDiagnostic, Result};
+#[cfg(target_os = "linux")]
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
@@ -31,6 +35,43 @@ use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 pub use process::{ProcessHandle, ProcessStatus};
+
+#[cfg(target_os = "linux")]
+static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+#[cfg(target_os = "linux")]
+pub(crate) fn register_managed_child(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 0 {
+        return;
+    }
+    if let Ok(mut children) = MANAGED_CHILDREN.lock() {
+        children.insert(pid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn unregister_managed_child(pid: u32) {
+    let Ok(pid) = i32::try_from(pid) else {
+        return;
+    };
+    if pid <= 0 {
+        return;
+    }
+    if let Ok(mut children) = MANAGED_CHILDREN.lock() {
+        children.remove(&pid);
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn is_managed_child(pid: i32) -> bool {
+    MANAGED_CHILDREN
+        .lock()
+        .is_ok_and(|children| children.contains(&pid))
+}
 
 /// Run a command in the sandbox.
 ///
@@ -245,6 +286,73 @@ pub async fn run_sandbox(
     } else {
         None
     };
+
+    // Zombie reaper — navigator-sandbox may run as PID 1 in containers and
+    // must reap orphaned grandchildren (e.g. background daemons started by
+    // coding agents) to prevent zombie accumulation.
+    //
+    // Use waitid(..., WNOWAIT) so we can inspect exited children before
+    // actually reaping them. This avoids racing explicit `child.wait()` calls
+    // for managed children (entrypoint and SSH session processes).
+    #[cfg(target_os = "linux")]
+    tokio::spawn(async {
+        use nix::sys::wait::{Id, WaitPidFlag, WaitStatus, waitid, waitpid};
+        use tokio::signal::unix::{SignalKind, signal};
+        use tokio::time::MissedTickBehavior;
+
+        let mut sigchld = match signal(SignalKind::child()) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(error = %e, "Failed to register SIGCHLD handler for zombie reaping");
+                return;
+            }
+        };
+        let mut retry = tokio::time::interval(Duration::from_secs(5));
+        retry.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tokio::select! {
+                _ = sigchld.recv() => {}
+                _ = retry.tick() => {}
+            }
+
+            loop {
+                let status = match waitid(
+                    Id::All,
+                    WaitPidFlag::WEXITED | WaitPidFlag::WNOHANG | WaitPidFlag::WNOWAIT,
+                ) {
+                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => break,
+                    Ok(status) => status,
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "waitid error during zombie reaping");
+                        break;
+                    }
+                };
+
+                let Some(pid) = status.pid() else {
+                    break;
+                };
+
+                if is_managed_child(pid.as_raw()) {
+                    // Let the explicit waiter own this child status.
+                    break;
+                }
+
+                match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
+                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {}
+                    Ok(reaped) => {
+                        tracing::debug!(?reaped, "Reaped orphaned child process");
+                    }
+                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(e) => {
+                        tracing::debug!(error = %e, "waitpid error during orphan reap");
+                        break;
+                    }
+                }
+            }
+        }
+    });
 
     if let Some(listen_addr) = ssh_listen_addr {
         let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;

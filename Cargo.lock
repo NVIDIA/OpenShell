@@ -2578,6 +2578,7 @@ dependencies = [
  "owo-colors",
  "prost-types",
  "rcgen",
+ "reqwest",
  "rustls",
  "rustls-pemfile",
  "serde",

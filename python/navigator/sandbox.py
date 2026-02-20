@@ -120,9 +120,11 @@ class SandboxClient:
         *,
         tls: TlsConfig | None = None,
         timeout: float = 30.0,
+        cluster_name: str | None = None,
     ) -> None:
         self._endpoint = endpoint
         self._timeout = timeout
+        self._cluster_name = cluster_name
         if tls is None:
             self._channel = grpc.insecure_channel(endpoint)
         else:
@@ -162,8 +164,8 @@ class SandboxClient:
                 cert_path=mtls_dir / "tls.crt",
                 key_path=mtls_dir / "tls.key",
             )
-            return cls(endpoint, tls=tls, timeout=timeout)
-        return cls(endpoint, timeout=timeout)
+            return cls(endpoint, tls=tls, timeout=timeout, cluster_name=cluster_name)
+        return cls(endpoint, timeout=timeout, cluster_name=cluster_name)
 
     def close(self) -> None:
         self._channel.close()
