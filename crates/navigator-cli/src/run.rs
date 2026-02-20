@@ -951,6 +951,7 @@ pub async fn sandbox_create_with_bootstrap(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
+    policy: Option<&str>,
     forward: Option<u16>,
     command: &[String],
 ) -> Result<()> {
@@ -963,7 +964,7 @@ pub async fn sandbox_create_with_bootstrap(
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
     sandbox_create(
-        &server, name, sync, keep, remote, ssh_key, providers, forward, command, &tls,
+        &server, name, sync, keep, remote, ssh_key, providers, policy, forward, command, &tls,
     )
     .await
 }
@@ -978,6 +979,7 @@ pub async fn sandbox_create(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
+    policy: Option<&str>,
     forward: Option<u16>,
     command: &[String],
     tls: &TlsOptions,
@@ -1004,7 +1006,7 @@ pub async fn sandbox_create(
     let required_providers = required_provider_types(command, providers);
     let configured_providers = ensure_required_providers(&mut client, &required_providers).await?;
 
-    let policy = load_dev_sandbox_policy()?;
+    let policy = load_sandbox_policy(policy)?;
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             policy: Some(policy),
@@ -1334,17 +1336,22 @@ struct DevNetworkBinary {
     path: String,
 }
 
-fn load_dev_sandbox_policy() -> Result<SandboxPolicy> {
-    let contents = match std::env::var("NAVIGATOR_SANDBOX_POLICY") {
-        Ok(policy_path) => {
-            let path = Path::new(&policy_path);
-            std::fs::read_to_string(path)
-                .into_diagnostic()
-                .wrap_err_with(|| {
-                    format!("failed to read sandbox policy from {}", path.display())
-                })?
-        }
-        Err(_) => DEFAULT_SANDBOX_POLICY_YAML.to_string(),
+/// Load sandbox policy YAML.
+///
+/// Resolution order: `--policy` flag > `NAVIGATOR_SANDBOX_POLICY` env var > built-in default.
+fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
+    let contents = if let Some(p) = cli_path {
+        let path = Path::new(p);
+        std::fs::read_to_string(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
+    } else if let Ok(policy_path) = std::env::var("NAVIGATOR_SANDBOX_POLICY") {
+        let path = Path::new(&policy_path);
+        std::fs::read_to_string(path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
+    } else {
+        DEFAULT_SANDBOX_POLICY_YAML.to_string()
     };
     let raw: DevSandboxPolicyFile = serde_yaml::from_str(&contents)
         .into_diagnostic()

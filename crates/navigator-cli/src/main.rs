@@ -394,6 +394,11 @@ enum SandboxCommands {
         #[arg(long = "provider", value_enum)]
         providers: Vec<CliProviderType>,
 
+        /// Path to a custom sandbox policy YAML file.
+        /// Overrides the built-in default and the `NAVIGATOR_SANDBOX_POLICY` env var.
+        #[arg(long)]
+        policy: Option<String>,
+
         /// Forward a local port to the sandbox after the command finishes.
         /// Implies --keep for non-interactive commands.
         #[arg(long)]
@@ -643,6 +648,7 @@ async fn main() -> Result<()> {
                     remote,
                     ssh_key,
                     providers,
+                    policy,
                     forward,
                     command,
                 } => {
@@ -671,6 +677,7 @@ async fn main() -> Result<()> {
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &provider_types,
+                                policy.as_deref(),
                                 forward,
                                 &command,
                                 &tls,
@@ -686,6 +693,7 @@ async fn main() -> Result<()> {
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &provider_types,
+                                policy.as_deref(),
                                 forward,
                                 &command,
                             )

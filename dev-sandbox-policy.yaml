@@ -14,6 +14,7 @@ filesystem_policy:
   read_write:
     - /sandbox
     - /tmp
+    - /dev/null
 
 landlock:
   compatibility: best_effort

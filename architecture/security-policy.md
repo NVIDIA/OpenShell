@@ -3,6 +3,7 @@
 The sandbox system uses a YAML-based policy language to govern sandbox behavior. This document is the definitive reference for the policy schema, how each field maps to enforcement mechanisms, and the behavioral triggers that control which enforcement layer is activated.
 
 Policies serve two purposes:
+
 1. **Static configuration** -- filesystem access rules, Landlock compatibility, and process privilege dropping (applied once at sandbox startup).
 2. **Dynamic network decisions** -- per-connection and per-request access control evaluated at runtime by the OPA engine.
 
@@ -21,10 +22,10 @@ navigator-sandbox \
   -- /bin/bash
 ```
 
-| Flag | Environment Variable | Description |
-|------|---------------------|-------------|
+| Flag             | Environment Variable     | Description                                      |
+| ---------------- | ------------------------ | ------------------------------------------------ |
 | `--policy-rules` | `NAVIGATOR_POLICY_RULES` | Path to `.rego` file containing evaluation rules |
-| `--policy-data` | `NAVIGATOR_POLICY_DATA` | Path to YAML file containing policy data |
+| `--policy-data`  | `NAVIGATOR_POLICY_DATA`  | Path to YAML file containing policy data         |
 
 The YAML data file is preprocessed before loading into the OPA engine: L7 policies are validated, and `access` presets are expanded into explicit `rules` arrays. See `crates/navigator-sandbox/src/opa.rs` -- `preprocess_yaml_data()`.
 
@@ -39,10 +40,10 @@ navigator-sandbox \
   -- /bin/bash
 ```
 
-| Flag | Environment Variable | Description |
-|------|---------------------|-------------|
-| `--sandbox-id` | `NAVIGATOR_SANDBOX_ID` | Sandbox ID for policy lookup |
-| `--navigator-endpoint` | `NAVIGATOR_ENDPOINT` | Gateway gRPC endpoint |
+| Flag                   | Environment Variable   | Description                  |
+| ---------------------- | ---------------------- | ---------------------------- |
+| `--sandbox-id`         | `NAVIGATOR_SANDBOX_ID` | Sandbox ID for policy lookup |
+| `--navigator-endpoint` | `NAVIGATOR_ENDPOINT`   | Gateway gRPC endpoint        |
 
 The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`dev-sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
 
@@ -113,11 +114,11 @@ inference:
 
 Controls which filesystem paths the sandboxed process can access. Enforced via Linux Landlock LSM at process startup.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `include_workdir` | `bool` | `true` | Automatically add the working directory to the read-write list |
-| `read_only` | `string[]` | `[]` | Paths accessible in read-only mode |
-| `read_write` | `string[]` | `[]` | Paths accessible in read-write mode |
+| Field             | Type       | Default | Description                                                    |
+| ----------------- | ---------- | ------- | -------------------------------------------------------------- |
+| `include_workdir` | `bool`     | `true`  | Automatically add the working directory to the read-write list |
+| `read_only`       | `string[]` | `[]`    | Paths accessible in read-only mode                             |
+| `read_write`      | `string[]` | `[]`    | Paths accessible in read-write mode                            |
 
 **Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V1)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V1)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
 
@@ -140,6 +141,7 @@ filesystem_policy:
   read_write:
     - /sandbox
     - /tmp
+    - /dev/null
 ```
 
 ---
@@ -148,16 +150,16 @@ filesystem_policy:
 
 Controls Landlock LSM compatibility behavior.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| Field           | Type     | Default         | Description                           |
+| --------------- | -------- | --------------- | ------------------------------------- |
 | `compatibility` | `string` | `"best_effort"` | How to handle Landlock unavailability |
 
 **Accepted values**:
 
-| Value | Behavior |
-|-------|----------|
-| `best_effort` | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing |
-| `hard_requirement` | If Landlock is unavailable, abort sandbox startup with an error |
+| Value              | Behavior                                                                                                                    |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------------- |
+| `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing |
+| `hard_requirement` | If Landlock is unavailable, abort sandbox startup with an error                                                             |
 
 See `crates/navigator-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`.
 
@@ -172,12 +174,13 @@ landlock:
 
 Controls privilege dropping for the sandboxed process.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `run_as_user` | `string` | `""` (no drop) | Unix user name to switch to before exec |
+| Field          | Type     | Default        | Description                              |
+| -------------- | -------- | -------------- | ---------------------------------------- |
+| `run_as_user`  | `string` | `""` (no drop) | Unix user name to switch to before exec  |
 | `run_as_group` | `string` | `""` (no drop) | Unix group name to switch to before exec |
 
 **Enforcement sequence** (in the child process `pre_exec`, before sandbox restrictions are applied):
+
 1. `initgroups()` -- set supplementary groups for the target user
 2. `setgid()` -- switch to the target group
 3. `setuid()` -- switch to the target user
@@ -200,41 +203,41 @@ A map of named network policy rules. Each rule defines which binary/endpoint pai
 
 ```yaml
 network_policies:
-  claude_code:          # <-- map key (arbitrary identifier)
-    name: claude_code   # <-- human-readable name (used in audit logs)
-    endpoints:          # <-- allowed host:port pairs
+  claude_code: # <-- map key (arbitrary identifier)
+    name: claude_code # <-- human-readable name (used in audit logs)
+    endpoints: # <-- allowed host:port pairs
       - { host: api.anthropic.com, port: 443 }
-    binaries:           # <-- allowed binary identities
+    binaries: # <-- allowed binary identities
       - { path: /usr/local/bin/claude }
 ```
 
 #### Network Policy Rule
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | `string` | Yes | Human-readable policy name (appears in proxy log lines as `policy=`) |
-| `endpoints` | `NetworkEndpoint[]` | Yes | List of allowed host:port pairs |
-| `binaries` | `NetworkBinary[]` | Yes | List of allowed binary identities |
+| Field       | Type                | Required | Description                                                          |
+| ----------- | ------------------- | -------- | -------------------------------------------------------------------- |
+| `name`      | `string`            | Yes      | Human-readable policy name (appears in proxy log lines as `policy=`) |
+| `endpoints` | `NetworkEndpoint[]` | Yes      | List of allowed host:port pairs                                      |
+| `binaries`  | `NetworkBinary[]`   | Yes      | List of allowed binary identities                                    |
 
 #### `NetworkEndpoint`
 
 Each endpoint defines a network destination and, optionally, L7 inspection behavior.
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `host` | `string` | _(required)_ | Hostname to match (case-insensitive) |
-| `port` | `integer` | _(required)_ | TCP port to match |
-| `protocol` | `string` | `""` | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
-| `tls` | `string` | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination). |
-| `enforcement` | `string` | `"audit"` | L7 enforcement mode: `"enforce"` or `"audit"` |
-| `access` | `string` | `""` | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`. |
-| `rules` | `L7Rule[]` | `[]` | Explicit L7 allow rules. Mutually exclusive with `access`. |
+| Field         | Type       | Default         | Description                                                                                                         |
+| ------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `host`        | `string`   | _(required)_    | Hostname to match (case-insensitive)                                                                                |
+| `port`        | `integer`  | _(required)_    | TCP port to match                                                                                                   |
+| `protocol`    | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
+| `tls`         | `string`   | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination).                  |
+| `enforcement` | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
+| `access`      | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
+| `rules`       | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
 
 #### `NetworkBinary`
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path` | `string` | Yes | Filesystem path of the binary. Supports glob patterns (`*`, `**`). |
+| Field  | Type     | Required | Description                                                        |
+| ------ | -------- | -------- | ------------------------------------------------------------------ |
+| `path` | `string` | Yes      | Filesystem path of the binary. Supports glob patterns (`*`, `**`). |
 
 **Binary identity matching** is evaluated in the Rego rules (`dev-sandbox-policy.rego`) using four strategies, tried in order:
 
@@ -259,10 +262,10 @@ rules:
 
 #### `L7Allow`
 
-| Field | Type | Description |
-|-------|------|-------------|
-| `method` | `string` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, or `*` (any). Case-insensitive matching. |
-| `path` | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter. |
+| Field     | Type     | Description                                                                                                                  |
+| --------- | -------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `method`  | `string` | HTTP method: `GET`, `HEAD`, `POST`, `PUT`, `DELETE`, `PATCH`, `OPTIONS`, or `*` (any). Case-insensitive matching.            |
+| `path`    | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter.                                   |
 | `command` | `string` | SQL command: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `*` (any). Case-insensitive matching. For `protocol: sql` endpoints. |
 
 Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. See `dev-sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`.
@@ -271,11 +274,11 @@ Method and command fields use `*` as wildcard for "any". Path patterns use `**` 
 
 The `access` field provides shorthand for common rule sets. During preprocessing, presets are expanded into explicit `rules` arrays before Rego evaluation.
 
-| Preset | Expands To | Description |
-|--------|-----------|-------------|
-| `read-only` | `GET/**`, `HEAD/**`, `OPTIONS/**` | Safe read-only HTTP methods on all paths |
-| `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | Read and write but not delete |
-| `full` | `*/**` | All methods, all paths |
+| Preset       | Expands To                                                         | Description                              |
+| ------------ | ------------------------------------------------------------------ | ---------------------------------------- |
+| `read-only`  | `GET/**`, `HEAD/**`, `OPTIONS/**`                                  | Safe read-only HTTP methods on all paths |
+| `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | Read and write but not delete            |
+| `full`       | `*/**`                                                             | All methods, all paths                   |
 
 See `crates/navigator-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
@@ -285,9 +288,9 @@ See `crates/navigator-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
 Controls access to the platform's inference routing system (gRPC mode only, included in the `SandboxPolicy` proto but not consumed by the sandbox supervisor directly).
 
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `allowed_routing_hints` | `string[]` | `[]` | Which routing hints the sandbox may request. e.g., `["local"]` for private-only, `["local", "frontier"]` for full access. Empty means no inference allowed. |
+| Field                   | Type       | Default | Description                                                                                                                                                 |
+| ----------------------- | ---------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `allowed_routing_hints` | `string[]` | `[]`    | Which routing hints the sandbox may request. e.g., `["local"]` for private-only, `["local", "frontier"]` for full access. Empty means no inference allowed. |
 
 ```yaml
 inference:
@@ -305,10 +308,10 @@ Several policy fields trigger fundamentally different enforcement behavior. Unde
 
 **Trigger**: The presence or absence of entries in `network_policies`.
 
-| Condition | Network Mode | Behavior |
-|-----------|-------------|----------|
-| `network_policies` is empty or absent | **Block** | Seccomp blocks all `socket()` calls for `AF_INET` and `AF_INET6`. No network proxy is started. No outbound TCP connections are possible. |
-| `network_policies` has any entries | **Proxy** | Seccomp allows `AF_INET` and `AF_INET6` sockets. An HTTP CONNECT proxy starts. A network namespace with veth pair isolates the sandbox. `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables are set on the child process. |
+| Condition                             | Network Mode | Behavior                                                                                                                                                                                                                           |
+| ------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `network_policies` is empty or absent | **Block**    | Seccomp blocks all `socket()` calls for `AF_INET` and `AF_INET6`. No network proxy is started. No outbound TCP connections are possible.                                                                                           |
+| `network_policies` has any entries    | **Proxy**    | Seccomp allows `AF_INET` and `AF_INET6` sockets. An HTTP CONNECT proxy starts. A network namespace with veth pair isolates the sandbox. `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables are set on the child process. |
 
 In proxy mode, the seccomp filter still blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` socket domains regardless. See `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs` -- `build_filter()`.
 
@@ -329,11 +332,11 @@ flowchart LR
 
 **Trigger**: The `protocol` field on a `NetworkEndpoint`.
 
-| Condition | Enforcement Layer | Behavior |
-|-----------|------------------|----------|
-| `protocol` absent or empty | **L4 (transport)** | The proxy performs a raw `copy_bidirectional` after the CONNECT handshake. No application-layer inspection occurs. Only the host:port and binary identity are checked. |
-| `protocol: rest` | **L7 (application)** | The proxy parses each HTTP/1.1 request within the tunnel, evaluates method+path against the endpoint's `rules`, and either forwards or denies each request individually. |
-| `protocol: sql` | **L7 (application, audit-only)** | Reserved for SQL protocol inspection. Currently falls through to passthrough with a warning. `enforcement: enforce` is rejected at validation time for SQL endpoints. |
+| Condition                  | Enforcement Layer                | Behavior                                                                                                                                                                 |
+| -------------------------- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `protocol` absent or empty | **L4 (transport)**               | The proxy performs a raw `copy_bidirectional` after the CONNECT handshake. No application-layer inspection occurs. Only the host:port and binary identity are checked.   |
+| `protocol: rest`           | **L7 (application)**             | The proxy parses each HTTP/1.1 request within the tunnel, evaluates method+path against the endpoint's `rules`, and either forwards or denies each request individually. |
+| `protocol: sql`            | **L7 (application, audit-only)** | Reserved for SQL protocol inspection. Currently falls through to passthrough with a warning. `enforcement: enforce` is rejected at validation time for SQL endpoints.    |
 
 This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
@@ -345,12 +348,13 @@ This is the single most important behavioral trigger in the policy language. An 
 
 **Trigger**: The `tls` field on a `NetworkEndpoint`.
 
-| Condition | Behavior |
-|-----------|----------|
-| `tls` absent or `"passthrough"` | For L7 endpoints: the proxy inspects plaintext only. For HTTPS endpoints (port 443), L7 rules will not be evaluated because the traffic is encrypted. A validation warning is emitted. |
-| `tls: "terminate"` | The proxy performs MITM TLS termination: it presents a dynamically-generated certificate (signed by an ephemeral per-sandbox CA) to the client, decrypts the traffic, inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs (webpki-roots). |
+| Condition                       | Behavior                                                                                                                                                                                                                                                            |
+| ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `tls` absent or `"passthrough"` | For L7 endpoints: the proxy inspects plaintext only. For HTTPS endpoints (port 443), L7 rules will not be evaluated because the traffic is encrypted. A validation warning is emitted.                                                                              |
+| `tls: "terminate"`              | The proxy performs MITM TLS termination: it presents a dynamically-generated certificate (signed by an ephemeral per-sandbox CA) to the client, decrypts the traffic, inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs (webpki-roots). |
 
 **Prerequisites for TLS termination**:
+
 - The `protocol` field must also be set. `tls: terminate` without `protocol` is rejected at validation time.
 - The sandbox supervisor generates an ephemeral CA at startup (`SandboxCa::generate()`) and writes it to `/etc/navigator-tls/`.
 - Trust store environment variables are set on the child process: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`.
@@ -364,10 +368,10 @@ This is the single most important behavioral trigger in the policy language. An 
 
 **Trigger**: The `enforcement` field on a `NetworkEndpoint` with L7 inspection enabled.
 
-| Value | Behavior |
-|-------|----------|
+| Value             | Behavior                                                                                                                                                                                |
+| ----------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `audit` (default) | L7 rule violations are logged as `l7_decision=audit` but traffic is forwarded to upstream. This is the safe migration path for introducing L7 rules without breaking existing behavior. |
-| `enforce` | L7 rule violations result in a `403 Forbidden` JSON response sent to the client. The connection is closed after the deny response. Traffic never reaches upstream. |
+| `enforce`         | L7 rule violations result in a `403 Forbidden` JSON response sent to the client. The connection is closed after the deny response. Traffic never reaches upstream.                      |
 
 **Enforce-mode deny response format**:
 
@@ -388,13 +392,13 @@ The response includes an `X-Navigator-Policy` header and `Connection: close`. Se
 
 **Trigger**: The `access` and `rules` fields on a `NetworkEndpoint`.
 
-| Condition | Behavior |
-|-----------|----------|
-| Neither `access` nor `rules` | Valid only if `protocol` is also absent (L4-only endpoint). If `protocol` is set, validation rejects. |
-| `access` only | Expanded to explicit `rules` during preprocessing. |
-| `rules` only | Used directly. |
-| Both `access` and `rules` | Rejected at validation time ("rules and access are mutually exclusive"). |
-| `rules` present but empty (`rules: []`) | Rejected at validation time ("rules list cannot be empty -- would deny all traffic"). |
+| Condition                               | Behavior                                                                                              |
+| --------------------------------------- | ----------------------------------------------------------------------------------------------------- |
+| Neither `access` nor `rules`            | Valid only if `protocol` is also absent (L4-only endpoint). If `protocol` is set, validation rejects. |
+| `access` only                           | Expanded to explicit `rules` during preprocessing.                                                    |
+| `rules` only                            | Used directly.                                                                                        |
+| Both `access` and `rules`               | Rejected at validation time ("rules and access are mutually exclusive").                              |
+| `rules` present but empty (`rules: []`) | Rejected at validation time ("rules list cannot be empty -- would deny all traffic").                 |
 
 ---
 
@@ -402,12 +406,12 @@ The response includes an `X-Navigator-Policy` header and `Connection: close`. Se
 
 Regardless of network mode, certain socket domains are always blocked:
 
-| Domain | Constant | Reason |
-|--------|----------|--------|
-| `AF_NETLINK` | 16 | Prevents manipulation of routing tables, firewall rules, and network interfaces |
-| `AF_PACKET` | 17 | Prevents raw packet capture and injection |
-| `AF_BLUETOOTH` | 31 | Prevents Bluetooth access |
-| `AF_VSOCK` | 40 | Prevents VM socket communication |
+| Domain         | Constant | Reason                                                                          |
+| -------------- | -------- | ------------------------------------------------------------------------------- |
+| `AF_NETLINK`   | 16       | Prevents manipulation of routing tables, firewall rules, and network interfaces |
+| `AF_PACKET`    | 17       | Prevents raw packet capture and injection                                       |
+| `AF_BLUETOOTH` | 31       | Prevents Bluetooth access                                                       |
+| `AF_VSOCK`     | 40       | Prevents VM socket communication                                                |
 
 In **block mode**, `AF_INET` (2) and `AF_INET6` (10) are also blocked, preventing all TCP/UDP networking.
 
@@ -419,13 +423,13 @@ The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with spe
 
 When proxy mode is active (on Linux), the sandbox creates an isolated network namespace:
 
-| Component | Value | Description |
-|-----------|-------|-------------|
-| Namespace name | `sandbox-{uuid8}` | 8-character UUID prefix |
-| Host veth IP | `10.200.0.1/24` | Proxy binds here |
-| Sandbox veth IP | `10.200.0.2/24` | Child process operates here |
-| Default route | via `10.200.0.1` | All sandbox traffic goes through the host veth |
-| Proxy port | `3128` (default) | Configurable |
+| Component       | Value             | Description                                    |
+| --------------- | ----------------- | ---------------------------------------------- |
+| Namespace name  | `sandbox-{uuid8}` | 8-character UUID prefix                        |
+| Host veth IP    | `10.200.0.1/24`   | Proxy binds here                               |
+| Sandbox veth IP | `10.200.0.2/24`   | Child process operates here                    |
+| Default route   | via `10.200.0.1`  | All sandbox traffic goes through the host veth |
+| Proxy port      | `3128` (default)  | Configurable                                   |
 
 The child process enters the namespace via `setns(fd, CLONE_NEWNET)` in `pre_exec`. This provides hard network isolation -- even if a process ignores proxy environment variables, it can only reach the host veth IP, where the proxy listens. See `crates/navigator-sandbox/src/sandbox/linux/netns.rs`.
 
@@ -507,21 +511,21 @@ The following validation rules are enforced during policy loading (both file mod
 
 ### Errors (Block Startup)
 
-| Condition | Error Message |
-|-----------|--------------|
-| Both `rules` and `access` on the same endpoint | `rules and access are mutually exclusive` |
-| `protocol` set without `rules` or `access` | `protocol requires rules or access to define allowed traffic` |
-| `tls: terminate` without `protocol` | `TLS termination requires a protocol for L7 inspection` |
-| `protocol: sql` with `enforcement: enforce` | `SQL enforcement requires full SQL parsing (not available in v1). Use enforcement: audit.` |
-| `rules: []` (empty list) | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.` |
-| Invalid HTTP method in REST rules | _(warning, not error)_ |
+| Condition                                      | Error Message                                                                              |
+| ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| Both `rules` and `access` on the same endpoint | `rules and access are mutually exclusive`                                                  |
+| `protocol` set without `rules` or `access`     | `protocol requires rules or access to define allowed traffic`                              |
+| `tls: terminate` without `protocol`            | `TLS termination requires a protocol for L7 inspection`                                    |
+| `protocol: sql` with `enforcement: enforce`    | `SQL enforcement requires full SQL parsing (not available in v1). Use enforcement: audit.` |
+| `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
+| Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
 
 ### Warnings (Log Only)
 
-| Condition | Warning Message |
-|-----------|----------------|
-| `protocol: rest` on port 443 without `tls: terminate` | `L7 rules won't be evaluated on encrypted traffic without tls: terminate` |
-| Unknown HTTP method in rules (not GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/*) | `Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS.` |
+| Condition                                                                    | Warning Message                                                                                   |
+| ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| `protocol: rest` on port 443 without `tls: terminate`                        | `L7 rules won't be evaluated on encrypted traffic without tls: terminate`                         |
+| Unknown HTTP method in rules (not GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/\*) | `Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS.` |
 
 See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
@@ -552,6 +556,7 @@ filesystem_policy:
   read_write:
     - /sandbox
     - /tmp
+    - /dev/null
 
 landlock:
   compatibility: best_effort
@@ -641,26 +646,26 @@ inference:
 
 When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message fields map to YAML keys as follows:
 
-| Proto Message | Proto Field | YAML Key |
-|---------------|-------------|----------|
-| `SandboxPolicy` | `filesystem` | `filesystem_policy` |
-| `SandboxPolicy` | `landlock` | `landlock` |
-| `SandboxPolicy` | `process` | `process` |
-| `SandboxPolicy` | `network_policies` | `network_policies` |
-| `SandboxPolicy` | `inference` | `inference` |
-| `FilesystemPolicy` | `include_workdir` | `filesystem_policy.include_workdir` |
-| `FilesystemPolicy` | `read_only` | `filesystem_policy.read_only` |
-| `FilesystemPolicy` | `read_write` | `filesystem_policy.read_write` |
-| `LandlockPolicy` | `compatibility` | `landlock.compatibility` |
-| `ProcessPolicy` | `run_as_user` | `process.run_as_user` |
-| `ProcessPolicy` | `run_as_group` | `process.run_as_group` |
-| `NetworkPolicyRule` | `name` | `network_policies.<key>.name` |
-| `NetworkPolicyRule` | `endpoints` | `network_policies.<key>.endpoints` |
-| `NetworkPolicyRule` | `binaries` | `network_policies.<key>.binaries` |
-| `NetworkEndpoint` | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules` | Same field names |
-| `L7Rule` | `allow` | `rules[].allow` |
-| `L7Allow` | `method`, `path`, `command` | `rules[].allow.method`, `.path`, `.command` |
-| `InferencePolicy` | `allowed_routing_hints` | `inference.allowed_routing_hints` |
+| Proto Message       | Proto Field                                                         | YAML Key                                    |
+| ------------------- | ------------------------------------------------------------------- | ------------------------------------------- |
+| `SandboxPolicy`     | `filesystem`                                                        | `filesystem_policy`                         |
+| `SandboxPolicy`     | `landlock`                                                          | `landlock`                                  |
+| `SandboxPolicy`     | `process`                                                           | `process`                                   |
+| `SandboxPolicy`     | `network_policies`                                                  | `network_policies`                          |
+| `SandboxPolicy`     | `inference`                                                         | `inference`                                 |
+| `FilesystemPolicy`  | `include_workdir`                                                   | `filesystem_policy.include_workdir`         |
+| `FilesystemPolicy`  | `read_only`                                                         | `filesystem_policy.read_only`               |
+| `FilesystemPolicy`  | `read_write`                                                        | `filesystem_policy.read_write`              |
+| `LandlockPolicy`    | `compatibility`                                                     | `landlock.compatibility`                    |
+| `ProcessPolicy`     | `run_as_user`                                                       | `process.run_as_user`                       |
+| `ProcessPolicy`     | `run_as_group`                                                      | `process.run_as_group`                      |
+| `NetworkPolicyRule` | `name`                                                              | `network_policies.<key>.name`               |
+| `NetworkPolicyRule` | `endpoints`                                                         | `network_policies.<key>.endpoints`          |
+| `NetworkPolicyRule` | `binaries`                                                          | `network_policies.<key>.binaries`           |
+| `NetworkEndpoint`   | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules` | Same field names                            |
+| `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
+| `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
+| `InferencePolicy`   | `allowed_routing_hints`                                             | `inference.allowed_routing_hints`           |
 
 The conversion is performed in `crates/navigator-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
 
@@ -685,19 +690,19 @@ The OPA engine evaluates two categories of rules:
 
 ### L4 Rules (per-CONNECT)
 
-| Rule | Signature | Returns |
-|------|-----------|---------|
-| `allow_network` | `input.network.host`, `input.network.port`, `input.exec.path`, `input.exec.ancestors`, `input.exec.cmdline_paths` | `true` if any policy matches both endpoint and binary |
-| `deny_reason` | Same input | Human-readable string explaining why access was denied |
-| `matched_network_policy` | Same input | Name of the matched policy (for audit logging) |
-| `matched_endpoint_config` | Same input | Raw endpoint object for L7 config extraction (only returned if endpoint has `protocol` field) |
+| Rule                      | Signature                                                                                                         | Returns                                                                                       |
+| ------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| `allow_network`           | `input.network.host`, `input.network.port`, `input.exec.path`, `input.exec.ancestors`, `input.exec.cmdline_paths` | `true` if any policy matches both endpoint and binary                                         |
+| `deny_reason`             | Same input                                                                                                        | Human-readable string explaining why access was denied                                        |
+| `matched_network_policy`  | Same input                                                                                                        | Name of the matched policy (for audit logging)                                                |
+| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (only returned if endpoint has `protocol` field) |
 
 ### L7 Rules (per-request within tunnel)
 
-| Rule | Signature | Returns |
-|------|-----------|---------|
-| `allow_request` | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path` | `true` if the request matches any rule in the matched endpoint |
-| `request_deny_reason` | Same input | Human-readable deny message |
+| Rule                  | Signature                                                                       | Returns                                                        |
+| --------------------- | ------------------------------------------------------------------------------- | -------------------------------------------------------------- |
+| `allow_request`       | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path` | `true` if the request matches any rule in the matched endpoint |
+| `request_deny_reason` | Same input                                                                      | Human-readable deny message                                    |
 
 See `dev-sandbox-policy.rego` for the full Rego implementation.
 
