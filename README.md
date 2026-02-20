@@ -11,7 +11,7 @@ It transforms the data center from a static deployment target into a continuous 
 🚧 Under construction 🚧
 
 ```bash
-uv pip install navigator --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple 
+uv pip install navigator --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple 
 
 navigator sandbox create -- claude  # or opencode or codex
 ```
