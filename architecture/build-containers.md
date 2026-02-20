@@ -1,0 +1,513 @@
+# Container Management
+
+This document describes how the project's container images are built, organized, and deployed. It covers the Dockerfiles, build automation, Helm chart configuration, and CI/CD integration.
+
+## Directory Structure
+
+```
+deploy/
+  docker/
+    .dockerignore
+    Dockerfile.sandbox             # Sandbox container (runs agent code in isolation)
+    Dockerfile.server              # Gateway container (orchestration / control plane)
+    Dockerfile.cluster             # Airgapped k3s cluster with Helm charts and manifests
+    Dockerfile.pki-job             # Lightweight Alpine image for gateway TLS PKI
+    Dockerfile.ci                  # CI runner image with pre-installed toolchain
+    Dockerfile.python-wheels       # Multi-arch Linux wheel builder for the Python CLI package
+    Dockerfile.python-wheels-macos # macOS arm64 wheel builder (cross-compilation via osxcross)
+    cross-build.sh                 # Shared Rust cross-compilation helpers for multi-arch builds
+    cluster-entrypoint.sh          # Entrypoint script for DNS proxy and registry config in Docker
+    cluster-healthcheck.sh         # Docker HEALTHCHECK script for cluster readiness
+    .build/                        # Generated artifacts (charts/*.tgz)
+  helm/
+    navigator/                     # Helm chart for the gateway
+      Chart.yaml
+      values.yaml
+      templates/
+        _helpers.tpl
+        statefulset.yaml
+        service.yaml
+        serviceaccount.yaml
+        role.yaml
+        rolebinding.yaml
+        gateway.yaml
+        gatewayclass.yaml
+        grpcroute.yaml
+        gateway-pki-job.yaml
+        gateway-pki-role.yaml
+        gateway-pki-rolebinding.yaml
+        gateway-pki-serviceaccount.yaml
+        gateway-client-traffic-policy.yaml
+        gateway-backend-traffic-policy.yaml
+  kube/
+    manifests/                     # Kubernetes manifests for k3s auto-deploy
+      envoy-gateway-helmchart.yaml
+      navigator-helmchart.yaml
+      agent-sandbox.yaml           # Agent Sandbox CRD controller RBAC
+build/
+  docker.toml                      # Docker image build tasks
+  cluster.toml                     # Cluster bootstrap and deploy tasks
+  helm.toml                        # Helm lint task
+  rust.toml                        # Rust build/lint/format tasks
+  ci.toml                          # Pre-commit, lint, sandbox runner tasks
+  test.toml                        # Test tasks (Rust + Python)
+  python.toml                      # Python build/lint/format tasks
+  publish.toml                     # Release publishing tasks
+  version.toml                     # Git-derived version management
+  scripts/
+    docker-build-component.sh      # Generic Docker image builder
+    docker-build-cluster.sh        # Cluster image builder (packages Helm charts first)
+    docker-publish-multiarch.sh    # Multi-arch build and push (registry or ECR)
+    cluster-bootstrap.sh           # Full cluster bootstrap (registry + push + deploy)
+    cluster-push-component.sh      # Tag and push a single component to the local registry
+    cluster-deploy-fast.sh         # Incremental deploy from local Git changes
+```
+
+## Container Images
+
+The project produces four runtime container images and two build-only wheel images.
+
+### Sandbox Image (`navigator-sandbox`)
+
+The sandbox container runs inside each sandbox pod. It contains the sandbox supervisor binary, Python runtime, AI agent tooling, and a virtual environment for the Python SDK.
+
+**Build stages** (5 stages in `deploy/docker/Dockerfile.sandbox`):
+
+1. **rust-builder** -- Cross-compiles the `navigator-sandbox` binary from Rust. Uses `deploy/docker/cross-build.sh` for multi-arch support (amd64/arm64). Build profile is controlled by the `RUST_BUILD_PROFILE` arg (default: `debug`).
+2. **base** -- Python 3.12 slim with system dependencies (`iproute2` for network namespace management, `dnsutils`, `curl`, etc.) and two users: `supervisor` (privileged) and `sandbox` (restricted).
+3. **builder** -- Installs Python dependencies via `uv` into `/app/.venv`. Includes the SDK dependencies (`cloudpickle`, `grpcio`, `protobuf`).
+4. **coding-agents** -- Installs AI agent CLIs: Claude (via native installer), OpenCode (`opencode-ai` npm package), and Codex (`@openai/codex` npm package). Requires Node.js and npm.
+5. **final** -- Combines the Rust binary, Python venv, SDK source, and coding agents. Creates `/var/navigator` for policy files and `/sandbox` owned by the `sandbox` user. Entrypoint is `navigator-sandbox`.
+
+**Key details:**
+
+- Multi-user isolation: `supervisor` (runs the sandbox supervisor) and `sandbox` (runs the restricted agent process).
+- Policy files are mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data) when running in file-based policy mode.
+- The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/navigator/`.
+
+### Gateway Image (`navigator-server`)
+
+The gateway container runs the control plane / orchestration service.
+
+**Build stages** (2 stages in `deploy/docker/Dockerfile.server`):
+
+1. **builder** -- Two-pass Rust compilation with dependency caching:
+   - First pass copies only `Cargo.toml`/`Cargo.lock` files and creates dummy source files (`fn main() {}` / empty `lib.rs`) to build dependencies in isolation. This layer is cached unless dependency manifests change.
+   - Second pass copies real source, touches source files and `.proto` definitions to force rebuilding, and compiles in release mode.
+   - Uses `deploy/docker/cross-build.sh` for multi-arch cross-compilation.
+   - Proto files are copied and `build.rs` is touched to ensure proto code regeneration when the cache mount retains stale `OUT_DIR` artifacts.
+2. **runtime** -- Debian bookworm-slim with `ca-certificates`. Runs as non-root user `navigator` (created with `useradd --create-home`). SQLx migrations are copied to `/build/crates/navigator-server/migrations` (the path expected by `sqlx` at build time).
+
+**Key details:**
+
+- Exposes port 8080 (gRPC + HTTP multiplexed).
+- Dockerfile HEALTHCHECK: `curl -f http://localhost:8080/healthz` (interval 30s, timeout 5s, start-period 5s, 3 retries).
+- Entrypoint: `navigator-server`, default args: `--port 8080`.
+
+### Cluster Image (`navigator-cluster`)
+
+A k3s image with bundled Helm charts and Kubernetes manifests for single-container deployment. Component images (sandbox, gateway, PKI job) are **pulled at runtime** from the distribution registry -- they are not bundled as tarballs in this image.
+
+**Defined in** `deploy/docker/Dockerfile.cluster`.
+
+**Base image:** `rancher/k3s:v1.29.8-k3s1` (configurable via `K3S_VERSION` build arg).
+
+**Layers added:**
+
+1. Custom entrypoint: `cluster-entrypoint.sh` at `/usr/local/bin/`.
+2. Healthcheck script: `cluster-healthcheck.sh` at `/usr/local/bin/`.
+3. Packaged Helm charts: `deploy/docker/.build/charts/*.tgz` at `/var/lib/rancher/k3s/server/static/charts/`.
+4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` at `/opt/navigator/manifests/`.
+
+**Bundled manifests:**
+
+- `navigator-helmchart.yaml` -- HelmChart CR that auto-deploys the gateway chart from the k3s static file server.
+- `envoy-gateway-helmchart.yaml` -- HelmChart CR for Envoy Gateway (v1.5.8, includes Gateway API CRDs).
+- `agent-sandbox.yaml` -- Agent Sandbox CRD controller namespace, service account, and RBAC bindings.
+
+**HEALTHCHECK:** `--interval=5s --timeout=5s --start-period=20s --retries=60`, runs `/usr/local/bin/cluster-healthcheck.sh`.
+
+**Runtime image pulling:** Registry credentials are generated by the entrypoint script at container start and written to `/etc/rancher/k3s/registries.yaml`. The bootstrap code (`navigator-bootstrap`) passes registry host, endpoint, and credentials as environment variables on the container.
+
+### PKI Job Image (`navigator-pki-job`)
+
+A minimal Alpine 3.20 image used by the Helm chart's gateway PKI pre-install/pre-upgrade Job. It generates mTLS certificates for the gateway when TLS is enabled.
+
+**Defined in** `deploy/docker/Dockerfile.pki-job`.
+
+**Contents:** `ca-certificates`, `kubectl`, `openssl`.
+
+The Job template in `deploy/helm/navigator/templates/gateway-pki-job.yaml` runs an inline shell script that:
+
+1. Checks if all three TLS secrets already exist (skips if they do, fails if only some exist).
+2. Generates a self-signed CA (RSA 2048, 10-year validity).
+3. Creates a server certificate with SANs for cluster-internal DNS names (`navigator`, `navigator.<ns>.svc`, `navigator.<ns>.svc.cluster.local`, `localhost`, `host.docker.internal`, `127.0.0.1`) plus any extra SANs from the `EXTRA_SANS` environment variable.
+4. Creates a client certificate for CLI mutual TLS authentication.
+5. Creates three Kubernetes secrets: server TLS secret, client CA secret, and CLI client secret (containing `ca.crt`, `tls.crt`, `tls.key`).
+
+### Python Wheel Images (build-only)
+
+Two Dockerfiles produce Python wheels for the CLI package distribution. These are not deployed as running containers.
+
+- **`Dockerfile.python-wheels`** -- Builds Linux amd64/arm64 wheels using Maturin. Installs Rust toolchain and cross-compilation targets. Output stage is `scratch` with only the `.whl` files.
+- **`Dockerfile.python-wheels-macos`** -- Builds macOS arm64 wheels using osxcross (cross-compiling from Linux). Uses `crazymax/osxcross:latest` as the cross-toolchain source. The `OSXCROSS_IMAGE` build arg allows using a mirrored registry image instead of Docker Hub.
+
+### CI Runner Image (`navigator-ci`)
+
+A pre-built Ubuntu 24.04 image for CI pipeline jobs, defined in `deploy/docker/Dockerfile.ci`.
+
+**Pre-installed tools:**
+
+| Tool | Purpose |
+|---|---|
+| Docker CLI + buildx plugin | DinD-based image build/publish jobs |
+| AWS CLI v2 | ECR authentication and image publishing |
+| kubectl, helm, protoc | Kubernetes operations, chart packaging, proto compilation |
+| mise | Task runner with Rust, Python, and cargo-edit toolchains |
+| uv | Python package management (installed from Astral's installer to avoid GitHub API rate limits) |
+| sccache | Rust compilation cache (amd64 only; skipped on arm64) |
+| socat | Docker socket forwarding in sandbox e2e tests |
+
+The build context must include `build/` because the Dockerfile copies mise task includes from that directory (`mise.toml` + `build/*.toml`).
+
+## Cross-Compilation Support
+
+All Rust-based Dockerfiles (sandbox, gateway) use `deploy/docker/cross-build.sh` for multi-architecture builds. This script:
+
+1. Detects whether the build is cross-platform by comparing `TARGETARCH` and `BUILDARCH` (set by `docker buildx`).
+2. Maps Docker arch names to Rust target triples (`arm64` -> `aarch64-unknown-linux-gnu`, `amd64` -> `x86_64-unknown-linux-gnu`).
+3. Installs the gcc cross-linker and target libc for the target architecture (no-op for native builds).
+4. Provides `cargo_cross_build()` which sets `CC`, `CXX`, and linker environment variables and passes the correct `--target` flag.
+5. Provides `cross_output_dir()` to locate the compiled binary in the correct target-specific output directory.
+
+This enables the `FROM --platform=$BUILDPLATFORM` pattern: Rust compilation runs natively on the build host for speed, and only the final runtime stage runs on the target platform.
+
+## Entrypoint Script
+
+`deploy/docker/cluster-entrypoint.sh` runs before k3s starts inside the cluster container. It performs four tasks.
+
+### DNS proxy setup
+
+On Docker custom networks, `/etc/resolv.conf` contains `127.0.0.11` (Docker's embedded DNS). k3s detects this loopback address and falls back to `8.8.8.8`, which does not work reliably on Docker Desktop (Mac/Windows) due to external UDP limitations.
+
+The entrypoint solves this with an iptables-based DNS proxy:
+
+1. Discovers Docker's real DNS listener ports from the `DOCKER_OUTPUT` iptables chain (Docker DNAT rules that redirect port 53 to random high ports on `127.0.0.11`).
+2. Gets the container's `eth0` IP as a routable address.
+3. Adds DNAT rules in `PREROUTING` to forward DNS traffic from k3s pod network namespaces through the container's `eth0` IP to Docker's DNS.
+4. Writes a custom resolv.conf at `/etc/rancher/k3s/resolv.conf` pointing to the container IP.
+5. Passes `--resolv-conf=/etc/rancher/k3s/resolv.conf` to k3s.
+
+If iptables detection fails, falls back to writing `8.8.8.8` / `8.8.4.4` as nameservers.
+
+### Registry configuration
+
+Writes `/etc/rancher/k3s/registries.yaml` from environment variables passed by the bootstrap code:
+
+| Variable | Purpose |
+|---|---|
+| `REGISTRY_HOST` | Registry hostname for the mirror entry |
+| `REGISTRY_ENDPOINT` | Endpoint URL (defaults to `REGISTRY_HOST`) |
+| `REGISTRY_INSECURE` | Use HTTP instead of HTTPS (parsed: `true`/`1`/`yes`/`on`) |
+| `REGISTRY_USERNAME` | Auth username (optional) |
+| `REGISTRY_PASSWORD` | Auth password (optional) |
+
+### Manifest injection
+
+Copies bundled manifests from `/opt/navigator/manifests/` to `/var/lib/rancher/k3s/server/manifests/`. This is necessary because the persistent volume mount on `/var/lib/rancher/k3s` overwrites any files baked into that path at image build time.
+
+### Image configuration overrides
+
+Modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml` based on environment variables:
+
+| Variable | Effect |
+|---|---|
+| `IMAGE_REPO_BASE` | Rewrites `repository:`, `sandboxImage:`, and `jobImage:` to use the specified base path |
+| `PUSH_IMAGE_REFS` | Parses comma-separated image refs and rewrites exact gateway, sandbox, and pki-job references (matching on path component `/server:`, `/sandbox:`, `/pki-job:`) |
+| `IMAGE_TAG` | Replaces `:latest` tags with the specified tag (handles both quoted and unquoted `tag: latest` formats) |
+| `IMAGE_PULL_POLICY` | Replaces `pullPolicy: Always` with the specified policy (e.g., `IfNotPresent`) |
+| `SSH_GATEWAY_HOST` / `SSH_GATEWAY_PORT` | Replaces `__SSH_GATEWAY_HOST__` and `__SSH_GATEWAY_PORT__` placeholders; clears to defaults if unset |
+| `EXTRA_SANS` | Builds a YAML flow-style list from comma-separated SANs and replaces `extraSANs: []` |
+
+## Healthcheck Script
+
+`deploy/docker/cluster-healthcheck.sh` validates cluster readiness through a series of sequential checks:
+
+1. **Kubernetes API** -- `kubectl get --raw='/readyz'`.
+2. **Gateway StatefulSet** -- Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
+3. **Gateway** -- Checks that `gateway/navigator-gateway` in namespace `navigator` has the `Programmed` condition.
+4. **mTLS secret** (conditional) -- If TLS is enabled (via `NAV_GATEWAY_TLS_ENABLED` env or inferred from HelmChart manifest using two-path detection: `/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml` then `/opt/navigator/manifests/navigator-helmchart.yaml`), checks that secret `navigator-cli-client` exists with non-empty `ca.crt`, `tls.crt`, and `tls.key` data.
+
+## Helm Chart
+
+The Helm chart at `deploy/helm/navigator/` deploys the gateway to Kubernetes as a StatefulSet.
+
+### Chart Metadata
+
+| Field | Value |
+|---|---|
+| Name | `navigator` |
+| Type | `application` |
+| Version | `0.1.0` |
+| appVersion | `0.1.0` |
+
+### Key Configuration (`values.yaml`)
+
+```yaml
+replicaCount: 1
+
+image:
+  repository: d1i0nduu2f6qxk.cloudfront.net/navigator/server
+  pullPolicy: Always
+  tag: "latest"
+
+server:
+  logLevel: info
+  sandboxNamespace: navigator
+  dbUrl: "sqlite:/var/navigator/navigator.db"
+  sandboxImage: "d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest"
+  grpcEndpoint: "http://navigator.navigator.svc.cluster.local:8080"
+  sshGatewayHost: ""     # Public host for SSH proxy CONNECT (default: 127.0.0.1)
+  sshGatewayPort: 0      # Public port for SSH proxy CONNECT (default: 8080)
+
+service:
+  type: NodePort
+  port: 8080
+  nodePort: 30051
+
+gateway:
+  enabled: true
+  name: navigator-gateway
+  className: envoy-gateway
+  createGatewayClass: true
+  listenerPort: 8080
+  tls:
+    enabled: false
+    secretName: navigator-gateway-tls
+    clientCaSecretName: navigator-gateway-client-ca
+    cliSecretName: navigator-cli-client
+    listenerPort: 443
+    jobImage: d1i0nduu2f6qxk.cloudfront.net/navigator/pki-job:latest
+    extraSANs: []
+```
+
+### Deployment Architecture
+
+The chart deploys a **StatefulSet** (not a Deployment) with a `volumeClaimTemplate` for persistent storage:
+
+- **PVC**: `navigator-data`, `ReadWriteOnce`, 1Gi, mounted at `/var/navigator`.
+- **Security context**: non-root (UID 1000), `fsGroup: 1000`, all capabilities dropped, no privilege escalation.
+- **Probes**: Liveness at `/healthz`, readiness at `/readyz`, both on the `grpc` port (8080). Initial delay 5s, period 10s.
+- **Service**: NodePort exposing port 8080, with nodePort 30051.
+
+### Gateway Configuration
+
+When `gateway.enabled` is true, the chart creates:
+
+- **GatewayClass** (`envoy-gateway`) and **Gateway** (`navigator-gateway`) with an HTTP or HTTPS listener depending on TLS settings.
+- **GRPCRoute** routing all gRPC traffic from the Envoy Gateway to the gateway service.
+- **BackendTrafficPolicy** disabling the default 15-second request timeout (`requestTimeout: "0s"`) so long-lived gRPC streaming calls (e.g., `WatchSandbox`) are not terminated.
+
+When `gateway.tls.enabled` is also true:
+
+- The gateway listener uses HTTPS with a TLS certificate from a Kubernetes secret.
+- A **ClientTrafficPolicy** enables mutual TLS validation using the client CA secret.
+- A pre-install/pre-upgrade **Job** (`gateway-pki-job`) generates the CA, server cert, and client cert (see [PKI Job Image](#pki-job-image-navigator-pki-job) above).
+
+### Gateway Environment Variables (from StatefulSet)
+
+| Environment Variable | Source | Description |
+|---|---|---|
+| `NAVIGATOR_SANDBOX_NAMESPACE` | `server.sandboxNamespace` | Kubernetes namespace for sandbox pods |
+| `NAVIGATOR_SANDBOX_IMAGE` | `server.sandboxImage` | Container image for sandbox pods |
+| `NAVIGATOR_GRPC_ENDPOINT` | `server.grpcEndpoint` | gRPC callback endpoint (reachable from pods) |
+| `NAVIGATOR_SSH_GATEWAY_HOST` | `server.sshGatewayHost` | Public SSH gateway hostname (conditional) |
+| `NAVIGATOR_SSH_GATEWAY_PORT` | `server.sshGatewayPort` | Public SSH gateway port (conditional) |
+
+### RBAC
+
+The chart creates a Role and RoleBinding granting the gateway's ServiceAccount permissions to manage `agents.x-k8s.io/sandboxes` resources (CRUD + watch) and read `events` in the release namespace.
+
+## Build Tasks (mise)
+
+All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
+
+### Docker Image Tasks
+
+| Task | Description |
+|---|---|
+| `mise run docker:build` | Build all runtime images (pki-job, sandbox, gateway, cluster) |
+| `mise run docker:build:sandbox` | Build sandbox image |
+| `mise run docker:build:server` | Build gateway image |
+| `mise run docker:build:pki-job` | Build gateway PKI job image |
+| `mise run docker:build:cluster` | Build k3s cluster image (packages Helm charts first) |
+| `mise run docker:build:ci` | Build CI runner image |
+| `mise run docker:build:cluster:multiarch` | Build multi-arch cluster image and push to a registry |
+| `mise run docker:publish:cluster:multiarch` | Build and publish multi-arch cluster image to ECR |
+
+### Cluster Lifecycle Tasks
+
+| Task | Description |
+|---|---|
+| `mise run cluster` | Build all images + deploy local k3s cluster via local registry |
+| `mise run cluster:deploy` | Fast deploy: rebuild changed components only |
+| `mise run cluster:deploy:all` | Full deploy: rebuild all components via local registry |
+| `mise run cluster:push:server` | Tag and push gateway image to local registry |
+| `mise run cluster:push:sandbox` | Tag and push sandbox image to local registry |
+| `mise run cluster:push:pki-job` | Tag and push pki-job image to local registry |
+
+### Other Tasks
+
+| Task | Description |
+|---|---|
+| `mise run sandbox` | Run sandbox container interactively (builds image first) |
+| `mise run helm:lint` | Lint the Helm chart |
+
+### How `cluster:deploy` Works
+
+`build/scripts/cluster-deploy-fast.sh` supports two modes:
+
+**Auto mode** (no arguments): Detects changed files from Git (unstaged, staged, and untracked) and determines which components to rebuild:
+
+| Changed Path | Triggers |
+|---|---|
+| `Cargo.toml`, `Cargo.lock`, `proto/*`, `deploy/docker/cross-build.sh` | Gateway + sandbox rebuild |
+| `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway + sandbox rebuild |
+| `crates/navigator-router/*` | Gateway rebuild |
+| `crates/navigator-server/*`, `deploy/docker/Dockerfile.server` | Gateway rebuild |
+| `crates/navigator-sandbox/*`, `deploy/docker/Dockerfile.sandbox`, `python/*`, `pyproject.toml`, `uv.lock`, `dev-sandbox-policy.rego` | Sandbox rebuild |
+| `deploy/docker/Dockerfile.pki-job` | PKI job rebuild |
+| `deploy/helm/navigator/*` | Helm upgrade |
+
+**Explicit target mode** (arguments: `server`, `sandbox`, `pki-job`, `chart`, `all`): Rebuilds only the specified components.
+
+After building, the script:
+
+1. Tags images with the `IMAGE_REPO_BASE` prefix and pushes to the local registry.
+2. Detects if the sandbox image content-addressable ID changed; if so, evicts the stale copy from k3s's containerd store via `crictl rmi` so new sandbox pods pull the updated image.
+3. Runs `helm upgrade` if chart changes were detected (or `FORCE_HELM_UPGRADE=1`).
+4. Restarts the gateway StatefulSet (or Deployment, if present) and waits for rollout completion.
+
+### How `mise run cluster` Works
+
+`build/scripts/cluster-bootstrap.sh` performs a full cluster bootstrap for local development:
+
+1. Resolves the local registry address (defaults to `localhost:5000/navigator`). In CI, uses `$CI_REGISTRY_IMAGE`.
+2. Ensures a local Docker registry container (`navigator-local-registry`) is running on port 5000 (creates one if needed).
+3. Builds and pushes all three component images (gateway, sandbox, pki-job) to the local registry via `cluster-push-component.sh`.
+4. Runs `nav cluster admin deploy --name <CLUSTER_NAME> --update-kube-config` to create or update the cluster container.
+
+### Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `IMAGE_TAG` | `dev` | Tag for built images |
+| `RUST_BUILD_PROFILE` | `debug` | `debug` or `release` for sandbox builds |
+| `K3S_VERSION` | `v1.29.8-k3s1` | k3s version for cluster image |
+| `ENVOY_GATEWAY_VERSION` | `v1.5.8` | Envoy Gateway Helm chart version |
+| `CLUSTER_NAME` | basename of `$PWD` | Name for local cluster deployment |
+| `DOCKER_PLATFORM` | (unset) | Target platform for multi-arch builds (e.g., `linux/amd64`) |
+| `DOCKER_BUILDER` | (auto-selected) | Buildx builder name |
+| `IMAGE_REPO_BASE` | `localhost:5000/navigator` | Image repository base for local registry pushes |
+
+### Build Caching
+
+Container builds use Docker BuildKit with local cache directories:
+
+- `build/scripts/docker-build-component.sh` stores per-component caches in `.cache/buildkit/<component>`.
+- `build/scripts/docker-build-cluster.sh` stores the cluster image cache in `.cache/buildkit/cluster`.
+- Rust-heavy Dockerfiles use BuildKit cache mounts for cargo registry and target directories, keyed by image name and `TARGETARCH`, with `sharing=locked` to prevent concurrent cache corruption in parallel CI builds.
+- When the active buildx driver is `docker` (not `docker-container`), local cache import/export flags are skipped automatically because the docker driver cannot export local caches. In CI, cache export is also skipped.
+- For local single-arch builds, the scripts auto-select a builder with the native `docker` driver (matching the active Docker context) so images land directly in the Docker image store without slow tarball export.
+
+### CI Caching
+
+In CI pipelines:
+
+- `.cache/buildkit/` is cached between pipeline runs to avoid recompiling unchanged Rust dependencies.
+- Rust lint/test jobs cache `.cache/sccache/` and `target/` with keys derived from `Cargo.lock` and Rust task config files, scoped per runner architecture.
+- CI sets `CARGO_INCREMENTAL=0` to favor deterministic clean builds over incremental metadata churn.
+- The `build_ci_image` job publishes a registry-backed BuildKit cache at `$CI_REGISTRY_IMAGE/ci:buildcache` so layer cache survives across runners and pipelines even when local cache directories are cold.
+- Publish jobs mirror `crazymax/osxcross:latest` into `$CI_REGISTRY_IMAGE/third_party/osxcross:latest` (when missing) and set `OSXCROSS_IMAGE` so macOS wheel Docker builds consume the mirrored image instead of pulling from Docker Hub on each run.
+- The sandbox e2e test job tags and pushes component images to the GitLab project registry (`$CI_REGISTRY_IMAGE`) and configures cluster bootstrap to pull from that remote registry with CI credentials.
+
+## Multi-Arch Publishing
+
+`build/scripts/docker-publish-multiarch.sh` builds and pushes all images for multiple architectures.
+
+**Two modes:**
+
+| Mode | Registry | Notes |
+|---|---|---|
+| `registry` | `DOCKER_REGISTRY` env var | Images named `navigator-<component>` |
+| `ecr` | AWS ECR (account/region configurable) | Images named `<component>` (no prefix), `--provenance=false --sbom=false` |
+
+**Process:**
+
+1. Builds and pushes sandbox, gateway, and pki-job images as multi-arch manifests using cross-compilation.
+2. Packages the Helm chart and downloads the Envoy Gateway chart.
+3. Builds and pushes the multi-arch cluster image.
+4. Applies additional tags (`:latest` if `TAG_LATEST=true`, plus any `EXTRA_DOCKER_TAGS`) by copying manifests with `docker buildx imagetools create --prefer-index=false`.
+
+**Default platforms:** `linux/amd64,linux/arm64` (overridable via `DOCKER_PLATFORMS`).
+
+## Deployment Flows
+
+### Local Development
+
+```bash
+# Full build + deploy (builds all images, starts local registry, bootstraps cluster)
+mise run cluster
+
+# Incremental rebuild of changed components only
+mise run cluster:deploy
+
+# Rebuild specific component(s)
+mise run cluster:deploy server sandbox
+
+# Run sandbox container interactively (for testing sandbox code)
+mise run sandbox
+```
+
+### Multi-Arch Publishing
+
+```bash
+# Push to a generic Docker registry
+DOCKER_REGISTRY=ghcr.io/myorg mise run docker:build:cluster:multiarch
+
+# Push to ECR
+mise run docker:publish:cluster:multiarch
+
+# Main branch publish (dev + latest + version tags, cluster image + Python wheels)
+mise run publish:main
+```
+
+### Auto-Deployed Components in Cluster
+
+When the cluster container starts, k3s automatically deploys these HelmChart CRs from `/var/lib/rancher/k3s/server/manifests/`:
+
+1. **Envoy Gateway** (from `gateway-helm-v1.5.8.tgz` in the static charts directory) -- deployed into `envoy-gateway-system` namespace. Includes Gateway API CRDs.
+2. **Gateway** (from `navigator-0.1.0.tgz` in the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. These values are rewritten by the entrypoint script based on environment variables from the bootstrap code.
+
+## Implementation References
+
+- `deploy/docker/Dockerfile.sandbox` -- Sandbox image (5-stage multi-arch build)
+- `deploy/docker/Dockerfile.server` -- Gateway image (2-stage with dependency caching)
+- `deploy/docker/Dockerfile.cluster` -- Cluster image (k3s base + charts + manifests)
+- `deploy/docker/Dockerfile.pki-job` -- PKI job image (Alpine + openssl + kubectl)
+- `deploy/docker/Dockerfile.ci` -- CI runner image (Ubuntu + full toolchain)
+- `deploy/docker/Dockerfile.python-wheels` -- Linux wheel builder
+- `deploy/docker/Dockerfile.python-wheels-macos` -- macOS wheel builder
+- `deploy/docker/cross-build.sh` -- Shared Rust cross-compilation helpers
+- `deploy/docker/cluster-entrypoint.sh` -- Cluster container entrypoint
+- `deploy/docker/cluster-healthcheck.sh` -- Cluster health check script
+- `deploy/helm/navigator/` -- Helm chart directory
+- `deploy/kube/manifests/` -- Auto-deployed Kubernetes manifests
+- `build/docker.toml` -- Docker build task definitions
+- `build/cluster.toml` -- Cluster lifecycle task definitions
+- `build/scripts/docker-build-component.sh` -- Generic component image builder
+- `build/scripts/docker-build-cluster.sh` -- Cluster image builder
+- `build/scripts/docker-publish-multiarch.sh` -- Multi-arch publish script
+- `build/scripts/cluster-bootstrap.sh` -- Full local cluster bootstrap
+- `build/scripts/cluster-deploy-fast.sh` -- Incremental deploy script
+- `build/scripts/cluster-push-component.sh` -- Single component push to registry

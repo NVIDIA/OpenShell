@@ -51,7 +51,7 @@ The gRPC surface is defined in `proto/navigator.proto`:
 - `crates/navigator-cli`
   - `nav provider ...` command handlers,
   - sandbox provider requirement resolution in `sandbox create`.
-- `crates/navigator-server`
+- `crates/navigator-server` (gateway)
   - provider CRUD gRPC handlers,
   - `GetSandboxProviderEnvironment` handler resolves credentials at runtime,
   - persistence using `object_type = "provider"`.
@@ -183,14 +183,14 @@ Resolution logic (CLI side, `crates/navigator-cli/src/run.rs`):
    (for example `claude`),
 2. union with explicit `--provider <type>` flags (normalized),
 3. deduplicate,
-4. `ensure_required_providers()` checks each required type exists on the server,
+4. `ensure_required_providers()` checks each required type exists on the gateway,
 5. if interactive and missing, auto-create from existing local state
    (uses `ProviderRegistry::discover_existing()`), trying names like `"claude"`,
    `"claude-1"`, etc. up to 5 retries for name conflicts,
 6. non-interactive mode fails with a clear missing-provider error,
 7. set resolved provider **names** in `SandboxSpec.providers`.
 
-Server-side `create_sandbox()` (`crates/navigator-server/src/grpc.rs`):
+Gateway-side `create_sandbox()` (`crates/navigator-server/src/grpc.rs`):
 
 1. validates all provider names exist by fetching each from the store (fail fast),
 2. creates the `Sandbox` object with `spec.providers` set,
@@ -211,7 +211,7 @@ If a requested provider name is not found, sandbox creation fails with a
 Credentials are **not** embedded in the pod spec. Instead, the sandbox supervisor fetches
 them at runtime via the `GetSandboxProviderEnvironment` gRPC call.
 
-### Server-side: `resolve_provider_environment()`
+### Gateway-side: `resolve_provider_environment()`
 
 `resolve_provider_environment()` (`crates/navigator-server/src/grpc.rs`) builds the
 environment map returned by `GetSandboxProviderEnvironment`:
@@ -233,7 +233,7 @@ Key behaviors:
 
 The sandbox pod runs `navigator-sandbox` (`crates/navigator-sandbox/src/main.rs`). On
 startup it receives `NAVIGATOR_SANDBOX_ID` and `NAVIGATOR_ENDPOINT` as environment
-variables (injected into the pod spec by the server's Kubernetes sandbox creation code).
+variables (injected into the pod spec by the gateway's Kubernetes sandbox creation code).
 
 In `run_sandbox()` (`crates/navigator-sandbox/src/lib.rs`):
 
@@ -296,22 +296,22 @@ CLI: nav sandbox create -- claude
   |
   +-- detect_provider_from_command(["claude"]) -> "claude"
   +-- ensure_required_providers() -> discovers local ANTHROPIC_API_KEY
-  |     +-- Creates provider record "claude" on server with credentials
+  |     +-- Creates provider record "claude" on gateway with credentials
   +-- Sets SandboxSpec.providers = ["claude"]
-  +-- Sends CreateSandboxRequest to server
+  +-- Sends CreateSandboxRequest to gateway
         |
-        Server: create_sandbox()
+        Gateway: create_sandbox()
           +-- Validates provider "claude" exists in store (fail fast)
           +-- Persists Sandbox with spec.providers = ["claude"]
           +-- Creates K8s Sandbox CRD (no credentials in pod spec)
                 |
-                K8s: Pod starts navigator-sandbox binary
+                K8s: pod starts navigator-sandbox binary
                   +-- NAVIGATOR_SANDBOX_ID and NAVIGATOR_ENDPOINT set in pod env
                   |
                   Sandbox supervisor: run_sandbox()
                     +-- Fetches policy via gRPC
                     +-- Fetches provider env via gRPC
-                    |     +-- Server resolves: "claude" -> credentials -> {ANTHROPIC_API_KEY: "sk-..."}
+                    |     +-- Gateway resolves: "claude" -> credentials -> {ANTHROPIC_API_KEY: "sk-..."}
                     +-- Spawns entrypoint: cmd.env("ANTHROPIC_API_KEY", "sk-...")
                     +-- SSH server holds provider_env
                           +-- Each SSH shell: cmd.env("ANTHROPIC_API_KEY", "sk-...")
@@ -319,7 +319,7 @@ CLI: nav sandbox create -- claude
 
 ## Persistence and Validation
 
-Server enforces:
+The gateway enforces:
 
 - `provider.type` must be non-empty,
 - name uniqueness for providers,
@@ -341,5 +341,5 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 - Per-provider unit tests in each provider module.
 - Shared normalization/command-detection tests in `crates/navigator-providers/src/lib.rs`.
 - Mocked discovery context tests cover env and path-based behavior.
-- CLI and server integration tests validate end-to-end RPC compatibility.
+- CLI and gateway integration tests validate end-to-end RPC compatibility.
 - `resolve_provider_environment` unit tests in `crates/navigator-server/src/grpc.rs`.
