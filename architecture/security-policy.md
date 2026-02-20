@@ -533,7 +533,60 @@ See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
 ## Control Plane Bypass
 
-When `--navigator-endpoint` is set, the proxy automatically allows connections to the gateway endpoint without OPA evaluation. This ensures the sandbox can always reach the gateway for inference routing and provider environment updates. The endpoint is parsed from the URL and added to a `control_plane_endpoints` allowlist. See `crates/navigator-sandbox/src/proxy.rs` -- `is_control_plane` check.
+When `--navigator-endpoint` is set, the proxy automatically allows connections to the gateway endpoint without OPA evaluation. This ensures the sandbox can always reach the gateway for inference routing and provider environment updates. The endpoint is parsed from the URL and added to a `control_plane_endpoints` allowlist. Control plane endpoints are also exempt from the SSRF internal-IP check (see below) because they legitimately resolve to private IPs in cluster deployments. See `crates/navigator-sandbox/src/proxy.rs` -- `is_control_plane` check.
+
+---
+
+## SSRF Protection (Internal IP Rejection)
+
+As a defense-in-depth measure, the proxy resolves DNS before connecting to upstream hosts and rejects any connection where the resolved IP address falls within an internal range. This prevents Server-Side Request Forgery (SSRF) attacks where a misconfigured or overly permissive OPA policy could allow connections to infrastructure endpoints such as cloud metadata services (`169.254.169.254`), localhost, or RFC 1918 private addresses.
+
+The check runs after OPA policy allows the connection but before the TCP connection to the upstream is established. Even if an attacker controls a DNS record that maps an allowed hostname to an internal IP, the proxy blocks the connection.
+
+### Blocked IP Ranges
+
+| Range | Description |
+|-------|-------------|
+| `127.0.0.0/8` | IPv4 loopback |
+| `10.0.0.0/8` | RFC 1918 private (Class A) |
+| `172.16.0.0/12` | RFC 1918 private (Class B) |
+| `192.168.0.0/16` | RFC 1918 private (Class C) |
+| `169.254.0.0/16` | IPv4 link-local (includes cloud metadata endpoints) |
+| `::1` | IPv6 loopback |
+| `fe80::/10` | IPv6 link-local |
+| `::ffff:0:0/96` (mapped) | IPv4-mapped IPv6 addresses are unwrapped and checked as IPv4 |
+
+### Implementation
+
+Two functions in `crates/navigator-sandbox/src/proxy.rs` implement this check:
+
+- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. For IPv6, it checks loopback and link-local ranges directly, then unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks.
+
+- **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected. On success, returns the resolved addresses for direct use with `TcpStream::connect()`.
+
+### Placement in Proxy Flow
+
+```mermaid
+flowchart TD
+    A[CONNECT request received] --> B{Control plane endpoint?}
+    B -- Yes --> C["Allow: skip OPA + SSRF check"]
+    B -- No --> D[OPA policy evaluation]
+    D --> E{Allowed?}
+    E -- No --> F["403 Forbidden"]
+    E -- Yes --> G["resolve_and_reject_internal(host, port)"]
+    G --> H{All IPs public?}
+    H -- No --> I["403 Forbidden + log warning"]
+    H -- Yes --> J["TcpStream::connect(resolved addrs)"]
+    J --> K[200 Connection Established]
+```
+
+### Control Plane Exemption
+
+Control plane endpoints bypass the SSRF check entirely and connect using hostname-based `TcpStream::connect()`. This is necessary because the gateway legitimately resolves to a private IP (e.g., a Kubernetes service IP or `10.200.0.1` on the veth pair). Control plane endpoints are already authenticated before OPA evaluation, so the SSRF bypass does not weaken the security model.
+
+### DNS Resolution Failure
+
+If DNS resolution fails (no addresses returned or lookup error), the connection is rejected with a descriptive error. This prevents connections to hosts that cannot be validated.
 
 ---
 

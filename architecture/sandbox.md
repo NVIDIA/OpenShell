@@ -354,13 +354,15 @@ sequenceDiagram
     participant S as Sandboxed Process
     participant P as Proxy (host netns)
     participant O as OPA Engine
+    participant DNS as DNS Resolver
     participant U as Upstream Server
 
     S->>P: CONNECT api.example.com:443 HTTP/1.1
     P->>P: Parse CONNECT target (host, port)
     P->>P: Check control-plane allowlist
     alt Control-plane endpoint
-        P->>P: Allow without OPA
+        P->>P: Allow without OPA or SSRF check
+        P->>U: TCP connect (hostname-based)
     else Normal endpoint
         P->>P: Resolve TCP peer identity via /proc
         P->>P: TOFU verify binary SHA256
@@ -368,18 +370,25 @@ sequenceDiagram
         P->>P: Collect cmdline paths
         P->>O: evaluate_network(input)
         O-->>P: PolicyDecision{allowed, reason, matched_policy}
-    end
-    P->>P: Log CONNECT decision (unified log line)
-    alt Denied
-        P-->>S: HTTP/1.1 403 Forbidden
-    else Allowed
-        P->>U: TCP connect
-        P-->>S: HTTP/1.1 200 Connection Established
-        alt L7 config present
-            P->>P: TLS termination / protocol detection
-            P->>P: Per-request L7 evaluation
-        else L4-only
-            P->>P: copy_bidirectional (raw tunnel)
+        P->>P: Log CONNECT decision (unified log line)
+        alt Denied by OPA
+            P-->>S: HTTP/1.1 403 Forbidden
+        else Allowed by OPA
+            P->>DNS: resolve_and_reject_internal(host, port)
+            DNS-->>P: Resolved addresses
+            alt Any IP is internal
+                P->>P: Log warning (SSRF blocked)
+                P-->>S: HTTP/1.1 403 Forbidden
+            else All IPs public
+                P->>U: TCP connect (resolved addrs)
+                P-->>S: HTTP/1.1 200 Connection Established
+                alt L7 config present
+                    P->>P: TLS termination / protocol detection
+                    P->>P: Per-request L7 evaluation
+                else L4-only
+                    P->>P: copy_bidirectional (raw tunnel)
+                end
+            end
         end
     end
 ```
@@ -399,7 +408,7 @@ The proxy reads up to 8192 bytes (`MAX_HEADER_BYTES`) looking for `\r\n\r\n`. It
 
 ### Control-plane bypass
 
-Connections to the gateway's own endpoint (parsed from `--navigator-endpoint`) are always allowed without OPA evaluation. This ensures the sandboxed process can reach the gateway for inference routing and other management operations. The decision engine is recorded as `"control_plane"`.
+Connections to the gateway's own endpoint (parsed from `--navigator-endpoint`) are always allowed without OPA evaluation and without the SSRF internal-IP check. This ensures the sandboxed process can reach the gateway for inference routing and other management operations, even when the gateway resolves to a private IP (e.g., a Kubernetes service IP). Control-plane connections use hostname-based `TcpStream::connect()` rather than pre-resolved addresses. The decision engine is recorded as `"control_plane"`.
 
 ### OPA evaluation with identity binding (`evaluate_opa_tcp()`)
 
@@ -445,9 +454,13 @@ struct ConnectDecision {
 
 Every CONNECT request produces a single `info!()` log line with all context: source/destination addresses, binary path, PID, ancestor chain, cmdline paths, action (allow/deny), engine, matched policy, and deny reason.
 
+### SSRF protection (internal IP rejection)
+
+After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. Control-plane endpoints are exempt from this check. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
+
 ### Post-decision: L7 dispatch or raw tunnel
 
-After a CONNECT is allowed and the upstream TCP connection is established:
+After a CONNECT is allowed, the SSRF check passes, and the upstream TCP connection is established:
 
 1. **Query L7 config**: `query_l7_config()` asks the OPA engine for `matched_endpoint_config`. If the endpoint has a `protocol` field, parse it into `L7EndpointConfig`.
 
@@ -776,6 +789,8 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | CA file write failure | Warn + TLS termination disabled |
 | OPA engine Mutex lock poisoned | Error on the individual evaluation |
 | Binary integrity TOFU mismatch | Deny the specific CONNECT request |
+| SSRF: hostname resolves to internal IP | Deny the specific CONNECT request (403 Forbidden + warning log) |
+| SSRF: DNS resolution failure | Deny the specific CONNECT request |
 | Proxy accept error | Log + break accept loop |
 | Benign connection close (EOF, reset, pipe) | Debug level (not visible to user by default) |
 | L7 parse error | Close the connection |

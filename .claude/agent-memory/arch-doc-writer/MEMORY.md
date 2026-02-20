@@ -93,6 +93,14 @@
 - CA files: /etc/navigator-tls/navigator-ca.pem (standalone) + ca-bundle.pem (system CAs + sandbox CA)
 - Trust env vars: NODE_EXTRA_CA_CERTS, SSL_CERT_FILE, REQUESTS_CA_BUNDLE, CURL_CA_BUNDLE
 
+## Proxy SSRF Protection
+- `is_internal_ip()` and `resolve_and_reject_internal()` in proxy.rs
+- Blocks: 127/8, 10/8, 172.16/12, 192.168/16, 169.254/16, ::1, fe80::/10, IPv4-mapped IPv6
+- Runs after OPA allow, before TcpStream::connect
+- Control plane endpoints exempt (they connect via hostname, skip SSRF check)
+- DNS failure also rejects the connection
+- Non-CP connections use pre-resolved addrs: `TcpStream::connect(addrs.as_slice())`
+
 ## Naming Conventions
 - The project name "Navigator" appears in code but docs should use generic terms per user preference
 - CLI binary: `navigator` (aliased as `nav` in dev via mise)

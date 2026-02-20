@@ -470,6 +470,91 @@ def test_l4_log_fields(
 
 
 # =============================================================================
+# SSRF Tests -- Internal IP rejection (defense-in-depth)
+#
+# The proxy resolves DNS before connecting and rejects any destination that
+# resolves to a loopback, RFC1918 private, or link-local address.  These
+# tests verify the check works even when OPA policy explicitly allows the
+# internal endpoint.
+#
+# SSRF-1: Loopback (127.0.0.1) blocked despite OPA allow
+# SSRF-2: Cloud metadata (169.254.169.254) blocked despite OPA allow
+# SSRF-3: Log shows "internal address" block reason
+# =============================================================================
+
+
+def test_ssrf_blocks_loopback_despite_policy_allow(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-1: CONNECT to 127.0.0.1 blocked even with explicit OPA allow."""
+    policy = _base_policy(
+        network_policies={
+            "internal": sandbox_pb2.NetworkPolicyRule(
+                name="internal",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="127.0.0.1", port=80),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("127.0.0.1", 80))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout
+
+
+def test_ssrf_blocks_metadata_endpoint_despite_policy_allow(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-2: CONNECT to 169.254.169.254 blocked even with explicit OPA allow."""
+    policy = _base_policy(
+        network_policies={
+            "metadata": sandbox_pb2.NetworkPolicyRule(
+                name="metadata",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="169.254.169.254", port=80),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("169.254.169.254", 80))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout
+
+
+def test_ssrf_log_shows_internal_address_block(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-3: Proxy log includes 'internal address' reason when SSRF check fires."""
+    policy = _base_policy(
+        network_policies={
+            "internal": sandbox_pb2.NetworkPolicyRule(
+                name="internal",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="127.0.0.1", port=80),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        sb.exec_python(_proxy_connect(), args=("127.0.0.1", 80))
+
+        log_result = sb.exec_python(_read_navigator_log())
+        assert log_result.exit_code == 0, log_result.stderr
+        log = log_result.stdout
+        assert "internal address" in log.lower(), (
+            f"Expected 'internal address' in proxy log, got:\n{log}"
+        )
+
+
+# =============================================================================
 # L7 Tests -- TLS termination HTTPS inspection (Phase 2: tls=terminate)
 #
 # These tests use api.anthropic.com:443 as a real HTTPS endpoint since the

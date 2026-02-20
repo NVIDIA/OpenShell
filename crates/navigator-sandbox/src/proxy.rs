@@ -5,7 +5,7 @@ use crate::l7::tls::ProxyTlsState;
 use crate::opa::OpaEngine;
 use crate::policy::ProxyPolicy;
 use miette::{IntoDiagnostic, Result};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
@@ -276,9 +276,30 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let mut upstream = TcpStream::connect((host.as_str(), port))
-        .await
-        .into_diagnostic()?;
+    // Defense-in-depth: resolve DNS and reject connections to internal IPs.
+    // Control plane endpoints are exempt — they legitimately resolve to private
+    // IPs in cluster deployments and are already checked before OPA evaluation.
+    let mut upstream = if is_control_plane {
+        TcpStream::connect((host.as_str(), port))
+            .await
+            .into_diagnostic()?
+    } else {
+        match resolve_and_reject_internal(&host, port).await {
+            Ok(addrs) => TcpStream::connect(addrs.as_slice())
+                .await
+                .into_diagnostic()?,
+            Err(reason) => {
+                warn!(
+                    dst_host = %host_lc,
+                    dst_port = port,
+                    reason = %reason,
+                    "CONNECT blocked: internal address"
+                );
+                respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                return Ok(());
+            }
+        }
+    };
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -598,6 +619,64 @@ fn query_l7_config(
     }
 }
 
+/// Check if an IP address is internal (loopback, private RFC1918, or link-local).
+///
+/// This is a defense-in-depth check to prevent SSRF via the CONNECT proxy.
+/// It covers:
+/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16)
+/// - IPv6 loopback (`::1`), link-local (`fe80::/10`)
+/// - IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped and checked as IPv4
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            // fe80::/10 — IPv6 link-local
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+            }
+            false
+        }
+    }
+}
+
+/// Resolve DNS for a host:port and reject if any resolved address is internal.
+///
+/// Returns the resolved `SocketAddr` list on success. Returns an error string
+/// if any resolved IP is in an internal range or if DNS resolution fails.
+async fn resolve_and_reject_internal(
+    host: &str,
+    port: u16,
+) -> std::result::Result<Vec<SocketAddr>, String> {
+    let addrs: Vec<SocketAddr> = tokio::net::lookup_host((host, port))
+        .await
+        .map_err(|e| format!("DNS resolution failed for {host}:{port}: {e}"))?
+        .collect();
+
+    if addrs.is_empty() {
+        return Err(format!(
+            "DNS resolution returned no addresses for {host}:{port}"
+        ));
+    }
+
+    for addr in &addrs {
+        if is_internal_ip(addr.ip()) {
+            return Err(format!(
+                "{host} resolves to internal address {}, connection rejected",
+                addr.ip()
+            ));
+        }
+    }
+
+    Ok(addrs)
+}
+
 fn parse_target(target: &str) -> Result<(String, u16)> {
     let (host, port_str) = target
         .split_once(':')
@@ -628,4 +707,157 @@ fn is_benign_relay_error(err: &miette::Report) -> bool {
     ];
     let msg = err.to_string().to_ascii_lowercase();
     BENIGN.iter().any(|pat| msg.contains(pat))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    // -- is_internal_ip: IPv4 --
+
+    #[test]
+    fn test_rejects_ipv4_loopback() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_private_10() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 255, 255, 255))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_private_172_16() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_private_192_168() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 255, 255
+        ))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_link_local_metadata() {
+        // Cloud metadata endpoint
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(169, 254, 0, 1))));
+    }
+
+    #[test]
+    fn test_allows_ipv4_public() {
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))));
+    }
+
+    #[test]
+    fn test_allows_ipv4_non_private_172() {
+        // 172.32.0.0 is outside the 172.16/12 private range
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 32, 0, 1))));
+    }
+
+    // -- is_internal_ip: IPv6 --
+
+    #[test]
+    fn test_rejects_ipv6_loopback() {
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_rejects_ipv6_link_local() {
+        // fe80::1
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_mapped_ipv6_private() {
+        // ::ffff:10.0.0.1
+        let v6 = Ipv4Addr::new(10, 0, 0, 1).to_ipv6_mapped();
+        assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_mapped_ipv6_loopback() {
+        // ::ffff:127.0.0.1
+        let v6 = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
+        assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    #[test]
+    fn test_rejects_ipv4_mapped_ipv6_link_local() {
+        // ::ffff:169.254.169.254
+        let v6 = Ipv4Addr::new(169, 254, 169, 254).to_ipv6_mapped();
+        assert!(is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    #[test]
+    fn test_allows_ipv6_public() {
+        // 2001:4860:4860::8888 (Google DNS)
+        assert!(!is_internal_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0x4860, 0x4860, 0, 0, 0, 0, 0x8888
+        ))));
+    }
+
+    #[test]
+    fn test_allows_ipv4_mapped_ipv6_public() {
+        // ::ffff:8.8.8.8
+        let v6 = Ipv4Addr::new(8, 8, 8, 8).to_ipv6_mapped();
+        assert!(!is_internal_ip(IpAddr::V6(v6)));
+    }
+
+    // -- resolve_and_reject_internal --
+
+    #[tokio::test]
+    async fn test_rejects_localhost_resolution() {
+        let result = resolve_and_reject_internal("localhost", 80).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("internal address"),
+            "expected 'internal address' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejects_loopback_ip_literal() {
+        let result = resolve_and_reject_internal("127.0.0.1", 443).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("internal address"),
+            "expected 'internal address' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rejects_metadata_ip() {
+        let result = resolve_and_reject_internal("169.254.169.254", 80).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("internal address"),
+            "expected 'internal address' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_dns_failure_returns_error() {
+        let result = resolve_and_reject_internal("this-host-does-not-exist.invalid", 80).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("DNS resolution failed"),
+            "expected 'DNS resolution failed' in error: {err}"
+        );
+    }
 }
