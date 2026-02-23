@@ -265,6 +265,8 @@ publish_main_artifacts:
     DOCKER_TLS_VERIFY: ""
     DOCKER_CERT_PATH: ""
     DOCKER_BUILDKIT: "1"
+    GIT_DEPTH: "0"  # full commit graph needed for setuptools_scm version computation
+    GIT_CLONE_FLAGS: "--filter=blob:none"  # skip blob download to keep clone fast
     OSXCROSS_IMAGE: "$CI_REGISTRY_IMAGE/third_party/osxcross:latest"
   rules:
     - if: $CI_COMMIT_BRANCH == "main"
