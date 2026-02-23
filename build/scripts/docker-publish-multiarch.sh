@@ -96,6 +96,22 @@ case "$MODE" in
 esac
 
 # ---------------------------------------------------------------------------
+# Resolve Dockerfile path for a component.
+# Components with a subdirectory layout (e.g. deploy/docker/sandbox/) use
+# Dockerfile.base from that subdirectory; others use the flat
+# deploy/docker/Dockerfile.<component> layout.
+# ---------------------------------------------------------------------------
+resolve_dockerfile() {
+  local comp="$1"
+  local comp_dir="deploy/docker/${comp}"
+  if [[ -d "${comp_dir}" ]]; then
+    echo "${comp_dir}/Dockerfile.base"
+  else
+    echo "deploy/docker/Dockerfile.${comp}"
+  fi
+}
+
+# ---------------------------------------------------------------------------
 # Step 1: Build and push component images as multi-arch manifests.
 # These use cross-compilation in the Dockerfile (BUILDPLATFORM != TARGETPLATFORM)
 # so Rust compiles natively and only the final stage runs on the target arch.
@@ -107,10 +123,11 @@ for component in sandbox server pki-job; do
   if [ "$component" = "sandbox" ]; then
     BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
   fi
+  DOCKERFILE=$(resolve_dockerfile "${component}")
   FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
   docker buildx build \
     --platform "${PLATFORMS}" \
-    -f "deploy/docker/Dockerfile.${component}" \
+    -f "${DOCKERFILE}" \
     -t "${FULL_IMAGE}:${IMAGE_TAG}" \
     --cache-from "type=registry,ref=${FULL_IMAGE}:latest" \
     --cache-to "type=inline" \
