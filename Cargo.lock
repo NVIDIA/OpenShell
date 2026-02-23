@@ -2585,6 +2585,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tar",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

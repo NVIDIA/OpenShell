@@ -29,3 +29,8 @@ run = "bash e2e/bash/test_port_forward.sh"
 description = "Run custom image build and sandbox e2e test"
 depends = ["cluster:deploy"]
 run = "bash e2e/bash/test_sandbox_custom_image.sh"
+
+["test:e2e:sync"]
+description = "Run sandbox file sync e2e test"
+depends = ["cluster:deploy"]
+run = "bash e2e/bash/test_sandbox_sync.sh"

@@ -5,7 +5,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
 use owo_colors::OwoColorize;
 use rustls::pki_types::ServerName;
-use std::io::{IsTerminal, Write};
+use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -460,12 +460,16 @@ pub async fn sandbox_exec(
     Ok(())
 }
 
-/// Sync local files into the sandbox using rsync over SSH.
-pub async fn sandbox_rsync(
+/// Push a list of files from a local directory into a sandbox using tar-over-SSH.
+///
+/// This replaces the old rsync-based sync. Files are streamed as a tar archive
+/// to `ssh ... tar xf - -C <dest>` on the sandbox side.
+pub async fn sandbox_sync_up_files(
     server: &str,
     name: &str,
-    repo_root: &Path,
+    base_dir: &Path,
     files: &[String],
+    dest: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if files.is_empty() {
@@ -474,34 +478,50 @@ pub async fn sandbox_rsync(
 
     let session = ssh_session_config(server, name, tls).await?;
 
-    let ssh_command = format!(
-        "ssh -o {} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o GlobalKnownHostsFile=/dev/null",
-        shell_escape(&format!("ProxyCommand={}", session.proxy_command))
-    );
-
-    let mut rsync = Command::new("rsync");
-    rsync
-        .arg("-az")
-        .arg("--from0")
-        .arg("--files-from=-")
-        .arg("--relative")
-        .arg("-e")
-        .arg(ssh_command)
-        .arg(".")
-        .arg("sandbox:/sandbox")
-        .current_dir(repo_root)
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(format!(
+            "mkdir -p {} && cat | tar xf - -C {}",
+            shell_escape(dest),
+            shell_escape(dest)
+        ))
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
-    let mut child = rsync.spawn().into_diagnostic()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        for path in files {
-            let entry = format!("./{path}");
-            stdin.write_all(entry.as_bytes()).into_diagnostic()?;
-            stdin.write_all(&[0]).into_diagnostic()?;
+    let mut child = ssh.spawn().into_diagnostic()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
+
+    // Build the tar archive in a blocking task since the tar crate is synchronous.
+    let base_dir = base_dir.to_path_buf();
+    let files = files.to_vec();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut archive = tar::Builder::new(stdin);
+        for file in &files {
+            let full_path = base_dir.join(file);
+            if full_path.is_file() {
+                archive
+                    .append_path_with_name(&full_path, file)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to add {file} to tar archive"))?;
+            } else if full_path.is_dir() {
+                archive
+                    .append_dir_all(file, &full_path)
+                    .into_diagnostic()
+                    .wrap_err_with(|| format!("failed to add directory {file} to tar archive"))?;
+            }
         }
-    }
+        archive.finish().into_diagnostic()?;
+        Ok(())
+    })
+    .await
+    .into_diagnostic()??;
 
     let status = tokio::task::spawn_blocking(move || child.wait())
         .await
@@ -509,7 +529,157 @@ pub async fn sandbox_rsync(
         .into_diagnostic()?;
 
     if !status.success() {
-        return Err(miette::miette!("rsync exited with status {status}"));
+        return Err(miette::miette!(
+            "ssh tar extract exited with status {status}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Push a local path (file or directory) into a sandbox using tar-over-SSH.
+pub async fn sandbox_sync_up(
+    server: &str,
+    name: &str,
+    local_path: &Path,
+    sandbox_path: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let session = ssh_session_config(server, name, tls).await?;
+
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(format!(
+            "mkdir -p {} && cat | tar xf - -C {}",
+            shell_escape(sandbox_path),
+            shell_escape(sandbox_path)
+        ))
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    let mut child = ssh.spawn().into_diagnostic()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| miette::miette!("failed to open stdin for ssh process"))?;
+
+    let local_path = local_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut archive = tar::Builder::new(stdin);
+        if local_path.is_file() {
+            let file_name = local_path
+                .file_name()
+                .ok_or_else(|| miette::miette!("path has no file name"))?;
+            archive
+                .append_path_with_name(&local_path, file_name)
+                .into_diagnostic()?;
+        } else if local_path.is_dir() {
+            archive.append_dir_all(".", &local_path).into_diagnostic()?;
+        } else {
+            return Err(miette::miette!(
+                "local path does not exist: {}",
+                local_path.display()
+            ));
+        }
+        archive.finish().into_diagnostic()?;
+        Ok(())
+    })
+    .await
+    .into_diagnostic()??;
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+
+    if !status.success() {
+        return Err(miette::miette!(
+            "ssh tar extract exited with status {status}"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Pull a path from a sandbox to a local destination using tar-over-SSH.
+pub async fn sandbox_sync_down(
+    server: &str,
+    name: &str,
+    sandbox_path: &str,
+    local_path: &Path,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let session = ssh_session_config(server, name, tls).await?;
+
+    // Build tar command.  When the sandbox path is a directory we tar its
+    // *contents* (using `-C <path> .`) so the caller gets the files directly
+    // without an extra wrapper directory.  For a single file we split into
+    // the parent directory and the filename.
+    let sandbox_path_clean = sandbox_path.trim_end_matches('/');
+
+    let tar_cmd = format!(
+        "if [ -d {path} ]; then tar cf - -C {path} .; else tar cf - -C {parent} {name}; fi",
+        path = shell_escape(sandbox_path_clean),
+        parent = shell_escape(
+            sandbox_path_clean
+                .rfind('/')
+                .map_or(".", |pos| if pos == 0 {
+                    "/"
+                } else {
+                    &sandbox_path_clean[..pos]
+                })
+        ),
+        name = shell_escape(
+            sandbox_path_clean
+                .rfind('/')
+                .map_or(sandbox_path_clean, |pos| &sandbox_path_clean[pos + 1..])
+        ),
+    );
+
+    let mut ssh = ssh_base_command(&session.proxy_command);
+    ssh.arg("-T")
+        .arg("-o")
+        .arg("RequestTTY=no")
+        .arg("sandbox")
+        .arg(tar_cmd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit());
+
+    let mut child = ssh.spawn().into_diagnostic()?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| miette::miette!("failed to open stdout for ssh process"))?;
+
+    let local_path = local_path.to_path_buf();
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        std::fs::create_dir_all(&local_path)
+            .into_diagnostic()
+            .wrap_err("failed to create local destination directory")?;
+        let mut archive = tar::Archive::new(stdout);
+        archive
+            .unpack(&local_path)
+            .into_diagnostic()
+            .wrap_err("failed to extract tar archive from sandbox")?;
+        Ok(())
+    })
+    .await
+    .into_diagnostic()??;
+
+    let status = tokio::task::spawn_blocking(move || child.wait())
+        .await
+        .into_diagnostic()?
+        .into_diagnostic()?;
+
+    if !status.success() {
+        return Err(miette::miette!(
+            "ssh tar create exited with status {status}"
+        ));
     }
 
     Ok(())

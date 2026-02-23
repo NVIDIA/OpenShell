@@ -458,6 +458,25 @@ enum SandboxCommands {
         command: ForwardCommands,
     },
 
+    /// Sync files to or from a sandbox.
+    Sync {
+        /// Sandbox name.
+        name: String,
+
+        /// Push local files up to the sandbox.
+        #[arg(long, conflicts_with = "down", value_name = "LOCAL_PATH")]
+        up: Option<String>,
+
+        /// Pull sandbox files down to the local machine.
+        #[arg(long, conflicts_with = "up", value_name = "SANDBOX_PATH")]
+        down: Option<String>,
+
+        /// Destination path (sandbox path when pushing, local path when pulling).
+        /// Defaults to /sandbox for --up or . for --down.
+        #[arg(value_name = "DEST")]
+        dest: Option<String>,
+    },
+
     /// Manage sandbox images.
     Image {
         #[command(subcommand)]
@@ -820,6 +839,22 @@ async fn main() -> Result<()> {
                     match other {
                         SandboxCommands::Create { .. } | SandboxCommands::Image { .. } => {
                             unreachable!()
+                        }
+                        SandboxCommands::Sync {
+                            name,
+                            up,
+                            down,
+                            dest,
+                        } => {
+                            run::sandbox_sync_command(
+                                endpoint,
+                                &name,
+                                up.as_deref(),
+                                down.as_deref(),
+                                dest.as_deref(),
+                                &tls,
+                            )
+                            .await?;
                         }
                         SandboxCommands::Get { name } => {
                             run::sandbox_get(endpoint, &name, &tls).await?;

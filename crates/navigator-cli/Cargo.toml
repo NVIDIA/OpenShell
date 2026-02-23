@@ -48,6 +48,9 @@ miette = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 
+# File archiving (tar-over-SSH sync)
+tar = "0.4"
+
 # Streams
 futures = { workspace = true }
 

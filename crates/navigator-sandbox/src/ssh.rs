@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -364,6 +364,18 @@ impl russh::server::Handler for SshHandler {
         }
         Ok(())
     }
+
+    async fn channel_eof(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Drop the input sender so the writer thread exits and the child's
+        // stdin pipe is closed.  Without this, commands like `tar xf -` that
+        // read until EOF on stdin would hang forever in pipe-based sessions.
+        self.input_sender.take();
+        Ok(())
+    }
 }
 
 impl SshHandler {
@@ -373,21 +385,35 @@ impl SshHandler {
         handle: Handle,
         command: Option<String>,
     ) -> anyhow::Result<()> {
-        let pty = self.pty_request.take().unwrap_or_default();
-        let (pty_master, input_sender) = spawn_pty_shell(
-            &self.policy,
-            self.workdir.clone(),
-            command,
-            &pty,
-            handle,
-            channel,
-            self.netns_fd,
-            self.proxy_url.clone(),
-            self.ca_file_paths.clone(),
-            &self.provider_env,
-        )?;
-        self.pty_master = Some(pty_master);
-        self.input_sender = Some(input_sender);
+        if let Some(pty) = self.pty_request.take() {
+            let (pty_master, input_sender) = spawn_pty_shell(
+                &self.policy,
+                self.workdir.clone(),
+                command,
+                &pty,
+                handle,
+                channel,
+                self.netns_fd,
+                self.proxy_url.clone(),
+                self.ca_file_paths.clone(),
+                &self.provider_env,
+            )?;
+            self.pty_master = Some(pty_master);
+            self.input_sender = Some(input_sender);
+        } else {
+            let input_sender = spawn_pipe_shell(
+                &self.policy,
+                self.workdir.clone(),
+                command,
+                handle,
+                channel,
+                self.netns_fd,
+                self.proxy_url.clone(),
+                self.ca_file_paths.clone(),
+                &self.provider_env,
+            )?;
+            self.input_sender = Some(input_sender);
+        }
         Ok(())
     }
 }
@@ -632,6 +658,217 @@ fn spawn_pty_shell(
     });
 
     Ok((master_file, sender))
+}
+
+/// Spawn a shell process with plain pipes (no PTY) for non-interactive sessions.
+///
+/// This is used when the SSH client did not request a PTY (e.g. `ssh -T`).
+/// Unlike [`spawn_pty_shell`], stdout and stderr are separate streams and no
+/// terminal output processing (LF→CRLF) is applied, making this safe for
+/// binary data transfer (e.g. tar archives).
+#[allow(clippy::too_many_arguments)]
+fn spawn_pipe_shell(
+    policy: &SandboxPolicy,
+    workdir: Option<String>,
+    command: Option<String>,
+    handle: Handle,
+    channel: ChannelId,
+    netns_fd: Option<RawFd>,
+    proxy_url: Option<String>,
+    ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
+    provider_env: &HashMap<String, String>,
+) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
+    let mut cmd = command.map_or_else(
+        || {
+            let mut c = Command::new("/bin/bash");
+            c.arg("-i");
+            c
+        },
+        |command| {
+            let mut c = Command::new("/bin/bash");
+            c.arg("-lc").arg(command);
+            c
+        },
+    );
+
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .env("NAVIGATOR_SANDBOX", "1")
+        .env("HOME", "/sandbox")
+        .env("USER", "sandbox")
+        .env("TERM", "dumb");
+
+    if let Some(ref url) = proxy_url {
+        cmd.env("HTTP_PROXY", url)
+            .env("HTTPS_PROXY", url)
+            .env("ALL_PROXY", url)
+            .env("http_proxy", url)
+            .env("https_proxy", url)
+            .env("grpc_proxy", url);
+    }
+
+    if let Some(ref paths) = ca_file_paths {
+        let (ca_cert_path, combined_bundle_path) = paths.as_ref();
+        cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
+            .env("SSL_CERT_FILE", combined_bundle_path)
+            .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
+            .env("CURL_CA_BUNDLE", combined_bundle_path);
+    }
+
+    for (key, value) in provider_env {
+        cmd.env(key, value);
+    }
+
+    if let Some(dir) = workdir.as_deref() {
+        cmd.current_dir(dir);
+    }
+
+    #[cfg(unix)]
+    {
+        unsafe_pipe::install_pre_exec(&mut cmd, policy.clone(), workdir.clone(), netns_fd);
+    }
+
+    let mut child = cmd.spawn()?;
+    #[cfg(target_os = "linux")]
+    let child_pid = child.id();
+    #[cfg(target_os = "linux")]
+    register_managed_child(child_pid);
+
+    let child_stdin = child.stdin.take().expect("stdin was piped");
+    let child_stdout = child.stdout.take().expect("stdout was piped");
+    let child_stderr = child.stderr.take().expect("stderr was piped");
+
+    // Writer thread: forwards SSH channel data to the child's stdin.
+    let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+    let mut writer = child_stdin;
+    std::thread::spawn(move || {
+        while let Ok(bytes) = receiver.recv() {
+            if writer.write_all(&bytes).is_err() {
+                break;
+            }
+            let _ = writer.flush();
+        }
+    });
+
+    let runtime = tokio::runtime::Handle::current();
+
+    // We need both stdout and stderr readers to finish before sending EOF.
+    // Use an Arc<AtomicUsize> to count completions.
+    let readers_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
+
+    // Stdout reader thread: forwards child stdout to the SSH channel.
+    let handle_stdout = handle.clone();
+    let runtime_stdout = runtime.clone();
+    let readers_remaining_stdout = readers_remaining.clone();
+    let reader_done_tx_stdout = reader_done_tx.clone();
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut reader = child_stdout;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = CryptoVec::from_slice(&buf[..n]);
+                    let h = handle_stdout.clone();
+                    drop(runtime_stdout.spawn(async move {
+                        let _ = h.data(channel, data).await;
+                    }));
+                }
+            }
+        }
+        if readers_remaining_stdout.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            let eof_handle = handle_stdout.clone();
+            drop(runtime_stdout.spawn(async move {
+                let _ = eof_handle.eof(channel).await;
+            }));
+            let _ = reader_done_tx_stdout.send(());
+        }
+    });
+
+    // Stderr reader thread: forwards child stderr to the SSH channel as
+    // extended data (type 1 = stderr).
+    let handle_stderr = handle.clone();
+    let runtime_stderr = runtime.clone();
+    let readers_remaining_stderr = readers_remaining;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 4096];
+        let mut reader = child_stderr;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let data = CryptoVec::from_slice(&buf[..n]);
+                    let h = handle_stderr.clone();
+                    drop(runtime_stderr.spawn(async move {
+                        let _ = h.extended_data(channel, 1, data).await;
+                    }));
+                }
+            }
+        }
+        if readers_remaining_stderr.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
+            let eof_handle = handle_stderr.clone();
+            drop(runtime_stderr.spawn(async move {
+                let _ = eof_handle.eof(channel).await;
+            }));
+            let _ = reader_done_tx.send(());
+        }
+    });
+
+    // Exit thread: waits for process exit, then sends exit-status and close.
+    let handle_exit = handle;
+    let runtime_exit = runtime;
+    std::thread::spawn(move || {
+        let status = child.wait().ok();
+        #[cfg(target_os = "linux")]
+        unregister_managed_child(child_pid);
+        let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
+        // Wait for reader threads to finish forwarding output before sending
+        // exit-status and close.
+        let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
+        drop(runtime_exit.spawn(async move {
+            let _ = handle_exit.exit_status_request(channel, code).await;
+            let _ = handle_exit.close(channel).await;
+        }));
+    });
+
+    Ok(sender)
+}
+
+mod unsafe_pipe {
+    use super::{Command, RawFd, SandboxPolicy, drop_privileges, sandbox};
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+
+    #[allow(unsafe_code)]
+    pub fn install_pre_exec(
+        cmd: &mut Command,
+        policy: SandboxPolicy,
+        workdir: Option<String>,
+        netns_fd: Option<RawFd>,
+    ) {
+        unsafe {
+            cmd.pre_exec(move || {
+                // Enter network namespace before dropping privileges.
+                #[cfg(target_os = "linux")]
+                if let Some(fd) = netns_fd {
+                    let result = libc::setns(fd, libc::CLONE_NEWNET);
+                    if result != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+
+                #[cfg(not(target_os = "linux"))]
+                let _ = netns_fd;
+
+                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+                sandbox::apply(&policy, workdir.as_deref())
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+    }
 }
 
 mod unsafe_pty {

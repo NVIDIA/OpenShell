@@ -244,18 +244,47 @@ If `timeout_seconds > 0`, the exec is wrapped in `tokio::time::timeout`. On time
 
 ### File Sync
 
-When `--sync` is passed to `sandbox create`, the CLI rsyncs local files into the sandbox after it reaches `Ready` and before any command runs.
+File sync uses **tar-over-SSH**: the CLI streams a tar archive through the existing SSH proxy tunnel. No external dependencies (like `rsync`) are required on the client side. The sandbox image provides GNU `tar` for extraction.
 
-**File**: `crates/navigator-cli/src/ssh.rs` -- `sandbox_rsync()`
+**Files**: `crates/navigator-cli/src/ssh.rs`, `crates/navigator-cli/src/run.rs`
 
-1. `crates/navigator-cli/src/run.rs` -- `git_repo_root()` determines the repository root via `git rev-parse --show-toplevel`
+#### `sandbox create --sync`
+
+When `--sync` is passed to `sandbox create`, the CLI pushes local git-tracked files into `/sandbox` after the sandbox reaches `Ready` and before any command runs.
+
+1. `git_repo_root()` determines the repository root via `git rev-parse --show-toplevel`
 2. `git_sync_files()` lists files with `git ls-files -co --exclude-standard -z` (tracked + untracked, respecting gitignore, null-delimited)
-3. `sandbox_rsync()` creates a new SSH session config (same as connect), then invokes:
-   ```
-   rsync -az --from0 --files-from=- --relative -e "ssh -o ProxyCommand=... -o StrictHostKeyChecking=no ..." . sandbox:/sandbox
-   ```
-4. File paths are written to rsync's stdin as null-delimited entries
-5. Files land in `/sandbox` inside the container
+3. `sandbox_sync_up_files()` creates an SSH session config, spawns `ssh <proxy> sandbox "tar xf - -C /sandbox"`, and streams a tar archive of the file list to the SSH child's stdin using the `tar` crate
+4. Files land in `/sandbox` inside the container
+
+#### `nav sandbox sync` command
+
+The standalone `sandbox sync` subcommand supports bidirectional file transfer:
+
+```bash
+# Push local files up to sandbox
+nav sandbox sync <name> --up <local-path> [<sandbox-path>]
+
+# Pull sandbox files down to local
+nav sandbox sync <name> --down <sandbox-path> [<local-path>]
+```
+
+- **Push (`--up`)**: `sandbox_sync_up()` streams a tar archive of the local path to `ssh ... tar xf - -C <dest>` on the sandbox side. Default destination: `/sandbox`.
+- **Pull (`--down`)**: `sandbox_sync_down()` runs `ssh ... tar cf - -C <dir> <path>` on the sandbox side and extracts the output locally via `tar::Archive`. Default destination: `.` (current directory).
+- No compression for v1 — the SSH tunnel is local-network; compression adds CPU cost with marginal bandwidth savings.
+
+#### Why tar-over-SSH instead of rsync
+
+| | tar-over-SSH | rsync |
+|---|---|---|
+| **Client dependency** | None — `tar` crate is compiled into the CLI | Requires `rsync` installed on the client machine |
+| **Sandbox dependency** | GNU `tar` (present in every base image) | Requires `rsync` installed in the container |
+| **Bidirectional** | Same pipe pattern reversed for push/pull | Needs different invocation or rsync daemon for pull |
+| **Transport complexity** | Single process (`ssh ... tar xf -`) | Two processes coordinating a delta-transfer protocol through the proxy tunnel |
+| **Incremental sync** | Re-sends everything every time | Only transfers changed blocks (faster for repeated syncs of large repos) |
+| **Compression** | Uncompressed (can add gzip via `flate2` later) | Built-in `-z` flag |
+
+For Navigator's use case — one-shot or on-demand pushes of project files over a local network tunnel — the incremental sync advantage of rsync is marginal. Eliminating the external dependency and getting clean bidirectional support outweigh the delta-transfer benefit. If repeated rapid re-syncs of large repos become a need (e.g., a watch mode), revisit by adding content-hash-based skip lists or gzip compression.
 
 ## NSSH1 Handshake Protocol
 

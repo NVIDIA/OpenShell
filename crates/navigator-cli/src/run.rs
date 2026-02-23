@@ -42,7 +42,8 @@ use tonic::{Code, transport::Channel};
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{list_forwards, stop_forward, stop_forwards_for_sandbox};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_exec, sandbox_forward, sandbox_rsync, sandbox_ssh_proxy,
+    sandbox_connect, sandbox_exec, sandbox_forward, sandbox_ssh_proxy, sandbox_sync_down,
+    sandbox_sync_up, sandbox_sync_up_files,
 };
 
 /// Convert a sandbox phase integer to a human-readable string.
@@ -1168,11 +1169,12 @@ pub async fn sandbox_create(
                 let repo_root = git_repo_root()?;
                 let files = git_sync_files(&repo_root)?;
                 if !files.is_empty() {
-                    sandbox_rsync(
+                    sandbox_sync_up_files(
                         &effective_server,
                         &sandbox_name,
                         &repo_root,
                         &files,
+                        "/sandbox",
                         &effective_tls,
                     )
                     .await?;
@@ -1445,6 +1447,51 @@ fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
                 allowed_routing_hints: inf.allowed_routing_hints,
             }),
     })
+}
+
+/// Sync files to or from a sandbox.
+///
+/// Dispatches to `sandbox_sync_up` or `sandbox_sync_down` based on the
+/// `--up` / `--down` flags.
+pub async fn sandbox_sync_command(
+    server: &str,
+    name: &str,
+    up: Option<&str>,
+    down: Option<&str>,
+    dest: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    match (up, down) {
+        (Some(local_path), None) => {
+            let sandbox_dest = dest.unwrap_or("/sandbox");
+            let local = Path::new(local_path);
+            if !local.exists() {
+                return Err(miette::miette!(
+                    "local path does not exist: {}",
+                    local.display()
+                ));
+            }
+            eprintln!("Syncing {} -> sandbox:{}", local.display(), sandbox_dest);
+            sandbox_sync_up(server, name, local, sandbox_dest, tls).await?;
+            eprintln!("{} Sync complete", "✓".green().bold());
+        }
+        (None, Some(sandbox_path)) => {
+            let local_dest = Path::new(dest.unwrap_or("."));
+            eprintln!(
+                "Syncing sandbox:{} -> {}",
+                sandbox_path,
+                local_dest.display()
+            );
+            sandbox_sync_down(server, name, sandbox_path, local_dest, tls).await?;
+            eprintln!("{} Sync complete", "✓".green().bold());
+        }
+        _ => {
+            return Err(miette::miette!(
+                "specify either --up <local-path> or --down <sandbox-path>"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fetch a sandbox by name.
