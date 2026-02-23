@@ -14,6 +14,8 @@ pub struct RouteConfig {
     pub endpoint: String,
     pub model: String,
     #[serde(default)]
+    pub protocols: Vec<String>,
+    #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
     pub api_key_env: Option<String>,
@@ -25,6 +27,7 @@ pub struct ResolvedRoute {
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
+    pub protocols: Vec<String>,
 }
 
 impl RouterConfig {
@@ -77,11 +80,20 @@ impl RouteConfig {
     }
 
     fn resolve(&self) -> Result<ResolvedRoute, RouterError> {
+        let protocols = navigator_core::inference::normalize_protocols(&self.protocols);
+        if protocols.is_empty() {
+            return Err(RouterError::Internal(format!(
+                "route '{}' has no protocols",
+                self.routing_hint
+            )));
+        }
+
         Ok(ResolvedRoute {
             routing_hint: self.routing_hint.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             api_key: self.resolve_api_key()?,
+            protocols,
         })
     }
 }

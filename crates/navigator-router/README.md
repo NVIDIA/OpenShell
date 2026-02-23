@@ -4,8 +4,8 @@
 
 ## Responsibilities
 
-- Select an upstream route from a candidate set (based on request context, `routing_hint` today).
-- Execute OpenAI-compatible chat completion HTTP calls to the selected upstream.
+- Select an upstream route from a candidate set (based on protocol compatibility).
+- Forward raw HTTP requests to the selected upstream backend.
 - Normalize upstream failures into router-level errors (`unauthorized`, `unavailable`, protocol/internal errors).
 - Keep routing decision logic in one place so strategies can evolve (fallbacks, scoring, health-based routing).
 
@@ -24,26 +24,19 @@ Current split:
 
 - `navigator-server`:
   - authenticates request origin
-  - enforces sandbox policy (`allowed_routing_hints`)
+  - enforces sandbox policy (`allowed_routes`)
   - loads enabled, policy-allowed route candidates from the entity store
 - `navigator-router`:
-  - picks a route from candidates (`completion_with_candidates`)
-  - calls upstream and returns completion response
+  - picks a route from candidates (`proxy_with_candidates`)
+  - forwards the HTTP request upstream and returns the raw response
 
 ## Public APIs
 
-- `Router::completion(&CompletionRequest)`
-  - Uses router-internal routes loaded from `RouterConfig`.
-  - Useful for config-file driven flows and tests.
-
-- `Router::completion_with_candidates(&CompletionRequest, &[ResolvedRoute])`
-  - Uses caller-provided route candidates.
+- `Router::proxy_with_candidates(source_protocol, method, path, headers, body, &[ResolvedRoute])`
+  - Filters candidates by protocol compatibility, then forwards the request to the first match.
   - Preferred path for entity-driven server routing.
-
-- `Router::completion_for_route(&ResolvedRoute, &CompletionRequest)`
-  - Executes a pre-selected route directly.
 
 ## Notes
 
-- `protocol` is currently expected to be OpenAI chat completions compatible.
-- Route selection currently matches by `routing_hint`; this is intentionally simple and will evolve.
+- Route selection matches candidates by `protocol` field (e.g. `openai_chat_completions`).
+- Route selection is intentionally simple and will evolve.

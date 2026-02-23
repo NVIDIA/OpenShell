@@ -2625,6 +2625,7 @@ dependencies = [
 name = "navigator-router"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "navigator-core",
  "reqwest",
  "serde",

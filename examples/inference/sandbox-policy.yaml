@@ -1,0 +1,31 @@
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+  - /usr
+  - /lib
+  - /etc
+  - /app
+  - /var/log
+  - /proc/self
+  - /dev/urandom
+  read_write:
+  - /sandbox
+  - /tmp
+  - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# No network_policies needed for inference routing — any outgoing connection
+# from a binary not explicitly allowed will be intercepted and checked for
+# inference API patterns when inference routing is configured below.
+
+inference:
+  allowed_routes:
+  - local

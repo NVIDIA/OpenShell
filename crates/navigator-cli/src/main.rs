@@ -538,13 +538,20 @@ enum SandboxImageCommands {
 enum InferenceCommands {
     /// Create an inference route.
     Create {
+        /// Optional route name (auto-generated if omitted).
+        #[arg(long)]
+        name: Option<String>,
         #[arg(long)]
         routing_hint: String,
         #[arg(long)]
         base_url: String,
-        #[arg(long, default_value = "openai_chat_completions")]
-        protocol: String,
-        #[arg(long)]
+        /// Supported protocol(s). Repeat flag or pass comma-separated values.
+        ///
+        /// If omitted, protocols are auto-detected by probing the base URL.
+        #[arg(long = "protocol", value_delimiter = ',')]
+        protocols: Vec<String>,
+        /// API key for the inference endpoint. Defaults to empty (for local models).
+        #[arg(long, default_value = "")]
         api_key: String,
         #[arg(long)]
         model_id: String,
@@ -560,9 +567,13 @@ enum InferenceCommands {
         routing_hint: String,
         #[arg(long)]
         base_url: String,
-        #[arg(long, default_value = "openai_chat_completions")]
-        protocol: String,
-        #[arg(long)]
+        /// Supported protocol(s). Repeat flag or pass comma-separated values.
+        ///
+        /// If omitted, protocols are auto-detected by probing the base URL.
+        #[arg(long = "protocol", value_delimiter = ',')]
+        protocols: Vec<String>,
+        /// API key for the inference endpoint. Defaults to empty (for local models).
+        #[arg(long, default_value = "")]
         api_key: String,
         #[arg(long)]
         model_id: String,
@@ -910,18 +921,20 @@ async fn main() -> Result<()> {
 
             match command {
                 InferenceCommands::Create {
+                    name,
                     routing_hint,
                     base_url,
-                    protocol,
+                    protocols,
                     api_key,
                     model_id,
                     disabled,
                 } => {
                     run::inference_route_create(
                         endpoint,
+                        name.as_deref(),
                         &routing_hint,
                         &base_url,
-                        &protocol,
+                        &protocols,
                         &api_key,
                         &model_id,
                         !disabled,
@@ -933,7 +946,7 @@ async fn main() -> Result<()> {
                     name,
                     routing_hint,
                     base_url,
-                    protocol,
+                    protocols,
                     api_key,
                     model_id,
                     disabled,
@@ -943,7 +956,7 @@ async fn main() -> Result<()> {
                         &name,
                         &routing_hint,
                         &base_url,
-                        &protocol,
+                        &protocols,
                         &api_key,
                         &model_id,
                         !disabled,

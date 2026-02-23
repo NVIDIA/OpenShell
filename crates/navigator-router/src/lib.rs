@@ -1,16 +1,19 @@
 mod backend;
 pub mod config;
+mod mock;
 
 use std::time::Duration;
 
+pub use backend::ProxyResponse;
 use config::{ResolvedRoute, RouterConfig};
-use navigator_core::proto::{CompletionRequest, CompletionResponse};
 use tracing::info;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
     #[error("route not found for routing_hint '{0}'")]
     RouteNotFound(String),
+    #[error("no compatible route for protocol '{0}'")]
+    NoCompatibleRoute(String),
     #[error("unauthorized: {0}")]
     Unauthorized(String),
     #[error("upstream unavailable: {0}")]
@@ -46,52 +49,41 @@ impl Router {
         Ok(router)
     }
 
-    pub async fn completion(
+    /// Proxy a raw HTTP request to the first compatible route from `candidates`.
+    ///
+    /// Filters candidates by `source_protocol` compatibility (exact match against
+    /// one of the route's `protocols`), then forwards to the first match.
+    pub async fn proxy_with_candidates(
         &self,
-        request: &CompletionRequest,
-    ) -> Result<CompletionResponse, RouterError> {
-        self.completion_with_candidates(request, &self.routes).await
-    }
-
-    pub async fn completion_with_candidates(
-        &self,
-        request: &CompletionRequest,
+        source_protocol: &str,
+        method: &str,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: bytes::Bytes,
         candidates: &[ResolvedRoute],
-    ) -> Result<CompletionResponse, RouterError> {
-        let route = resolve_route_from_candidates(candidates, &request.routing_hint)?;
-        self.completion_for_route(route, request).await
-    }
+    ) -> Result<ProxyResponse, RouterError> {
+        let normalized_source = source_protocol.trim().to_ascii_lowercase();
+        let route = candidates
+            .iter()
+            .find(|r| r.protocols.iter().any(|p| p == &normalized_source))
+            .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
 
-    pub async fn completion_for_route(
-        &self,
-        route: &ResolvedRoute,
-        request: &CompletionRequest,
-    ) -> Result<CompletionResponse, RouterError> {
         info!(
             routing_hint = %route.routing_hint,
-            model = %route.model,
+            protocols = %route.protocols.join(","),
             endpoint = %route.endpoint,
-            "routing completion request"
+            method = %method,
+            path = %path,
+            "routing proxy inference request"
         );
 
-        backend::call_backend(&self.client, route, request).await
-    }
-}
+        if mock::is_mock_route(route) {
+            info!(routing_hint = %route.routing_hint, "returning mock response");
+            return Ok(mock::mock_response(route, &normalized_source));
+        }
 
-fn resolve_route_from_candidates<'a>(
-    routes: &'a [ResolvedRoute],
-    routing_hint: &str,
-) -> Result<&'a ResolvedRoute, RouterError> {
-    if routing_hint.is_empty() {
-        return routes
-            .first()
-            .ok_or_else(|| RouterError::Internal("no routes configured".to_string()));
+        backend::proxy_to_backend(&self.client, route, method, path, headers, body).await
     }
-
-    routes
-        .iter()
-        .find(|r| r.routing_hint == routing_hint)
-        .ok_or_else(|| RouterError::RouteNotFound(routing_hint.to_string()))
 }
 
 #[cfg(test)]
@@ -106,6 +98,7 @@ mod tests {
                     routing_hint: "local".to_string(),
                     endpoint: "http://localhost:8000/v1".to_string(),
                     model: "meta/llama-3.1-8b-instruct".to_string(),
+                    protocols: vec!["openai_chat_completions".to_string()],
                     api_key: Some("test-key".to_string()),
                     api_key_env: None,
                 },
@@ -113,6 +106,7 @@ mod tests {
                     routing_hint: "frontier".to_string(),
                     endpoint: "http://localhost:8000/v1".to_string(),
                     model: "meta/llama-3.1-70b-instruct".to_string(),
+                    protocols: vec!["openai_chat_completions".to_string()],
                     api_key: Some("test-key".to_string()),
                     api_key_env: None,
                 },
@@ -121,38 +115,11 @@ mod tests {
     }
 
     #[test]
-    fn resolve_known_hint() {
+    fn router_resolves_routes_from_config() {
         let router = Router::from_config(&test_config()).unwrap();
-        let route = resolve_route_from_candidates(&router.routes, "frontier").unwrap();
-        assert_eq!(route.model, "meta/llama-3.1-70b-instruct");
-    }
-
-    #[test]
-    fn resolve_empty_hint_falls_back_to_first() {
-        let router = Router::from_config(&test_config()).unwrap();
-        let route = resolve_route_from_candidates(&router.routes, "").unwrap();
-        assert_eq!(route.model, "meta/llama-3.1-8b-instruct");
-    }
-
-    #[test]
-    fn resolve_unknown_hint_returns_error() {
-        let router = Router::from_config(&test_config()).unwrap();
-        let err = resolve_route_from_candidates(&router.routes, "unknown").unwrap_err();
-        assert!(matches!(err, RouterError::RouteNotFound(_)));
-    }
-
-    #[test]
-    fn resolve_from_external_candidates_works() {
-        let router = Router::new().unwrap();
-        let candidates = vec![ResolvedRoute {
-            routing_hint: "local".to_string(),
-            endpoint: "http://localhost:8000/v1".to_string(),
-            model: "test/model".to_string(),
-            api_key: "test-key".to_string(),
-        }];
-        let route = resolve_route_from_candidates(&candidates, "local").unwrap();
-        assert_eq!(route.model, "test/model");
-        assert!(router.routes.is_empty());
+        assert_eq!(router.routes.len(), 2);
+        assert_eq!(router.routes[0].routing_hint, "local");
+        assert_eq!(router.routes[0].protocols, vec!["openai_chat_completions"]);
     }
 
     #[test]
@@ -162,6 +129,7 @@ mod tests {
                 routing_hint: "test".to_string(),
                 endpoint: "http://localhost".to_string(),
                 model: "test-model".to_string(),
+                protocols: vec!["openai_chat_completions".to_string()],
                 api_key: None,
                 api_key_env: None,
             }],

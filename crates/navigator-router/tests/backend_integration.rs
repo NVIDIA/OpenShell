@@ -1,87 +1,20 @@
-use navigator_core::proto::{ChatMessage, CompletionRequest};
 use navigator_router::Router;
-use navigator_router::config::{RouteConfig, RouterConfig};
+use navigator_router::config::{ResolvedRoute, RouteConfig, RouterConfig};
 use wiremock::matchers::{bearer_token, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-fn make_request(routing_hint: &str) -> CompletionRequest {
-    CompletionRequest {
-        routing_hint: routing_hint.to_string(),
-        messages: vec![ChatMessage {
-            role: "user".to_string(),
-            content: "Hello".to_string(),
-            reasoning_content: None,
-        }],
-        temperature: Some(0.7),
-        max_tokens: Some(100),
-        top_p: None,
-    }
+fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
+    vec![ResolvedRoute {
+        routing_hint: "local".to_string(),
+        endpoint: base_url.to_string(),
+        model: "meta/llama-3.1-8b-instruct".to_string(),
+        api_key: "test-api-key".to_string(),
+        protocols: vec!["openai_chat_completions".to_string()],
+    }]
 }
 
 #[tokio::test]
-async fn completion_handles_null_content_with_reasoning_content() {
-    let mock_server = MockServer::start().await;
-
-    let response_body = serde_json::json!({
-        "id": "chatcmpl-456",
-        "object": "chat.completion",
-        "created": 1_700_000_123_i64,
-        "model": "nvidia/nemotron-3-nano-30b-a3b",
-        "choices": [{
-            "index": 0,
-            "message": {
-                "role": "assistant",
-                "content": null,
-                "reasoning_content": "model thinking"
-            },
-            "finish_reason": "length"
-        }],
-        "usage": {
-            "prompt_tokens": 10,
-            "completion_tokens": 8,
-            "total_tokens": 18
-        }
-    });
-
-    Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .and(bearer_token("test-api-key"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
-        .mount(&mock_server)
-        .await;
-
-    let config = mock_config(&mock_server.uri());
-    let router = Router::from_config(&config).unwrap();
-    let response = router.completion(&make_request("local")).await.unwrap();
-
-    let message = response.choices[0].message.as_ref().unwrap();
-    assert_eq!(message.content, "");
-    assert_eq!(message.reasoning_content.as_deref(), Some("model thinking"));
-}
-
-fn mock_config(base_url: &str) -> RouterConfig {
-    RouterConfig {
-        routes: vec![
-            RouteConfig {
-                routing_hint: "local".to_string(),
-                endpoint: base_url.to_string(),
-                model: "meta/llama-3.1-8b-instruct".to_string(),
-                api_key: Some("test-api-key".to_string()),
-                api_key_env: None,
-            },
-            RouteConfig {
-                routing_hint: "frontier".to_string(),
-                endpoint: base_url.to_string(),
-                model: "meta/llama-3.1-70b-instruct".to_string(),
-                api_key: Some("test-api-key".to_string()),
-                api_key_env: None,
-            },
-        ],
-    }
-}
-
-#[tokio::test]
-async fn completion_success_roundtrip() {
+async fn proxy_forwards_request_to_backend() {
     let mock_server = MockServer::start().await;
 
     let response_body = serde_json::json!({
@@ -105,69 +38,178 @@ async fn completion_success_roundtrip() {
     });
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .and(bearer_token("test-api-key"))
         .respond_with(ResponseTemplate::new(200).set_body_json(&response_body))
         .mount(&mock_server)
         .await;
 
-    let config = mock_config(&mock_server.uri());
-    let router = Router::from_config(&config).unwrap();
-    let response = router.completion(&make_request("local")).await.unwrap();
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
 
-    assert_eq!(response.id, "chatcmpl-123");
-    assert_eq!(response.model, "meta/llama-3.1-8b-instruct");
-    assert_eq!(response.choices.len(), 1);
-    assert_eq!(
-        response.choices[0].message.as_ref().unwrap().content,
-        "Hello! How can I help you?"
-    );
-    assert_eq!(response.choices[0].finish_reason, "stop");
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "test",
+        "messages": [{"role": "user", "content": "Hello"}]
+    }))
+    .unwrap();
 
-    let usage = response.usage.unwrap();
-    assert_eq!(usage.prompt_tokens, 10);
-    assert_eq!(usage.completion_tokens, 8);
-    assert_eq!(usage.total_tokens, 18);
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(resp_body["id"], "chatcmpl-123");
 }
 
 #[tokio::test]
-async fn completion_upstream_401_returns_unauthorized() {
+async fn proxy_upstream_401_returns_error() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
+        .and(path("/v1/chat/completions"))
         .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
             "error": { "message": "Invalid API key" }
         })))
         .mount(&mock_server)
         .await;
 
-    let config = mock_config(&mock_server.uri());
-    let router = Router::from_config(&config).unwrap();
-    let err = router.completion(&make_request("local")).await.unwrap_err();
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![],
+            bytes::Bytes::new(),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    // Raw proxy returns the actual HTTP status, not a RouterError
+    assert_eq!(response.status, 401);
+}
+
+#[tokio::test]
+async fn proxy_no_compatible_route_returns_error() {
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        routing_hint: "local".to_string(),
+        endpoint: "http://localhost:1234".to_string(),
+        model: "test".to_string(),
+        api_key: "key".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+    }];
+
+    let err = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![],
+            bytes::Bytes::new(),
+            &candidates,
+        )
+        .await
+        .unwrap_err();
 
     assert!(
-        matches!(err, navigator_router::RouterError::Unauthorized(_)),
-        "expected Unauthorized, got: {err:?}"
+        matches!(err, navigator_router::RouterError::NoCompatibleRoute(_)),
+        "expected NoCompatibleRoute, got: {err:?}"
     );
 }
 
 #[tokio::test]
-async fn completion_upstream_500_returns_unavailable() {
+async fn proxy_strips_auth_header() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
-        .and(path("/chat/completions"))
-        .respond_with(ResponseTemplate::new(500).set_body_string("Internal Server Error"))
+        .and(path("/v1/chat/completions"))
+        .and(bearer_token("test-api-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
         .mount(&mock_server)
         .await;
 
-    let config = mock_config(&mock_server.uri());
-    let router = Router::from_config(&config).unwrap();
-    let err = router.completion(&make_request("local")).await.unwrap_err();
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
 
-    assert!(
-        matches!(err, navigator_router::RouterError::UpstreamUnavailable(_)),
-        "expected UpstreamUnavailable, got: {err:?}"
+    // Client sends its own Authorization header — should be stripped and replaced
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("authorization".to_string(), "Bearer client-key".to_string())],
+            bytes::Bytes::new(),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn proxy_mock_route_returns_canned_response() {
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        routing_hint: "local".to_string(),
+        endpoint: "mock://test".to_string(),
+        model: "mock/test-model".to_string(),
+        api_key: "unused".to_string(),
+        protocols: vec!["openai_chat_completions".to_string()],
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "mock/test-model",
+        "messages": [{"role": "user", "content": "hello"}]
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(resp_body["model"], "mock/test-model");
+    assert_eq!(
+        resp_body["choices"][0]["message"]["content"],
+        "Hello from navigator mock backend"
     );
+}
+
+#[test]
+fn config_resolves_routes_with_protocol() {
+    let config = RouterConfig {
+        routes: vec![RouteConfig {
+            routing_hint: "local".to_string(),
+            endpoint: "http://localhost:8000".to_string(),
+            model: "test-model".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            api_key: Some("key".to_string()),
+            api_key_env: None,
+        }],
+    };
+    let routes = config.resolve_routes().unwrap();
+    assert_eq!(routes[0].protocols, vec!["openai_chat_completions"]);
 }

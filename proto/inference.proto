@@ -7,8 +7,9 @@ option java_package = "com.anthropic.navigator.inference.v1";
 
 // Inference service provides LLM completion capabilities.
 service Inference {
-  // Send a completion request routed by the server's inference router.
-  rpc Completion(CompletionRequest) returns (CompletionResponse);
+  // Proxy a raw HTTP inference request through the router.
+  // Used by the sandbox supervisor to reroute intercepted SDK calls.
+  rpc ProxyInference(ProxyInferenceRequest) returns (ProxyInferenceResponse);
 
   // Create a new inference route.
   rpc CreateInferenceRoute(CreateInferenceRouteRequest) returns (InferenceRouteResponse);
@@ -26,7 +27,8 @@ service Inference {
 message InferenceRouteSpec {
   string routing_hint = 1;
   string base_url = 2;
-  string protocol = 3;
+  // Protocols this route can serve (e.g. "openai_chat_completions").
+  repeated string protocols = 3;
   string api_key = 4;
   string model_id = 5;
   bool enabled = 6;
@@ -74,61 +76,34 @@ message InferenceRouteResponse {
   InferenceRoute route = 1;
 }
 
-// Completion request.
-message CompletionRequest {
-  // Routing hint tells the router what kind of inference to use (e.g. "frontier", "local").
-  // The router resolves this to a specific model and backend.
-  string routing_hint = 1;
-  // Chat messages for the completion.
-  repeated ChatMessage messages = 2;
-  // Sampling temperature.
-  optional float temperature = 3;
-  // Maximum number of tokens to generate.
-  optional int32 max_tokens = 4;
-  // Nucleus sampling parameter.
-  optional float top_p = 5;
+// HTTP header key-value pair.
+message HttpHeader {
+  string name = 1;
+  string value = 2;
 }
 
-// A single chat message.
-message ChatMessage {
-  // Message role (e.g. "system", "user", "assistant").
-  string role = 1;
-  // Message content.
-  string content = 2;
-  // Optional model reasoning content when provided by upstream.
-  optional string reasoning_content = 3;
+// Request to proxy a raw HTTP inference call through the router.
+message ProxyInferenceRequest {
+  // Sandbox making the request (for policy lookup).
+  string sandbox_id = 1;
+  // Source protocol (e.g. "openai_chat_completions") to match compatible routes.
+  string source_protocol = 2;
+  // HTTP method (e.g. "POST").
+  string http_method = 3;
+  // HTTP path (e.g. "/v1/chat/completions").
+  string http_path = 4;
+  // HTTP headers (auth headers stripped by the supervisor).
+  repeated HttpHeader http_headers = 5;
+  // Raw HTTP request body.
+  bytes http_body = 6;
 }
 
-// Completion response.
-message CompletionResponse {
-  // Unique completion ID.
-  string id = 1;
-  // The actual model that served the request (resolved by router).
-  string model = 2;
-  // Creation timestamp (unix seconds).
-  int64 created = 3;
-  // Completion choices.
-  repeated CompletionChoice choices = 4;
-  // Token usage statistics.
-  CompletionUsage usage = 5;
-}
-
-// A single completion choice.
-message CompletionChoice {
-  // Choice index.
-  int32 index = 1;
-  // The generated message.
-  ChatMessage message = 2;
-  // Reason the generation stopped (e.g. "stop", "length").
-  string finish_reason = 3;
-}
-
-// Token usage statistics.
-message CompletionUsage {
-  // Number of tokens in the prompt.
-  int32 prompt_tokens = 1;
-  // Number of tokens in the completion.
-  int32 completion_tokens = 2;
-  // Total tokens used.
-  int32 total_tokens = 3;
+// Response from the proxied inference call.
+message ProxyInferenceResponse {
+  // HTTP status code from the upstream backend.
+  int32 http_status = 1;
+  // HTTP response headers.
+  repeated HttpHeader http_headers = 2;
+  // Raw HTTP response body.
+  bytes http_body = 3;
 }

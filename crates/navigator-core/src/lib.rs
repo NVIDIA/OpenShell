@@ -7,6 +7,7 @@
 
 pub mod config;
 pub mod error;
+pub mod inference;
 pub mod proto;
 
 pub use config::Config;

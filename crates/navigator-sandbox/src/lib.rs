@@ -233,6 +233,16 @@ pub async fn run_sandbox(
             .into_iter()
             .collect::<Vec<_>>();
 
+        // Build inference context for rerouting intercepted inference calls
+        let inference_ctx = match (&sandbox_id, &navigator_endpoint_for_proxy) {
+            (Some(id), Some(endpoint)) => Some(Arc::new(proxy::InferenceContext::new(
+                endpoint.clone(),
+                id.clone(),
+                l7::inference::default_patterns(),
+            ))),
+            _ => None,
+        };
+
         Some(
             ProxyHandle::start_with_bind_addr(
                 proxy_policy,
@@ -242,6 +252,7 @@ pub async fn run_sandbox(
                 entrypoint_pid.clone(),
                 control_plane_endpoints,
                 tls_state,
+                inference_ctx,
             )
             .await?,
         )
@@ -475,13 +486,20 @@ async fn load_policy(
         );
         let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
 
-        // Build OPA engine from baked-in rules + typed proto data
-        let opa_engine = if proto_policy.network_policies.is_empty() {
-            info!("No network policies in proto, skipping OPA engine");
-            None
-        } else {
+        // Build OPA engine from baked-in rules + typed proto data.
+        // The engine is needed when network policies exist OR inference routing
+        // is configured (inference routing uses OPA to decide inspect_for_inference).
+        let has_network_policies = !proto_policy.network_policies.is_empty();
+        let has_inference = proto_policy
+            .inference
+            .as_ref()
+            .is_some_and(|inf| !inf.allowed_routes.is_empty());
+        let opa_engine = if has_network_policies || has_inference {
             info!("Creating OPA engine from proto policy data");
             Some(Arc::new(OpaEngine::from_proto(&proto_policy)?))
+        } else {
+            info!("No network policies or inference config in proto, skipping OPA engine");
+            None
         };
 
         let policy = SandboxPolicy::try_from(proto_policy)?;

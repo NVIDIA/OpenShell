@@ -2,7 +2,7 @@
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
-use crate::opa::OpaEngine;
+use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
 use miette::{IntoDiagnostic, Result};
 use std::net::{IpAddr, SocketAddr};
@@ -18,7 +18,7 @@ const MAX_HEADER_BYTES: usize = 8192;
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
-    allowed: bool,
+    action: NetworkAction,
     /// Resolved binary path.
     binary: Option<PathBuf>,
     /// PID owning the socket.
@@ -27,12 +27,44 @@ struct ConnectDecision {
     ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
     cmdline_paths: Vec<PathBuf>,
-    /// Name of the matched policy rule (allow only).
-    matched_policy: Option<String>,
     /// Which engine made the decision ("opa" or "`control_plane`").
     engine: &'static str,
-    /// Deny reason or error context.
-    reason: String,
+}
+
+/// Inference routing context passed to the proxy for gRPC rerouting.
+///
+/// The gRPC client is lazily initialized on first use and reused for all
+/// subsequent inference requests, avoiding per-request connection overhead.
+pub struct InferenceContext {
+    pub gateway_endpoint: String,
+    pub sandbox_id: String,
+    pub patterns: Vec<crate::l7::inference::InferenceApiPattern>,
+    grpc_client: tokio::sync::OnceCell<crate::grpc_client::CachedInferenceClient>,
+}
+
+impl InferenceContext {
+    pub fn new(
+        gateway_endpoint: String,
+        sandbox_id: String,
+        patterns: Vec<crate::l7::inference::InferenceApiPattern>,
+    ) -> Self {
+        Self {
+            gateway_endpoint,
+            sandbox_id,
+            patterns,
+            grpc_client: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn client(&self) -> Result<crate::grpc_client::CachedInferenceClient> {
+        let client = self
+            .grpc_client
+            .get_or_try_init(|| {
+                crate::grpc_client::CachedInferenceClient::connect(&self.gateway_endpoint)
+            })
+            .await?;
+        Ok(client.clone())
+    }
 }
 
 /// An endpoint that the proxy always allows without OPA evaluation.
@@ -73,6 +105,7 @@ impl ProxyHandle {
     /// via `/proc/net/tcp`. Connections to `control_plane_endpoints` are always
     /// allowed without OPA evaluation — these are infrastructure endpoints
     /// (like the navigator server) that the sandbox needs to function.
+    #[allow(clippy::too_many_arguments)]
     pub async fn start_with_bind_addr(
         policy: &ProxyPolicy,
         bind_addr: Option<SocketAddr>,
@@ -81,6 +114,7 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         control_plane_endpoints: Vec<AllowedEndpoint>,
         tls_state: Option<Arc<ProxyTlsState>>,
+        inference_ctx: Option<Arc<InferenceContext>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -110,9 +144,10 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let cp = cp_endpoints.clone();
                         let tls = tls_state.clone();
+                        let inf = inference_ctx.clone();
                         tokio::spawn(async move {
                             if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, cp, tls).await
+                                handle_tcp_connection(stream, opa, cache, spid, cp, tls, inf).await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -151,6 +186,7 @@ async fn handle_tcp_connection(
     entrypoint_pid: Arc<AtomicU32>,
     control_plane_endpoints: Arc<Vec<AllowedEndpoint>>,
     tls_state: Option<Arc<ProxyTlsState>>,
+    inference_ctx: Option<Arc<InferenceContext>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -202,14 +238,14 @@ async fn handle_tcp_connection(
 
     let decision = if is_control_plane {
         ConnectDecision {
-            allowed: true,
+            action: NetworkAction::Allow {
+                matched_policy: Some("control_plane".into()),
+            },
             binary: None,
             binary_pid: None,
             ancestors: vec![],
             cmdline_paths: vec![],
-            matched_policy: Some("control_plane".into()),
             engine: "control_plane",
-            reason: String::new(),
         }
     } else {
         // Evaluate OPA policy with process-identity binding
@@ -223,8 +259,18 @@ async fn handle_tcp_connection(
         )
     };
 
+    // Extract action string and matched policy for logging
+    let (action_str, matched_policy, deny_reason) = match &decision.action {
+        NetworkAction::InspectForInference { matched_policy } => (
+            "inspect_for_inference",
+            matched_policy.clone(),
+            String::new(),
+        ),
+        NetworkAction::Allow { matched_policy } => ("allow", matched_policy.clone(), String::new()),
+        NetworkAction::Deny { reason } => ("deny", None, reason.clone()),
+    };
+
     // Unified log line: one info! per CONNECT with full context
-    let action = if decision.allowed { "allow" } else { "deny" };
     let binary_str = decision
         .binary
         .as_ref()
@@ -252,7 +298,7 @@ async fn handle_tcp_connection(
             .collect::<Vec<_>>()
             .join(", ")
     };
-    let policy_str = decision.matched_policy.as_deref().unwrap_or("-");
+    let policy_str = matched_policy.as_deref().unwrap_or("-");
 
     info!(
         src_addr = %peer_addr.ip(),
@@ -264,16 +310,31 @@ async fn handle_tcp_connection(
         binary_pid = %pid_str,
         ancestors = %ancestors_str,
         cmdline = %cmdline_str,
-        action = %action,
+        action = %action_str,
         engine = %decision.engine,
         policy = %policy_str,
-        reason = %decision.reason,
+        reason = %deny_reason,
         "CONNECT",
     );
 
-    if !decision.allowed {
+    if matches!(decision.action, NetworkAction::Deny { .. }) {
         respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
+    }
+
+    // InspectForInference: intercept the connection, don't connect upstream.
+    // TLS-terminate the client side, parse HTTP requests, and reroute inference
+    // calls through the gateway's ProxyInference gRPC endpoint.
+    if matches!(decision.action, NetworkAction::InspectForInference { .. }) {
+        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        return handle_inference_interception(
+            client,
+            &host_lc,
+            port,
+            tls_state.as_ref(),
+            inference_ctx.as_ref(),
+        )
+        .await;
     }
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
@@ -317,7 +378,7 @@ async fn handle_tcp_connection(
         let ctx = crate::l7::relay::L7EvalContext {
             host: host_lc.clone(),
             port,
-            policy_name: decision.matched_policy.clone().unwrap_or_default(),
+            policy_name: matched_policy.clone().unwrap_or_default(),
             binary_path: decision
                 .binary
                 .as_ref()
@@ -454,34 +515,44 @@ fn evaluate_opa_tcp(
     use crate::opa::NetworkInput;
     use std::sync::atomic::Ordering;
 
+    let deny = |reason: String,
+                binary: Option<PathBuf>,
+                binary_pid: Option<u32>,
+                ancestors: Vec<PathBuf>,
+                cmdline_paths: Vec<PathBuf>|
+     -> ConnectDecision {
+        ConnectDecision {
+            action: NetworkAction::Deny { reason },
+            binary,
+            binary_pid,
+            ancestors,
+            cmdline_paths,
+            engine: "opa",
+        }
+    };
+
     let pid = entrypoint_pid.load(Ordering::Acquire);
     if pid == 0 {
-        return ConnectDecision {
-            allowed: false,
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-            cmdline_paths: vec![],
-            matched_policy: None,
-            engine: "opa",
-            reason: "entrypoint process not yet spawned".into(),
-        };
+        return deny(
+            "entrypoint process not yet spawned".into(),
+            None,
+            None,
+            vec![],
+            vec![],
+        );
     }
 
     let peer_port = peer_addr.port();
     let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
         Ok(r) => r,
         Err(e) => {
-            return ConnectDecision {
-                allowed: false,
-                binary: None,
-                binary_pid: None,
-                ancestors: vec![],
-                cmdline_paths: vec![],
-                matched_policy: None,
-                engine: "opa",
-                reason: format!("failed to resolve peer binary: {e}"),
-            };
+            return deny(
+                format!("failed to resolve peer binary: {e}"),
+                None,
+                None,
+                vec![],
+                vec![],
+            );
         }
     };
 
@@ -489,16 +560,13 @@ fn evaluate_opa_tcp(
     let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
         Ok(h) => h,
         Err(e) => {
-            return ConnectDecision {
-                allowed: false,
-                binary: Some(bin_path),
-                binary_pid: Some(binary_pid),
-                ancestors: vec![],
-                cmdline_paths: vec![],
-                matched_policy: None,
-                engine: "opa",
-                reason: format!("binary integrity check failed: {e}"),
-            };
+            return deny(
+                format!("binary integrity check failed: {e}"),
+                Some(bin_path),
+                Some(binary_pid),
+                vec![],
+                vec![],
+            );
         }
     };
 
@@ -508,19 +576,16 @@ fn evaluate_opa_tcp(
     // TOFU verify each ancestor binary
     for ancestor in &ancestors {
         if let Err(e) = identity_cache.verify_or_cache(ancestor) {
-            return ConnectDecision {
-                allowed: false,
-                binary: Some(bin_path),
-                binary_pid: Some(binary_pid),
-                ancestors: ancestors.clone(),
-                cmdline_paths: vec![],
-                matched_policy: None,
-                engine: "opa",
-                reason: format!(
+            return deny(
+                format!(
                     "ancestor integrity check failed for {}: {e}",
                     ancestor.display()
                 ),
-            };
+                Some(bin_path),
+                Some(binary_pid),
+                ancestors.clone(),
+                vec![],
+            );
         }
     }
 
@@ -539,27 +604,22 @@ fn evaluate_opa_tcp(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    match engine.evaluate_network(&input) {
-        Ok(decision) => ConnectDecision {
-            allowed: decision.allowed,
+    match engine.evaluate_network_action(&input) {
+        Ok(action) => ConnectDecision {
+            action,
             binary: Some(bin_path),
             binary_pid: Some(binary_pid),
             ancestors,
             cmdline_paths,
-            matched_policy: decision.matched_policy,
             engine: "opa",
-            reason: decision.reason,
         },
-        Err(e) => ConnectDecision {
-            allowed: false,
-            binary: Some(bin_path),
-            binary_pid: Some(binary_pid),
+        Err(e) => deny(
+            format!("policy evaluation error: {e}"),
+            Some(bin_path),
+            Some(binary_pid),
             ancestors,
             cmdline_paths,
-            matched_policy: None,
-            engine: "opa",
-            reason: format!("policy evaluation error: {e}"),
-        },
+        ),
     }
 }
 
@@ -574,15 +634,226 @@ fn evaluate_opa_tcp(
     _port: u16,
 ) -> ConnectDecision {
     ConnectDecision {
-        allowed: false,
+        action: NetworkAction::Deny {
+            reason: "identity binding unavailable on this platform".into(),
+        },
         binary: None,
         binary_pid: None,
         ancestors: vec![],
         cmdline_paths: vec![],
-        matched_policy: None,
         engine: "opa",
-        reason: "identity binding unavailable on this platform".into(),
     }
+}
+
+/// Maximum buffer size for inference request parsing (10 MiB).
+const MAX_INFERENCE_BUF: usize = 10 * 1024 * 1024;
+
+/// Initial buffer size for inference request parsing (64 KiB).
+const INITIAL_INFERENCE_BUF: usize = 65536;
+
+/// Handle an intercepted connection for inference routing.
+///
+/// TLS-terminates the client connection, parses HTTP requests, and reroutes
+/// inference API calls through the gateway's `ProxyInference` gRPC endpoint.
+/// Non-inference requests are denied with 403.
+async fn handle_inference_interception(
+    client: TcpStream,
+    host: &str,
+    _port: u16,
+    tls_state: Option<&Arc<ProxyTlsState>>,
+    inference_ctx: Option<&Arc<InferenceContext>>,
+) -> Result<()> {
+    use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
+
+    let ctx = inference_ctx.ok_or_else(|| {
+        miette::miette!(
+            "InspectForInference requires inference context (gateway endpoint + sandbox_id)"
+        )
+    })?;
+
+    let tls = tls_state.ok_or_else(|| {
+        miette::miette!("InspectForInference requires TLS state for client termination")
+    })?;
+
+    // Lazily connect the gRPC client (reused across requests on this connection
+    // and shared with other connections via the OnceCell).
+    let grpc_client = ctx.client().await?;
+
+    // TLS-terminate the client side (present a cert for the target host)
+    let mut tls_client = crate::l7::tls::tls_terminate_client(client, tls, host).await?;
+
+    // Read and process HTTP requests from the tunnel
+    let mut buf = vec![0u8; INITIAL_INFERENCE_BUF];
+    let mut used = 0usize;
+
+    loop {
+        let n = tls_client.read(&mut buf[used..]).await.into_diagnostic()?;
+        if n == 0 {
+            break; // Client closed connection
+        }
+        used += n;
+
+        // Try to parse a complete HTTP request
+        match try_parse_http_request(&buf[..used]) {
+            ParseResult::Complete(request, consumed) => {
+                // Parsed successfully — fall through to routing below
+                route_inference_request(
+                    &request,
+                    &ctx.patterns,
+                    &grpc_client,
+                    &ctx.sandbox_id,
+                    &mut tls_client,
+                )
+                .await?;
+
+                // Shift buffer for next request
+                buf.copy_within(consumed..used, 0);
+                used -= consumed;
+            }
+            ParseResult::Incomplete => {
+                // Need more data — grow buffer if full
+                if used == buf.len() {
+                    if buf.len() >= MAX_INFERENCE_BUF {
+                        let response = format_http_response(413, &[], b"Payload Too Large");
+                        write_all(&mut tls_client, &response).await?;
+                        break;
+                    }
+                    buf.resize((buf.len() * 2).min(MAX_INFERENCE_BUF), 0);
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Route a parsed inference request through the gateway or deny it.
+async fn route_inference_request(
+    request: &crate::l7::inference::ParsedHttpRequest,
+    patterns: &[crate::l7::inference::InferenceApiPattern],
+    grpc_client: &crate::grpc_client::CachedInferenceClient,
+    sandbox_id: &str,
+    tls_client: &mut (impl tokio::io::AsyncWrite + Unpin),
+) -> Result<()> {
+    use crate::l7::inference::{detect_inference_pattern, format_http_response};
+
+    if let Some(pattern) = detect_inference_pattern(&request.method, &request.path, patterns) {
+        info!(
+            method = %request.method,
+            path = %request.path,
+            protocol = %pattern.protocol,
+            kind = %pattern.kind,
+            "Intercepted inference request, rerouting through gateway"
+        );
+
+        // Strip credential + framing/hop-by-hop headers.
+        // The gateway/client stack will set correct framing for forwarded bytes.
+        let filtered_headers = sanitize_inference_request_headers(&request.headers);
+
+        match grpc_client
+            .proxy_inference(
+                sandbox_id,
+                &pattern.protocol,
+                &request.method,
+                &request.path,
+                filtered_headers,
+                request.body.clone(),
+            )
+            .await
+        {
+            Ok(resp) => {
+                let resp_headers = resp
+                    .http_headers
+                    .into_iter()
+                    .map(|h| (h.name, h.value))
+                    .collect::<Vec<_>>();
+                let resp_headers = sanitize_inference_response_headers(resp_headers);
+                let status = u16::try_from(resp.http_status).unwrap_or(502);
+                let response = format_http_response(status, &resp_headers, &resp.http_body);
+                write_all(tls_client, &response).await?;
+            }
+            Err(e) => {
+                warn!(error = %e, "Gateway inference proxy failed");
+                let body = serde_json::json!({"error": "inference routing failed"});
+                let body_bytes = body.to_string();
+                let response = format_http_response(
+                    502,
+                    &[("content-type".to_string(), "application/json".to_string())],
+                    body_bytes.as_bytes(),
+                );
+                write_all(tls_client, &response).await?;
+            }
+        }
+    } else {
+        // Not an inference request — deny
+        info!(
+            method = %request.method,
+            path = %request.path,
+            "Non-inference request denied (inference-only mode)"
+        );
+        let body =
+            serde_json::json!({"error": "only inference API calls are allowed on this connection"});
+        let body_bytes = body.to_string();
+        let response = format_http_response(
+            403,
+            &[("content-type".to_string(), "application/json".to_string())],
+            body_bytes.as_bytes(),
+        );
+        write_all(tls_client, &response).await?;
+    }
+
+    Ok(())
+}
+
+fn sanitize_inference_request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    headers
+        .iter()
+        .filter(|(name, _)| !should_strip_request_header(name))
+        .cloned()
+        .collect()
+}
+
+fn sanitize_inference_response_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .filter(|(name, _)| !should_strip_response_header(name))
+        .collect()
+}
+
+fn should_strip_request_header(name: &str) -> bool {
+    let name_lc = name.to_ascii_lowercase();
+    matches!(
+        name_lc.as_str(),
+        "authorization" | "x-api-key" | "host" | "content-length"
+    ) || is_hop_by_hop_header(&name_lc)
+}
+
+fn should_strip_response_header(name: &str) -> bool {
+    let name_lc = name.to_ascii_lowercase();
+    matches!(name_lc.as_str(), "content-length") || is_hop_by_hop_header(&name_lc)
+}
+
+fn is_hop_by_hop_header(name: &str) -> bool {
+    matches!(
+        name,
+        "connection"
+            | "keep-alive"
+            | "proxy-authenticate"
+            | "proxy-authorization"
+            | "proxy-connection"
+            | "te"
+            | "trailer"
+            | "transfer-encoding"
+            | "upgrade"
+    )
+}
+
+/// Write all bytes to an async writer.
+async fn write_all(writer: &mut (impl tokio::io::AsyncWrite + Unpin), data: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    writer.write_all(data).await.into_diagnostic()?;
+    writer.flush().await.into_diagnostic()?;
+    Ok(())
 }
 
 /// Query L7 endpoint config from the OPA engine for a matched CONNECT decision.
@@ -595,8 +866,12 @@ fn query_l7_config(
     host: &str,
     port: u16,
 ) -> Option<crate::l7::L7EndpointConfig> {
-    // Only query if L4 allowed and we have a matched policy
-    if !decision.allowed || decision.matched_policy.is_none() {
+    // Only query if action is Allow (not Deny or InspectForInference)
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
         return None;
     }
 
@@ -858,6 +1133,89 @@ mod tests {
         assert!(
             err.contains("DNS resolution failed"),
             "expected 'DNS resolution failed' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn sanitize_request_headers_strips_auth_and_framing() {
+        let headers = vec![
+            ("authorization".to_string(), "Bearer test".to_string()),
+            ("x-api-key".to_string(), "secret".to_string()),
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            ("content-length".to_string(), "42".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+            ("accept".to_string(), "text/event-stream".to_string()),
+        ];
+
+        let kept = sanitize_inference_request_headers(&headers);
+
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("authorization")),
+            "authorization should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("x-api-key")),
+            "x-api-key should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("transfer-encoding")),
+            "transfer-encoding should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("content-length")),
+            "content-length should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type")),
+            "content-type should be preserved"
+        );
+        assert!(
+            kept.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")),
+            "accept should be preserved"
+        );
+    }
+
+    #[test]
+    fn sanitize_response_headers_strips_hop_by_hop() {
+        let headers = vec![
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            ("content-length".to_string(), "128".to_string()),
+            ("connection".to_string(), "keep-alive".to_string()),
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            ("cache-control".to_string(), "no-cache".to_string()),
+        ];
+
+        let kept = sanitize_inference_response_headers(headers);
+
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("transfer-encoding")),
+            "transfer-encoding should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("content-length")),
+            "content-length should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .all(|(k, _)| !k.eq_ignore_ascii_case("connection")),
+            "connection should be stripped"
+        );
+        assert!(
+            kept.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("content-type")),
+            "content-type should be preserved"
+        );
+        assert!(
+            kept.iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("cache-control")),
+            "cache-control should be preserved"
         );
     }
 }

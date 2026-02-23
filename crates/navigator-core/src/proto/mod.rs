@@ -59,7 +59,7 @@ pub mod test {
 )]
 pub mod inference {
     pub mod v1 {
-        include!("navigator.inference.v1.rs");
+        include!(concat!(env!("OUT_DIR"), "/navigator.inference.v1.rs"));
     }
 }
 

@@ -14,6 +14,8 @@ import grpc
 
 from navigator._proto import (
     datamodel_pb2,
+    inference_pb2,
+    inference_pb2_grpc,
     navigator_pb2,
     navigator_pb2_grpc,
     sandbox_pb2,
@@ -367,6 +369,66 @@ class SandboxClient:
         )
 
 
+@dataclass(frozen=True)
+class InferenceRouteRef:
+    id: str
+    name: str
+
+
+class InferenceRouteClient:
+    """gRPC client for managing inference routes."""
+
+    def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
+        self._stub = inference_pb2_grpc.InferenceStub(channel)
+        self._timeout = timeout
+
+    @classmethod
+    def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
+        return cls(client._channel, timeout=client._timeout)
+
+    def create(
+        self,
+        *,
+        name: str,
+        routing_hint: str,
+        base_url: str,
+        protocols: builtins.list[str],
+        api_key: str,
+        model_id: str,
+        enabled: bool = True,
+    ) -> InferenceRouteRef:
+        spec = inference_pb2.InferenceRouteSpec(
+            routing_hint=routing_hint,
+            base_url=base_url,
+            protocols=protocols,
+            api_key=api_key,
+            model_id=model_id,
+            enabled=enabled,
+        )
+        response = self._stub.CreateInferenceRoute(
+            inference_pb2.CreateInferenceRouteRequest(route=spec, name=name),
+            timeout=self._timeout,
+        )
+        route = response.route
+        return InferenceRouteRef(id=route.id, name=route.name)
+
+    def delete(self, name: str) -> bool:
+        response = self._stub.DeleteInferenceRoute(
+            inference_pb2.DeleteInferenceRouteRequest(name=name),
+            timeout=self._timeout,
+        )
+        return bool(response.deleted)
+
+    def list(
+        self, *, limit: int = 100, offset: int = 0
+    ) -> builtins.list[InferenceRouteRef]:
+        response = self._stub.ListInferenceRoutes(
+            inference_pb2.ListInferenceRoutesRequest(limit=limit, offset=offset),
+            timeout=self._timeout,
+        )
+        return [InferenceRouteRef(id=r.id, name=r.name) for r in response.routes]
+
+
 class Sandbox:
     """Context-managed sandbox session bound to one sandbox id."""
 
@@ -529,7 +591,7 @@ def _sandbox_ref(sandbox: datamodel_pb2.Sandbox) -> SandboxRef:
 def _default_policy() -> sandbox_pb2.SandboxPolicy:
     return sandbox_pb2.SandboxPolicy(
         version=1,
-        inference=sandbox_pb2.InferencePolicy(allowed_routing_hints=["local"]),
+        inference=sandbox_pb2.InferencePolicy(allowed_routes=["local"]),
         filesystem=sandbox_pb2.FilesystemPolicy(
             include_workdir=True,
             read_only=["/usr", "/lib", "/etc", "/app"],

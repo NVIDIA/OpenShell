@@ -51,10 +51,12 @@ deny_reason := reason if {
 	reason := concat("; ", all_reasons)
 }
 
-deny_reason := "no network policies defined" if {
+deny_reason := "no matching policy and no inference routing configured" if {
 	input.network
 	input.exec
+	not network_policy_for_request
 	count(data.network_policies) == 0
+	count(object.get(data, "inference", {}).allowed_routes) == 0
 }
 
 # --- Matched policy name (for audit logging) ---
@@ -125,6 +127,29 @@ binary_allowed(policy, exec) if {
 	some p
 	p := all_paths[_]
 	glob.match(b.path, ["/"], p)
+}
+
+# --- Network action (allow / inspect_for_inference / deny) ---
+#
+# These rules are mutually exclusive by construction:
+#   - "allow" requires `network_policy_for_request` (binary+endpoint matched)
+#   - "inspect_for_inference" requires `not network_policy_for_request`
+# They can never both be true, so OPA's complete-rule conflict semantics
+# are satisfied without an explicit `else`.
+
+default network_action := "deny"
+
+# Explicitly allowed: endpoint + binary match in a network policy → allow.
+network_action := "allow" if {
+	network_policy_for_request
+}
+
+# Binary not explicitly allowed + inference configured → inspect.
+# Fires whether the endpoint is declared in a policy or not — the key condition
+# is that THIS binary is not allowed for this endpoint.
+network_action := "inspect_for_inference" if {
+	not network_policy_for_request
+	count(data.inference.allowed_routes) > 0
 }
 
 # ===========================================================================

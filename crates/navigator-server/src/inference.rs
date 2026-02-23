@@ -1,21 +1,19 @@
 use navigator_core::proto::{
-    CompletionRequest, CompletionResponse, DeleteInferenceRouteRequest,
-    DeleteInferenceRouteResponse, InferenceRoute, InferenceRouteResponse,
-    ListInferenceRoutesRequest, ListInferenceRoutesResponse, Sandbox, UpdateInferenceRouteRequest,
+    DeleteInferenceRouteRequest, DeleteInferenceRouteResponse, HttpHeader, InferenceRoute,
+    InferenceRouteResponse, ListInferenceRoutesRequest, ListInferenceRoutesResponse,
+    ProxyInferenceRequest, ProxyInferenceResponse, Sandbox, UpdateInferenceRouteRequest,
     inference_server::Inference,
 };
 use navigator_router::{RouterError, config::ResolvedRoute};
 use prost::Message;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::{
     ServerState,
     persistence::{ObjectId, ObjectName, ObjectType, Store, generate_name},
 };
-
-const SANDBOX_ID_HEADER: &str = "x-sandbox-id";
 
 #[derive(Debug)]
 pub struct InferenceService {
@@ -48,30 +46,23 @@ impl ObjectName for InferenceRoute {
 
 #[tonic::async_trait]
 impl Inference for InferenceService {
-    async fn completion(
+    async fn proxy_inference(
         &self,
-        request: Request<CompletionRequest>,
-    ) -> Result<Response<CompletionResponse>, Status> {
-        let sandbox_id = request
-            .metadata()
-            .get(SANDBOX_ID_HEADER)
-            .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
-
-        if sandbox_id.is_empty() {
-            return Err(Status::unauthenticated("x-sandbox-id header is required"));
-        }
-
+        request: Request<ProxyInferenceRequest>,
+    ) -> Result<Response<ProxyInferenceResponse>, Status> {
         let req = request.into_inner();
+
+        if req.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
 
         let sandbox = self
             .state
             .store
-            .get_message::<Sandbox>(&sandbox_id)
+            .get_message::<Sandbox>(&req.sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("failed to load sandbox: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
+            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
 
         let policy = sandbox
             .spec
@@ -79,28 +70,14 @@ impl Inference for InferenceService {
             .and_then(|s| s.policy.as_ref())
             .and_then(|p| p.inference.as_ref());
 
-        if req.routing_hint.is_empty() {
-            return Err(Status::invalid_argument("routing_hint is required"));
-        }
-
-        let allowed_hints = match policy {
+        let allowed_routes = match policy {
             Some(inference_policy) => {
-                if !inference_policy
-                    .allowed_routing_hints
-                    .iter()
-                    .any(|h| h == &req.routing_hint)
-                {
-                    warn!(
-                        sandbox_id = %sandbox_id,
-                        routing_hint = %req.routing_hint,
-                        "inference request denied by sandbox policy"
-                    );
-                    return Err(Status::permission_denied(format!(
-                        "routing_hint '{}' not allowed for sandbox {sandbox_id}",
-                        req.routing_hint
-                    )));
+                if inference_policy.allowed_routes.is_empty() {
+                    return Err(Status::permission_denied(
+                        "sandbox inference policy has no allowed routes",
+                    ));
                 }
-                inference_policy.allowed_routing_hints.clone()
+                inference_policy.allowed_routes.clone()
             }
             None => {
                 return Err(Status::permission_denied(
@@ -109,7 +86,7 @@ impl Inference for InferenceService {
             }
         };
 
-        let routes = list_resolved_routes(self.state.store.as_ref(), &allowed_hints).await?;
+        let routes = list_resolved_routes(self.state.store.as_ref(), &allowed_routes).await?;
         if routes.is_empty() {
             return Err(Status::failed_precondition(
                 "no enabled routes available for sandbox policy",
@@ -120,19 +97,44 @@ impl Inference for InferenceService {
             Status::unavailable("inference router is not configured on this server")
         })?;
 
+        let headers: Vec<(String, String)> = req
+            .http_headers
+            .iter()
+            .map(|h| (h.name.clone(), h.value.clone()))
+            .collect();
+
         info!(
-            sandbox_id = %sandbox_id,
-            routing_hint = %req.routing_hint,
+            sandbox_id = %req.sandbox_id,
+            source_protocol = %req.source_protocol,
+            method = %req.http_method,
+            path = %req.http_path,
             candidate_routes = routes.len(),
-            "processing inference completion request"
+            "processing proxy inference request"
         );
 
         let response = inference_router
-            .completion_with_candidates(&req, &routes)
+            .proxy_with_candidates(
+                &req.source_protocol,
+                &req.http_method,
+                &req.http_path,
+                headers,
+                bytes::Bytes::from(req.http_body),
+                &routes,
+            )
             .await
             .map_err(router_error_to_status)?;
 
-        Ok(Response::new(response))
+        let resp_headers: Vec<HttpHeader> = response
+            .headers
+            .into_iter()
+            .map(|(name, value)| HttpHeader { name, value })
+            .collect();
+
+        Ok(Response::new(ProxyInferenceResponse {
+            http_status: i32::from(response.status),
+            http_headers: resp_headers,
+            http_body: response.body.to_vec(),
+        }))
     }
 
     async fn create_inference_route(
@@ -140,9 +142,10 @@ impl Inference for InferenceService {
         request: Request<navigator_core::proto::CreateInferenceRouteRequest>,
     ) -> Result<Response<InferenceRouteResponse>, Status> {
         let req = request.into_inner();
-        let spec = req
+        let mut spec = req
             .route
             .ok_or_else(|| Status::invalid_argument("route is required"))?;
+        normalize_route_protocols(&mut spec);
         validate_route_spec(&spec)?;
 
         let name = if req.name.is_empty() {
@@ -185,9 +188,10 @@ impl Inference for InferenceService {
         if request.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
-        let spec = request
+        let mut spec = request
             .route
             .ok_or_else(|| Status::invalid_argument("route is required"))?;
+        normalize_route_protocols(&mut spec);
         validate_route_spec(&spec)?;
 
         let existing = self
@@ -273,11 +277,8 @@ fn validate_route_spec(spec: &navigator_core::proto::InferenceRouteSpec) -> Resu
     if spec.base_url.trim().is_empty() {
         return Err(Status::invalid_argument("route.base_url is required"));
     }
-    if spec.protocol.trim().is_empty() {
-        return Err(Status::invalid_argument("route.protocol is required"));
-    }
-    if spec.api_key.trim().is_empty() {
-        return Err(Status::invalid_argument("route.api_key is required"));
+    if navigator_core::inference::normalize_protocols(&spec.protocols).is_empty() {
+        return Err(Status::invalid_argument("route.protocols is required"));
     }
     if spec.model_id.trim().is_empty() {
         return Err(Status::invalid_argument("route.model_id is required"));
@@ -285,13 +286,21 @@ fn validate_route_spec(spec: &navigator_core::proto::InferenceRouteSpec) -> Resu
     Ok(())
 }
 
+fn normalize_route_protocols(spec: &mut navigator_core::proto::InferenceRouteSpec) {
+    spec.protocols = navigator_core::inference::normalize_protocols(&spec.protocols);
+}
+
+/// Resolve inference routes from the store, filtered by allowed route names.
+///
+/// Routes are matched by `routing_hint` against the `allowed_routes` list
+/// from the sandbox's inference policy. Only enabled routes are returned.
 async fn list_resolved_routes(
     store: &Store,
-    allowed_hints: &[String],
+    allowed_routes: &[String],
 ) -> Result<Vec<ResolvedRoute>, Status> {
     let mut allowed_set = std::collections::HashSet::new();
-    for hint in allowed_hints {
-        allowed_set.insert(hint.as_str());
+    for name in allowed_routes {
+        allowed_set.insert(name.as_str());
     }
 
     let records = store
@@ -313,11 +322,17 @@ async fn list_resolved_routes(
             continue;
         }
 
+        let protocols = navigator_core::inference::normalize_protocols(&spec.protocols);
+        if protocols.is_empty() {
+            continue;
+        }
+
         routes.push(ResolvedRoute {
             routing_hint: spec.routing_hint.clone(),
             endpoint: spec.base_url.clone(),
             model: spec.model_id.clone(),
             api_key: spec.api_key.clone(),
+            protocols,
         });
     }
 
@@ -329,6 +344,9 @@ fn router_error_to_status(err: RouterError) -> Status {
         RouterError::RouteNotFound(hint) => {
             Status::invalid_argument(format!("no route configured for routing_hint '{hint}'"))
         }
+        RouterError::NoCompatibleRoute(protocol) => Status::failed_precondition(format!(
+            "no compatible route for source protocol '{protocol}'"
+        )),
         RouterError::Unauthorized(msg) => Status::unauthenticated(msg),
         RouterError::UpstreamUnavailable(msg) => Status::unavailable(msg),
         RouterError::UpstreamProtocol(msg) | RouterError::Internal(msg) => Status::internal(msg),
@@ -347,10 +365,10 @@ mod tests {
             spec: Some(InferenceRouteSpec {
                 routing_hint: routing_hint.to_string(),
                 base_url: "https://example.com/v1".to_string(),
-                protocol: "openai_chat_completions".to_string(),
                 api_key: "test-key".to_string(),
                 model_id: "test/model".to_string(),
                 enabled,
+                protocols: vec!["openai_chat_completions".to_string()],
             }),
         }
     }
@@ -360,13 +378,39 @@ mod tests {
         let spec = InferenceRouteSpec {
             routing_hint: String::new(),
             base_url: String::new(),
-            protocol: String::new(),
             api_key: String::new(),
             model_id: String::new(),
             enabled: true,
+            protocols: Vec::new(),
         };
         let err = validate_route_spec(&spec).unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[test]
+    fn normalize_route_protocols_dedupes_and_lowercases() {
+        let mut spec = InferenceRouteSpec {
+            routing_hint: "local".to_string(),
+            base_url: "https://example.com/v1".to_string(),
+            api_key: "test-key".to_string(),
+            model_id: "model".to_string(),
+            enabled: true,
+            protocols: vec![
+                "OpenAI_Chat_Completions".to_string(),
+                "openai_chat_completions".to_string(),
+                "anthropic_messages".to_string(),
+            ],
+        };
+
+        normalize_route_protocols(&mut spec);
+
+        assert_eq!(
+            spec.protocols,
+            vec![
+                "openai_chat_completions".to_string(),
+                "anthropic_messages".to_string()
+            ]
+        );
     }
 
     #[tokio::test]
@@ -393,10 +437,11 @@ mod tests {
 
         assert_eq!(routes.len(), 1);
         assert_eq!(routes[0].routing_hint, "local");
+        assert_eq!(routes[0].protocols, vec!["openai_chat_completions"]);
     }
 
     #[tokio::test]
-    async fn list_resolved_routes_filters_by_allowed_hints() {
+    async fn list_resolved_routes_filters_by_allowed_routes() {
         let store = Store::connect("sqlite::memory:?cache=shared")
             .await
             .expect("store should connect");
@@ -411,5 +456,45 @@ mod tests {
             .await
             .expect("routes should resolve");
         assert!(routes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_resolved_routes_keeps_multi_protocols_in_single_route() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store should connect");
+
+        let route = InferenceRoute {
+            id: "r-1".to_string(),
+            name: "route-multi".to_string(),
+            spec: Some(InferenceRouteSpec {
+                routing_hint: "local".to_string(),
+                base_url: "https://example.com/v1".to_string(),
+                api_key: "test-key".to_string(),
+                model_id: "test/model".to_string(),
+                enabled: true,
+                protocols: vec![
+                    "openai_chat_completions".to_string(),
+                    "anthropic_messages".to_string(),
+                ],
+            }),
+        };
+        store
+            .put_message(&route)
+            .await
+            .expect("route should persist");
+
+        let routes = list_resolved_routes(&store, &["local".to_string()])
+            .await
+            .expect("routes should resolve");
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].protocols,
+            vec![
+                "openai_chat_completions".to_string(),
+                "anthropic_messages".to_string()
+            ]
+        );
     }
 }

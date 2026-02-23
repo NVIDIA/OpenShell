@@ -2,8 +2,9 @@
 
 use miette::{IntoDiagnostic, Result};
 use navigator_core::proto::{
-    GetSandboxPolicyRequest, GetSandboxProviderEnvironmentRequest,
-    SandboxPolicy as ProtoSandboxPolicy, navigator_client::NavigatorClient,
+    GetSandboxPolicyRequest, GetSandboxProviderEnvironmentRequest, HttpHeader,
+    ProxyInferenceRequest, ProxyInferenceResponse, SandboxPolicy as ProtoSandboxPolicy,
+    inference_client::InferenceClient, navigator_client::NavigatorClient,
 };
 use std::collections::HashMap;
 use tracing::debug;
@@ -72,4 +73,63 @@ pub async fn fetch_provider_environment(
         .into_diagnostic()?;
 
     Ok(response.into_inner().environment)
+}
+
+/// A reusable gRPC client for the inference service.
+///
+/// Wraps a tonic channel that is connected once and reused for all
+/// subsequent `ProxyInference` calls, avoiding per-request connection overhead.
+#[derive(Clone)]
+pub struct CachedInferenceClient {
+    client: InferenceClient<tonic::transport::Channel>,
+}
+
+impl CachedInferenceClient {
+    pub async fn connect(endpoint: &str) -> Result<Self> {
+        debug!(endpoint = %endpoint, "Connecting inference gRPC client");
+        let client = InferenceClient::connect(endpoint.to_string())
+            .await
+            .into_diagnostic()?;
+        Ok(Self { client })
+    }
+
+    /// Forward an intercepted inference request to the gateway via gRPC.
+    pub async fn proxy_inference(
+        &self,
+        sandbox_id: &str,
+        source_protocol: &str,
+        http_method: &str,
+        http_path: &str,
+        http_headers: Vec<(String, String)>,
+        http_body: Vec<u8>,
+    ) -> Result<ProxyInferenceResponse> {
+        debug!(
+            sandbox_id = %sandbox_id,
+            source_protocol = %source_protocol,
+            method = %http_method,
+            path = %http_path,
+            "Forwarding inference request to gateway"
+        );
+
+        let headers: Vec<HttpHeader> = http_headers
+            .into_iter()
+            .map(|(name, value)| HttpHeader { name, value })
+            .collect();
+
+        let response = self
+            .client
+            .clone()
+            .proxy_inference(ProxyInferenceRequest {
+                sandbox_id: sandbox_id.to_string(),
+                source_protocol: source_protocol.to_string(),
+                http_method: http_method.to_string(),
+                http_path: http_path.to_string(),
+                http_headers: headers,
+                http_body,
+            })
+            .await
+            .into_diagnostic()?;
+
+        Ok(response.into_inner())
+    }
 }

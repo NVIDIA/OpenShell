@@ -42,6 +42,7 @@ hyper-rustls = "0.27"
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
+reqwest = { workspace = true }
 
 # Error handling
 miette = { workspace = true }

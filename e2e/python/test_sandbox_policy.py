@@ -22,8 +22,6 @@ _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
 _BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
-_BASE_INFERENCE = sandbox_pb2.InferencePolicy(allowed_routing_hints=["local"])
-
 # Standard proxy address inside the sandbox network namespace
 _PROXY_HOST = "10.200.0.1"
 _PROXY_PORT = 3128
@@ -35,7 +33,6 @@ def _base_policy(
     """Build a sandbox policy with standard filesystem/process/landlock settings."""
     return sandbox_pb2.SandboxPolicy(
         version=1,
-        inference=_BASE_INFERENCE,
         filesystem=_BASE_FILESYSTEM,
         landlock=_BASE_LANDLOCK,
         process=_BASE_PROCESS,

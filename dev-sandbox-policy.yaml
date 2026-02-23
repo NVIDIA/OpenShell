@@ -90,5 +90,5 @@ network_policies:
       - { path: /usr/bin/curl }
 
 inference:
-  allowed_routing_hints:
+  allowed_routes:
     - local

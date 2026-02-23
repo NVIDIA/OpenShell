@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from navigator import Sandbox, SandboxClient
+from navigator import InferenceRouteClient, Sandbox, SandboxClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -62,6 +62,39 @@ def sandbox(cluster_name: str | None) -> Callable[..., Sandbox]:
         )
 
     return _create
+
+
+@pytest.fixture(scope="session")
+def inference_client(sandbox_client: SandboxClient) -> InferenceRouteClient:
+    return InferenceRouteClient.from_sandbox_client(sandbox_client)
+
+
+@pytest.fixture(scope="session")
+def mock_inference_route(
+    inference_client: InferenceRouteClient,
+) -> Iterator[str]:
+    name = "e2e-mock-local"
+    routing_hint = "e2e_mock_local"
+    # Clean up any leftover route from a previous run.
+    try:
+        inference_client.delete(name)
+    except grpc.RpcError:
+        pass
+
+    inference_client.create(
+        name=name,
+        routing_hint=routing_hint,
+        base_url="mock://e2e",
+        protocols=["openai_chat_completions"],
+        api_key="mock",
+        model_id="mock/test-model",
+        enabled=True,
+    )
+    yield name
+    try:
+        inference_client.delete(name)
+    except grpc.RpcError:
+        pass
 
 
 @pytest.fixture

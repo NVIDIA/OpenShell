@@ -69,15 +69,17 @@ RUN uv venv /app/.venv && \
     uv sync --no-dev --no-install-project 2>/dev/null || true
 
 # Install navigator SDK dependencies
-RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grpcio protobuf
+RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grpcio protobuf openai
 
 # Stage 4: Coding agents layer
 FROM base AS coding-agents
 
 # Install Node.js 22 via NodeSource (required by OpenClaw and other agents)
 # build-essential & python3 are needed for npm packages with native addons (node-gyp)
+# Include a minimal native toolchain so npm can compile optional native
+# dependencies on platforms where prebuilt artifacts are unavailable.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends git nodejs build-essential python3 && \
+    apt-get install -y --no-install-recommends build-essential git nodejs build-essential python3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Claude CLI via native installer (npm method is deprecated)

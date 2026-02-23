@@ -33,6 +33,7 @@ flowchart TB
     subgraph EXT["External Services"]
         HOSTS["Allowed Hosts (github.com, api.anthropic.com, ...)"]
         CREDS["Provider APIs (Claude, GitHub, GitLab, ...)"]
+        BACKEND["Inference Backends (LM Studio, vLLM, ...)"]
     end
 
     CLI -- "gRPC / HTTPS" --> SERVER
@@ -44,6 +45,8 @@ flowchart TB
     CHILD -- "All network traffic" --> PROXY
     PROXY -- "Evaluate request" --> OPA
     PROXY -- "Allowed traffic only" --> HOSTS
+    PROXY -- "Inference reroute (gRPC)" --> SERVER
+    SERVER -- "Proxied inference" --> BACKEND
     SERVER -. "Store / retrieve credentials" .-> CREDS
 ```
 
@@ -80,6 +83,7 @@ When the agent (or any tool running inside the sandbox) tries to connect to a re
 3. **Evaluates the request against policy** using the OPA engine. The policy can allow or deny connections based on the destination hostname, port, and the identity of the requesting program.
 4. **Rejects connections to internal IP addresses** as a defense against SSRF (Server-Side Request Forgery). Even if the policy allows a hostname, the proxy resolves DNS before connecting and blocks any result that points to a private network address (e.g., cloud metadata endpoints, localhost, or RFC 1918 ranges). This prevents an attacker from redirecting an allowed hostname to internal infrastructure.
 5. **Performs protocol-aware inspection (L7)** for configured endpoints. The proxy can terminate TLS, inspect the underlying HTTP traffic, and enforce rules on individual API requests -- not just connection-level allow/deny. This operates in either audit mode (log violations but allow traffic) or enforce mode (block violations).
+6. **Intercepts inference API calls** when the sandbox has inference routing configured. Connections that don't match any explicit network policy but have inference routes available are TLS-terminated and inspected. Known inference API patterns (OpenAI, Anthropic) are detected and rerouted through the gateway to the configured backend, while non-inference requests are denied.
 
 The proxy generates an ephemeral certificate authority at startup and injects it into the sandbox's trust store. This allows it to transparently inspect HTTPS traffic when L7 inspection is configured for an endpoint.
 
@@ -158,6 +162,51 @@ This approach means users configure credentials once, and every sandbox that nee
 
 For more detail, see [Providers](sandbox-providers.md).
 
+### Inference Routing
+
+The inference routing system transparently intercepts AI inference API calls from sandboxed agents and reroutes them through the gateway to policy-controlled backends. This enables organizations to redirect inference traffic to local or self-hosted models without modifying the agent's code.
+
+**How it works end-to-end:**
+
+1. The sandbox policy includes an `inference.allowed_routes` list (e.g., `["local"]`).
+2. When the agent makes an HTTPS request to any endpoint (e.g., `api.openai.com`), the proxy evaluates it:
+   - If the endpoint + binary is explicitly allowed in `network_policies` -- pass through directly.
+   - If no policy match but inference routes are configured -- **intercept** (OPA returns the `inspect_for_inference` action).
+   - Otherwise -- deny.
+3. For intercepted connections, the proxy:
+   - TLS-terminates the client connection using the sandbox's ephemeral CA.
+   - Parses the HTTP request.
+   - Detects known inference API patterns (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic).
+   - Strips authorization headers and forwards the request to the gateway via gRPC (`ProxyInference` RPC).
+4. The gateway's inference service:
+   - Loads the sandbox's policy to get `allowed_routes`.
+   - Finds enabled inference routes whose `routing_hint` matches the allowed list.
+   - Selects a compatible route by matching the source protocol (e.g., `openai_chat_completions`).
+   - Forwards the request to the route's backend URL, rewriting the authorization header with the route's API key.
+5. The response flows back through the gateway to the proxy to the agent -- the agent sees a normal HTTP response as if it came from the original API.
+
+**Key design properties:**
+
+- Agents need zero code changes -- standard OpenAI/Anthropic SDK calls work transparently.
+- The sandbox never sees the real API key for the backend -- credential isolation is maintained.
+- Policy controls which routes a sandbox can access via `inference.allowed_routes`.
+- Routes are managed as server-side resources via CLI (`nav inference create/update/delete/list`).
+
+**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`) and have these fields: `routing_hint` (name for policy matching), `base_url` (backend endpoint), `protocols` (supported API protocols like `openai_chat_completions` or `anthropic_messages`), `api_key`, `model_id`, and `enabled` flag.
+
+**Components involved:**
+
+| Component | Location | Role |
+|---|---|---|
+| OPA `network_action` rule | `dev-sandbox-policy.rego` | Returns `inspect_for_inference` when no explicit policy match and inference routes exist |
+| Proxy interception | `crates/navigator-sandbox/src/proxy.rs` | TLS-terminates intercepted connections, parses HTTP, calls gateway |
+| Inference pattern detection | `crates/navigator-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
+| gRPC forwarding | `crates/navigator-sandbox/src/grpc_client.rs` | Sends `ProxyInferenceRequest` to the gateway |
+| Gateway inference service | `crates/navigator-server/src/inference.rs` | Resolves routes from policy, delegates to router |
+| Inference router | `crates/navigator-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
+| Proto definitions | `proto/inference.proto` | `InferenceRouteSpec`, `ProxyInferenceRequest/Response`, CRUD RPCs |
+
+
 ### Container and Build System
 
 The platform produces three container images:
@@ -179,7 +228,7 @@ Sandbox behavior is governed by policies written in YAML and evaluated by an emb
 - **Filesystem access**: Which directories are readable, which are writable.
 - **Network access**: Which remote hosts each program in the sandbox can connect to, with per-binary granularity.
 - **Process privileges**: What user/group the agent runs as.
-- **Inference routing**: Which AI model endpoints the agent can access.
+- **Inference routing**: Which AI model backends the sandbox can route inference traffic to, referenced by `routing_hint` name.
 - **L7 inspection rules**: Protocol-level constraints on HTTP API calls for specific endpoints.
 
 Policies are not intended to be hand-edited by end users in normal operation. They are associated with sandboxes at creation time and fetched by the sandbox supervisor at startup via gRPC. For development and testing, policies can also be loaded from local files.
@@ -242,3 +291,5 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 | [Sandbox Connect](sandbox-connect.md) | SSH tunneling into sandboxes through the gateway. |
 | [Providers](sandbox-providers.md) | External credential management, auto-discovery, and runtime injection. |
 | [Policy Language](security-policy.md) | The YAML/Rego policy system that governs sandbox behavior. |
+| [Inference Routing](inference-routing.md) | Transparent interception and rerouting of AI inference API calls from sandboxed agents to policy-controlled backends. |
+| [Local Inference Routing Demo](inference-routing-local-demo.md) | Step-by-step recording script for showing OpenAI SDK interception and reroute to a local LM Studio backend. |

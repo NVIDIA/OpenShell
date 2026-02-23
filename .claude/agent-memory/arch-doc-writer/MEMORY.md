@@ -7,7 +7,7 @@
 - Sandbox entry: `crates/navigator-sandbox/src/lib.rs` (`run_sandbox()`)
 - OPA engine: `crates/navigator-sandbox/src/opa.rs` (single file, not a directory)
 - Identity cache: `crates/navigator-sandbox/src/identity.rs` (SHA256 TOFU, uses Mutex<HashMap> NOT DashMap)
-- L7 inspection: `crates/navigator-sandbox/src/l7/` (mod.rs, tls.rs, relay.rs, rest.rs, provider.rs)
+- L7 inspection: `crates/navigator-sandbox/src/l7/` (mod.rs, tls.rs, relay.rs, rest.rs, provider.rs, inference.rs)
 - Proxy: `crates/navigator-sandbox/src/proxy.rs`
 - Server multiplex: `crates/navigator-server/src/multiplex.rs`
 - SSH tunnel: `crates/navigator-server/src/ssh_tunnel.rs`
@@ -18,7 +18,7 @@
 
 ## Architecture Docs
 - Files renamed from numbered prefix format to descriptive names (e.g., `2 - server-architecture.md` -> `gateway-architecture.md`)
-- Current files: README.md, sandbox-providers.md, cluster-single-node.md, build-containers.md, sandbox-connect.md, sandbox.md, security-policy.md, gateway.md
+- Current files: README.md, sandbox-providers.md, cluster-single-node.md, build-containers.md, sandbox-connect.md, sandbox.md, security-policy.md, gateway.md, inference-routing.md, inference-routing-debug-handoff.md
 - Cross-references use plain filenames: `[text](gateway.md)`
 - Naming convention: "gateway" in prose for the control plane component; code identifiers like `navigator-server` stay unchanged
 
@@ -100,6 +100,19 @@
 - Control plane endpoints exempt (they connect via hostname, skip SSRF check)
 - DNS failure also rejects the connection
 - Non-CP connections use pre-resolved addrs: `TcpStream::connect(addrs.as_slice())`
+
+## Inference Routing Details
+- Three-action OPA model: Allow, InspectForInference, Deny (see `NetworkAction` in opa.rs)
+- InspectForInference triggers: no explicit network_policy match AND inference.allowed_routes is non-empty in policy
+- Proxy handler: `handle_inference_interception()` in proxy.rs -- TLS-terminates, parses HTTP, pattern-matches, calls gateway
+- gRPC client: `proxy_inference()` in `crates/navigator-sandbox/src/grpc_client.rs`
+- Default inference patterns: POST /v1/chat/completions (openai_chat_completions), POST /v1/completions (openai_completions), POST /v1/messages (anthropic_messages)
+- Pattern detection: exact path match after stripping query string, case-insensitive method
+- Gateway route resolution: loads all InferenceRoute objects, filters by enabled + routing_hint in allowed_routes, then router selects by protocol match
+- Router: `navigator-router` crate, `proxy_with_candidates()` finds first route whose `protocols` list contains the source_protocol
+- InferenceRouteSpec proto fields: routing_hint, base_url, protocols (repeated string), api_key, model_id, enabled
+- Auth header stripping: proxy removes `Authorization` header before forwarding; gateway/router adds route's api_key as Bearer token
+- Non-inference requests on intercepted connections get 403 JSON response
 
 ## Naming Conventions
 - The project name "Navigator" appears in code but docs should use generic terms per user preference

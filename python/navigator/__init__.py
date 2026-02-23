@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from navigator.inference import Inference
 from navigator.sandbox import (
     ExecChunk,
     ExecResult,
+    InferenceRouteClient,
+    InferenceRouteRef,
     Sandbox,
     SandboxClient,
     SandboxError,
@@ -24,7 +25,8 @@ except Exception:
 __all__ = [
     "ExecChunk",
     "ExecResult",
-    "Inference",
+    "InferenceRouteClient",
+    "InferenceRouteRef",
     "Sandbox",
     "SandboxClient",
     "SandboxError",

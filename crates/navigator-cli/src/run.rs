@@ -31,6 +31,7 @@ use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
 };
 use owo_colors::OwoColorize;
+use reqwest::StatusCode as ReqwestStatusCode;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
@@ -1304,7 +1305,7 @@ struct DevProcessPolicy {
 #[serde(deny_unknown_fields)]
 struct DevInferencePolicy {
     #[serde(default)]
-    allowed_routing_hints: Vec<String>,
+    allowed_routes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1356,6 +1357,10 @@ struct DevL7Allow {
 #[serde(deny_unknown_fields)]
 struct DevNetworkBinary {
     path: String,
+    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
+    #[serde(default)]
+    #[allow(dead_code)]
+    harness: bool,
 }
 
 /// Load sandbox policy YAML.
@@ -1415,7 +1420,10 @@ fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
                 binaries: rule
                     .binaries
                     .into_iter()
-                    .map(|b| NetworkBinary { path: b.path })
+                    .map(|b| NetworkBinary {
+                        path: b.path,
+                        ..Default::default()
+                    })
                     .collect(),
             };
             (key, proto_rule)
@@ -1444,7 +1452,8 @@ fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
         inference: raw
             .inference
             .map(|inf| navigator_core::proto::InferencePolicy {
-                allowed_routing_hints: inf.allowed_routing_hints,
+                allowed_routes: inf.allowed_routes,
+                ..Default::default()
             }),
     })
 }
@@ -1545,7 +1554,7 @@ struct PolicyYaml {
 #[derive(Serialize)]
 struct InferenceYaml {
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    allowed_routing_hints: Vec<String>,
+    allowed_routes: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -1617,7 +1626,7 @@ struct NetworkBinaryYaml {
 /// Convert proto policy to serializable YAML structure.
 fn policy_to_yaml(policy: &SandboxPolicy) -> PolicyYaml {
     let inference = policy.inference.as_ref().map(|inf| InferenceYaml {
-        allowed_routing_hints: inf.allowed_routing_hints.clone(),
+        allowed_routes: inf.allowed_routes.clone(),
     });
 
     let filesystem = policy.filesystem.as_ref().map(|fs| FilesystemYaml {
@@ -2448,32 +2457,70 @@ pub async fn provider_delete(server: &str, names: &[String], tls: &TlsOptions) -
 #[allow(clippy::too_many_arguments)]
 pub async fn inference_route_create(
     server: &str,
+    name: Option<&str>,
     routing_hint: &str,
     base_url: &str,
-    protocol: &str,
+    protocols: &[String],
     api_key: &str,
     model_id: &str,
     enabled: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut client = grpc_inference_client(server, tls).await?;
+    let spinner = inference_route_spinner("Preparing inference route...");
+    let (resolved_protocols, auto_detected) =
+        match resolve_route_protocols(protocols, base_url, api_key, model_id, Some(&spinner)).await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                spinner.finish_and_clear();
+                return Err(err);
+            }
+        };
+
+    spinner.set_message("Creating inference route...".to_string());
+
+    let mut client = match grpc_inference_client(server, tls).await {
+        Ok(client) => client,
+        Err(err) => {
+            spinner.finish_and_clear();
+            return Err(err);
+        }
+    };
+
     let response = client
         .create_inference_route(CreateInferenceRouteRequest {
-            name: String::new(), // auto-generate
+            name: name.unwrap_or_default().to_string(),
             route: Some(InferenceRouteSpec {
                 routing_hint: routing_hint.to_string(),
                 base_url: base_url.to_string(),
-                protocol: protocol.to_string(),
+                protocols: resolved_protocols.clone(),
                 api_key: api_key.to_string(),
                 model_id: model_id.to_string(),
                 enabled,
             }),
         })
         .await
-        .into_diagnostic()?;
+        .into_diagnostic();
+
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            spinner.finish_and_clear();
+            return Err(err);
+        }
+    };
+
+    spinner.finish_and_clear();
 
     if let Some(route) = response.into_inner().route {
         println!("{} Created route {}", "✓".green().bold(), route.name);
+        if auto_detected {
+            println!(
+                "  {} {}",
+                "Detected protocols:".dimmed(),
+                resolved_protocols.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -2484,30 +2531,67 @@ pub async fn inference_route_update(
     name: &str,
     routing_hint: &str,
     base_url: &str,
-    protocol: &str,
+    protocols: &[String],
     api_key: &str,
     model_id: &str,
     enabled: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let mut client = grpc_inference_client(server, tls).await?;
+    let spinner = inference_route_spinner("Preparing inference route update...");
+    let (resolved_protocols, auto_detected) =
+        match resolve_route_protocols(protocols, base_url, api_key, model_id, Some(&spinner)).await
+        {
+            Ok(result) => result,
+            Err(err) => {
+                spinner.finish_and_clear();
+                return Err(err);
+            }
+        };
+
+    spinner.set_message(format!("Updating inference route {name}..."));
+
+    let mut client = match grpc_inference_client(server, tls).await {
+        Ok(client) => client,
+        Err(err) => {
+            spinner.finish_and_clear();
+            return Err(err);
+        }
+    };
+
     let response = client
         .update_inference_route(UpdateInferenceRouteRequest {
             name: name.to_string(),
             route: Some(InferenceRouteSpec {
                 routing_hint: routing_hint.to_string(),
                 base_url: base_url.to_string(),
-                protocol: protocol.to_string(),
+                protocols: resolved_protocols.clone(),
                 api_key: api_key.to_string(),
                 model_id: model_id.to_string(),
                 enabled,
             }),
         })
         .await
-        .into_diagnostic()?;
+        .into_diagnostic();
+
+    let response = match response {
+        Ok(response) => response,
+        Err(err) => {
+            spinner.finish_and_clear();
+            return Err(err);
+        }
+    };
+
+    spinner.finish_and_clear();
 
     if let Some(route) = response.into_inner().route {
         println!("{} Updated route {}", "✓".green().bold(), route.name);
+        if auto_detected {
+            println!(
+                "  {} {}",
+                "Detected protocols:".dimmed(),
+                resolved_protocols.join(", ")
+            );
+        }
     }
     Ok(())
 }
@@ -2551,10 +2635,11 @@ pub async fn inference_route_list(
     }
 
     println!(
-        "{:<12}  {:<16}  {:<40}  {:<30}  {:<8}",
+        "{:<12}  {:<16}  {:<40}  {:<30}  {:<30}  {:<8}",
         "NAME".bold(),
         "HINT".bold(),
         "BASE URL".bold(),
+        "PROTOCOLS".bold(),
         "MODEL".bold(),
         "ENABLED".bold()
     );
@@ -2568,15 +2653,175 @@ pub async fn inference_route_list(
 fn print_route_row(route: &InferenceRoute) {
     let Some(spec) = route.spec.as_ref() else {
         println!(
-            "{:<12}  {:<16}  {:<40}  {:<30}  {:<8}",
-            route.name, "<missing>", "", "", "false"
+            "{:<12}  {:<16}  {:<40}  {:<30}  {:<30}  {:<8}",
+            route.name, "<missing>", "", "", "", "false"
         );
         return;
     };
+
+    let protocols = route_protocols(spec);
+    let protocol_display = if protocols.is_empty() {
+        "<none>".to_string()
+    } else {
+        protocols.join(",")
+    };
+
     println!(
-        "{:<12}  {:<16}  {:<40}  {:<30}  {:<8}",
-        route.name, spec.routing_hint, spec.base_url, spec.model_id, spec.enabled
+        "{:<12}  {:<16}  {:<40}  {:<30}  {:<30}  {:<8}",
+        route.name, spec.routing_hint, spec.base_url, protocol_display, spec.model_id, spec.enabled
     );
+}
+
+fn route_protocols(spec: &InferenceRouteSpec) -> Vec<String> {
+    navigator_core::inference::normalize_protocols(&spec.protocols)
+}
+
+fn inference_route_spinner(initial_message: &str) -> ProgressBar {
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+    );
+    spinner.enable_steady_tick(Duration::from_millis(120));
+    spinner.set_message(initial_message.to_string());
+    spinner
+}
+
+fn protocol_probe_url(base_url: &str, endpoint_path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") && endpoint_path.starts_with("/v1/") {
+        format!("{base}{}", &endpoint_path[3..])
+    } else {
+        format!("{base}{endpoint_path}")
+    }
+}
+
+fn is_supported_probe_status(status: ReqwestStatusCode) -> bool {
+    !matches!(status.as_u16(), 404 | 501)
+}
+
+/// Auto-detect which inference protocols a route endpoint supports.
+///
+/// **Note:** This sends real HTTP POST requests (with `max_tokens: 1`) to the
+/// endpoint to probe for protocol support. This may consume a small amount of
+/// API credits on production endpoints.
+async fn detect_route_protocols(
+    base_url: &str,
+    api_key: &str,
+    model_id: &str,
+    spinner: Option<&ProgressBar>,
+) -> Result<Vec<String>> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .build()
+        .into_diagnostic()
+        .wrap_err("failed to build protocol detection HTTP client")?;
+
+    let probes = [
+        (
+            "openai_chat_completions",
+            "/v1/chat/completions",
+            serde_json::json!({
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }),
+        ),
+        (
+            "openai_completions",
+            "/v1/completions",
+            serde_json::json!({
+                "model": model_id,
+                "prompt": "ping",
+                "max_tokens": 1,
+            }),
+        ),
+        (
+            "anthropic_messages",
+            "/v1/messages",
+            serde_json::json!({
+                "model": model_id,
+                "max_tokens": 1,
+                "messages": [{"role": "user", "content": "ping"}],
+            }),
+        ),
+    ];
+
+    let mut detected = Vec::new();
+    let mut transport_errors = Vec::new();
+
+    let probe_count = probes.len();
+    for (index, (protocol, path, body)) in probes.into_iter().enumerate() {
+        if let Some(spinner) = spinner {
+            spinner.set_message(format!(
+                "Detecting protocols ({}/{}): POST {}",
+                index + 1,
+                probe_count,
+                path
+            ));
+        }
+
+        let url = protocol_probe_url(base_url, path);
+
+        let mut request = client.post(url).header("content-type", "application/json");
+
+        if protocol == "anthropic_messages" {
+            request = request
+                .header("x-api-key", api_key)
+                .header("anthropic-version", "2023-06-01");
+        } else {
+            request = request.bearer_auth(api_key);
+        }
+
+        match request.json(&body).send().await {
+            Ok(response) => {
+                if is_supported_probe_status(response.status()) {
+                    detected.push(protocol.to_string());
+                }
+            }
+            Err(err) => {
+                transport_errors.push(format!("{protocol}: {err}"));
+            }
+        }
+    }
+
+    if detected.is_empty() {
+        if transport_errors.is_empty() {
+            return Err(miette::miette!(
+                "could not detect any supported protocols for {base_url}; pass --protocol manually"
+            ));
+        }
+
+        return Err(miette::miette!(
+            "could not detect any supported protocols for {base_url}; first probe error: {}; pass --protocol manually",
+            transport_errors[0]
+        ));
+    }
+
+    Ok(detected)
+}
+
+async fn resolve_route_protocols(
+    protocols: &[String],
+    base_url: &str,
+    api_key: &str,
+    model_id: &str,
+    spinner: Option<&ProgressBar>,
+) -> Result<(Vec<String>, bool)> {
+    let normalized = navigator_core::inference::normalize_protocols(protocols);
+    if !normalized.is_empty() {
+        if let Some(spinner) = spinner {
+            spinner.set_message("Using explicitly provided protocols...".to_string());
+        }
+        return Ok((normalized, false));
+    }
+
+    if let Some(spinner) = spinner {
+        spinner.set_message(format!("Detecting supported protocols from {base_url}..."));
+    }
+
+    let detected = detect_route_protocols(base_url, api_key, model_id, spinner).await?;
+    Ok((detected, true))
 }
 
 fn git_repo_root() -> Result<PathBuf> {
@@ -2632,7 +2877,7 @@ fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_credential_pairs;
+    use super::{parse_credential_pairs, resolve_route_protocols};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -2711,5 +2956,43 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_route_protocols_skips_autodetect_when_protocols_are_provided() {
+        let (protocols, autodetected) = resolve_route_protocols(
+            &[
+                " OpenAI_Chat_Completions ".to_string(),
+                "openai_chat_completions".to_string(),
+                "anthropic_messages".to_string(),
+            ],
+            "not-a-valid-url",
+            "dummy-key",
+            "dummy-model",
+            None,
+        )
+        .await
+        .expect("manual protocols should bypass auto-detection");
+
+        assert!(!autodetected);
+        assert_eq!(
+            protocols,
+            vec![
+                "openai_chat_completions".to_string(),
+                "anthropic_messages".to_string(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_route_protocols_errors_when_autodetect_fails() {
+        let err = resolve_route_protocols(&[], "not-a-valid-url", "dummy-key", "dummy-model", None)
+            .await
+            .expect_err("missing protocols should require auto-detection");
+
+        assert!(
+            err.to_string()
+                .contains("could not detect any supported protocols")
+        );
     }
 }
