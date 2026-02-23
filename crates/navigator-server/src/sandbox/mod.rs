@@ -392,6 +392,118 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
     Err("sandbox id not found on object".to_string())
 }
 
+/// Path where the supervisor binary is mounted inside the agent container
+/// when using supervisor bootstrap mode (custom workload image).
+const SUPERVISOR_MOUNT_PATH: &str = "/opt/navigator/bin";
+
+/// Name of the shared volume used to side-load the supervisor binary.
+const SUPERVISOR_VOLUME_NAME: &str = "navigator-supervisor-bin";
+
+/// Source path of the supervisor binary inside the default sandbox image.
+const SUPERVISOR_SRC_PATH: &str = "/usr/local/bin/navigator-sandbox";
+
+/// Returns `true` when supervisor bootstrap mode is needed: the template
+/// specifies a custom workload image that differs from the server's default
+/// sandbox image.
+fn needs_supervisor_bootstrap(template: &SandboxTemplate, default_image: &str) -> bool {
+    !template.image.is_empty() && template.image != default_image
+}
+
+/// Build the init container JSON that copies the supervisor binary from the
+/// default sandbox image into the shared volume.
+fn supervisor_init_container(default_image: &str) -> serde_json::Value {
+    serde_json::json!({
+        "name": "copy-supervisor",
+        "image": default_image,
+        "command": ["sh", "-c", format!(
+            "cp {src} {dst}/navigator-sandbox && chmod 755 {dst}/navigator-sandbox",
+            src = SUPERVISOR_SRC_PATH,
+            dst = SUPERVISOR_MOUNT_PATH,
+        )],
+        "volumeMounts": [{
+            "name": SUPERVISOR_VOLUME_NAME,
+            "mountPath": SUPERVISOR_MOUNT_PATH
+        }]
+    })
+}
+
+/// Build the emptyDir volume definition for the supervisor binary.
+fn supervisor_volume() -> serde_json::Value {
+    serde_json::json!({
+        "name": SUPERVISOR_VOLUME_NAME,
+        "emptyDir": {}
+    })
+}
+
+/// Build the read-only volume mount for the supervisor binary in the agent container.
+fn supervisor_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": SUPERVISOR_VOLUME_NAME,
+        "mountPath": SUPERVISOR_MOUNT_PATH,
+        "readOnly": true
+    })
+}
+
+/// Apply supervisor bootstrap transforms to an already-built pod template JSON.
+///
+/// This injects the init container, shared volume, volume mount, and command
+/// override into the pod template, targeting the `agent` container (or the
+/// first container if no `agent` is found).
+fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_image: &str) {
+    let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+
+    // 1. Add the shared volume to spec.volumes
+    let volumes = spec
+        .entry("volumes")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(volumes) = volumes {
+        volumes.push(supervisor_volume());
+    }
+
+    // 2. Add the init container to spec.initContainers
+    let init_containers = spec
+        .entry("initContainers")
+        .or_insert_with(|| serde_json::json!([]))
+        .as_array_mut();
+    if let Some(init_containers) = init_containers {
+        init_containers.push(supervisor_init_container(default_image));
+    }
+
+    // 3. Find the agent container and add volume mount + command override
+    let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
+        return;
+    };
+
+    let mut target_index = None;
+    for (i, c) in containers.iter().enumerate() {
+        if c.get("name").and_then(|v| v.as_str()) == Some("agent") {
+            target_index = Some(i);
+            break;
+        }
+    }
+    let index = target_index.unwrap_or(0);
+
+    if let Some(container) = containers.get_mut(index).and_then(|v| v.as_object_mut()) {
+        // Override command to use the side-loaded supervisor binary
+        container.insert(
+            "command".to_string(),
+            serde_json::json!([format!("{}/navigator-sandbox", SUPERVISOR_MOUNT_PATH)]),
+        );
+
+        // Add volume mount
+        let volume_mounts = container
+            .entry("volumeMounts")
+            .or_insert_with(|| serde_json::json!([]))
+            .as_array_mut();
+        if let Some(volume_mounts) = volume_mounts {
+            volume_mounts.push(supervisor_volume_mount());
+        }
+    }
+}
+
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     default_image: &str,
@@ -477,12 +589,22 @@ fn sandbox_template_to_k8s(
         return inject_pod_template_env(
             pod_template,
             template,
+            default_image,
             sandbox_id,
             grpc_endpoint,
             ssh_listen_addr,
             ssh_handshake_secret,
             ssh_handshake_skew_secs,
             spec_environment,
+        );
+    }
+
+    let bootstrap = needs_supervisor_bootstrap(template, default_image);
+    if bootstrap {
+        info!(
+            workload_image = %template.image,
+            supervisor_image = %default_image,
+            "Supervisor bootstrap mode active: side-loading supervisor from default image"
         );
     }
 
@@ -508,10 +630,10 @@ fn sandbox_template_to_k8s(
     let mut container = serde_json::Map::new();
     container.insert("name".to_string(), serde_json::json!("agent"));
     // Use template image if provided, otherwise fall back to default
-    let image = if template.agent_image.is_empty() {
+    let image = if template.image.is_empty() {
         default_image
     } else {
-        &template.agent_image
+        &template.image
     };
     if !image.is_empty() {
         container.insert("image".to_string(), serde_json::json!(image));
@@ -559,13 +681,21 @@ fn sandbox_template_to_k8s(
     }
     template_value.insert("spec".to_string(), serde_json::Value::Object(spec));
 
-    serde_json::Value::Object(template_value)
+    let mut result = serde_json::Value::Object(template_value);
+
+    // Apply supervisor bootstrap transforms when using a custom workload image
+    if bootstrap {
+        apply_supervisor_bootstrap(&mut result, default_image);
+    }
+
+    result
 }
 
 #[allow(clippy::too_many_arguments)]
 fn inject_pod_template_env(
     mut pod_template: serde_json::Value,
     template: &SandboxTemplate,
+    default_image: &str,
     sandbox_id: &str,
     grpc_endpoint: &str,
     ssh_listen_addr: &str,
@@ -608,6 +738,16 @@ fn inject_pod_template_env(
             ssh_handshake_skew_secs,
             spec_environment,
         );
+    }
+
+    // Apply supervisor bootstrap transforms for custom workload images
+    if needs_supervisor_bootstrap(template, default_image) {
+        info!(
+            workload_image = %template.image,
+            supervisor_image = %default_image,
+            "Supervisor bootstrap mode active for custom pod template"
+        );
+        apply_supervisor_bootstrap(&mut pod_template, default_image);
     }
 
     pod_template

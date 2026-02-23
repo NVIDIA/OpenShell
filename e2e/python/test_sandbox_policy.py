@@ -21,9 +21,7 @@ _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     read_write=["/sandbox", "/tmp"],
 )
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
-_BASE_PROCESS = sandbox_pb2.ProcessPolicy(
-    run_as_user="sandbox", run_as_group="sandbox"
-)
+_BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
 _BASE_INFERENCE = sandbox_pb2.InferencePolicy(allowed_routing_hints=["local"])
 
 # Standard proxy address inside the sandbox network namespace
@@ -118,10 +116,7 @@ def _proxy_connect_then_http():
             sock.settimeout(15)
 
             request = (
-                f"{method} {path} HTTP/1.1\r\n"
-                f"Host: {host}\r\n"
-                f"Connection: close\r\n"
-                f"\r\n"
+                f"{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
             )
             sock.sendall(request.encode())
 
@@ -214,21 +209,11 @@ def test_policy_applies_to_exec_commands(
 def test_policy_blocks_unauthorized_proxy_connect(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    def proxy_connect_status() -> str:
-        import socket
-
-        connection = socket.create_connection(("10.200.0.1", 3128), timeout=5)
-        try:
-            connection.sendall(
-                b"CONNECT example.com:443 HTTP/1.1\r\nHost: example.com\r\n\r\n"
-            )
-            return connection.recv(128).decode("latin1")
-        finally:
-            connection.close()
-
     spec = datamodel_pb2.SandboxSpec(policy=_policy_for_python_proxy_tests())
     with sandbox(spec=spec, delete_on_exit=True) as policy_sandbox:
-        proxy_result = policy_sandbox.exec_python(proxy_connect_status)
+        proxy_result = policy_sandbox.exec_python(
+            _proxy_connect(), args=("example.com", 443)
+        )
         assert proxy_result.exit_code == 0, proxy_result.stderr
         assert "403" in proxy_result.stdout
 
@@ -271,9 +256,7 @@ def test_l4_no_policy_denies_all(
     )
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(
-            _proxy_connect(), args=("api.anthropic.com", 443)
-        )
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout
 
@@ -411,7 +394,9 @@ def test_l4_non_connect_method_rejected(
 
         conn = socket.create_connection(("10.200.0.1", 3128), timeout=10)
         try:
-            conn.sendall(b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+            conn.sendall(
+                b"GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n"
+            )
             return conn.recv(256).decode("latin1")
         finally:
             conn.close()
@@ -758,14 +743,16 @@ def test_l7_tls_ca_trust_store_injected(
         import json as _json
         import os
 
-        return _json.dumps({
-            "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE", ""),
-            "NODE_EXTRA_CA_CERTS": os.environ.get("NODE_EXTRA_CA_CERTS", ""),
-            "REQUESTS_CA_BUNDLE": os.environ.get("REQUESTS_CA_BUNDLE", ""),
-            "CURL_CA_BUNDLE": os.environ.get("CURL_CA_BUNDLE", ""),
-            "ca_cert_exists": os.path.exists("/etc/navigator-tls/navigator-ca.pem"),
-            "bundle_exists": os.path.exists("/etc/navigator-tls/ca-bundle.pem"),
-        })
+        return _json.dumps(
+            {
+                "SSL_CERT_FILE": os.environ.get("SSL_CERT_FILE", ""),
+                "NODE_EXTRA_CA_CERTS": os.environ.get("NODE_EXTRA_CA_CERTS", ""),
+                "REQUESTS_CA_BUNDLE": os.environ.get("REQUESTS_CA_BUNDLE", ""),
+                "CURL_CA_BUNDLE": os.environ.get("CURL_CA_BUNDLE", ""),
+                "ca_cert_exists": os.path.exists("/etc/navigator-tls/navigator-ca.pem"),
+                "bundle_exists": os.path.exists("/etc/navigator-tls/ca-bundle.pem"),
+            }
+        )
 
     policy = _base_policy(
         network_policies={

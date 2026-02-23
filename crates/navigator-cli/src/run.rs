@@ -24,7 +24,8 @@ use navigator_core::proto::{
     GetSandboxRequest, HealthRequest, InferenceRoute, InferenceRouteSpec,
     ListInferenceRoutesRequest, ListProvidersRequest, ListSandboxesRequest, NetworkBinary,
     NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, UpdateInferenceRouteRequest, UpdateProviderRequest, WatchSandboxRequest,
+    SandboxSpec, SandboxTemplate, UpdateInferenceRouteRequest, UpdateProviderRequest,
+    WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
@@ -946,6 +947,7 @@ pub fn cluster_admin_tunnel(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create_with_bootstrap(
     name: Option<&str>,
+    image: Option<&str>,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
@@ -964,7 +966,8 @@ pub async fn sandbox_create_with_bootstrap(
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
     sandbox_create(
-        &server, name, sync, keep, remote, ssh_key, providers, policy, forward, command, &tls,
+        &server, name, image, sync, keep, remote, ssh_key, providers, policy, forward, command,
+        &tls,
     )
     .await
 }
@@ -974,6 +977,7 @@ pub async fn sandbox_create_with_bootstrap(
 pub async fn sandbox_create(
     server: &str,
     name: Option<&str>,
+    image: Option<&str>,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
@@ -1006,11 +1010,27 @@ pub async fn sandbox_create(
     let required_providers = required_provider_types(command, providers);
     let configured_providers = ensure_required_providers(&mut client, &required_providers).await?;
 
-    let policy = load_sandbox_policy(policy)?;
+    let mut policy = load_sandbox_policy(policy)?;
+
+    // When a custom image is specified, clear the default run_as_user/group
+    // to prevent failures on images that lack the "sandbox" user/group.
+    if image.is_some()
+        && let Some(ref mut process) = policy.process
+    {
+        process.run_as_user = String::new();
+        process.run_as_group = String::new();
+    }
+
+    let template = image.map(|img| SandboxTemplate {
+        image: img.to_string(),
+        ..SandboxTemplate::default()
+    });
+
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
             policy: Some(policy),
             providers: configured_providers,
+            template,
             ..SandboxSpec::default()
         }),
         name: name.unwrap_or_default().to_string(),
@@ -1794,6 +1814,114 @@ pub async fn sandbox_delete(server: &str, names: &[String], tls: &TlsOptions) ->
             println!("{} Sandbox {name} not found", "!".yellow());
         }
     }
+
+    Ok(())
+}
+
+/// Build and push a container image into the cluster.
+pub async fn sandbox_image_push(
+    dockerfile: &Path,
+    tag: Option<&str>,
+    context: Option<&Path>,
+    cluster_name: &str,
+    build_args: &[String],
+) -> Result<()> {
+    // Validate the Dockerfile exists.
+    if !dockerfile.exists() {
+        return Err(miette::miette!(
+            "Dockerfile not found: {}",
+            dockerfile.display()
+        ));
+    }
+
+    // Resolve the Dockerfile to an absolute path.
+    let dockerfile = dockerfile
+        .canonicalize()
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "failed to resolve Dockerfile path: {}",
+                dockerfile.display()
+            )
+        })?;
+
+    // Resolve the build context directory (default: Dockerfile parent directory).
+    let context_dir = match context {
+        Some(ctx) => ctx
+            .canonicalize()
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to resolve context path: {}", ctx.display()))?,
+        None => dockerfile
+            .parent()
+            .ok_or_else(|| miette::miette!("Dockerfile has no parent directory"))?
+            .to_path_buf(),
+    };
+
+    if !context_dir.is_dir() {
+        return Err(miette::miette!(
+            "Build context is not a directory: {}",
+            context_dir.display()
+        ));
+    }
+
+    // Parse build args from KEY=VALUE strings.
+    let mut build_arg_map = HashMap::new();
+    for arg in build_args {
+        let Some((key, value)) = arg.split_once('=') else {
+            return Err(miette::miette!(
+                "--build-arg expects KEY=VALUE, got '{arg}'"
+            ));
+        };
+        build_arg_map.insert(key.to_string(), value.to_string());
+    }
+
+    // Generate a default tag if not provided.
+    let default_tag;
+    let tag = if let Some(t) = tag {
+        t
+    } else {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        default_tag = format!("navigator-sandbox-custom:{timestamp}");
+        &default_tag
+    };
+
+    eprintln!(
+        "Building image {} from {}",
+        tag.cyan(),
+        dockerfile.display()
+    );
+    eprintln!("  {} {}", "Context:".dimmed(), context_dir.display());
+    eprintln!("  {} {}", "Cluster:".dimmed(), cluster_name);
+    eprintln!();
+
+    let mut on_log = |msg: String| {
+        eprintln!("  {msg}");
+    };
+
+    navigator_bootstrap::build::build_and_push_image(
+        &dockerfile,
+        tag,
+        &context_dir,
+        cluster_name,
+        &build_arg_map,
+        &mut on_log,
+    )
+    .await?;
+
+    eprintln!();
+    eprintln!(
+        "{} Image {} is available in the cluster.",
+        "✓".green().bold(),
+        tag.cyan(),
+    );
+    eprintln!();
+    eprintln!(
+        "Use it with: {}",
+        format!("nav sandbox create --image {tag}").dimmed()
+    );
 
     Ok(())
 }

@@ -13,12 +13,12 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     let read_only = policy.filesystem.read_only.clone();
     let mut read_write = policy.filesystem.read_write.clone();
 
-    if policy.filesystem.include_workdir {
-        if let Some(dir) = workdir {
-            let workdir_path = PathBuf::from(dir);
-            if !read_write.contains(&workdir_path) {
-                read_write.push(workdir_path);
-            }
+    if policy.filesystem.include_workdir
+        && let Some(dir) = workdir
+    {
+        let workdir_path = PathBuf::from(dir);
+        if !read_write.contains(&workdir_path) {
+            read_write.push(workdir_path);
         }
     }
 

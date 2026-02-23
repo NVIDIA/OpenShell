@@ -21,10 +21,8 @@ pub struct SandboxSpec {
     #[prost(string, tag = "1")]
     pub log_level: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "5")]
-    pub environment: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub environment:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, optional, tag = "6")]
     pub template: ::core::option::Option<SandboxTemplate>,
     /// Required sandbox policy configuration.
@@ -38,26 +36,20 @@ pub struct SandboxSpec {
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct SandboxTemplate {
     #[prost(string, tag = "1")]
-    pub agent_image: ::prost::alloc::string::String,
+    pub image: ::prost::alloc::string::String,
     #[prost(string, tag = "2")]
     pub runtime_class_name: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub agent_socket: ::prost::alloc::string::String,
     #[prost(map = "string, string", tag = "4")]
-    pub labels: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub labels:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(map = "string, string", tag = "5")]
-    pub annotations: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub annotations:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(map = "string, string", tag = "6")]
-    pub environment: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub environment:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, optional, tag = "7")]
     pub resources: ::core::option::Option<::prost_types::Struct>,
     #[prost(message, optional, tag = "8")]

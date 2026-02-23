@@ -144,6 +144,52 @@ mise run helm:lint       # Lint the navigator helm chart
 mise run sandbox         # Run sandbox container with interactive shell
 ```
 
+### Custom Container Images
+
+Use `--image` to run a sandbox with any Linux container image:
+
+```bash
+# Run an interactive shell in an Ubuntu sandbox
+nav sandbox create --image ubuntu:24.04
+
+# Run a command in a custom image
+nav sandbox create --image python:3.12-slim -- python3 -c "print('hello')"
+
+# Sync local files and run in a custom image
+nav sandbox create --image node:22 --sync -- npm test
+```
+
+The supervisor binary is side-loaded from the standard sandbox image via a Kubernetes init
+container. The default `run_as_user`/`run_as_group` policy is cleared for custom images to
+avoid failures on images that lack the `sandbox` user. See `architecture/sandbox.md` for
+details on the bootstrap flow and constraints.
+
+#### Building and Pushing Custom Images
+
+Use `nav sandbox image push` to build a Dockerfile and push the resulting image into the
+cluster's containerd runtime so it can be used with `--image`:
+
+```bash
+# Build and push from a Dockerfile
+nav sandbox image push --dockerfile ./Dockerfile
+
+# Specify a custom tag
+nav sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+
+# Specify a build context directory
+nav sandbox image push --dockerfile ./build/Dockerfile --context ./build
+
+# Pass build arguments
+nav sandbox image push --dockerfile ./Dockerfile --build-arg PYTHON_VERSION=3.12
+
+# Use the pushed image
+nav sandbox create --image my-sandbox:latest
+```
+
+The command builds the image using the local Docker daemon and pushes it into the cluster
+via the same `docker save` / `ctr images import` pipeline used for component images. A
+`.dockerignore` file in the build context directory is respected.
+
 ### Git Hooks (Pre-commit)
 
 We use `mise generate git-pre-commit` for local pre-commit checks.

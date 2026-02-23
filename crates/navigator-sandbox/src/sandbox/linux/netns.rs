@@ -25,8 +25,8 @@ pub struct NetworkNamespace {
     name: String,
     /// Host-side veth interface name
     veth_host: String,
-    /// Sandbox-side veth interface name (inside namespace)
-    veth_sandbox: String,
+    /// Sandbox-side veth interface name (inside namespace, used only during setup)
+    _veth_sandbox: String,
     /// Host-side IP address (proxy binds here)
     host_ip: IpAddr,
     /// Sandbox-side IP address
@@ -159,7 +159,7 @@ impl NetworkNamespace {
         Ok(Self {
             name,
             veth_host,
-            veth_sandbox,
+            _veth_sandbox: veth_sandbox,
             host_ip,
             sandbox_ip,
             ns_fd,
@@ -187,7 +187,7 @@ impl NetworkNamespace {
     /// Enter this network namespace.
     ///
     /// Must be called from the child process after fork, before exec.
-    /// Uses setns() to switch the calling process into the namespace.
+    /// Uses `setns()` to switch the calling process into the namespace.
     ///
     /// # Errors
     ///
@@ -195,7 +195,7 @@ impl NetworkNamespace {
     ///
     /// # Safety
     ///
-    /// This function should only be called in a pre_exec context after fork.
+    /// This function should only be called in a `pre_exec` context after fork.
     pub fn enter(&self) -> Result<()> {
         if let Some(fd) = self.ns_fd {
             debug!(namespace = %self.name, "Entering network namespace via setns");

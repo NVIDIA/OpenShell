@@ -1,3 +1,4 @@
+pub mod build;
 pub mod image;
 
 mod constants;
@@ -6,7 +7,7 @@ mod kubeconfig;
 mod metadata;
 mod mtls;
 mod paths;
-mod push;
+pub(crate) mod push;
 mod runtime;
 
 use bollard::Docker;

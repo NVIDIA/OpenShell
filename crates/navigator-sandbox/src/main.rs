@@ -1,8 +1,8 @@
 //! Navigator Sandbox - process sandbox and monitor.
 
 use clap::Parser;
-use miette::{IntoDiagnostic, Result};
-use tracing::info;
+use miette::Result;
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -80,30 +80,51 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let file = std::fs::OpenOptions::new()
+    // Try to open the log file; fall back to stdout-only logging if it fails
+    // (e.g., /var/log is not writable in custom workload images).
+    let file_logging = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open("/var/log/navigator.log")
-        .into_diagnostic()?;
-    let (file_writer, _file_guard) = tracing_appender::non_blocking(file);
+        .ok()
+        .map(|file| {
+            let (writer, guard) = tracing_appender::non_blocking(file);
+            (writer, guard)
+        });
 
     let stdout_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
-    let file_filter = EnvFilter::new("info");
 
-    tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stdout)
-                .with_filter(stdout_filter),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(file_writer)
-                .with_ansi(false)
-                .with_filter(file_filter),
-        )
-        .init();
+    // Keep the file guard alive for the entire process. When the guard is
+    // dropped the non-blocking writer flushes remaining logs.
+    let _file_guard = if let Some((file_writer, file_guard)) = file_logging {
+        let file_filter = EnvFilter::new("info");
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stdout)
+                    .with_filter(stdout_filter),
+            )
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(file_writer)
+                    .with_ansi(false)
+                    .with_filter(file_filter),
+            )
+            .init();
+        Some(file_guard)
+    } else {
+        tracing_subscriber::registry()
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_writer(std::io::stdout)
+                    .with_filter(stdout_filter),
+            )
+            .init();
+        // Log the warning after the subscriber is initialized
+        warn!("Could not open /var/log/navigator.log; using stdout-only logging");
+        None
+    };
 
     // Get command - either from CLI args, environment variable, or default to /bin/bash
     let command = if !args.command.is_empty() {

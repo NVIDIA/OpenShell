@@ -37,7 +37,7 @@ pub fn binary_path(pid: i32) -> Result<PathBuf> {
 pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<PathBuf> {
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
     let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    binary_path(pid as i32)
+    binary_path(pid.cast_signed())
 }
 
 /// Like `resolve_tcp_peer_binary`, but also returns the PID that owns the socket.
@@ -47,11 +47,11 @@ pub fn resolve_tcp_peer_binary(entrypoint_pid: u32, peer_port: u16) -> Result<Pa
 pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<(PathBuf, u32)> {
     let inode = parse_proc_net_tcp(entrypoint_pid, peer_port)?;
     let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
-    let path = binary_path(pid as i32)?;
+    let path = binary_path(pid.cast_signed())?;
     Ok((path, pid))
 }
 
-/// Read the PPid (parent PID) from `/proc/<pid>/status`.
+/// Read the `PPid` (parent PID) from `/proc/<pid>/status`.
 #[cfg(target_os = "linux")]
 pub fn read_ppid(pid: u32) -> Option<u32> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
@@ -68,6 +68,7 @@ pub fn read_ppid(pid: u32) -> Option<u32> {
 /// Stops at PID 1 (init), `stop_pid` (the entrypoint process), or after 64 ancestors
 /// as a safety limit. The returned vec does NOT include `pid` itself — only its parents.
 #[cfg(target_os = "linux")]
+#[allow(clippy::similar_names)]
 pub fn collect_ancestor_binaries(pid: u32, stop_pid: u32) -> Vec<PathBuf> {
     const MAX_DEPTH: usize = 64;
     let mut ancestors = Vec::new();
@@ -79,7 +80,7 @@ pub fn collect_ancestor_binaries(pid: u32, stop_pid: u32) -> Vec<PathBuf> {
             _ => break,
         };
 
-        if let Ok(path) = binary_path(ppid as i32) {
+        if let Ok(path) = binary_path(ppid.cast_signed()) {
             ancestors.push(path);
         }
 
@@ -118,6 +119,7 @@ pub fn cmdline_absolute_paths(pid: u32) -> Vec<PathBuf> {
 /// PID and each ancestor up to `stop_pid` / PID 1. Paths already present in
 /// `exclude` (typically the exe-based paths) are omitted to avoid duplicates.
 #[cfg(target_os = "linux")]
+#[allow(clippy::similar_names)]
 pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Vec<PathBuf> {
     const MAX_DEPTH: usize = 64;
     let mut paths = Vec::new();
@@ -156,7 +158,7 @@ pub fn collect_cmdline_paths(pid: u32, stop_pid: u32, exclude: &[PathBuf]) -> Ve
 /// inode for a given local port.
 ///
 /// Checks both IPv4 and IPv6 tables because some clients (notably gRPC C-core)
-/// use AF_INET6 sockets with IPv4-mapped addresses even for IPv4 connections.
+/// use `AF_INET6` sockets with IPv4-mapped addresses even for IPv4 connections.
 ///
 /// Format of `/proc/net/tcp`:
 /// ```text
@@ -171,9 +173,8 @@ fn parse_proc_net_tcp(pid: u32, peer_port: u16) -> Result<u64> {
     // Check IPv4 first (most common), then IPv6.
     for suffix in &["tcp", "tcp6"] {
         let path = format!("/proc/{pid}/net/{suffix}");
-        let content = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => continue,
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
         };
 
         for line in content.lines().skip(1) {
@@ -269,10 +270,10 @@ fn check_pid_fds(pid: u32, target: &str) -> Option<u32> {
     let fd_dir = format!("/proc/{pid}/fd");
     let fds = std::fs::read_dir(&fd_dir).ok()?;
     for fd_entry in fds.flatten() {
-        if let Ok(link) = std::fs::read_link(fd_entry.path()) {
-            if link.to_string_lossy() == target {
-                return Some(pid);
-            }
+        if let Ok(link) = std::fs::read_link(fd_entry.path())
+            && link.to_string_lossy() == target
+        {
+            return Some(pid);
         }
     }
     None
@@ -357,7 +358,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn binary_path_reads_current_process() {
-        let pid = std::process::id() as i32;
+        let pid = std::process::id().cast_signed();
         let path = binary_path(pid).unwrap();
         // Should resolve to the test runner binary
         assert!(path.exists());
@@ -373,6 +374,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::similar_names)]
     fn read_ppid_returns_parent() {
         let pid = std::process::id();
         let ppid = read_ppid(pid);
@@ -410,6 +412,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[allow(clippy::similar_names)]
     fn collect_ancestor_binaries_stops_at_stop_pid() {
         let pid = std::process::id();
         let ppid = read_ppid(pid).unwrap();
@@ -448,9 +451,9 @@ mod tests {
     #[test]
     fn collect_cmdline_paths_excludes_known() {
         let pid = std::process::id();
-        let exe = binary_path(pid as i32).unwrap();
+        let exe = binary_path(pid.cast_signed()).unwrap();
         // When we exclude the exe path, it shouldn't appear in cmdline_paths
-        let paths = collect_cmdline_paths(pid, 1, &[exe.clone()]);
+        let paths = collect_cmdline_paths(pid, 1, std::slice::from_ref(&exe));
         assert!(
             !paths.contains(&exe),
             "Should not contain excluded exe path"

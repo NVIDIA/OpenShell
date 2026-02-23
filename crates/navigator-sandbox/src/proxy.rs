@@ -82,12 +82,12 @@ impl ProxyHandle {
         control_plane_endpoints: Vec<AllowedEndpoint>,
         tls_state: Option<Arc<ProxyTlsState>>,
     ) -> Result<Self> {
-        // Use override bind_addr or fall back to policy http_addr
-        let http_addr = bind_addr.or(policy.http_addr);
-
-        let http_addr = http_addr.ok_or_else(|| {
-            miette::miette!("Proxy policy must set http_addr or provide a bind address")
-        })?;
+        // Use override bind_addr, fall back to policy http_addr, then default
+        // to loopback:3128.  The default allows the proxy to function when no
+        // network namespace is available (e.g. missing CAP_NET_ADMIN) and the
+        // policy doesn't specify an explicit address.
+        let default_addr: SocketAddr = ([127, 0, 0, 1], 3128).into();
+        let http_addr = bind_addr.or(policy.http_addr).unwrap_or(default_addr);
 
         // Only enforce loopback restriction when not using network namespace override
         if bind_addr.is_none() && !http_addr.ip().is_loopback() {

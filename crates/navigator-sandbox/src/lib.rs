@@ -256,7 +256,7 @@ pub async fn run_sandbox(
     // - proxy_url: set HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars so
     //   cooperative tools (curl, etc.) route through the CONNECT proxy
     #[cfg(target_os = "linux")]
-    let ssh_netns_fd = netns.as_ref().and_then(|ns| ns.ns_fd());
+    let ssh_netns_fd = netns.as_ref().and_then(NetworkNamespace::ns_fd);
 
     #[cfg(not(target_os = "linux"))]
     let ssh_netns_fd: Option<i32> = None;
@@ -344,7 +344,7 @@ pub async fn run_sandbox(
                     Ok(reaped) => {
                         tracing::debug!(?reaped, "Reaped orphaned child process");
                     }
-                    Err(nix::errno::Errno::EINTR) => continue,
+                    Err(nix::errno::Errno::EINTR) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "waitpid error during orphan reap");
                         break;

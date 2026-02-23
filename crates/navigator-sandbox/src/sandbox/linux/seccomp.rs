@@ -61,6 +61,7 @@ fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
     filter.try_into().into_diagnostic()
 }
 
+#[allow(clippy::cast_sign_loss)]
 fn add_socket_domain_rule(rules: &mut BTreeMap<i64, Vec<SeccompRule>>, domain: i32) -> Result<()> {
     let condition =
         SeccompCondition::new(0, SeccompCmpArgLen::Dword, SeccompCmpOp::Eq, domain as u64)

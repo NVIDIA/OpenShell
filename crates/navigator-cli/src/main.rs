@@ -374,6 +374,11 @@ enum SandboxCommands {
         #[arg(long)]
         name: Option<String>,
 
+        /// Container image for the sandbox workload.
+        /// The sandbox supervisor is side-loaded via an init container.
+        #[arg(long)]
+        image: Option<String>,
+
         /// Sync local files into the sandbox before running.
         #[arg(long)]
         sync: bool,
@@ -452,6 +457,12 @@ enum SandboxCommands {
         #[command(subcommand)]
         command: ForwardCommands,
     },
+
+    /// Manage sandbox images.
+    Image {
+        #[command(subcommand)]
+        command: SandboxImageCommands,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -480,6 +491,28 @@ enum ForwardCommands {
 
     /// List active port forwards.
     List,
+}
+
+#[derive(Subcommand, Debug)]
+enum SandboxImageCommands {
+    /// Build and push a container image into the cluster.
+    Push {
+        /// Path to the Dockerfile.
+        #[arg(long)]
+        dockerfile: PathBuf,
+
+        /// Image name and tag (default: navigator-sandbox-custom:<timestamp>).
+        #[arg(long)]
+        tag: Option<String>,
+
+        /// Build context directory (default: Dockerfile parent directory).
+        #[arg(long)]
+        context: Option<PathBuf>,
+
+        /// Build argument in KEY=VALUE format (can be specified multiple times).
+        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
+        build_args: Vec<String>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -643,6 +676,7 @@ async fn main() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
+                    image,
                     sync,
                     keep,
                     remote,
@@ -672,6 +706,7 @@ async fn main() -> Result<()> {
                             run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
+                                image.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -688,6 +723,7 @@ async fn main() -> Result<()> {
                             // No cluster configured — go straight to bootstrap.
                             run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
+                                image.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -753,6 +789,25 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
+                SandboxCommands::Image { command } => match command {
+                    SandboxImageCommands::Push {
+                        dockerfile,
+                        tag,
+                        context,
+                        build_args,
+                    } => {
+                        let cluster_name = resolve_cluster_name(&cli.cluster)
+                            .unwrap_or_else(|| "navigator".to_string());
+                        run::sandbox_image_push(
+                            &dockerfile,
+                            tag.as_deref(),
+                            context.as_deref(),
+                            &cluster_name,
+                            &build_args,
+                        )
+                        .await?;
+                    }
+                },
                 other => {
                     let ctx = resolve_cluster(&cli.cluster)?;
                     let endpoint = &ctx.endpoint;
@@ -763,7 +818,9 @@ async fn main() -> Result<()> {
                     }
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
-                        SandboxCommands::Create { .. } => unreachable!(),
+                        SandboxCommands::Create { .. } | SandboxCommands::Image { .. } => {
+                            unreachable!()
+                        }
                         SandboxCommands::Get { name } => {
                             run::sandbox_get(endpoint, &name, &tls).await?;
                         }

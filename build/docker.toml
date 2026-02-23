@@ -14,8 +14,13 @@ description = "Build the CI Docker image"
 run = "build/scripts/docker-build-component.sh ci"
 
 ["docker:build:sandbox"]
-description = "Build the sandbox Docker image"
+description = "Build the sandbox Docker image (base variant)"
 run = "build/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}"
+
+["docker:build:sandbox:nvidia"]
+description = "Build the NVIDIA GPU sandbox Docker image"
+depends = ["docker:build:sandbox"]
+run = "build/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=navigator-sandbox:${IMAGE_TAG:-dev}"
 
 ["docker:build:server"]
 description = "Build the server Docker image"

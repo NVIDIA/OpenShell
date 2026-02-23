@@ -102,7 +102,7 @@ elif [[ "${explicit_target}" == "0" ]]; then
       crates/navigator-server/*|deploy/docker/Dockerfile.server)
         build_server=1
         ;;
-      crates/navigator-sandbox/*|deploy/docker/Dockerfile.sandbox|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
+      crates/navigator-sandbox/*|deploy/docker/sandbox/*|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
         build_sandbox=1
         ;;
       deploy/docker/Dockerfile.pki-job)
@@ -116,6 +116,13 @@ elif [[ "${explicit_target}" == "0" ]]; then
 fi
 
 if [[ "${FORCE_HELM_UPGRADE}" == "1" ]]; then
+  needs_helm_upgrade=1
+fi
+
+# Always run helm upgrade when images are rebuilt so that the
+# NAVIGATOR_SANDBOX_IMAGE env var on the server pod is set correctly
+# and image pull policy is Always (not IfNotPresent from bootstrap).
+if [[ "${build_server}" == "1" || "${build_sandbox}" == "1" || "${build_pki_job}" == "1" ]]; then
   needs_helm_upgrade=1
 fi
 

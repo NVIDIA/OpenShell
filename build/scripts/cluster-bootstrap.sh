@@ -94,6 +94,12 @@ done
 
 nav cluster admin deploy --name "${CLUSTER_NAME}" --update-kube-config
 
+# Warm the sandbox image so the first test doesn't wait for an image pull
+CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+SANDBOX_IMAGE="${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}"
+echo "Pre-pulling sandbox image: ${SANDBOX_IMAGE}"
+docker exec "${CONTAINER_NAME}" crictl pull "${SANDBOX_IMAGE}"
+
 echo ""
 echo "Cluster '${CLUSTER_NAME}' is ready."
 echo "KUBECONFIG has been updated."

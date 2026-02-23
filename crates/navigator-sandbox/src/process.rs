@@ -31,6 +31,7 @@ impl ProcessHandle {
     ///
     /// Returns an error if the process fails to start.
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     pub fn spawn(
         program: &str,
         args: &[String],
@@ -47,7 +48,7 @@ impl ProcessHandle {
             workdir,
             interactive,
             policy,
-            netns.and_then(|ns| ns.ns_fd()),
+            netns.and_then(NetworkNamespace::ns_fd),
             ca_paths,
             provider_env,
         )
@@ -80,6 +81,7 @@ impl ProcessHandle {
     }
 
     #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_arguments)]
     fn spawn_impl(
         program: &str,
         args: &[String],

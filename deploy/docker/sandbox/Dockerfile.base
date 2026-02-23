@@ -74,9 +74,10 @@ RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grp
 # Stage 4: Coding agents layer
 FROM base AS coding-agents
 
-# Install Node.js 22 from NodeSource (openclaw requires >=22.12.0)
+# Install Node.js 22 via NodeSource (required by OpenClaw and other agents)
+# build-essential & python3 are needed for npm packages with native addons (node-gyp)
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends git nodejs && \
+    apt-get install -y --no-install-recommends git nodejs build-essential python3 && \
     rm -rf /var/lib/apt/lists/*
 
 # Install Claude CLI via native installer (npm method is deprecated)
@@ -84,8 +85,12 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
     && cp /root/.local/bin/claude /usr/local/bin/claude \
     && chmod 755 /usr/local/bin/claude
 
-# Install OpenCode CLI, Codex CLI (OpenAI), and OpenClaw CLI
-RUN npm install -g opencode-ai @openai/codex openclaw
+# Install OpenClaw CLI via npm (the native installer uses npm under the hood;
+# installing directly avoids TTY and onboarding issues in Docker builds)
+RUN npm install -g openclaw
+
+# Install OpenCode CLI and Codex CLI (OpenAI)
+RUN npm install -g opencode-ai @openai/codex
 
 # Stage 5: Final image
 FROM coding-agents AS final

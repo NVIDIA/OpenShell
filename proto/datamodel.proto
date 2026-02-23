@@ -30,7 +30,7 @@ message SandboxSpec {
 
 // Sandbox template mapped onto Kubernetes pod template inputs.
 message SandboxTemplate {
-  string agent_image = 1;
+  string image = 1;
   string runtime_class_name = 2;
   string agent_socket = 3;
   map<string, string> labels = 4;
