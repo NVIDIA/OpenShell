@@ -7,9 +7,14 @@
 use crate::l7::provider::{BodyLength, L7Provider, L7Request};
 use miette::{IntoDiagnostic, Result, miette};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::debug;
 
 const MAX_HEADER_BYTES: usize = 16384; // 16 KiB for HTTP headers
 const RELAY_BUF_SIZE: usize = 8192;
+/// Idle timeout for `relay_until_eof`.  If no data arrives within this window
+/// the body is considered complete.  Prevents blocking on servers that keep
+/// the TCP connection alive after the response body (common with CDN keep-alive).
+const RELAY_EOF_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// HTTP/1.1 REST protocol provider.
 pub struct RestProvider;
@@ -22,7 +27,7 @@ impl L7Provider for RestProvider {
         parse_http_request(client).await
     }
 
-    async fn relay<C, U>(&self, req: &L7Request, client: &mut C, upstream: &mut U) -> Result<()>
+    async fn relay<C, U>(&self, req: &L7Request, client: &mut C, upstream: &mut U) -> Result<bool>
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send,
@@ -106,7 +111,9 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
 }
 
 /// Forward an allowed HTTP request to upstream and relay the response back.
-async fn relay_http_request<C, U>(req: &L7Request, client: &mut C, upstream: &mut U) -> Result<()>
+///
+/// Returns `true` if the upstream connection is reusable, `false` if consumed.
+async fn relay_http_request<C, U>(req: &L7Request, client: &mut C, upstream: &mut U) -> Result<bool>
 where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
@@ -140,16 +147,14 @@ where
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(client, upstream).await?;
+            relay_chunked(client, upstream, &req.raw_header[header_end..]).await?;
         }
         BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
 
     // Read and forward response from upstream back to client
-    relay_response(upstream, client).await?;
-
-    Ok(())
+    relay_response(&req.action, upstream, client).await
 }
 
 /// Send a 403 Forbidden JSON deny response.
@@ -232,43 +237,138 @@ where
 
 /// Relay chunked transfer encoding from reader to writer.
 ///
-/// Copies chunks verbatim (preserving the chunked framing) until the
-/// terminal `0\r\n\r\n` chunk is seen.
-async fn relay_chunked<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+/// Copies bytes verbatim (preserving chunk framing) while parsing the stream
+/// boundaries so we can stop exactly at the end of the current message body.
+/// Handles chunk extensions and trailers per RFC 7230.
+///
+/// `already_forwarded` are overflow bytes that were already written to the
+/// writer during header parsing. They are seeded into the parser buffer so
+/// termination can still be detected when boundaries span reads.
+async fn relay_chunked<R, W>(reader: &mut R, writer: &mut W, already_forwarded: &[u8]) -> Result<()>
 where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; RELAY_BUF_SIZE];
-    let mut tail = Vec::new();
+    let started_at = std::time::Instant::now();
+    let mut read_buf = [0u8; RELAY_BUF_SIZE];
+    let mut parse_buf = Vec::from(already_forwarded);
+    let mut pos = 0usize;
+    let mut chunk_count = 0usize;
+    let mut chunk_payload_bytes = 0usize;
 
+    // Parse chunk-size lines + chunk payloads until final 0-size chunk, then
+    // parse trailers until the terminating empty trailer line.
     loop {
-        let n = reader.read(&mut buf).await.into_diagnostic()?;
-        if n == 0 {
-            return Ok(());
+        // Parse one chunk size line: "<hex>[;extensions]\r\n"
+        let size_line_end = loop {
+            if let Some(end) = find_crlf(&parse_buf, pos) {
+                break end;
+            }
+            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette!("Chunked body ended before chunk-size line"));
+            }
+            writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
+            parse_buf.extend_from_slice(&read_buf[..n]);
+        };
+
+        let size_line = std::str::from_utf8(&parse_buf[pos..size_line_end])
+            .into_diagnostic()
+            .map_err(|_| miette!("Invalid UTF-8 in chunk-size line"))?;
+        let size_token = size_line
+            .split(';')
+            .next()
+            .map(str::trim)
+            .unwrap_or_default();
+        let chunk_size = usize::from_str_radix(size_token, 16)
+            .into_diagnostic()
+            .map_err(|_| miette!("Invalid chunk size token: {size_token:?}"))?;
+        pos = size_line_end + 2;
+
+        if chunk_size == 0 {
+            // Parse trailers (if any). Terminates on empty trailer line.
+            let mut trailer_count = 0usize;
+            loop {
+                let trailer_end = loop {
+                    if let Some(end) = find_crlf(&parse_buf, pos) {
+                        break end;
+                    }
+                    let n = reader.read(&mut read_buf).await.into_diagnostic()?;
+                    if n == 0 {
+                        return Err(miette!("Chunked body ended before trailer terminator"));
+                    }
+                    writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
+                    parse_buf.extend_from_slice(&read_buf[..n]);
+                };
+
+                let trailer_line = &parse_buf[pos..trailer_end];
+                pos = trailer_end + 2;
+                if trailer_line.is_empty() {
+                    debug!(
+                        chunk_count,
+                        chunk_payload_bytes,
+                        trailer_count,
+                        elapsed_ms = started_at.elapsed().as_millis(),
+                        "relay_chunked complete"
+                    );
+                    return Ok(());
+                }
+                trailer_count += 1;
+            }
         }
 
-        writer.write_all(&buf[..n]).await.into_diagnostic()?;
+        // Ensure the full chunk payload + trailing CRLF is available.
+        let chunk_end = pos
+            .checked_add(chunk_size)
+            .ok_or_else(|| miette!("Chunk size overflow"))?;
+        let chunk_with_crlf_end = chunk_end
+            .checked_add(2)
+            .ok_or_else(|| miette!("Chunk size overflow"))?;
 
-        // Track tail bytes to detect terminal chunk: 0\r\n\r\n
-        tail.extend_from_slice(&buf[..n]);
-        if tail.len() > 16 {
-            let keep_from = tail.len() - 7;
-            tail.drain(..keep_from);
+        while parse_buf.len() < chunk_with_crlf_end {
+            let n = reader.read(&mut read_buf).await.into_diagnostic()?;
+            if n == 0 {
+                return Err(miette!("Chunked body ended mid-chunk"));
+            }
+            writer.write_all(&read_buf[..n]).await.into_diagnostic()?;
+            parse_buf.extend_from_slice(&read_buf[..n]);
         }
+        if &parse_buf[chunk_end..chunk_with_crlf_end] != b"\r\n" {
+            return Err(miette!("Chunk missing terminating CRLF"));
+        }
+        pos = chunk_with_crlf_end;
+        chunk_count += 1;
+        chunk_payload_bytes = chunk_payload_bytes.saturating_add(chunk_size);
 
-        if tail.windows(5).any(|w| w == b"0\r\n\r\n") {
-            return Ok(());
+        // Keep parser memory bounded for long streams.
+        if pos > RELAY_BUF_SIZE * 4 {
+            parse_buf.drain(..pos);
+            pos = 0;
         }
     }
 }
 
+fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
+    buf.get(start..)?
+        .windows(2)
+        .position(|w| w == b"\r\n")
+        .map(|offset| start + offset)
+}
+
 /// Read and relay a full HTTP response (headers + body) from upstream to client.
-async fn relay_response<U, C>(upstream: &mut U, client: &mut C) -> Result<()>
+///
+/// Returns `true` if the upstream connection is reusable (keep-alive),
+/// `false` if it was consumed (read-until-EOF or `Connection: close`).
+async fn relay_response<U, C>(
+    request_method: &str,
+    upstream: &mut U,
+    client: &mut C,
+) -> Result<bool>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
+    let started_at = std::time::Instant::now();
     let mut buf = Vec::with_capacity(4096);
     let mut tmp = [0u8; 1024];
 
@@ -284,7 +384,7 @@ where
             if !buf.is_empty() {
                 client.write_all(&buf).await.into_diagnostic()?;
             }
-            return Ok(());
+            return Ok(false);
         }
         buf.extend_from_slice(&tmp[..n]);
 
@@ -295,13 +395,64 @@ where
 
     let header_end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
 
-    // Parse response body framing
+    // Parse response framing
     let header_str = String::from_utf8_lossy(&buf[..header_end]);
+    let status_code = parse_status_code(&header_str).unwrap_or(200);
+    let server_wants_close = parse_connection_close(&header_str);
     let body_length = parse_body_length(&header_str);
+
+    debug!(
+        status_code,
+        ?body_length,
+        server_wants_close,
+        request_method,
+        overflow_bytes = buf.len() - header_end,
+        "relay_response framing"
+    );
+
+    // Bodiless responses (HEAD, 1xx, 204, 304): forward headers only, skip body
+    if is_bodiless_response(request_method, status_code) {
+        client
+            .write_all(&buf[..header_end])
+            .await
+            .into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+        return Ok(!server_wants_close);
+    }
+
+    // No explicit framing (no Content-Length, no Transfer-Encoding).
+    // Per RFC 7230 §3.3.3 the body is delimited by connection close.
+    if matches!(body_length, BodyLength::None) {
+        if server_wants_close {
+            // Server indicated it will close — read until EOF.
+            let before_end = &buf[..header_end - 2];
+            client.write_all(before_end).await.into_diagnostic()?;
+            client
+                .write_all(b"Connection: close\r\n\r\n")
+                .await
+                .into_diagnostic()?;
+            let overflow = &buf[header_end..];
+            if !overflow.is_empty() {
+                client.write_all(overflow).await.into_diagnostic()?;
+            }
+            relay_until_eof(upstream, client).await?;
+            client.flush().await.into_diagnostic()?;
+            return Ok(false);
+        }
+        // No Connection: close — an HTTP/1.1 keep-alive server that omits
+        // framing headers has an empty body.  Forward headers and continue
+        // the relay loop instead of blocking on relay_until_eof.
+        debug!("BodyLength::None without Connection: close — treating body as empty");
+        client
+            .write_all(&buf[..header_end])
+            .await
+            .into_diagnostic()?;
+        client.flush().await.into_diagnostic()?;
+        return Ok(true);
+    }
 
     // Forward response headers + any overflow body bytes
     client.write_all(&buf).await.into_diagnostic()?;
-
     let overflow_len = (buf.len() - header_end) as u64;
 
     // Forward remaining response body
@@ -313,13 +464,82 @@ where
             }
         }
         BodyLength::Chunked => {
-            relay_chunked(upstream, client).await?;
+            relay_chunked(upstream, client, &buf[header_end..]).await?;
         }
-        BodyLength::None => {}
+        BodyLength::None => unreachable!(),
     }
     client.flush().await.into_diagnostic()?;
+    debug!(
+        request_method,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "relay_response complete (explicit framing)"
+    );
 
-    Ok(())
+    // When body framing is explicit (Content-Length / Chunked), always report
+    // the connection as reusable so the relay loop continues.  If the server
+    // sent `Connection: close`, the *next* upstream write will fail and the
+    // loop will exit via the normal error path.  Exiting early here would
+    // tear down the CONNECT tunnel before the client can detect the close,
+    // causing ~30 s retry delays in clients like `gh`.
+    Ok(true)
+}
+
+/// Parse the HTTP status code from a response status line.
+///
+/// Expects the first line to look like `HTTP/1.1 200 OK`.
+fn parse_status_code(headers: &str) -> Option<u16> {
+    let status_line = headers.lines().next()?;
+    let code_str = status_line.split_whitespace().nth(1)?;
+    code_str.parse().ok()
+}
+
+/// Check if the response headers contain `Connection: close`.
+fn parse_connection_close(headers: &str) -> bool {
+    for line in headers.lines().skip(1) {
+        let lower = line.to_ascii_lowercase();
+        if lower.starts_with("connection:") {
+            let val = lower.split_once(':').map_or("", |(_, v)| v.trim());
+            return val.contains("close");
+        }
+    }
+    false
+}
+
+/// Returns true for responses that MUST NOT contain a message body per RFC 7230 §3.3.3:
+/// HEAD responses, 1xx informational, 204 No Content, 304 Not Modified.
+fn is_bodiless_response(request_method: &str, status_code: u16) -> bool {
+    request_method.eq_ignore_ascii_case("HEAD")
+        || (100..200).contains(&status_code)
+        || status_code == 204
+        || status_code == 304
+}
+
+/// Relay all bytes from reader to writer until EOF or idle timeout.
+///
+/// Used for HTTP responses with no explicit framing (no Content-Length,
+/// no Transfer-Encoding) where the body is delimited by connection close.
+/// An idle timeout prevents blocking when servers keep the TCP connection
+/// alive longer than expected (e.g. CDN keep-alive timers).
+async fn relay_until_eof<R, W>(reader: &mut R, writer: &mut W) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; RELAY_BUF_SIZE];
+    loop {
+        match tokio::time::timeout(RELAY_EOF_IDLE_TIMEOUT, reader.read(&mut buf)).await {
+            Ok(Ok(0)) => return Ok(()),
+            Ok(Ok(n)) => writer.write_all(&buf[..n]).await.into_diagnostic()?,
+            Ok(Err(e)) => return Err(miette::miette!("{e}")),
+            Err(_) => {
+                debug!(
+                    "relay_until_eof idle timeout after {:?}",
+                    RELAY_EOF_IDLE_TIMEOUT
+                );
+                return Ok(());
+            }
+        }
+    }
 }
 
 /// Detect if the first bytes look like an HTTP request.
@@ -393,5 +613,318 @@ mod tests {
         assert!(looks_like_http(b"DELETE /foo HTTP/1.1\r\n"));
         assert!(!looks_like_http(b"\x00\x00\x00\x08")); // Postgres
         assert!(!looks_like_http(b"HELLO")); // Unknown
+    }
+
+    #[test]
+    fn test_parse_status_code() {
+        assert_eq!(
+            parse_status_code("HTTP/1.1 200 OK\r\nHost: x\r\n\r\n"),
+            Some(200)
+        );
+        assert_eq!(
+            parse_status_code("HTTP/1.1 204 No Content\r\n\r\n"),
+            Some(204)
+        );
+        assert_eq!(
+            parse_status_code("HTTP/1.1 304 Not Modified\r\n\r\n"),
+            Some(304)
+        );
+        assert_eq!(
+            parse_status_code("HTTP/1.1 100 Continue\r\n\r\n"),
+            Some(100)
+        );
+        assert_eq!(parse_status_code(""), None);
+    }
+
+    #[test]
+    fn test_parse_connection_close() {
+        assert!(parse_connection_close(
+            "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n"
+        ));
+        assert!(!parse_connection_close(
+            "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n"
+        ));
+        assert!(!parse_connection_close(
+            "HTTP/1.1 200 OK\r\nHost: x\r\n\r\n"
+        ));
+    }
+
+    #[test]
+    fn test_is_bodiless_response() {
+        assert!(is_bodiless_response("HEAD", 200));
+        assert!(is_bodiless_response("GET", 100));
+        assert!(is_bodiless_response("GET", 199));
+        assert!(is_bodiless_response("GET", 204));
+        assert!(is_bodiless_response("GET", 304));
+        assert!(!is_bodiless_response("GET", 200));
+        assert!(!is_bodiless_response("POST", 201));
+    }
+
+    #[tokio::test]
+    async fn relay_response_no_framing_with_connection_close_reads_until_eof() {
+        // Response with Connection: close but no Content-Length/TE: body is
+        // delimited by connection close — relay_until_eof should forward it.
+        let response = b"HTTP/1.1 200 OK\r\nConnection: close\r\nServer: test\r\n\r\nhello world";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            upstream_write.shutdown().await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("relay_response should not deadlock");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(!reusable, "connection consumed by read-until-EOF");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(
+            received_str.contains("Connection: close"),
+            "should preserve Connection: close"
+        );
+        assert!(
+            received_str.contains("hello world"),
+            "body should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_no_framing_without_connection_close_treats_as_empty() {
+        // Response without Content-Length, TE, or Connection: close.
+        // HTTP/1.1 keep-alive implies empty body — must not block.
+        let response = b"HTTP/1.1 200 OK\r\nServer: test\r\n\r\n";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            // Do NOT close — if relay blocks on read it will hang
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("must not block when no Connection: close");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(reusable, "keep-alive implied, connection reusable");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(
+            received_str.contains("200 OK"),
+            "headers should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_head_with_content_length_no_body() {
+        // HEAD response with Content-Length must NOT try to read body bytes.
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 1000\r\n\r\n";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            // Do NOT close — if relay tries to read body it will block forever
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("HEAD", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("HEAD relay must not deadlock waiting for body");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(reusable, "HEAD response should be reusable");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(received_str.contains("200 OK"));
+        // Should NOT contain body bytes
+        assert!(!received_str.contains('\0'));
+    }
+
+    #[tokio::test]
+    async fn relay_response_204_no_body() {
+        let response = b"HTTP/1.1 204 No Content\r\nServer: test\r\n\r\n";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("204 relay must not deadlock");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(reusable, "204 response should be reusable");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        assert!(String::from_utf8_lossy(&received).contains("204 No Content"));
+    }
+
+    #[tokio::test]
+    async fn relay_response_chunked_body_complete_in_overflow() {
+        // Entire chunked body (including terminal 0\r\n\r\n) arrives with
+        // headers in the same read.  relay_chunked must NOT be called or it
+        // will block forever waiting for data that was already consumed.
+        let response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            // Do NOT close — if relay_chunked is called it will block forever
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("must not block when chunked body is complete in overflow");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(reusable, "connection should be reusable");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(
+            received_str.contains("hello"),
+            "chunked body should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_chunked_with_trailers_does_not_wait_for_eof() {
+        // Last-chunk can be followed by trailers, so body terminator is not
+        // always literal "0\r\n\r\n". We must stop at final empty trailer
+        // line without waiting for upstream connection close.
+        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\nx-checksum: abc123\r\n\r\n";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+            // Keep stream open to ensure relay terminates by framing, not EOF.
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("must not block when chunked response has trailers");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(reusable, "chunked response should be reusable");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(
+            received_str.contains("hello"),
+            "chunked body should be forwarded"
+        );
+        assert!(
+            received_str.contains("x-checksum: abc123"),
+            "trailers should be forwarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_response_normal_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("normal relay must not deadlock");
+
+        let reusable = result.expect("relay_response should succeed");
+        assert!(reusable, "Content-Length response should be reusable");
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        let received_str = String::from_utf8_lossy(&received);
+        assert!(received_str.contains("hello"));
+    }
+
+    #[tokio::test]
+    async fn relay_response_connection_close_with_content_length() {
+        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello";
+
+        let (mut upstream_read, mut upstream_write) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            upstream_write.write_all(response).await.unwrap();
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            relay_response("GET", &mut upstream_read, &mut client_write),
+        )
+        .await
+        .expect("relay must not deadlock");
+
+        let reusable = result.expect("relay_response should succeed");
+        // With explicit framing, Connection: close is still reported as reusable
+        // so the relay loop continues.  The *next* upstream write will fail and
+        // exit the loop via the normal error path.
+        assert!(
+            reusable,
+            "explicit framing keeps loop alive despite Connection: close"
+        );
+
+        client_write.shutdown().await.unwrap();
+        let mut received = Vec::new();
+        client_read.read_to_end(&mut received).await.unwrap();
+        assert!(String::from_utf8_lossy(&received).contains("hello"));
     }
 }

@@ -131,7 +131,15 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            provider.relay(&req, client, upstream).await?;
+            let reusable = provider.relay(&req, client, upstream).await?;
+            if !reusable {
+                debug!(
+                    host = %ctx.host,
+                    port = ctx.port,
+                    "Upstream connection not reusable, closing L7 relay"
+                );
+                return Ok(());
+            }
         } else {
             // Enforce mode: deny with 403 and close connection
             provider

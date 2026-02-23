@@ -11,6 +11,7 @@ filesystem_policy:
     - /dev/urandom
     - /app
     - /etc
+    - /var/log
   read_write:
     - /sandbox
     - /tmp
@@ -88,6 +89,48 @@ network_policies:
               path: "/api/v1/data"
     binaries:
       - { path: /usr/bin/curl }
+
+  # --- GitHub repo-scoped policy (L7, TLS-terminated) ---
+  # Combined policy for api.github.com to avoid OPA complete-rule conflict.
+  #   - johntmyers/alpha-claw: full access (all methods including DELETE)
+  #   - johntmyers/bravo-claw: read-only + create/edit issues
+  github_repos:
+    name: github_repos
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          # Read-only access to all GitHub API paths
+          - allow:
+              method: GET
+              path: "/**"
+          - allow:
+              method: HEAD
+              path: "/**"
+          - allow:
+              method: OPTIONS
+              path: "/**"
+          # GraphQL API (used by gh CLI for most operations)
+          - allow:
+              method: POST
+              path: "/graphql"
+          # alpha-claw: full write access
+          - allow:
+              method: "*"
+              path: "/repos/johntmyers/alpha-claw/**"
+          # bravo-claw: create + edit issues
+          - allow:
+              method: POST
+              path: "/repos/johntmyers/bravo-claw/issues"
+          - allow:
+              method: PATCH
+              path: "/repos/johntmyers/bravo-claw/issues/*"
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/gh }
 
 inference:
   allowed_routes:

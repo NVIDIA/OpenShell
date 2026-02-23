@@ -50,12 +50,15 @@ pub trait L7Provider: Send + Sync {
     ) -> impl Future<Output = Result<Option<L7Request>>> + Send;
 
     /// Forward an allowed request to upstream and relay the response back.
+    ///
+    /// Returns `true` if the upstream connection is reusable (keep-alive),
+    /// `false` if it was consumed (e.g. read-until-EOF or `Connection: close`).
     fn relay<C, U>(
         &self,
         req: &L7Request,
         client: &mut C,
         upstream: &mut U,
-    ) -> impl Future<Output = Result<()>> + Send
+    ) -> impl Future<Output = Result<bool>> + Send
     where
         C: AsyncRead + AsyncWrite + Unpin + Send,
         U: AsyncRead + AsyncWrite + Unpin + Send;
