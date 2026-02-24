@@ -134,7 +134,7 @@ filesystem_policy:
   read_only:
     - /usr
     - /lib
-    - /proc/self
+    - /proc
     - /dev/urandom
     - /app
     - /etc
@@ -602,7 +602,7 @@ filesystem_policy:
   read_only:
     - /usr
     - /lib
-    - /proc/self
+    - /proc
     - /dev/urandom
     - /app
     - /etc

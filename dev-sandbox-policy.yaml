@@ -42,10 +42,36 @@ network_policies:
       - { host: platform.claude.com, port: 443 }
     binaries:
       - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/node }
+  gitlab:
+    name: gitlab
+    endpoints:
+      - { host: gitlab.com, port: 443 }
+      - { host: gitlab.mycorp.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/glab }
   github:
     name: github
     endpoints:
-      - { host: github.com, port: 443 }
+      - host: github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          # Git Smart HTTP read-only: allow clone, fetch, pull
+          # Discovery (query string is included in path matching)
+          - allow:
+              method: GET
+              path: "/**/info/refs*"
+          # Data transfer for reads (all repos)
+          - allow:
+              method: POST
+              path: "/**/git-upload-pack"
+          # Data transfer for writes (alpha-claw only)
+          - allow:
+              method: POST
+              path: "/johntmyers/alpha-claw*/git-receive-pack"
     binaries:
       - { path: /usr/bin/git }
   nvidia:

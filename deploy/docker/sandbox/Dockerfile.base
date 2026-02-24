@@ -29,9 +29,9 @@ RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,ta
     --mount=type=cache,id=cargo-target-sandbox-${TARGETARCH},sharing=locked,target=/build/target \
     . cross-build.sh && \
     if [ "$RUST_BUILD_PROFILE" = "release" ]; then \
-        cargo_cross_build --release -p navigator-sandbox; \
+    cargo_cross_build --release -p navigator-sandbox; \
     else \
-        cargo_cross_build -p navigator-sandbox; \
+    cargo_cross_build -p navigator-sandbox; \
     fi && \
     mkdir -p /build/out && \
     cp "$(cross_output_dir "$RUST_BUILD_PROFILE")/navigator-sandbox" /build/out/
@@ -79,14 +79,14 @@ FROM base AS coding-agents
 # Include a minimal native toolchain so npm can compile optional native
 # dependencies on platforms where prebuilt artifacts are unavailable.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends build-essential git nodejs build-essential python3 && \
+    apt-get install -y --no-install-recommends build-essential git nodejs build-essential python3 vim-tiny nano && \
     rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) from the official apt repository
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
-        -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
+    -o /usr/share/keyrings/githubcli-archive-keyring.gpg && \
     echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
-        > /etc/apt/sources.list.d/github-cli.list && \
+    > /etc/apt/sources.list.d/github-cli.list && \
     apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/*
 
@@ -97,10 +97,25 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
 
 # Install OpenClaw CLI via npm (the native installer uses npm under the hood;
 # installing directly avoids TTY and onboarding issues in Docker builds)
-RUN npm install -g openclaw
+RUN npm install -g openclaw@2026.2.9
 
 # Install OpenCode CLI and Codex CLI (OpenAI)
 RUN npm install -g opencode-ai @openai/codex
+
+# Install GitHub CLI (gh) via official Debian repository
+RUN mkdir -p -m 755 /etc/apt/keyrings && \
+    curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+    -o /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg && \
+    echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+    > /etc/apt/sources.list.d/github-cli.list && \
+    apt-get update && apt-get install -y --no-install-recommends gh && \
+    rm -rf /var/lib/apt/lists/*
+
+# Install ai-pim-utils (NVIDIA PIM CLI tools: outlook, calendar, transcripts, etc.)
+# The install script auto-detects Debian and installs via .deb package to /usr/bin.
+# Skills are installed to /usr/share/ai-pim-utils/skills and symlinked to ~/.claude/skills.
+# RUN curl -fsSL https://outlook-cli-80d21a.gitlab-master-pages.nvidia.com/install.sh | bash
 
 # Stage 5: Final image
 FROM coding-agents AS final
@@ -116,11 +131,29 @@ COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
 # Add venv to PATH
 ENV PATH="/app/.venv/bin:$PATH"
 
+# Copy custom navigator skills into the image
+# To add a skill, create a subdirectory under deploy/docker/sandbox/skills/
+# with a SKILL.md file (and any supporting files). It will be installed into
+# both ~/.claude/skills/ and ~/.agents/skills/ for agent discovery.
+COPY deploy/docker/sandbox/skills/ /sandbox/.openclaw/skills/
+
 RUN mkdir -p /var/navigator /sandbox /var/log && \
     touch /var/log/navigator.log && \
     chown supervisor:supervisor /var/log/navigator.log && \
     chmod 0664 /var/log/navigator.log && \
-    chown sandbox:sandbox /sandbox
+    chown sandbox:sandbox /sandbox && \
+    # Install agent skills into the sandbox user's home directory
+    # so Claude and other agents can discover them at runtime.
+    # Sources: ai-pim-utils (.deb) and custom navigator skills.
+    mkdir -p /sandbox/.claude/skills /sandbox/.agents/skills && \
+    for src in /usr/share/ai-pim-utils/skills /usr/share/navigator/skills; do \
+    [ -d "$src" ] || continue; \
+    find "$src" -mindepth 1 -maxdepth 1 -type d | while read -r skill; do \
+    ln -sf "$skill" "/sandbox/.claude/skills/$(basename "$skill")"; \
+    ln -sf "$skill" "/sandbox/.agents/skills/$(basename "$skill")"; \
+    done; \
+    done && \
+    chown -R sandbox:sandbox /sandbox/.openclaw /sandbox/.claude /sandbox/.agents
 
 # OpenClaw startup helper for environments without systemd (e.g. sandboxes).
 # Usage: nav sandbox create --forward 18789 -- openclaw-start
