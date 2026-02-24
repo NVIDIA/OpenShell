@@ -8,19 +8,30 @@ It transforms the data center from a static deployment target into a continuous 
 
 ## Quickstart
 
-🚧 Under construction 🚧
+### Prerequisites
+
+- **Docker** — Docker Desktop (or a Docker daemon) must be running.
+- **Python 3.12+** and [uv](https://docs.astral.sh/uv/)
+
+### Install
 
 ```bash
-uv pip install navigator --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple 
+uv pip install navigator --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
+```
 
-navigator sandbox create -- claude  # or opencode or codex
+The `navigator` binary is installed into your Python environment. Use `uv run navigator` to invoke it, or activate your venv first (`source .venv/bin/activate`).
+
+### Create a sandbox
+
+```bash
+uv run navigator sandbox create -- claude  # or opencode or codex
 ```
 
 The sandbox container includes a minimal networking toolset by default: `ping`, `dig`, `nslookup`, `nc`, `traceroute`, and `netstat`.
 
 ## Developing
 
-See `CONTRIBUTING.md` for more information about developing and contributing to Navigator.
+See `CONTRIBUTING.md` for building from source and contributing to Navigator.
 
 ## Architecture
 

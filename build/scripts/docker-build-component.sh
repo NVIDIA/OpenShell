@@ -71,7 +71,7 @@ fi
 CACHE_ARGS=()
 if [[ -n "${CI:-}" ]]; then
   echo "CI environment detected; skipping local build cache export options."
-elif docker buildx inspect "${BUILDER_ARGS[@]}" 2>/dev/null | grep -q "Driver: docker-container"; then
+elif docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
   CACHE_ARGS=(
     --cache-from "type=local,src=${CACHE_PATH}"
     --cache-to "type=local,dest=${CACHE_PATH},mode=max"
@@ -79,9 +79,9 @@ elif docker buildx inspect "${BUILDER_ARGS[@]}" 2>/dev/null | grep -q "Driver: d
 fi
 
 docker buildx build \
-  "${BUILDER_ARGS[@]}" \
+  ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
-  "${CACHE_ARGS[@]}" \
+  ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
   -f "${DOCKERFILE}" \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
   --provenance=false \

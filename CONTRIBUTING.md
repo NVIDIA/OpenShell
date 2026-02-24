@@ -25,28 +25,30 @@ Zsh (Mac OS Default):
 echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 ```
 
-Project uses Rust 1.88+ and Python 3.12+.
+Project uses Rust 1.88+ and Python 3.12+. Docker must be running for cluster and sandbox workflows.
 
 ## Getting started
 
 ```bash
-# Install dependencies and build
-mise install
+# Trust the project config (one-time)
+mise trust
 
-# Build the project
-mise build
-
-# Run all project tests
-mise test
-
-# Run the CLI, this will build/run the cli from source (first run will be slow)
-nav --help
-
-# Run the sandbox
-mise run sandbox
-
-# Run the cluster
+# Build and deploy a local development cluster
 mise run cluster
+
+# Create a sandbox with Claude (or opencode / codex)
+nav sandbox create -- claude
+```
+
+Note: `nav` builds the CLI from source on first run, which takes several minutes while Rust compiles. Subsequent runs are fast.
+
+### Other useful commands
+
+```bash
+nav --help                        # CLI help
+mise build                        # Debug build (without running)
+mise test                         # Run all project tests
+mise run sandbox                  # Run sandbox container interactively
 ```
 
 ## Sandbox SSH access
