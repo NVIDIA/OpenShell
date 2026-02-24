@@ -69,7 +69,7 @@ The `navigator-sandbox` supervisor adapts to arbitrary environments:
 
 - **Log file fallback**: Attempts to open `/var/log/navigator.log` for append; silently falls back to stdout-only logging if the path is not writable.
 - **Command resolution**: Executes the command from CLI args, then the `NAVIGATOR_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
-- **Network namespace**: Attempts to create a network namespace for proxy isolation; continues without isolation if `CAP_NET_ADMIN` is unavailable, with the proxy falling back to `127.0.0.1:3128`.
+- **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable.
 
 ## Design Decisions
 
@@ -86,5 +86,5 @@ The `navigator-sandbox` supervisor adapts to arbitrary environments:
 ## Limitations
 
 - Distroless / `FROM scratch` images are not supported (the supervisor needs glibc, `/proc`, and a shell for the init container `cp`)
-- Missing `iproute2` degrades network namespace isolation but does not block startup
+- Missing `iproute2` (or required capabilities) blocks startup in proxy mode because namespace isolation is mandatory
 - The init container assumes the supervisor binary is at `/usr/local/bin/navigator-sandbox` in the default sandbox image

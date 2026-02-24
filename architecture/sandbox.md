@@ -84,11 +84,11 @@ flowchart TD
 6. **Network namespace** (Linux, proxy mode only):
    - `NetworkNamespace::create()` builds the veth pair and namespace
    - Opens `/var/run/netns/sandbox-{uuid}` as an FD for later `setns()`
-   - On failure: warn and continue without network isolation
+   - On failure: return a fatal startup error (fail-closed)
 
 7. **Proxy startup** (proxy mode only):
    - Validate that OPA engine and identity cache are present
-   - Determine bind address: veth host IP if netns exists, else `policy.network.proxy.http_addr`
+   - Determine bind address: on Linux, use the netns veth host IP (netns creation is required and startup already aborted if it failed); on non-Linux, use `policy.network.proxy.http_addr`
    - Parse the gateway endpoint URL into the control-plane allowlist
    - Build `InferenceContext` when both `sandbox_id` and `navigator_endpoint` are available, populated with `default_patterns()` from `l7::inference`
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
@@ -381,7 +381,7 @@ Each step has rollback on failure -- if any `ip` command fails, previously creat
 
 The `iproute2` package must be installed (provides the `ip` command).
 
-If namespace creation fails (e.g., missing capabilities), the sandbox logs a warning and continues without network isolation. Seccomp still blocks raw socket domains, but without the namespace a process could bypass the proxy by connecting directly to external IPs.
+If namespace creation fails (e.g., missing capabilities), startup fails in `Proxy` mode. This preserves fail-closed behavior: either network namespace isolation is active, or the sandbox does not run.
 
 ## HTTP CONNECT Proxy
 
@@ -905,7 +905,7 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Landlock failure + `BestEffort` | Warn + continue without filesystem isolation |
 | Landlock failure + `HardRequirement` | Fatal |
 | Seccomp failure | Fatal |
-| Network namespace creation failure | Warn + continue without isolation (seccomp still blocks raw socket domains) |
+| Network namespace creation failure | Fatal in `Proxy` mode (sandbox startup aborts) |
 | Ephemeral CA generation failure | Warn + TLS termination disabled (L7 inspection on TLS endpoints will not work) |
 | CA file write failure | Warn + TLS termination disabled |
 | OPA engine Mutex lock poisoned | Error on the individual evaluation |

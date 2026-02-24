@@ -180,12 +180,11 @@ pub async fn run_sandbox(
         match NetworkNamespace::create() {
             Ok(ns) => Some(ns),
             Err(e) => {
-                // Log warning but continue without netns - allows running without CAP_NET_ADMIN
-                tracing::warn!(
-                    error = %e,
-                    "Failed to create network namespace, continuing without isolation"
-                );
-                None
+                return Err(miette::miette!(
+                    "Network namespace creation failed and proxy mode requires isolation. \
+                     Ensure CAP_NET_ADMIN and CAP_SYS_ADMIN are available and iproute2 is installed. \
+                     Error: {e}"
+                ));
             }
         }
     } else {
