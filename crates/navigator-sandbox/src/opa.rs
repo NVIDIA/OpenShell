@@ -773,12 +773,12 @@ mod tests {
     }
 
     #[test]
-    fn gitlab_policy_allows_glab() {
+    fn github_policy_allows_git() {
         let engine = test_engine();
         let input = NetworkInput {
-            host: "gitlab.com".into(),
+            host: "github.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/glab"),
+            binary_path: PathBuf::from("/usr/bin/git"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
@@ -789,7 +789,7 @@ mod tests {
             "Expected allow, got deny: {}",
             decision.reason
         );
-        assert_eq!(decision.matched_policy.as_deref(), Some("gitlab"));
+        assert_eq!(decision.matched_policy.as_deref(), Some("github"));
     }
 
     #[test]
@@ -904,15 +904,15 @@ network_policies: {}
 
     #[test]
     fn ancestor_binary_allowed() {
-        // Use gitlab policy: binary /usr/bin/glab is the policy binary.
-        // If the socket process is /usr/bin/python3 but its ancestor is /usr/bin/glab, allow.
+        // Use github policy: binary /usr/bin/git is the policy binary.
+        // If the socket process is /usr/bin/python3 but its ancestor is /usr/bin/git, allow.
         let engine = test_engine();
         let input = NetworkInput {
-            host: "gitlab.com".into(),
+            host: "github.com".into(),
             port: 443,
             binary_path: PathBuf::from("/usr/bin/python3"),
             binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/glab")],
+            ancestors: vec![PathBuf::from("/usr/bin/git")],
             cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
@@ -921,14 +921,14 @@ network_policies: {}
             "Expected allow via ancestor match, got deny: {}",
             decision.reason
         );
-        assert_eq!(decision.matched_policy.as_deref(), Some("gitlab"));
+        assert_eq!(decision.matched_policy.as_deref(), Some("github"));
     }
 
     #[test]
     fn no_ancestor_match_denied() {
         let engine = test_engine();
         let input = NetworkInput {
-            host: "gitlab.com".into(),
+            host: "github.com".into(),
             port: 443,
             binary_path: PathBuf::from("/usr/bin/python3"),
             binary_sha256: "unused".into(),
@@ -948,11 +948,11 @@ network_policies: {}
     fn deep_ancestor_chain_matches() {
         let engine = test_engine();
         let input = NetworkInput {
-            host: "gitlab.com".into(),
+            host: "github.com".into(),
             port: 443,
             binary_path: PathBuf::from("/usr/bin/python3"),
             binary_sha256: "unused".into(),
-            ancestors: vec![PathBuf::from("/usr/bin/sh"), PathBuf::from("/usr/bin/glab")],
+            ancestors: vec![PathBuf::from("/usr/bin/sh"), PathBuf::from("/usr/bin/git")],
             cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
@@ -1725,11 +1725,11 @@ process:
             },
         );
 
-        // glab to gitlab.com → allow
+        // git to github.com → allow
         let input = NetworkInput {
-            host: "gitlab.com".into(),
+            host: "github.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/glab"),
+            binary_path: PathBuf::from("/usr/bin/git"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
             cmdline_paths: vec![],
@@ -1738,7 +1738,7 @@ process:
         assert_eq!(
             action,
             NetworkAction::Allow {
-                matched_policy: Some("gitlab".to_string())
+                matched_policy: Some("github".to_string())
             },
         );
     }
