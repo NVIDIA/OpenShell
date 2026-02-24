@@ -2,6 +2,7 @@
 set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
+GATEWAY_PORT=${GATEWAY_PORT:-8080}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then
@@ -88,11 +89,11 @@ if is_local_registry_host; then
   ensure_local_registry
 fi
 
-for component in server sandbox pki-job; do
+for component in server sandbox; do
   build/scripts/cluster-push-component.sh "${component}"
 done
 
-nav cluster admin deploy --name "${CLUSTER_NAME}" --update-kube-config
+nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config
 
 # Warm the sandbox image so the first test doesn't wait for an image pull
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"

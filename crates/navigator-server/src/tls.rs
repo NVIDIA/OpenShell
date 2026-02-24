@@ -3,6 +3,7 @@
 use navigator_core::{Error, Result};
 use rustls::ServerConfig;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::server::WebPkiClientVerifier;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
@@ -15,17 +16,32 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-    /// Create a new TLS acceptor from certificate and key files.
+    /// Create a new TLS acceptor from certificate, key, and client CA files.
+    ///
+    /// The server always enforces mTLS — all clients must present a valid
+    /// certificate signed by the given CA.
     ///
     /// # Errors
     ///
-    /// Returns an error if the certificate or key files cannot be read or parsed.
-    pub fn from_files(cert_path: &Path, key_path: &Path) -> Result<Self> {
+    /// Returns an error if the certificate, key, or CA files cannot be read or parsed.
+    pub fn from_files(cert_path: &Path, key_path: &Path, client_ca_path: &Path) -> Result<Self> {
         let certs = load_certs(cert_path)?;
         let key = load_key(key_path)?;
 
+        let ca_certs = load_certs(client_ca_path)?;
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in ca_certs {
+            root_store
+                .add(cert)
+                .map_err(|e| Error::tls(format!("failed to add CA certificate: {e}")))?;
+        }
+
+        let verifier = WebPkiClientVerifier::builder(Arc::new(root_store))
+            .build()
+            .map_err(|e| Error::tls(format!("failed to build client verifier: {e}")))?;
+
         let mut config = ServerConfig::builder()
-            .with_no_client_auth()
+            .with_client_cert_verifier(verifier)
             .with_single_cert(certs, key)
             .map_err(|e| Error::tls(format!("failed to create TLS config: {e}")))?;
 

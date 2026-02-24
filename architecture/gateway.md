@@ -115,6 +115,8 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--log-level` | `NAVIGATOR_LOG_LEVEL` | `info` | Tracing log level filter |
 | `--tls-cert` | `NAVIGATOR_TLS_CERT` | None | Path to PEM certificate file |
 | `--tls-key` | `NAVIGATOR_TLS_KEY` | None | Path to PEM private key file |
+| `--tls-client-ca` | `NAVIGATOR_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification |
+| `--client-tls-secret-name` | `NAVIGATOR_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
 | `--db-url` | `NAVIGATOR_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/navigator/navigator.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
 | `--sandbox-namespace` | `NAVIGATOR_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `NAVIGATOR_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
@@ -174,13 +176,17 @@ All traffic (gRPC and HTTP) shares a single TCP port. Multiplexing happens at th
 
 Both gRPC and HTTP handlers produce different response body types. `MultiplexedService` normalizes them through a custom `BoxBody` wrapper (an `UnsyncBoxBody<Bytes, Box<dyn Error>>`) so that Hyper receives a uniform response type.
 
-### TLS + ALPN
+### TLS + mTLS
 
 When TLS is enabled (`crates/navigator-server/src/tls.rs`):
 
-- `TlsAcceptor::from_files()` loads PEM certificates and keys via `rustls_pemfile`, builds a `rustls::ServerConfig` with no client auth, and configures ALPN to advertise `h2` and `http/1.1`.
+- `TlsAcceptor::from_files()` loads PEM certificates and keys via `rustls_pemfile`, builds a `rustls::ServerConfig`, and configures ALPN to advertise `h2` and `http/1.1`.
+- When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` -- all clients must present a certificate signed by the cluster CA. Without a client CA path, the server falls back to `with_no_client_auth()` (for local dev).
 - Supports PKCS#1, PKCS#8, and SEC1 private key formats.
 - The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
+- Certificates are generated at cluster bootstrap time by the `navigator-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `navigator-server-tls` (server cert+key), `navigator-server-client-ca` (CA cert), and `navigator-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
+- **Certificate lifetime**: Certificates use `rcgen` defaults (effectively never expire), which is appropriate for an internal dev-cluster PKI where certs are ephemeral to the cluster's lifetime.
+- **Redeploy behavior**: On redeploy, existing cluster TLS secrets are loaded and reused if they are complete and valid PEM. If secrets are missing, incomplete, or malformed, fresh PKI is generated. If rotation occurs and the navigator workload is already running, the bootstrap performs a rollout restart and waits for completion before persisting CLI-side credentials.
 
 ## gRPC Services
 

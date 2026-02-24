@@ -9,10 +9,12 @@ use std::path::PathBuf;
 pub struct ClusterMetadata {
     /// The cluster name.
     pub name: String,
-    /// Gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
+    /// Gateway endpoint URL (e.g., `https://127.0.0.1:8080`).
     pub gateway_endpoint: String,
     /// Whether this is a remote cluster.
     pub is_remote: bool,
+    /// Host port mapped to the gateway `NodePort`.
+    pub gateway_port: u16,
     /// For remote clusters, the SSH destination (e.g., `user@hostname`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_host: Option<String>,
@@ -21,18 +23,22 @@ pub struct ClusterMetadata {
     pub resolved_host: Option<String>,
 }
 
-pub fn create_cluster_metadata(name: &str, remote: Option<&RemoteOptions>) -> ClusterMetadata {
+pub fn create_cluster_metadata(
+    name: &str,
+    remote: Option<&RemoteOptions>,
+    port: u16,
+) -> ClusterMetadata {
     let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
         || {
             let host = local_gateway_host().unwrap_or_else(|| "127.0.0.1".to_string());
-            (format!("https://{host}"), false, None, None)
+            (format!("https://{host}:{port}"), false, None, None)
         },
         |opts| {
             // Extract the host portion from the SSH destination, then resolve it
             // via `ssh -G` to get the actual hostname/IP (handles SSH config aliases).
             let ssh_host = extract_host_from_ssh_destination(&opts.destination);
             let resolved = resolve_ssh_hostname(&ssh_host);
-            let endpoint = format!("https://{resolved}");
+            let endpoint = format!("https://{resolved}:{port}");
             (
                 endpoint,
                 true,
@@ -46,6 +52,7 @@ pub fn create_cluster_metadata(name: &str, remote: Option<&RemoteOptions>) -> Cl
         name: name.to_string(),
         gateway_endpoint,
         is_remote,
+        gateway_port: port,
         remote_host,
         resolved_host,
     }
@@ -292,12 +299,20 @@ mod tests {
 
     #[test]
     fn local_cluster_metadata() {
-        let meta = create_cluster_metadata("test", None);
+        let meta = create_cluster_metadata("test", None, 8080);
         assert_eq!(meta.name, "test");
-        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1");
+        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
+        assert_eq!(meta.gateway_port, 8080);
         assert!(!meta.is_remote);
         assert!(meta.remote_host.is_none());
         assert!(meta.resolved_host.is_none());
+    }
+
+    #[test]
+    fn local_cluster_metadata_custom_port() {
+        let meta = create_cluster_metadata("test", None, 9090);
+        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:9090");
+        assert_eq!(meta.gateway_port, 9090);
     }
 
     #[test]
@@ -321,30 +336,33 @@ mod tests {
     #[test]
     fn remote_cluster_metadata_has_resolved_host() {
         let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta = create_cluster_metadata("test", Some(&opts));
+        let meta = create_cluster_metadata("test", Some(&opts), 8080);
         assert!(meta.is_remote);
         assert_eq!(meta.remote_host.as_deref(), Some("user@10.0.0.5"));
         // When the host is a plain IP, ssh -G should resolve it to itself
         assert!(meta.resolved_host.is_some());
         assert_eq!(
             meta.gateway_endpoint,
-            format!("https://{}", meta.resolved_host.as_ref().unwrap())
+            format!("https://{}:8080", meta.resolved_host.as_ref().unwrap())
         );
+        assert_eq!(meta.gateway_port, 8080);
     }
 
     #[test]
     fn metadata_roundtrip_with_resolved_host() {
         let meta = ClusterMetadata {
             name: "test".to_string(),
-            gateway_endpoint: "https://10.0.0.5".to_string(),
+            gateway_endpoint: "https://10.0.0.5:8080".to_string(),
             is_remote: true,
+            gateway_port: 8080,
             remote_host: Some("user@navigator-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: ClusterMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.resolved_host.as_deref(), Some("10.0.0.5"));
-        assert_eq!(parsed.gateway_endpoint, "https://10.0.0.5");
+        assert_eq!(parsed.gateway_endpoint, "https://10.0.0.5:8080");
+        assert_eq!(parsed.gateway_port, 8080);
     }
 
     #[test]
@@ -355,6 +373,7 @@ mod tests {
             "name": "test",
             "gateway_endpoint": "http://myserver:8080",
             "is_remote": true,
+            "gateway_port": 8080,
             "remote_host": "user@myserver"
         }"#;
         let parsed: ClusterMetadata = serde_json::from_str(json).unwrap();

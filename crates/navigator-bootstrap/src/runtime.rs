@@ -297,7 +297,10 @@ pub async fn fetch_recent_logs(docker: &Docker, container_name: &str, n: usize) 
 pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
     let container_name = container_name(name);
 
-    // Get the list of NotReady nodes
+    // Get the list of NotReady nodes.
+    // The last condition on a node is always type=Ready; we need to check its
+    // **status** (True/False/Unknown), not its type.  Nodes where the Ready
+    // condition status is not "True" are stale and should be removed.
     let (output, exit_code) = exec_capture_with_exit(
         docker,
         &container_name,
@@ -306,8 +309,8 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
             "-c".to_string(),
             format!(
                 "KUBECONFIG={KUBECONFIG_PATH} kubectl get nodes \
-                 --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].type \
-                 2>/dev/null | grep -v '\\bReady$' | awk '{{print $1}}'"
+                 --no-headers -o custom-columns=NAME:.metadata.name,STATUS:.status.conditions[-1].status \
+                 2>/dev/null | grep -v '\\bTrue$' | awk '{{print $1}}'"
             ),
         ],
     )
@@ -351,47 +354,105 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
     Ok(count)
 }
 
-/// Restart the navigator deployment so pods resolve freshly imported local images.
+/// Restart the navigator workload so pods pick up updated images or secrets.
+///
+/// Probes for a `StatefulSet` first, then falls back to a `Deployment`, matching
+/// the same detection pattern used by `cluster-deploy-fast.sh`.
 pub async fn restart_navigator_deployment(docker: &Docker, name: &str) -> Result<()> {
-    let container_name = container_name(name);
+    let cname = container_name(name);
+
+    // Detect which workload kind exists in the cluster.
+    let workload_kind = detect_navigator_workload_kind(docker, &cname).await?;
+    let workload_ref = format!("{workload_kind}/navigator");
 
     let (restart_output, restart_exit) = exec_capture_with_exit(
         docker,
-        &container_name,
+        &cname,
         vec![
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout restart deployment/navigator -n navigator"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout restart {workload_ref} -n navigator"
             ),
         ],
     )
     .await?;
     if restart_exit != 0 {
         return Err(miette::miette!(
-            "failed to restart navigator deployment (exit code {restart_exit})\n{restart_output}"
+            "failed to restart navigator {workload_ref} (exit code {restart_exit})\n{restart_output}"
         ));
     }
 
     let (status_output, status_exit) = exec_capture_with_exit(
         docker,
-        &container_name,
+        &cname,
         vec![
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status deployment/navigator -n navigator --timeout=180s"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status {workload_ref} -n navigator --timeout=180s"
             ),
         ],
     )
     .await?;
     if status_exit != 0 {
         return Err(miette::miette!(
-            "navigator rollout status failed (exit code {status_exit})\n{status_output}"
+            "navigator rollout status failed for {workload_ref} (exit code {status_exit})\n{status_output}"
         ));
     }
 
     Ok(())
+}
+
+/// Check whether a navigator workload exists in the cluster (`StatefulSet` or `Deployment`).
+pub async fn navigator_workload_exists(docker: &Docker, name: &str) -> Result<bool> {
+    let cname = container_name(name);
+    match detect_navigator_workload_kind(docker, &cname).await {
+        Ok(_) => Ok(true),
+        Err(_) => Ok(false),
+    }
+}
+
+/// Detect whether navigator is deployed as a `StatefulSet` or `Deployment`.
+/// Returns "statefulset" or "deployment".
+async fn detect_navigator_workload_kind(docker: &Docker, container_name: &str) -> Result<String> {
+    // Check StatefulSet first (primary workload type for fresh deploys)
+    let (_, ss_exit) = exec_capture_with_exit(
+        docker,
+        container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl get statefulset/navigator -n navigator -o name 2>/dev/null"
+            ),
+        ],
+    )
+    .await?;
+    if ss_exit == 0 {
+        return Ok("statefulset".to_string());
+    }
+
+    // Fall back to Deployment
+    let (_, dep_exit) = exec_capture_with_exit(
+        docker,
+        container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl get deployment/navigator -n navigator -o name 2>/dev/null"
+            ),
+        ],
+    )
+    .await?;
+    if dep_exit == 0 {
+        return Ok("deployment".to_string());
+    }
+
+    Err(miette::miette!(
+        "no navigator workload (statefulset or deployment) found in namespace 'navigator'"
+    ))
 }
 
 fn is_valid_kubeconfig(output: &str) -> bool {

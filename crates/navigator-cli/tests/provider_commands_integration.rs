@@ -11,12 +11,16 @@ use navigator_core::proto::{
     Provider, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse,
     SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
 };
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::sync::{Mutex, mpsc};
 use tokio_stream::wrappers::TcpListenerStream;
-use tonic::transport::Server;
+use tonic::transport::{Certificate as TlsCertificate, Identity, Server, ServerTlsConfig};
 use tonic::{Response, Status};
 
 struct EnvVarGuard {
@@ -243,76 +247,138 @@ impl Navigator for TestNavigator {
     }
 }
 
-async fn run_server() -> std::net::SocketAddr {
+fn install_rustls_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
+fn build_ca() -> (Certificate, KeyPair) {
+    let key_pair = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    let cert = params.self_signed(&key_pair).unwrap();
+    (cert, key_pair)
+}
+
+fn build_server_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
+    let key_pair = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(vec!["localhost".to_string()]).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
+    (cert.pem(), key_pair.serialize_pem())
+}
+
+fn build_client_cert(ca: &Certificate, ca_key: &KeyPair) -> (String, String) {
+    let key_pair = KeyPair::generate().unwrap();
+    let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let cert = params.signed_by(&key_pair, ca, ca_key).unwrap();
+    (cert.pem(), key_pair.serialize_pem())
+}
+
+/// Test fixture: TLS-enabled server with matching client certs.
+struct TestServer {
+    endpoint: String,
+    tls: TlsOptions,
+    _dir: TempDir,
+}
+
+async fn run_server() -> TestServer {
+    install_rustls_provider();
+
+    let (ca, ca_key) = build_ca();
+    let (server_cert, server_key) = build_server_cert(&ca, &ca_key);
+    let (client_cert, client_key) = build_client_cert(&ca, &ca_key);
+    let ca_cert = ca.pem();
+
+    let identity = Identity::from_pem(server_cert, server_key);
+    let client_ca = TlsCertificate::from_pem(ca_cert.clone());
+    let tls_config = ServerTlsConfig::new()
+        .identity(identity)
+        .client_ca_root(client_ca);
+
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let incoming = TcpListenerStream::new(listener);
     tokio::spawn(async move {
         Server::builder()
+            .tls_config(tls_config)
+            .unwrap()
             .add_service(NavigatorServer::new(TestNavigator::default()))
             .serve_with_incoming(incoming)
             .await
             .unwrap();
     });
-    addr
+
+    let dir = tempfile::tempdir().unwrap();
+    let ca_path = dir.path().join("ca.crt");
+    let cert_path = dir.path().join("tls.crt");
+    let key_path = dir.path().join("tls.key");
+    std::fs::write(&ca_path, ca_cert).unwrap();
+    std::fs::write(&cert_path, client_cert).unwrap();
+    std::fs::write(&key_path, client_key).unwrap();
+
+    let tls = TlsOptions::new(Some(ca_path), Some(cert_path), Some(key_path));
+    let endpoint = format!("https://localhost:{}", addr.port());
+
+    TestServer {
+        endpoint,
+        tls,
+        _dir: dir,
+    }
 }
 
 #[tokio::test]
 async fn provider_cli_run_functions_support_full_crud_flow() {
-    let addr = run_server().await;
-    let endpoint = format!("http://127.0.0.1:{}", addr.port());
-    let tls = TlsOptions::default();
+    let ts = run_server().await;
 
     run::provider_create(
-        &endpoint,
+        &ts.endpoint,
         "my-claude",
         "claude",
         false,
         &["API_KEY=abc".to_string()],
         &["profile=dev".to_string()],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect("provider create");
 
-    run::provider_get(&endpoint, "my-claude", &tls)
+    run::provider_get(&ts.endpoint, "my-claude", &ts.tls)
         .await
         .expect("provider get");
-    run::provider_list(&endpoint, 100, 0, false, &tls)
+    run::provider_list(&ts.endpoint, 100, 0, false, &ts.tls)
         .await
         .expect("provider list");
 
     run::provider_update(
-        &endpoint,
+        &ts.endpoint,
         "my-claude",
         "claude",
         false,
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect("provider update");
 
-    run::provider_delete(&endpoint, &["my-claude".to_string()], &tls)
+    run::provider_delete(&ts.endpoint, &["my-claude".to_string()], &ts.tls)
         .await
         .expect("provider delete");
 }
 
 #[tokio::test]
 async fn provider_create_rejects_key_only_credentials_without_local_env_value() {
-    let addr = run_server().await;
-    let endpoint = format!("http://127.0.0.1:{}", addr.port());
-    let tls = TlsOptions::default();
+    let ts = run_server().await;
 
     let err = run::provider_create(
-        &endpoint,
+        &ts.endpoint,
         "bad-provider",
         "claude",
         false,
         &["INVALID_PAIR".to_string()],
         &[],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect_err("invalid key=value should fail");
@@ -326,24 +392,22 @@ async fn provider_create_rejects_key_only_credentials_without_local_env_value() 
 
 #[tokio::test]
 async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
-    let addr = run_server().await;
-    let endpoint = format!("http://127.0.0.1:{}", addr.port());
-    let tls = TlsOptions::default();
+    let ts = run_server().await;
     let _guard = EnvVarGuard::set("NAV_GENERIC_TEST_KEY", "generic-value");
 
     run::provider_create(
-        &endpoint,
+        &ts.endpoint,
         "my-generic",
         "generic",
         false,
         &["NAV_GENERIC_TEST_KEY".to_string()],
         &[],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect("provider create");
 
-    let mut client = navigator_cli::tls::grpc_client(&endpoint, &tls)
+    let mut client = navigator_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
         .await
         .expect("grpc client should connect");
     let response = client
@@ -363,18 +427,16 @@ async fn provider_create_supports_generic_type_and_env_lookup_credentials() {
 
 #[tokio::test]
 async fn provider_create_rejects_combined_from_existing_and_credentials() {
-    let addr = run_server().await;
-    let endpoint = format!("http://127.0.0.1:{}", addr.port());
-    let tls = TlsOptions::default();
+    let ts = run_server().await;
 
     let err = run::provider_create(
-        &endpoint,
+        &ts.endpoint,
         "bad-provider",
         "claude",
         true,
         &["API_KEY=abc".to_string()],
         &[],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect_err("from-existing and credentials should be mutually exclusive");
@@ -388,19 +450,17 @@ async fn provider_create_rejects_combined_from_existing_and_credentials() {
 
 #[tokio::test]
 async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
-    let addr = run_server().await;
-    let endpoint = format!("http://127.0.0.1:{}", addr.port());
-    let tls = TlsOptions::default();
+    let ts = run_server().await;
     let _guard = EnvVarGuard::set("NAV_EMPTY_ENV_KEY", "");
 
     let err = run::provider_create(
-        &endpoint,
+        &ts.endpoint,
         "bad-provider",
         "generic",
         false,
         &["NAV_EMPTY_ENV_KEY".to_string()],
         &[],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect_err("empty env var should be rejected");
@@ -414,24 +474,22 @@ async fn provider_create_rejects_empty_env_var_for_key_only_credential() {
 
 #[tokio::test]
 async fn provider_create_supports_nvidia_type_with_nvidia_api_key() {
-    let addr = run_server().await;
-    let endpoint = format!("http://127.0.0.1:{}", addr.port());
-    let tls = TlsOptions::default();
+    let ts = run_server().await;
     let _guard = EnvVarGuard::set("NVIDIA_API_KEY", "nvapi-live-test");
 
     run::provider_create(
-        &endpoint,
+        &ts.endpoint,
         "my-nvidia",
         "nvidia",
         false,
         &["NVIDIA_API_KEY".to_string()],
         &[],
-        &tls,
+        &ts.tls,
     )
     .await
     .expect("provider create");
 
-    let mut client = navigator_cli::tls::grpc_client(&endpoint, &tls)
+    let mut client = navigator_cli::tls::grpc_client(&ts.endpoint, &ts.tls)
         .await
         .expect("grpc client should connect");
     let response = client

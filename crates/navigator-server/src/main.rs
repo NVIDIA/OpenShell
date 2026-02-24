@@ -25,11 +25,15 @@ struct Args {
 
     /// Path to TLS certificate file.
     #[arg(long, env = "NAVIGATOR_TLS_CERT")]
-    tls_cert: Option<PathBuf>,
+    tls_cert: PathBuf,
 
     /// Path to TLS private key file.
     #[arg(long, env = "NAVIGATOR_TLS_KEY")]
-    tls_key: Option<PathBuf>,
+    tls_key: PathBuf,
+
+    /// Path to CA certificate for client certificate verification (mTLS).
+    #[arg(long, env = "NAVIGATOR_TLS_CLIENT_CA")]
+    tls_client_ca: PathBuf,
 
     /// Database URL for persistence.
     #[arg(long, env = "NAVIGATOR_DB_URL", required = true)]
@@ -75,6 +79,10 @@ struct Args {
     /// Allowed clock skew in seconds for SSH handshake.
     #[arg(long, env = "NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
     ssh_handshake_skew_secs: u64,
+
+    /// Kubernetes secret name containing client TLS materials for sandbox pods.
+    #[arg(long, env = "NAVIGATOR_CLIENT_TLS_SECRET_NAME")]
+    client_tls_secret_name: Option<String>,
 }
 
 #[tokio::main]
@@ -94,13 +102,15 @@ async fn main() -> Result<()> {
     // Build configuration
     let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
 
-    let mut config = navigator_core::Config::default()
+    let tls = navigator_core::TlsConfig {
+        cert_path: args.tls_cert,
+        key_path: args.tls_key,
+        client_ca_path: args.tls_client_ca,
+    };
+
+    let mut config = navigator_core::Config::new(tls)
         .with_bind_address(bind)
         .with_log_level(&args.log_level);
-
-    if let (Some(cert), Some(key)) = (args.tls_cert, args.tls_key) {
-        config = config.with_tls(cert, key);
-    }
 
     config = config
         .with_database_url(args.db_url)
@@ -121,6 +131,10 @@ async fn main() -> Result<()> {
 
     if let Some(secret) = args.ssh_handshake_secret {
         config = config.with_ssh_handshake_secret(secret);
+    }
+
+    if let Some(name) = args.client_tls_secret_name {
+        config = config.with_client_tls_secret_name(name);
     }
 
     let router = Router::new().map_err(|e| miette::miette!("failed to initialize router: {e}"))?;

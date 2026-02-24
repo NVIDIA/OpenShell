@@ -132,11 +132,6 @@ fn xdg_config_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config"))
 }
 
-pub fn is_https(server: &str) -> Result<bool> {
-    let uri: hyper::Uri = server.parse().into_diagnostic()?;
-    Ok(uri.scheme_str() == Some("https"))
-}
-
 pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMaterials> {
     let resolved = tls.with_default_paths(server);
     let default_hint = default_tls_dir(server).map_or_else(String::new, |dir| {
@@ -210,11 +205,9 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClie
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
-    if is_https(server)? {
-        let materials = require_tls_materials(server, tls)?;
-        let tls_config = build_tonic_tls_config(&materials);
-        endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    }
+    let materials = require_tls_materials(server, tls)?;
+    let tls_config = build_tonic_tls_config(&materials);
+    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     let channel = endpoint.connect().await.into_diagnostic()?;
     Ok(NavigatorClient::new(channel))
 }
@@ -228,11 +221,9 @@ pub async fn grpc_inference_client(
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
-    if is_https(server)? {
-        let materials = require_tls_materials(server, tls)?;
-        let tls_config = build_tonic_tls_config(&materials);
-        endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    }
+    let materials = require_tls_materials(server, tls)?;
+    let tls_config = build_tonic_tls_config(&materials);
+    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     let channel = endpoint.connect().await.into_diagnostic()?;
     Ok(InferenceClient::new(channel))
 }

@@ -8,7 +8,7 @@
 # Environment:
 #   IMAGE_TAG                - Image tag (default: dev)
 #   K3S_VERSION              - k3s version (set by mise.toml [env])
-#   ENVOY_GATEWAY_VERSION    - Envoy Gateway chart version (set by mise.toml [env])
+
 #   DOCKER_PLATFORMS         - Target platforms (default: linux/amd64,linux/arm64)
 #   RUST_BUILD_PROFILE       - Rust build profile for sandbox (default: release)
 #   TAG_LATEST               - If true, add/update :latest tag (default: false)
@@ -117,7 +117,7 @@ resolve_dockerfile() {
 # so Rust compiles natively and only the final stage runs on the target arch.
 # ---------------------------------------------------------------------------
 echo "Building multi-arch component images..."
-for component in sandbox server pki-job; do
+for component in sandbox server; do
   echo "Building ${IMAGE_PREFIX}${component} for ${PLATFORMS}..."
   BUILD_ARGS=""
   if [ "$component" = "sandbox" ]; then
@@ -143,11 +143,6 @@ done
 mkdir -p deploy/docker/.build/charts
 echo "Packaging navigator helm chart..."
 helm package deploy/helm/navigator -d deploy/docker/.build/charts/
-
-echo "Downloading gateway-helm chart..."
-helm pull oci://docker.io/envoyproxy/gateway-helm \
-  --version ${ENVOY_GATEWAY_VERSION} \
-  --destination deploy/docker/.build/charts/
 
 # ---------------------------------------------------------------------------
 # Step 3: Build and push multi-arch cluster image.
@@ -179,7 +174,7 @@ if [ "$TAG_LATEST" = true ]; then
 fi
 
 if [ ${#TAGS_TO_APPLY[@]} -gt 0 ]; then
-  for component in sandbox server pki-job cluster; do
+  for component in sandbox server cluster; do
     FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}${component}"
     for tag in "${TAGS_TO_APPLY[@]}"; do
       if [ "${tag}" = "${IMAGE_TAG}" ]; then
@@ -198,7 +193,6 @@ echo ""
 echo "Done! Multi-arch images pushed to ${REGISTRY}:"
 echo "  ${REGISTRY}/${IMAGE_PREFIX}sandbox:${IMAGE_TAG}"
 echo "  ${REGISTRY}/${IMAGE_PREFIX}server:${IMAGE_TAG}"
-echo "  ${REGISTRY}/${IMAGE_PREFIX}pki-job:${IMAGE_TAG}"
 echo "  ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:${IMAGE_TAG}"
 if [ "$TAG_LATEST" = true ]; then
   echo "  (all also tagged :latest)"

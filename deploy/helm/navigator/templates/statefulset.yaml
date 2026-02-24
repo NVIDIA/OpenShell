@@ -57,27 +57,46 @@ spec:
             - name: NAVIGATOR_SSH_GATEWAY_PORT
               value: {{ .Values.server.sshGatewayPort | quote }}
             {{- end }}
+            - name: NAVIGATOR_TLS_CERT
+              value: /etc/navigator-tls/server/tls.crt
+            - name: NAVIGATOR_TLS_KEY
+              value: /etc/navigator-tls/server/tls.key
+            - name: NAVIGATOR_TLS_CLIENT_CA
+              value: /etc/navigator-tls/client-ca/ca.crt
+            - name: NAVIGATOR_CLIENT_TLS_SECRET_NAME
+              value: {{ .Values.server.tls.clientTlsSecretName | quote }}
           volumeMounts:
             - name: navigator-data
               mountPath: /var/navigator
+            - name: tls-cert
+              mountPath: /etc/navigator-tls/server
+              readOnly: true
+            - name: tls-client-ca
+              mountPath: /etc/navigator-tls/client-ca
+              readOnly: true
           ports:
             - name: grpc
               containerPort: {{ .Values.service.port }}
               protocol: TCP
           livenessProbe:
-            httpGet:
-              path: /healthz
+            tcpSocket:
               port: grpc
             initialDelaySeconds: 5
             periodSeconds: 10
           readinessProbe:
-            httpGet:
-              path: /readyz
+            tcpSocket:
               port: grpc
             initialDelaySeconds: 5
             periodSeconds: 10
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+      volumes:
+        - name: tls-cert
+          secret:
+            secretName: {{ .Values.server.tls.certSecretName }}
+        - name: tls-client-ca
+          secret:
+            secretName: {{ .Values.server.tls.clientCaSecretName }}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

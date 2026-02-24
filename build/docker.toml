@@ -3,7 +3,6 @@
 ["docker:build"]
 description = "Build all Docker images"
 depends = [
-  "docker:build:pki-job",
   "docker:build:sandbox",
   "docker:build:server",
   "docker:build:cluster",
@@ -25,10 +24,6 @@ run = "build/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_I
 ["docker:build:server"]
 description = "Build the server Docker image"
 run = "build/scripts/docker-build-component.sh server"
-
-["docker:build:pki-job"]
-description = "Build the gateway PKI job image"
-run = "build/scripts/docker-build-component.sh pki-job"
 
 ["docker:build:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"

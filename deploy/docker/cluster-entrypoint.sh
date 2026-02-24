@@ -126,11 +126,33 @@ fi
 # Copy bundled manifests to k3s manifests directory.
 # These are stored in /opt/navigator/manifests/ because the volume mount
 # on /var/lib/rancher/k3s overwrites any files baked into that path.
-if [ -d "/opt/navigator/manifests" ]; then
+#
+# When reusing a persistent volume from a previous deploy, stale manifests
+# (e.g. envoy-gateway-helmchart.yaml from an older image) may linger.
+# We remove any navigator-managed manifests that no longer exist in the
+# bundled set so k3s does not keep installing removed components.
+K3S_MANIFESTS="/var/lib/rancher/k3s/server/manifests"
+BUNDLED_MANIFESTS="/opt/navigator/manifests"
+
+if [ -d "$BUNDLED_MANIFESTS" ]; then
     echo "Copying bundled manifests to k3s..."
-    for manifest in /opt/navigator/manifests/*.yaml; do
+    for manifest in "$BUNDLED_MANIFESTS"/*.yaml; do
         [ ! -f "$manifest" ] && continue
-        cp "$manifest" /var/lib/rancher/k3s/server/manifests/
+        cp "$manifest" "$K3S_MANIFESTS/"
+    done
+
+    # Remove navigator-managed manifests that are no longer bundled.
+    # Only clean up files that look like navigator manifests (navigator-* or
+    # envoy-gateway-* or agent-*) to avoid removing built-in k3s manifests.
+    for existing in "$K3S_MANIFESTS"/navigator-*.yaml \
+                    "$K3S_MANIFESTS"/envoy-gateway-*.yaml \
+                    "$K3S_MANIFESTS"/agent-*.yaml; do
+        [ ! -f "$existing" ] && continue
+        basename=$(basename "$existing")
+        if [ ! -f "$BUNDLED_MANIFESTS/$basename" ]; then
+            echo "Removing stale manifest: $basename"
+            rm -f "$existing"
+        fi
     done
 fi
 
@@ -148,7 +170,6 @@ if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
     echo "Setting image repository base: ${IMAGE_REPO_BASE}"
     sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/server|" "$HELMCHART"
     sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${IMAGE_REPO_BASE}/sandbox:${target_tag}|" "$HELMCHART"
-    sed -i -E "s|jobImage:[[:space:]]*[^[:space:]]+|jobImage: ${IMAGE_REPO_BASE}/pki-job:${target_tag}|" "$HELMCHART"
 fi
 
 # In push mode, use the exact image references that were imported into cluster
@@ -156,14 +177,12 @@ fi
 if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
     server_image=""
     sandbox_image=""
-    pki_job_image=""
     old_ifs="$IFS"
     IFS=','
     for ref in $PUSH_IMAGE_REFS; do
         case "$ref" in
             */server:*) server_image="$ref" ;;
             */sandbox:*) sandbox_image="$ref" ;;
-            */pki-job:*) pki_job_image="$ref" ;;
         esac
     done
     IFS="$old_ifs"
@@ -181,11 +200,6 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
         echo "Setting sandbox image: ${sandbox_image}"
         sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${sandbox_image}|" "$HELMCHART"
     fi
-
-    if [ -n "$pki_job_image" ]; then
-        echo "Setting pki job image: ${pki_job_image}"
-        sed -i -E "s|jobImage:[[:space:]]*[^[:space:]]+|jobImage: ${pki_job_image}|" "$HELMCHART"
-    fi
 fi
 
 if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
@@ -195,8 +209,6 @@ if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
     sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
     # sandbox image (inline tag in image reference)
     sed -i "s|sandbox:latest|sandbox:${IMAGE_TAG}|" "$HELMCHART"
-    # pki-job image (inline tag in image reference)
-    sed -i "s|pki-job:latest|pki-job:${IMAGE_TAG}|" "$HELMCHART"
 fi
 
 if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then
@@ -220,34 +232,6 @@ if [ -f "$HELMCHART" ]; then
     else
         # Clear the placeholder so the default (8080) is used
         sed -i "s|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g" "$HELMCHART"
-    fi
-fi
-
-# If EXTRA_SANS is set (comma-separated list), inject them into the HelmChart
-# manifest so the gateway PKI job includes them in the TLS certificate.
-if [ -n "$EXTRA_SANS" ]; then
-    HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
-    if [ -f "$HELMCHART" ]; then
-        echo "Injecting extra TLS SANs: $EXTRA_SANS"
-        # Build a YAML list from the comma-separated string.
-        # e.g. "160.211.47.2,my.host.com" -> "['160.211.47.2','my.host.com']"  (flow style)
-        # We use sed-friendly single-quoted flow style to keep it on one line.
-        yaml_list="["
-        first=1
-        IFS=','
-        for san in $EXTRA_SANS; do
-            san=$(echo "$san" | xargs)
-            [ -z "$san" ] && continue
-            if [ "$first" = "1" ]; then
-                yaml_list="${yaml_list}'${san}'"
-                first=0
-            else
-                yaml_list="${yaml_list},'${san}'"
-            fi
-        done
-        unset IFS
-        yaml_list="${yaml_list}]"
-        sed -i "s|extraSANs: \[\]|extraSANs: ${yaml_list}|g" "$HELMCHART"
     fi
 fi
 

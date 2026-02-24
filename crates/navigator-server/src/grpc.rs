@@ -618,11 +618,7 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
 
         let (gateway_host, gateway_port) = resolve_gateway(&self.state.config);
-        let scheme = if self.state.config.tls.is_some() {
-            "https"
-        } else {
-            "http"
-        };
+        let scheme = "https";
 
         Ok(Response::new(CreateSshSessionResponse {
             sandbox_id: req.sandbox_id,

@@ -2548,6 +2548,7 @@ dependencies = [
  "bytes",
  "futures",
  "miette",
+ "rcgen",
  "serde",
  "serde_json",
  "serde_yaml",

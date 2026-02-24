@@ -32,6 +32,8 @@ pub struct SandboxClient {
     ssh_listen_addr: String,
     ssh_handshake_secret: String,
     ssh_handshake_skew_secs: u64,
+    /// When non-empty, sandbox pods get this K8s secret mounted for mTLS to the server.
+    client_tls_secret_name: String,
 }
 
 impl std::fmt::Debug for SandboxClient {
@@ -52,6 +54,7 @@ impl SandboxClient {
         ssh_listen_addr: String,
         ssh_handshake_secret: String,
         ssh_handshake_skew_secs: u64,
+        client_tls_secret_name: String,
     ) -> Result<Self, KubeError> {
         let client = Client::try_default().await?;
         Ok(Self {
@@ -62,6 +65,7 @@ impl SandboxClient {
             ssh_listen_addr,
             ssh_handshake_secret,
             ssh_handshake_skew_secs,
+            client_tls_secret_name,
         })
     }
 
@@ -132,6 +136,7 @@ impl SandboxClient {
             self.ssh_listen_addr(),
             self.ssh_handshake_secret(),
             self.ssh_handshake_skew_secs(),
+            &self.client_tls_secret_name,
         );
         let api = self.api();
 
@@ -504,6 +509,7 @@ fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_imag
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     default_image: &str,
@@ -512,6 +518,7 @@ fn sandbox_to_k8s_spec(
     ssh_listen_addr: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
+    client_tls_secret_name: &str,
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
     if let Some(spec) = spec {
@@ -536,6 +543,7 @@ fn sandbox_to_k8s_spec(
                     ssh_handshake_secret,
                     ssh_handshake_skew_secs,
                     &spec.environment,
+                    client_tls_secret_name,
                 ),
             );
             if !template.agent_socket.is_empty() {
@@ -565,6 +573,7 @@ fn sandbox_to_k8s_spec(
                 ssh_handshake_secret,
                 ssh_handshake_skew_secs,
                 spec_env,
+                client_tls_secret_name,
             ),
         );
     }
@@ -584,9 +593,10 @@ fn sandbox_template_to_k8s(
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
+    client_tls_secret_name: &str,
 ) -> serde_json::Value {
     if let Some(pod_template) = struct_to_json(&template.pod_template) {
-        return inject_pod_template_env(
+        return inject_pod_template(
             pod_template,
             template,
             default_image,
@@ -596,6 +606,7 @@ fn sandbox_template_to_k8s(
             ssh_handshake_secret,
             ssh_handshake_skew_secs,
             spec_environment,
+            client_tls_secret_name,
         );
     }
 
@@ -667,6 +678,18 @@ fn sandbox_template_to_k8s(
         }),
     );
 
+    // Mount client TLS secret for mTLS to the server.
+    if !client_tls_secret_name.is_empty() {
+        container.insert(
+            "volumeMounts".to_string(),
+            serde_json::json!([{
+                "name": "navigator-client-tls",
+                "mountPath": "/etc/navigator-tls/client",
+                "readOnly": true
+            }]),
+        );
+    }
+
     if let Some(resources) = struct_to_json(&template.resources) {
         container.insert("resources".to_string(), resources);
     }
@@ -674,6 +697,17 @@ fn sandbox_template_to_k8s(
         "containers".to_string(),
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
+
+    // Add TLS secret volume.
+    if !client_tls_secret_name.is_empty() {
+        spec.insert(
+            "volumes".to_string(),
+            serde_json::json!([{
+                "name": "navigator-client-tls",
+                "secret": { "secretName": client_tls_secret_name }
+            }]),
+        );
+    }
 
     let mut template_value = serde_json::Map::new();
     if !metadata.is_empty() {
@@ -692,7 +726,7 @@ fn sandbox_template_to_k8s(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn inject_pod_template_env(
+fn inject_pod_template(
     mut pod_template: serde_json::Value,
     template: &SandboxTemplate,
     default_image: &str,
@@ -702,6 +736,7 @@ fn inject_pod_template_env(
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
+    client_tls_secret_name: &str,
 ) -> serde_json::Value {
     let Some(spec) = pod_template
         .get_mut("spec")
@@ -709,6 +744,20 @@ fn inject_pod_template_env(
     else {
         return pod_template;
     };
+
+    // Inject TLS volume at the pod spec level.
+    if !client_tls_secret_name.is_empty() {
+        let volumes = spec
+            .entry("volumes")
+            .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+        if let Some(volumes_arr) = volumes.as_array_mut() {
+            volumes_arr.push(serde_json::json!({
+                "name": "navigator-client-tls",
+                "secret": { "secretName": client_tls_secret_name }
+            }));
+        }
+    }
+
     let Some(containers) = spec
         .get_mut("containers")
         .and_then(|value| value.as_array_mut())
@@ -738,6 +787,22 @@ fn inject_pod_template_env(
             ssh_handshake_skew_secs,
             spec_environment,
         );
+
+        // Inject TLS volumeMount on the agent container.
+        if !client_tls_secret_name.is_empty()
+            && let Some(container_obj) = container.as_object_mut()
+        {
+            let mounts = container_obj
+                .entry("volumeMounts")
+                .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+            if let Some(mounts_arr) = mounts.as_array_mut() {
+                mounts_arr.push(serde_json::json!({
+                    "name": "navigator-client-tls",
+                    "mountPath": "/etc/navigator-tls/client",
+                    "readOnly": true
+                }));
+            }
+        }
     }
 
     // Apply supervisor bootstrap transforms for custom workload images
@@ -839,6 +904,20 @@ fn apply_required_env(
         env,
         "NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS",
         &ssh_handshake_skew_secs.to_string(),
+    );
+    // TLS cert paths for sandbox-to-server mTLS. The actual secret is mounted
+    // as a volume; these env vars tell the sandbox gRPC client where to find
+    // the certs.
+    upsert_env(env, "NAVIGATOR_TLS_CA", "/etc/navigator-tls/client/ca.crt");
+    upsert_env(
+        env,
+        "NAVIGATOR_TLS_CERT",
+        "/etc/navigator-tls/client/tls.crt",
+    );
+    upsert_env(
+        env,
+        "NAVIGATOR_TLS_KEY",
+        "/etc/navigator-tls/client/tls.key",
     );
 }
 

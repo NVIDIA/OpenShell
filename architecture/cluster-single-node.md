@@ -82,12 +82,9 @@ sequenceDiagram
   B->>B: rewrite and store kubeconfig
   B->>R: clean_stale_nodes (kubectl delete node)
   B->>R: wait_for_cluster_ready (180 attempts, 2s apart)
-  B->>B: gateway_tls_enabled detection
-  opt gateway TLS enabled
-    B->>R: poll for secret navigator-cli-client (90 attempts, 2s apart)
-    R-->>B: ca.crt, tls.crt, tls.key
-    B->>B: atomically store mTLS bundle
-  end
+  B->>R: poll for secret navigator-cli-client (90 attempts, 2s apart)
+  R-->>B: ca.crt, tls.crt, tls.key
+  B->>B: atomically store mTLS bundle
   B->>B: create and persist cluster metadata JSON
   B->>B: save_active_cluster
   B-->>C: ClusterHandle (kubeconfig_path, metadata, docker client)
@@ -109,9 +106,7 @@ flowchart LR
     DOCKER[Docker daemon]
     K3S[navigator-cluster-NAME single k3s container]
     KAPI[Kubernetes API :6443]
-    G8080[Gateway :8080 -> :30051]
-    G80[HTTP :80]
-    G443[HTTPS :443]
+    G8080[Gateway :port -> :30051 mTLS default 8080]
     SBX[Sandbox runtime]
   end
 
@@ -121,8 +116,6 @@ flowchart LR
 
   NAV --> G8080
   MTLS -. client cert auth .-> G8080
-  NAV --> G80
-  NAV --> G443
 
   DOCKER --> K3S
   K3S --> KAPI
@@ -137,7 +130,7 @@ flowchart LR
 
 `deploy_cluster(DeployOptions)` in `crates/navigator-bootstrap/src/lib.rs` chooses execution mode:
 
-- `DeployOptions` fields: `name: String`, `image_ref: Option<String>`, `remote: Option<RemoteOptions>`.
+- `DeployOptions` fields: `name: String`, `image_ref: Option<String>`, `remote: Option<RemoteOptions>`, `port: u16` (default 8080).
 - `RemoteOptions` fields: `destination: String`, `ssh_key: Option<String>`.
 - **Local deploy**: Create one Docker client with `Docker::connect_with_local_defaults()`.
 - **Remote deploy**: Create SSH Docker client via `Docker::connect_with_ssh()` with a 600-second timeout (for large image transfers). The destination is prefixed with `ssh://` if not already present.
@@ -178,9 +171,7 @@ For the target daemon (local or remote):
      | Container Port | Host Port | Purpose |
      |---|---|---|
      | 6443/tcp | 6443 | Kubernetes API |
-     | 80/tcp | 80 | HTTP gateway |
-     | 443/tcp | 443 | HTTPS gateway |
-     | 30051/tcp | 8080 | Navigator service NodePort |
+     | 30051/tcp | configurable (default 8080) | Navigator service NodePort (mTLS) |
 
    - Container environment variables (see [Container Environment Variables](#container-environment-variables) below).
    - If the container exists with a different image ID (compared by inspecting the content-addressable ID), it is stopped, force-removed, and recreated. If the image matches, the existing container is reused.
@@ -202,15 +193,7 @@ After the container starts:
 
 ### 5) mTLS bundle capture
 
-TLS mode detection in `gateway_tls_enabled()`:
-
-1. Check env var `NAV_GATEWAY_TLS_ENABLED` (accepts `true`/`1`/`yes`/`false`/`0`/`no`).
-2. If not set, read HelmChart manifest from the container, checking paths in order:
-   - `/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml`
-   - `/opt/navigator/manifests/navigator-helmchart.yaml`
-3. Parse `spec.valuesContent` YAML and read `gateway.tls.enabled`.
-
-If gateway TLS is enabled, `fetch_and_store_cli_mtls()` polls for Kubernetes secret `navigator-cli-client` in namespace `navigator` (90 attempts, 2 seconds apart, 3 min total). Each attempt checks the container is still running. The secret's base64-encoded `ca.crt`, `tls.crt`, and `tls.key` fields are decoded and stored.
+TLS is always required. `fetch_and_store_cli_mtls()` polls for Kubernetes secret `navigator-cli-client` in namespace `navigator` (90 attempts, 2 seconds apart, 3 min total). Each attempt checks the container is still running. The secret's base64-encoded `ca.crt`, `tls.crt`, and `tls.key` fields are decoded and stored.
 
 Storage location: `~/.config/navigator/clusters/{name}/mtls/`
 
@@ -220,22 +203,23 @@ Write is atomic: write to `.tmp` directory, validate all three files are non-emp
 
 `create_cluster_metadata()` produces a `ClusterMetadata` struct:
 
-- **Local**: endpoint `https://127.0.0.1` by default, or `https://{docker_host}` when `DOCKER_HOST` is a non-loopback `tcp://` endpoint. `is_remote=false`.
-- **Remote**: endpoint `https://{resolved_host}`, `is_remote=true`, plus SSH destination and resolved host.
+- **Local**: endpoint `https://127.0.0.1:{port}` by default, or `https://{docker_host}:{port}` when `DOCKER_HOST` is a non-loopback `tcp://` endpoint. `is_remote=false`.
+- **Remote**: endpoint `https://{resolved_host}:{port}`, `is_remote=true`, plus SSH destination and resolved host.
 
 Metadata fields:
 
 | Field | Type | Description |
 |---|---|---|
 | `name` | `String` | Cluster name |
-| `gateway_endpoint` | `String` | HTTPS endpoint (no port) |
+| `gateway_endpoint` | `String` | HTTPS endpoint with port (e.g., `https://127.0.0.1:8080`) |
 | `is_remote` | `bool` | Whether cluster is remote |
+| `gateway_port` | `u16` | Host port mapped to the gateway NodePort |
 | `remote_host` | `Option<String>` | SSH destination (e.g., `user@host`) |
 | `resolved_host` | `Option<String>` | Resolved hostname/IP from `ssh -G` |
 
 Metadata location: `~/.config/navigator/clusters/{name}_metadata.json`
 
-Note: metadata is stored at the `clusters/` level (not nested inside `{name}/` like kubeconfig and mTLS). The `resolved_host` field is optional and backward-compatible via `serde(default)`.
+Note: metadata is stored at the `clusters/` level (not nested inside `{name}/` like kubeconfig and mTLS).
 
 After deploy, the CLI calls `save_active_cluster(name)`, writing the cluster name to `~/.config/navigator/active_cluster`. Subsequent commands that don't specify `--cluster` or `NAVIGATOR_CLUSTER` resolve to this active cluster.
 
@@ -341,9 +325,9 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 
 ### Gateway endpoint exposure
 
-- Local: `https://127.0.0.1` (or `https://{docker_host}` when `DOCKER_HOST` is a non-loopback TCP endpoint).
-- Remote: `https://<resolved-remote-host>`.
-- Host port 8080 maps to container port 30051 (Navigator service NodePort).
+- Local: `https://127.0.0.1:{port}` (or `https://{docker_host}:{port}` when `DOCKER_HOST` is a non-loopback TCP endpoint). Default port is 8080.
+- Remote: `https://<resolved-remote-host>:{port}`.
+- The host port (configurable via `--port`, default 8080) maps to container port 30051 (Navigator service NodePort).
 
 ## Lifecycle Operations
 
@@ -379,7 +363,7 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
   - Kubeconfig readiness timeout (60s) with recent container logs in the error message.
   - Health check timeout (6 min) with recent container logs.
   - Container exit during any polling phase (kubeconfig, health, mTLS) with diagnostic information (exit code, OOM status, recent logs).
-  - mTLS secret polling timeout (3 min) when TLS is enabled.
+   - mTLS secret polling timeout (3 min).
   - Local image ref without registry prefix: clear error with build instructions rather than a failed Docker Hub pull.
 
 ## Auto-Bootstrap from `sandbox create`
@@ -405,7 +389,7 @@ Variables set on the container by `ensure_container()` in `docker.rs`:
 | `REGISTRY_PASSWORD` | Registry auth password | When credentials available |
 | `EXTRA_SANS` | Comma-separated extra TLS SANs | When extra SANs computed |
 | `SSH_GATEWAY_HOST` | Resolved remote hostname/IP | Remote deploys only |
-| `SSH_GATEWAY_PORT` | `8080` | Remote deploys only |
+| `SSH_GATEWAY_PORT` | Configured host port (default `8080`) | Remote deploys only |
 | `IMAGE_TAG` | Image tag (e.g., `"dev"`) | When `IMAGE_TAG` env is set or push mode |
 | `IMAGE_PULL_POLICY` | `"IfNotPresent"` | Push mode only |
 | `PUSH_IMAGE_REFS` | Comma-separated image refs | Push mode only |

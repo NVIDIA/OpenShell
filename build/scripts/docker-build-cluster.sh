@@ -4,7 +4,7 @@
 # Environment:
 #   IMAGE_TAG                - Image tag (default: dev)
 #   K3S_VERSION              - k3s version (set by mise.toml [env])
-#   ENVOY_GATEWAY_VERSION    - Envoy Gateway chart version (set by mise.toml [env])
+
 #   DOCKER_PLATFORM          - Target platform (optional)
 #   DOCKER_BUILDER           - Buildx builder name (default: auto-select)
 set -euo pipefail
@@ -41,13 +41,6 @@ mkdir -p deploy/docker/.build/charts
 # Package navigator helm chart
 echo "Packaging navigator helm chart..."
 helm package deploy/helm/navigator -d deploy/docker/.build/charts/
-
-# Download envoy-gateway helm chart
-# This chart includes Gateway API CRDs, so we don't need a separate CRDs chart
-echo "Downloading gateway-helm chart..."
-helm pull oci://docker.io/envoyproxy/gateway-helm \
-  --version ${ENVOY_GATEWAY_VERSION} \
-  --destination deploy/docker/.build/charts/
 
 # Build cluster image (no bundled component images — they are pulled at runtime
 # from the distribution registry; credentials are injected at deploy time)

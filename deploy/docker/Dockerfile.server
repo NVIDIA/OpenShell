@@ -81,8 +81,8 @@ COPY crates/navigator-server/migrations /build/crates/navigator-server/migration
 USER navigator
 EXPOSE 8080
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8080/healthz || exit 1
+# Health checks are handled by Kubernetes liveness/readiness probes (tcpSocket).
+# No Docker HEALTHCHECK is needed since this image runs inside a k3s cluster.
 
 ENTRYPOINT ["navigator-server"]
 CMD ["--port", "8080"]

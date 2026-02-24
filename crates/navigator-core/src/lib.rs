@@ -10,5 +10,5 @@ pub mod error;
 pub mod inference;
 pub mod proto;
 
-pub use config::Config;
+pub use config::{Config, TlsConfig};
 pub use error::{Error, Result};

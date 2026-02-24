@@ -15,9 +15,8 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// TLS configuration.
-    #[serde(default)]
-    pub tls: Option<TlsConfig>,
+    /// TLS configuration (mTLS is always enforced).
+    pub tls: TlsConfig,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -58,9 +57,18 @@ pub struct Config {
     /// Allowed clock skew for SSH handshake validation, in seconds.
     #[serde(default = "default_ssh_handshake_skew_secs")]
     pub ssh_handshake_skew_secs: u64,
+
+    /// Kubernetes secret name containing client TLS materials for sandbox pods.
+    /// When set, sandbox pods get this secret mounted so they can connect to
+    /// the server over mTLS.
+    #[serde(default)]
+    pub client_tls_secret_name: String,
 }
 
 /// TLS configuration.
+///
+/// mTLS is always enforced — all clients must present a certificate signed
+/// by the given CA.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
@@ -68,14 +76,20 @@ pub struct TlsConfig {
 
     /// Path to the TLS private key file.
     pub key_path: PathBuf,
+
+    /// Path to the CA certificate file for client certificate verification (mTLS).
+    /// The server requires all clients to present a valid certificate signed by
+    /// this CA.
+    pub client_ca_path: PathBuf,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    /// Create a new config with the required TLS paths.
+    pub fn new(tls: TlsConfig) -> Self {
         Self {
             bind_address: default_bind_address(),
             log_level: default_log_level(),
-            tls: None,
+            tls,
             database_url: String::new(),
             sandbox_namespace: default_sandbox_namespace(),
             sandbox_image: String::new(),
@@ -86,43 +100,10 @@ impl Default for Config {
             sandbox_ssh_port: default_sandbox_ssh_port(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
+            client_tls_secret_name: String::new(),
         }
     }
-}
 
-fn default_bind_address() -> SocketAddr {
-    "0.0.0.0:8080".parse().expect("valid default address")
-}
-
-fn default_log_level() -> String {
-    "info".to_string()
-}
-
-fn default_sandbox_namespace() -> String {
-    "default".to_string()
-}
-
-fn default_ssh_gateway_host() -> String {
-    "127.0.0.1".to_string()
-}
-
-const fn default_ssh_gateway_port() -> u16 {
-    8080
-}
-
-fn default_ssh_connect_path() -> String {
-    "/connect/ssh".to_string()
-}
-
-const fn default_sandbox_ssh_port() -> u16 {
-    2222
-}
-
-const fn default_ssh_handshake_skew_secs() -> u64 {
-    300
-}
-
-impl Config {
     /// Create a new configuration with the given bind address.
     #[must_use]
     pub const fn with_bind_address(mut self, addr: SocketAddr) -> Self {
@@ -134,16 +115,6 @@ impl Config {
     #[must_use]
     pub fn with_log_level(mut self, level: impl Into<String>) -> Self {
         self.log_level = level.into();
-        self
-    }
-
-    /// Create a new configuration with TLS enabled.
-    #[must_use]
-    pub fn with_tls(mut self, cert_path: PathBuf, key_path: PathBuf) -> Self {
-        self.tls = Some(TlsConfig {
-            cert_path,
-            key_path,
-        });
         self
     }
 
@@ -216,4 +187,43 @@ impl Config {
         self.ssh_handshake_skew_secs = secs;
         self
     }
+
+    /// Set the Kubernetes secret name for sandbox client TLS materials.
+    #[must_use]
+    pub fn with_client_tls_secret_name(mut self, name: impl Into<String>) -> Self {
+        self.client_tls_secret_name = name.into();
+        self
+    }
+}
+
+fn default_bind_address() -> SocketAddr {
+    "0.0.0.0:8080".parse().expect("valid default address")
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_sandbox_namespace() -> String {
+    "default".to_string()
+}
+
+fn default_ssh_gateway_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+const fn default_ssh_gateway_port() -> u16 {
+    8080
+}
+
+fn default_ssh_connect_path() -> String {
+    "/connect/ssh".to_string()
+}
+
+const fn default_sandbox_ssh_port() -> u16 {
+    2222
+}
+
+const fn default_ssh_handshake_skew_secs() -> u64 {
+    300
 }

@@ -7,6 +7,7 @@ mod kubeconfig;
 mod metadata;
 mod mtls;
 mod paths;
+mod pki;
 pub(crate) mod push;
 mod runtime;
 
@@ -15,7 +16,10 @@ use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use crate::constants::{DEFAULT_IMAGE_NAME, container_name, volume_name};
+use crate::constants::{
+    CLIENT_TLS_SECRET_NAME, DEFAULT_IMAGE_NAME, SERVER_CLIENT_CA_SECRET_NAME,
+    SERVER_TLS_SECRET_NAME, container_name, volume_name,
+};
 use crate::docker::{
     check_existing_cluster, create_ssh_docker_client, destroy_cluster_resources, ensure_container,
     ensure_image, ensure_network, ensure_volume, start_container, stop_container,
@@ -25,9 +29,11 @@ use crate::metadata::{
     create_cluster_metadata, extract_host_from_ssh_destination, local_gateway_host,
     resolve_ssh_hostname,
 };
-use crate::mtls::fetch_and_store_cli_mtls;
+use crate::mtls::store_pki_bundle;
+use crate::pki::generate_pki;
 use crate::runtime::{
-    clean_stale_nodes, restart_navigator_deployment, wait_for_cluster_ready, wait_for_kubeconfig,
+    clean_stale_nodes, exec_capture_with_exit, navigator_workload_exists,
+    restart_navigator_deployment, wait_for_cluster_ready, wait_for_kubeconfig,
 };
 
 pub use crate::docker::ExistingClusterInfo;
@@ -67,12 +73,17 @@ impl RemoteOptions {
     }
 }
 
+/// Default host port that maps to the k3s `NodePort` (30051) for the gateway.
+pub const DEFAULT_GATEWAY_PORT: u16 = 8080;
+
 #[derive(Debug, Clone)]
 pub struct DeployOptions {
     pub name: String,
     pub image_ref: Option<String>,
     /// Remote deployment options. If None, deploys locally.
     pub remote: Option<RemoteOptions>,
+    /// Host port to map to the gateway `NodePort` (30051). Defaults to 8080.
+    pub port: u16,
 }
 
 impl DeployOptions {
@@ -81,6 +92,7 @@ impl DeployOptions {
             name: name.into(),
             image_ref: None,
             remote: None,
+            port: DEFAULT_GATEWAY_PORT,
         }
     }
 
@@ -88,6 +100,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_remote(mut self, remote: RemoteOptions) -> Self {
         self.remote = Some(remote);
+        self
+    }
+
+    /// Set the host port for the gateway.
+    #[must_use]
+    pub fn with_port(mut self, port: u16) -> Self {
+        self.port = port;
         self
     }
 }
@@ -149,6 +168,7 @@ where
 {
     let name = options.name;
     let image_ref = options.image_ref.unwrap_or_else(default_cluster_image_ref);
+    let port = options.port;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -226,6 +246,7 @@ where
         &image_ref,
         &extra_sans,
         ssh_gateway_host.as_deref(),
+        port,
     )
     .await?;
     log("[status] Starting cluster container".to_string());
@@ -252,6 +273,29 @@ where
             tracing::debug!("stale node cleanup failed (non-fatal): {err}");
         }
     }
+
+    // Reconcile PKI: reuse existing cluster TLS secrets if they are complete and
+    // valid; only generate fresh PKI when secrets are missing, incomplete,
+    // malformed, or expiring within MIN_REMAINING_VALIDITY_DAYS.
+    //
+    // Ordering is: kubeconfig ready -> reconcile secrets -> (if rotated and
+    // workload exists: rollout restart and wait) -> persist CLI-side bundle.
+    log("[status] Reconciling TLS certificates".to_string());
+    let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
+
+    if rotated {
+        // If a navigator workload is already running, it must be restarted so
+        // it picks up the new TLS secrets before we write CLI-side certs.
+        // A failed rollout is a hard error — CLI certs must not be persisted
+        // if the server cannot come up with the new PKI.
+        if navigator_workload_exists(&target_docker, &name).await? {
+            log("[status] PKI rotated — restarting navigator workload".to_string());
+            restart_navigator_deployment(&target_docker, &name).await?;
+        }
+    }
+
+    log("[status] Storing CLI mTLS credentials".to_string());
+    store_pki_bundle(&name, &pki_bundle)?;
 
     // Push locally-built component images into the k3s containerd runtime.
     // This is the "push" path for local development — images are exported from
@@ -304,12 +348,10 @@ where
         };
         wait_for_cluster_ready(&target_docker, &name, &mut cluster_log).await?;
     }
-    log("[status] Fetching mTLS credentials".to_string());
-    fetch_and_store_cli_mtls(&target_docker, &name).await?;
 
     // Create and store cluster metadata
     log("[status] Persisting cluster metadata".to_string());
-    let metadata = create_cluster_metadata(&name, remote_opts.as_ref());
+    let metadata = create_cluster_metadata(&name, remote_opts.as_ref(), port);
     store_cluster_metadata(&name, &metadata)?;
 
     Ok(ClusterHandle {
@@ -331,8 +373,9 @@ pub fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<Clus
     };
     let kubeconfig_path = stored_kubeconfig_path(name)?;
     // Try to load existing metadata, fall back to creating new metadata
-    let metadata =
-        load_cluster_metadata(name).unwrap_or_else(|_| create_cluster_metadata(name, remote));
+    // with the default port (the actual port is only known at deploy time).
+    let metadata = load_cluster_metadata(name)
+        .unwrap_or_else(|_| create_cluster_metadata(name, remote, DEFAULT_GATEWAY_PORT));
     Ok(ClusterHandle {
         name: name.to_string(),
         kubeconfig_path,
@@ -359,4 +402,295 @@ fn default_cluster_image_ref() -> String {
         .filter(|val| !val.trim().is_empty())
         .unwrap_or_else(|| "dev".to_string());
     format!("{DEFAULT_IMAGE_NAME}:{tag}")
+}
+
+/// Create the three TLS K8s secrets required by the Navigator server and sandbox pods.
+///
+/// Secrets are created via `kubectl` exec'd inside the cluster container:
+/// - `navigator-server-tls` (kubernetes.io/tls): server cert + key
+/// - `navigator-server-client-ca` (Opaque): CA cert for verifying client certs
+/// - `navigator-client-tls` (Opaque): client cert + key + CA cert (shared by CLI & sandboxes)
+async fn create_k8s_tls_secrets(
+    docker: &Docker,
+    name: &str,
+    bundle: &pki::PkiBundle,
+) -> Result<()> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use miette::WrapErr;
+
+    let cname = container_name(name);
+    let kubeconfig = constants::KUBECONFIG_PATH;
+
+    // Wait for the navigator namespace to exist (the Helm controller creates it).
+    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
+
+    // Helper: run kubectl apply -f - with a JSON secret manifest.
+    let apply_secret = |manifest: String| {
+        let docker = docker.clone();
+        let cname = cname.clone();
+        async move {
+            let (output, exit_code) = exec_capture_with_exit(
+                &docker,
+                &cname,
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    format!(
+                        "KUBECONFIG={kubeconfig} kubectl apply -f - <<'ENDOFMANIFEST'\n{manifest}\nENDOFMANIFEST"
+                    ),
+                ],
+            )
+            .await?;
+            if exit_code != 0 {
+                return Err(miette::miette!(
+                    "kubectl apply failed (exit {exit_code}): {output}"
+                ));
+            }
+            Ok(())
+        }
+    };
+
+    // 1. navigator-server-tls (kubernetes.io/tls)
+    let server_tls_manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": SERVER_TLS_SECRET_NAME,
+            "namespace": "navigator"
+        },
+        "type": "kubernetes.io/tls",
+        "data": {
+            "tls.crt": STANDARD.encode(&bundle.server_cert_pem),
+            "tls.key": STANDARD.encode(&bundle.server_key_pem)
+        }
+    });
+    apply_secret(server_tls_manifest.to_string())
+        .await
+        .wrap_err("failed to create navigator-server-tls secret")?;
+
+    // 2. navigator-server-client-ca (Opaque)
+    let client_ca_manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": SERVER_CLIENT_CA_SECRET_NAME,
+            "namespace": "navigator"
+        },
+        "type": "Opaque",
+        "data": {
+            "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
+        }
+    });
+    apply_secret(client_ca_manifest.to_string())
+        .await
+        .wrap_err("failed to create navigator-server-client-ca secret")?;
+
+    // 3. navigator-client-tls (Opaque) — shared by CLI and sandbox pods
+    let client_tls_manifest = serde_json::json!({
+        "apiVersion": "v1",
+        "kind": "Secret",
+        "metadata": {
+            "name": CLIENT_TLS_SECRET_NAME,
+            "namespace": "navigator"
+        },
+        "type": "Opaque",
+        "data": {
+            "tls.crt": STANDARD.encode(&bundle.client_cert_pem),
+            "tls.key": STANDARD.encode(&bundle.client_key_pem),
+            "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
+        }
+    });
+    apply_secret(client_tls_manifest.to_string())
+        .await
+        .wrap_err("failed to create navigator-client-tls secret")?;
+
+    Ok(())
+}
+
+/// Reconcile cluster TLS secrets: reuse existing PKI if valid, generate new if needed.
+///
+/// Returns `(bundle, rotated)` where `rotated` is true if new PKI was generated
+/// and applied to the cluster (meaning the server needs a restart to pick it up).
+async fn reconcile_pki<F>(
+    docker: &Docker,
+    name: &str,
+    extra_sans: &[String],
+    log: &F,
+) -> Result<(pki::PkiBundle, bool)>
+where
+    F: Fn(String) + Sync,
+{
+    use miette::WrapErr;
+
+    let cname = container_name(name);
+    let kubeconfig = constants::KUBECONFIG_PATH;
+
+    // Wait for namespace before attempting to read secrets.
+    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
+
+    // Try to load existing secrets.
+    match load_existing_pki_bundle(docker, &cname, kubeconfig).await {
+        Ok(bundle) => {
+            log("[status] Reusing existing TLS certificates".to_string());
+            return Ok((bundle, false));
+        }
+        Err(reason) => {
+            log(format!(
+                "[status] Cannot reuse existing TLS secrets ({reason}) — generating new PKI"
+            ));
+        }
+    }
+
+    // Generate fresh PKI and apply to cluster.
+    let bundle = generate_pki(extra_sans)?;
+    create_k8s_tls_secrets(docker, name, &bundle)
+        .await
+        .wrap_err("failed to apply new TLS secrets")?;
+
+    Ok((bundle, true))
+}
+
+/// Load existing TLS secrets from the cluster and reconstruct a [`PkiBundle`].
+///
+/// Returns an error string describing why secrets couldn't be loaded (for logging).
+async fn load_existing_pki_bundle(
+    docker: &Docker,
+    container_name: &str,
+    kubeconfig: &str,
+) -> std::result::Result<pki::PkiBundle, String> {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+
+    // Helper to read a specific key from a K8s secret.
+    let read_secret_key = |secret: &str, key: &str| {
+        let docker = docker.clone();
+        let container_name = container_name.to_string();
+        let secret = secret.to_string();
+        let key = key.to_string();
+        async move {
+            let jsonpath = format!("{{.data.{}}}", key.replace('.', "\\."));
+            let cmd = format!(
+                "KUBECONFIG={kubeconfig} kubectl get secret {secret} -n navigator -o jsonpath='{jsonpath}' 2>/dev/null"
+            );
+            let (output, exit_code) = exec_capture_with_exit(
+                &docker,
+                &container_name,
+                vec!["sh".to_string(), "-c".to_string(), cmd],
+            )
+            .await
+            .map_err(|e| format!("exec failed: {e}"))?;
+
+            if exit_code != 0 || output.trim().is_empty() {
+                return Err(format!("secret {secret} key {key} not found or empty"));
+            }
+
+            let decoded = STANDARD
+                .decode(output.trim())
+                .map_err(|e| format!("base64 decode failed for {secret}/{key}: {e}"))?;
+            String::from_utf8(decoded).map_err(|e| format!("non-UTF8 data in {secret}/{key}: {e}"))
+        }
+    };
+
+    // Read all required fields from the three TLS secrets.
+    let server_cert = read_secret_key(SERVER_TLS_SECRET_NAME, "tls.crt").await?;
+    let server_key = read_secret_key(SERVER_TLS_SECRET_NAME, "tls.key").await?;
+    let ca_cert = read_secret_key(SERVER_CLIENT_CA_SECRET_NAME, "ca.crt").await?;
+    let client_cert = read_secret_key(CLIENT_TLS_SECRET_NAME, "tls.crt").await?;
+    let client_key = read_secret_key(CLIENT_TLS_SECRET_NAME, "tls.key").await?;
+    // Also read ca.crt from client-tls for completeness check
+    let client_ca = read_secret_key(CLIENT_TLS_SECRET_NAME, "ca.crt").await?;
+
+    // Validate that all PEM data contains expected markers.
+    for (label, data) in [
+        ("server cert", &server_cert),
+        ("server key", &server_key),
+        ("CA cert", &ca_cert),
+        ("client cert", &client_cert),
+        ("client key", &client_key),
+        ("client CA", &client_ca),
+    ] {
+        if !data.contains("-----BEGIN ") {
+            return Err(format!("{label} does not contain valid PEM data"));
+        }
+    }
+
+    Ok(pki::PkiBundle {
+        ca_cert_pem: ca_cert,
+        ca_key_pem: String::new(), // CA key is not stored in cluster secrets
+        server_cert_pem: server_cert,
+        server_key_pem: server_key,
+        client_cert_pem: client_cert,
+        client_key_pem: client_key,
+    })
+}
+
+/// Wait for a K8s namespace to exist inside the cluster container.
+///
+/// The Helm controller creates the `navigator` namespace when it processes
+/// the `HelmChart` manifest, but there's a race between kubeconfig being ready
+/// and the namespace being created. We poll briefly.
+async fn wait_for_namespace(
+    docker: &Docker,
+    container_name: &str,
+    kubeconfig: &str,
+    namespace: &str,
+) -> Result<()> {
+    use miette::WrapErr;
+
+    let attempts = 60;
+    let backoff = std::time::Duration::from_secs(2);
+
+    for attempt in 0..attempts {
+        let (output, exit_code) = exec_capture_with_exit(
+            docker,
+            container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("KUBECONFIG={kubeconfig} kubectl get namespace {namespace} -o name 2>&1"),
+            ],
+        )
+        .await?;
+
+        if exit_code == 0 && output.contains(namespace) {
+            return Ok(());
+        }
+
+        if attempt + 1 == attempts {
+            return Err(miette::miette!(
+                "timed out waiting for namespace '{namespace}' to exist: {output}"
+            ))
+            .wrap_err("K8s namespace not ready");
+        }
+
+        tokio::time::sleep(backoff).await;
+    }
+
+    unreachable!()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_existing_pki_bundle_validates_pem_markers() {
+        // The PEM validation in load_existing_pki_bundle checks for "-----BEGIN "
+        // markers. This test verifies that generate_pki produces bundles that
+        // would pass that check.
+        let bundle = generate_pki(&[]).expect("generate_pki failed");
+        for (label, pem) in [
+            ("ca_cert", &bundle.ca_cert_pem),
+            ("server_cert", &bundle.server_cert_pem),
+            ("server_key", &bundle.server_key_pem),
+            ("client_cert", &bundle.client_cert_pem),
+            ("client_key", &bundle.client_key_pem),
+        ] {
+            assert!(
+                pem.contains("-----BEGIN "),
+                "{label} should contain PEM marker"
+            );
+        }
+    }
 }

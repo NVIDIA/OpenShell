@@ -36,7 +36,7 @@ When the sandbox runs inside a managed cluster, it fetches its typed protobuf po
 ```bash
 navigator-sandbox \
   --sandbox-id abc123 \
-  --navigator-endpoint http://navigator:8080 \
+  --navigator-endpoint https://navigator:8080 \
   -- /bin/bash
 ```
 

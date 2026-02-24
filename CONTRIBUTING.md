@@ -209,7 +209,6 @@ mise run cluster          # Build and deploy local k3s cluster with Navigator
 mise run cluster:deploy   # Fast deploy: rebuild changed components and skip unnecessary helm work
 mise run cluster:push:server    # Push local server image to configured pull registry
 mise run cluster:push:sandbox   # Push local sandbox image to configured pull registry
-mise run cluster:push:pki-job   # Push local pki-job image to configured pull registry
 mise run cluster:deploy:pull    # Force full pull-mode deploy flow
 mise run cluster:push           # Legacy image-import fallback workflow
 ```

@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
 use navigator_cli::run;
-use navigator_cli::tls::{TlsOptions, is_https};
+use navigator_cli::tls::TlsOptions;
 
 /// Resolved cluster context: name + gateway endpoint.
 struct ClusterContext {
@@ -96,15 +96,6 @@ struct Cli {
     /// Path to TLS client private key (PEM).
     #[arg(long, env = "NAVIGATOR_TLS_KEY", global = true)]
     tls_key: Option<PathBuf>,
-
-    /// Allow http:// endpoints even when TLS settings are provided.
-    #[arg(
-        long,
-        env = "NAVIGATOR_ALLOW_INSECURE_ACCESS",
-        default_value_t = false,
-        global = true
-    )]
-    allow_insecure_access: bool,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -307,6 +298,10 @@ enum ClusterAdminCommands {
         /// Path to SSH private key for remote deployment.
         #[arg(long)]
         ssh_key: Option<String>,
+
+        /// Host port to map to the gateway (default: 8080).
+        #[arg(long, default_value_t = navigator_bootstrap::DEFAULT_GATEWAY_PORT)]
+        port: u16,
     },
 
     /// Stop a cluster (preserves state).
@@ -626,11 +621,6 @@ async fn main() -> Result<()> {
             ClusterCommands::Status => {
                 let ctx = resolve_cluster(&cli.cluster)?;
                 let endpoint = &ctx.endpoint;
-                if !is_https(endpoint)? && !cli.allow_insecure_access {
-                    return Err(miette::miette!(
-                        "https is required; use --allow-insecure-access to connect over http"
-                    ));
-                }
                 let tls = tls.with_cluster_name(&ctx.name);
                 run::cluster_status(&ctx.name, endpoint, &tls).await?;
             }
@@ -647,6 +637,7 @@ async fn main() -> Result<()> {
                     get_kubeconfig,
                     remote,
                     ssh_key,
+                    port,
                 } => {
                     run::cluster_admin_deploy(
                         &name,
@@ -654,6 +645,7 @@ async fn main() -> Result<()> {
                         get_kubeconfig,
                         remote.as_deref(),
                         ssh_key.as_deref(),
+                        port,
                     )
                     .await?;
                 }
@@ -727,11 +719,6 @@ async fn main() -> Result<()> {
                     match resolve_cluster(&cli.cluster) {
                         Ok(ctx) => {
                             let endpoint = &ctx.endpoint;
-                            if !is_https(endpoint)? && !cli.allow_insecure_access {
-                                return Err(miette::miette!(
-                                    "https is required; use --allow-insecure-access to connect over http"
-                                ));
-                            }
                             let tls = tls.with_cluster_name(&ctx.name);
                             run::sandbox_create(
                                 endpoint,
@@ -841,11 +828,6 @@ async fn main() -> Result<()> {
                 other => {
                     let ctx = resolve_cluster(&cli.cluster)?;
                     let endpoint = &ctx.endpoint;
-                    if !is_https(endpoint)? && !cli.allow_insecure_access {
-                        return Err(miette::miette!(
-                            "https is required; use --allow-insecure-access to connect over http"
-                        ));
-                    }
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
                         SandboxCommands::Create { .. } | SandboxCommands::Image { .. } => {
@@ -912,11 +894,6 @@ async fn main() -> Result<()> {
         Some(Commands::Inference { command }) => {
             let ctx = resolve_cluster(&cli.cluster)?;
             let endpoint = &ctx.endpoint;
-            if !is_https(endpoint)? && !cli.allow_insecure_access {
-                return Err(miette::miette!(
-                    "https is required; use --allow-insecure-access to connect over http"
-                ));
-            }
             let tls = tls.with_cluster_name(&ctx.name);
 
             match command {
@@ -975,11 +952,6 @@ async fn main() -> Result<()> {
         Some(Commands::Provider { command }) => {
             let ctx = resolve_cluster(&cli.cluster)?;
             let endpoint = &ctx.endpoint;
-            if !is_https(endpoint)? && !cli.allow_insecure_access {
-                return Err(miette::miette!(
-                    "https is required; use --allow-insecure-access to connect over http"
-                ));
-            }
             let tls = tls.with_cluster_name(&ctx.name);
 
             match command {

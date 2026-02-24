@@ -50,26 +50,18 @@ server:
   dbUrl: "sqlite:/var/navigator/navigator.db"
   sandboxImage: "d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest"
   # gRPC endpoint for sandboxes to callback to Navigator (must be reachable from pods)
-  grpcEndpoint: "http://navigator.navigator.svc.cluster.local:8080"
+  grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
   # For local clusters the default 127.0.0.1:8080 is correct; for remote
   # clusters these should be set to the externally reachable host and port.
   sshGatewayHost: ""
   sshGatewayPort: 0
-
-gateway:
-  enabled: true
-  name: navigator-gateway
-  className: envoy-gateway
-  createGatewayClass: true
-  listenerPort: 8080
+  # TLS configuration for the server. The server always terminates mTLS
+  # directly and requires client certificates.
   tls:
-    enabled: false
-    secretName: navigator-gateway-tls
-    clientCaSecretName: navigator-gateway-client-ca
-    cliSecretName: navigator-cli-client
-    listenerPort: 443
-    jobImage: d1i0nduu2f6qxk.cloudfront.net/navigator/pki-job:latest
-    # Additional Subject Alternative Names for the gateway TLS certificate.
-    # Entries that look like IP addresses are added as IP SANs; others as DNS SANs.
-    extraSANs: []
+    # K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server
+    certSecretName: navigator-server-tls
+    # K8s secret with ca.crt for client certificate verification
+    clientCaSecretName: navigator-server-client-ca
+    # K8s secret mounted into sandbox pods for mTLS to the server
+    clientTlsSecretName: navigator-client-tls

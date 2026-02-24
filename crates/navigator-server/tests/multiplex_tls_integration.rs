@@ -20,7 +20,7 @@ use navigator_core::proto::{
     navigator_server::{Navigator, NavigatorServer},
 };
 use navigator_server::{MultiplexedService, TlsAcceptor, health_router};
-use rcgen::{CertifiedKey, generate_simple_self_signed};
+use rcgen::{CertificateParams, IsCa, KeyPair};
 use rustls::RootCertStore;
 use rustls::pki_types::CertificateDer;
 use rustls_pemfile::certs;
@@ -174,86 +174,87 @@ impl Navigator for TestNavigator {
     }
 }
 
-fn write_cert_pair() -> (tempfile::TempDir, Vec<u8>) {
-    let CertifiedKey { cert, key_pair } =
-        generate_simple_self_signed(vec!["localhost".to_string()])
-            .expect("failed to generate cert");
-    let cert_pem = cert.pem();
-    let key_pem = key_pair.serialize_pem();
+/// PKI bundle: CA cert, server cert+key, client cert+key.
+#[allow(dead_code, clippy::struct_field_names)]
+struct PkiBundle {
+    ca_cert_pem: Vec<u8>,
+    server_cert_pem: Vec<u8>,
+    server_key_pem: Vec<u8>,
+    client_cert_pem: Vec<u8>,
+    client_key_pem: Vec<u8>,
+}
+
+/// Generate a full PKI: CA -> server cert (for localhost) + client cert.
+fn generate_pki() -> (tempfile::TempDir, PkiBundle) {
+    // Generate CA
+    let mut ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create CA params");
+    ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test-ca");
+    let ca_key = KeyPair::generate().expect("failed to generate CA key");
+    let ca_cert = ca_params
+        .self_signed(&ca_key)
+        .expect("failed to sign CA cert");
+
+    // Generate server cert signed by CA
+    let server_params = CertificateParams::new(vec!["localhost".to_string()])
+        .expect("failed to create server params");
+    let server_key = KeyPair::generate().expect("failed to generate server key");
+    let server_cert = server_params
+        .signed_by(&server_key, &ca_cert, &ca_key)
+        .expect("failed to sign server cert");
+
+    // Generate client cert signed by CA
+    let mut client_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create client params");
+    client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "test-client");
+    let client_key = KeyPair::generate().expect("failed to generate client key");
+    let client_cert = client_params
+        .signed_by(&client_key, &ca_cert, &ca_key)
+        .expect("failed to sign client cert");
 
     let dir = tempdir().expect("failed to create tempdir");
-    let cert_path = dir.path().join("cert.pem");
-    let key_path = dir.path().join("key.pem");
+    let write = |name: &str, data: &[u8]| {
+        let path = dir.path().join(name);
+        std::fs::File::create(&path)
+            .and_then(|mut f| f.write_all(data))
+            .expect("failed to write file");
+    };
 
-    std::fs::File::create(&cert_path)
-        .and_then(|mut f| f.write_all(cert_pem.as_bytes()))
-        .expect("failed to write cert");
-    std::fs::File::create(&key_path)
-        .and_then(|mut f| f.write_all(key_pem.as_bytes()))
-        .expect("failed to write key");
+    write("ca.pem", ca_cert.pem().as_bytes());
+    write("server-cert.pem", server_cert.pem().as_bytes());
+    write("server-key.pem", server_key.serialize_pem().as_bytes());
+    write("client-cert.pem", client_cert.pem().as_bytes());
+    write("client-key.pem", client_key.serialize_pem().as_bytes());
 
-    (dir, cert_pem.into_bytes())
+    let bundle = PkiBundle {
+        ca_cert_pem: ca_cert.pem().into_bytes(),
+        server_cert_pem: server_cert.pem().into_bytes(),
+        server_key_pem: server_key.serialize_pem().into_bytes(),
+        client_cert_pem: client_cert.pem().into_bytes(),
+        client_key_pem: client_key.serialize_pem().into_bytes(),
+    };
+
+    (dir, bundle)
 }
 
-fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
-    let mut roots = RootCertStore::empty();
-    let mut cursor = std::io::Cursor::new(cert_pem);
-    let parsed = certs(&mut cursor)
-        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
-        .expect("failed to parse cert pem");
-    for cert in parsed {
-        roots.add(cert).expect("failed to add cert");
-    }
-    roots
-}
-
-async fn grpc_client(addr: std::net::SocketAddr, cert_pem: Vec<u8>) -> NavigatorClient<Channel> {
-    let ca_cert = tonic::transport::Certificate::from_pem(cert_pem);
-    let tls = ClientTlsConfig::new()
-        .ca_certificate(ca_cert)
-        .domain_name("localhost");
-    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
-        .expect("invalid endpoint")
-        .tls_config(tls)
-        .expect("failed to set tls");
-    let channel = endpoint.connect().await.expect("failed to connect");
-    NavigatorClient::new(channel)
-}
-
-fn https_client(
-    cert_pem: &[u8],
-) -> Client<
-    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
-    Empty<Bytes>,
-> {
-    let roots = build_tls_root(cert_pem);
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(roots)
-        .with_no_client_auth();
-    let https = HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_only()
-        .enable_http1()
-        .build();
-    Client::builder(TokioExecutor::new()).build(https)
-}
-
-#[tokio::test]
-async fn serves_grpc_and_http_over_tls_on_same_port() {
-    install_rustls_provider();
+/// Start a test server with the given TLS acceptor, returning its address and
+/// a handle that aborts the server on drop.
+async fn start_test_server(
+    tls_acceptor: TlsAcceptor,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-
-    let (temp, cert_pem) = write_cert_pair();
-    let cert_path = temp.path().join("cert.pem");
-    let key_path = temp.path().join("key.pem");
-    let tls_acceptor = TlsAcceptor::from_files(&cert_path, &key_path).unwrap();
 
     let grpc_service = NavigatorServer::new(TestNavigator);
     let http_service = health_router();
     let service = MultiplexedService::new(grpc_service, http_service);
 
-    let server = tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         loop {
             let Ok((stream, _)) = listener.accept().await else {
                 continue;
@@ -271,11 +272,103 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
         }
     });
 
-    let mut grpc = grpc_client(addr, cert_pem.clone()).await;
+    (addr, handle)
+}
+
+/// Build a gRPC client with mTLS (CA + client cert).
+async fn grpc_client_mtls(
+    addr: std::net::SocketAddr,
+    ca_pem: Vec<u8>,
+    client_cert_pem: Vec<u8>,
+    client_key_pem: Vec<u8>,
+) -> NavigatorClient<Channel> {
+    let ca_cert = tonic::transport::Certificate::from_pem(ca_pem);
+    let identity = tonic::transport::Identity::from_pem(client_cert_pem, client_key_pem);
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca_cert)
+        .identity(identity)
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+        .expect("invalid endpoint")
+        .tls_config(tls)
+        .expect("failed to set tls");
+    let channel = endpoint.connect().await.expect("failed to connect");
+    NavigatorClient::new(channel)
+}
+
+fn build_tls_root(cert_pem: &[u8]) -> RootCertStore {
+    let mut roots = RootCertStore::empty();
+    let mut cursor = std::io::Cursor::new(cert_pem);
+    let parsed = certs(&mut cursor)
+        .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+        .expect("failed to parse cert pem");
+    for cert in parsed {
+        roots.add(cert).expect("failed to add cert");
+    }
+    roots
+}
+
+/// Build an HTTPS client with mTLS (CA trust + client cert/key).
+fn https_client_mtls(
+    pki: &PkiBundle,
+) -> Client<
+    hyper_rustls::HttpsConnector<hyper_util::client::legacy::connect::HttpConnector>,
+    Empty<Bytes>,
+> {
+    let roots = build_tls_root(&pki.ca_cert_pem);
+
+    let client_certs = {
+        let mut cursor = std::io::Cursor::new(&pki.client_cert_pem);
+        certs(&mut cursor)
+            .collect::<Result<Vec<CertificateDer<'static>>, _>>()
+            .expect("failed to parse client cert pem")
+    };
+    let client_key = {
+        let mut cursor = std::io::Cursor::new(&pki.client_key_pem);
+        rustls_pemfile::private_key(&mut cursor)
+            .expect("failed to parse client key pem")
+            .expect("no private key found")
+    };
+
+    let tls_config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(client_certs, client_key)
+        .expect("failed to build client TLS config with client cert");
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_only()
+        .enable_http1()
+        .build();
+    Client::builder(TokioExecutor::new()).build(https)
+}
+
+#[tokio::test]
+async fn serves_grpc_and_http_over_tls_on_same_port() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        &temp.path().join("ca.pem"),
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
+    // gRPC with mTLS
+    let mut grpc = grpc_client_mtls(
+        addr,
+        pki.ca_cert_pem.clone(),
+        pki.client_cert_pem.clone(),
+        pki.client_key_pem.clone(),
+    )
+    .await;
     let response = grpc.health(HealthRequest {}).await.unwrap();
     assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
 
-    let client = https_client(&cert_pem);
+    // HTTP with mTLS
+    let client = https_client_mtls(&pki);
     let req = Request::builder()
         .method("GET")
         .uri(format!("https://localhost:{}/healthz", addr.port()))
@@ -283,6 +376,136 @@ async fn serves_grpc_and_http_over_tls_on_same_port() {
         .unwrap();
     let resp = client.request(req).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mtls_valid_client_cert_accepted() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        &temp.path().join("ca.pem"),
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
+    let mut grpc = grpc_client_mtls(
+        addr,
+        pki.ca_cert_pem.clone(),
+        pki.client_cert_pem.clone(),
+        pki.client_key_pem.clone(),
+    )
+    .await;
+    let response = grpc.health(HealthRequest {}).await.unwrap();
+    assert_eq!(response.get_ref().status, ServiceStatus::Healthy as i32);
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mtls_no_client_cert_rejected() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        &temp.path().join("ca.pem"),
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
+    // Connect with CA trust but no client cert -- should be rejected.
+    let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca_cert)
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+        .expect("invalid endpoint")
+        .tls_config(tls)
+        .expect("failed to set tls");
+
+    let result = endpoint.connect().await;
+    // Connection should fail at the TLS handshake level or shortly after.
+    // The exact error depends on timing -- it may fail on connect or on first RPC.
+    if let Ok(channel) = result {
+        let mut client = NavigatorClient::new(channel);
+        let rpc_result = client.health(HealthRequest {}).await;
+        assert!(
+            rpc_result.is_err(),
+            "expected RPC to fail without client cert"
+        );
+    }
+
+    server.abort();
+}
+
+#[tokio::test]
+async fn mtls_wrong_ca_client_cert_rejected() {
+    install_rustls_provider();
+    let (temp, pki) = generate_pki();
+
+    let tls_acceptor = TlsAcceptor::from_files(
+        &temp.path().join("server-cert.pem"),
+        &temp.path().join("server-key.pem"),
+        &temp.path().join("ca.pem"),
+    )
+    .unwrap();
+
+    let (addr, server) = start_test_server(tls_acceptor).await;
+
+    // Generate a rogue CA + client cert not signed by the server's CA.
+    let mut rogue_ca_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue CA params");
+    rogue_ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    rogue_ca_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-ca");
+    let rogue_ca_key = KeyPair::generate().expect("failed to generate rogue CA key");
+    let rogue_ca_cert = rogue_ca_params
+        .self_signed(&rogue_ca_key)
+        .expect("failed to sign rogue CA cert");
+
+    let mut rogue_client_params =
+        CertificateParams::new(Vec::<String>::new()).expect("failed to create rogue client params");
+    rogue_client_params
+        .distinguished_name
+        .push(rcgen::DnType::CommonName, "rogue-client");
+    let rogue_client_key = KeyPair::generate().expect("failed to generate rogue client key");
+    let rogue_client_cert = rogue_client_params
+        .signed_by(&rogue_client_key, &rogue_ca_cert, &rogue_ca_key)
+        .expect("failed to sign rogue client cert");
+
+    // Connect with rogue client cert -- server should reject it.
+    let ca_cert = tonic::transport::Certificate::from_pem(pki.ca_cert_pem.clone());
+    let identity = tonic::transport::Identity::from_pem(
+        rogue_client_cert.pem(),
+        rogue_client_key.serialize_pem(),
+    );
+    let tls = ClientTlsConfig::new()
+        .ca_certificate(ca_cert)
+        .identity(identity)
+        .domain_name("localhost");
+    let endpoint = Endpoint::from_shared(format!("https://localhost:{}", addr.port()))
+        .expect("invalid endpoint")
+        .tls_config(tls)
+        .expect("failed to set tls");
+
+    let result = endpoint.connect().await;
+    if let Ok(channel) = result {
+        let mut client = NavigatorClient::new(channel);
+        let rpc_result = client.health(HealthRequest {}).await;
+        assert!(
+            rpc_result.is_err(),
+            "expected RPC to fail with rogue client cert"
+        );
+    }
 
     server.abort();
 }

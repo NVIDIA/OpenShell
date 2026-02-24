@@ -35,7 +35,6 @@ NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared
 
 # Shared build constants (overridable via environment)
 K3S_VERSION = "{{env.K3S_VERSION | default(value='v1.29.8-k3s1')}}"
-ENVOY_GATEWAY_VERSION = "{{env.ENVOY_GATEWAY_VERSION | default(value='v1.5.8')}}"
 DOCKER_BUILDKIT = "1"
 
 [vars]

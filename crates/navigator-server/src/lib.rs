@@ -4,7 +4,7 @@
 //! - gRPC service implementation
 //! - HTTP health endpoints
 //! - Protocol multiplexing (gRPC + HTTP on same port)
-//! - Optional TLS support
+//! - mTLS support
 
 mod grpc;
 mod http;
@@ -108,6 +108,7 @@ pub async fn run_server(
         format!("0.0.0.0:{}", config.sandbox_ssh_port),
         config.ssh_handshake_secret.clone(),
         config.ssh_handshake_skew_secs,
+        config.client_tls_secret_name.clone(),
     )
     .await
     .map_err(|e| Error::execution(format!("failed to create kubernetes client: {e}")))?;
@@ -143,11 +144,11 @@ pub async fn run_server(
 
     info!(address = %config.bind_address, "Server listening");
 
-    let tls_acceptor = if let Some(tls) = &config.tls {
-        Some(TlsAcceptor::from_files(&tls.cert_path, &tls.key_path)?)
-    } else {
-        None
-    };
+    let tls_acceptor = TlsAcceptor::from_files(
+        &config.tls.cert_path,
+        &config.tls.key_path,
+        &config.tls.client_ca_path,
+    )?;
 
     // Accept connections
     loop {
@@ -163,19 +164,15 @@ pub async fn run_server(
         let tls_acceptor = tls_acceptor.clone();
 
         tokio::spawn(async move {
-            if let Some(tls) = tls_acceptor {
-                match tls.inner().accept(stream).await {
-                    Ok(tls_stream) => {
-                        if let Err(e) = service.serve(tls_stream).await {
-                            error!(error = %e, client = %addr, "Connection error");
-                        }
-                    }
-                    Err(e) => {
-                        error!(error = %e, client = %addr, "TLS handshake failed");
+            match tls_acceptor.inner().accept(stream).await {
+                Ok(tls_stream) => {
+                    if let Err(e) = service.serve(tls_stream).await {
+                        error!(error = %e, client = %addr, "Connection error");
                     }
                 }
-            } else if let Err(e) = service.serve(stream).await {
-                error!(error = %e, client = %addr, "Connection error");
+                Err(e) => {
+                    error!(error = %e, client = %addr, "TLS handshake failed");
+                }
             }
         });
     }

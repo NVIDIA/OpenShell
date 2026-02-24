@@ -579,25 +579,14 @@ pub fn cluster_list() -> Result<()> {
 async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {
     let base = server.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
-    if uri.scheme_str() == Some("https") {
-        let materials = require_tls_materials(server, tls)?;
-        let tls_config = build_rustls_config(&materials)?;
-        let https = HttpsConnectorBuilder::new()
-            .with_tls_config(tls_config)
-            .https_only()
-            .enable_http1()
-            .build();
-        let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-        let req = Request::builder()
-            .method("GET")
-            .uri(uri)
-            .body(Full::new(Bytes::new()))
-            .into_diagnostic()?;
-        let resp = client.request(req).await.into_diagnostic()?;
-        return Ok(Some(resp.status()));
-    }
-
-    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build_http();
+    let materials = require_tls_materials(server, tls)?;
+    let tls_config = build_rustls_config(&materials)?;
+    let https = HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_only()
+        .enable_http1()
+        .build();
+    let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
     let req = Request::builder()
         .method("GET")
         .uri(uri)
@@ -722,10 +711,11 @@ pub async fn cluster_admin_deploy(
     get_kubeconfig: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
+    port: u16,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
-    let mut options = DeployOptions::new(name);
+    let mut options = DeployOptions::new(name).with_port(port);
     if let Some(dest) = remote {
         let mut remote_opts = RemoteOptions::new(dest);
         if let Some(key) = ssh_key {

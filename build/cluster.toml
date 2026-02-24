@@ -6,7 +6,6 @@ depends = [
   "docker:build:cluster",
   "docker:build:server",
   "docker:build:sandbox",
-  "docker:build:pki-job",
 ]
 run = "build/scripts/cluster-bootstrap.sh"
 
@@ -26,6 +25,4 @@ run = "build/scripts/cluster-push-component.sh server"
 description = "Tag and push sandbox image to pull registry"
 run = "build/scripts/cluster-push-component.sh sandbox"
 
-["cluster:push:pki-job"]
-description = "Tag and push pki-job image to pull registry"
-run = "build/scripts/cluster-push-component.sh pki-job"
+

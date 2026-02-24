@@ -1,9 +1,0 @@
-apiVersion: helm.cattle.io/v1
-kind: HelmChart
-metadata:
-  name: envoy-gateway
-  namespace: kube-system
-spec:
-  chart: https://%{KUBERNETES_API}%/static/charts/gateway-helm-v1.5.8.tgz
-  targetNamespace: envoy-gateway-system
-  createNamespace: true

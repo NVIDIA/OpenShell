@@ -179,6 +179,7 @@ pub async fn ensure_container(
     image_ref: &str,
     extra_sans: &[String],
     ssh_gateway_host: Option<&str>,
+    gateway_port: u16,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -245,32 +246,13 @@ pub async fn ensure_container(
         }]),
     );
     port_bindings.insert(
-        "80/tcp".to_string(),
-        Some(vec![PortBinding {
-            host_ip: Some("0.0.0.0".to_string()),
-            host_port: Some("80".to_string()),
-        }]),
-    );
-    port_bindings.insert(
         "30051/tcp".to_string(),
         Some(vec![PortBinding {
             host_ip: Some("0.0.0.0".to_string()),
-            host_port: Some("8080".to_string()),
+            host_port: Some(gateway_port.to_string()),
         }]),
     );
-    port_bindings.insert(
-        "443/tcp".to_string(),
-        Some(vec![PortBinding {
-            host_ip: Some("0.0.0.0".to_string()),
-            host_port: Some("443".to_string()),
-        }]),
-    );
-    let exposed_ports = vec![
-        "6443/tcp".to_string(),
-        "80/tcp".to_string(),
-        "30051/tcp".to_string(),
-        "443/tcp".to_string(),
-    ];
+    let exposed_ports = vec!["6443/tcp".to_string(), "30051/tcp".to_string()];
 
     let host_config = HostConfig {
         privileged: Some(true),
@@ -339,9 +321,9 @@ pub async fn ensure_container(
     }
     if let Some(host) = ssh_gateway_host {
         env_vars.push(format!("SSH_GATEWAY_HOST={host}"));
-        // The NodePort is mapped to host:8080, so the SSH gateway port for
-        // remote clusters is also 8080.
-        env_vars.push("SSH_GATEWAY_PORT=8080".to_string());
+        // The NodePort is mapped to the configured host port, so the SSH
+        // gateway port for remote clusters must match.
+        env_vars.push(format!("SSH_GATEWAY_PORT={gateway_port}"));
     }
 
     // Pass image configuration for local development.

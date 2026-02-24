@@ -27,9 +27,8 @@ spec:
       sandboxImage: d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
-    gateway:
+      grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
       tls:
-        enabled: true
-        listenerPort: 443
-        jobImage: d1i0nduu2f6qxk.cloudfront.net/navigator/pki-job:latest
-        extraSANs: []
+        certSecretName: navigator-server-tls
+        clientCaSecretName: navigator-server-client-ca
+        clientTlsSecretName: navigator-client-tls
