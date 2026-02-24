@@ -705,11 +705,16 @@ Implements `L7Provider` for HTTP/1.1:
 
 **File:** `crates/navigator-sandbox/src/identity.rs`
 
-`BinaryIdentityCache` wraps a `Mutex<HashMap<PathBuf, String>>` (hex-encoded SHA256 hashes).
+`BinaryIdentityCache` wraps a `Mutex<HashMap<PathBuf, CachedBinary>>`, where
+each cached entry stores:
+
+- Hex-encoded SHA256 hash
+- File fingerprint (`len`, `mtime`, `ctime`, and on Unix `dev` + `inode`)
 
 `verify_or_cache(path)`:
-- **First call for a path**: Compute SHA256 via `procfs::file_sha256()`, store as the "golden" hash, return the hash.
-- **Subsequent calls**: Compute SHA256, compare with cached value. Return `Ok(hash)` on match; return `Err` on mismatch (binary tampered/replaced mid-sandbox).
+- **First call for a path**: Compute SHA256 via `procfs::file_sha256()`, store as the "golden" hash plus fingerprint, return the hash.
+- **Subsequent calls, unchanged fingerprint**: Return cached hash without re-hashing the file.
+- **Subsequent calls, changed fingerprint**: Recompute SHA256 and compare with cached value. Return `Ok(hash)` on match; return `Err` on mismatch (binary tampered/replaced mid-sandbox).
 
 The TOFU model means:
 - No hashes are specified in policy data -- the first observed binary is trusted
