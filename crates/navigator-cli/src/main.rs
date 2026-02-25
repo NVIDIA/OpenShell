@@ -515,7 +515,7 @@ enum SandboxImageCommands {
         #[arg(long)]
         dockerfile: PathBuf,
 
-        /// Image name and tag (default: navigator-sandbox-custom:<timestamp>).
+        /// Image name and tag (default: navigator/sandbox-custom:<timestamp>).
         #[arg(long)]
         tag: Option<String>,
 

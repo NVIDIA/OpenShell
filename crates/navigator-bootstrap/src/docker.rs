@@ -1,8 +1,11 @@
 use crate::RemoteOptions;
 use crate::constants::{NETWORK_NAME, container_name, volume_name};
-use crate::image::{pull_registry, pull_registry_password, pull_registry_username};
+use crate::image::{
+    parse_image_ref, pull_registry, pull_registry_password, pull_registry_username,
+};
 use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
+use bollard::auth::DockerCredentials;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, HostConfig, NetworkCreateRequest, PortBinding, VolumeCreateRequest,
@@ -162,11 +165,26 @@ pub async fn ensure_image(docker: &Docker, image_ref: &str) -> Result<()> {
         ));
     }
 
+    let (repo, tag) = parse_image_ref(image_ref);
     let options = CreateImageOptions {
-        from_image: Some(image_ref.to_string()),
+        from_image: Some(repo.clone()),
+        tag: if tag.is_empty() { None } else { Some(tag) },
         ..Default::default()
     };
-    let mut stream = docker.create_image(Some(options), None, None);
+
+    let registry = pull_registry();
+    let credentials = if repo.starts_with(&(registry.clone() + "/")) {
+        Some(DockerCredentials {
+            username: Some(pull_registry_username()),
+            password: Some(pull_registry_password()),
+            serveraddress: Some(registry),
+            ..Default::default()
+        })
+    } else {
+        None
+    };
+
+    let mut stream = docker.create_image(Some(options), None, credentials);
     while let Some(result) = stream.next().await {
         result.into_diagnostic()?;
     }

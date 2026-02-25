@@ -19,7 +19,7 @@ run = "build/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PR
 ["docker:build:sandbox:nvidia"]
 description = "Build the NVIDIA GPU sandbox Docker image"
 depends = ["docker:build:sandbox"]
-run = "build/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=navigator-sandbox:${IMAGE_TAG:-dev}"
+run = "build/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=navigator/sandbox:${IMAGE_TAG:-dev}"
 
 ["docker:build:server"]
 description = "Build the server Docker image"

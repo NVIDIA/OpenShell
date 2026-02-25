@@ -33,8 +33,11 @@ Project uses Rust 1.88+ and Python 3.12+. Docker must be running for cluster and
 # Trust the project config (one-time)
 mise trust
 
-# Build and deploy a local development cluster
+# Fast local cluster recreate (reuses prebuilt images)
 mise run cluster
+
+# Build images and deploy (recommended for CI/first setup)
+mise run cluster:build
 
 # Create a sandbox with Claude (or opencode / codex)
 nav sandbox create -- claude
@@ -207,15 +210,34 @@ mise generate git-pre-commit --write --task=pre-commit
 The project uses the Navigator CLI to provision a local k3s-in-container cluster. Docker is the only external dependency for cluster bootstrap.
 
 ```bash
-mise run cluster          # Build and deploy local k3s cluster with Navigator
+mise run cluster          # Recreate local cluster quickly using prebuilt images
+mise run cluster:build    # Build component images, then deploy cluster (CI-friendly)
 mise run cluster:deploy   # Fast deploy: rebuild changed components and skip unnecessary helm work
+mise run cluster:deploy:sandbox # Fast deploy sandbox-only changes
 mise run cluster:push:server    # Push local server image to configured pull registry
 mise run cluster:push:sandbox   # Push local sandbox image to configured pull registry
 mise run cluster:deploy:pull    # Force full pull-mode deploy flow
 mise run cluster:push           # Legacy image-import fallback workflow
 ```
 
+`mise run cluster` uses local `.env` values when present and appends missing keys:
+`CLUSTER_NAME`, `GATEWAY_PORT`, and `NAVIGATOR_CLUSTER`.
+If `GATEWAY_PORT` is missing, it picks a free local port and persists it to `.env`.
+Existing `.env` values are not overwritten.
+Fast `mise run cluster` flow:
+1. Recreate cluster.
+2. Ensure local registry (`127.0.0.1:5000`) is running in pull-through-cache mode.
+3. Deploy with local image refs (`127.0.0.1:5000/navigator/*`, tag `latest` unless `IMAGE_TAG` is set) while k3s pulls through `host.docker.internal:5000`.
+4. Use `mise run cluster:deploy` (or `cluster:deploy:sandbox`) to push local changes to that registry and redeploy only relevant components.
+
+This keeps iterative local push workflows working while still caching remote pulls.
+`mise run cluster:build` keeps the local build-and-push flow for development/CI.
+Cluster bootstrap pulls the cluster image from the published remote registry by default.
+Set `NAVIGATOR_CLUSTER_IMAGE` to override the image reference explicitly.
+
 Default local cluster workflow uses pull mode with a local Docker registry at `127.0.0.1:5000`.
+Local clusters also bind host port `6443` for the Kubernetes API, so only one
+local Navigator cluster can run at a time on a given Docker host.
 You can override repository settings with:
 
 - `IMAGE_REPO_BASE` (for example `127.0.0.1:5000/navigator`)

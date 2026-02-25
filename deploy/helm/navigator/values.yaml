@@ -35,6 +35,22 @@ service:
   port: 8080
   nodePort: 30051
 
+# Pod restart behavior and health probe tuning.
+podLifecycle:
+  terminationGracePeriodSeconds: 5
+
+probes:
+  liveness:
+    initialDelaySeconds: 2
+    periodSeconds: 5
+    timeoutSeconds: 1
+    failureThreshold: 3
+  readiness:
+    initialDelaySeconds: 1
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 3
+
 resources: {}
 
 nodeSelector: {}

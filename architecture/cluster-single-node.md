@@ -45,7 +45,7 @@ All cluster lifecycle commands live under `nav cluster admin`:
 |---|---|
 | `nav cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
 | `nav cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `nav cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, volume, kubeconfig, metadata, and network |
+| `nav cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
 | `nav cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
 | `nav cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
 | `nav cluster status` | Show gateway health via gRPC/HTTP |
@@ -53,6 +53,19 @@ All cluster lifecycle commands live under `nav cluster admin`:
 | `nav cluster list` | List all clusters with metadata |
 
 The `--name` flag defaults to `"navigator"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--cluster` flag, then `NAVIGATOR_CLUSTER` env, then `~/.config/navigator/active_cluster` file.
+
+## Local Task Flows (`mise`)
+
+Development task entrypoints split bootstrap behavior:
+
+| Task | Behavior |
+|---|---|
+| `mise run cluster` | Fast recreate path: destroys existing local cluster resources for `CLUSTER_NAME` (if present), removes conflicting local Navigator clusters that occupy host port `6443`, pushes prebuilt local component images to the local registry, and deploys using local-registry image refs (`127.0.0.1:5000/navigator/*`) |
+| `mise run cluster:build` | Full build path: builds cluster/server/sandbox images, pushes components, then deploys (preferred in CI) |
+| `mise run cluster:deploy` | Iterative deploy path: detects changed files and rebuilds/pushes only impacted components |
+
+For `mise run cluster`, `.env` acts as local source-of-truth for `CLUSTER_NAME`, `GATEWAY_PORT`, and `NAVIGATOR_CLUSTER`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
+Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so `cluster` and `cluster:deploy` can push/pull local component images consistently.
 
 ## Bootstrap Sequence Diagram
 
@@ -144,12 +157,10 @@ The `deploy_cluster_with_logs` variant accepts an `FnMut(String)` callback for p
 Image ref resolution in `default_cluster_image_ref()`:
 
 1. If `NAVIGATOR_CLUSTER_IMAGE` is set and non-empty, use it verbatim.
-2. Otherwise, use `navigator-cluster:{IMAGE_TAG}` where `IMAGE_TAG` defaults to `"dev"`.
+2. Otherwise, use the published distribution image base (`<distribution-registry>/navigator/cluster`) with its default tag behavior.
 
-The constant `DEFAULT_IMAGE_NAME` is `"navigator-cluster"` (defined in `constants.rs`).
-
-- **Local deploy**: `ensure_image()` inspects the image on the local daemon. If missing and the image ref has no registry prefix (no `/` in the repository), the function returns an error suggesting `mise run docker:build:cluster` instead of attempting a Docker Hub pull. If the image ref has a registry prefix, it pulls normally.
-- **Remote deploy**: `pull_remote_image()` queries the remote daemon's architecture via `Docker::version()`, pulls the matching platform variant from the distribution registry (with XOR-decoded credentials), and tags the pulled image to the expected local ref (e.g., `navigator-cluster:dev`).
+- **Local deploy**: `ensure_image()` inspects the image on the local daemon and pulls from the configured registry if missing (using built-in distribution credentials when pulling from the default distribution host).
+- **Remote deploy**: `pull_remote_image()` queries the remote daemon's architecture via `Docker::version()`, pulls the matching platform variant from the distribution registry (with XOR-decoded credentials), and tags the pulled image to the expected local ref (for example `navigator/cluster:dev` when an explicit local tag is requested).
 
 ### 3) Runtime infrastructure
 
@@ -297,7 +308,7 @@ flowchart LR
   RP --> Auth[Authenticate with distribution registry]
   Auth --> Pull[Pull platform-specific image layers]
   Pull --> Tag[Tag to local image ref]
-  Tag --> OK[Image available as navigator-cluster:TAG]
+  Tag --> OK[Image available as navigator/cluster:TAG]
 ```
 
 - Remote platform is queried via `Docker::version()` and normalized (e.g., `x86_64` -> `amd64`, `aarch64` -> `arm64`).

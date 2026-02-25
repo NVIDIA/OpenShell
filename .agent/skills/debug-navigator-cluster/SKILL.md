@@ -11,7 +11,7 @@ Diagnose why a navigator cluster failed to start after `nav cluster admin deploy
 
 `nav cluster admin deploy` creates a Docker container running k3s with the Navigator server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
 
-1. **Pre-deploy check**: If a cluster already exists (container/volume present), the CLI prompts the user to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start)
+1. **Pre-deploy check**: `nav cluster admin deploy` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
 3. Create Docker network (`navigator-cluster`) and volume (`navigator-cluster-{name}`)
 4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
@@ -84,10 +84,10 @@ If the container does not exist:
 
 ```bash
 # Check if the image is available
-docker images 'navigator-cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+docker images 'navigator/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 ```
 
-If the image is missing, the fix is `mise run docker:build:cluster` (local) or re-deploy (remote).
+If the image is missing, re-deploy so bootstrap can pull the published cluster image (or set `NAVIGATOR_CLUSTER_IMAGE` explicitly).
 
 If the container exists but is not running, inspect it:
 
@@ -169,6 +169,8 @@ docker port navigator-cluster-<name>
 ```
 
 Expected ports: `6443/tcp`, `30051/tcp` (mapped to configurable host port, default 8080; set via `--port` on deploy).
+Only one local cluster can run on a Docker host at a time because `6443` is fixed.
+`mise run cluster` handles this by removing conflicting local `navigator-cluster-*` containers first.
 
 If ports are missing or conflicting, another process may be using them. Check with:
 
@@ -183,7 +185,7 @@ If using Docker-in-Docker (`DOCKER_HOST=tcp://docker:2375`), verify metadata poi
 
 Component images (server, sandbox, pki-job) can reach kubelet via two paths:
 
-**Local/external pull mode** (default local via `mise run cluster`): Images are built locally, tagged to the configured local registry base (default `127.0.0.1:5000/navigator/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`).
+**Local/external pull mode** (default local via `mise run cluster` / `mise run cluster:build`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/navigator/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). `cluster:build` builds then pushes images; `cluster` pushes prebuilt local tags (`navigator/*:dev`, falling back to `localhost:5000/navigator/*:dev` or `127.0.0.1:5000/navigator/*:dev`).
 
 ```bash
 # Verify image refs currently used by navigator deployment

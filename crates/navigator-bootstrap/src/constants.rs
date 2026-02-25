@@ -1,4 +1,3 @@
-pub const DEFAULT_IMAGE_NAME: &str = "navigator-cluster";
 pub const NETWORK_NAME: &str = "navigator-cluster";
 pub const KUBECONFIG_PATH: &str = "/etc/rancher/k3s/k3s.yaml";
 

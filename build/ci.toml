@@ -35,5 +35,5 @@ docker run ${TTY_FLAG} \
   -w /sandbox \
   -e NAVIGATOR_POLICY_RULES=/var/navigator/policy.rego \
   -e NAVIGATOR_POLICY_DATA=/var/navigator/data.yaml \
-  navigator-sandbox:${IMAGE_TAG:-dev} -i -- ${CMD[@]}
+  navigator/sandbox:${IMAGE_TAG:-dev} -i -- ${CMD[@]}
 """

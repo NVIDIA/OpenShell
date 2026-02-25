@@ -62,7 +62,7 @@ pub(crate) fn pull_registry() -> String {
 }
 
 /// Full image path on the distribution registry (without tag), decoded at runtime.
-fn pull_registry_image() -> String {
+pub(crate) fn pull_registry_image() -> String {
     xor_decode(&PULL_REGISTRY_IMAGE_ENC)
 }
 
@@ -151,7 +151,7 @@ pub async fn pull_image(
 /// registry, authenticating with the built-in distribution credentials.
 ///
 /// After pulling, the image is tagged to the expected local image ref (e.g.,
-/// `navigator-cluster:dev`) so that all downstream container creation logic works
+/// `navigator/cluster:dev`) so that all downstream container creation logic works
 /// without changes.
 ///
 /// The remote host's platform is queried so the correct architecture variant is
@@ -230,7 +230,7 @@ pub async fn pull_remote_image(
 
     // Tag the pulled image to the expected local image ref so downstream code
     // (container creation, image ID checks) works unchanged.
-    // e.g., tag "d1i0nduu2f6qxk.cloudfront.net/navigator/cluster:dev" as "navigator-cluster:dev"
+    // e.g., tag "d1i0nduu2f6qxk.cloudfront.net/navigator/cluster:dev" as "navigator/cluster:dev"
     let (target_repo, target_tag) = parse_image_ref(image_ref);
     info!(
         "Tagging {} as {}:{}",
@@ -284,7 +284,7 @@ pub async fn pull_remote_image(
 /// Check whether an image reference looks like a locally-built image (no registry prefix).
 ///
 /// An image reference is considered "local-only" when the repository portion contains no `/`,
-/// meaning it has no registry or namespace prefix (e.g., `navigator-cluster:dev` vs
+/// meaning it has no registry or namespace prefix (e.g., `cluster-local:dev` vs
 /// `ghcr.io/org/image:tag` or `docker.io/library/nginx:latest`).
 pub(crate) fn is_local_image_ref(image_ref: &str) -> bool {
     let (repo, _tag) = parse_image_ref(image_ref);

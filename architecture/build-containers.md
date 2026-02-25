@@ -56,7 +56,7 @@ build/
 
 The project produces three runtime container images and two build-only wheel images.
 
-### Sandbox Image (`navigator-sandbox`)
+### Sandbox Image (`navigator/sandbox`)
 
 The sandbox container runs inside each sandbox pod. It contains the sandbox supervisor binary, Python runtime, AI agent tooling, and a virtual environment for the Python SDK.
 
@@ -74,7 +74,7 @@ The sandbox container runs inside each sandbox pod. It contains the sandbox supe
 - Policy files are mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data) when running in file-based policy mode.
 - The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/navigator/`.
 
-### Gateway Image (`navigator-server`)
+### Gateway Image (`navigator/server`)
 
 The gateway container runs the control plane / orchestration service.
 
@@ -93,7 +93,7 @@ The gateway container runs the control plane / orchestration service.
 - No Docker HEALTHCHECK -- health checks are handled by Kubernetes liveness/readiness probes (`tcpSocket` on the gRPC port).
 - Entrypoint: `navigator-server`, default args: `--port 8080`.
 
-### Cluster Image (`navigator-cluster`)
+### Cluster Image (`navigator/cluster`)
 
 A k3s image with bundled Helm charts and Kubernetes manifests for single-container deployment. Component images (sandbox, gateway) are **pulled at runtime** from the distribution registry -- they are not bundled as tarballs in this image.
 
@@ -257,7 +257,11 @@ The chart deploys a **StatefulSet** (not a Deployment) with a `volumeClaimTempla
 
 - **PVC**: `navigator-data`, `ReadWriteOnce`, 1Gi, mounted at `/var/navigator`.
 - **Security context**: non-root (UID 1000), `fsGroup: 1000`, all capabilities dropped, no privilege escalation.
-- **Probes**: `tcpSocket` on the `grpc` port (8080) for both liveness and readiness. Initial delay 5s, period 10s. TCP probes are used because the server terminates TLS directly.
+- **Probes**: `tcpSocket` on the `grpc` port (8080) for both liveness and readiness. Defaults are tuned for faster local rollouts:
+  - liveness: initial delay 2s, period 5s, timeout 1s, failure threshold 3
+  - readiness: initial delay 1s, period 2s, timeout 1s, failure threshold 3
+  TCP probes are used because the server terminates TLS directly.
+- **Termination grace**: `terminationGracePeriodSeconds` is configurable via chart values (default 5s) to reduce restart latency during iterative deploys.
 - **Service**: NodePort exposing port 8080, with nodePort 30051.
 
 ### Server TLS Configuration
@@ -312,7 +316,7 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 
 | Task | Description |
 |---|---|
-| `mise run cluster` | Build all images + deploy local k3s cluster via local registry |
+| `mise run cluster` | Fast local recreate: push prebuilt local component images and deploy via local registry |
 | `mise run cluster:deploy` | Fast deploy: rebuild changed components only |
 | `mise run cluster:deploy:all` | Full deploy: rebuild all components via local registry |
 | `mise run cluster:push:server` | Tag and push gateway image to local registry |
@@ -329,7 +333,7 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 
 `build/scripts/cluster-deploy-fast.sh` supports two modes:
 
-**Auto mode** (no arguments): Detects changed files from Git (unstaged, staged, and untracked) and determines which components to rebuild:
+**Auto mode** (no arguments): Detects changed files from Git (unstaged, staged, and untracked), fingerprints the relevant local changes for each component, and rebuilds only components whose fingerprint changed since the last successful deploy.
 
 | Changed Path | Triggers |
 |---|---|
@@ -337,10 +341,12 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 | `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway + sandbox rebuild |
 | `crates/navigator-router/*` | Gateway rebuild |
 | `crates/navigator-server/*`, `deploy/docker/Dockerfile.server` | Gateway rebuild |
-| `crates/navigator-sandbox/*`, `deploy/docker/Dockerfile.sandbox`, `python/*`, `pyproject.toml`, `uv.lock`, `dev-sandbox-policy.rego` | Sandbox rebuild |
+| `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `deploy/docker/openclaw-start.sh`, `python/*`, `pyproject.toml`, `uv.lock`, `dev-sandbox-policy.rego` | Sandbox rebuild |
 | `deploy/helm/navigator/*` | Helm upgrade |
 
 **Explicit target mode** (arguments: `server`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.
+
+Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster:deploy` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
 
 After building, the script:
 
@@ -348,14 +354,15 @@ After building, the script:
 2. Detects if the sandbox image content-addressable ID changed; if so, evicts the stale copy from k3s's containerd store via `crictl rmi` so new sandbox pods pull the updated image.
 3. Runs `helm upgrade` if chart changes were detected (or `FORCE_HELM_UPGRADE=1`).
 4. Restarts the gateway StatefulSet (or Deployment, if present) and waits for rollout completion.
+5. On success, updates the local deploy fingerprint state file for the next incremental deploy.
 
 ### How `mise run cluster` Works
 
 `build/scripts/cluster-bootstrap.sh` performs a full cluster bootstrap for local development:
 
-1. Resolves the local registry address (defaults to `localhost:5000/navigator`). In CI, uses `$CI_REGISTRY_IMAGE`.
+1. Resolves the local registry address (defaults to `127.0.0.1:5000/navigator`). In CI, uses `$CI_REGISTRY_IMAGE`.
 2. Ensures a local Docker registry container (`navigator-local-registry`) is running on port 5000 (creates one if needed).
-3. Builds and pushes component images (gateway, sandbox) to the local registry via `cluster-push-component.sh`.
+3. Pushes prebuilt local component images (server, sandbox) to the local registry via `cluster-push-component.sh`.
 4. Runs `nav cluster admin deploy --name <CLUSTER_NAME> --update-kube-config` to create or update the cluster container.
 
 ### Environment Variables
@@ -369,7 +376,8 @@ After building, the script:
 | `CLUSTER_NAME` | basename of `$PWD` | Name for local cluster deployment |
 | `DOCKER_PLATFORM` | (unset) | Target platform for multi-arch builds (e.g., `linux/amd64`) |
 | `DOCKER_BUILDER` | (auto-selected) | Buildx builder name |
-| `IMAGE_REPO_BASE` | `localhost:5000/navigator` | Image repository base for local registry pushes |
+| `IMAGE_REPO_BASE` | `127.0.0.1:5000/navigator` | Image repository base for local registry pushes |
+| `DEPLOY_FAST_STATE_FILE` | `.cache/cluster-deploy-fast.state` | Location of local incremental deploy fingerprint state |
 
 ### Build Caching
 

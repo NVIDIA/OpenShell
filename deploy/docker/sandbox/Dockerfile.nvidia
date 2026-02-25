@@ -6,7 +6,7 @@
 #
 # TODO: Add NVIDIA-specific layers (CUDA toolkit, cuDNN, GPU drivers, etc.)
 
-ARG BASE_IMAGE=navigator-sandbox:dev
+ARG BASE_IMAGE=navigator/sandbox:dev
 FROM ${BASE_IMAGE}
 
 # Placeholder: add NVIDIA GPU packages and configuration here.

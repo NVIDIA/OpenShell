@@ -50,9 +50,9 @@ docker buildx build \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
   -f deploy/docker/Dockerfile.cluster \
-  -t navigator-cluster:${IMAGE_TAG} \
+  -t navigator/cluster:${IMAGE_TAG} \
   --build-arg K3S_VERSION=${K3S_VERSION} \
   --load \
   .
 
-echo "Done! Cluster image: navigator-cluster:${IMAGE_TAG}"
+echo "Done! Cluster image: navigator/cluster:${IMAGE_TAG}"

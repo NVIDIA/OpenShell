@@ -1930,7 +1930,7 @@ pub async fn sandbox_image_push(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        default_tag = format!("navigator-sandbox-custom:{timestamp}");
+        default_tag = format!("navigator/sandbox-custom:{timestamp}");
         &default_tag
     };
 

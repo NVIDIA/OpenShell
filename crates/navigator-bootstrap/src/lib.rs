@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::constants::{
-    CLIENT_TLS_SECRET_NAME, DEFAULT_IMAGE_NAME, SERVER_CLIENT_CA_SECRET_NAME,
-    SERVER_TLS_SECRET_NAME, container_name, volume_name,
+    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME, container_name,
+    volume_name,
 };
 use crate::docker::{
     check_existing_cluster, create_ssh_docker_client, destroy_cluster_resources, ensure_container,
@@ -32,7 +32,7 @@ use crate::metadata::{
 use crate::mtls::store_pki_bundle;
 use crate::pki::generate_pki;
 use crate::runtime::{
-    clean_stale_nodes, exec_capture_with_exit, navigator_workload_exists,
+    clean_stale_nodes, exec_capture_with_exit, fetch_recent_logs, navigator_workload_exists,
     restart_navigator_deployment, wait_for_cluster_ready, wait_for_kubeconfig,
 };
 
@@ -280,18 +280,21 @@ where
     //
     // Ordering is: kubeconfig ready -> reconcile secrets -> (if rotated and
     // workload exists: rollout restart and wait) -> persist CLI-side bundle.
+    //
+    // We check workload presence before reconciliation. On a fresh/recreated
+    // cluster, secrets are always newly generated and a restart is unnecessary.
+    // Restarting only when workload pre-existed avoids extra rollout latency.
+    let workload_existed_before_pki = navigator_workload_exists(&target_docker, &name).await?;
     log("[status] Reconciling TLS certificates".to_string());
     let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
 
-    if rotated {
+    if rotated && workload_existed_before_pki {
         // If a navigator workload is already running, it must be restarted so
         // it picks up the new TLS secrets before we write CLI-side certs.
         // A failed rollout is a hard error — CLI certs must not be persisted
         // if the server cannot come up with the new PKI.
-        if navigator_workload_exists(&target_docker, &name).await? {
-            log("[status] PKI rotated — restarting navigator workload".to_string());
-            restart_navigator_deployment(&target_docker, &name).await?;
-        }
+        log("[status] PKI rotated — restarting navigator workload".to_string());
+        restart_navigator_deployment(&target_docker, &name).await?;
     }
 
     log("[status] Storing CLI mTLS credentials".to_string());
@@ -386,7 +389,7 @@ pub fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<Clus
 
 pub async fn ensure_cluster_image(version: &str) -> Result<String> {
     let docker = Docker::connect_with_local_defaults().into_diagnostic()?;
-    let image_ref = format!("{DEFAULT_IMAGE_NAME}:{version}");
+    let image_ref = format!("{}:{version}", image::pull_registry_image());
     ensure_image(&docker, &image_ref).await?;
     Ok(image_ref)
 }
@@ -397,11 +400,7 @@ fn default_cluster_image_ref() -> String {
     {
         return image;
     }
-    let tag = std::env::var("IMAGE_TAG")
-        .ok()
-        .filter(|val| !val.trim().is_empty())
-        .unwrap_or_else(|| "dev".to_string());
-    format!("{DEFAULT_IMAGE_NAME}:{tag}")
+    image::pull_registry_image()
 }
 
 /// Create the three TLS K8s secrets required by the Navigator server and sandbox pods.
@@ -421,9 +420,6 @@ async fn create_k8s_tls_secrets(
 
     let cname = container_name(name);
     let kubeconfig = constants::KUBECONFIG_PATH;
-
-    // Wait for the navigator namespace to exist (the Helm controller creates it).
-    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
 
     // Helper: run kubectl apply -f - with a JSON secret manifest.
     let apply_secret = |manifest: String| {
@@ -526,9 +522,6 @@ where
     let cname = container_name(name);
     let kubeconfig = constants::KUBECONFIG_PATH;
 
-    // Wait for namespace before attempting to read secrets.
-    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
-
     // Try to load existing secrets.
     match load_existing_pki_bundle(docker, &cname, kubeconfig).await {
         Ok(bundle) => {
@@ -543,6 +536,9 @@ where
     }
 
     // Generate fresh PKI and apply to cluster.
+    // Namespace may still be creating on first bootstrap, so wait here only
+    // when rotation is actually needed.
+    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
     let bundle = generate_pki(extra_sans)?;
     create_k8s_tls_secrets(docker, name, &bundle)
         .await
@@ -592,14 +588,16 @@ async fn load_existing_pki_bundle(
         }
     };
 
-    // Read all required fields from the three TLS secrets.
-    let server_cert = read_secret_key(SERVER_TLS_SECRET_NAME, "tls.crt").await?;
-    let server_key = read_secret_key(SERVER_TLS_SECRET_NAME, "tls.key").await?;
-    let ca_cert = read_secret_key(SERVER_CLIENT_CA_SECRET_NAME, "ca.crt").await?;
-    let client_cert = read_secret_key(CLIENT_TLS_SECRET_NAME, "tls.crt").await?;
-    let client_key = read_secret_key(CLIENT_TLS_SECRET_NAME, "tls.key").await?;
-    // Also read ca.crt from client-tls for completeness check
-    let client_ca = read_secret_key(CLIENT_TLS_SECRET_NAME, "ca.crt").await?;
+    // Read required fields concurrently to reduce bootstrap latency.
+    let (server_cert, server_key, ca_cert, client_cert, client_key, client_ca) = tokio::try_join!(
+        read_secret_key(SERVER_TLS_SECRET_NAME, "tls.crt"),
+        read_secret_key(SERVER_TLS_SECRET_NAME, "tls.key"),
+        read_secret_key(SERVER_CLIENT_CA_SECRET_NAME, "ca.crt"),
+        read_secret_key(CLIENT_TLS_SECRET_NAME, "tls.crt"),
+        read_secret_key(CLIENT_TLS_SECRET_NAME, "tls.key"),
+        // Also read ca.crt from client-tls for completeness check.
+        read_secret_key(CLIENT_TLS_SECRET_NAME, "ca.crt"),
+    )?;
 
     // Validate that all PEM data contains expected markers.
     for (label, data) in [
@@ -639,10 +637,11 @@ async fn wait_for_namespace(
     use miette::WrapErr;
 
     let attempts = 60;
-    let backoff = std::time::Duration::from_secs(2);
+    let max_backoff = std::time::Duration::from_secs(2);
+    let mut backoff = std::time::Duration::from_millis(200);
 
     for attempt in 0..attempts {
-        let (output, exit_code) = exec_capture_with_exit(
+        let exec_result = exec_capture_with_exit(
             docker,
             container_name,
             vec![
@@ -651,7 +650,29 @@ async fn wait_for_namespace(
                 format!("KUBECONFIG={kubeconfig} kubectl get namespace {namespace} -o name 2>&1"),
             ],
         )
-        .await?;
+        .await;
+
+        let (output, exit_code) = match exec_result {
+            Ok(result) => result,
+            Err(err) => {
+                if let Err(status_err) =
+                    docker::check_container_running(docker, container_name).await
+                {
+                    let logs = fetch_recent_logs(docker, container_name, 40).await;
+                    return Err(miette::miette!(
+                        "cluster container is not running while waiting for namespace '{namespace}': {status_err}\n{logs}"
+                    ))
+                    .wrap_err("K8s namespace not ready");
+                }
+
+                if attempt + 1 == attempts {
+                    return Err(err).wrap_err("K8s namespace not ready");
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
+                continue;
+            }
+        };
 
         if exit_code == 0 && output.contains(namespace) {
             return Ok(());
@@ -665,6 +686,7 @@ async fn wait_for_namespace(
         }
 
         tokio::time::sleep(backoff).await;
+        backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
     }
 
     unreachable!()

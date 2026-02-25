@@ -1,14 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
-GATEWAY_PORT=${GATEWAY_PORT:-8080}
-IMAGE_TAG=${IMAGE_TAG:-dev}
+MODE=${1:-build}
+if [ "${MODE}" != "build" ] && [ "${MODE}" != "fast" ]; then
+  echo "usage: $0 [build|fast]" >&2
+  exit 1
+fi
+
+if [ -n "${IMAGE_TAG:-}" ]; then
+  IMAGE_TAG=${IMAGE_TAG}
+else
+  IMAGE_TAG=dev
+fi
+ENV_FILE=.env
+PUBLISHED_IMAGE_REPO_BASE_DEFAULT=d1i0nduu2f6qxk.cloudfront.net/navigator
+LOCAL_REGISTRY_CONTAINER=navigator-local-registry
+LOCAL_REGISTRY_ADDR=127.0.0.1:5000
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then
   IMAGE_REPO_BASE_DEFAULT=${CI_REGISTRY_IMAGE}
+elif [ "${MODE}" = "fast" ]; then
+  IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/navigator
 else
-  IMAGE_REPO_BASE_DEFAULT=localhost:5000/navigator
+  IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/navigator
 fi
 
 IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NAVIGATOR_REGISTRY:-${IMAGE_REPO_BASE_DEFAULT}}}
@@ -19,6 +33,86 @@ if [ "${REGISTRY_NAMESPACE_DEFAULT}" = "${IMAGE_REPO_BASE}" ]; then
   REGISTRY_NAMESPACE_DEFAULT=navigator
 fi
 
+has_env_key() {
+  local key=$1
+  [ -f "${ENV_FILE}" ] || return 1
+  grep -Eq "^[[:space:]]*(export[[:space:]]+)?${key}=" "${ENV_FILE}"
+}
+
+append_env_if_missing() {
+  local key=$1
+  local value=$2
+  if has_env_key "${key}"; then
+    return
+  fi
+  if [ -f "${ENV_FILE}" ] && [ -s "${ENV_FILE}" ]; then
+    printf "\n%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
+  else
+    printf "%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
+  fi
+}
+
+port_is_in_use() {
+  local port=$1
+  if command -v lsof >/dev/null 2>&1; then
+    lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1
+    return $?
+  fi
+
+  if command -v nc >/dev/null 2>&1; then
+    nc -z 127.0.0.1 "${port}" >/dev/null 2>&1
+    return $?
+  fi
+
+  (echo >/dev/tcp/127.0.0.1/"${port}") >/dev/null 2>&1
+}
+
+pick_random_port() {
+  local lower=20000
+  local upper=60999
+  local attempts=256
+  local port
+
+  for _ in $(seq 1 "${attempts}"); do
+    port=$((RANDOM % (upper - lower + 1) + lower))
+    if ! port_is_in_use "${port}"; then
+      echo "${port}"
+      return 0
+    fi
+  done
+
+  echo "Error: could not find a free port after ${attempts} attempts." >&2
+  return 1
+}
+
+list_6443_conflicts() {
+  docker ps --format '{{.Names}} {{.Ports}}' | awk '
+    $0 ~ /0\.0\.0\.0:6443->6443\/tcp/ || $0 ~ /:::6443->6443\/tcp/ {
+      print $1
+    }'
+}
+
+CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
+
+if [ -n "${GATEWAY_PORT:-}" ]; then
+  RESOLVED_GATEWAY_PORT=${GATEWAY_PORT}
+elif [ "${MODE}" = "fast" ]; then
+  RESOLVED_GATEWAY_PORT=$(pick_random_port)
+else
+  RESOLVED_GATEWAY_PORT=8080
+fi
+
+NAVIGATOR_CLUSTER=${NAVIGATOR_CLUSTER:-${CLUSTER_NAME}}
+GATEWAY_PORT=${RESOLVED_GATEWAY_PORT}
+
+append_env_if_missing "CLUSTER_NAME" "${CLUSTER_NAME}"
+append_env_if_missing "GATEWAY_PORT" "${GATEWAY_PORT}"
+append_env_if_missing "NAVIGATOR_CLUSTER" "${NAVIGATOR_CLUSTER}"
+
+export CLUSTER_NAME
+export GATEWAY_PORT
+export NAVIGATOR_CLUSTER
+
 is_local_registry_host() {
   [ "${REGISTRY_HOST}" = "127.0.0.1:5000" ] || [ "${REGISTRY_HOST}" = "localhost:5000" ]
 }
@@ -28,27 +122,50 @@ registry_reachable() {
     curl -4 -fsS --max-time 2 "http://localhost:5000/v2/" >/dev/null 2>&1
 }
 
+wait_for_registry_ready() {
+  local attempts=${1:-20}
+  local delay_s=${2:-1}
+  local i
+
+  for i in $(seq 1 "${attempts}"); do
+    if registry_reachable; then
+      return 0
+    fi
+    sleep "${delay_s}"
+  done
+
+  return 1
+}
+
 ensure_local_registry() {
-  if registry_reachable; then
-    return
+  if docker inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
+    local proxy_remote_url
+    proxy_remote_url=$(docker inspect "${LOCAL_REGISTRY_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' 2>/dev/null | awk -F= '/^REGISTRY_PROXY_REMOTEURL=/{print $2; exit}' || true)
+    if [ -n "${proxy_remote_url}" ]; then
+      docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+    fi
   fi
 
-  if ! docker inspect navigator-local-registry >/dev/null 2>&1; then
-    docker run -d --restart=always --name navigator-local-registry -p 5000:5000 registry:2 >/dev/null
+  if ! docker inspect "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1; then
+    docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
   else
-    if ! docker ps --filter "name=^navigator-local-registry$" --filter "status=running" -q | grep -q .; then
-      docker start navigator-local-registry >/dev/null
+    if ! docker ps --filter "name=^${LOCAL_REGISTRY_CONTAINER}$" --filter "status=running" -q | grep -q .; then
+      docker start "${LOCAL_REGISTRY_CONTAINER}" >/dev/null
     fi
 
-    port_map=$(docker port navigator-local-registry 5000/tcp 2>/dev/null || true)
+    port_map=$(docker port "${LOCAL_REGISTRY_CONTAINER}" 5000/tcp 2>/dev/null || true)
     case "${port_map}" in
       *:5000*)
         ;;
       *)
-        docker rm -f navigator-local-registry >/dev/null 2>&1 || true
-        docker run -d --restart=always --name navigator-local-registry -p 5000:5000 registry:2 >/dev/null
+        docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+        docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
         ;;
     esac
+  fi
+
+  if wait_for_registry_ready 20 1; then
+    return
   fi
 
   if registry_reachable; then
@@ -58,7 +175,7 @@ ensure_local_registry() {
   echo "Error: local registry is not reachable at ${REGISTRY_HOST}." >&2
   echo "       Ensure a registry is running on port 5000 (e.g. docker run -d --name navigator-local-registry -p 5000:5000 registry:2)." >&2
   docker ps -a >&2 || true
-  docker logs navigator-local-registry >&2 || true
+  docker logs "${LOCAL_REGISTRY_CONTAINER}" >&2 || true
   exit 1
 }
 
@@ -89,17 +206,42 @@ if is_local_registry_host; then
   ensure_local_registry
 fi
 
-for component in server sandbox; do
-  build/scripts/cluster-push-component.sh "${component}"
-done
+CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
+
+if [ "${MODE}" = "fast" ]; then
+  mapfile -t port_conflicts < <(list_6443_conflicts || true)
+  for cname in "${port_conflicts[@]:-}"; do
+    [ -n "${cname}" ] || continue
+    if [ "${cname}" = "${CONTAINER_NAME}" ]; then
+      continue
+    fi
+
+    if [[ "${cname}" == navigator-cluster-* ]]; then
+      other_cluster=${cname#navigator-cluster-}
+      echo "Removing conflicting local cluster '${other_cluster}' (holds host port 6443)..."
+      nav cluster admin destroy --name "${other_cluster}"
+      continue
+    fi
+
+    echo "Error: container '${cname}' is using host port 6443, which Navigator clusters require." >&2
+    echo "Stop/remove that container, then retry 'mise run cluster'." >&2
+    exit 1
+  done
+
+  if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
+    echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
+    nav cluster admin destroy --name "${CLUSTER_NAME}"
+  fi
+fi
+
+if [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
+  for component in server sandbox; do
+    build/scripts/cluster-push-component.sh "${component}"
+  done
+fi
 
 nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config
-
-# Warm the sandbox image so the first test doesn't wait for an image pull
-CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
-SANDBOX_IMAGE="${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG}"
-echo "Pre-pulling sandbox image: ${SANDBOX_IMAGE}"
-docker exec "${CONTAINER_NAME}" crictl pull "${SANDBOX_IMAGE}"
 
 echo ""
 echo "Cluster '${CLUSTER_NAME}' is ready."

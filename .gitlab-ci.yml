@@ -240,6 +240,7 @@ python_e2e_sandbox_test:
     DOCKER_CERT_PATH: ""
     IMAGE_TAG: "$CI_COMMIT_SHA"
     IMAGE_REPO_BASE: "$CI_REGISTRY_IMAGE"
+    NAVIGATOR_CLUSTER_IMAGE: "navigator/cluster:$CI_COMMIT_SHA"
     NAVIGATOR_REGISTRY_INSECURE: "false"
   before_script:
     - uv sync --frozen
@@ -247,7 +248,8 @@ python_e2e_sandbox_test:
   script:
     - socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
     - sleep 1
-    - mise run --no-prepare cluster
+    - mise run --no-prepare docker:build:cluster
+    - mise run --no-prepare cluster:build
     - mise run --no-prepare test:e2e:sandbox
 
 # =============================================================================

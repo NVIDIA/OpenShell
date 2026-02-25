@@ -3,12 +3,13 @@ set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NAVIGATOR_REGISTRY:-localhost:5000/navigator}}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NAVIGATOR_REGISTRY:-127.0.0.1:5000/navigator}}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}
 DEPLOY_FAST_MODE=${DEPLOY_FAST_MODE:-auto}
 FORCE_HELM_UPGRADE=${FORCE_HELM_UPGRADE:-0}
 DEPLOY_FAST_HELM_WAIT=${DEPLOY_FAST_HELM_WAIT:-0}
+DEPLOY_FAST_STATE_FILE=${DEPLOY_FAST_STATE_FILE:-.cache/cluster-deploy-fast.state}
 
 overall_start=$(date +%s)
 
@@ -29,6 +30,13 @@ build_server=0
 build_sandbox=0
 needs_helm_upgrade=0
 explicit_target=0
+
+previous_server_fingerprint=""
+previous_sandbox_fingerprint=""
+previous_helm_fingerprint=""
+current_server_fingerprint=""
+current_sandbox_fingerprint=""
+current_helm_fingerprint=""
 
 if [[ "$#" -gt 0 ]]; then
   explicit_target=1
@@ -61,48 +69,151 @@ if [[ "$#" -gt 0 ]]; then
 fi
 
 declare -a changed_files=()
-if [[ "${explicit_target}" == "0" ]]; then
-  detect_start=$(date +%s)
-  mapfile -t changed_files < <(
-    {
-      git diff --name-only
-      git diff --name-only --cached
-      git ls-files --others --exclude-standard
-    } | sort -u
-  )
-  detect_end=$(date +%s)
-  log_duration "Change detection" "${detect_start}" "${detect_end}"
+detect_start=$(date +%s)
+mapfile -t changed_files < <(
+  {
+    git diff --name-only
+    git diff --name-only --cached
+    git ls-files --others --exclude-standard
+  } | sort -u
+)
+detect_end=$(date +%s)
+log_duration "Change detection" "${detect_start}" "${detect_end}"
+
+if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
+  while IFS='=' read -r key value; do
+    case "${key}" in
+      cluster_name)
+        previous_cluster_name=${value}
+        ;;
+      server)
+        previous_server_fingerprint=${value}
+        ;;
+      sandbox)
+        previous_sandbox_fingerprint=${value}
+        ;;
+      helm)
+        previous_helm_fingerprint=${value}
+        ;;
+    esac
+  done < "${DEPLOY_FAST_STATE_FILE}"
+
+  if [[ "${previous_cluster_name:-}" != "${CLUSTER_NAME}" ]]; then
+    previous_server_fingerprint=""
+    previous_sandbox_fingerprint=""
+    previous_helm_fingerprint=""
+  fi
 fi
+
+matches_server() {
+  local path=$1
+  case "${path}" in
+    Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
+      return 0
+      ;;
+    crates/navigator-core/*|crates/navigator-providers/*)
+      return 0
+      ;;
+    crates/navigator-router/*)
+      return 0
+      ;;
+    crates/navigator-server/*|deploy/docker/Dockerfile.server)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+matches_sandbox() {
+  local path=$1
+  case "${path}" in
+    Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
+      return 0
+      ;;
+    crates/navigator-core/*|crates/navigator-providers/*)
+      return 0
+      ;;
+    crates/navigator-sandbox/*|deploy/docker/sandbox/*|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+matches_helm() {
+  local path=$1
+  case "${path}" in
+    deploy/helm/navigator/*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+compute_fingerprint() {
+  local component=$1
+  local payload=""
+  local path
+  local digest
+
+  for path in "${changed_files[@]}"; do
+    case "${component}" in
+      server)
+        if ! matches_server "${path}"; then
+          continue
+        fi
+        ;;
+      sandbox)
+        if ! matches_sandbox "${path}"; then
+          continue
+        fi
+        ;;
+      helm)
+        if ! matches_helm "${path}"; then
+          continue
+        fi
+        ;;
+    esac
+
+    if [[ -e "${path}" ]]; then
+      digest=$(shasum -a 256 "${path}" | cut -d ' ' -f 1)
+    else
+      digest="__MISSING__"
+    fi
+    payload+="${path}:${digest}"$'\n'
+  done
+
+  if [[ -z "${payload}" ]]; then
+    printf ''
+  else
+    printf '%s' "${payload}" | shasum -a 256 | cut -d ' ' -f 1
+  fi
+}
+
+current_server_fingerprint=$(compute_fingerprint server)
+current_sandbox_fingerprint=$(compute_fingerprint sandbox)
+current_helm_fingerprint=$(compute_fingerprint helm)
 
 if [[ "${explicit_target}" == "0" && "${DEPLOY_FAST_MODE}" == "full" ]]; then
   build_server=1
   build_sandbox=1
   needs_helm_upgrade=1
 elif [[ "${explicit_target}" == "0" ]]; then
-  for path in "${changed_files[@]}"; do
-    case "${path}" in
-      Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
-        build_server=1
-        build_sandbox=1
-        ;;
-      crates/navigator-core/*|crates/navigator-providers/*)
-        build_server=1
-        build_sandbox=1
-        ;;
-      crates/navigator-router/*)
-        build_server=1
-        ;;
-      crates/navigator-server/*|deploy/docker/Dockerfile.server)
-        build_server=1
-        ;;
-      crates/navigator-sandbox/*|deploy/docker/sandbox/*|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
-        build_sandbox=1
-        ;;
-      deploy/helm/navigator/*)
-        needs_helm_upgrade=1
-        ;;
-    esac
-  done
+  if [[ "${current_server_fingerprint}" != "${previous_server_fingerprint}" ]]; then
+    build_server=1
+  fi
+  if [[ "${current_sandbox_fingerprint}" != "${previous_sandbox_fingerprint}" ]]; then
+    build_sandbox=1
+  fi
+  if [[ "${current_helm_fingerprint}" != "${previous_helm_fingerprint}" ]]; then
+    needs_helm_upgrade=1
+  fi
 fi
 
 if [[ "${FORCE_HELM_UPGRADE}" == "1" ]]; then
@@ -121,8 +232,8 @@ echo "  build server:  ${build_server}"
 echo "  build sandbox: ${build_sandbox}"
 echo "  helm upgrade:  ${needs_helm_upgrade}"
 
-if [[ "${explicit_target}" == "0" && "${#changed_files[@]}" -eq 0 && "${DEPLOY_FAST_MODE}" != "full" ]]; then
-  echo "No local changes detected."
+if [[ "${explicit_target}" == "0" && "${build_server}" == "0" && "${build_sandbox}" == "0" && "${needs_helm_upgrade}" == "0" && "${DEPLOY_FAST_MODE}" != "full" ]]; then
+  echo "No new local changes since last deploy."
 fi
 
 build_start=$(date +%s)
@@ -132,7 +243,7 @@ declare -A image_id_before=()
 for component in server sandbox; do
   var="build_${component//-/_}"
   if [[ "${!var}" == "1" ]]; then
-    image_id_before[${component}]=$(docker images -q "navigator-${component}:${IMAGE_TAG}" 2>/dev/null || true)
+    image_id_before[${component}]=$(docker images -q "navigator/${component}:${IMAGE_TAG}" 2>/dev/null || true)
   fi
 done
 
@@ -174,11 +285,11 @@ declare -a changed_images=()
 for component in server sandbox; do
   var="build_${component//-/_}"
   if [[ "${!var}" == "1" ]]; then
-    docker tag "navigator-${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}"
+    docker tag "navigator/${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}"
     pushed_images+=("${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}")
 
     # Detect whether the image actually changed by comparing Docker image IDs.
-    id_after=$(docker images -q "navigator-${component}:${IMAGE_TAG}" 2>/dev/null || true)
+    id_after=$(docker images -q "navigator/${component}:${IMAGE_TAG}" 2>/dev/null || true)
     id_before=${image_id_before[${component}]:-}
     if [[ -z "${id_before}" || "${id_before}" != "${id_after}" ]]; then
       changed_images+=("${component}")
@@ -250,6 +361,16 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   log_duration "Rollout" "${rollout_start}" "${rollout_end}"
 else
   echo "No image updates to roll out."
+fi
+
+if [[ "${explicit_target}" == "0" ]]; then
+  mkdir -p "$(dirname "${DEPLOY_FAST_STATE_FILE}")"
+  cat > "${DEPLOY_FAST_STATE_FILE}" <<EOF
+cluster_name=${CLUSTER_NAME}
+server=${current_server_fingerprint}
+sandbox=${current_sandbox_fingerprint}
+helm=${current_helm_fingerprint}
+EOF
 fi
 
 overall_end=$(date +%s)

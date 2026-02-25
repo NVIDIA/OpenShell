@@ -57,7 +57,7 @@ nav sandbox create --image my-sandbox:latest
 | Flag | Description |
 |------|-------------|
 | `--dockerfile` (required) | Path to the Dockerfile |
-| `--tag` | Image name and tag (default: `navigator-sandbox-custom:<unix_timestamp>`) |
+| `--tag` | Image name and tag (default: `navigator/sandbox-custom:<unix_timestamp>`) |
 | `--context` | Build context directory (default: Dockerfile parent directory) |
 | `--build-arg` | Repeatable `KEY=VALUE` Docker build arguments |
 
