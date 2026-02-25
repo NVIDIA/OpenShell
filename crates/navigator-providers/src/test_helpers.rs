@@ -1,4 +1,5 @@
 use crate::DiscoveryContext;
+use crate::context::expand_home_relative;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -45,7 +46,8 @@ impl DiscoveryContext for MockDiscoveryContext {
 
     fn expand_home(&self, path: &str) -> Option<PathBuf> {
         if let Some(stripped) = path.strip_prefix("~/") {
-            return self.home.as_ref().map(|home| home.join(stripped));
+            let home = self.home.as_deref()?;
+            return expand_home_relative(home, stripped);
         }
         Some(PathBuf::from(path))
     }

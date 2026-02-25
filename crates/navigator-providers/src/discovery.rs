@@ -92,3 +92,29 @@ fn collect_credential_fields(
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::discover_with_spec;
+    use crate::ProviderDiscoverySpec;
+    use crate::test_helpers::{MockDiscoveryContext, home_join};
+
+    #[test]
+    fn ignores_home_escaping_config_paths() {
+        let spec = ProviderDiscoverySpec {
+            id: "test",
+            credential_env_vars: &[],
+            config_paths: &["~/../secrets.json"],
+        };
+
+        let ctx = MockDiscoveryContext::new()
+            .with_home("/mock/home")
+            .with_file(
+                home_join("/mock/home", "../secrets.json"),
+                r#"{"token":"secret"}"#,
+            );
+
+        let discovered = discover_with_spec(&spec, &ctx).expect("discovery");
+        assert!(discovered.is_none());
+    }
+}

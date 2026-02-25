@@ -123,6 +123,7 @@ Discovery behavior is split into three layers:
 
 2. **Config file scan**: for each path in `spec.config_paths`:
    - expands `~/` via the context,
+   - rejects `~/` expansions that contain path-escape components (for example `..`),
    - checks file existence,
    - **only parses `.json` files** (`.yml`/`.yaml` are checked for existence but not read),
    - recursively collects JSON fields whose keys match credential patterns
