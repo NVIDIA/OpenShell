@@ -1,10 +1,9 @@
 use navigator_core::proto::{
-    DeleteInferenceRouteRequest, DeleteInferenceRouteResponse, HttpHeader, InferenceRoute,
-    InferenceRouteResponse, ListInferenceRoutesRequest, ListInferenceRoutesResponse,
-    ProxyInferenceRequest, ProxyInferenceResponse, Sandbox, UpdateInferenceRouteRequest,
-    inference_server::Inference,
+    DeleteInferenceRouteRequest, DeleteInferenceRouteResponse, GetSandboxInferenceBundleRequest,
+    GetSandboxInferenceBundleResponse, InferenceRoute, InferenceRouteResponse,
+    ListInferenceRoutesRequest, ListInferenceRoutesResponse, Sandbox, SandboxResolvedRoute,
+    UpdateInferenceRouteRequest, inference_server::Inference,
 };
-use navigator_router::{RouterError, config::ResolvedRoute};
 use prost::Message;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
@@ -46,95 +45,14 @@ impl ObjectName for InferenceRoute {
 
 #[tonic::async_trait]
 impl Inference for InferenceService {
-    async fn proxy_inference(
+    async fn get_sandbox_inference_bundle(
         &self,
-        request: Request<ProxyInferenceRequest>,
-    ) -> Result<Response<ProxyInferenceResponse>, Status> {
+        request: Request<GetSandboxInferenceBundleRequest>,
+    ) -> Result<Response<GetSandboxInferenceBundleResponse>, Status> {
         let req = request.into_inner();
-
-        if req.sandbox_id.is_empty() {
-            return Err(Status::invalid_argument("sandbox_id is required"));
-        }
-
-        let sandbox = self
-            .state
-            .store
-            .get_message::<Sandbox>(&req.sandbox_id)
+        resolve_sandbox_inference_bundle(self.state.store.as_ref(), &req.sandbox_id)
             .await
-            .map_err(|e| Status::internal(format!("failed to load sandbox: {e}")))?
-            .ok_or_else(|| Status::not_found(format!("sandbox {} not found", req.sandbox_id)))?;
-
-        let policy = sandbox
-            .spec
-            .as_ref()
-            .and_then(|s| s.policy.as_ref())
-            .and_then(|p| p.inference.as_ref());
-
-        let allowed_routes = match policy {
-            Some(inference_policy) => {
-                if inference_policy.allowed_routes.is_empty() {
-                    return Err(Status::permission_denied(
-                        "sandbox inference policy has no allowed routes",
-                    ));
-                }
-                inference_policy.allowed_routes.clone()
-            }
-            None => {
-                return Err(Status::permission_denied(
-                    "sandbox has no inference policy configured",
-                ));
-            }
-        };
-
-        let routes = list_resolved_routes(self.state.store.as_ref(), &allowed_routes).await?;
-        if routes.is_empty() {
-            return Err(Status::failed_precondition(
-                "no enabled routes available for sandbox policy",
-            ));
-        }
-
-        let inference_router = self.state.router.as_ref().ok_or_else(|| {
-            Status::unavailable("inference router is not configured on this server")
-        })?;
-
-        let headers: Vec<(String, String)> = req
-            .http_headers
-            .iter()
-            .map(|h| (h.name.clone(), h.value.clone()))
-            .collect();
-
-        info!(
-            sandbox_id = %req.sandbox_id,
-            source_protocol = %req.source_protocol,
-            method = %req.http_method,
-            path = %req.http_path,
-            candidate_routes = routes.len(),
-            "processing proxy inference request"
-        );
-
-        let response = inference_router
-            .proxy_with_candidates(
-                &req.source_protocol,
-                &req.http_method,
-                &req.http_path,
-                headers,
-                bytes::Bytes::from(req.http_body),
-                &routes,
-            )
-            .await
-            .map_err(router_error_to_status)?;
-
-        let resp_headers: Vec<HttpHeader> = response
-            .headers
-            .into_iter()
-            .map(|(name, value)| HttpHeader { name, value })
-            .collect();
-
-        Ok(Response::new(ProxyInferenceResponse {
-            http_status: i32::from(response.status),
-            http_headers: resp_headers,
-            http_body: response.body.to_vec(),
-        }))
+            .map(Response::new)
     }
 
     async fn create_inference_route(
@@ -290,14 +208,88 @@ fn normalize_route_protocols(spec: &mut navigator_core::proto::InferenceRouteSpe
     spec.protocols = navigator_core::inference::normalize_protocols(&spec.protocols);
 }
 
-/// Resolve inference routes from the store, filtered by allowed route names.
+/// Resolve a full inference bundle for a sandbox.
+///
+/// Loads the sandbox from the store, extracts the inference policy, filters
+/// routes by `allowed_routes`, and computes a revision hash.
+async fn resolve_sandbox_inference_bundle(
+    store: &Store,
+    sandbox_id: &str,
+) -> Result<GetSandboxInferenceBundleResponse, Status> {
+    if sandbox_id.is_empty() {
+        return Err(Status::invalid_argument("sandbox_id is required"));
+    }
+
+    let sandbox = store
+        .get_message::<Sandbox>(sandbox_id)
+        .await
+        .map_err(|e| Status::internal(format!("failed to load sandbox: {e}")))?
+        .ok_or_else(|| Status::not_found(format!("sandbox {sandbox_id} not found")))?;
+
+    let policy = sandbox
+        .spec
+        .as_ref()
+        .and_then(|s| s.policy.as_ref())
+        .and_then(|p| p.inference.as_ref());
+
+    let allowed_routes = match policy {
+        Some(inference_policy) => {
+            if inference_policy.allowed_routes.is_empty() {
+                return Err(Status::permission_denied(
+                    "sandbox inference policy has no allowed routes",
+                ));
+            }
+            inference_policy.allowed_routes.clone()
+        }
+        None => {
+            return Err(Status::permission_denied(
+                "sandbox has no inference policy configured",
+            ));
+        }
+    };
+
+    let routes = list_sandbox_routes(store, &allowed_routes).await?;
+
+    info!(
+        sandbox_id = %sandbox_id,
+        route_count = routes.len(),
+        "serving inference bundle"
+    );
+
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    // Compute a simple revision from route contents for cache freshness checks.
+    let revision = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        for r in &routes {
+            r.routing_hint.hash(&mut hasher);
+            r.base_url.hash(&mut hasher);
+            r.model_id.hash(&mut hasher);
+            r.api_key.hash(&mut hasher);
+            r.protocols.hash(&mut hasher);
+        }
+        format!("{:016x}", hasher.finish())
+    };
+
+    Ok(GetSandboxInferenceBundleResponse {
+        routes,
+        revision,
+        generated_at_ms: now_ms,
+    })
+}
+
+/// Resolve inference routes from the store as sandbox-ready bundle entries.
 ///
 /// Routes are matched by `routing_hint` against the `allowed_routes` list
 /// from the sandbox's inference policy. Only enabled routes are returned.
-async fn list_resolved_routes(
+async fn list_sandbox_routes(
     store: &Store,
     allowed_routes: &[String],
-) -> Result<Vec<ResolvedRoute>, Status> {
+) -> Result<Vec<SandboxResolvedRoute>, Status> {
     let mut allowed_set = std::collections::HashSet::new();
     for name in allowed_routes {
         allowed_set.insert(name.as_str());
@@ -327,30 +319,16 @@ async fn list_resolved_routes(
             continue;
         }
 
-        routes.push(ResolvedRoute {
+        routes.push(SandboxResolvedRoute {
             routing_hint: spec.routing_hint.clone(),
-            endpoint: spec.base_url.clone(),
-            model: spec.model_id.clone(),
+            base_url: spec.base_url.clone(),
+            model_id: spec.model_id.clone(),
             api_key: spec.api_key.clone(),
             protocols,
         });
     }
 
     Ok(routes)
-}
-
-fn router_error_to_status(err: RouterError) -> Status {
-    match err {
-        RouterError::RouteNotFound(hint) => {
-            Status::invalid_argument(format!("no route configured for routing_hint '{hint}'"))
-        }
-        RouterError::NoCompatibleRoute(protocol) => Status::failed_precondition(format!(
-            "no compatible route for source protocol '{protocol}'"
-        )),
-        RouterError::Unauthorized(msg) => Status::unauthenticated(msg),
-        RouterError::UpstreamUnavailable(msg) => Status::unavailable(msg),
-        RouterError::UpstreamProtocol(msg) | RouterError::Internal(msg) => Status::internal(msg),
-    }
 }
 
 #[cfg(test)]
@@ -414,7 +392,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_resolved_routes_returns_enabled_allowed_routes() {
+    async fn list_sandbox_routes_returns_enabled_allowed_routes() {
         let store = Store::connect("sqlite::memory:?cache=shared")
             .await
             .expect("store should connect");
@@ -431,7 +409,7 @@ mod tests {
             .await
             .expect("enabled route should persist");
 
-        let routes = list_resolved_routes(&store, &["local".to_string()])
+        let routes = list_sandbox_routes(&store, &["local".to_string()])
             .await
             .expect("routes should resolve");
 
@@ -441,7 +419,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_resolved_routes_filters_by_allowed_routes() {
+    async fn list_sandbox_routes_filters_by_allowed_routes() {
         let store = Store::connect("sqlite::memory:?cache=shared")
             .await
             .expect("store should connect");
@@ -452,14 +430,152 @@ mod tests {
             .await
             .expect("route should persist");
 
-        let routes = list_resolved_routes(&store, &["local".to_string()])
+        let routes = list_sandbox_routes(&store, &["local".to_string()])
             .await
             .expect("routes should resolve");
         assert!(routes.is_empty());
     }
 
+    // -- resolve_sandbox_inference_bundle tests --
+
+    fn make_sandbox(id: &str, allowed_routes: Option<Vec<String>>) -> Sandbox {
+        use navigator_core::proto::SandboxSpec;
+
+        let policy =
+            allowed_routes.map(|routes| navigator_core::proto::sandbox::v1::SandboxPolicy {
+                inference: Some(navigator_core::proto::sandbox::v1::InferencePolicy {
+                    allowed_routes: routes,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+
+        Sandbox {
+            id: id.to_string(),
+            name: format!("sandbox-{id}"),
+            spec: Some(SandboxSpec {
+                policy,
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn list_resolved_routes_keeps_multi_protocols_in_single_route() {
+    async fn bundle_happy_path_returns_matching_routes() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let sandbox = make_sandbox("sb-1", Some(vec!["local".into()]));
+        store.put_message(&sandbox).await.expect("persist sandbox");
+
+        let route = make_route("r-1", "route-a", "local", true);
+        store.put_message(&route).await.expect("persist route");
+
+        let resp = resolve_sandbox_inference_bundle(&store, "sb-1")
+            .await
+            .expect("bundle should resolve");
+
+        assert_eq!(resp.routes.len(), 1);
+        assert_eq!(resp.routes[0].routing_hint, "local");
+        assert!(!resp.revision.is_empty());
+        assert!(resp.generated_at_ms > 0);
+    }
+
+    #[tokio::test]
+    async fn bundle_missing_sandbox_id_returns_invalid_argument() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let err = resolve_sandbox_inference_bundle(&store, "")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn bundle_sandbox_not_found_returns_not_found() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let err = resolve_sandbox_inference_bundle(&store, "nonexistent")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn bundle_no_inference_policy_returns_permission_denied() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        // Sandbox with no inference policy (None)
+        let sandbox = make_sandbox("sb-2", None);
+        store.put_message(&sandbox).await.expect("persist sandbox");
+
+        let err = resolve_sandbox_inference_bundle(&store, "sb-2")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("no inference policy"),
+            "message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_empty_allowed_routes_returns_permission_denied() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        // Sandbox with empty allowed_routes
+        let sandbox = make_sandbox("sb-3", Some(vec![]));
+        store.put_message(&sandbox).await.expect("persist sandbox");
+
+        let err = resolve_sandbox_inference_bundle(&store, "sb-3")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(
+            err.message().contains("no allowed routes"),
+            "message: {}",
+            err.message()
+        );
+    }
+
+    #[tokio::test]
+    async fn bundle_revision_is_stable_for_same_routes() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let sandbox = make_sandbox("sb-4", Some(vec!["local".into()]));
+        store.put_message(&sandbox).await.expect("persist sandbox");
+
+        let route = make_route("r-1", "route-a", "local", true);
+        store.put_message(&route).await.expect("persist route");
+
+        let resp1 = resolve_sandbox_inference_bundle(&store, "sb-4")
+            .await
+            .expect("first resolve");
+        let resp2 = resolve_sandbox_inference_bundle(&store, "sb-4")
+            .await
+            .expect("second resolve");
+
+        assert_eq!(
+            resp1.revision, resp2.revision,
+            "same routes should produce same revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_sandbox_routes_keeps_multi_protocols_in_single_route() {
         let store = Store::connect("sqlite::memory:?cache=shared")
             .await
             .expect("store should connect");
@@ -484,7 +600,7 @@ mod tests {
             .await
             .expect("route should persist");
 
-        let routes = list_resolved_routes(&store, &["local".to_string()])
+        let routes = list_sandbox_routes(&store, &["local".to_string()])
             .await
             .expect("routes should resolve");
 

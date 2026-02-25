@@ -19,7 +19,6 @@ mod tls;
 pub mod tracing_bus;
 
 use navigator_core::{Config, Error, Result};
-use navigator_router::Router;
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use tracing::{error, info};
@@ -54,9 +53,6 @@ pub struct ServerState {
 
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
-
-    /// Inference router (None if not configured).
-    pub router: Option<Router>,
 }
 
 impl ServerState {
@@ -69,7 +65,6 @@ impl ServerState {
         sandbox_index: SandboxIndex,
         sandbox_watch_bus: SandboxWatchBus,
         tracing_log_bus: TracingLogBus,
-        router: Option<Router>,
     ) -> Self {
         Self {
             config,
@@ -78,7 +73,6 @@ impl ServerState {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
-            router,
         }
     }
 }
@@ -90,11 +84,7 @@ impl ServerState {
 /// # Errors
 ///
 /// Returns an error if the server fails to start or encounters a fatal error.
-pub async fn run_server(
-    config: Config,
-    tracing_log_bus: TracingLogBus,
-    router: Option<Router>,
-) -> Result<()> {
+pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Result<()> {
     let database_url = config.database_url.trim();
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
@@ -123,7 +113,6 @@ pub async fn run_server(
         sandbox_index,
         sandbox_watch_bus,
         tracing_log_bus,
-        router,
     ));
 
     spawn_sandbox_watcher(

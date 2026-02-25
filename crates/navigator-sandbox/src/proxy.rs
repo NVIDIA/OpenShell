@@ -31,39 +31,34 @@ struct ConnectDecision {
     engine: &'static str,
 }
 
-/// Inference routing context passed to the proxy for gRPC rerouting.
+/// Inference routing context for sandbox-local execution.
 ///
-/// The gRPC client is lazily initialized on first use and reused for all
-/// subsequent inference requests, avoiding per-request connection overhead.
+/// Holds a `Router` (HTTP client) and a cached set of resolved routes.
+/// Routes are loaded at startup and refreshed periodically by a background task.
 pub struct InferenceContext {
-    pub gateway_endpoint: String,
-    pub sandbox_id: String,
     pub patterns: Vec<crate::l7::inference::InferenceApiPattern>,
-    grpc_client: tokio::sync::OnceCell<crate::grpc_client::CachedInferenceClient>,
+    router: navigator_router::Router,
+    routes: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
 }
 
 impl InferenceContext {
     pub fn new(
-        gateway_endpoint: String,
-        sandbox_id: String,
         patterns: Vec<crate::l7::inference::InferenceApiPattern>,
+        router: navigator_router::Router,
+        routes: Vec<navigator_router::config::ResolvedRoute>,
     ) -> Self {
         Self {
-            gateway_endpoint,
-            sandbox_id,
             patterns,
-            grpc_client: tokio::sync::OnceCell::new(),
+            router,
+            routes: Arc::new(tokio::sync::RwLock::new(routes)),
         }
     }
 
-    async fn client(&self) -> Result<crate::grpc_client::CachedInferenceClient> {
-        let client = self
-            .grpc_client
-            .get_or_try_init(|| {
-                crate::grpc_client::CachedInferenceClient::connect(&self.gateway_endpoint)
-            })
-            .await?;
-        Ok(client.clone())
+    /// Get a handle to the route cache for background refresh.
+    pub fn route_cache(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>> {
+        self.routes.clone()
     }
 }
 
@@ -653,8 +648,8 @@ const INITIAL_INFERENCE_BUF: usize = 65536;
 
 /// Handle an intercepted connection for inference routing.
 ///
-/// TLS-terminates the client connection, parses HTTP requests, and reroutes
-/// inference API calls through the gateway's `ProxyInference` gRPC endpoint.
+/// TLS-terminates the client connection, parses HTTP requests, and executes
+/// inference API calls locally via `navigator-router`.
 /// Non-inference requests are denied with 403.
 async fn handle_inference_interception(
     client: TcpStream,
@@ -666,18 +661,12 @@ async fn handle_inference_interception(
     use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
 
     let ctx = inference_ctx.ok_or_else(|| {
-        miette::miette!(
-            "InspectForInference requires inference context (gateway endpoint + sandbox_id)"
-        )
+        miette::miette!("InspectForInference requires inference context (router + routes)")
     })?;
 
     let tls = tls_state.ok_or_else(|| {
         miette::miette!("InspectForInference requires TLS state for client termination")
     })?;
-
-    // Lazily connect the gRPC client (reused across requests on this connection
-    // and shared with other connections via the OnceCell).
-    let grpc_client = ctx.client().await?;
 
     // TLS-terminate the client side (present a cert for the target host)
     let mut tls_client = crate::l7::tls::tls_terminate_client(client, tls, host).await?;
@@ -696,15 +685,7 @@ async fn handle_inference_interception(
         // Try to parse a complete HTTP request
         match try_parse_http_request(&buf[..used]) {
             ParseResult::Complete(request, consumed) => {
-                // Parsed successfully — fall through to routing below
-                route_inference_request(
-                    &request,
-                    &ctx.patterns,
-                    &grpc_client,
-                    &ctx.sandbox_id,
-                    &mut tls_client,
-                )
-                .await?;
+                route_inference_request(&request, ctx, &mut tls_client).await?;
 
                 // Shift buffer for next request
                 buf.copy_within(consumed..used, 0);
@@ -727,57 +708,65 @@ async fn handle_inference_interception(
     Ok(())
 }
 
-/// Route a parsed inference request through the gateway or deny it.
+/// Route a parsed inference request locally via the sandbox router, or deny it.
 async fn route_inference_request(
     request: &crate::l7::inference::ParsedHttpRequest,
-    patterns: &[crate::l7::inference::InferenceApiPattern],
-    grpc_client: &crate::grpc_client::CachedInferenceClient,
-    sandbox_id: &str,
+    ctx: &InferenceContext,
     tls_client: &mut (impl tokio::io::AsyncWrite + Unpin),
 ) -> Result<()> {
     use crate::l7::inference::{detect_inference_pattern, format_http_response};
 
-    if let Some(pattern) = detect_inference_pattern(&request.method, &request.path, patterns) {
+    if let Some(pattern) = detect_inference_pattern(&request.method, &request.path, &ctx.patterns) {
         info!(
             method = %request.method,
             path = %request.path,
             protocol = %pattern.protocol,
             kind = %pattern.kind,
-            "Intercepted inference request, rerouting through gateway"
+            "Intercepted inference request, routing locally"
         );
 
         // Strip credential + framing/hop-by-hop headers.
-        // The gateway/client stack will set correct framing for forwarded bytes.
         let filtered_headers = sanitize_inference_request_headers(&request.headers);
 
-        match grpc_client
-            .proxy_inference(
-                sandbox_id,
+        let routes = ctx.routes.read().await;
+
+        if routes.is_empty() {
+            let body = serde_json::json!({"error": "no inference routes configured"});
+            let body_bytes = body.to_string();
+            let response = format_http_response(
+                503,
+                &[("content-type".to_string(), "application/json".to_string())],
+                body_bytes.as_bytes(),
+            );
+            write_all(tls_client, &response).await?;
+            return Ok(());
+        }
+
+        match ctx
+            .router
+            .proxy_with_candidates(
                 &pattern.protocol,
                 &request.method,
                 &request.path,
                 filtered_headers,
-                request.body.clone(),
+                bytes::Bytes::from(request.body.clone()),
+                &routes,
             )
             .await
         {
             Ok(resp) => {
-                let resp_headers = resp
-                    .http_headers
-                    .into_iter()
-                    .map(|h| (h.name, h.value))
-                    .collect::<Vec<_>>();
-                let resp_headers = sanitize_inference_response_headers(resp_headers);
-                let status = u16::try_from(resp.http_status).unwrap_or(502);
-                let response = format_http_response(status, &resp_headers, &resp.http_body);
+                let resp_headers =
+                    sanitize_inference_response_headers(resp.headers.into_iter().collect());
+                let response = format_http_response(resp.status, &resp_headers, &resp.body);
                 write_all(tls_client, &response).await?;
             }
             Err(e) => {
-                warn!(error = %e, "Gateway inference proxy failed");
-                let body = serde_json::json!({"error": "inference routing failed"});
+                warn!(error = %e, "Local inference routing failed");
+                let (status, msg) = router_error_to_http(&e);
+                let body = serde_json::json!({"error": msg});
                 let body_bytes = body.to_string();
                 let response = format_http_response(
-                    502,
+                    status,
                     &[("content-type".to_string(), "application/json".to_string())],
                     body_bytes.as_bytes(),
                 );
@@ -803,6 +792,23 @@ async fn route_inference_request(
     }
 
     Ok(())
+}
+
+fn router_error_to_http(err: &navigator_router::RouterError) -> (u16, String) {
+    use navigator_router::RouterError;
+    match err {
+        RouterError::RouteNotFound(hint) => (
+            400,
+            format!("no route configured for routing_hint '{hint}'"),
+        ),
+        RouterError::NoCompatibleRoute(protocol) => (
+            400,
+            format!("no compatible route for source protocol '{protocol}'"),
+        ),
+        RouterError::Unauthorized(msg) => (401, msg.clone()),
+        RouterError::UpstreamUnavailable(msg) => (503, msg.clone()),
+        RouterError::UpstreamProtocol(msg) | RouterError::Internal(msg) => (502, msg.clone()),
+    }
 }
 
 fn sanitize_inference_request_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
@@ -1178,6 +1184,62 @@ mod tests {
             kept.iter().any(|(k, _)| k.eq_ignore_ascii_case("accept")),
             "accept should be preserved"
         );
+    }
+
+    // -- router_error_to_http --
+
+    #[test]
+    fn router_error_route_not_found_maps_to_400() {
+        let err = navigator_router::RouterError::RouteNotFound("local".into());
+        let (status, msg) = router_error_to_http(&err);
+        assert_eq!(status, 400);
+        assert!(
+            msg.contains("local"),
+            "message should contain the hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn router_error_no_compatible_route_maps_to_400() {
+        let err = navigator_router::RouterError::NoCompatibleRoute("anthropic_messages".into());
+        let (status, msg) = router_error_to_http(&err);
+        assert_eq!(status, 400);
+        assert!(
+            msg.contains("anthropic_messages"),
+            "message should contain the protocol: {msg}"
+        );
+    }
+
+    #[test]
+    fn router_error_unauthorized_maps_to_401() {
+        let err = navigator_router::RouterError::Unauthorized("bad token".into());
+        let (status, msg) = router_error_to_http(&err);
+        assert_eq!(status, 401);
+        assert_eq!(msg, "bad token");
+    }
+
+    #[test]
+    fn router_error_upstream_unavailable_maps_to_503() {
+        let err = navigator_router::RouterError::UpstreamUnavailable("connection refused".into());
+        let (status, msg) = router_error_to_http(&err);
+        assert_eq!(status, 503);
+        assert_eq!(msg, "connection refused");
+    }
+
+    #[test]
+    fn router_error_upstream_protocol_maps_to_502() {
+        let err = navigator_router::RouterError::UpstreamProtocol("bad gateway".into());
+        let (status, msg) = router_error_to_http(&err);
+        assert_eq!(status, 502);
+        assert_eq!(msg, "bad gateway");
+    }
+
+    #[test]
+    fn router_error_internal_maps_to_502() {
+        let err = navigator_router::RouterError::Internal("unexpected".into());
+        let (status, msg) = router_error_to_http(&err);
+        assert_eq!(status, 502);
+        assert_eq!(msg, "unexpected");
     }
 
     #[test]

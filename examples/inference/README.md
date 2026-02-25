@@ -12,8 +12,8 @@ a configured backend — without any code changes in the sandboxed application.
    policy but inference routing is configured, the connection is inspected.
 3. The proxy TLS-terminates, parses the HTTP request, and detects known
    inference patterns (e.g., `POST /v1/chat/completions`).
-4. Matching requests are forwarded through the gateway to the policy-allowed
-   inference backend. Non-inference requests are denied.
+4. Matching requests are forwarded directly to the policy-allowed inference
+   backend via the sandbox's local router. Non-inference requests are denied.
 
 ## Files
 
@@ -21,17 +21,42 @@ a configured backend — without any code changes in the sandboxed application.
 |---|---|
 | `inference.py` | Python script that calls the OpenAI SDK — works unmodified inside a sandbox |
 | `sandbox-policy.yaml` | Sandbox policy with inference routing enabled (route hint: `local`) |
+| `routes.yaml` | Example YAML route file for standalone (no-cluster) mode |
 
 ## Quick Start
 
-### 1. Start a Navigator cluster
+There are two ways to run inference routing: **with a cluster** (managed
+routes, multi-sandbox) or **standalone** (single sandbox, routes from a file).
+
+### Standalone (no cluster)
+
+Run the sandbox binary directly with a route file — no Navigator cluster needed:
+
+```bash
+# 1. Edit routes.yaml to point at your local LLM (e.g. LM Studio on :1234)
+#    See examples/inference/routes.yaml
+
+# 2. Run the sandbox with --inference-routes
+navigator-sandbox \
+  --inference-routes examples/inference/routes.yaml \
+  --policy-rules <your-policy.rego> \
+  --policy-data examples/inference/sandbox-policy.yaml \
+  -- python examples/inference/inference.py
+```
+
+The sandbox loads routes from the YAML file at startup and routes inference
+requests locally — no gRPC server or cluster required.
+
+### With a cluster
+
+#### 1. Start a Navigator cluster
 
 ```bash
 mise run cluster
 navigator cluster status
 ```
 
-### 2. Create an inference route
+#### 2. Create an inference route
 
 Point the route at any OpenAI-compatible endpoint (local or remote):
 
@@ -59,7 +84,7 @@ Verify the route:
 navigator inference list
 ```
 
-### 3. Run the example inside a sandbox
+#### 3. Run the example inside a sandbox
 
 ```bash
 navigator sandbox create \
@@ -80,7 +105,7 @@ model=<backend model name>
 content=NAV_OK
 ```
 
-### 4. (Optional) Interactive session
+#### 4. (Optional) Interactive session
 
 ```bash
 navigator sandbox connect inference-demo
@@ -88,7 +113,7 @@ navigator sandbox connect inference-demo
 python examples/inference/inference.py
 ```
 
-### 5. Cleanup
+#### 5. Cleanup
 
 ```bash
 navigator sandbox delete inference-demo

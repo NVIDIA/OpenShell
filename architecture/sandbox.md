@@ -17,7 +17,7 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 | `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
-| `grpc_client.rs` | gRPC client for fetching policy, provider environment, and proxying inference requests to the gateway |
+| `grpc_client.rs` | gRPC client for fetching policy, provider environment, and inference route bundles from the gateway |
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
@@ -48,7 +48,8 @@ flowchart TD
     H --> I{Proxy mode?}
     I -- Yes --> J[Generate ephemeral CA + write TLS files]
     J --> K[Create network namespace]
-    K --> L[Start HTTP CONNECT proxy]
+    K --> K2[Build InferenceContext]
+    K2 --> L[Start HTTP CONNECT proxy]
     I -- No --> M[Skip proxy setup]
     L --> N{SSH enabled?}
     M --> N
@@ -90,7 +91,7 @@ flowchart TD
    - Validate that OPA engine and identity cache are present
    - Determine bind address: on Linux, use the netns veth host IP (netns creation is required and startup already aborted if it failed); on non-Linux, use `policy.network.proxy.http_addr`
    - Parse the gateway endpoint URL into the control-plane allowlist
-   - Build `InferenceContext` when both `sandbox_id` and `navigator_endpoint` are available, populated with `default_patterns()` from `l7::inference`
+   - Build `InferenceContext` via `build_inference_context()` which resolves routes from one of two sources (see [Inference routing context](#inference-routing-context) below)
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
 
 8. **SSH server** (optional): If `--ssh-listen-addr` is provided, spawn an async task running `ssh::run_ssh_server()` with the policy, workdir, netns FD, proxy URL, CA paths, and provider env.
@@ -396,8 +397,9 @@ sequenceDiagram
     participant S as Sandboxed Process
     participant P as Proxy (host netns)
     participant O as OPA Engine
+    participant R as Router (sandbox-local)
     participant DNS as DNS Resolver
-    participant GW as Gateway (gRPC)
+    participant Backend as Inference Backend
     participant U as Upstream Server
 
     S->>P: CONNECT api.example.com:443 HTTP/1.1
@@ -422,9 +424,11 @@ sequenceDiagram
             P->>P: Parse HTTP request from tunnel
             alt Inference API pattern matched
                 P->>P: Strip Authorization header
-                P->>GW: proxy_inference() via gRPC
-                GW-->>P: ProxyInferenceResponse
-                P-->>S: HTTP response (gateway result)
+                P->>R: proxy_with_candidates(protocol, method, path, headers, body, routes)
+                R->>Backend: POST /v1/chat/completions (with route API key)
+                Backend-->>R: HTTP response
+                R-->>P: ProxyResponse(status, headers, body)
+                P-->>S: HTTP response (re-encrypted via TLS)
             else Non-inference request
                 P-->>S: HTTP/1.1 403 JSON error
             end
@@ -450,17 +454,7 @@ sequenceDiagram
 
 ### `ProxyHandle`
 
-`ProxyHandle` wraps a `JoinHandle` and the bound address. The `Drop` implementation aborts the accept loop. `start_with_bind_addr()` accepts an optional `inference_ctx: Option<Arc<InferenceContext>>` that enables inference interception:
-
-```rust
-pub struct InferenceContext {
-    pub gateway_endpoint: String,
-    pub sandbox_id: String,
-    pub patterns: Vec<InferenceApiPattern>,
-}
-```
-
-The `InferenceContext` provides the gateway gRPC endpoint for forwarding, the sandbox ID for request attribution, and the list of API patterns to detect. It is built in `run_sandbox()` when both `sandbox_id` and `navigator_endpoint` are available.
+`ProxyHandle` wraps a `JoinHandle` and the bound address. The `Drop` implementation aborts the accept loop. `start_with_bind_addr()` accepts an optional `inference_ctx: Option<Arc<InferenceContext>>` that enables inference interception. See [Inference routing context](#inference-routing-context) for how the `InferenceContext` is constructed.
 
 Startup steps:
 
@@ -475,7 +469,7 @@ The proxy reads up to 8192 bytes (`MAX_HEADER_BYTES`) looking for `\r\n\r\n`. It
 
 ### Control-plane bypass
 
-Connections to the gateway's own endpoint (parsed from `--navigator-endpoint`) are always allowed without OPA evaluation and without the SSRF internal-IP check. This ensures the sandboxed process can reach the gateway for inference routing and other management operations, even when the gateway resolves to a private IP (e.g., a Kubernetes service IP). Control-plane connections use hostname-based `TcpStream::connect()` rather than pre-resolved addresses. The decision engine is recorded as `"control_plane"`.
+Connections to the gateway's own endpoint (parsed from `--navigator-endpoint`) are always allowed without OPA evaluation and without the SSRF internal-IP check. This ensures the sandboxed process can reach the gateway for management operations (policy fetch, provider environment, inference route bundle refresh), even when the gateway resolves to a private IP (e.g., a Kubernetes service IP). Control-plane connections use hostname-based `TcpStream::connect()` rather than pre-resolved addresses. The decision engine is recorded as `"control_plane"`.
 
 ### OPA evaluation with identity binding (`evaluate_opa_tcp()`)
 
@@ -527,11 +521,11 @@ After OPA allows a connection, the proxy resolves DNS and rejects any host that 
 
 ### Inference interception (`InspectForInference` path)
 
-When OPA returns `InspectForInference`, the proxy does not connect to the upstream server. Instead, it TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. The function `handle_inference_interception()` implements this path:
+When OPA returns `InspectForInference`, the proxy does not connect to the upstream server. Instead, it TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `navigator-router` crate. The function `handle_inference_interception()` implements this path:
 
 1. **TLS termination**: The proxy responds with `200 Connection Established`, then performs TLS termination using the existing `SandboxCa` / `CertCache` infrastructure (same as L7 inspection). The client sees a valid certificate for the target hostname.
 
-2. **HTTP request parsing**: Reads HTTP/1.1 requests from the decrypted tunnel using `try_parse_http_request()` from `l7/inference.rs`. Supports both `Content-Length` and `Transfer-Encoding: chunked` request framing (chunked bodies are decoded before forwarding). Buffers up to 64 KiB per request.
+2. **HTTP request parsing**: Reads HTTP/1.1 requests from the decrypted tunnel using `try_parse_http_request()` from `l7/inference.rs`. Supports both `Content-Length` and `Transfer-Encoding: chunked` request framing (chunked bodies are decoded before forwarding). Uses a growable buffer starting at 64 KiB (`INITIAL_INFERENCE_BUF`) up to 10 MiB (`MAX_INFERENCE_BUF`). Returns `413 Payload Too Large` if the limit is exceeded.
 
 3. **Inference pattern detection**: `detect_inference_pattern()` checks the request method and path against the configured patterns. Default patterns from `default_patterns()`:
 
@@ -539,40 +533,100 @@ When OPA returns `InspectForInference`, the proxy does not connect to the upstre
    |--------|------|----------|------|
    | `POST` | `/v1/chat/completions` | `openai_chat_completions` | `chat_completion` |
    | `POST` | `/v1/completions` | `openai_completions` | `completion` |
+   | `POST` | `/v1/responses` | `openai_responses` | `responses` |
    | `POST` | `/v1/messages` | `anthropic_messages` | `messages` |
 
    Pattern matching strips query strings and uses exact path comparison (not glob).
 
-4. **Header sanitization**: For matched inference requests, the proxy strips credential headers (`Authorization`, `x-api-key`) and framing/hop-by-hop headers (`host`, `content-length`, `transfer-encoding`, `connection`, etc.). The gateway/client stack rebuilds correct framing for the forwarded body.
+4. **Header sanitization**: For matched inference requests, the proxy strips credential headers (`Authorization`, `x-api-key`) and framing/hop-by-hop headers (`host`, `content-length`, `transfer-encoding`, `connection`, etc.). The router rebuilds correct framing for the forwarded body.
 
-5. **Gateway forwarding**: Matched requests are forwarded via `grpc_client::proxy_inference()` to the gateway's `Inference::ProxyInference` gRPC endpoint. The request includes the sandbox ID, detected protocol name, HTTP method, path, filtered headers, and body.
+5. **Local routing**: Matched requests are executed by calling `Router::proxy_with_candidates()` directly, passing the detected protocol, HTTP method, path, sanitized headers, body, and the cached `ResolvedRoute` list from `InferenceContext`. The router selects the first route whose `protocols` list contains the source protocol (see [Inference Router](inference-routing.md#inference-router) for route selection details). The router adds the route's `api_key` as a `Bearer` authorization header when forwarding to the backend.
 
 6. **Response handling**:
-   - On success: the gateway's response (status code, headers, body) is formatted as an HTTP/1.1 response and sent back to the client after stripping response framing/hop-by-hop headers (`transfer-encoding`, `content-length`, `connection`, etc.)
-   - On gateway failure: returns `502 Bad Gateway` with a JSON error body (`{"error": "inference routing failed: ..."}`)
+   - On success: the router's response (status code, headers, body) is formatted as an HTTP/1.1 response and sent back to the client after stripping response framing/hop-by-hop headers (`transfer-encoding`, `content-length`, `connection`, etc.)
+   - On router failure: the error is mapped to an HTTP status code via `router_error_to_http()` and returned as a JSON error body (see error table below)
+   - Empty route cache: returns `503` JSON error (`{"error": "no inference routes configured"}`)
    - Non-inference requests: returns `403 Forbidden` with a JSON error body (`{"error": "only inference API calls are allowed on this connection"}`)
 
 7. **Connection lifecycle**: The handler loops to process multiple HTTP requests on the same connection (HTTP keep-alive). The loop ends when the client closes the connection or an unrecoverable error occurs.
 
-### gRPC inference forwarding
+### Router error to HTTP mapping
 
-**File:** `crates/navigator-sandbox/src/grpc_client.rs`
+When `Router::proxy_with_candidates()` returns an error, `router_error_to_http()` in `proxy.rs` maps it to an HTTP status code:
 
-`proxy_inference()` forwards an intercepted inference request to the gateway. It connects to the `Inference` gRPC service (not the `Navigator` service) and calls the `ProxyInference` RPC:
+| `RouterError` variant | HTTP status | Response body |
+|----------------------|-------------|---------------|
+| `RouteNotFound(hint)` | `400` | `no route configured for routing_hint '{hint}'` |
+| `NoCompatibleRoute(protocol)` | `400` | `no compatible route for source protocol '{protocol}'` |
+| `Unauthorized(msg)` | `401` | `{msg}` |
+| `UpstreamUnavailable(msg)` | `503` | `{msg}` |
+| `UpstreamProtocol(msg)` / `Internal(msg)` | `502` | `{msg}` |
+
+### Inference routing context
+
+**Files:** `crates/navigator-sandbox/src/lib.rs` (`build_inference_context`, `bundle_to_resolved_routes`, `spawn_route_refresh`), `crates/navigator-sandbox/src/proxy.rs` (`InferenceContext`)
+
+The sandbox executes inference requests locally using the `navigator-router` crate. `InferenceContext` holds the router, API patterns, and a cached set of resolved routes:
 
 ```rust
-pub async fn proxy_inference(
-    endpoint: &str,           // gateway gRPC endpoint
-    sandbox_id: &str,         // sandbox attribution
-    source_protocol: &str,    // detected protocol (e.g. "openai_chat_completions")
-    http_method: &str,        // original HTTP method
-    http_path: &str,          // original HTTP path
-    http_headers: Vec<(String, String)>,  // filtered headers (no Authorization)
-    http_body: Vec<u8>,       // request body
-) -> Result<ProxyInferenceResponse>
+pub struct InferenceContext {
+    pub patterns: Vec<InferenceApiPattern>,
+    router: navigator_router::Router,
+    routes: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
+}
 ```
 
-The request is serialized as a `ProxyInferenceRequest` proto message with `HttpHeader` entries. The response contains `http_status`, `http_headers`, and `http_body` fields that the proxy formats into an HTTP/1.1 response for the client.
+`build_inference_context()` in `lib.rs` resolves routes from one of two sources.
+
+#### Design decision: standalone capability
+
+The sandbox is designed to operate both as part of a Navigator cluster and as a standalone component without any cluster infrastructure. This is intentional — it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full Navigator stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs — policy, inference routes — can be provided without any dependency on the control plane.
+
+#### Route sources (priority order)
+
+1. **Route file (standalone mode)**: `--inference-routes` / `NAVIGATOR_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
+
+2. **Cluster bundle (cluster mode)**: When `sandbox_id` and `navigator_endpoint` are available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetSandboxInferenceBundle` gRPC RPC on the `Inference` service. The gateway returns a `GetSandboxInferenceBundleResponse` containing pre-filtered `SandboxResolvedRoute` entries (routes whose `routing_hint` matches the sandbox's `allowed_routes` policy). These proto messages are converted to `ResolvedRoute` structs by `bundle_to_resolved_routes()`.
+
+3. **No source**: If neither route file nor cluster credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
+
+#### Cluster mode graceful degradation
+
+In cluster mode, `fetch_inference_bundle()` failures are handled based on the error type:
+- gRPC `PermissionDenied` or `NotFound` (detected via error message string matching): sandbox has no inference policy -- inference routing is silently disabled.
+- Other errors: logged as a warning, inference routing is disabled.
+- Empty route bundle: inference routing is disabled (no routes available).
+
+Both route sources handle empty route lists the same way: inference routing is gracefully disabled. The difference is that file *loading errors* (missing file, parse failure) are fatal, while cluster *fetch errors* are non-fatal.
+
+#### Background route cache refresh
+
+In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds. The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
+
+```mermaid
+flowchart TD
+    A[build_inference_context] --> B{Route file configured?}
+    B -- Yes --> C[RouterConfig::load_from_file]
+    C --> D[resolve_routes]
+    D --> E{Routes non-empty?}
+    E -- Yes --> F[Create InferenceContext]
+    E -- No --> L[None: inference disabled]
+    B -- No --> H{sandbox_id + endpoint?}
+    H -- Yes --> I[fetch_inference_bundle via gRPC]
+    I --> J{Success?}
+    J -- Yes --> K{Routes non-empty?}
+    K -- Yes --> F
+    K -- No --> L
+    J -- No --> M{PermissionDenied / NotFound?}
+    M -- Yes --> L
+    M -- No --> N[Warn + None]
+    H -- No --> L
+    F --> O[spawn_route_refresh if cluster mode]
+```
+
+#### API key security
+
+`ResolvedRoute` has a custom `Debug` implementation in `crates/navigator-router/src/config.rs` that redacts the `api_key` field, printing `[REDACTED]` instead of the actual value. This prevents key leakage in log output and debug traces.
 
 ### Post-decision: L7 dispatch or raw tunnel (`Allow` path)
 
@@ -872,6 +926,7 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 | `NAVIGATOR_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
 | `NAVIGATOR_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
 | `NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
+| `NAVIGATOR_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
 
 ### Injected into child process
 
@@ -912,9 +967,15 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Binary integrity TOFU mismatch | Deny the specific CONNECT request |
 | SSRF: hostname resolves to internal IP | Deny the specific CONNECT request (403 Forbidden + warning log) |
 | SSRF: DNS resolution failure | Deny the specific CONNECT request |
+| Inference route file load/parse error | Fatal -- sandbox startup aborts |
+| Inference route file with empty routes | Inference routing disabled (graceful) |
+| Inference cluster bundle fetch failure | Warn + inference routing disabled (graceful) |
 | Inference interception: missing InferenceContext | Error on the specific connection |
 | Inference interception: missing TLS state | Error on the specific connection |
-| Inference interception: gateway ProxyInference failure | 502 Bad Gateway with JSON error body |
+| Inference interception: empty route cache | 503 Service Unavailable with JSON error body |
+| Inference interception: no compatible route | 400 Bad Request with JSON error body |
+| Inference interception: backend timeout/unavailable | 503 Service Unavailable with JSON error body |
+| Inference interception: backend protocol error | 502 Bad Gateway with JSON error body |
 | Inference interception: non-inference request | 403 Forbidden with JSON error body |
 | Proxy accept error | Log + break accept loop |
 | Benign connection close (EOF, reset, pipe) | Debug level (not visible to user by default) |
@@ -957,4 +1018,4 @@ On non-Linux platforms, the sandbox can still run commands with proxy-based netw
 - [Sandbox Connect](sandbox-connect.md) -- SSH tunnel from gateway to sandbox
 - [Providers](sandbox-providers.md) -- Provider credential injection
 - [Policy Language](security-policy.md) -- Rego policy syntax and rules
-- [Inference Routing](inference-routing.md) -- Gateway-side inference interception and routing
+- [Inference Routing](inference-routing.md) -- Inference interception, route management, and the `navigator-router` crate

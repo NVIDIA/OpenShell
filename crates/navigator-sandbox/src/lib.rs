@@ -36,6 +36,12 @@ use crate::proxy::ProxyHandle;
 use crate::sandbox::linux::netns::NetworkNamespace;
 pub use process::{ProcessHandle, ProcessStatus};
 
+/// How often the sandbox re-fetches the inference route bundle from the gateway
+/// in cluster mode. Keeps local route cache reasonably fresh without excessive
+/// gRPC traffic. File-based routes (`--inference-routes`) are loaded once at
+/// startup and never refreshed.
+const ROUTE_REFRESH_INTERVAL_SECS: u64 = 30;
+
 #[cfg(target_os = "linux")]
 static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -93,6 +99,7 @@ pub async fn run_sandbox(
     ssh_handshake_skew_secs: u64,
     _health_check: bool,
     _health_port: u16,
+    inference_routes: Option<String>,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -232,15 +239,13 @@ pub async fn run_sandbox(
             .into_iter()
             .collect::<Vec<_>>();
 
-        // Build inference context for rerouting intercepted inference calls
-        let inference_ctx = match (&sandbox_id, &navigator_endpoint_for_proxy) {
-            (Some(id), Some(endpoint)) => Some(Arc::new(proxy::InferenceContext::new(
-                endpoint.clone(),
-                id.clone(),
-                l7::inference::default_patterns(),
-            ))),
-            _ => None,
-        };
+        // Build inference context for local routing of intercepted inference calls.
+        let inference_ctx = build_inference_context(
+            sandbox_id.as_deref(),
+            navigator_endpoint_for_proxy.as_deref(),
+            inference_routes.as_deref(),
+        )
+        .await?;
 
         Some(
             ProxyHandle::start_with_bind_addr(
@@ -439,6 +444,143 @@ pub async fn run_sandbox(
     Ok(status.code())
 }
 
+/// Build an inference context for local routing, if route sources are available.
+///
+/// Route sources (in priority order):
+/// 1. Inference routes file (standalone mode) — always takes precedence
+/// 2. Cluster bundle (fetched from gateway via gRPC)
+///
+/// If both a routes file and cluster credentials are provided, the routes file
+/// wins and the cluster bundle is not fetched.
+///
+/// Returns `None` if neither source is configured (inference routing disabled).
+async fn build_inference_context(
+    sandbox_id: Option<&str>,
+    navigator_endpoint: Option<&str>,
+    inference_routes: Option<&str>,
+) -> Result<Option<Arc<proxy::InferenceContext>>> {
+    use navigator_router::Router;
+    use navigator_router::config::RouterConfig;
+
+    let routes = if let Some(path) = inference_routes {
+        // Standalone mode: load routes from file (fail-fast on errors)
+        if sandbox_id.is_some() {
+            info!(
+                inference_routes = %path,
+                "Inference routes file takes precedence over cluster bundle"
+            );
+        }
+        info!(inference_routes = %path, "Loading inference routes from file");
+        let config = RouterConfig::load_from_file(std::path::Path::new(path))
+            .map_err(|e| miette::miette!("failed to load inference routes {path}: {e}"))?;
+        config
+            .resolve_routes()
+            .map_err(|e| miette::miette!("failed to resolve routes from {path}: {e}"))?
+    } else if let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint) {
+        // Cluster mode: fetch bundle from gateway
+        info!(sandbox_id = %id, endpoint = %endpoint, "Fetching inference route bundle from gateway");
+        match grpc_client::fetch_inference_bundle(endpoint, id).await {
+            Ok(bundle) => {
+                info!(
+                    route_count = bundle.routes.len(),
+                    revision = %bundle.revision,
+                    "Loaded inference route bundle"
+                );
+                bundle_to_resolved_routes(&bundle)
+            }
+            Err(e) => {
+                // Distinguish "no inference policy" (expected) from server errors.
+                // gRPC PermissionDenied/NotFound means inference is not configured
+                // for this sandbox — skip gracefully. Other errors are unexpected.
+                let msg = e.to_string();
+                if msg.contains("permission denied") || msg.contains("not found") {
+                    info!(error = %e, "Sandbox has no inference policy, inference routing disabled");
+                    return Ok(None);
+                }
+                warn!(error = %e, "Failed to fetch inference bundle, inference routing disabled");
+                return Ok(None);
+            }
+        }
+    } else {
+        // No route source — inference routing is not configured
+        return Ok(None);
+    };
+
+    if routes.is_empty() {
+        info!("No usable inference routes, inference routing disabled");
+        return Ok(None);
+    }
+
+    info!(
+        route_count = routes.len(),
+        "Inference routing enabled with local execution"
+    );
+
+    let router =
+        Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
+    let patterns = l7::inference::default_patterns();
+    let ctx = Arc::new(proxy::InferenceContext::new(patterns, router, routes));
+
+    // Spawn background route cache refresh for cluster mode
+    if inference_routes.is_none()
+        && let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint)
+    {
+        spawn_route_refresh(ctx.route_cache(), id.to_string(), endpoint.to_string());
+    }
+
+    Ok(Some(ctx))
+}
+
+/// Convert a proto bundle response into resolved routes for the router.
+fn bundle_to_resolved_routes(
+    bundle: &navigator_core::proto::GetSandboxInferenceBundleResponse,
+) -> Vec<navigator_router::config::ResolvedRoute> {
+    bundle
+        .routes
+        .iter()
+        .map(|r| navigator_router::config::ResolvedRoute {
+            routing_hint: r.routing_hint.clone(),
+            endpoint: r.base_url.clone(),
+            model: r.model_id.clone(),
+            api_key: r.api_key.clone(),
+            protocols: r.protocols.clone(),
+        })
+        .collect()
+}
+
+/// Spawn a background task that periodically refreshes the route cache from the gateway.
+fn spawn_route_refresh(
+    cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
+    sandbox_id: String,
+    endpoint: String,
+) {
+    tokio::spawn(async move {
+        use tokio::time::{MissedTickBehavior, interval};
+
+        let mut tick = interval(Duration::from_secs(ROUTE_REFRESH_INTERVAL_SECS));
+        tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            tick.tick().await;
+
+            match grpc_client::fetch_inference_bundle(&endpoint, &sandbox_id).await {
+                Ok(bundle) => {
+                    let routes = bundle_to_resolved_routes(&bundle);
+                    debug!(
+                        route_count = routes.len(),
+                        revision = %bundle.revision,
+                        "Refreshed inference route cache"
+                    );
+                    *cache.write().await = routes;
+                }
+                Err(e) => {
+                    warn!(error = %e, "Failed to refresh inference route cache, keeping stale routes");
+                }
+            }
+        }
+    });
+}
+
 /// Load sandbox policy from local files or gRPC.
 ///
 /// Priority:
@@ -576,4 +718,146 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
 #[cfg(not(unix))]
 fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_to_resolved_routes_converts_all_fields() {
+        let bundle = navigator_core::proto::GetSandboxInferenceBundleResponse {
+            routes: vec![
+                navigator_core::proto::SandboxResolvedRoute {
+                    routing_hint: "frontier".to_string(),
+                    base_url: "https://api.example.com/v1".to_string(),
+                    api_key: "sk-test-key".to_string(),
+                    model_id: "gpt-4".to_string(),
+                    protocols: vec![
+                        "openai_chat_completions".to_string(),
+                        "openai_responses".to_string(),
+                    ],
+                },
+                navigator_core::proto::SandboxResolvedRoute {
+                    routing_hint: "local".to_string(),
+                    base_url: "http://vllm:8000/v1".to_string(),
+                    api_key: "local-key".to_string(),
+                    model_id: "llama-3".to_string(),
+                    protocols: vec!["openai_chat_completions".to_string()],
+                },
+            ],
+            revision: "abc123".to_string(),
+            generated_at_ms: 1000,
+        };
+
+        let routes = bundle_to_resolved_routes(&bundle);
+
+        assert_eq!(routes.len(), 2);
+        assert_eq!(routes[0].routing_hint, "frontier");
+        assert_eq!(routes[0].endpoint, "https://api.example.com/v1");
+        assert_eq!(routes[0].model, "gpt-4");
+        assert_eq!(routes[0].api_key, "sk-test-key");
+        assert_eq!(
+            routes[0].protocols,
+            vec!["openai_chat_completions", "openai_responses"]
+        );
+        assert_eq!(routes[1].routing_hint, "local");
+        assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
+    }
+
+    #[test]
+    fn bundle_to_resolved_routes_handles_empty_bundle() {
+        let bundle = navigator_core::proto::GetSandboxInferenceBundleResponse {
+            routes: vec![],
+            revision: "empty".to_string(),
+            generated_at_ms: 0,
+        };
+
+        let routes = bundle_to_resolved_routes(&bundle);
+        assert!(routes.is_empty());
+    }
+
+    // -- build_inference_context tests --
+
+    #[tokio::test]
+    async fn build_inference_context_route_file_loads_routes() {
+        use std::io::Write;
+
+        let yaml = r#"
+routes:
+  - routing_hint: local
+    endpoint: http://localhost:8000/v1
+    model: llama-3
+    protocols: [openai_chat_completions]
+    api_key: test-key
+"#;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+        let path = f.path().to_str().unwrap();
+
+        let ctx = build_inference_context(None, None, Some(path))
+            .await
+            .expect("should load routes from file");
+
+        let ctx = ctx.expect("context should be Some");
+        let cache = ctx.route_cache();
+        let routes = cache.read().await;
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].routing_hint, "local");
+    }
+
+    #[tokio::test]
+    async fn build_inference_context_empty_route_file_returns_none() {
+        use std::io::Write;
+
+        // Route file with empty routes list → inference routing disabled (not an error)
+        let yaml = "routes: []\n";
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+        let path = f.path().to_str().unwrap();
+
+        let ctx = build_inference_context(None, None, Some(path))
+            .await
+            .expect("empty routes file should not error");
+        assert!(
+            ctx.is_none(),
+            "empty routes should disable inference routing"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_inference_context_no_sources_returns_none() {
+        let ctx = build_inference_context(None, None, None)
+            .await
+            .expect("should succeed with None");
+
+        assert!(ctx.is_none(), "no sources should return None");
+    }
+
+    #[tokio::test]
+    async fn build_inference_context_route_file_overrides_cluster() {
+        use std::io::Write;
+
+        let yaml = r#"
+routes:
+  - routing_hint: file-route
+    endpoint: http://localhost:9999/v1
+    model: file-model
+    protocols: [openai_chat_completions]
+    api_key: file-key
+"#;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+        let path = f.path().to_str().unwrap();
+
+        // Even with sandbox_id and endpoint, route_file takes precedence
+        let ctx = build_inference_context(Some("sb-1"), Some("http://localhost:50051"), Some(path))
+            .await
+            .expect("should load from file");
+
+        let ctx = ctx.expect("context should be Some");
+        let cache = ctx.route_cache();
+        let routes = cache.read().await;
+        assert_eq!(routes[0].routing_hint, "file-route");
+    }
 }

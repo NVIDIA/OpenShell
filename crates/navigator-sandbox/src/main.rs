@@ -67,6 +67,12 @@ struct Args {
     #[arg(long, env = "NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS", default_value = "300")]
     ssh_handshake_skew_secs: u64,
 
+    /// Path to YAML inference routes for standalone routing.
+    /// When set, inference routes are loaded from this file instead of
+    /// fetching a bundle from the gateway.
+    #[arg(long, env = "NAVIGATOR_INFERENCE_ROUTES")]
+    inference_routes: Option<String>,
+
     /// Enable health check endpoint.
     #[arg(long)]
     health_check: bool,
@@ -154,6 +160,7 @@ async fn main() -> Result<()> {
         args.ssh_handshake_skew_secs,
         args.health_check,
         args.health_port,
+        args.inference_routes,
     )
     .await?;
 

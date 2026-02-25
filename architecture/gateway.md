@@ -28,7 +28,6 @@ graph TD
     LOG_BUS["TracingLogBus"]
     PLAT_BUS["PlatformEventBus"]
     INDEX["SandboxIndex"]
-    ROUTER["Inference Router<br/>(navigator-router)"]
 
     Client --> TCP
     TCP --> TLS
@@ -42,7 +41,6 @@ graph TD
     NAV --> STORE
     NAV --> K8S
     INF --> STORE
-    INF --> ROUTER
     SSH_TUNNEL --> STORE
     SSH_TUNNEL --> K8S
     WATCHER --> K8S
@@ -63,7 +61,7 @@ graph TD
 | Gateway runtime | `crates/navigator-server/src/lib.rs` | `ServerState` struct, `run_server()` accept loop |
 | Protocol mux | `crates/navigator-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
 | gRPC: Navigator | `crates/navigator-server/src/grpc.rs` | `NavigatorService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
-| gRPC: Inference | `crates/navigator-server/src/inference.rs` | `InferenceService` -- completion routing, inference route CRUD |
+| gRPC: Inference | `crates/navigator-server/src/inference.rs` | `InferenceService` -- inference route CRUD and sandbox inference bundle delivery |
 | HTTP | `crates/navigator-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
 | SSH tunnel | `crates/navigator-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
 | TLS | `crates/navigator-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
@@ -80,7 +78,7 @@ Proto definitions consumed by the gateway:
 | Proto file | Package | Defines |
 |------------|---------|---------|
 | `proto/navigator.proto` | `navigator.v1` | `Navigator` service, sandbox/provider/SSH/watch messages |
-| `proto/inference.proto` | `navigator.inference.v1` | `Inference` service, completion/route messages |
+| `proto/inference.proto` | `navigator.inference.v1` | `Inference` service, route CRUD messages, `GetSandboxInferenceBundle` |
 | `proto/datamodel.proto` | `navigator.datamodel.v1` | `Sandbox`, `SandboxSpec`, `SandboxStatus`, `Provider`, `SandboxPhase` |
 | `proto/sandbox.proto` | `navigator.sandbox.v1` | `SandboxPolicy`, `NetworkPolicyRule`, `InferencePolicy` |
 
@@ -92,8 +90,7 @@ The gateway boots in `main()` (`crates/navigator-server/src/main.rs`) and procee
 2. **Parse CLI arguments** -- `Args::parse()` via `clap`. Every flag has a corresponding environment variable (see [Configuration](#configuration)).
 3. **Initialize tracing** -- Creates a `TracingLogBus` and installs a tracing subscriber that writes to stdout and publishes log events keyed by `sandbox_id` into the bus.
 4. **Build `Config`** -- Assembles a `navigator_core::Config` from the parsed arguments.
-5. **Create inference router** -- `navigator_router::Router::new()`. The router is passed into `run_server` as `Option<Router>`.
-6. **Call `run_server()`** (`crates/navigator-server/src/lib.rs`):
+5. **Call `run_server()`** (`crates/navigator-server/src/lib.rs`):
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
    2. Create `SandboxClient` (initializes a `kube::Client` from in-cluster or kubeconfig).
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
@@ -140,7 +137,6 @@ pub struct ServerState {
     pub sandbox_index: SandboxIndex,
     pub sandbox_watch_bus: SandboxWatchBus,
     pub tracing_log_bus: TracingLogBus,
-    pub router: Option<Router>,
 }
 ```
 
@@ -149,7 +145,6 @@ pub struct ServerState {
 - **`sandbox_index`** -- in-memory bidirectional index mapping sandbox names and agent pod names to sandbox IDs. Used by the event tailer to correlate Kubernetes events.
 - **`sandbox_watch_bus`** -- `broadcast`-based notification bus keyed by sandbox ID. Producers call `notify(&id)` when the persisted sandbox record changes; consumers in `WatchSandbox` streams receive `()` signals and re-read the record.
 - **`tracing_log_bus`** -- captures `tracing` events that include a `sandbox_id` field and republishes them as `SandboxLogLine` messages. Maintains a per-sandbox tail buffer (default 200 entries). Also contains a nested `PlatformEventBus` for Kubernetes events.
-- **`router`** -- optional inference router (`navigator-router::Router`). `None` when the gateway is started without inference configuration.
 
 ## Protocol Multiplexing
 
@@ -238,12 +233,36 @@ These RPCs are called by sandbox pods at startup to bootstrap themselves.
 
 Defined in `proto/inference.proto`, implemented in `crates/navigator-server/src/inference.rs` as `InferenceService`.
 
+The gateway acts as the control plane for inference routes. It stores route definitions, enforces sandbox-scoped access policies, and delivers pre-filtered route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
+
+#### Route Delivery
+
 | RPC | Description |
 |-----|-------------|
-| `Completion` | Routes an LLM completion request. Requires `x-sandbox-id` header. Validates the routing hint against the sandbox's `InferencePolicy.allowed_routing_hints`. Fetches enabled `InferenceRoute` records matching allowed hints, then delegates to `navigator-router::Router::completion_with_candidates()`. |
-| `CreateInferenceRoute` | Creates a route. Validates required fields (`routing_hint`, `base_url`, `protocol`, `api_key`, `model_id`). Auto-generates name if empty. |
-| `UpdateInferenceRoute` | Updates a route by name. Preserves stored `id`. |
-| `DeleteInferenceRoute` | Deletes a route by name. |
+| `GetSandboxInferenceBundle` | Returns the set of inference routes a sandbox is authorized to use. Takes a `sandbox_id`, loads the sandbox's `InferencePolicy.allowed_routes`, fetches all enabled `InferenceRoute` records whose `routing_hint` matches, normalizes protocols, and returns them as `SandboxResolvedRoute` messages along with a revision hash and `generated_at_ms` timestamp. |
+
+The trait method delegates to the standalone function `resolve_sandbox_inference_bundle(store, sandbox_id)` (`crates/navigator-server/src/inference.rs`), which takes `&Store` and `&str` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server. The function similarly delegates route filtering to `list_sandbox_routes(store, allowed_routes)`.
+
+The `GetSandboxInferenceBundleResponse` includes:
+
+- **`routes`** -- a list of `SandboxResolvedRoute` messages, each containing `routing_hint`, `base_url`, `model_id`, `api_key`, and normalized `protocols`. These are flattened from `InferenceRoute.spec` -- no route IDs or names are exposed to the sandbox.
+- **`revision`** -- a hex-encoded hash computed from the route contents (`routing_hint`, `base_url`, `model_id`, `api_key`, `protocols`). Sandboxes can compare this value to detect when their route set has changed.
+- **`generated_at_ms`** -- epoch milliseconds when the bundle was assembled.
+
+Route filtering in `list_sandbox_routes()` (`crates/navigator-server/src/inference.rs`):
+1. Load the sandbox's `InferencePolicy.allowed_routes` into a `HashSet`.
+2. Fetch all `InferenceRoute` records from the store (up to 500).
+3. Skip routes where `enabled == false`.
+4. Skip routes whose `routing_hint` is not in the allowed set.
+5. Normalize protocols via `navigator_core::inference::normalize_protocols()` and skip routes with no valid protocols after normalization.
+
+#### Route CRUD
+
+| RPC | Description |
+|-----|-------------|
+| `CreateInferenceRoute` | Creates a route. Normalizes protocols (lowercase + dedupe), validates required fields (`routing_hint`, `base_url`, `protocols`, `model_id`). Auto-generates a 6-char name if empty. Rejects duplicates by name. |
+| `UpdateInferenceRoute` | Updates a route by name. Preserves stored `id`. Normalizes protocols and validates the spec. |
+| `DeleteInferenceRoute` | Deletes a route by name. Returns `deleted: bool`. |
 | `ListInferenceRoutes` | Paginated list (default limit 100). |
 
 ## HTTP Endpoints
@@ -488,11 +507,9 @@ Updated by the sandbox watcher on every Applied event and by gRPC handlers durin
   - `AlreadyExists` for duplicate creation
   - `FailedPrecondition` for state violations (e.g., exec on non-Ready sandbox, missing provider)
   - `Internal` for store/decode/Kubernetes failures
-  - `Unauthenticated` for missing `x-sandbox-id` header on inference requests
-  - `PermissionDenied` for policy violations
+  - `PermissionDenied` for policy violations (e.g., sandbox has no inference policy or empty `allowed_routes`)
   - `ResourceExhausted` for broadcast lag (missed messages)
   - `Cancelled` for closed broadcast channels
-  - `Unavailable` for missing inference router
 
 - **HTTP errors**: The SSH tunnel handler returns HTTP status codes directly (`401`, `404`, `405`, `412`, `500`, `502`).
 
@@ -503,6 +520,7 @@ Updated by the sandbox watcher on every Applied event and by gRPC handlers durin
 ## Cross-References
 
 - [Sandbox Architecture](sandbox.md) -- sandbox-side policy enforcement, proxy, and isolation details
+- [Inference Routing](inference-routing.md) -- end-to-end inference interception flow, sandbox-side proxy logic, and route resolution
 - [Container Management](build-containers.md) -- how sandbox container images are built and configured
 - [Sandbox Connect](sandbox-connect.md) -- client-side SSH connection flow
 - [Providers](sandbox-providers.md) -- provider credential management and injection

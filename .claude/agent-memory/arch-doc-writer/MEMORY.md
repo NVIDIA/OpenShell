@@ -18,7 +18,7 @@
 
 ## Architecture Docs
 - Files renamed from numbered prefix format to descriptive names (e.g., `2 - server-architecture.md` -> `gateway-architecture.md`)
-- Current files: README.md, sandbox-providers.md, cluster-single-node.md, build-containers.md, sandbox-connect.md, sandbox.md, security-policy.md, gateway.md, inference-routing.md, inference-routing-debug-handoff.md
+- Current files: README.md, sandbox-providers.md, cluster-single-node.md, build-containers.md, sandbox-connect.md, sandbox.md, security-policy.md, gateway.md, gateway-security.md, sandbox-custom-containers.md, inference-routing.md
 - Cross-references use plain filenames: `[text](gateway.md)`
 - Naming convention: "gateway" in prose for the control plane component; code identifiers like `navigator-server` stay unchanged
 
@@ -41,6 +41,8 @@
 
 ## Server Crate Details
 - Two gRPC services: Navigator (grpc.rs) and Inference (inference.rs), multiplexed via GrpcRouter by URI path
+- Gateway is control-plane only for inference: route CRUD + GetSandboxInferenceBundle
+- GetSandboxInferenceBundle: returns SandboxResolvedRoute list + revision hash + generated_at_ms for a sandbox_id
 - Persistence: single `objects` table, protobuf payloads, Store enum dispatches SQLite vs Postgres by URL prefix
 - Persistence CRUD: upsert ON CONFLICT (id) not (object_type, id); list ORDER BY created_at_ms ASC, name ASC (not id!)
 - --db-url has no code default; Helm values.yaml sets `sqlite:/var/navigator/navigator.db`
@@ -102,17 +104,13 @@
 - Non-CP connections use pre-resolved addrs: `TcpStream::connect(addrs.as_slice())`
 
 ## Inference Routing Details
-- Three-action OPA model: Allow, InspectForInference, Deny (see `NetworkAction` in opa.rs)
-- InspectForInference triggers: no explicit network_policy match AND inference.allowed_routes is non-empty in policy
-- Proxy handler: `handle_inference_interception()` in proxy.rs -- TLS-terminates, parses HTTP, pattern-matches, calls gateway
-- gRPC client: `proxy_inference()` in `crates/navigator-sandbox/src/grpc_client.rs`
-- Default inference patterns: POST /v1/chat/completions (openai_chat_completions), POST /v1/completions (openai_completions), POST /v1/messages (anthropic_messages)
-- Pattern detection: exact path match after stripping query string, case-insensitive method
-- Gateway route resolution: loads all InferenceRoute objects, filters by enabled + routing_hint in allowed_routes, then router selects by protocol match
-- Router: `navigator-router` crate, `proxy_with_candidates()` finds first route whose `protocols` list contains the source_protocol
-- InferenceRouteSpec proto fields: routing_hint, base_url, protocols (repeated string), api_key, model_id, enabled
-- Auth header stripping: proxy removes `Authorization` header before forwarding; gateway/router adds route's api_key as Bearer token
-- Non-inference requests on intercepted connections get 403 JSON response
+- Sandbox-local execution via navigator-router crate
+- OPA three-action model: Allow, InspectForInference, Deny (`NetworkAction` in opa.rs)
+- InferenceContext: Router + patterns + `Arc<RwLock<Vec<ResolvedRoute>>>` route cache
+- Route sources: `--inference-routes` YAML file (standalone) > cluster bundle via gRPC; empty routes gracefully disable
+- Cluster bundle refreshed every ROUTE_REFRESH_INTERVAL_SECS (30s)
+- Patterns: POST /v1/chat/completions, /v1/completions, /v1/responses, /v1/messages
+- Dev sandbox: `mise run sandbox -e VAR_NAME` forwards host env vars; NVIDIA_API_KEY always passed
 
 ## Naming Conventions
 - The project name "Navigator" appears in code but docs should use generic terms per user preference

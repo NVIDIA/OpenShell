@@ -97,6 +97,61 @@ def mock_inference_route(
         pass
 
 
+@pytest.fixture(scope="session")
+def mock_anthropic_route(
+    inference_client: InferenceRouteClient,
+) -> Iterator[str]:
+    name = "e2e-mock-anthropic"
+    routing_hint = "e2e_mock_anthropic"
+    try:
+        inference_client.delete(name)
+    except grpc.RpcError:
+        pass
+
+    inference_client.create(
+        name=name,
+        routing_hint=routing_hint,
+        base_url="mock://e2e-anthropic",
+        protocols=["anthropic_messages"],
+        api_key="mock",
+        model_id="mock/claude-test",
+        enabled=True,
+    )
+    yield name
+    try:
+        inference_client.delete(name)
+    except grpc.RpcError:
+        pass
+
+
+@pytest.fixture(scope="session")
+def mock_disallowed_route(
+    inference_client: InferenceRouteClient,
+) -> Iterator[str]:
+    """Route that exists but is NOT in any sandbox's allowed_routes."""
+    name = "e2e-mock-disallowed"
+    routing_hint = "e2e_mock_disallowed"
+    try:
+        inference_client.delete(name)
+    except grpc.RpcError:
+        pass
+
+    inference_client.create(
+        name=name,
+        routing_hint=routing_hint,
+        base_url="mock://e2e-disallowed",
+        protocols=["openai_chat_completions"],
+        api_key="mock",
+        model_id="mock/disallowed-model",
+        enabled=True,
+    )
+    yield name
+    try:
+        inference_client.delete(name)
+    except grpc.RpcError:
+        pass
+
+
 @pytest.fixture
 def run_python() -> Callable[[Sandbox, str], tuple[int, str, str]]:
     def _run(sandbox: Sandbox, code: str) -> tuple[int, str, str]:

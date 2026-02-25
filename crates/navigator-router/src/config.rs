@@ -21,13 +21,25 @@ pub struct RouteConfig {
     pub api_key_env: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ResolvedRoute {
     pub routing_hint: String,
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
     pub protocols: Vec<String>,
+}
+
+impl std::fmt::Debug for ResolvedRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedRoute")
+            .field("routing_hint", &self.routing_hint)
+            .field("endpoint", &self.endpoint)
+            .field("model", &self.model)
+            .field("api_key", &"[REDACTED]")
+            .field("protocols", &self.protocols)
+            .finish()
+    }
 }
 
 impl RouterConfig {
@@ -38,7 +50,7 @@ impl RouterConfig {
                 path.display()
             ))
         })?;
-        let config: Self = toml::from_str(&content).map_err(|e| {
+        let config: Self = serde_yaml::from_str(&content).map_err(|e| {
             RouterError::Internal(format!(
                 "failed to parse router config {}: {e}",
                 path.display()
@@ -95,5 +107,131 @@ impl RouteConfig {
             api_key: self.resolve_api_key()?,
             protocols,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn load_from_file_valid_yaml_round_trip() {
+        let yaml = r#"
+routes:
+  - routing_hint: local
+    endpoint: http://localhost:8000/v1
+    model: llama-3
+    protocols: [openai_chat_completions]
+    api_key: sk-test-key
+  - routing_hint: frontier
+    endpoint: https://api.openai.com/v1
+    model: gpt-4o
+    protocols: [openai_chat_completions, anthropic_messages]
+    api_key: sk-prod-key
+"#;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+
+        let config = RouterConfig::load_from_file(f.path()).unwrap();
+        assert_eq!(config.routes.len(), 2);
+        assert_eq!(config.routes[0].routing_hint, "local");
+        assert_eq!(config.routes[1].routing_hint, "frontier");
+
+        let resolved = config.resolve_routes().unwrap();
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].api_key, "sk-test-key");
+        assert_eq!(resolved[1].model, "gpt-4o");
+        assert_eq!(
+            resolved[1].protocols,
+            vec!["openai_chat_completions", "anthropic_messages"]
+        );
+    }
+
+    #[test]
+    fn load_from_file_invalid_yaml_returns_error() {
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(b"not: [valid: yaml: {{{{").unwrap();
+
+        let err = RouterConfig::load_from_file(f.path()).unwrap_err();
+        assert!(
+            matches!(err, RouterError::Internal(_)),
+            "expected Internal error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_from_file_missing_api_key_returns_error() {
+        let yaml = r#"
+routes:
+  - routing_hint: local
+    endpoint: http://localhost:8000/v1
+    model: llama-3
+    protocols: [openai_chat_completions]
+"#;
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+
+        let err = RouterConfig::load_from_file(f.path()).unwrap_err();
+        assert!(
+            matches!(err, RouterError::Internal(_)),
+            "expected Internal error for missing api_key, got: {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.contains("neither api_key nor api_key_env"),
+            "error should mention missing key: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_from_file_api_key_env_resolves_from_environment() {
+        let yaml = r#"
+routes:
+  - routing_hint: local
+    endpoint: http://localhost:8000/v1
+    model: llama-3
+    protocols: [openai_chat_completions]
+    api_key_env: NAV_TEST_API_KEY_FOR_YAML_TEST
+"#;
+        // SAFETY: this test runs single-threaded; no other thread reads this var.
+        unsafe { std::env::set_var("NAV_TEST_API_KEY_FOR_YAML_TEST", "from-env") };
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(yaml.as_bytes()).unwrap();
+
+        let config = RouterConfig::load_from_file(f.path()).unwrap();
+        let resolved = config.resolve_routes().unwrap();
+        assert_eq!(resolved[0].api_key, "from-env");
+
+        unsafe { std::env::remove_var("NAV_TEST_API_KEY_FOR_YAML_TEST") };
+    }
+
+    #[test]
+    fn load_from_file_nonexistent_path_returns_error() {
+        let err = RouterConfig::load_from_file(Path::new("/nonexistent/routes.yaml")).unwrap_err();
+        assert!(
+            matches!(err, RouterError::Internal(_)),
+            "expected Internal error, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolved_route_debug_redacts_api_key() {
+        let route = ResolvedRoute {
+            routing_hint: "local".to_string(),
+            endpoint: "https://api.example.com/v1".to_string(),
+            model: "test-model".to_string(),
+            api_key: "sk-super-secret-key-12345".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+        };
+        let debug_output = format!("{route:?}");
+        assert!(
+            !debug_output.contains("sk-super-secret-key-12345"),
+            "Debug output must not contain raw API key: {debug_output}"
+        );
+        assert!(
+            debug_output.contains("[REDACTED]"),
+            "Debug output should show [REDACTED] for api_key: {debug_output}"
+        );
     }
 }

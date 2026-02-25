@@ -1,0 +1,20 @@
+# Example route configuration for standalone (no-cluster) inference routing.
+#
+# Usage:
+#   navigator-sandbox \
+#     --inference-routes examples/inference/routes.yaml \
+#     --policy-rules policy.rego \
+#     --policy-data examples/inference/sandbox-policy.yaml \
+#     -- python examples/inference/inference.py
+
+routes:
+  - routing_hint: local
+    endpoint: http://localhost:1234/v1
+    model: local-model
+    protocols:
+      - openai_chat_completions
+    # Inline API key (for local models that require one):
+    api_key: lm-studio
+
+    # Or reference an environment variable instead:
+    # api_key_env: OPENAI_API_KEY

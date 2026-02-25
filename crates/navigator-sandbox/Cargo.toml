@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 navigator-core = { path = "../navigator-core" }
+navigator-router = { path = "../navigator-router" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -42,6 +43,9 @@ rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 rcgen = { workspace = true }
 webpki-roots = { workspace = true }
+
+# HTTP
+bytes = { workspace = true }
 
 # Serialization
 serde_json = { workspace = true }

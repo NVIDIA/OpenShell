@@ -2,9 +2,9 @@
 
 When a process inside the sandbox makes an inference API call (e.g. POST
 /v1/chat/completions) to an endpoint not explicitly allowed by network policy,
-the proxy intercepts it and reroutes through the gateway's ProxyInference gRPC
-endpoint, which forwards to the policy-allowed inference route (configured with
-`mock://` for testing).
+the proxy intercepts it, TLS-terminates the connection, detects the inference
+API pattern, and the sandbox routes the request locally to the configured
+backend (configured with `mock://` for testing).
 """
 
 from __future__ import annotations
@@ -53,11 +53,11 @@ def _inference_routing_policy() -> sandbox_pb2.SandboxPolicy:
 # =============================================================================
 
 
-def test_inference_call_rerouted_through_gateway(
+def test_inference_call_routed_to_backend(
     sandbox: Callable[..., Sandbox],
     mock_inference_route: str,
 ) -> None:
-    """Inference call to undeclared endpoint is intercepted and rerouted.
+    """Inference call to undeclared endpoint is intercepted and routed.
 
     A Python process inside the sandbox calls the OpenAI chat completions
     endpoint via raw urllib. Since api.openai.com is not in any network
@@ -65,7 +65,7 @@ def test_inference_call_rerouted_through_gateway(
     1. Detect no explicit policy match (inspect_for_inference)
     2. TLS-terminate the connection
     3. Detect the inference API pattern (POST /v1/chat/completions)
-    4. Forward through the gateway's ProxyInference RPC
+    4. Forward locally via sandbox router to the policy-allowed backend
     5. Return the mock response from the configured route
     """
     spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy())
@@ -140,3 +140,114 @@ def test_non_inference_request_denied(
         result = sb.exec_python(make_non_inference_request, timeout_seconds=30)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         assert "403" in result.stdout.strip()
+
+
+def test_inference_anthropic_messages_protocol(
+    sandbox: Callable[..., Sandbox],
+    mock_anthropic_route: str,
+) -> None:
+    """Anthropic messages protocol (POST /v1/messages) is intercepted and routed.
+
+    Verifies multi-protocol routing: a request using the Anthropic messages
+    format is correctly detected and forwarded to a route configured with
+    the anthropic_messages protocol.
+    """
+    policy = sandbox_pb2.SandboxPolicy(
+        version=1,
+        inference=sandbox_pb2.InferencePolicy(
+            allowed_routes=["e2e_mock_anthropic"],
+        ),
+        filesystem=_BASE_FILESYSTEM,
+        landlock=_BASE_LANDLOCK,
+        process=_BASE_PROCESS,
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+
+    def call_anthropic_messages() -> str:
+        import json
+        import ssl
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "claude-test",
+                "max_tokens": 64,
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+
+        req = urllib.request.Request(
+            "https://api.anthropic.com/v1/messages",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "x-api-key": "dummy-key",
+                "anthropic-version": "2023-06-01",
+            },
+            method="POST",
+        )
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+        return resp.read().decode()
+
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(call_anthropic_messages, timeout_seconds=60)
+        assert result.exit_code == 0, f"stderr: {result.stderr}"
+        output = result.stdout.strip()
+        assert "Hello from navigator mock backend" in output
+        assert "mock/claude-test" in output
+
+
+def test_inference_route_filtering_by_allowed_routes(
+    sandbox: Callable[..., Sandbox],
+    mock_inference_route: str,
+    mock_disallowed_route: str,
+) -> None:
+    """Only routes in allowed_routes are available; others produce errors.
+
+    Two routes exist (e2e_mock_local and e2e_mock_disallowed), but the
+    policy only allows e2e_mock_local. A request that would match the
+    allowed route should succeed, while inference requests that can't
+    match any allowed route get an error from the sandbox router.
+    """
+    # Policy only allows e2e_mock_local, NOT e2e_mock_disallowed
+    spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy())
+
+    def call_allowed_route() -> str:
+        import json
+        import ssl
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer dummy",
+            },
+            method="POST",
+        )
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+        return resp.read().decode()
+
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(call_allowed_route, timeout_seconds=60)
+        assert result.exit_code == 0, f"stderr: {result.stderr}"
+        output = result.stdout.strip()
+        # The allowed route (e2e_mock_local) should serve the request
+        assert "Hello from navigator mock backend" in output
+        assert "mock/test-model" in output

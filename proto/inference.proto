@@ -5,11 +5,11 @@ package navigator.inference.v1;
 option java_multiple_files = true;
 option java_package = "com.anthropic.navigator.inference.v1";
 
-// Inference service provides LLM completion capabilities.
+// Inference service provides LLM route management and sandbox route delivery.
 service Inference {
-  // Proxy a raw HTTP inference request through the router.
-  // Used by the sandbox supervisor to reroute intercepted SDK calls.
-  rpc ProxyInference(ProxyInferenceRequest) returns (ProxyInferenceResponse);
+  // Return the pre-filtered set of routes a sandbox is allowed to execute.
+  rpc GetSandboxInferenceBundle(GetSandboxInferenceBundleRequest)
+      returns (GetSandboxInferenceBundleResponse);
 
   // Create a new inference route.
   rpc CreateInferenceRoute(CreateInferenceRouteRequest) returns (InferenceRouteResponse);
@@ -76,34 +76,24 @@ message InferenceRouteResponse {
   InferenceRoute route = 1;
 }
 
-// HTTP header key-value pair.
-message HttpHeader {
-  string name = 1;
-  string value = 2;
-}
-
-// Request to proxy a raw HTTP inference call through the router.
-message ProxyInferenceRequest {
-  // Sandbox making the request (for policy lookup).
+message GetSandboxInferenceBundleRequest {
+  // Sandbox to fetch routes for (used for policy-based filtering).
   string sandbox_id = 1;
-  // Source protocol (e.g. "openai_chat_completions") to match compatible routes.
-  string source_protocol = 2;
-  // HTTP method (e.g. "POST").
-  string http_method = 3;
-  // HTTP path (e.g. "/v1/chat/completions").
-  string http_path = 4;
-  // HTTP headers (auth headers stripped by the supervisor).
-  repeated HttpHeader http_headers = 5;
-  // Raw HTTP request body.
-  bytes http_body = 6;
 }
 
-// Response from the proxied inference call.
-message ProxyInferenceResponse {
-  // HTTP status code from the upstream backend.
-  int32 http_status = 1;
-  // HTTP response headers.
-  repeated HttpHeader http_headers = 2;
-  // Raw HTTP response body.
-  bytes http_body = 3;
+// A single resolved route ready for sandbox-local execution.
+message SandboxResolvedRoute {
+  string routing_hint = 1;
+  string base_url = 2;
+  repeated string protocols = 3;
+  string api_key = 4;
+  string model_id = 5;
+}
+
+message GetSandboxInferenceBundleResponse {
+  repeated SandboxResolvedRoute routes = 1;
+  // Opaque revision tag for cache freshness checks.
+  string revision = 2;
+  // Timestamp (epoch ms) when this bundle was generated.
+  int64 generated_at_ms = 3;
 }

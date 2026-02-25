@@ -1,9 +1,10 @@
-//! gRPC client for fetching sandbox policy and provider environment from Navigator server.
+//! gRPC client for fetching sandbox policy, provider environment, and inference
+//! route bundles from Navigator server.
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
-    GetSandboxPolicyRequest, GetSandboxProviderEnvironmentRequest, HttpHeader,
-    ProxyInferenceRequest, ProxyInferenceResponse, SandboxPolicy as ProtoSandboxPolicy,
+    GetSandboxInferenceBundleRequest, GetSandboxInferenceBundleResponse, GetSandboxPolicyRequest,
+    GetSandboxProviderEnvironmentRequest, SandboxPolicy as ProtoSandboxPolicy,
     inference_client::InferenceClient, navigator_client::NavigatorClient,
 };
 use std::collections::HashMap;
@@ -63,15 +64,6 @@ async fn connect(endpoint: &str) -> Result<NavigatorClient<Channel>> {
 }
 
 /// Fetch sandbox policy from Navigator server via gRPC.
-///
-/// # Arguments
-///
-/// * `endpoint` - The Navigator server gRPC endpoint (e.g., `https://navigator:8080`)
-/// * `sandbox_id` - The sandbox ID to fetch policy for
-///
-/// # Errors
-///
-/// Returns an error if the gRPC connection fails or the sandbox is not found.
 pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<ProtoSandboxPolicy> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to Navigator server");
 
@@ -97,15 +89,6 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<ProtoSandb
 /// Returns a map of environment variable names to values derived from provider
 /// credentials configured on the sandbox. Returns an empty map if the sandbox
 /// has no providers or the call fails.
-///
-/// # Arguments
-///
-/// * `endpoint` - The Navigator server gRPC endpoint (e.g., `https://navigator:8080`)
-/// * `sandbox_id` - The sandbox ID to fetch provider environment for
-///
-/// # Errors
-///
-/// Returns an error if the gRPC connection fails or the sandbox is not found.
 pub async fn fetch_provider_environment(
     endpoint: &str,
     sandbox_id: &str,
@@ -124,60 +107,22 @@ pub async fn fetch_provider_environment(
     Ok(response.into_inner().environment)
 }
 
-/// A reusable gRPC client for the inference service.
-///
-/// Wraps a tonic channel that is connected once and reused for all
-/// subsequent `ProxyInference` calls, avoiding per-request connection overhead.
-#[derive(Clone)]
-pub struct CachedInferenceClient {
-    client: InferenceClient<Channel>,
-}
+/// Fetch the pre-filtered inference route bundle for a sandbox.
+pub async fn fetch_inference_bundle(
+    endpoint: &str,
+    sandbox_id: &str,
+) -> Result<GetSandboxInferenceBundleResponse> {
+    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching inference route bundle");
 
-impl CachedInferenceClient {
-    pub async fn connect(endpoint: &str) -> Result<Self> {
-        debug!(endpoint = %endpoint, "Connecting inference gRPC client");
-        let channel = connect_channel(endpoint).await?;
-        let client = InferenceClient::new(channel);
-        Ok(Self { client })
-    }
+    let channel = connect_channel(endpoint).await?;
+    let mut client = InferenceClient::new(channel);
 
-    /// Forward an intercepted inference request to the gateway via gRPC.
-    pub async fn proxy_inference(
-        &self,
-        sandbox_id: &str,
-        source_protocol: &str,
-        http_method: &str,
-        http_path: &str,
-        http_headers: Vec<(String, String)>,
-        http_body: Vec<u8>,
-    ) -> Result<ProxyInferenceResponse> {
-        debug!(
-            sandbox_id = %sandbox_id,
-            source_protocol = %source_protocol,
-            method = %http_method,
-            path = %http_path,
-            "Forwarding inference request to gateway"
-        );
+    let response = client
+        .get_sandbox_inference_bundle(GetSandboxInferenceBundleRequest {
+            sandbox_id: sandbox_id.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
 
-        let headers: Vec<HttpHeader> = http_headers
-            .into_iter()
-            .map(|(name, value)| HttpHeader { name, value })
-            .collect();
-
-        let response = self
-            .client
-            .clone()
-            .proxy_inference(ProxyInferenceRequest {
-                sandbox_id: sandbox_id.to_string(),
-                source_protocol: source_protocol.to_string(),
-                http_method: http_method.to_string(),
-                http_path: http_path.to_string(),
-                http_headers: headers,
-                http_body,
-            })
-            .await
-            .into_diagnostic()?;
-
-        Ok(response.into_inner())
-    }
+    Ok(response.into_inner())
 }
