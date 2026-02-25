@@ -43,6 +43,20 @@ pub async fn proxy_to_backend(
         builder = builder.header(name.as_str(), value.as_str());
     }
 
+    // Set the "model" field in the JSON body to the route's configured model so the
+    // backend receives the correct model ID regardless of what the client sent.
+    let body = match serde_json::from_slice::<serde_json::Value>(&body) {
+        Ok(mut json) => {
+            if let Some(obj) = json.as_object_mut() {
+                obj.insert(
+                    "model".to_string(),
+                    serde_json::Value::String(route.model.clone()),
+                );
+            }
+            bytes::Bytes::from(serde_json::to_vec(&json).unwrap_or_else(|_| body.to_vec()))
+        }
+        Err(_) => body,
+    };
     builder = builder.body(body);
 
     let response = builder.send().await.map_err(|e| {

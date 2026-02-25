@@ -12,7 +12,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 | `crates/navigator-sandbox/src/grpc_client.rs` | `fetch_inference_bundle()` -- fetches the pre-filtered route bundle from the gateway |
 | `crates/navigator-sandbox/src/opa.rs` | `NetworkAction` enum, `evaluate_network_action()` -- tri-state routing decision |
 | `crates/navigator-router/src/lib.rs` | `Router` -- protocol-based route selection and request forwarding |
-| `crates/navigator-router/src/backend.rs` | `proxy_to_backend()` -- HTTP request forwarding with auth header rewriting |
+| `crates/navigator-router/src/backend.rs` | `proxy_to_backend()` -- HTTP request forwarding with auth header and model ID rewriting |
 | `crates/navigator-router/src/config.rs` | `RouterConfig`, `RouteConfig`, `ResolvedRoute` -- route configuration types and YAML loading |
 | `crates/navigator-router/src/mock.rs` | Mock route support (`mock://` scheme) for testing |
 | `crates/navigator-server/src/inference.rs` | `InferenceService` gRPC implementation -- route CRUD and bundle delivery (control plane only) |
@@ -76,7 +76,8 @@ sequenceDiagram
     Proxy->>Proxy: Strip Authorization + hop-by-hop headers
     Proxy->>Router: proxy_with_candidates(protocol, method, path, headers, body, routes)
     Router->>Router: Find compatible route (protocol match)
-    Router->>Backend: POST /v1/chat/completions (with route's API key)
+    Router->>Router: Rewrite Authorization, Host, and model in body
+    Router->>Backend: POST /v1/chat/completions
     Backend-->>Router: 200 OK (response body)
     Router-->>Proxy: ProxyResponse(status, headers, body)
     Proxy-->>Agent: HTTP 200 OK (re-encrypted via TLS)
@@ -395,9 +396,11 @@ All mock responses include an `x-navigator-mock: true` header and use the route'
 
 3. **Forward headers**: All headers except `authorization` and `host` are forwarded from the original request.
 
-4. **Timeout**: 60 seconds (set at `Client` construction time).
+4. **Model ID rewrite**: If the request body is valid JSON containing a `"model"` key, the value is replaced with `route.model`. This ensures the backend receives the model ID it serves, not the client's original model alias. If the body is not JSON or has no `"model"` key, it is forwarded unchanged.
 
-5. **Error classification**:
+5. **Timeout**: 60 seconds (set at `Client` construction time).
+
+6. **Error classification**:
 
 | Condition | Error variant |
 |-----------|--------------|

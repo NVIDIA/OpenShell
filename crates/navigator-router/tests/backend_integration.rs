@@ -1,6 +1,6 @@
 use navigator_router::Router;
 use navigator_router::config::{ResolvedRoute, RouteConfig, RouterConfig};
-use wiremock::matchers::{bearer_token, method, path};
+use wiremock::matchers::{bearer_token, body_partial_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
@@ -196,6 +196,83 @@ async fn proxy_mock_route_returns_canned_response() {
         resp_body["choices"][0]["message"]["content"],
         "Hello from navigator mock backend"
     );
+}
+
+#[tokio::test]
+async fn proxy_overrides_model_in_request_body() {
+    let mock_server = MockServer::start().await;
+
+    // The mock expects the route's model, NOT the client's original model
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "model": "meta/llama-3.1-8b-instruct"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
+
+    // Client sends "gpt-4o-mini" but route is configured with "meta/llama-3.1-8b-instruct"
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "gpt-4o-mini",
+        "messages": [{"role": "user", "content": "Hello"}]
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn proxy_inserts_model_when_absent_from_body() {
+    let mock_server = MockServer::start().await;
+
+    // The mock expects the route's model to be inserted even though the client didn't send one
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .and(body_partial_json(serde_json::json!({
+            "model": "meta/llama-3.1-8b-instruct"
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = mock_candidates(&mock_server.uri());
+
+    // Client omits "model" entirely
+    let body = serde_json::to_vec(&serde_json::json!({
+        "messages": [{"role": "user", "content": "Hello"}]
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "openai_chat_completions",
+            "POST",
+            "/v1/chat/completions",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
 }
 
 #[test]
