@@ -75,7 +75,10 @@ async fn ssh_session_config(
 }
 
 /// If the server-provided gateway host is a loopback address, use the host
-/// from the cluster endpoint instead so the CLI connects to the right machine.
+/// and port from the cluster endpoint instead so the CLI connects to the right
+/// machine. The server returns its internal bind address (e.g. 0.0.0.0:8080)
+/// which may not be reachable from outside — the cluster URL has the actual
+/// Docker-mapped or tunnel port.
 fn resolve_ssh_gateway(gateway_host: &str, gateway_port: u16, cluster_url: &str) -> (String, u16) {
     let is_loopback = gateway_host == "127.0.0.1"
         || gateway_host == "0.0.0.0"
@@ -86,16 +89,20 @@ fn resolve_ssh_gateway(gateway_host: &str, gateway_port: u16, cluster_url: &str)
         return (gateway_host.to_string(), gateway_port);
     }
 
-    // Try to extract the host from the cluster URL
+    // Extract host and port from the cluster URL. The cluster URL represents
+    // the externally reachable endpoint (e.g. Docker port-mapped address).
     if let Ok(url) = url::Url::parse(cluster_url)
         && let Some(host) = url.host_str()
     {
-        // Only override if the cluster endpoint is not also a loopback address
+        let cluster_port = url.port().unwrap_or(gateway_port);
         let cluster_is_loopback =
             host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
         if !cluster_is_loopback {
-            return (host.to_string(), gateway_port);
+            // Remote cluster: use the remote host but keep the cluster URL port.
+            return (host.to_string(), cluster_port);
         }
+        // Local cluster: both loopback — use cluster URL's port (Docker-mapped).
+        return (gateway_host.to_string(), cluster_port);
     }
 
     (gateway_host.to_string(), gateway_port)
