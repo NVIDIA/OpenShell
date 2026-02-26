@@ -128,18 +128,39 @@ enum Commands {
     },
 
     /// SSH proxy (used by `ProxyCommand`).
+    ///
+    /// Two mutually exclusive modes:
+    ///
+    /// **Token mode** (used internally by `sandbox connect`):
+    ///   `nav ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///
+    /// **Name mode** (for use in `~/.ssh/config`):
+    ///   `nav ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
+        /// Required in token mode.
         #[arg(long)]
-        gateway: String,
+        gateway: Option<String>,
 
-        /// Sandbox id.
+        /// Sandbox id. Required in token mode.
         #[arg(long)]
-        sandbox_id: String,
+        sandbox_id: Option<String>,
 
-        /// SSH session token.
+        /// SSH session token. Required in token mode.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
+
+        /// Cluster endpoint URL. Used in name mode. Deprecated: prefer --cluster.
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Cluster name (resolves endpoint from stored metadata). Used in name mode.
+        #[arg(long, short)]
+        cluster: Option<String>,
+
+        /// Sandbox name. Used in name mode.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
 
@@ -509,6 +530,15 @@ enum SandboxCommands {
         /// Minimum log level to display: error, warn, info (default), debug, trace.
         #[arg(long, default_value = "")]
         level: String,
+    },
+
+    /// Print an SSH config entry for a sandbox.
+    ///
+    /// Outputs a Host block suitable for appending to ~/.ssh/config,
+    /// enabling tools like `VSCode` Remote-SSH to connect to the sandbox.
+    SshConfig {
+        /// Sandbox name.
+        name: String,
     },
 }
 
@@ -1006,6 +1036,9 @@ async fn main() -> Result<()> {
                             )
                             .await?;
                         }
+                        SandboxCommands::SshConfig { name } => {
+                            run::print_ssh_config(&ctx.name, &name);
+                        }
                     }
                 }
             }
@@ -1129,8 +1162,42 @@ async fn main() -> Result<()> {
             gateway,
             sandbox_id,
             token,
+            server,
+            cluster,
+            name,
         }) => {
-            run::sandbox_ssh_proxy(&gateway, &sandbox_id, &token, &tls).await?;
+            match (gateway, sandbox_id, token, server, cluster, name) {
+                // Token mode (existing behavior): pre-created session credentials.
+                (Some(gw), Some(sid), Some(tok), _, _, _) => {
+                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &tls).await?;
+                }
+                // Name mode with --cluster: resolve endpoint from metadata.
+                (_, _, _, server_override, Some(c), Some(n)) => {
+                    let endpoint = if let Some(srv) = server_override {
+                        srv
+                    } else {
+                        let meta = load_cluster_metadata(&c).map_err(|_| {
+                            miette::miette!(
+                                "Unknown cluster '{c}'.\n\
+                                 Deploy it first: nav cluster admin deploy --name {c}\n\
+                                 Or list available clusters: nav cluster list"
+                            )
+                        })?;
+                        meta.gateway_endpoint
+                    };
+                    let tls = tls.with_cluster_name(&c);
+                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
+                }
+                // Legacy name mode with --server only (no --cluster).
+                (_, _, _, Some(srv), None, Some(n)) => {
+                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
+                }
+                _ => {
+                    return Err(miette::miette!(
+                        "provide either --gateway/--sandbox-id/--token or --cluster/--name (or --server/--name)"
+                    ));
+                }
+            }
         }
         None => {
             Cli::command().print_help().expect("Failed to print help");

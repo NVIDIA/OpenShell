@@ -53,7 +53,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 # Create supervisor and sandbox users/groups
 RUN groupadd -r supervisor && useradd -r -g supervisor -s /usr/sbin/nologin supervisor && \
-    groupadd -r sandbox && useradd -r -g sandbox -s /usr/sbin/nologin sandbox
+    groupadd -r sandbox && useradd -r -g sandbox -d /sandbox -s /bin/bash sandbox
 
 # Stage 3: Python dependencies builder
 FROM base AS builder
@@ -142,6 +142,14 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     chown supervisor:supervisor /var/log/navigator.log && \
     chmod 0664 /var/log/navigator.log && \
     chown sandbox:sandbox /sandbox && \
+    # Minimal shell init files so interactive and non-interactive shells
+    # get a sane PATH and prompt.  Without these, bash sources nothing
+    # under /sandbox and tools like VS Code Remote-SSH may mis-detect
+    # the platform.
+    printf 'export PATH="/app/.venv/bin:$PATH"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
+        > /sandbox/.bashrc && \
+    printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > /sandbox/.profile && \
+    chown sandbox:sandbox /sandbox/.bashrc /sandbox/.profile && \
     # Install agent skills into the sandbox user's home directory
     # so Claude and other agents can discover them at runtime.
     # Sources: ai-pim-utils (.deb) and custom navigator skills.

@@ -18,6 +18,8 @@ use tokio_rustls::TlsConnector;
 struct SshSessionConfig {
     proxy_command: String,
     sandbox_id: String,
+    gateway_url: String,
+    token: String,
 }
 
 async fn ssh_session_config(
@@ -70,7 +72,9 @@ async fn ssh_session_config(
 
     Ok(SshSessionConfig {
         proxy_command,
-        sandbox_id: session.sandbox_id,
+        sandbox_id: session.sandbox_id.clone(),
+        gateway_url,
+        token: session.token,
     })
 }
 
@@ -766,6 +770,46 @@ pub async fn sandbox_ssh_proxy(
     to_remote.abort();
 
     Ok(())
+}
+
+/// Run the SSH proxy in "name mode": create a session on the fly, then proxy.
+///
+/// This is equivalent to [`sandbox_ssh_proxy`] but accepts a cluster endpoint
+/// and sandbox name instead of pre-created gateway/token credentials.  It is
+/// suitable for use as an SSH `ProxyCommand` in `~/.ssh/config` because it
+/// creates a fresh session on every invocation.
+pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let session = ssh_session_config(server, name, tls).await?;
+    sandbox_ssh_proxy(
+        &session.gateway_url,
+        &session.sandbox_id,
+        &session.token,
+        tls,
+    )
+    .await
+}
+
+/// Print an SSH config `Host` block for a sandbox to stdout.
+///
+/// The output is suitable for appending to `~/.ssh/config` so that tools like
+/// `VSCode` Remote-SSH can connect to the sandbox by host alias.
+///
+/// The `ProxyCommand` uses `--cluster` so that `ssh-proxy` resolves the
+/// gateway endpoint and TLS certificates from the cluster metadata directory
+/// (`~/.config/navigator/clusters/<name>/mtls/`).
+pub fn print_ssh_config(cluster: &str, name: &str) {
+    let exe = std::env::current_exe().expect("failed to resolve navigator executable");
+    let exe = shell_escape(&exe.to_string_lossy());
+
+    let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
+
+    println!("Host nav-{name}");
+    println!("    User sandbox");
+    println!("    StrictHostKeyChecking no");
+    println!("    UserKnownHostsFile /dev/null");
+    println!("    GlobalKnownHostsFile /dev/null");
+    println!("    LogLevel ERROR");
+    println!("    ProxyCommand {proxy_cmd}");
 }
 
 /// Copy all bytes from `reader` to `writer`, flushing on completion.
