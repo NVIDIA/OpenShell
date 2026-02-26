@@ -95,12 +95,8 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
     && cp /root/.local/bin/claude /usr/local/bin/claude \
     && chmod 755 /usr/local/bin/claude
 
-# Install OpenClaw CLI via npm (the native installer uses npm under the hood;
-# installing directly avoids TTY and onboarding issues in Docker builds)
-RUN npm install -g openclaw@2026.2.9
-
 # Install OpenCode CLI and Codex CLI (OpenAI)
-RUN npm install -g opencode-ai @openai/codex
+RUN npm install -g opencode-ai @openai/codex openclaw
 
 # Install GitHub CLI (gh) via official Debian repository
 RUN mkdir -p -m 755 /etc/apt/keyrings && \
@@ -147,7 +143,7 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     # under /sandbox and tools like VS Code Remote-SSH may mis-detect
     # the platform.
     printf 'export PATH="/app/.venv/bin:$PATH"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
-        > /sandbox/.bashrc && \
+    > /sandbox/.bashrc && \
     printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > /sandbox/.profile && \
     chown sandbox:sandbox /sandbox/.bashrc /sandbox/.profile && \
     # Install agent skills into the sandbox user's home directory
