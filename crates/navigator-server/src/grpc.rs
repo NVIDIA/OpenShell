@@ -32,7 +32,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use russh::ChannelMsg;
 use russh::client::AuthResult;
@@ -580,7 +580,7 @@ impl Navigator for NavigatorService {
         if let Some(record) = latest {
             let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
-            info!(
+            debug!(
                 sandbox_id = %sandbox_id,
                 version = record.version,
                 "GetSandboxPolicy served from policy history"
