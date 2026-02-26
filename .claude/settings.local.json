@@ -1,0 +1,11 @@
+{
+  "sandbox": {
+    "enabled": true,
+    "autoAllowBashIfSandboxed": true
+  },
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:code.claude.com)"
+    ]
+  }
+}

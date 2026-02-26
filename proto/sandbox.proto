@@ -125,4 +125,8 @@ message GetSandboxPolicyRequest {
 message GetSandboxPolicyResponse {
   // The sandbox policy configuration.
   SandboxPolicy policy = 1;
+  // Current policy version (monotonically increasing per sandbox).
+  uint32 version = 2;
+  // SHA-256 hash of the serialized policy payload.
+  string policy_hash = 3;
 }

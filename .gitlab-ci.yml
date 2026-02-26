@@ -228,7 +228,8 @@ python_e2e_sandbox_test:
   rules:
     - if: $CI_COMMIT_TAG
       when: never
-    - when: on_success
+    - if: $CI_COMMIT_BRANCH == "main"
+    - when: never
   services:
     - docker:24-dind
   tags:

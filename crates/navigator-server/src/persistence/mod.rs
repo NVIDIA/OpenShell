@@ -22,6 +22,20 @@ pub struct ObjectRecord {
     pub updated_at_ms: i64,
 }
 
+/// Stored sandbox policy revision record.
+#[derive(Debug, Clone)]
+pub struct PolicyRecord {
+    pub id: String,
+    pub sandbox_id: String,
+    pub version: i64,
+    pub policy_payload: Vec<u8>,
+    pub policy_hash: String,
+    pub status: String,
+    pub load_error: Option<String>,
+    pub created_at_ms: i64,
+    pub loaded_at_ms: Option<i64>,
+}
+
 /// Persistence store implementations.
 #[derive(Debug, Clone)]
 pub enum Store {
@@ -122,6 +136,121 @@ impl Store {
             Self::Sqlite(store) => store.list(object_type, limit, offset).await,
         }
     }
+
+    // -----------------------------------------------------------------------
+    // Policy revision operations
+    // -----------------------------------------------------------------------
+
+    /// Insert a new policy revision.
+    pub async fn put_policy_revision(
+        &self,
+        id: &str,
+        sandbox_id: &str,
+        version: i64,
+        payload: &[u8],
+        hash: &str,
+    ) -> Result<()> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .put_policy_revision(id, sandbox_id, version, payload, hash)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .put_policy_revision(id, sandbox_id, version, payload, hash)
+                    .await
+            }
+        }
+    }
+
+    /// Get the latest policy revision for a sandbox (by highest version, any status).
+    pub async fn get_latest_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => store.get_latest_policy(sandbox_id).await,
+            Self::Sqlite(store) => store.get_latest_policy(sandbox_id).await,
+        }
+    }
+
+    /// Get the latest loaded policy revision for a sandbox.
+    pub async fn get_latest_loaded_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => store.get_latest_loaded_policy(sandbox_id).await,
+            Self::Sqlite(store) => store.get_latest_loaded_policy(sandbox_id).await,
+        }
+    }
+
+    /// Get a specific policy revision by sandbox id and version.
+    pub async fn get_policy_by_version(
+        &self,
+        sandbox_id: &str,
+        version: i64,
+    ) -> Result<Option<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => store.get_policy_by_version(sandbox_id, version).await,
+            Self::Sqlite(store) => store.get_policy_by_version(sandbox_id, version).await,
+        }
+    }
+
+    /// List policy revisions for a sandbox, ordered by version descending.
+    pub async fn list_policies(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<PolicyRecord>> {
+        match self {
+            Self::Postgres(store) => store.list_policies(sandbox_id, limit, offset).await,
+            Self::Sqlite(store) => store.list_policies(sandbox_id, limit, offset).await,
+        }
+    }
+
+    /// Update the status of a policy revision.
+    pub async fn update_policy_status(
+        &self,
+        sandbox_id: &str,
+        version: i64,
+        status: &str,
+        load_error: Option<&str>,
+        loaded_at_ms: Option<i64>,
+    ) -> Result<bool> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .update_policy_status(sandbox_id, version, status, load_error, loaded_at_ms)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .update_policy_status(sandbox_id, version, status, load_error, loaded_at_ms)
+                    .await
+            }
+        }
+    }
+
+    /// Mark all pending and loaded policy revisions older than `before_version` as superseded.
+    pub async fn supersede_older_policies(
+        &self,
+        sandbox_id: &str,
+        before_version: i64,
+    ) -> Result<u64> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .supersede_older_policies(sandbox_id, before_version)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .supersede_older_policies(sandbox_id, before_version)
+                    .await
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Generic protobuf message helpers
+    // -----------------------------------------------------------------------
 
     /// Insert or update a protobuf message using its inferred object type, id, and name.
     pub async fn put_message<T: Message + ObjectType + ObjectId + ObjectName>(

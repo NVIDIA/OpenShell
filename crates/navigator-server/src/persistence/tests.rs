@@ -261,3 +261,235 @@ impl ObjectName for ObjectForTest {
         &self.name
     }
 }
+
+// ---------------------------------------------------------------------------
+// Policy revision tests
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn policy_put_and_get_latest() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"policy-v1", "hash1")
+        .await
+        .unwrap();
+
+    let latest = store.get_latest_policy("sandbox-1").await.unwrap().unwrap();
+    assert_eq!(latest.version, 1);
+    assert_eq!(latest.policy_hash, "hash1");
+    assert_eq!(latest.status, "pending");
+    assert_eq!(latest.policy_payload, b"policy-v1");
+
+    // Add version 2
+    store
+        .put_policy_revision("p2", "sandbox-1", 2, b"policy-v2", "hash2")
+        .await
+        .unwrap();
+
+    let latest = store.get_latest_policy("sandbox-1").await.unwrap().unwrap();
+    assert_eq!(latest.version, 2);
+    assert_eq!(latest.policy_hash, "hash2");
+}
+
+#[tokio::test]
+async fn policy_get_by_version() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+    store
+        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .await
+        .unwrap();
+
+    let v1 = store
+        .get_policy_by_version("sandbox-1", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v1.version, 1);
+    assert_eq!(v1.policy_hash, "h1");
+
+    let v2 = store
+        .get_policy_by_version("sandbox-1", 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v2.version, 2);
+    assert_eq!(v2.policy_hash, "h2");
+
+    let none = store.get_policy_by_version("sandbox-1", 99).await.unwrap();
+    assert!(none.is_none());
+}
+
+#[tokio::test]
+async fn policy_update_status_and_get_loaded() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+
+    // No loaded policy yet.
+    let loaded = store.get_latest_loaded_policy("sandbox-1").await.unwrap();
+    assert!(loaded.is_none());
+
+    // Mark as loaded.
+    let updated = store
+        .update_policy_status("sandbox-1", 1, "loaded", None, Some(1000))
+        .await
+        .unwrap();
+    assert!(updated);
+
+    let loaded = store
+        .get_latest_loaded_policy("sandbox-1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.version, 1);
+    assert_eq!(loaded.status, "loaded");
+    assert_eq!(loaded.loaded_at_ms, Some(1000));
+}
+
+#[tokio::test]
+async fn policy_status_failed_with_error() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+
+    store
+        .update_policy_status("sandbox-1", 1, "failed", Some("L7 validation error"), None)
+        .await
+        .unwrap();
+
+    let record = store
+        .get_policy_by_version("sandbox-1", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(record.status, "failed");
+    assert_eq!(record.load_error.as_deref(), Some("L7 validation error"));
+}
+
+#[tokio::test]
+async fn policy_supersede_older() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+    store
+        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .await
+        .unwrap();
+    store
+        .put_policy_revision("p3", "sandbox-1", 3, b"v3", "h3")
+        .await
+        .unwrap();
+
+    // Mark v1 as loaded.
+    store
+        .update_policy_status("sandbox-1", 1, "loaded", None, Some(1000))
+        .await
+        .unwrap();
+
+    // Supersede all older revisions (pending + loaded) before v3.
+    let count = store
+        .supersede_older_policies("sandbox-1", 3)
+        .await
+        .unwrap();
+    assert_eq!(count, 2); // v1 (loaded) + v2 (pending) both < v3
+
+    let v1 = store
+        .get_policy_by_version("sandbox-1", 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v1.status, "superseded");
+
+    let v2 = store
+        .get_policy_by_version("sandbox-1", 2)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v2.status, "superseded");
+
+    let v3 = store
+        .get_policy_by_version("sandbox-1", 3)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(v3.status, "pending"); // still pending (not < 3)
+}
+
+#[tokio::test]
+async fn policy_list_ordered_by_version_desc() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+    store
+        .put_policy_revision("p2", "sandbox-1", 2, b"v2", "h2")
+        .await
+        .unwrap();
+    store
+        .put_policy_revision("p3", "sandbox-1", 3, b"v3", "h3")
+        .await
+        .unwrap();
+
+    let records = store.list_policies("sandbox-1", 10, 0).await.unwrap();
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0].version, 3);
+    assert_eq!(records[1].version, 2);
+    assert_eq!(records[2].version, 1);
+
+    // Test with limit.
+    let records = store.list_policies("sandbox-1", 2, 0).await.unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0].version, 3);
+    assert_eq!(records[1].version, 2);
+}
+
+#[tokio::test]
+async fn policy_isolation_between_sandboxes() {
+    let store = Store::connect("sqlite::memory:?cache=shared")
+        .await
+        .unwrap();
+
+    store
+        .put_policy_revision("p1", "sandbox-1", 1, b"v1", "h1")
+        .await
+        .unwrap();
+    store
+        .put_policy_revision("p2", "sandbox-2", 1, b"v1-s2", "h2")
+        .await
+        .unwrap();
+
+    let s1 = store.get_latest_policy("sandbox-1").await.unwrap().unwrap();
+    let s2 = store.get_latest_policy("sandbox-2").await.unwrap().unwrap();
+
+    assert_eq!(s1.policy_payload, b"v1");
+    assert_eq!(s2.policy_payload, b"v1-s2");
+}

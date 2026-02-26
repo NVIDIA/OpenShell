@@ -21,11 +21,12 @@ use navigator_core::proto::navigator_client::NavigatorClient;
 use navigator_core::proto::{
     CreateInferenceRouteRequest, CreateProviderRequest, CreateSandboxRequest,
     DeleteInferenceRouteRequest, DeleteProviderRequest, DeleteSandboxRequest, GetProviderRequest,
-    GetSandboxRequest, HealthRequest, InferenceRoute, InferenceRouteSpec,
-    ListInferenceRoutesRequest, ListProvidersRequest, ListSandboxesRequest, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, Provider, Sandbox, SandboxPhase, SandboxPolicy,
-    SandboxSpec, SandboxTemplate, UpdateInferenceRouteRequest, UpdateProviderRequest,
-    WatchSandboxRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    InferenceRoute, InferenceRouteSpec, ListInferenceRoutesRequest, ListProvidersRequest,
+    ListSandboxPoliciesRequest, ListSandboxesRequest, NetworkBinary, NetworkEndpoint,
+    NetworkPolicyRule, PolicyStatus, Provider, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec,
+    SandboxTemplate, UpdateInferenceRouteRequest, UpdateProviderRequest,
+    UpdateSandboxPolicyRequest, WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
@@ -1063,6 +1064,11 @@ pub async fn sandbox_create(
             log_tail_lines: 200,
             event_tail: 0,
             stop_on_terminal: true,
+            log_since_ms: 0,
+            // Only show gateway logs during provisioning — sandbox logs would
+            // keep the stream alive indefinitely and prevent stop_on_terminal.
+            log_sources: vec!["gateway".to_string()],
+            log_min_level: String::new(),
         })
         .await
         .into_diagnostic()?
@@ -2863,6 +2869,389 @@ fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
     }
 
     Ok(files)
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox policy commands
+// ---------------------------------------------------------------------------
+
+/// Parse a duration string like "5m", "1h", "30s" into milliseconds.
+fn parse_duration_to_ms(s: &str) -> Result<i64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err(miette::miette!("empty duration string"));
+    }
+    let (num_str, unit) = s.split_at(s.len() - 1);
+    let num: i64 = num_str
+        .parse()
+        .map_err(|_| miette::miette!("invalid duration: {s} (expected e.g. 5m, 1h, 30s)"))?;
+    let multiplier = match unit {
+        "s" => 1_000,
+        "m" => 60_000,
+        "h" => 3_600_000,
+        _ => {
+            return Err(miette::miette!(
+                "unknown duration unit: {unit} (use s, m, or h)"
+            ));
+        }
+    };
+    Ok(num * multiplier)
+}
+
+pub async fn sandbox_policy_set(
+    server: &str,
+    name: &str,
+    policy_path: &str,
+    wait: bool,
+    timeout_secs: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let policy = load_sandbox_policy(Some(policy_path))?;
+
+    let mut client = grpc_client(server, tls).await?;
+
+    // Get current version so we can detect no-ops.
+    let current_version = client
+        .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+            name: name.to_string(),
+            version: 0,
+        })
+        .await
+        .ok()
+        .and_then(|r| r.into_inner().revision)
+        .map(|r| r.version)
+        .unwrap_or(0);
+
+    let response = client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: name.to_string(),
+            policy: Some(policy),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let resp = response.into_inner();
+
+    if resp.version == current_version {
+        eprintln!(
+            "{} Policy unchanged (version {}, hash: {})",
+            "·".dimmed(),
+            resp.version,
+            &resp.policy_hash[..12]
+        );
+        return Ok(());
+    }
+
+    eprintln!(
+        "{} Policy version {} submitted (hash: {})",
+        "✓".green().bold(),
+        resp.version,
+        &resp.policy_hash[..12]
+    );
+
+    if !wait {
+        return Ok(());
+    }
+
+    // Poll for status until loaded, failed, or timeout.
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    loop {
+        if Instant::now() > deadline {
+            eprintln!(
+                "{} Timeout waiting for policy version {} to load",
+                "✗".red().bold(),
+                resp.version
+            );
+            std::process::exit(124);
+        }
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        let status_resp = client
+            .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+                name: name.to_string(),
+                version: resp.version,
+            })
+            .await
+            .into_diagnostic()?;
+
+        let inner = status_resp.into_inner();
+        if let Some(rev) = &inner.revision {
+            let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+            match status {
+                PolicyStatus::Loaded => {
+                    eprintln!(
+                        "{} Policy version {} loaded (active version: {})",
+                        "✓".green().bold(),
+                        rev.version,
+                        inner.active_version
+                    );
+                    return Ok(());
+                }
+                PolicyStatus::Failed => {
+                    eprintln!(
+                        "{} Policy version {} failed to load: {}",
+                        "✗".red().bold(),
+                        rev.version,
+                        rev.load_error
+                    );
+                    std::process::exit(1);
+                }
+                PolicyStatus::Superseded => {
+                    eprintln!(
+                        "{} Policy version {} was superseded (active version: {})",
+                        "⚠".yellow().bold(),
+                        rev.version,
+                        inner.active_version
+                    );
+                    return Ok(());
+                }
+                _ => {} // still pending, keep polling
+            }
+        }
+    }
+}
+
+pub async fn sandbox_policy_get(
+    server: &str,
+    name: &str,
+    version: u32,
+    full: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let status_resp = client
+        .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+            name: name.to_string(),
+            version,
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = status_resp.into_inner();
+    if let Some(rev) = inner.revision {
+        let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+        println!("Version:      {}", rev.version);
+        println!("Hash:         {}", rev.policy_hash);
+        println!("Status:       {status:?}");
+        println!("Active:       {}", inner.active_version);
+        if rev.created_at_ms > 0 {
+            println!("Created:      {} ms", rev.created_at_ms);
+        }
+        if rev.loaded_at_ms > 0 {
+            println!("Loaded:       {} ms", rev.loaded_at_ms);
+        }
+        if !rev.load_error.is_empty() {
+            println!("Error:        {}", rev.load_error);
+        }
+
+        if full {
+            if let Some(policy) = rev.policy {
+                println!("---");
+                let yaml_repr = policy_to_yaml(&policy);
+                let yaml_str = serde_yaml::to_string(&yaml_repr)
+                    .into_diagnostic()
+                    .wrap_err("failed to serialize policy to YAML")?;
+                print!("{yaml_str}");
+            } else {
+                eprintln!("Policy payload not available for this version");
+            }
+        }
+    } else {
+        eprintln!("No policy history found for sandbox '{name}'");
+    }
+
+    Ok(())
+}
+
+pub async fn sandbox_policy_list(
+    server: &str,
+    name: &str,
+    limit: u32,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let resp = client
+        .list_sandbox_policies(ListSandboxPoliciesRequest {
+            name: name.to_string(),
+            limit,
+            offset: 0,
+        })
+        .await
+        .into_diagnostic()?;
+
+    let revisions = resp.into_inner().revisions;
+    if revisions.is_empty() {
+        eprintln!("No policy history found for sandbox '{name}'");
+        return Ok(());
+    }
+
+    println!(
+        "{:<8} {:<14} {:<12} {:<24} {}",
+        "VERSION", "HASH", "STATUS", "CREATED", "ERROR"
+    );
+    for rev in &revisions {
+        let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+        let hash_short = if rev.policy_hash.len() >= 12 {
+            &rev.policy_hash[..12]
+        } else {
+            &rev.policy_hash
+        };
+        let error_short = if rev.load_error.len() > 40 {
+            format!("{}...", &rev.load_error[..40])
+        } else {
+            rev.load_error.clone()
+        };
+        println!(
+            "{:<8} {:<14} {:<12} {:<24} {}",
+            rev.version,
+            hash_short,
+            format!("{status:?}"),
+            rev.created_at_ms,
+            error_short,
+        );
+    }
+
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox logs command
+// ---------------------------------------------------------------------------
+
+pub async fn sandbox_logs(
+    server: &str,
+    name: &str,
+    lines: u32,
+    tail: bool,
+    since: Option<&str>,
+    sources: &[String],
+    level: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    // Resolve sandbox name to id.
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    // Normalize "all" to empty list (server treats empty as "no filter").
+    let source_filter: Vec<String> = sources
+        .iter()
+        .filter(|s| s.as_str() != "all")
+        .cloned()
+        .collect();
+
+    let since_ms = if let Some(s) = since {
+        let dur_ms = parse_duration_to_ms(s)?;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .into_diagnostic()?
+                .as_millis(),
+        )
+        .into_diagnostic()?;
+        now_ms - dur_ms
+    } else {
+        0
+    };
+
+    if tail {
+        // Streaming mode: use WatchSandbox.
+        let mut stream = client
+            .watch_sandbox(WatchSandboxRequest {
+                id: sandbox.id.clone(),
+                follow_status: false,
+                follow_logs: true,
+                follow_events: false,
+                log_tail_lines: lines,
+                event_tail: 0,
+                stop_on_terminal: false,
+                log_since_ms: since_ms,
+                log_sources: source_filter,
+                log_min_level: level.to_uppercase(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner();
+
+        while let Some(event) = stream.next().await {
+            let event = event.into_diagnostic()?;
+            if let Some(navigator_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                event.payload
+            {
+                print_log_line(&log);
+            }
+        }
+    } else {
+        // One-shot mode: use GetSandboxLogs.
+        let resp = client
+            .get_sandbox_logs(GetSandboxLogsRequest {
+                sandbox_id: sandbox.id.clone(),
+                lines,
+                since_ms,
+                sources: source_filter,
+                min_level: level.to_uppercase(),
+            })
+            .await
+            .into_diagnostic()?;
+
+        let inner = resp.into_inner();
+
+        if since_ms > 0 && inner.buffer_total > 0 {
+            eprintln!(
+                "Warning: log buffer contains only the last {} lines; --since results may be incomplete.",
+                inner.buffer_total
+            );
+        }
+
+        for log in &inner.logs {
+            print_log_line(log);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
+    let source = if log.source.is_empty() {
+        "gateway"
+    } else {
+        &log.source
+    };
+    let secs = log.timestamp_ms / 1000;
+    let millis = log.timestamp_ms % 1000;
+    if log.fields.is_empty() {
+        println!(
+            "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {}",
+            log.level, log.target, log.message
+        );
+    } else {
+        let mut fields_str = String::new();
+        let mut entries: Vec<_> = log.fields.iter().collect();
+        entries.sort_by_key(|(k, _)| k.as_str());
+        for (k, v) in entries {
+            if !fields_str.is_empty() {
+                fields_str.push(' ');
+            }
+            fields_str.push_str(k);
+            fields_str.push('=');
+            fields_str.push_str(v);
+        }
+        println!(
+            "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {} {}",
+            log.level, log.target, log.message, fields_str
+        );
+    }
 }
 
 #[cfg(test)]

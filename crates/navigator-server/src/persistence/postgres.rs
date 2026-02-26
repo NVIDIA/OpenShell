@@ -1,4 +1,4 @@
-use super::{ObjectRecord, current_time_ms, map_db_error, map_migrate_error};
+use super::{ObjectRecord, PolicyRecord, current_time_ms, map_db_error, map_migrate_error};
 use navigator_core::Result;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -159,5 +159,178 @@ LIMIT $2 OFFSET $3
             .collect();
 
         Ok(records)
+    }
+
+    // -------------------------------------------------------------------
+    // Policy revision operations
+    // -------------------------------------------------------------------
+
+    pub async fn put_policy_revision(
+        &self,
+        id: &str,
+        sandbox_id: &str,
+        version: i64,
+        payload: &[u8],
+        hash: &str,
+    ) -> Result<()> {
+        let now_ms = current_time_ms()?;
+        sqlx::query(
+            r"
+INSERT INTO sandbox_policies (id, sandbox_id, version, policy_payload, policy_hash, status, created_at_ms)
+VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+",
+        )
+        .bind(id)
+        .bind(sandbox_id)
+        .bind(version)
+        .bind(payload)
+        .bind(hash)
+        .bind(now_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    pub async fn get_latest_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
+        let row = sqlx::query(
+            r"
+SELECT id, sandbox_id, version, policy_payload, policy_hash, status, load_error, created_at_ms, loaded_at_ms
+FROM sandbox_policies
+WHERE sandbox_id = $1
+ORDER BY version DESC
+LIMIT 1
+",
+        )
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(row.map(row_to_policy_record))
+    }
+
+    pub async fn get_latest_loaded_policy(&self, sandbox_id: &str) -> Result<Option<PolicyRecord>> {
+        let row = sqlx::query(
+            r"
+SELECT id, sandbox_id, version, policy_payload, policy_hash, status, load_error, created_at_ms, loaded_at_ms
+FROM sandbox_policies
+WHERE sandbox_id = $1 AND status = 'loaded'
+ORDER BY version DESC
+LIMIT 1
+",
+        )
+        .bind(sandbox_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(row.map(row_to_policy_record))
+    }
+
+    pub async fn get_policy_by_version(
+        &self,
+        sandbox_id: &str,
+        version: i64,
+    ) -> Result<Option<PolicyRecord>> {
+        let row = sqlx::query(
+            r"
+SELECT id, sandbox_id, version, policy_payload, policy_hash, status, load_error, created_at_ms, loaded_at_ms
+FROM sandbox_policies
+WHERE sandbox_id = $1 AND version = $2
+",
+        )
+        .bind(sandbox_id)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(row.map(row_to_policy_record))
+    }
+
+    pub async fn list_policies(
+        &self,
+        sandbox_id: &str,
+        limit: u32,
+        offset: u32,
+    ) -> Result<Vec<PolicyRecord>> {
+        let rows = sqlx::query(
+            r"
+SELECT id, sandbox_id, version, policy_payload, policy_hash, status, load_error, created_at_ms, loaded_at_ms
+FROM sandbox_policies
+WHERE sandbox_id = $1
+ORDER BY version DESC
+LIMIT $2 OFFSET $3
+",
+        )
+        .bind(sandbox_id)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(rows.into_iter().map(row_to_policy_record).collect())
+    }
+
+    pub async fn update_policy_status(
+        &self,
+        sandbox_id: &str,
+        version: i64,
+        status: &str,
+        load_error: Option<&str>,
+        loaded_at_ms: Option<i64>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r"
+UPDATE sandbox_policies
+SET status = $3, load_error = $4, loaded_at_ms = $5
+WHERE sandbox_id = $1 AND version = $2
+",
+        )
+        .bind(sandbox_id)
+        .bind(version)
+        .bind(status)
+        .bind(load_error)
+        .bind(loaded_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn supersede_older_policies(
+        &self,
+        sandbox_id: &str,
+        before_version: i64,
+    ) -> Result<u64> {
+        let result = sqlx::query(
+            r"
+UPDATE sandbox_policies
+SET status = 'superseded'
+WHERE sandbox_id = $1 AND version < $2 AND status IN ('pending', 'loaded')
+",
+        )
+        .bind(sandbox_id)
+        .bind(before_version)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected())
+    }
+}
+
+fn row_to_policy_record(row: sqlx::postgres::PgRow) -> PolicyRecord {
+    PolicyRecord {
+        id: row.get("id"),
+        sandbox_id: row.get("sandbox_id"),
+        version: row.get("version"),
+        policy_payload: row.get("policy_payload"),
+        policy_hash: row.get("policy_hash"),
+        status: row.get("status"),
+        load_error: row.get("load_error"),
+        created_at_ms: row.get("created_at_ms"),
+        loaded_at_ms: row.get("loaded_at_ms"),
     }
 }

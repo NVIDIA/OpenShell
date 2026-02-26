@@ -101,6 +101,23 @@ async fn main() -> Result<()> {
     let stdout_filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
 
+    // Install rustls crypto provider before any TLS connections (including log push).
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Set up optional log push layer (gRPC mode only).
+    let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
+        (&args.sandbox_id, &args.navigator_endpoint)
+    {
+        let (tx, handle) =
+            navigator_sandbox::log_push::spawn_log_push_task(endpoint.clone(), sandbox_id.clone());
+        let layer = navigator_sandbox::log_push::LogPushLayer::new(sandbox_id.clone(), tx);
+        Some((layer, handle))
+    } else {
+        None
+    };
+    let push_layer = log_push_state.as_ref().map(|(layer, _)| layer.clone());
+    let _log_push_handle = log_push_state.map(|(_, handle)| handle);
+
     // Keep the file guard alive for the entire process. When the guard is
     // dropped the non-blocking writer flushes remaining logs.
     let _file_guard = if let Some((file_writer, file_guard)) = file_logging {
@@ -117,6 +134,7 @@ async fn main() -> Result<()> {
                     .with_ansi(false)
                     .with_filter(file_filter),
             )
+            .with(push_layer.clone())
             .init();
         Some(file_guard)
     } else {
@@ -126,6 +144,7 @@ async fn main() -> Result<()> {
                     .with_writer(std::io::stdout)
                     .with_filter(stdout_filter),
             )
+            .with(push_layer)
             .init();
         // Log the warning after the subscriber is initialized
         warn!("Could not open /var/log/navigator.log; using stdout-only logging");
@@ -141,8 +160,6 @@ async fn main() -> Result<()> {
     } else {
         vec!["/bin/bash".to_string()]
     };
-
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
     info!(command = ?command, "Starting sandbox");
 

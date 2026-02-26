@@ -8,8 +8,9 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 
 | File | Purpose |
 |------|---------|
-| `main.rs` | CLI entry point, argument parsing via `clap`, dual-output logging setup |
+| `main.rs` | CLI entry point, argument parsing via `clap`, dual-output logging setup, log push layer initialization |
 | `lib.rs` | `run_sandbox()` orchestration -- the main startup sequence |
+| `log_push.rs` | `LogPushLayer` tracing layer and `spawn_log_push_task()` background batching/streaming to gateway |
 | `policy.rs` | `SandboxPolicy`, `NetworkPolicy`, `ProxyPolicy`, `LandlockPolicy`, `ProcessPolicy` structs and proto conversions |
 | `opa.rs` | OPA/Rego policy engine using `regorus` crate -- network evaluation, sandbox config queries, L7 endpoint queries |
 | `process.rs` | `ProcessHandle` for spawning child processes, privilege dropping, signal handling |
@@ -17,7 +18,7 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 | `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
-| `grpc_client.rs` | gRPC client for fetching policy, provider environment, and inference route bundles from the gateway |
+| `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, and log push (`CachedNavigatorClient`) |
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
@@ -38,7 +39,11 @@ The `run_sandbox()` function in `crates/navigator-sandbox/src/lib.rs` is the mai
 
 ```mermaid
 flowchart TD
-    A[Parse CLI args] --> B[Initialize logging]
+    A[Parse CLI args] --> B0{gRPC mode?}
+    B0 -- Yes --> B1[Spawn log push task + LogPushLayer]
+    B0 -- No --> B2[Skip log push]
+    B1 --> B[Initialize logging with push layer]
+    B2 --> B[Initialize logging]
     B --> C[Install rustls crypto provider]
     C --> D[run_sandbox]
     D --> E[load_policy]
@@ -57,8 +62,12 @@ flowchart TD
     N -- No --> P[Spawn child process]
     O --> P
     P --> Q[Store entrypoint PID]
-    Q --> R[Wait with optional timeout]
-    R --> S[Exit with child exit code]
+    Q --> R{gRPC mode?}
+    R -- Yes --> T[Spawn policy poll task]
+    R -- No --> U[Skip policy poll]
+    T --> V[Wait with optional timeout]
+    U --> V
+    V --> S[Exit with child exit code]
 ```
 
 ### Step-by-step detail
@@ -103,7 +112,9 @@ flowchart TD
 
 10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-11. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
+11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `navigator_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+
+12. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
@@ -288,7 +299,113 @@ After L4 allows a connection, `query_endpoint_config(input)` evaluates `data.nav
 
 ### Hot reload
 
-`reload(policy, data_yaml)` builds a new engine from strings and atomically replaces the inner engine. Designed for future gRPC-based policy updates.
+Two reload methods exist:
+
+- **`reload(policy, data_yaml)`**: Builds a new engine from raw Rego + YAML strings and atomically replaces the inner engine. Used in tests and by the file-mode path.
+- **`reload_from_proto(proto)`**: Builds a new engine through the same validated pipeline as `from_proto()` -- proto-to-JSON conversion, L7 validation, access preset expansion -- then atomically swaps the inner `regorus::Engine`. On success, all subsequent `evaluate_network_action()` and `query_endpoint_config()` calls use the new policy. On failure (e.g., L7 validation errors), the previous engine is untouched (last-known-good behavior). This is the method used by the policy poll loop for live reloads in gRPC mode.
+
+Both methods hold the `Mutex` only for the final swap (`*engine = new_engine`), so evaluation is blocked for only the duration of a pointer-sized assignment.
+
+## Policy Reload Lifecycle
+
+**File:** `crates/navigator-sandbox/src/lib.rs` (`run_policy_poll_loop()`)
+
+In gRPC mode, the sandbox can receive policy updates at runtime without restarting. A background task polls the gateway for new policy versions and hot-reloads the OPA engine when changes are detected. Only **dynamic** policy domains (network rules and inference routing) can change at runtime; **static** domains (filesystem, Landlock, process) are applied once in the pre-exec closure and cannot be modified after the child process spawns.
+
+### Dynamic vs static policy domains
+
+| Domain | Mutable at runtime | Applied where | Reason |
+|--------|-------------------|---------------|--------|
+| `network_policies` | Yes | OPA engine (proxy evaluates per-CONNECT) | Engine swap updates all future evaluations |
+| `inference` | Yes | OPA engine (proxy evaluates per-CONNECT) | Same mechanism as network policies |
+| `filesystem` | No | Landlock LSM in pre-exec | Kernel-enforced; cannot be modified after `restrict_self()` |
+| `landlock` | No | Landlock LSM in pre_exec | Configuration for the above; same restriction |
+| `process` | No | `setuid`/`setgid` in pre-exec | Privileges dropped irrevocably before exec |
+
+The gateway's `UpdateSandboxPolicy` RPC enforces this boundary: it rejects any update where the static fields (`filesystem`, `landlock`, `process`) differ from the version 1 (creation-time) policy. It also rejects updates that would change the network mode (e.g., adding `network_policies` to a sandbox that started in `Block` mode), because the network namespace and proxy infrastructure are set up once at startup.
+
+### Poll loop
+
+```mermaid
+sequenceDiagram
+    participant PL as Policy Poll Loop
+    participant GW as Gateway (gRPC)
+    participant OPA as OPA Engine (Arc)
+
+    PL->>GW: GetSandboxPolicy(sandbox_id)
+    GW-->>PL: policy + version + hash
+    PL->>PL: Store initial version
+
+    loop Every NAVIGATOR_POLICY_POLL_INTERVAL_SECS (default 30)
+        PL->>GW: GetSandboxPolicy(sandbox_id)
+        GW-->>PL: policy + version + hash
+        alt version > current_version
+            PL->>OPA: reload_from_proto(policy)
+            alt Reload succeeds
+                OPA-->>PL: Ok
+                PL->>PL: Update current_version
+                PL->>GW: ReportPolicyStatus(version, LOADED)
+            else Reload fails (validation error)
+                OPA-->>PL: Err (old engine untouched)
+                PL->>GW: ReportPolicyStatus(version, FAILED, error_msg)
+            end
+        else version <= current_version
+            PL->>PL: Skip (no update)
+        end
+    end
+```
+
+The `run_policy_poll_loop()` function in `crates/navigator-sandbox/src/lib.rs` implements this loop:
+
+1. **Connect once**: Create a `CachedNavigatorClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
+2. **Fetch initial version**: Call `poll_policy(sandbox_id)` to establish the baseline `current_version`. On failure, log a warning and retry on the next interval.
+3. **Poll loop**: Sleep for the configured interval, then call `poll_policy()` again.
+4. **Version comparison**: If `result.version <= current_version`, skip. The version is a monotonically increasing `u32` per sandbox.
+5. **Reload attempt**: Call `opa_engine.reload_from_proto(&result.policy)`. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
+6. **Status reporting**: On success, report `PolicyStatus::Loaded` to the gateway via `ReportPolicyStatus` RPC. On failure, report `PolicyStatus::Failed` with the error message. Status report failures are logged but do not affect the poll loop.
+
+### `CachedNavigatorClient`
+
+**File:** `crates/navigator-sandbox/src/grpc_client.rs`
+
+`CachedNavigatorClient` is a persistent gRPC client for the `Navigator` service, analogous to `CachedInferenceClient` for the `Inference` service. It wraps a `NavigatorClient<Channel>` connected once at construction and reused for all subsequent calls.
+
+```rust
+pub struct CachedNavigatorClient {
+    client: NavigatorClient<Channel>,
+}
+
+pub struct PolicyPollResult {
+    pub policy: ProtoSandboxPolicy,
+    pub version: u32,
+    pub policy_hash: String,
+}
+```
+
+Methods:
+- **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
+- **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing the policy, version, and hash.
+- **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
+
+### Server-side policy versioning
+
+The gateway assigns a monotonically increasing version number to each policy revision per sandbox. The `GetSandboxPolicyResponse` includes `version` and `policy_hash` fields. The `ReportPolicyStatus` RPC records which version the sandbox successfully loaded (or failed to load), enabling operators to query `GetSandboxPolicyStatus` for the current active version and load history.
+
+Proto messages involved:
+- `GetSandboxPolicyResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`
+- `ReportPolicyStatusRequest` (`proto/navigator.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
+- `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
+- `SandboxPolicyRevision` (`proto/navigator.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`
+
+### Failure modes
+
+| Condition | Behavior |
+|-----------|----------|
+| Gateway unreachable during poll | Log at debug level, retry on next interval |
+| Initial version fetch fails | Log warning, retry on next interval (poll loop continues) |
+| `reload_from_proto()` fails (L7 validation error) | Log warning, keep last-known-good engine, report FAILED status |
+| Status report RPC fails | Log warning, poll loop continues unaffected |
+| Poll interval env var unparseable | Fall back to default (30 seconds) |
 
 ## Linux Enforcement
 
@@ -938,6 +1055,8 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 | `NAVIGATOR_POLICY_RULES` | `--policy-rules` | | Path to Rego policy file |
 | `NAVIGATOR_POLICY_DATA` | `--policy-data` | | Path to YAML data file |
 | `NAVIGATOR_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
+| `NAVIGATOR_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
+| `NAVIGATOR_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
 | `NAVIGATOR_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
 | `NAVIGATOR_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
 | `NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
@@ -972,6 +1091,9 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 |-----------|----------|
 | Policy fetch failure (gRPC or file) | Fatal -- sandbox cannot start without policy |
 | Provider env fetch failure | Warn + continue with empty map |
+| Policy poll: gateway unreachable | Debug log + retry on next interval |
+| Policy poll: `reload_from_proto()` failure | Warn + keep last-known-good engine + report FAILED status to gateway |
+| Policy poll: status report failure | Warn + poll loop continues |
 | Landlock failure + `BestEffort` | Warn + continue without filesystem isolation |
 | Landlock failure + `HardRequirement` | Fatal |
 | Seccomp failure | Fatal |
@@ -996,6 +1118,9 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Inference interception: backend protocol error | 502 Bad Gateway with JSON error body |
 | Inference interception: non-inference request (no prior routing) | 403 Forbidden with JSON error body + structured CONNECT deny log |
 | Inference interception: non-inference request (after prior routing) | 403 Forbidden with JSON error body (no deny log, connection counts as routed) |
+| Log push gRPC connection fails | Task prints to stderr and exits; logs not pushed for sandbox lifetime |
+| Log push mpsc channel full (1024 lines) | Event dropped silently; logging never blocks |
+| Log push gRPC stream breaks | Push loop exits, flushes remaining batch |
 | Proxy accept error | Log + break accept loop |
 | Benign connection close (EOF, reset, pipe) | Debug level (not visible to user by default) |
 | L7 parse error | Close the connection |
@@ -1012,6 +1137,228 @@ Key structured log events:
 - `CONNECT`: One per proxy CONNECT request with full identity context. `InspectForInference` connections that are ultimately denied produce a second `CONNECT action=deny` log with the denial reason.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
 - Sandbox lifecycle events: process start, exit, namespace creation/cleanup
+- Policy reload events: new version detected, reload success/failure, status report outcomes
+
+## Log Streaming
+
+In gRPC mode, sandbox supervisor logs are streamed to the gateway in real time. This enables operators and CLI users to view both gateway-side and sandbox-side logs in a unified stream via `nav sandbox logs`.
+
+### Architecture overview
+
+```mermaid
+flowchart LR
+    subgraph "Sandbox supervisor"
+        A[tracing events] --> B[LogPushLayer]
+        B -->|try_send| C[mpsc channel\n1024 lines]
+        C --> D[Background task]
+        D -->|batched| E[PushSandboxLogs\nclient-streaming RPC]
+    end
+    subgraph "Gateway server"
+        E --> F[push_sandbox_logs handler]
+        F -->|force source=sandbox| G[TracingLogBus.publish_external]
+        G --> H[broadcast channel\n+ tail buffer 2000 lines]
+        I[SandboxLogLayer] -->|source=gateway| H
+    end
+    subgraph "CLI / watchers"
+        H --> J[WatchSandbox stream]
+        H --> K[GetSandboxLogs one-shot]
+    end
+```
+
+Two log sources feed the same `TracingLogBus`:
+- **Gateway logs** (`source: "gateway"`): Generated by the server's `SandboxLogLayer` tracing layer when server-side code emits events containing a `sandbox_id` field. These capture reconciliation, provisioning, and management operations.
+- **Sandbox logs** (`source: "sandbox"`): Pushed from the sandbox supervisor via the `PushSandboxLogs` client-streaming RPC. These capture proxy decisions, policy reloads, process lifecycle, and all other sandbox-internal tracing events.
+
+### LogPushLayer
+
+**File:** `crates/navigator-sandbox/src/log_push.rs`
+
+`LogPushLayer` is a `tracing_subscriber::Layer` that intercepts tracing events in the sandbox supervisor and forwards them to the gateway.
+
+```rust
+pub struct LogPushLayer {
+    sandbox_id: String,
+    tx: mpsc::Sender<SandboxLogLine>,
+    max_level: tracing::Level,
+}
+```
+
+Key behaviors:
+- **Level filtering**: Defaults to `INFO`. Configurable via the `NAVIGATOR_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
+- **Best-effort delivery**: Uses `try_send()` on the mpsc channel. If the channel is full (1024 lines buffered), the event is dropped. Logging never blocks the sandbox supervisor.
+- **Structured fields**: Implements a `LogVisitor` that collects all tracing key-value fields (e.g., `dst_host`, `action`, `policy`) into a `HashMap<String, String>`. The `message` field is extracted separately; all other fields go into `SandboxLogLine.fields`.
+- **Source tagging**: Sets `source: "sandbox"` on every log line at construction time.
+
+### Initialization
+
+**File:** `crates/navigator-sandbox/src/main.rs`
+
+The log push layer is set up in `main()` before calling `run_sandbox()`, only in gRPC mode (when both `--sandbox-id` and `--navigator-endpoint` are present):
+
+1. `spawn_log_push_task(endpoint, sandbox_id)` creates the mpsc channel and background task, returning the sender half and a `JoinHandle`.
+2. `LogPushLayer::new(sandbox_id, tx)` wraps the sender in a tracing layer.
+3. The layer is added to the `tracing_subscriber::registry()` alongside the stdout and file layers.
+
+This means the push layer captures all tracing events the sandbox supervisor generates, filtered by `NAVIGATOR_LOG_PUSH_LEVEL` (default INFO).
+
+### Background push task
+
+**File:** `crates/navigator-sandbox/src/log_push.rs` (`spawn_log_push_task()`, `run_push_loop()`)
+
+The background task batches log lines and streams them to the gateway:
+
+1. **Channel setup**: Creates a bounded `mpsc::channel::<SandboxLogLine>(1024)`. The sender goes to the `LogPushLayer`; the receiver feeds the push loop.
+2. **gRPC connection**: Connects a `CachedNavigatorClient` to the gateway. On connection failure, the task prints to stderr (cannot use tracing to avoid recursion) and exits.
+3. **Client-streaming RPC**: Opens a `PushSandboxLogs` client-streaming call via a secondary `mpsc::channel::<PushSandboxLogsRequest>(32)` wrapped in `tokio_stream::wrappers::ReceiverStream`. A separate spawned task drives the gRPC call.
+4. **Batch-and-flush loop**: Accumulates lines in a `Vec` (capacity 50). Flushes when:
+   - The batch reaches 50 lines, OR
+   - A 500ms interval timer fires (with `MissedTickBehavior::Skip`)
+5. **Shutdown**: When the `LogPushLayer` sender is dropped (sandbox exits), the receiver returns `None`, the loop breaks, and any remaining lines are flushed in a final batch.
+
+### Server-side ingestion
+
+**File:** `crates/navigator-server/src/grpc.rs` (`push_sandbox_logs`)
+
+The `PushSandboxLogs` RPC handler processes each batch:
+1. Validates `sandbox_id` is non-empty (skips empty batches).
+2. Iterates over `batch.logs`, capped at 100 lines per batch to prevent abuse.
+3. Forces `log.source = "sandbox"` on every line -- the sandbox cannot claim to be the gateway.
+4. Forces `log.sandbox_id` to match the batch envelope -- a sandbox cannot inject logs for other sandboxes.
+5. Publishes each log via `TracingLogBus::publish_external()`.
+
+### TracingLogBus integration
+
+**File:** `crates/navigator-server/src/tracing_bus.rs`
+
+`publish_external()` wraps the `SandboxLogLine` in a `SandboxStreamEvent` and calls the internal `publish()` method, which:
+1. Sends the event to the per-sandbox `broadcast::Sender` (capacity 1024). Subscribers (active `WatchSandbox` streams) receive the event immediately.
+2. Appends the event to the per-sandbox tail buffer (`VecDeque`), capped at 2000 lines. Overflow evicts the oldest entry.
+
+The same `publish()` method is used by the server's own `SandboxLogLayer` for gateway-sourced logs, so both sources share identical broadcast and tail buffer infrastructure.
+
+### Source tagging
+
+The `SandboxLogLine.source` field distinguishes log origins:
+
+| Source | Set by | Description |
+|--------|--------|-------------|
+| `"gateway"` | `SandboxLogLayer` in `tracing_bus.rs` | Server-side logs (reconciliation, provisioning, management) |
+| `"sandbox"` | `push_sandbox_logs` handler in `grpc.rs` | Sandbox supervisor logs (proxy, policy, process lifecycle) |
+| `""` (empty) | Legacy/pre-source logs | Treated as `"gateway"` by the CLI (`print_log_line()`) and server (`source_matches()`) |
+
+### Structured fields
+
+The `SandboxLogLine.fields` map (`map<string, string>` in proto) carries tracing key-value pairs from sandbox events. Examples:
+
+| Field | Source | Description |
+|-------|--------|-------------|
+| `dst_host` | Proxy CONNECT log | Destination hostname |
+| `action` | Proxy CONNECT log | `allow`, `deny`, or `inspect_for_inference` |
+| `policy` | Proxy CONNECT log | Matched policy name |
+| `version` | Policy reload log | New policy version number |
+| `policy_hash` | Policy reload log | SHA256 hash of new policy |
+
+Gateway-sourced logs do not currently populate the `fields` map (it remains empty). Only sandbox-pushed logs include structured fields.
+
+### CLI filtering
+
+**File:** `crates/navigator-cli/src/main.rs` (command definition), `crates/navigator-cli/src/run.rs` (`sandbox_logs()`)
+
+The `nav sandbox logs` command supports filtering by source and level:
+
+```bash
+# Show only sandbox-side logs
+nav sandbox logs my-sandbox --source sandbox
+
+# Show only warnings and errors from the gateway
+nav sandbox logs my-sandbox --source gateway --level warn
+
+# Stream live logs from all sources
+nav sandbox logs my-sandbox --tail
+
+# Stream live sandbox logs only
+nav sandbox logs my-sandbox --tail --source sandbox
+```
+
+**CLI flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--source` | `all` | Filter by source: `gateway`, `sandbox`, or `all`. Can be specified multiple times. |
+| `--level` | (empty) | Minimum log level: `error`, `warn`, `info`, `debug`, `trace`. Empty means all levels. |
+
+**Server-side filtering:**
+
+Both `WatchSandboxRequest` and `GetSandboxLogsRequest` carry filter fields:
+
+| Proto field | Message | Purpose |
+|-------------|---------|---------|
+| `log_sources` | `WatchSandboxRequest` | `repeated string` -- filter live log events by source |
+| `log_min_level` | `WatchSandboxRequest` | `string` -- minimum log level for live events |
+| `sources` | `GetSandboxLogsRequest` | `repeated string` -- filter one-shot log fetch by source |
+| `min_level` | `GetSandboxLogsRequest` | `string` -- minimum log level for one-shot fetch |
+
+Filtering is implemented server-side. For `WatchSandbox`, filters apply to both the tail replay and live events. For `GetSandboxLogs`, filters apply to the tail buffer scan. The `source_matches()` helper treats empty source as `"gateway"` for backward compatibility. The `level_matches()` helper uses a numeric ranking (ERROR=0, WARN=1, INFO=2, DEBUG=3, TRACE=4); unknown levels always pass.
+
+### CLI output format
+
+`print_log_line()` in `crates/navigator-cli/src/run.rs` formats each log line:
+
+```
+[timestamp] [source ] [level] [target] message key=value key=value
+```
+
+Example output:
+```
+[1708891234.567] [sandbox] [INFO ] [navigator_sandbox::proxy] CONNECT api.example.com:443 dst_host=api.example.com action=allow
+[1708891234.890] [gateway] [INFO ] [navigator_server::grpc] ReportPolicyStatus: sandbox reported policy load result
+```
+
+When the `fields` map is non-empty, entries are sorted by key and appended as `key=value` pairs.
+
+### Create-watch filter
+
+**File:** `crates/navigator-cli/src/run.rs`
+
+During `sandbox create`, the CLI opens a `WatchSandbox` stream with `stop_on_terminal: true` to wait until the sandbox reaches `Ready` phase. This stream uses `log_sources: ["gateway"]` to filter out sandbox-pushed logs. Without this filter, continuous sandbox supervisor logs (e.g., proxy CONNECT events) would keep the stream active and prevent `stop_on_terminal` from detecting that provisioning has completed and the stream should close.
+
+### Data flow summary
+
+```mermaid
+sequenceDiagram
+    participant SB as Sandbox Supervisor
+    participant LP as LogPushLayer
+    participant CH as mpsc channel (1024)
+    participant BG as Background push task
+    participant GW as Gateway (push_sandbox_logs)
+    participant TB as TracingLogBus
+    participant CL as CLI (nav sandbox logs)
+
+    SB->>LP: tracing event (info!(...))
+    LP->>LP: Check level >= NAVIGATOR_LOG_PUSH_LEVEL
+    LP->>CH: try_send(SandboxLogLine)
+    Note over CH: Drops if full (best-effort)
+    CH->>BG: recv()
+    BG->>BG: Accumulate in batch (max 50)
+    alt Batch full OR 500ms timer
+        BG->>GW: PushSandboxLogsRequest (client-streaming)
+    end
+    GW->>GW: Force source="sandbox", cap 100 lines
+    GW->>TB: publish_external(log)
+    TB->>TB: broadcast + append to tail buffer (2000 cap)
+    CL->>TB: WatchSandbox / GetSandboxLogs
+    TB-->>CL: SandboxStreamEvent with log payload
+```
+
+### Failure modes
+
+| Condition | Behavior |
+|-----------|----------|
+| Log push gRPC connection fails | Task prints to stderr and exits; no logs are pushed for the sandbox lifetime |
+| mpsc channel full (1024 lines buffered) | `try_send()` drops the event silently; logging never blocks |
+| gRPC stream breaks mid-session | Push loop detects send error, breaks, flushes remaining batch |
+| Push batch exceeds 100 lines | Server caps at 100 lines per batch; excess lines in the batch are ignored |
+| `NAVIGATOR_LOG_PUSH_LEVEL` unparseable | Falls back to INFO |
 
 ## Platform Support
 

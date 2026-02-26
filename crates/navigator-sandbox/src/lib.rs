@@ -5,6 +5,7 @@
 mod grpc_client;
 mod identity;
 pub mod l7;
+pub mod log_push;
 pub mod opa;
 mod policy;
 mod process;
@@ -424,6 +425,28 @@ pub async fn run_sandbox(
     entrypoint_pid.store(handle.pid(), Ordering::Release);
     info!(pid = handle.pid(), "Process started");
 
+    // Spawn background policy poll task (gRPC mode only).
+    if let (Some(id), Some(endpoint), Some(engine)) =
+        (&sandbox_id, &navigator_endpoint, &opa_engine)
+    {
+        let poll_id = id.clone();
+        let poll_endpoint = endpoint.clone();
+        let poll_engine = engine.clone();
+        let poll_interval_secs: u64 = std::env::var("NAVIGATOR_POLICY_POLL_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30);
+
+        tokio::spawn(async move {
+            if let Err(e) =
+                run_policy_poll_loop(&poll_endpoint, &poll_id, &poll_engine, poll_interval_secs)
+                    .await
+            {
+                warn!(error = %e, "Policy poll loop exited with error");
+            }
+        });
+    }
+
     // Wait for process with optional timeout
     let result = if timeout_secs > 0 {
         if let Ok(result) = timeout(Duration::from_secs(timeout_secs), handle.wait()).await {
@@ -718,6 +741,88 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
 #[cfg(not(unix))]
 fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
     Ok(())
+}
+
+/// Background loop that polls the server for policy updates.
+///
+/// When a new version is detected, attempts to reload the OPA engine via
+/// `reload_from_proto()`. Reports load success/failure back to the server.
+/// On failure, the previous engine is untouched (LKG behavior).
+async fn run_policy_poll_loop(
+    endpoint: &str,
+    sandbox_id: &str,
+    opa_engine: &Arc<OpaEngine>,
+    interval_secs: u64,
+) -> Result<()> {
+    use crate::grpc_client::CachedNavigatorClient;
+
+    let client = CachedNavigatorClient::connect(endpoint).await?;
+    let mut current_version: u32 = 0;
+
+    // Initialize current_version from the first poll.
+    match client.poll_policy(sandbox_id).await {
+        Ok(result) => {
+            current_version = result.version;
+            debug!(version = current_version, "Policy poll: initial version");
+        }
+        Err(e) => {
+            warn!(error = %e, "Policy poll: failed to fetch initial version, will retry");
+        }
+    }
+
+    let interval = Duration::from_secs(interval_secs);
+    loop {
+        tokio::time::sleep(interval).await;
+
+        let result = match client.poll_policy(sandbox_id).await {
+            Ok(r) => r,
+            Err(e) => {
+                debug!(error = %e, "Policy poll: server unreachable, will retry");
+                continue;
+            }
+        };
+
+        if result.version <= current_version {
+            continue;
+        }
+
+        info!(
+            old_version = current_version,
+            new_version = result.version,
+            policy_hash = %result.policy_hash,
+            "Policy poll: new version detected, reloading"
+        );
+
+        match opa_engine.reload_from_proto(&result.policy) {
+            Ok(()) => {
+                current_version = result.version;
+                info!(
+                    version = current_version,
+                    policy_hash = %result.policy_hash,
+                    "Policy reloaded successfully"
+                );
+                if let Err(e) = client
+                    .report_policy_status(sandbox_id, result.version, true, "")
+                    .await
+                {
+                    warn!(error = %e, "Failed to report policy load success");
+                }
+            }
+            Err(e) => {
+                warn!(
+                    version = result.version,
+                    error = %e,
+                    "Policy reload failed, keeping last-known-good policy"
+                );
+                if let Err(report_err) = client
+                    .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                    .await
+                {
+                    warn!(error = %report_err, "Failed to report policy load failure");
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

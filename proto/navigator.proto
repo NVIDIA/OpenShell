@@ -49,13 +49,35 @@ service Navigator {
   // Delete a provider by name.
   rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
 
-  // Get sandbox policy by id (called by sandbox entrypoint at startup).
+  // Get sandbox policy by id (called by sandbox entrypoint and poll loop).
   rpc GetSandboxPolicy(navigator.sandbox.v1.GetSandboxPolicyRequest)
       returns (navigator.sandbox.v1.GetSandboxPolicyResponse);
+
+  // Update sandbox policy on a live sandbox.
+  rpc UpdateSandboxPolicy(UpdateSandboxPolicyRequest)
+      returns (UpdateSandboxPolicyResponse);
+
+  // Get the load status of a specific policy version.
+  rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
+      returns (GetSandboxPolicyStatusResponse);
+
+  // List policy history for a sandbox.
+  rpc ListSandboxPolicies(ListSandboxPoliciesRequest)
+      returns (ListSandboxPoliciesResponse);
+
+  // Report policy load result (called by sandbox after reload attempt).
+  rpc ReportPolicyStatus(ReportPolicyStatusRequest)
+      returns (ReportPolicyStatusResponse);
 
   // Get provider environment for a sandbox (called by sandbox supervisor at startup).
   rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
       returns (GetSandboxProviderEnvironmentResponse);
+
+  // Fetch recent sandbox logs (one-shot).
+  rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse);
+
+  // Push sandbox supervisor logs to the server (client-streaming).
+  rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse);
 
   // Watch a sandbox and stream updates.
   //
@@ -248,6 +270,16 @@ message WatchSandboxRequest {
 
   // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
   bool stop_on_terminal = 7;
+
+  // Only include log lines with timestamp >= this value (milliseconds since epoch).
+  // 0 means no time filter. Applies to both tail replay and live streaming.
+  int64 log_since_ms = 8;
+
+  // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
+  repeated string log_sources = 9;
+
+  // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
+  string log_min_level = 10;
 }
 
 // One event in a sandbox watch stream.
@@ -264,13 +296,18 @@ message SandboxStreamEvent {
   }
 }
 
-// Navigator server process log line correlated to a sandbox.
+// Log line correlated to a sandbox.
 message SandboxLogLine {
   string sandbox_id = 1;
   int64 timestamp_ms = 2;
   string level = 3;
   string target = 4;
   string message = 5;
+  // Log source: "gateway" (server-side) or "sandbox" (supervisor).
+  // Empty is treated as "gateway" for backward compatibility.
+  string source = 6;
+  // Structured key-value fields from the tracing event (e.g. dst_host, action).
+  map<string, string> fields = 7;
 }
 
 // Platform event correlated to a sandbox.
@@ -345,6 +382,144 @@ message GetSandboxProviderEnvironmentResponse {
   // Provider credential environment variables.
   map<string, string> environment = 1;
 }
+
+// ---------------------------------------------------------------------------
+// Policy update messages
+// ---------------------------------------------------------------------------
+
+// Update sandbox policy request.
+message UpdateSandboxPolicyRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // The new policy to apply. Only network_policies and inference fields may
+  // differ from the create-time policy; static fields (filesystem, landlock,
+  // process) must match version 1 or the request is rejected.
+  navigator.sandbox.v1.SandboxPolicy policy = 2;
+}
+
+// Update sandbox policy response.
+message UpdateSandboxPolicyResponse {
+  // Assigned policy version (monotonically increasing per sandbox).
+  uint32 version = 1;
+  // SHA-256 hash of the serialized policy payload.
+  string policy_hash = 2;
+}
+
+// Get sandbox policy status request.
+message GetSandboxPolicyStatusRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // The specific policy version to query. 0 means latest.
+  uint32 version = 2;
+}
+
+// Get sandbox policy status response.
+message GetSandboxPolicyStatusResponse {
+  // The queried policy revision.
+  SandboxPolicyRevision revision = 1;
+  // The currently active (loaded) policy version for this sandbox.
+  uint32 active_version = 2;
+}
+
+// List sandbox policies request.
+message ListSandboxPoliciesRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+// List sandbox policies response.
+message ListSandboxPoliciesResponse {
+  repeated SandboxPolicyRevision revisions = 1;
+}
+
+// Report policy load status (called by sandbox runtime after reload attempt).
+message ReportPolicyStatusRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // The policy version that was attempted.
+  uint32 version = 2;
+  // Load result status.
+  PolicyStatus status = 3;
+  // Error message if status is FAILED.
+  string load_error = 4;
+}
+
+// Report policy status response.
+message ReportPolicyStatusResponse {}
+
+// A versioned policy revision with metadata.
+message SandboxPolicyRevision {
+  // Policy version (monotonically increasing per sandbox).
+  uint32 version = 1;
+  // SHA-256 hash of the serialized policy payload.
+  string policy_hash = 2;
+  // Load status of this revision.
+  PolicyStatus status = 3;
+  // Error message if status is FAILED.
+  string load_error = 4;
+  // Milliseconds since epoch when this revision was created.
+  int64 created_at_ms = 5;
+  // Milliseconds since epoch when this revision was loaded by the sandbox.
+  int64 loaded_at_ms = 6;
+  // The full policy (only populated when explicitly requested).
+  navigator.sandbox.v1.SandboxPolicy policy = 7;
+}
+
+// Policy load status.
+enum PolicyStatus {
+  POLICY_STATUS_UNSPECIFIED = 0;
+  // Server received the update; sandbox has not yet loaded it.
+  POLICY_STATUS_PENDING = 1;
+  // Sandbox successfully applied this policy version.
+  POLICY_STATUS_LOADED = 2;
+  // Sandbox attempted to apply but failed; LKG policy remains active.
+  POLICY_STATUS_FAILED = 3;
+  // A newer version was persisted before the sandbox loaded this one.
+  POLICY_STATUS_SUPERSEDED = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox logs messages
+// ---------------------------------------------------------------------------
+
+// Get sandbox logs request (one-shot fetch).
+message GetSandboxLogsRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // Maximum number of log lines to return. 0 means use default (2000).
+  uint32 lines = 2;
+  // Only include logs with timestamp >= this value (ms since epoch). 0 means no filter.
+  int64 since_ms = 3;
+  // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
+  repeated string sources = 4;
+  // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
+  string min_level = 5;
+}
+
+// Batch of log lines pushed from sandbox to server.
+message PushSandboxLogsRequest {
+  // The sandbox ID.
+  string sandbox_id = 1;
+  // Log lines to ingest.
+  repeated SandboxLogLine logs = 2;
+}
+
+// Push sandbox logs response.
+message PushSandboxLogsResponse {}
+
+// Get sandbox logs response.
+message GetSandboxLogsResponse {
+  // Log lines in chronological order.
+  repeated SandboxLogLine logs = 1;
+  // Total number of lines in the server's buffer for this sandbox.
+  uint32 buffer_total = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Service status
+// ---------------------------------------------------------------------------
 
 // Service status enum.
 enum ServiceStatus {

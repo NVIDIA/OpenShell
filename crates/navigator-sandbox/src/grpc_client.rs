@@ -4,8 +4,9 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
     GetSandboxInferenceBundleRequest, GetSandboxInferenceBundleResponse, GetSandboxPolicyRequest,
-    GetSandboxProviderEnvironmentRequest, SandboxPolicy as ProtoSandboxPolicy,
-    inference_client::InferenceClient, navigator_client::NavigatorClient,
+    GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, inference_client::InferenceClient,
+    navigator_client::NavigatorClient,
 };
 use std::collections::HashMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -105,6 +106,87 @@ pub async fn fetch_provider_environment(
         .into_diagnostic()?;
 
     Ok(response.into_inner().environment)
+}
+
+/// A reusable gRPC client for the Navigator service.
+///
+/// Wraps a tonic channel connected once and reused for policy polling
+/// and status reporting, avoiding per-request TLS handshake overhead.
+#[derive(Clone)]
+pub struct CachedNavigatorClient {
+    client: NavigatorClient<Channel>,
+}
+
+/// Policy poll result returned by [`CachedNavigatorClient::poll_policy`].
+pub struct PolicyPollResult {
+    pub policy: ProtoSandboxPolicy,
+    pub version: u32,
+    pub policy_hash: String,
+}
+
+impl CachedNavigatorClient {
+    pub async fn connect(endpoint: &str) -> Result<Self> {
+        debug!(endpoint = %endpoint, "Connecting navigator gRPC client for policy polling");
+        let channel = connect_channel(endpoint).await?;
+        let client = NavigatorClient::new(channel);
+        Ok(Self { client })
+    }
+
+    /// Get a clone of the underlying tonic client for direct RPC calls.
+    pub fn raw_client(&self) -> NavigatorClient<Channel> {
+        self.client.clone()
+    }
+
+    /// Poll for the current sandbox policy version.
+    pub async fn poll_policy(&self, sandbox_id: &str) -> Result<PolicyPollResult> {
+        let response = self
+            .client
+            .clone()
+            .get_sandbox_policy(GetSandboxPolicyRequest {
+                sandbox_id: sandbox_id.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+
+        let inner = response.into_inner();
+        let policy = inner
+            .policy
+            .ok_or_else(|| miette::miette!("Server returned empty policy"))?;
+
+        Ok(PolicyPollResult {
+            policy,
+            version: inner.version,
+            policy_hash: inner.policy_hash,
+        })
+    }
+
+    /// Report policy load status back to the server.
+    pub async fn report_policy_status(
+        &self,
+        sandbox_id: &str,
+        version: u32,
+        loaded: bool,
+        error_msg: &str,
+    ) -> Result<()> {
+        let status = if loaded {
+            PolicyStatus::Loaded
+        } else {
+            PolicyStatus::Failed
+        };
+
+        self.client
+            .clone()
+            .report_policy_status(ReportPolicyStatusRequest {
+                sandbox_id: sandbox_id.to_string(),
+                version,
+                status: status.into(),
+                load_error: error_msg.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+
+        Ok(())
+    }
 }
 
 /// Fetch the pre-filtered inference route bundle for a sandbox.

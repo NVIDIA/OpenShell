@@ -82,6 +82,13 @@ network_policies:
       - { path: /usr/bin/curl }
       - { path: /bin/bash }
       - { path: /usr/local/bin/opencode }
+  nvidia_web:
+    name: nvidia_web
+    endpoints:
+      - { host: nvidia.com, port: 443 }
+      - { host: www.nvidia.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
 
   # --- GitHub repo-scoped policy (L7, TLS-terminated) ---
   # Combined policy for api.github.com to avoid OPA complete-rule conflict.

@@ -208,6 +208,48 @@ impl Navigator for TestNavigator {
             rx,
         )))
     }
+
+    async fn update_sandbox_policy(
+        &self,
+        _request: tonic::Request<navigator_core::proto::UpdateSandboxPolicyRequest>,
+    ) -> Result<Response<navigator_core::proto::UpdateSandboxPolicyResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_sandbox_policy_status(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetSandboxPolicyStatusRequest>,
+    ) -> Result<Response<navigator_core::proto::GetSandboxPolicyStatusResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn list_sandbox_policies(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ListSandboxPoliciesRequest>,
+    ) -> Result<Response<navigator_core::proto::ListSandboxPoliciesResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn report_policy_status(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ReportPolicyStatusRequest>,
+    ) -> Result<Response<navigator_core::proto::ReportPolicyStatusResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_sandbox_logs(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetSandboxLogsRequest>,
+    ) -> Result<Response<navigator_core::proto::GetSandboxLogsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn push_sandbox_logs(
+        &self,
+        _request: tonic::Request<tonic::Streaming<navigator_core::proto::PushSandboxLogsRequest>>,
+    ) -> Result<Response<navigator_core::proto::PushSandboxLogsResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 fn build_ca() -> (Certificate, KeyPair) {

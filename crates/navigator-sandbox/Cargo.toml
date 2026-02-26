@@ -20,6 +20,7 @@ tokio = { workspace = true }
 
 # gRPC
 tonic = { workspace = true, features = ["channel", "tls"] }
+tokio-stream = { workspace = true }
 
 # CLI
 clap = { workspace = true }

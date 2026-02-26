@@ -4,8 +4,8 @@ The sandbox system uses a YAML-based policy language to govern sandbox behavior.
 
 Policies serve two purposes:
 
-1. **Static configuration** -- filesystem access rules, Landlock compatibility, and process privilege dropping (applied once at sandbox startup).
-2. **Dynamic network decisions** -- per-connection and per-request access control evaluated at runtime by the OPA engine.
+1. **Static configuration** -- filesystem access rules, Landlock compatibility, and process privilege dropping (applied once at sandbox startup and immutable for the sandbox's lifetime).
+2. **Dynamic network decisions** -- per-connection and per-request access control evaluated at runtime by the OPA engine. These fields can be updated on a running sandbox via live policy updates.
 
 ## Policy Loading
 
@@ -71,6 +71,187 @@ flowchart TD
 
 File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--navigator-endpoint` are provided, file mode is used. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`.
 
+## Live Policy Updates
+
+Policy can be updated on a running sandbox without restarting it. This enables operators to tighten or relax network access rules and inference routing in response to changing requirements.
+
+Live updates are only available in **gRPC mode** (production clusters). File-mode sandboxes load policy once at startup and do not poll for changes.
+
+### Static vs. Dynamic Fields
+
+Policy fields fall into two categories based on when they are enforced:
+
+| Category | Fields | Enforcement Point | Updatable? |
+|----------|--------|-------------------|------------|
+| **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
+| **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `nav sandbox policy set` |
+
+Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/navigator-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
+
+### Network Mode Immutability
+
+The network mode (Block vs. Proxy) cannot change after sandbox creation. This is because switching modes requires infrastructure changes that only happen at startup:
+
+- **Block to Proxy**: Requires creating a network namespace, veth pair, and starting the CONNECT proxy -- none of which exist if the sandbox started in Block mode.
+- **Proxy to Block**: Requires removing the proxy, veth pair, and network namespace, and applying a stricter seccomp filter that blocks `AF_INET`/`AF_INET6` -- not possible on a running process.
+
+An update that adds `network_policies` to a sandbox created without them (or removes all `network_policies` from a sandbox created with them) is rejected. See `crates/navigator-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
+
+### Update Flow
+
+The update mechanism uses a poll-based model with versioned policy revisions and server-side status tracking.
+
+```mermaid
+sequenceDiagram
+    participant CLI as nav sandbox policy set
+    participant GW as Gateway (navigator-server)
+    participant DB as Persistence (SQLite/Postgres)
+    participant SB as Sandbox (navigator-sandbox)
+
+    CLI->>GW: UpdateSandboxPolicy(name, new_policy)
+    GW->>GW: Validate static fields unchanged
+    GW->>GW: Validate network mode unchanged
+    GW->>DB: put_policy_revision(version=N, status=pending)
+    GW->>DB: supersede_pending_policies(before_version=N)
+    GW-->>CLI: UpdateSandboxPolicyResponse(version=N, hash)
+
+    loop Every 30s (configurable)
+        SB->>GW: GetSandboxPolicy(sandbox_id)
+        GW->>DB: get_latest_policy(sandbox_id)
+        GW-->>SB: GetSandboxPolicyResponse(policy, version=N, hash)
+    end
+
+    Note over SB: Detects version > current_version
+    SB->>SB: OpaEngine::reload_from_proto(new_policy)
+
+    alt Reload succeeds
+        SB->>GW: ReportPolicyStatus(version=N, LOADED)
+        GW->>DB: update_policy_status(version=N, "loaded")
+        GW->>DB: Update sandbox.current_policy_version = N
+    else Reload fails (validation error)
+        Note over SB: Previous engine untouched (LKG)
+        SB->>GW: ReportPolicyStatus(version=N, FAILED, error_msg)
+        GW->>DB: update_policy_status(version=N, "failed", error_msg)
+    end
+
+    opt CLI --wait flag
+        CLI->>GW: GetSandboxPolicyStatus(name, version=N)
+        GW-->>CLI: revision.status = LOADED / FAILED
+    end
+```
+
+### Policy Versioning
+
+Each sandbox maintains an independent, monotonically increasing version counter for its policy revisions:
+
+- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxPolicy` call if no explicit revision exists in the policy history table. See `crates/navigator-server/src/grpc.rs` -- `get_sandbox_policy()`.
+- Each `UpdateSandboxPolicy` call computes the next version as `latest_version + 1` and persists a new `PolicyRecord` with status `"pending"`.
+- When a new version is persisted, all older revisions still in `"pending"` status are marked `"superseded"` via `supersede_pending_policies()`. This handles rapid successive updates where the sandbox has not yet picked up an intermediate version.
+- The `Sandbox` protobuf object carries a `current_policy_version` field (see `proto/datamodel.proto`) that is updated when the sandbox reports a successful load.
+
+Each revision is stored as a `PolicyRecord` containing the full serialized protobuf payload, a SHA-256 hash of that payload, a status string, and timestamps. See `crates/navigator-server/src/persistence/mod.rs` -- `PolicyRecord`.
+
+### Deterministic Policy Hashing
+
+Policy hashes use a deterministic function that avoids the non-determinism of protobuf's `encode_to_vec()` on `map` fields. Protobuf `map` fields are backed by `HashMap`, whose iteration order is randomized, so encoding the same logical policy twice can produce different byte sequences. The `deterministic_policy_hash()` function avoids this by hashing each top-level field individually and sorting `network_policies` map entries by key before hashing. See `crates/navigator-server/src/grpc.rs` -- `deterministic_policy_hash()`.
+
+The hash is computed as follows:
+
+1. Hash the `version` field as little-endian bytes.
+2. Hash the `filesystem`, `landlock`, and `process` sub-messages via `encode_to_vec()` (these contain no `map` fields, so encoding is deterministic).
+3. Collect `network_policies` entries, sort by map key, then hash each key (as UTF-8 bytes) followed by the value's `encode_to_vec()`.
+4. Hash the `inference` sub-message via `encode_to_vec()`.
+5. Return the hex-encoded SHA-256 digest.
+
+This guarantees that the same logical policy always produces the same hash regardless of protobuf serialization order.
+
+**Idempotent updates**: `UpdateSandboxPolicy` compares the deterministic hash of the submitted policy against the latest stored revision's hash. If they match, the handler returns the existing version and hash without creating a new revision. The CLI detects this (the returned version equals the pre-call version) and prints `Policy unchanged` instead of `Policy version N submitted`. This makes repeated `policy set` calls safe and idempotent.
+
+### Policy Revision Statuses
+
+| Status | Meaning |
+|--------|---------|
+| `pending` | Server accepted the update; sandbox has not yet polled and loaded it |
+| `loaded` | Sandbox successfully applied this version via `OpaEngine::reload_from_proto()` |
+| `failed` | Sandbox attempted to load but validation failed; LKG policy remains active |
+| `superseded` | A newer version was persisted before the sandbox loaded this one |
+
+### Sandbox Poll Loop
+
+In gRPC mode, the sandbox spawns a background task that periodically polls the gateway for policy updates. See `crates/navigator-sandbox/src/lib.rs` -- `run_policy_poll_loop()`.
+
+| Parameter | Default | Override |
+|-----------|---------|----------|
+| Poll interval | 30 seconds | `NAVIGATOR_POLICY_POLL_INTERVAL_SECS` environment variable |
+
+The poll loop:
+
+1. Connects a reusable gRPC client (`CachedNavigatorClient`) to avoid per-poll TLS handshake overhead.
+2. Fetches the current policy via `GetSandboxPolicy`, which returns the latest version, its policy payload, and a SHA-256 hash.
+3. Compares the returned version against the locally tracked `current_version`. If the server version is not greater, the loop sleeps and retries.
+4. On a new version, calls `OpaEngine::reload_from_proto()` which builds a complete new `regorus::Engine` through the same validated pipeline as the initial load (proto-to-JSON conversion, L7 validation, access preset expansion).
+5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>`. If it fails, the previous engine is untouched.
+6. Reports success or failure back to the server via `ReportPolicyStatus`.
+
+See `crates/navigator-sandbox/src/grpc_client.rs` -- `CachedNavigatorClient`.
+
+### Last-Known-Good (LKG) Behavior
+
+When a new policy version fails validation during reload, the sandbox keeps the previous policy active. This provides safe rollback semantics:
+
+- `OpaEngine::reload_from_proto()` constructs a complete new engine via `OpaEngine::from_proto()` before touching the existing one. If `from_proto()` returns an error (L7 validation failures, preset expansion errors, malformed proto data), the existing engine's `Mutex<regorus::Engine>` is never locked for replacement. See `crates/navigator-sandbox/src/opa.rs` -- `reload_from_proto()`.
+- The failure error message is reported back to the server via `ReportPolicyStatus` with `PolicyStatus::FAILED` and stored in the `PolicyRecord.load_error` field.
+- The CLI's `--wait` flag polls `GetSandboxPolicyStatus` and surfaces the error to the operator.
+
+Failure scenarios that trigger LKG behavior include:
+
+- L7 validation errors (e.g., `rules` and `access` both set on an endpoint)
+- Preset expansion failures (e.g., unknown access preset value)
+- Rego rule compilation failures (should not occur with baked-in rules, but guarded against)
+
+### CLI Commands
+
+The `nav sandbox policy` subcommand group manages live policy updates:
+
+```bash
+# Push a new policy to a running sandbox
+nav sandbox policy set <sandbox-name> --policy updated-policy.yaml
+
+# Push and wait for the sandbox to load it (with 60s timeout)
+nav sandbox policy set <sandbox-name> --policy updated-policy.yaml --wait
+
+# Push and wait with a custom timeout
+nav sandbox policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
+
+# View the current active policy and its status
+nav sandbox policy get <sandbox-name>
+
+# Inspect a specific revision
+nav sandbox policy get <sandbox-name> --rev 3
+
+# Print the full policy as YAML (round-trips with --policy input format)
+nav sandbox policy get <sandbox-name> --full
+
+# Combine: inspect a specific revision's full policy
+nav sandbox policy get <sandbox-name> --rev 2 --full
+
+# List policy revision history
+nav sandbox policy list <sandbox-name> --limit 20
+```
+
+#### `policy get` flags
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--rev N` | `0` (latest) | Retrieve a specific policy revision by version number instead of the latest. Maps to the `version` field of `GetSandboxPolicyStatusRequest` -- version `0` resolves to the latest revision server-side. |
+| `--full` | off | Print the complete policy as YAML after the metadata summary. The YAML output uses the same schema as the `--policy` input file, so it round-trips: you can save it to a file and pass it back to `nav sandbox policy set --policy`. |
+
+When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/navigator-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/navigator-cli/src/run.rs` -- `policy_to_yaml()`, `sandbox_policy_get()`.
+
+See `crates/navigator-cli/src/main.rs` -- `PolicyCommands` enum, `crates/navigator-cli/src/run.rs` -- `sandbox_policy_set()`, `sandbox_policy_get()`, `sandbox_policy_list()`.
+
+---
+
 ## Full YAML Policy Schema
 
 The YAML data file contains top-level keys that map directly to the OPA data namespace (`data.*`). The following sections document every field.
@@ -112,7 +293,7 @@ inference:
 
 ### `filesystem_policy`
 
-Controls which filesystem paths the sandboxed process can access. Enforced via Linux Landlock LSM at process startup.
+Controls which filesystem paths the sandboxed process can access. Enforced via Linux Landlock LSM at process startup. **Static field** -- immutable after sandbox creation (see [Static vs. Dynamic Fields](#static-vs-dynamic-fields)).
 
 | Field             | Type       | Default | Description                                                    |
 | ----------------- | ---------- | ------- | -------------------------------------------------------------- |
@@ -148,7 +329,7 @@ filesystem_policy:
 
 ### `landlock`
 
-Controls Landlock LSM compatibility behavior.
+Controls Landlock LSM compatibility behavior. **Static field** -- immutable after sandbox creation (see [Static vs. Dynamic Fields](#static-vs-dynamic-fields)).
 
 | Field           | Type     | Default         | Description                           |
 | --------------- | -------- | --------------- | ------------------------------------- |
@@ -172,7 +353,7 @@ landlock:
 
 ### `process`
 
-Controls privilege dropping for the sandboxed process.
+Controls privilege dropping for the sandboxed process. **Static field** -- immutable after sandbox creation (see [Static vs. Dynamic Fields](#static-vs-dynamic-fields)).
 
 | Field          | Type     | Default        | Description                              |
 | -------------- | -------- | -------------- | ---------------------------------------- |
@@ -197,7 +378,7 @@ process:
 
 ### `network_policies`
 
-A map of named network policy rules. Each rule defines which binary/endpoint pairs are allowed to make outbound network connections. This is the core of the network access control system.
+A map of named network policy rules. Each rule defines which binary/endpoint pairs are allowed to make outbound network connections. This is the core of the network access control system. **Dynamic field** -- can be updated on a running sandbox via live policy updates (see [Live Policy Updates](#live-policy-updates)). However, the overall network mode (Block vs. Proxy) is immutable.
 
 **Behavioral trigger**: The mere presence of any entries in `network_policies` switches the sandbox to **proxy mode**. When `network_policies` is empty or absent, the sandbox operates in **block mode** where all outbound network access is denied via seccomp.
 
@@ -286,7 +467,7 @@ See `crates/navigator-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
 ### `inference`
 
-Controls access to the platform's inference routing system (gRPC mode only, included in the `SandboxPolicy` proto but not consumed by the sandbox supervisor directly).
+Controls access to the platform's inference routing system (gRPC mode only, included in the `SandboxPolicy` proto but not consumed by the sandbox supervisor directly). **Dynamic field** -- can be updated on a running sandbox via live policy updates (see [Live Policy Updates](#live-policy-updates)).
 
 | Field                   | Type       | Default | Description                                                                                                                                                 |
 | ----------------------- | ---------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -314,6 +495,8 @@ Several policy fields trigger fundamentally different enforcement behavior. Unde
 | `network_policies` has any entries    | **Proxy**    | Seccomp allows `AF_INET` and `AF_INET6` sockets. An HTTP CONNECT proxy starts. A network namespace with veth pair isolates the sandbox. `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables are set on the child process. |
 
 In proxy mode, the seccomp filter still blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` socket domains regardless. See `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs` -- `build_filter()`.
+
+**Immutability**: The network mode is determined at sandbox creation and cannot change via live policy updates. Adding `network_policies` to a Block-mode sandbox or removing all policies from a Proxy-mode sandbox is rejected by the gateway. See [Network Mode Immutability](#network-mode-immutability).
 
 ```mermaid
 flowchart LR
@@ -519,6 +702,18 @@ The following validation rules are enforced during policy loading (both file mod
 | `protocol: sql` with `enforcement: enforce`    | `SQL enforcement requires full SQL parsing (not available in v1). Use enforcement: audit.` |
 | `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
+
+### Errors (Live Update Rejection)
+
+These errors are returned by the gateway's `UpdateSandboxPolicy` handler and reject the update before it is persisted. See `crates/navigator-server/src/grpc.rs`.
+
+| Condition | Error Message |
+|-----------|---------------|
+| `filesystem_policy` differs from version 1 | `filesystem policy cannot be changed on a live sandbox (applied at startup)` |
+| `landlock` differs from version 1 | `landlock policy cannot be changed on a live sandbox (applied at startup)` |
+| `process` differs from version 1 | `process policy cannot be changed on a live sandbox (applied at startup)` |
+| Adding `network_policies` when version 1 had none | `cannot add network policies to a sandbox created without them (Block -> Proxy mode change requires restart)` |
+| Removing all `network_policies` when version 1 had some | `cannot remove all network policies from a sandbox created with them (Proxy -> Block mode change requires restart)` |
 
 ### Warnings (Log Only)
 
@@ -758,6 +953,69 @@ The OPA engine evaluates two categories of rules:
 | `request_deny_reason` | Same input                                                                      | Human-readable deny message                                    |
 
 See `dev-sandbox-policy.rego` for the full Rego implementation.
+
+---
+
+## Sandbox Log Filtering
+
+The `nav sandbox logs` command retrieves log lines from the gateway's in-memory log buffer. Two server-side filters narrow the output before logs are sent to the CLI.
+
+### Source Filter (`--source`)
+
+Log lines carry a `source` field identifying their origin. The `--source` flag filters by this field.
+
+| Value | Description |
+|-------|-------------|
+| `all` | Show logs from all sources (default). Translates to an empty filter list server-side. |
+| `gateway` | Show only server-side logs (reconciler events, gRPC handler traces). Logs with an empty `source` field are treated as `gateway` for backward compatibility. |
+| `sandbox` | Show only supervisor logs (proxy decisions, OPA evaluations, identity checks). These are pushed from the sandbox to the gateway via `PushSandboxLogs`. |
+
+Multiple sources can be specified: `--source gateway --source sandbox` is equivalent to `--source all`.
+
+```bash
+# Show only proxy/OPA logs from the sandbox supervisor
+nav sandbox logs my-sandbox --source sandbox
+
+# Show only gateway-side reconciler logs
+nav sandbox logs my-sandbox --source gateway
+```
+
+The filter applies to both one-shot mode (`GetSandboxLogs` RPC) and streaming mode (`--tail`, via `WatchSandbox` RPC). In both cases, the server evaluates `source_matches()` before sending each log line to the client. See `crates/navigator-server/src/grpc.rs` -- `source_matches()`, `get_sandbox_logs()`.
+
+### Level Filter (`--level`)
+
+The `--level` flag sets a minimum log severity. Only lines at or above the specified level are returned.
+
+| Level | Numeric | Passes when `--level` is |
+|-------|---------|--------------------------|
+| `ERROR` | 0 | error, warn, info, debug, trace |
+| `WARN` | 1 | warn, info, debug, trace |
+| `INFO` | 2 | info, debug, trace |
+| `DEBUG` | 3 | debug, trace |
+| `TRACE` | 4 | trace |
+
+The default (empty string) disables level filtering -- all levels pass. An unrecognized level string is assigned numeric value 5, so it always passes.
+
+```bash
+# Show only WARN and ERROR logs
+nav sandbox logs my-sandbox --level warn
+
+# Combine with source filter: only sandbox ERROR logs
+nav sandbox logs my-sandbox --source sandbox --level error
+```
+
+The filter is applied server-side via `level_matches()` in both one-shot and streaming modes. See `crates/navigator-server/src/grpc.rs` -- `level_matches()`.
+
+### Proto Messages
+
+The source and level filters are carried in both log-related RPC messages:
+
+| RPC | Proto Message | Source Field | Level Field |
+|-----|---------------|--------------|-------------|
+| `GetSandboxLogs` | `GetSandboxLogsRequest` | `repeated string sources` | `string min_level` |
+| `WatchSandbox` | `WatchSandboxRequest` | `repeated string log_sources` | `string log_min_level` |
+
+An empty `sources`/`log_sources` list means no source filtering (all sources pass). An empty `min_level`/`log_min_level` string means no level filtering (all levels pass). See `proto/navigator.proto`.
 
 ---
 

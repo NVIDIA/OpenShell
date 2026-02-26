@@ -477,6 +477,84 @@ enum SandboxCommands {
         #[command(subcommand)]
         command: SandboxImageCommands,
     },
+
+    /// Manage sandbox policy.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+
+    /// View sandbox logs.
+    Logs {
+        /// Sandbox name.
+        name: String,
+
+        /// Number of log lines to return.
+        #[arg(short, default_value_t = 200)]
+        n: u32,
+
+        /// Stream live logs.
+        #[arg(long)]
+        tail: bool,
+
+        /// Only show logs from this duration ago (e.g. 5m, 1h, 30s).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter by log source: "gateway", "sandbox", or "all" (default).
+        /// Can be specified multiple times: --source gateway --source sandbox
+        #[arg(long, default_value = "all")]
+        source: Vec<String>,
+
+        /// Minimum log level to display: error, warn, info (default), debug, trace.
+        #[arg(long, default_value = "")]
+        level: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PolicyCommands {
+    /// Update policy on a live sandbox.
+    Set {
+        /// Sandbox name.
+        name: String,
+
+        /// Path to the policy YAML file.
+        #[arg(long)]
+        policy: String,
+
+        /// Wait for the sandbox to load the policy.
+        #[arg(long)]
+        wait: bool,
+
+        /// Timeout for --wait in seconds.
+        #[arg(long, default_value_t = 60)]
+        timeout: u64,
+    },
+
+    /// Show current active policy for a sandbox.
+    Get {
+        /// Sandbox name.
+        name: String,
+
+        /// Show a specific policy revision (default: latest).
+        #[arg(long = "rev", default_value_t = 0)]
+        rev: u32,
+
+        /// Print the full policy as YAML.
+        #[arg(long)]
+        full: bool,
+    },
+
+    /// List policy history for a sandbox.
+    List {
+        /// Sandbox name.
+        name: String,
+
+        /// Maximum number of revisions to return.
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -887,6 +965,47 @@ async fn main() -> Result<()> {
                             }
                             ForwardCommands::Stop { .. } | ForwardCommands::List => unreachable!(),
                         },
+                        SandboxCommands::Policy {
+                            command: policy_cmd,
+                        } => match policy_cmd {
+                            PolicyCommands::Set {
+                                name,
+                                policy,
+                                wait,
+                                timeout,
+                            } => {
+                                run::sandbox_policy_set(
+                                    endpoint, &name, &policy, wait, timeout, &tls,
+                                )
+                                .await?;
+                            }
+                            PolicyCommands::Get { name, rev, full } => {
+                                run::sandbox_policy_get(endpoint, &name, rev, full, &tls).await?;
+                            }
+                            PolicyCommands::List { name, limit } => {
+                                run::sandbox_policy_list(endpoint, &name, limit, &tls).await?;
+                            }
+                        },
+                        SandboxCommands::Logs {
+                            name,
+                            n,
+                            tail,
+                            since,
+                            source,
+                            level,
+                        } => {
+                            run::sandbox_logs(
+                                endpoint,
+                                &name,
+                                n,
+                                tail,
+                                since.as_deref(),
+                                &source,
+                                &level,
+                                &tls,
+                            )
+                            .await?;
+                        }
                     }
                 }
             }

@@ -2,22 +2,27 @@
 
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
-use crate::persistence::{ObjectId, ObjectName, ObjectType, generate_name};
+use crate::persistence::{ObjectId, ObjectName, ObjectType, PolicyRecord, generate_name};
 use futures::future;
 use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
-    GetProviderRequest, GetSandboxPolicyRequest, GetSandboxPolicyResponse,
+    GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyRequest,
+    GetSandboxPolicyResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxesRequest, ListSandboxesResponse, Provider, ProviderResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceStatus, SshSession, UpdateProviderRequest, WatchSandboxRequest,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
+    ListSandboxesResponse, PolicyStatus, Provider, ProviderResponse, PushSandboxLogsRequest,
+    PushSandboxLogsResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SshSession, UpdateProviderRequest,
+    UpdateSandboxPolicyRequest, UpdateSandboxPolicyResponse, WatchSandboxRequest,
     navigator_server::Navigator,
 };
-use navigator_core::proto::{Sandbox, SandboxPhase};
+use navigator_core::proto::{Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy};
 use prost::Message;
+use sha2::{Digest, Sha256};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -177,6 +182,9 @@ impl Navigator for NavigatorService {
             req.log_tail_lines
         };
         let stop_on_terminal = req.stop_on_terminal;
+        let log_since_ms = req.log_since_ms;
+        let log_sources = req.log_sources;
+        let log_min_level = req.log_min_level;
 
         let (tx, rx) = mpsc::channel::<Result<SandboxStreamEvent, Status>>(256);
         let state = self.state.clone();
@@ -242,9 +250,23 @@ impl Navigator for NavigatorService {
                 }
             }
 
-            // Replay tail logs (best-effort).
+            // Replay tail logs (best-effort), filtered by log_since_ms and log_sources.
             if follow_logs {
                 for evt in state.tracing_log_bus.tail(&sandbox_id, log_tail as usize) {
+                    if let Some(navigator_core::proto::sandbox_stream_event::Payload::Log(
+                        ref log,
+                    )) = evt.payload
+                    {
+                        if log_since_ms > 0 && log.timestamp_ms < log_since_ms {
+                            continue;
+                        }
+                        if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                            continue;
+                        }
+                        if !level_matches(&log.level, &log_min_level) {
+                            continue;
+                        }
+                    }
                     if tx.send(Ok(evt)).await.is_err() {
                         return;
                     }
@@ -300,6 +322,15 @@ impl Navigator for NavigatorService {
                     } => {
                         match res {
                             Ok(evt) => {
+                                // Apply source + level filter on live log events.
+                                if let Some(navigator_core::proto::sandbox_stream_event::Payload::Log(ref log)) = evt.payload {
+                                    if !log_sources.is_empty() && !source_matches(&log.source, &log_sources) {
+                                        continue;
+                                    }
+                                    if !level_matches(&log.level, &log_min_level) {
+                                        continue;
+                                    }
+                                }
                                 if tx.send(Ok(evt)).await.is_err() {
                                     return;
                                 }
@@ -528,21 +559,68 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
+        // Try to get the latest policy from the policy history table.
+        let latest = self
+            .state
+            .store
+            .get_latest_policy(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
+
+        if let Some(record) = latest {
+            let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
+            info!(
+                sandbox_id = %sandbox_id,
+                version = record.version,
+                "GetSandboxPolicy served from policy history"
+            );
+            return Ok(Response::new(GetSandboxPolicyResponse {
+                policy: Some(policy),
+                version: u32::try_from(record.version).unwrap_or(0),
+                policy_hash: record.policy_hash,
+            }));
+        }
+
+        // Lazy backfill: no policy history exists yet, create version 1 from spec.policy.
         let spec = sandbox
             .spec
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-
         let policy = spec
             .policy
             .ok_or_else(|| Status::failed_precondition("sandbox has no policy configured"))?;
 
+        let payload = policy.encode_to_vec();
+        let hash = deterministic_policy_hash(&policy);
+        let policy_id = uuid::Uuid::new_v4().to_string();
+
+        // Best-effort backfill: if it fails (e.g., concurrent backfill race), we still
+        // return the policy from spec.
+        if let Err(e) = self
+            .state
+            .store
+            .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
+            .await
+        {
+            warn!(sandbox_id = %sandbox_id, error = %e, "Failed to backfill policy version 1");
+        } else if let Err(e) = self
+            .state
+            .store
+            .update_policy_status(&sandbox_id, 1, "loaded", None, None)
+            .await
+        {
+            warn!(sandbox_id = %sandbox_id, error = %e, "Failed to mark backfilled policy as loaded");
+        }
+
         info!(
             sandbox_id = %sandbox_id,
-            "GetSandboxPolicy request completed successfully"
+            "GetSandboxPolicy served from spec (backfilled version 1)"
         );
 
         Ok(Response::new(GetSandboxPolicyResponse {
             policy: Some(policy),
+            version: 1,
+            policy_hash: hash,
         }))
     }
 
@@ -716,6 +794,466 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("persist ssh session failed: {e}")))?;
 
         Ok(Response::new(RevokeSshSessionResponse { revoked: true }))
+    }
+
+    // -------------------------------------------------------------------
+    // Policy update handlers
+    // -------------------------------------------------------------------
+
+    async fn update_sandbox_policy(
+        &self,
+        request: Request<UpdateSandboxPolicyRequest>,
+    ) -> Result<Response<UpdateSandboxPolicyResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        let new_policy = req
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+
+        // Resolve sandbox by name.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let sandbox_id = sandbox.id.clone();
+
+        // Get the baseline (version 1) policy for static field validation.
+        let spec = sandbox
+            .spec
+            .as_ref()
+            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+        let baseline_policy = spec
+            .policy
+            .as_ref()
+            .ok_or_else(|| Status::failed_precondition("sandbox has no policy configured"))?;
+
+        // Validate static fields haven't changed.
+        validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+
+        // Validate network mode hasn't changed (Block ↔ Proxy).
+        validate_network_mode_unchanged(baseline_policy, &new_policy)?;
+
+        // Determine next version number.
+        let latest = self
+            .state
+            .store
+            .get_latest_policy(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+        // Compute hash and check if the policy actually changed.
+        let payload = new_policy.encode_to_vec();
+        let hash = deterministic_policy_hash(&new_policy);
+
+        if let Some(ref current) = latest {
+            if current.policy_hash == hash {
+                return Ok(Response::new(UpdateSandboxPolicyResponse {
+                    version: u32::try_from(current.version).unwrap_or(0),
+                    policy_hash: hash,
+                }));
+            }
+        }
+
+        let next_version = latest.map_or(1, |r| r.version + 1);
+        let policy_id = uuid::Uuid::new_v4().to_string();
+
+        self.state
+            .store
+            .put_policy_revision(&policy_id, &sandbox_id, next_version, &payload, &hash)
+            .await
+            .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
+
+        // Supersede older pending revisions.
+        let _ = self
+            .state
+            .store
+            .supersede_older_policies(&sandbox_id, next_version)
+            .await;
+
+        // Notify watchers (unblocks CLI --wait polling).
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        info!(
+            sandbox_id = %sandbox_id,
+            version = next_version,
+            policy_hash = %hash,
+            "UpdateSandboxPolicy: new policy version persisted"
+        );
+
+        Ok(Response::new(UpdateSandboxPolicyResponse {
+            version: u32::try_from(next_version).unwrap_or(0),
+            policy_hash: hash,
+        }))
+    }
+
+    async fn get_sandbox_policy_status(
+        &self,
+        request: Request<GetSandboxPolicyStatusRequest>,
+    ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let sandbox_id = sandbox.id;
+
+        let record = if req.version == 0 {
+            self.state
+                .store
+                .get_latest_policy(&sandbox_id)
+                .await
+                .map_err(|e| Status::internal(format!("fetch policy failed: {e}")))?
+        } else {
+            self.state
+                .store
+                .get_policy_by_version(&sandbox_id, i64::from(req.version))
+                .await
+                .map_err(|e| Status::internal(format!("fetch policy failed: {e}")))?
+        };
+
+        let record =
+            record.ok_or_else(|| Status::not_found("no policy revision found for this sandbox"))?;
+
+        let active_version = sandbox.current_policy_version;
+
+        Ok(Response::new(GetSandboxPolicyStatusResponse {
+            revision: Some(policy_record_to_revision(&record, true)),
+            active_version,
+        }))
+    }
+
+    async fn list_sandbox_policies(
+        &self,
+        request: Request<ListSandboxPoliciesRequest>,
+    ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        let limit = if req.limit == 0 { 50 } else { req.limit };
+        let records = self
+            .state
+            .store
+            .list_policies(&sandbox.id, limit, req.offset)
+            .await
+            .map_err(|e| Status::internal(format!("list policies failed: {e}")))?;
+
+        let revisions = records
+            .iter()
+            .map(|r| policy_record_to_revision(r, false))
+            .collect();
+
+        Ok(Response::new(ListSandboxPoliciesResponse { revisions }))
+    }
+
+    async fn report_policy_status(
+        &self,
+        request: Request<ReportPolicyStatusRequest>,
+    ) -> Result<Response<ReportPolicyStatusResponse>, Status> {
+        let req = request.into_inner();
+        if req.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+        if req.version == 0 {
+            return Err(Status::invalid_argument("version is required"));
+        }
+
+        let version = i64::from(req.version);
+        let status_str = match PolicyStatus::try_from(req.status) {
+            Ok(PolicyStatus::Loaded) => "loaded",
+            Ok(PolicyStatus::Failed) => "failed",
+            _ => return Err(Status::invalid_argument("status must be LOADED or FAILED")),
+        };
+
+        let loaded_at_ms = if status_str == "loaded" {
+            Some(current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?)
+        } else {
+            None
+        };
+
+        let load_error = if status_str == "failed" && !req.load_error.is_empty() {
+            Some(req.load_error.as_str())
+        } else {
+            None
+        };
+
+        let updated = self
+            .state
+            .store
+            .update_policy_status(
+                &req.sandbox_id,
+                version,
+                status_str,
+                load_error,
+                loaded_at_ms,
+            )
+            .await
+            .map_err(|e| Status::internal(format!("update policy status failed: {e}")))?;
+
+        if !updated {
+            return Err(Status::not_found("policy revision not found"));
+        }
+
+        // If loaded, update the sandbox's current_policy_version and
+        // supersede all older versions.
+        if status_str == "loaded" {
+            let _ = self
+                .state
+                .store
+                .supersede_older_policies(&req.sandbox_id, version)
+                .await;
+            if let Ok(Some(mut sandbox)) = self
+                .state
+                .store
+                .get_message::<Sandbox>(&req.sandbox_id)
+                .await
+            {
+                sandbox.current_policy_version = req.version;
+                let _ = self.state.store.put_message(&sandbox).await;
+            }
+            // Notify watchers so CLI --wait can detect the status change.
+            self.state.sandbox_watch_bus.notify(&req.sandbox_id);
+        }
+
+        info!(
+            sandbox_id = %req.sandbox_id,
+            version = req.version,
+            status = %status_str,
+            "ReportPolicyStatus: sandbox reported policy load result"
+        );
+
+        Ok(Response::new(ReportPolicyStatusResponse {}))
+    }
+
+    // -------------------------------------------------------------------
+    // Sandbox logs handler
+    // -------------------------------------------------------------------
+
+    async fn get_sandbox_logs(
+        &self,
+        request: Request<GetSandboxLogsRequest>,
+    ) -> Result<Response<GetSandboxLogsResponse>, Status> {
+        let req = request.into_inner();
+        if req.sandbox_id.is_empty() {
+            return Err(Status::invalid_argument("sandbox_id is required"));
+        }
+
+        let lines = if req.lines == 0 { 2000 } else { req.lines };
+        let tail = self
+            .state
+            .tracing_log_bus
+            .tail(&req.sandbox_id, lines as usize);
+
+        let buffer_total = tail.len() as u32;
+
+        // Extract SandboxLogLine and apply time + source filters.
+        let logs: Vec<SandboxLogLine> = tail
+            .into_iter()
+            .filter_map(|evt| {
+                if let Some(navigator_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                    evt.payload
+                {
+                    if req.since_ms > 0 && log.timestamp_ms < req.since_ms {
+                        return None;
+                    }
+                    if !req.sources.is_empty() && !source_matches(&log.source, &req.sources) {
+                        return None;
+                    }
+                    if !level_matches(&log.level, &req.min_level) {
+                        return None;
+                    }
+                    Some(log)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        Ok(Response::new(GetSandboxLogsResponse { logs, buffer_total }))
+    }
+
+    async fn push_sandbox_logs(
+        &self,
+        request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
+    ) -> Result<Response<PushSandboxLogsResponse>, Status> {
+        let mut stream = request.into_inner();
+
+        while let Some(batch) = stream
+            .message()
+            .await
+            .map_err(|e| Status::internal(format!("stream error: {e}")))?
+        {
+            if batch.sandbox_id.is_empty() {
+                continue;
+            }
+
+            // Cap lines per batch to prevent abuse.
+            for log in batch.logs.into_iter().take(100) {
+                let mut log = log;
+                // Force source to "sandbox" — the sandbox cannot claim to be the gateway.
+                log.source = "sandbox".to_string();
+                // Force sandbox_id to match the batch envelope.
+                log.sandbox_id.clone_from(&batch.sandbox_id);
+                self.state.tracing_log_bus.publish_external(log);
+            }
+        }
+
+        Ok(Response::new(PushSandboxLogsResponse {}))
+    }
+}
+
+/// Compute a deterministic SHA-256 hash of a `SandboxPolicy`.
+///
+/// Protobuf `map` fields use `HashMap` which has randomized iteration order,
+/// so `encode_to_vec()` is non-deterministic. This function hashes each field
+/// individually with map entries sorted by key.
+fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(policy.version.to_le_bytes());
+    if let Some(fs) = &policy.filesystem {
+        hasher.update(fs.encode_to_vec());
+    }
+    if let Some(ll) = &policy.landlock {
+        hasher.update(ll.encode_to_vec());
+    }
+    if let Some(p) = &policy.process {
+        hasher.update(p.encode_to_vec());
+    }
+    // Sort network_policies by key for deterministic ordering.
+    let mut entries: Vec<_> = policy.network_policies.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+    for (key, value) in entries {
+        hasher.update(key.as_bytes());
+        hasher.update(value.encode_to_vec());
+    }
+    if let Some(inf) = &policy.inference {
+        hasher.update(inf.encode_to_vec());
+    }
+    hex::encode(hasher.finalize())
+}
+
+/// Check if a log line's source matches the filter list.
+/// Empty source is treated as "gateway" for backward compatibility.
+fn source_matches(log_source: &str, filters: &[String]) -> bool {
+    let effective = if log_source.is_empty() {
+        "gateway"
+    } else {
+        log_source
+    };
+    filters.iter().any(|f| f == effective)
+}
+
+/// Check if a log line's level meets the minimum level threshold.
+/// Empty `min_level` means no filtering (all levels pass).
+fn level_matches(log_level: &str, min_level: &str) -> bool {
+    if min_level.is_empty() {
+        return true;
+    }
+    let to_num = |s: &str| match s.to_uppercase().as_str() {
+        "ERROR" => 0,
+        "WARN" => 1,
+        "INFO" => 2,
+        "DEBUG" => 3,
+        "TRACE" => 4,
+        _ => 5, // unknown levels always pass
+    };
+    to_num(log_level) <= to_num(min_level)
+}
+
+// ---------------------------------------------------------------------------
+// Policy helper functions
+// ---------------------------------------------------------------------------
+
+/// Validate that static policy fields (filesystem, landlock, process) haven't changed
+/// from the baseline (version 1) policy.
+fn validate_static_fields_unchanged(
+    baseline: &ProtoSandboxPolicy,
+    new: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    if baseline.filesystem != new.filesystem {
+        return Err(Status::invalid_argument(
+            "filesystem policy cannot be changed on a live sandbox (applied at startup)",
+        ));
+    }
+    if baseline.landlock != new.landlock {
+        return Err(Status::invalid_argument(
+            "landlock policy cannot be changed on a live sandbox (applied at startup)",
+        ));
+    }
+    if baseline.process != new.process {
+        return Err(Status::invalid_argument(
+            "process policy cannot be changed on a live sandbox (applied at startup)",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that network mode hasn't changed (Block ↔ Proxy).
+/// Adding network_policies when none existed (or removing all) changes the mode.
+fn validate_network_mode_unchanged(
+    baseline: &ProtoSandboxPolicy,
+    new: &ProtoSandboxPolicy,
+) -> Result<(), Status> {
+    let baseline_has_policies = !baseline.network_policies.is_empty();
+    let new_has_policies = !new.network_policies.is_empty();
+    if baseline_has_policies != new_has_policies {
+        let msg = if new_has_policies {
+            "cannot add network policies to a sandbox created without them (Block → Proxy mode change requires restart)"
+        } else {
+            "cannot remove all network policies from a sandbox created with them (Proxy → Block mode change requires restart)"
+        };
+        return Err(Status::invalid_argument(msg));
+    }
+    Ok(())
+}
+
+/// Convert a `PolicyRecord` to a `SandboxPolicyRevision` proto message.
+fn policy_record_to_revision(record: &PolicyRecord, include_policy: bool) -> SandboxPolicyRevision {
+    let status = match record.status.as_str() {
+        "pending" => PolicyStatus::Pending,
+        "loaded" => PolicyStatus::Loaded,
+        "failed" => PolicyStatus::Failed,
+        "superseded" => PolicyStatus::Superseded,
+        _ => PolicyStatus::Unspecified,
+    };
+
+    let policy = if include_policy {
+        ProtoSandboxPolicy::decode(record.policy_payload.as_slice()).ok()
+    } else {
+        None
+    };
+
+    SandboxPolicyRevision {
+        version: u32::try_from(record.version).unwrap_or(0),
+        policy_hash: record.policy_hash.clone(),
+        status: status.into(),
+        load_error: record.load_error.clone().unwrap_or_default(),
+        created_at_ms: record.created_at_ms,
+        loaded_at_ms: record.loaded_at_ms.unwrap_or(0),
+        policy,
     }
 }
 

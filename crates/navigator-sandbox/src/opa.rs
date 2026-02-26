@@ -296,6 +296,27 @@ impl OpaEngine {
         Ok(())
     }
 
+    /// Reload policy from a proto `SandboxPolicy` message.
+    ///
+    /// Reuses the full `from_proto()` pipeline (proto-to-JSON conversion, L7
+    /// validation, access preset expansion) so the reload has identical
+    /// validation guarantees as initial load. Atomically replaces the inner
+    /// engine on success; on failure the previous engine is untouched (LKG).
+    pub fn reload_from_proto(&self, proto: &ProtoSandboxPolicy) -> Result<()> {
+        // Build a complete new engine through the same validated pipeline.
+        let new = Self::from_proto(proto)?;
+        let new_engine = new
+            .engine
+            .into_inner()
+            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
+        let mut engine = self
+            .engine
+            .lock()
+            .map_err(|_| miette::miette!("OPA engine lock poisoned"))?;
+        *engine = new_engine;
+        Ok(())
+    }
+
     /// Query static sandbox configuration from the OPA data module.
     ///
     /// Extracts `filesystem_policy`, `landlock`, and `process` from the Rego

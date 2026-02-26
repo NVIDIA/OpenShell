@@ -46,7 +46,7 @@ impl TracingLogBus {
     pub fn install_subscriber(&self, env_filter: EnvFilter) {
         let layer = SandboxLogLayer {
             bus: self.clone(),
-            default_tail: 200,
+            default_tail: Self::DEFAULT_TAIL,
         };
 
         tracing_subscriber::registry()
@@ -83,6 +83,23 @@ impl TracingLogBus {
             .rev()
             .collect()
     }
+
+    /// Publish a log line from an external source (e.g., sandbox push).
+    ///
+    /// Injects the line into the same broadcast channel and tail buffer
+    /// used by the tracing layer, so it appears in `WatchSandbox` and
+    /// `GetSandboxLogs` transparently.
+    pub fn publish_external(&self, log: SandboxLogLine) {
+        let evt = SandboxStreamEvent {
+            payload: Some(navigator_core::proto::sandbox_stream_event::Payload::Log(
+                log.clone(),
+            )),
+        };
+        self.publish(&log.sandbox_id, evt, Self::DEFAULT_TAIL);
+    }
+
+    /// Default tail buffer capacity (lines per sandbox).
+    const DEFAULT_TAIL: usize = 2000;
 
     fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent, tail_cap: usize) {
         let tx = self.sender_for(sandbox_id);
@@ -125,6 +142,8 @@ where
             level: meta.level().to_string(),
             target: meta.target().to_string(),
             message: msg,
+            source: "gateway".to_string(),
+            fields: HashMap::new(),
         };
         let evt = SandboxStreamEvent {
             payload: Some(navigator_core::proto::sandbox_stream_event::Payload::Log(
