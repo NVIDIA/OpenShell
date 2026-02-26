@@ -82,77 +82,155 @@ pub fn spawn_log_push_task(
     (tx, handle)
 }
 
+/// Maximum backoff delay between reconnection attempts.
+const MAX_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(30);
+/// Initial backoff delay after a connection failure.
+const INITIAL_BACKOFF: tokio::time::Duration = tokio::time::Duration::from_secs(1);
+
 async fn run_push_loop(
     endpoint: String,
     sandbox_id: String,
     mut rx: mpsc::Receiver<SandboxLogLine>,
 ) {
-    let client = match CachedNavigatorClient::connect(&endpoint).await {
-        Ok(c) => c,
-        Err(e) => {
-            // Can't use tracing here (would recurse). Use stderr directly.
-            eprintln!("navigator: log push connect failed: {e}");
-            return;
-        }
-    };
-
-    // Channel for sending batches into the gRPC client-streaming call.
-    let (push_tx, push_rx) = mpsc::channel::<PushSandboxLogsRequest>(32);
-    let stream = tokio_stream::wrappers::ReceiverStream::new(push_rx);
-
-    // Spawn the gRPC call.
-    tokio::spawn({
-        let mut nav_client = client.raw_client();
-        async move {
-            if let Err(e) = nav_client.push_sandbox_logs(stream).await {
-                eprintln!("navigator: log push RPC failed: {e}");
-            }
-        }
-    });
-
-    // Batch and send loop.
     let mut batch = Vec::with_capacity(50);
-    let flush_interval = tokio::time::Duration::from_millis(500);
-    let mut timer = tokio::time::interval(flush_interval);
-    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut backoff = INITIAL_BACKOFF;
 
+    // Outer reconnect loop — runs for the entire sandbox lifetime.
     loop {
-        tokio::select! {
-            line = rx.recv() => {
-                let Some(line) = line else { break };
-                batch.push(line);
-                if batch.len() >= 50 {
-                    let lines = std::mem::take(&mut batch);
-                    if push_tx.send(PushSandboxLogsRequest {
-                        sandbox_id: sandbox_id.clone(),
-                        logs: lines,
-                    }).await.is_err() {
-                        break;
+        // --- Connect ---
+        let client = match CachedNavigatorClient::connect(&endpoint).await {
+            Ok(c) => {
+                backoff = INITIAL_BACKOFF;
+                c
+            }
+            Err(e) => {
+                eprintln!("navigator: log push connect failed: {e}");
+                // Drain the channel during backoff so the tracing layer doesn't
+                // block, but discard lines we can't deliver.
+                drain_during_backoff(&mut rx, &mut batch, backoff).await;
+                backoff = (backoff * 2).min(MAX_BACKOFF);
+                continue;
+            }
+        };
+
+        // --- Open the client-streaming RPC ---
+        let (push_tx, push_rx) = mpsc::channel::<PushSandboxLogsRequest>(32);
+        let stream = tokio_stream::wrappers::ReceiverStream::new(push_rx);
+
+        // Spawn the gRPC streaming call. When the call ends (success or error),
+        // `rpc_done_tx` fires so the batch loop below knows to reconnect.
+        let (rpc_done_tx, mut rpc_done_rx) = mpsc::channel::<()>(1);
+        tokio::spawn({
+            let mut nav_client = client.raw_client();
+            async move {
+                if let Err(e) = nav_client.push_sandbox_logs(stream).await {
+                    eprintln!("navigator: log push RPC failed: {e}");
+                }
+                let _ = rpc_done_tx.send(()).await;
+            }
+        });
+
+        // --- Flush any lines buffered during reconnect ---
+        if !batch.is_empty() {
+            let lines = std::mem::take(&mut batch);
+            if push_tx
+                .send(PushSandboxLogsRequest {
+                    sandbox_id: sandbox_id.clone(),
+                    logs: lines,
+                })
+                .await
+                .is_err()
+            {
+                // RPC died immediately — go back to reconnect.
+                backoff = INITIAL_BACKOFF;
+                continue;
+            }
+        }
+
+        // --- Batch and send loop (runs until stream breaks) ---
+        let flush_interval = tokio::time::Duration::from_millis(500);
+        let mut timer = tokio::time::interval(flush_interval);
+        timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        let stream_broken = loop {
+            tokio::select! {
+                line = rx.recv() => {
+                    let Some(line) = line else {
+                        // Tracing layer dropped — sandbox is shutting down.
+                        // Flush remaining and exit entirely.
+                        if !batch.is_empty() {
+                            let lines = std::mem::take(&mut batch);
+                            let _ = push_tx.send(PushSandboxLogsRequest {
+                                sandbox_id: sandbox_id.clone(),
+                                logs: lines,
+                            }).await;
+                        }
+                        return;
+                    };
+                    batch.push(line);
+                    if batch.len() >= 50 {
+                        let lines = std::mem::take(&mut batch);
+                        if push_tx.send(PushSandboxLogsRequest {
+                            sandbox_id: sandbox_id.clone(),
+                            logs: lines,
+                        }).await.is_err() {
+                            break true;
+                        }
                     }
                 }
-            }
-            _ = timer.tick() => {
-                if !batch.is_empty() {
-                    let lines = std::mem::take(&mut batch);
-                    if push_tx.send(PushSandboxLogsRequest {
-                        sandbox_id: sandbox_id.clone(),
-                        logs: lines,
-                    }).await.is_err() {
-                        break;
+                _ = timer.tick() => {
+                    if !batch.is_empty() {
+                        let lines = std::mem::take(&mut batch);
+                        if push_tx.send(PushSandboxLogsRequest {
+                            sandbox_id: sandbox_id.clone(),
+                            logs: lines,
+                        }).await.is_err() {
+                            break true;
+                        }
                     }
                 }
+                _ = rpc_done_rx.recv() => {
+                    // The gRPC streaming call ended (server closed / error).
+                    break true;
+                }
             }
+        };
+
+        if stream_broken {
+            eprintln!("navigator: log push stream lost, reconnecting...");
+            backoff = INITIAL_BACKOFF;
+            // Loop back to reconnect.
         }
     }
+}
 
-    // Flush remaining.
-    if !batch.is_empty() {
-        let _ = push_tx
-            .send(PushSandboxLogsRequest {
-                sandbox_id,
-                logs: batch,
-            })
-            .await;
+/// Drain incoming log lines during a backoff delay so the tracing layer's
+/// `try_send` doesn't fill up. Lines received during backoff are kept in `batch`
+/// (up to a limit) so they can be sent after reconnecting.
+async fn drain_during_backoff(
+    rx: &mut mpsc::Receiver<SandboxLogLine>,
+    batch: &mut Vec<SandboxLogLine>,
+    delay: tokio::time::Duration,
+) {
+    // Keep at most 200 lines across reconnect attempts to bound memory.
+    const MAX_BUFFERED: usize = 200;
+
+    let deadline = tokio::time::Instant::now() + delay;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => { return; }
+            line = rx.recv() => {
+                match line {
+                    Some(l) => {
+                        if batch.len() < MAX_BUFFERED {
+                            batch.push(l);
+                        }
+                        // else: drop — we're over the reconnect buffer limit
+                    }
+                    None => return, // channel closed, sandbox shutting down
+                }
+            }
+        }
     }
 }
 
