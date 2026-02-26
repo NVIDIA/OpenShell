@@ -1,8 +1,10 @@
 //! Navigator CLI - command-line interface for Navigator.
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
+use std::io::Write;
 use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
@@ -127,6 +129,13 @@ enum Commands {
         command: ProviderCommands,
     },
 
+    /// Generate shell completions.
+    #[command(after_long_help = COMPLETIONS_HELP)]
+    Completions {
+        /// Shell to generate completions for.
+        shell: CompletionShell,
+    },
+
     /// SSH proxy (used by `ProxyCommand`).
     ///
     /// Two mutually exclusive modes:
@@ -163,6 +172,70 @@ enum Commands {
         name: Option<String>,
     },
 }
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Fish,
+    Zsh,
+    Powershell,
+}
+
+impl std::fmt::Display for CompletionShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bash => write!(f, "bash"),
+            Self::Fish => write!(f, "fish"),
+            Self::Zsh => write!(f, "zsh"),
+            Self::Powershell => write!(f, "powershell"),
+        }
+    }
+}
+
+const COMPLETIONS_HELP: &str = "\
+Enable tab completion for Bash, Fish, Zsh, or PowerShell.
+
+The script is output on stdout, allowing you to redirect the output
+to the file of your choosing. Where you place the file will depend
+on which shell and operating system you are using.
+
+BASH:
+
+    $ mkdir -p ~/.local/share/bash-completion/completions
+    $ navigator completions bash > ~/.local/share/bash-completion/completions/navigator
+
+  On macOS with Homebrew (install bash-completion first):
+
+    $ mkdir -p $(brew --prefix)/etc/bash_completion.d
+    $ navigator completions bash > $(brew --prefix)/etc/bash_completion.d/navigator.bash-completion
+
+FISH:
+
+    $ mkdir -p ~/.config/fish/completions
+    $ navigator completions fish > ~/.config/fish/completions/navigator.fish
+
+ZSH:
+
+    $ mkdir -p ~/.zfunc
+    $ navigator completions zsh > ~/.zfunc/_navigator
+
+  Then add the following to your .zshrc before compinit:
+
+    fpath+=~/.zfunc
+
+  And reload with:
+
+    $ exec zsh
+
+POWERSHELL:
+
+    > navigator completions powershell >> $PROFILE
+
+  If no profile exists yet, create one first:
+
+    > New-Item -Path $PROFILE -Type File -Force
+
+You may need to log out and back in for changes to take effect.";
 
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderType {
@@ -702,6 +775,8 @@ enum InferenceCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
@@ -1158,6 +1233,17 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Completions { shell }) => {
+            let exe = std::env::current_exe()
+                .map_err(|e| miette::miette!("failed to find current executable: {e}"))?;
+            let output = std::process::Command::new(exe)
+                .env("COMPLETE", shell.to_string())
+                .output()
+                .map_err(|e| miette::miette!("failed to generate completions: {e}"))?;
+            std::io::stdout()
+                .write_all(&output.stdout)
+                .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
+        }
         Some(Commands::SshProxy {
             gateway,
             sandbox_id,
@@ -1205,4 +1291,43 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn cli_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_engine_returns_candidates() {
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec!["navigator".into(), "".into()];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
+            .expect("completion engine failed");
+        assert!(
+            !candidates.is_empty(),
+            "expected subcommand completions for empty input"
+        );
+    }
+
+    #[test]
+    fn completions_subcommand_appears_in_candidates() {
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec!["navigator".into(), "comp".into()];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
+            .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"completions".to_string()),
+            "expected 'completions' in candidates, got: {names:?}"
+        );
+    }
 }

@@ -54,6 +54,30 @@ mise test                         # Run all project tests
 mise run sandbox                  # Run sandbox container interactively
 ```
 
+## Shell Completions
+
+The CLI supports dynamic shell completions. Run `navigator completions --help` for full per-shell setup instructions.
+
+For the `nav` wrapper, generate completions from the real binary and rewrite the registration to target `nav`:
+
+**Fish:**
+
+```bash
+navigator completions fish | sed 's/--command navigator/--command nav/' > ~/.config/fish/completions/nav.fish
+```
+
+**Bash:**
+
+```bash
+navigator completions bash | sed 's/_clap_complete_navigator/_clap_complete_nav/g; s/ navigator$/ nav/' > ~/.local/share/bash-completion/completions/nav
+```
+
+**Zsh:**
+
+```bash
+navigator completions zsh | sed 's/_clap_dynamic_completer_navigator/_clap_dynamic_completer_nav/g; s/ navigator$/ nav/' > ~/.zfunc/_nav
+```
+
 ## Sandbox SSH access
 
 To connect to a running sandbox with SSH, use:

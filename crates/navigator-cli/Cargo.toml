@@ -28,6 +28,7 @@ tonic = { workspace = true, features = ["tls"] }
 
 # CLI
 clap = { workspace = true }
+clap_complete = { workspace = true }
 crossterm = { workspace = true }
 dialoguer = "0.11"
 indicatif = { workspace = true }

@@ -38,6 +38,7 @@ webpki-roots = "1"
 
 # CLI
 clap = { version = "4.5", features = ["derive", "env"] }
+clap_complete = { version = "4.5", features = ["unstable-dynamic"] }
 indicatif = "0.17"
 owo-colors = "4"
 ratatui = "0.26"
