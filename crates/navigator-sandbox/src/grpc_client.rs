@@ -1,6 +1,9 @@
 //! gRPC client for fetching sandbox policy, provider environment, and inference
 //! route bundles from Navigator server.
 
+use std::collections::HashMap;
+use std::time::Duration;
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
     GetSandboxInferenceBundleRequest, GetSandboxInferenceBundleResponse, GetSandboxPolicyRequest,
@@ -8,7 +11,6 @@ use navigator_core::proto::{
     SandboxPolicy as ProtoSandboxPolicy, inference_client::InferenceClient,
     navigator_client::NavigatorClient,
 };
-use std::collections::HashMap;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
@@ -21,7 +23,11 @@ use tracing::debug;
 async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
-        .wrap_err("invalid gRPC endpoint")?;
+        .wrap_err("invalid gRPC endpoint")?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .keep_alive_timeout(Duration::from_secs(20));
 
     let ca_path = std::env::var("NAVIGATOR_TLS_CA")
         .into_diagnostic()
