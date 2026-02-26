@@ -19,7 +19,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use app::{App, ClusterEntry, Focus};
+use app::{App, ClusterEntry, Focus, LogLine, Screen};
 use event::{Event, EventHandler};
 
 /// Launch the Gator TUI.
@@ -56,16 +56,20 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 }
                 if app.pending_log_fetch {
                     app.pending_log_fetch = false;
-                    spawn_log_fetch(&app, events.sender());
+                    spawn_log_stream(&mut app, events.sender());
                 }
                 if app.pending_sandbox_delete {
                     app.pending_sandbox_delete = false;
                     handle_sandbox_delete(&mut app).await;
                 }
             }
-            Some(Event::LogResult(lines)) => {
-                app.sandbox_log_lines = lines;
-                app.sandbox_log_scroll = 0;
+            Some(Event::LogLines(lines)) => {
+                app.sandbox_log_lines.extend(lines);
+                // Auto-scroll to bottom if already near the end.
+                let filtered_len = app.filtered_log_lines().len();
+                if app.sandbox_log_scroll + 5 >= filtered_len.saturating_sub(1) {
+                    app.sandbox_log_scroll = filtered_len.saturating_sub(1);
+                }
             }
             Some(Event::Tick) => {
                 refresh_cluster_list(&mut app);
@@ -75,6 +79,9 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
             None => break,
         }
     }
+
+    // Cancel any running log stream.
+    app.cancel_log_stream();
 
     disable_raw_mode().into_diagnostic()?;
     execute!(
@@ -121,9 +128,8 @@ fn refresh_cluster_list(app: &mut App) {
 
 /// Handle a pending cluster switch requested by the user.
 async fn handle_cluster_switch(app: &mut App) {
-    let name = match app.pending_cluster_switch.take() {
-        Some(n) => n,
-        None => return,
+    let Some(name) = app.pending_cluster_switch.take() else {
+        return;
     };
 
     // Look up the endpoint from the cluster list.
@@ -199,12 +205,14 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
 // Sandbox actions
 // ---------------------------------------------------------------------------
 
-/// Kick off a non-blocking log fetch for the currently selected sandbox.
+/// Spawn a background task that streams logs for the currently selected sandbox.
 ///
-/// Immediately switches focus to the log view with a "Loading..." placeholder,
-/// then spawns a background task that calls the unary `GetSandboxLogs` RPC and
-/// delivers the result via the event channel.
-fn spawn_log_fetch(app: &App, tx: mpsc::UnboundedSender<Event>) {
+/// Uses `WatchSandbox` with `follow_logs: true` for live streaming. Initial
+/// history is fetched via `GetSandboxLogs`, then live events are appended.
+fn spawn_log_stream(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    // Cancel any previous stream.
+    app.cancel_log_stream();
+
     let sandbox_id = match app.selected_sandbox_id() {
         Some(id) => id.to_string(),
         None => return,
@@ -212,37 +220,98 @@ fn spawn_log_fetch(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     let mut client = app.client.clone();
 
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
+        // Phase 1: Fetch initial history via unary RPC.
         let req = navigator_core::proto::GetSandboxLogsRequest {
-            sandbox_id,
+            sandbox_id: sandbox_id.clone(),
             lines: 500,
             since_ms: 0,
             sources: vec![],
             min_level: String::new(),
         };
 
-        let lines = match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req))
-            .await
-        {
+        match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req)).await {
             Ok(Ok(resp)) => {
                 let logs = resp.into_inner().logs;
-                if logs.is_empty() {
-                    vec!["No logs available.".to_string()]
-                } else {
-                    logs.iter()
-                        .map(|log| {
-                            let ts = format_short_time(log.timestamp_ms);
-                            format!("{ts}  {:<5}  {}", log.level, log.message)
-                        })
-                        .collect()
+                let lines: Vec<LogLine> = logs.into_iter().map(proto_to_log_line).collect();
+                if !lines.is_empty() {
+                    let _ = tx.send(Event::LogLines(lines));
                 }
             }
-            Ok(Err(e)) => vec![format!("Failed to fetch logs: {}", e.message())],
-            Err(_) => vec!["Timed out fetching logs.".to_string()],
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::LogLines(vec![LogLine {
+                    timestamp_ms: 0,
+                    level: "ERROR".into(),
+                    source: String::new(),
+                    target: String::new(),
+                    message: format!("Failed to fetch logs: {}", e.message()),
+                    fields: Default::default(),
+                }]));
+                return;
+            }
+            Err(_) => {
+                let _ = tx.send(Event::LogLines(vec![LogLine {
+                    timestamp_ms: 0,
+                    level: "ERROR".into(),
+                    source: String::new(),
+                    target: String::new(),
+                    message: "Timed out fetching logs.".into(),
+                    fields: Default::default(),
+                }]));
+                return;
+            }
+        }
+
+        // Phase 2: Stream live logs via WatchSandbox.
+        let req = navigator_core::proto::WatchSandboxRequest {
+            id: sandbox_id,
+            follow_status: false,
+            follow_logs: true,
+            follow_events: false,
+            log_tail_lines: 0, // Don't re-fetch tail, we already have history.
+            ..Default::default()
         };
 
-        let _ = tx.send(Event::LogResult(lines));
+        let resp =
+            match tokio::time::timeout(Duration::from_secs(5), client.watch_sandbox(req)).await {
+                Ok(Ok(r)) => r,
+                Ok(Err(_)) | Err(_) => return, // Silently stop — user can re-enter logs.
+            };
+
+        let mut stream = resp.into_inner();
+        loop {
+            match stream.message().await {
+                Ok(Some(event)) => {
+                    if let Some(navigator_core::proto::sandbox_stream_event::Payload::Log(log)) =
+                        event.payload
+                    {
+                        let line = proto_to_log_line(log);
+                        let _ = tx.send(Event::LogLines(vec![line]));
+                    }
+                }
+                _ => break, // Stream ended or error.
+            }
+        }
     });
+
+    app.log_stream_handle = Some(handle);
+}
+
+/// Convert a proto `SandboxLogLine` to our display `LogLine`.
+fn proto_to_log_line(log: navigator_core::proto::SandboxLogLine) -> LogLine {
+    let source = if log.source.is_empty() {
+        "gateway".to_string()
+    } else {
+        log.source
+    };
+    LogLine {
+        timestamp_ms: log.timestamp_ms,
+        level: log.level,
+        source,
+        target: log.target,
+        message: log.message,
+        fields: log.fields,
+    }
 }
 
 /// Delete the currently selected sandbox.
@@ -252,17 +321,17 @@ async fn handle_sandbox_delete(app: &mut App) {
         None => return,
     };
 
-    let req = navigator_core::proto::DeleteSandboxRequest {
-        name: sandbox_name,
-    };
+    let req = navigator_core::proto::DeleteSandboxRequest { name: sandbox_name };
     match app.client.delete_sandbox(req).await {
         Ok(_) => {
-            // Return to sandbox list and refresh.
+            app.cancel_log_stream();
+            app.screen = Screen::Dashboard;
             app.focus = Focus::Sandboxes;
             refresh_sandboxes(app).await;
         }
         Err(e) => {
             app.status_text = format!("delete failed: {}", e.message());
+            app.screen = Screen::Dashboard;
             app.focus = Focus::Sandboxes;
         }
     }
@@ -304,16 +373,13 @@ async fn refresh_sandboxes(app: &mut App) {
         limit: 100,
         offset: 0,
     };
-    let result =
-        tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
+    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
     match result {
         Ok(Err(e)) => {
             tracing::warn!("failed to list sandboxes: {}", e.message());
-            return;
         }
         Err(_) => {
             tracing::warn!("list sandboxes timed out");
-            return;
         }
         Ok(Ok(resp)) => {
             let sandboxes = resp.into_inner().sandboxes;
@@ -389,44 +455,27 @@ fn format_timestamp(epoch_ms: i64) -> String {
         return String::from("-");
     }
     let secs = epoch_ms / 1000;
-    // Days since Unix epoch.
     let days = secs / 86400;
     let time_of_day = secs % 86400;
     let hours = time_of_day / 3600;
     let minutes = (time_of_day % 3600) / 60;
 
-    // Convert days since epoch to year-month-day (Gregorian).
     let (year, month, day) = days_to_ymd(days);
     format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}")
 }
 
-/// Format epoch milliseconds as a short time string: `HH:MM:SS`.
-fn format_short_time(epoch_ms: i64) -> String {
-    if epoch_ms <= 0 {
-        return String::from("--:--:--");
-    }
-    let secs = epoch_ms / 1000;
-    let time_of_day = secs % 86400;
-    let hours = time_of_day / 3600;
-    let minutes = (time_of_day % 3600) / 60;
-    let seconds = time_of_day % 60;
-    format!("{hours:02}:{minutes:02}:{seconds:02}")
-}
-
 /// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-///
-/// Uses a civil calendar algorithm (no external crate needed).
+#[allow(clippy::unreadable_literal)]
 fn days_to_ymd(days: i64) -> (i64, i64, i64) {
-    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
     let z = days + 719468;
     let era = if z >= 0 { z } else { z - 146096 } / 146097;
-    let doe = z - era * 146097; // day of era [0, 146096]
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let doe = z - era * 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
-    let mp = (5 * doy + 2) / 153; // month proxy [0, 11]
-    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
-    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
 }

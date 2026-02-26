@@ -1,13 +1,14 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use crate::app::{App, Focus};
 use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    // Dynamic height: cluster table gets just enough rows, rest goes to sandbox area.
+    // Dynamic height: cluster table gets just enough rows, rest goes to sandbox table.
+    #[allow(clippy::cast_possible_truncation)]
     let cluster_height = (app.clusters.len() as u16 + 4).clamp(5, 12);
 
     let chunks = Layout::default()
@@ -16,13 +17,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
 
     draw_cluster_list(frame, app, chunks[0]);
-
-    // The bottom panel depends on focus state.
-    match app.focus {
-        Focus::SandboxDetail => super::sandbox_detail::draw(frame, app, chunks[1]),
-        Focus::SandboxLogs => super::sandbox_logs::draw(frame, app, chunks[1]),
-        _ => super::sandboxes::draw(frame, app, chunks[1], app.focus == Focus::Sandboxes),
-    }
+    super::sandboxes::draw(frame, app, chunks[1], app.focus == Focus::Sandboxes);
 }
 
 fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -42,19 +37,26 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .enumerate()
         .map(|(i, entry)| {
             let is_active = entry.name == app.cluster_name;
-            let selected = focused && i == app.cluster_selected;
+            let is_cursor = focused && i == app.cluster_selected;
 
-            let name_cell = if selected {
-                Cell::from(Line::from(vec![
-                    Span::styled("▌ ", styles::ACCENT),
-                    Span::styled(&entry.name, styles::TEXT),
-                ]))
+            // Name cell: cursor marker (▌) + active dot (●).
+            let cursor = if is_cursor { "▌" } else { " " };
+            let dot = if is_active { "● " } else { "  " };
+            let dot_style = if is_active {
+                styles::STATUS_OK
             } else {
-                Cell::from(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(&entry.name, styles::TEXT),
-                ]))
+                styles::MUTED
             };
+            let name_style = if is_active {
+                styles::HEADING
+            } else {
+                styles::TEXT
+            };
+            let name_cell = Cell::from(Line::from(vec![
+                Span::styled(cursor, styles::ACCENT),
+                Span::styled(dot, dot_style),
+                Span::styled(&entry.name, name_style),
+            ]));
 
             let type_label = if entry.is_remote { "remote" } else { "local" };
 

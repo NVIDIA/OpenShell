@@ -2,14 +2,16 @@ use crossterm::event::{self, Event as TermEvent, KeyEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
+use crate::app::LogLine;
+
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
     Tick,
     #[allow(dead_code)]
     Resize(u16, u16),
-    /// Asynchronous log-fetch result delivered from a background task.
-    LogResult(Vec<String>),
+    /// A batch of log lines from the streaming log task.
+    LogLines(Vec<LogLine>),
 }
 
 pub struct EventHandler {

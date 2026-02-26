@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme::styles;
@@ -68,8 +68,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         styles::BORDER
     };
 
+    let title = Line::from(vec![
+        Span::styled(" Sandboxes ", styles::HEADING),
+        Span::styled("─ ", styles::BORDER),
+        Span::styled(&app.cluster_name, styles::MUTED),
+        Span::styled(" ", styles::MUTED),
+    ]);
+
     let block = Block::default()
-        .title(Span::styled(" Sandboxes ", styles::HEADING))
+        .title(title)
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1));
@@ -79,20 +86,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     frame.render_widget(table, area);
 
     if app.sandbox_count == 0 {
-        let inner = block_inner(area);
-        let msg = Paragraph::new(Span::styled(
-            " No sandboxes found. Press [n] to create one.",
-            styles::MUTED,
-        ));
+        let inner = Rect {
+            x: area.x + 2,
+            y: area.y + 2,
+            width: area.width.saturating_sub(4),
+            height: area.height.saturating_sub(3),
+        };
+        let msg = Paragraph::new(Span::styled(" No sandboxes found.", styles::MUTED));
         frame.render_widget(msg, inner);
-    }
-}
-
-fn block_inner(area: Rect) -> Rect {
-    Rect {
-        x: area.x + 2,
-        y: area.y + 2,
-        width: area.width.saturating_sub(4),
-        height: area.height.saturating_sub(3),
     }
 }

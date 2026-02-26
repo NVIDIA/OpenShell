@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme::styles;
@@ -51,12 +51,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled("  Age:      ", styles::MUTED),
             Span::styled(age, styles::TEXT),
         ]),
-        Line::from(""),
-        Line::from(vec![Span::styled("  Actions", styles::HEADING)]),
-        Line::from(""),
     ];
 
     if app.confirm_delete {
+        lines.push(Line::from(""));
         lines.push(Line::from(vec![
             Span::styled("  ", styles::TEXT),
             Span::styled("Delete sandbox '", styles::STATUS_ERR),
@@ -66,23 +64,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
             Span::styled(" Confirm  ", styles::TEXT),
             Span::styled("[Esc]", styles::KEY_HINT),
             Span::styled(" Cancel", styles::TEXT),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("    ", styles::TEXT),
-            Span::styled("[l]", styles::KEY_HINT),
-            Span::styled(" View Logs", styles::TEXT),
-        ]));
-        lines.push(Line::from(vec![
-            Span::styled("    ", styles::TEXT),
-            Span::styled("[d]", styles::KEY_HINT),
-            Span::styled(" Delete", styles::TEXT),
-        ]));
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            Span::styled("    ", styles::TEXT),
-            Span::styled("[Esc]", styles::MUTED),
-            Span::styled(" Back", styles::MUTED),
         ]));
     }
 

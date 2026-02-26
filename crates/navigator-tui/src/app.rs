@@ -1,10 +1,20 @@
+use std::collections::HashMap;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use navigator_core::proto::navigator_client::NavigatorClient;
 use tonic::transport::Channel;
 
+// ---------------------------------------------------------------------------
+// Screens & focus
+// ---------------------------------------------------------------------------
+
+/// Top-level screen (each is a full-screen layout with its own nav bar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum View {
+pub enum Screen {
+    /// Cluster list + sandbox table.
     Dashboard,
+    /// Single-sandbox view (detail + logs).
+    Sandbox,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13,13 +23,61 @@ pub enum InputMode {
     Command,
 }
 
+/// Which panel is focused within the current screen.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
+    // Dashboard screen
     Clusters,
     Sandboxes,
+    // Sandbox screen
     SandboxDetail,
     SandboxLogs,
 }
+
+// ---------------------------------------------------------------------------
+// Log data model
+// ---------------------------------------------------------------------------
+
+/// Structured log line stored from the server.
+#[derive(Debug, Clone)]
+pub struct LogLine {
+    pub timestamp_ms: i64,
+    pub level: String,
+    pub source: String, // "gateway" or "sandbox"
+    pub target: String,
+    pub message: String,
+    pub fields: HashMap<String, String>,
+}
+
+/// Which log sources to display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogSourceFilter {
+    All,
+    Gateway,
+    Sandbox,
+}
+
+impl LogSourceFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Gateway,
+            Self::Gateway => Self::Sandbox,
+            Self::Sandbox => Self::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Gateway => "gateway",
+            Self::Sandbox => "sandbox",
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cluster entry
+// ---------------------------------------------------------------------------
 
 pub struct ClusterEntry {
     pub name: String,
@@ -27,9 +85,14 @@ pub struct ClusterEntry {
     pub is_remote: bool,
 }
 
+// ---------------------------------------------------------------------------
+// App state
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::struct_excessive_bools)]
 pub struct App {
     pub running: bool,
-    pub view: View,
+    pub screen: Screen,
     pub input_mode: InputMode,
     pub focus: Focus,
     pub command_input: String,
@@ -61,15 +124,18 @@ pub struct App {
     pub pending_sandbox_delete: bool,
 
     // Sandbox logs
-    pub sandbox_log_lines: Vec<String>,
+    pub sandbox_log_lines: Vec<LogLine>,
     pub sandbox_log_scroll: usize,
+    pub log_source_filter: LogSourceFilter,
+    /// Handle for the streaming log task. Dropped to cancel.
+    pub log_stream_handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl App {
     pub fn new(client: NavigatorClient<Channel>, cluster_name: String, endpoint: String) -> Self {
         Self {
             running: true,
-            view: View::Dashboard,
+            screen: Screen::Dashboard,
             input_mode: InputMode::Normal,
             focus: Focus::Clusters,
             command_input: String::new(),
@@ -93,8 +159,30 @@ impl App {
             pending_sandbox_delete: false,
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
+            log_source_filter: LogSourceFilter::All,
+            log_stream_handle: None,
         }
     }
+
+    // ------------------------------------------------------------------
+    // Filtered log helpers
+    // ------------------------------------------------------------------
+
+    /// Return log lines matching the current source filter.
+    pub fn filtered_log_lines(&self) -> Vec<&LogLine> {
+        self.sandbox_log_lines
+            .iter()
+            .filter(|l| match self.log_source_filter {
+                LogSourceFilter::All => true,
+                LogSourceFilter::Gateway => l.source == "gateway",
+                LogSourceFilter::Sandbox => l.source == "sandbox",
+            })
+            .collect()
+    }
+
+    // ------------------------------------------------------------------
+    // Key handling
+    // ------------------------------------------------------------------
 
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -137,8 +225,11 @@ impl App {
             KeyCode::Enter => {
                 if let Some(entry) = self.clusters.get(self.cluster_selected) {
                     if entry.name != self.cluster_name {
+                        // Switch to a different cluster.
                         self.pending_cluster_switch = Some(entry.name.clone());
                     }
+                    // Always drop into sandboxes panel on Enter.
+                    self.focus = Focus::Sandboxes;
                 }
             }
             _ => {}
@@ -163,9 +254,15 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.sandbox_count > 0 {
+                    // Enter the full-screen sandbox view.
+                    self.screen = Screen::Sandbox;
                     self.focus = Focus::SandboxDetail;
                     self.confirm_delete = false;
                 }
+            }
+            KeyCode::Esc => {
+                // Go back to clusters panel.
+                self.focus = Focus::Clusters;
             }
             _ => {}
         }
@@ -187,12 +284,17 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Esc => self.focus = Focus::Sandboxes,
+            KeyCode::Esc => {
+                self.cancel_log_stream();
+                self.screen = Screen::Dashboard;
+                self.focus = Focus::Sandboxes;
+            }
             KeyCode::Char('l') => {
                 // Immediately show log view with loading placeholder; the
                 // actual fetch runs asynchronously in the background.
-                self.sandbox_log_lines = vec!["Loading...".to_string()];
+                self.sandbox_log_lines.clear();
                 self.sandbox_log_scroll = 0;
+                self.log_source_filter = LogSourceFilter::All;
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
@@ -206,21 +308,29 @@ impl App {
 
     fn handle_logs_key(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Esc => self.focus = Focus::SandboxDetail,
+            KeyCode::Esc => {
+                self.cancel_log_stream();
+                self.focus = Focus::SandboxDetail;
+            }
             KeyCode::Char('q') => self.running = false,
             KeyCode::Char('j') | KeyCode::Down => {
-                let max_scroll = self.sandbox_log_lines.len().saturating_sub(1);
+                let filtered_len = self.filtered_log_lines().len();
+                let max_scroll = filtered_len.saturating_sub(1);
                 self.sandbox_log_scroll = (self.sandbox_log_scroll + 1).min(max_scroll);
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(1);
             }
             KeyCode::Char('G') => {
-                // Jump to bottom
-                self.sandbox_log_scroll = self.sandbox_log_lines.len().saturating_sub(1);
+                let filtered_len = self.filtered_log_lines().len();
+                self.sandbox_log_scroll = filtered_len.saturating_sub(1);
             }
             KeyCode::Char('g') => {
-                // Jump to top
+                self.sandbox_log_scroll = 0;
+            }
+            KeyCode::Char('s') => {
+                // Cycle source filter: all -> gateway -> sandbox -> all
+                self.log_source_filter = self.log_source_filter.next();
                 self.sandbox_log_scroll = 0;
             }
             _ => {}
@@ -254,6 +364,10 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Helpers
+    // ------------------------------------------------------------------
+
     /// Get the ID of the currently selected sandbox.
     pub fn selected_sandbox_id(&self) -> Option<&str> {
         self.sandbox_ids
@@ -268,8 +382,16 @@ impl App {
             .map(String::as_str)
     }
 
+    /// Cancel any running log stream task.
+    pub fn cancel_log_stream(&mut self) {
+        if let Some(handle) = self.log_stream_handle.take() {
+            handle.abort();
+        }
+    }
+
     /// Reset sandbox state after switching clusters.
     pub fn reset_sandbox_state(&mut self) {
+        self.cancel_log_stream();
         self.sandbox_ids.clear();
         self.sandbox_names.clear();
         self.sandbox_phases.clear();
@@ -282,8 +404,9 @@ impl App {
         self.sandbox_log_scroll = 0;
         self.confirm_delete = false;
         self.status_text = String::from("connecting...");
-        // Return to sandboxes list if in detail/logs
-        if matches!(self.focus, Focus::SandboxDetail | Focus::SandboxLogs) {
+        // Return to dashboard if in sandbox screen.
+        if self.screen == Screen::Sandbox {
+            self.screen = Screen::Dashboard;
             self.focus = Focus::Sandboxes;
         }
     }
