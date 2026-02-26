@@ -94,12 +94,18 @@ async fn run_push_loop(
 ) {
     let mut batch = Vec::with_capacity(50);
     let mut backoff = INITIAL_BACKOFF;
+    let mut attempt: u64 = 0;
 
     // Outer reconnect loop — runs for the entire sandbox lifetime.
     loop {
+        attempt += 1;
+
         // --- Connect ---
         let client = match CachedNavigatorClient::connect(&endpoint).await {
             Ok(c) => {
+                if attempt > 1 {
+                    eprintln!("navigator: log push reconnected (attempt {attempt})");
+                }
                 backoff = INITIAL_BACKOFF;
                 c
             }
