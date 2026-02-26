@@ -513,7 +513,9 @@ The `action` field carries the matched policy name (for `Allow` and `InspectForI
 
 ### Unified logging
 
-Every CONNECT request produces a single `info!()` log line with all context: source/destination addresses, binary path, PID, ancestor chain, cmdline paths, action (`allow`, `inspect_for_inference`, or `deny`), engine, matched policy, and deny reason.
+Every CONNECT request produces an `info!()` log line with all context: source/destination addresses, binary path, PID, ancestor chain, cmdline paths, action (`allow`, `inspect_for_inference`, or `deny`), engine, matched policy, and deny reason.
+
+For `InspectForInference` connections, the initial log records `action=inspect_for_inference`. If the subsequent inference interception fails (TLS handshake failure, client disconnect, non-inference request, payload too large, missing context, or I/O error), a second `CONNECT` log is emitted with `action=deny` and a `reason` describing the failure. Successfully routed connections produce no second log. This two-log pattern gives operators visibility into why an `inspect_for_inference` decision ultimately resulted in a denial.
 
 ### SSRF protection (internal IP rejection)
 
@@ -521,11 +523,24 @@ After OPA allows a connection, the proxy resolves DNS and rejects any host that 
 
 ### Inference interception (`InspectForInference` path)
 
-When OPA returns `InspectForInference`, the proxy does not connect to the upstream server. Instead, it TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `navigator-router` crate. The function `handle_inference_interception()` implements this path:
+When OPA returns `InspectForInference`, the proxy does not connect to the upstream server. Instead, it TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `navigator-router` crate. The function `handle_inference_interception()` implements this path and returns an `InferenceOutcome`:
 
-1. **TLS termination**: The proxy responds with `200 Connection Established`, then performs TLS termination using the existing `SandboxCa` / `CertCache` infrastructure (same as L7 inspection). The client sees a valid certificate for the target hostname.
+```rust
+enum InferenceOutcome {
+    /// At least one request was successfully routed to a local inference backend.
+    Routed,
+    /// The connection was denied (TLS failure, non-inference request, etc.).
+    Denied { reason: String },
+}
+```
 
-2. **HTTP request parsing**: Reads HTTP/1.1 requests from the decrypted tunnel using `try_parse_http_request()` from `l7/inference.rs`. Supports both `Content-Length` and `Transfer-Encoding: chunked` request framing (chunked bodies are decoded before forwarding). Uses a growable buffer starting at 64 KiB (`INITIAL_INFERENCE_BUF`) up to 10 MiB (`MAX_INFERENCE_BUF`). Returns `413 Payload Too Large` if the limit is exceeded.
+Every exit path in `handle_inference_interception` produces an explicit outcome. The `Denied` variant carries a human-readable reason describing the failure. At the call site in `handle_tcp_connection`, `Denied` outcomes (and `Err` results) trigger a structured CONNECT deny log with the same fields as the initial decision log (see [Unified logging](#unified-logging)). The `route_inference_request` helper returns `Result<bool>` where `true` means the request was routed and `false` means it was a non-inference request that was denied inline.
+
+The interception steps:
+
+1. **TLS termination**: The proxy responds with `200 Connection Established`, then performs TLS termination using the existing `SandboxCa` / `CertCache` infrastructure (same as L7 inspection). The client sees a valid certificate for the target hostname. If TLS termination fails, returns `Denied { reason: "TLS handshake failed: ..." }`.
+
+2. **HTTP request parsing**: Reads HTTP/1.1 requests from the decrypted tunnel using `try_parse_http_request()` from `l7/inference.rs`. Supports both `Content-Length` and `Transfer-Encoding: chunked` request framing (chunked bodies are decoded before forwarding). Uses a growable buffer starting at 64 KiB (`INITIAL_INFERENCE_BUF`) up to 10 MiB (`MAX_INFERENCE_BUF`). Returns `413 Payload Too Large` if the limit is exceeded (and `Denied { reason: "payload too large" }` if no request was previously routed).
 
 3. **Inference pattern detection**: `detect_inference_pattern()` checks the request method and path against the configured patterns. Default patterns from `default_patterns()`:
 
@@ -548,7 +563,7 @@ When OPA returns `InspectForInference`, the proxy does not connect to the upstre
    - Empty route cache: returns `503` JSON error (`{"error": "no inference routes configured"}`)
    - Non-inference requests: returns `403 Forbidden` with a JSON error body (`{"error": "only inference API calls are allowed on this connection"}`)
 
-7. **Connection lifecycle**: The handler loops to process multiple HTTP requests on the same connection (HTTP keep-alive). The loop ends when the client closes the connection or an unrecoverable error occurs.
+7. **Connection lifecycle**: The handler loops to process multiple HTTP requests on the same connection (HTTP keep-alive). The loop ends when the client closes the connection or an unrecoverable error occurs. Once at least one request has been successfully routed (`routed_any` flag), subsequent failures (client disconnect, I/O error, payload too large, non-inference request) are treated as clean termination (`InferenceOutcome::Routed`) rather than denials.
 
 ### Router error to HTTP mapping
 
@@ -970,13 +985,17 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Inference route file load/parse error | Fatal -- sandbox startup aborts |
 | Inference route file with empty routes | Inference routing disabled (graceful) |
 | Inference cluster bundle fetch failure | Warn + inference routing disabled (graceful) |
-| Inference interception: missing InferenceContext | Error on the specific connection |
-| Inference interception: missing TLS state | Error on the specific connection |
+| Inference interception: missing InferenceContext | Denied outcome + structured CONNECT deny log |
+| Inference interception: missing TLS state | Denied outcome + structured CONNECT deny log |
+| Inference interception: TLS handshake failure | Denied outcome + structured CONNECT deny log |
+| Inference interception: client disconnect (no prior routing) | Denied outcome + structured CONNECT deny log |
+| Inference interception: I/O error (no prior routing) | Denied outcome + structured CONNECT deny log |
 | Inference interception: empty route cache | 503 Service Unavailable with JSON error body |
 | Inference interception: no compatible route | 400 Bad Request with JSON error body |
 | Inference interception: backend timeout/unavailable | 503 Service Unavailable with JSON error body |
 | Inference interception: backend protocol error | 502 Bad Gateway with JSON error body |
-| Inference interception: non-inference request | 403 Forbidden with JSON error body |
+| Inference interception: non-inference request (no prior routing) | 403 Forbidden with JSON error body + structured CONNECT deny log |
+| Inference interception: non-inference request (after prior routing) | 403 Forbidden with JSON error body (no deny log, connection counts as routed) |
 | Proxy accept error | Log + break accept loop |
 | Benign connection close (EOF, reset, pipe) | Debug level (not visible to user by default) |
 | L7 parse error | Close the connection |
@@ -990,7 +1009,7 @@ Dual-output logging is configured in `main.rs`:
 - **`/var/log/navigator.log`**: Fixed at `info` level, no ANSI, non-blocking writer
 
 Key structured log events:
-- `CONNECT`: One per proxy CONNECT request with full identity context
+- `CONNECT`: One per proxy CONNECT request with full identity context. `InspectForInference` connections that are ultimately denied produce a second `CONNECT action=deny` log with the denial reason.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
 - Sandbox lifecycle events: process start, exit, namespace creation/cleanup
 

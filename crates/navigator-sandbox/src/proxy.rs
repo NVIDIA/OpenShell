@@ -31,6 +31,17 @@ struct ConnectDecision {
     engine: &'static str,
 }
 
+/// Outcome of an inference interception attempt.
+///
+/// Returned by [`handle_inference_interception`] so the call site can emit
+/// a structured CONNECT deny log when the connection is not successfully routed.
+enum InferenceOutcome {
+    /// At least one request was successfully routed to a local inference backend.
+    Routed,
+    /// The connection was denied (TLS failure, non-inference request, etc.).
+    Denied { reason: String },
+}
+
 /// Inference routing context for sandbox-local execution.
 ///
 /// Holds a `Router` (HTTP client) and a cached set of resolved routes.
@@ -322,7 +333,7 @@ async fn handle_tcp_connection(
     // calls through the gateway's ProxyInference gRPC endpoint.
     if matches!(decision.action, NetworkAction::InspectForInference { .. }) {
         respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-        return handle_inference_interception(
+        let outcome = handle_inference_interception(
             client,
             &host_lc,
             port,
@@ -330,6 +341,35 @@ async fn handle_tcp_connection(
             inference_ctx.as_ref(),
         )
         .await;
+
+        let deny_reason = match &outcome {
+            Ok(InferenceOutcome::Routed) => None,
+            Ok(InferenceOutcome::Denied { reason }) => Some(reason.clone()),
+            Err(e) => Some(format!("{e}")),
+        };
+
+        if let Some(reason) = deny_reason {
+            info!(
+                src_addr = %peer_addr.ip(),
+                src_port = peer_addr.port(),
+                proxy_addr = %local_addr,
+                dst_host = %host_lc,
+                dst_port = port,
+                binary = %binary_str,
+                binary_pid = %pid_str,
+                ancestors = %ancestors_str,
+                cmdline = %cmdline_str,
+                action = "deny",
+                engine = %decision.engine,
+                policy = %policy_str,
+                reason = %reason,
+                "CONNECT",
+            );
+        }
+
+        // Propagate errors; Ok(Routed|Denied) are both terminal
+        outcome?;
+        return Ok(());
     }
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
@@ -651,41 +691,80 @@ const INITIAL_INFERENCE_BUF: usize = 65536;
 /// TLS-terminates the client connection, parses HTTP requests, and executes
 /// inference API calls locally via `navigator-router`.
 /// Non-inference requests are denied with 403.
+///
+/// Returns [`InferenceOutcome::Routed`] if at least one request was successfully
+/// routed, or [`InferenceOutcome::Denied`] with a reason for all denial cases.
 async fn handle_inference_interception(
     client: TcpStream,
     host: &str,
     _port: u16,
     tls_state: Option<&Arc<ProxyTlsState>>,
     inference_ctx: Option<&Arc<InferenceContext>>,
-) -> Result<()> {
+) -> Result<InferenceOutcome> {
     use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
 
-    let ctx = inference_ctx.ok_or_else(|| {
-        miette::miette!("InspectForInference requires inference context (router + routes)")
-    })?;
+    let Some(ctx) = inference_ctx else {
+        return Ok(InferenceOutcome::Denied {
+            reason: "missing inference context".to_string(),
+        });
+    };
 
-    let tls = tls_state.ok_or_else(|| {
-        miette::miette!("InspectForInference requires TLS state for client termination")
-    })?;
+    let Some(tls) = tls_state else {
+        return Ok(InferenceOutcome::Denied {
+            reason: "missing TLS state".to_string(),
+        });
+    };
 
     // TLS-terminate the client side (present a cert for the target host)
-    let mut tls_client = crate::l7::tls::tls_terminate_client(client, tls, host).await?;
+    let mut tls_client = match crate::l7::tls::tls_terminate_client(client, tls, host).await {
+        Ok(c) => c,
+        Err(e) => {
+            return Ok(InferenceOutcome::Denied {
+                reason: format!("TLS handshake failed: {e}"),
+            });
+        }
+    };
 
-    // Read and process HTTP requests from the tunnel
+    // Read and process HTTP requests from the tunnel.
+    // Track whether any request was successfully routed so that a late denial
+    // on a keep-alive connection still counts as "routed".
     let mut buf = vec![0u8; INITIAL_INFERENCE_BUF];
     let mut used = 0usize;
+    let mut routed_any = false;
 
     loop {
-        let n = tls_client.read(&mut buf[used..]).await.into_diagnostic()?;
+        let n = match tls_client.read(&mut buf[used..]).await {
+            Ok(n) => n,
+            Err(e) => {
+                if routed_any {
+                    break;
+                }
+                return Ok(InferenceOutcome::Denied {
+                    reason: format!("I/O error: {e}"),
+                });
+            }
+        };
         if n == 0 {
-            break; // Client closed connection
+            if routed_any {
+                break;
+            }
+            return Ok(InferenceOutcome::Denied {
+                reason: "client closed connection".to_string(),
+            });
         }
         used += n;
 
         // Try to parse a complete HTTP request
         match try_parse_http_request(&buf[..used]) {
             ParseResult::Complete(request, consumed) => {
-                route_inference_request(&request, ctx, &mut tls_client).await?;
+                let was_routed = route_inference_request(&request, ctx, &mut tls_client).await?;
+                if was_routed {
+                    routed_any = true;
+                } else if !routed_any {
+                    return Ok(InferenceOutcome::Denied {
+                        reason: "non-inference request".to_string(),
+                    });
+                }
 
                 // Shift buffer for next request
                 buf.copy_within(consumed..used, 0);
@@ -697,7 +776,12 @@ async fn handle_inference_interception(
                     if buf.len() >= MAX_INFERENCE_BUF {
                         let response = format_http_response(413, &[], b"Payload Too Large");
                         write_all(&mut tls_client, &response).await?;
-                        break;
+                        if routed_any {
+                            break;
+                        }
+                        return Ok(InferenceOutcome::Denied {
+                            reason: "payload too large".to_string(),
+                        });
                     }
                     buf.resize((buf.len() * 2).min(MAX_INFERENCE_BUF), 0);
                 }
@@ -705,15 +789,18 @@ async fn handle_inference_interception(
         }
     }
 
-    Ok(())
+    Ok(InferenceOutcome::Routed)
 }
 
 /// Route a parsed inference request locally via the sandbox router, or deny it.
+///
+/// Returns `Ok(true)` if the request was routed to an inference backend,
+/// `Ok(false)` if it was denied as a non-inference request.
 async fn route_inference_request(
     request: &crate::l7::inference::ParsedHttpRequest,
     ctx: &InferenceContext,
     tls_client: &mut (impl tokio::io::AsyncWrite + Unpin),
-) -> Result<()> {
+) -> Result<bool> {
     use crate::l7::inference::{detect_inference_pattern, format_http_response};
 
     if let Some(pattern) = detect_inference_pattern(&request.method, &request.path, &ctx.patterns) {
@@ -739,7 +826,7 @@ async fn route_inference_request(
                 body_bytes.as_bytes(),
             );
             write_all(tls_client, &response).await?;
-            return Ok(());
+            return Ok(true);
         }
 
         match ctx
@@ -773,6 +860,7 @@ async fn route_inference_request(
                 write_all(tls_client, &response).await?;
             }
         }
+        Ok(true)
     } else {
         // Not an inference request — deny
         info!(
@@ -789,9 +877,8 @@ async fn route_inference_request(
             body_bytes.as_bytes(),
         );
         write_all(tls_client, &response).await?;
+        Ok(false)
     }
-
-    Ok(())
 }
 
 fn router_error_to_http(err: &navigator_router::RouterError) -> (u16, String) {
