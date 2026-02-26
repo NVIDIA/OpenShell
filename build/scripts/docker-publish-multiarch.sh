@@ -129,8 +129,8 @@ for component in sandbox server; do
     --platform "${PLATFORMS}" \
     -f "${DOCKERFILE}" \
     -t "${FULL_IMAGE}:${IMAGE_TAG}" \
-    --cache-from "type=registry,ref=${FULL_IMAGE}:latest" \
-    --cache-to "type=inline" \
+    --cache-from "type=registry,ref=${FULL_IMAGE}:buildcache" \
+    --cache-to "type=registry,ref=${FULL_IMAGE}:buildcache,mode=max" \
     ${EXTRA_BUILD_FLAGS} \
     ${BUILD_ARGS} \
     --push \
@@ -157,8 +157,8 @@ docker buildx build \
   -f deploy/docker/Dockerfile.cluster \
   -t "${CLUSTER_IMAGE}:${IMAGE_TAG}" \
   --build-arg K3S_VERSION=${K3S_VERSION} \
-  --cache-from "type=registry,ref=${CLUSTER_IMAGE}:latest" \
-  --cache-to "type=inline" \
+  --cache-from "type=registry,ref=${CLUSTER_IMAGE}:buildcache" \
+  --cache-to "type=registry,ref=${CLUSTER_IMAGE}:buildcache,mode=max" \
   ${EXTRA_BUILD_FLAGS} \
   --push \
   .
