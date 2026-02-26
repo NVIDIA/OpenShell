@@ -10,6 +10,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
     let header = Row::new(vec![
         Cell::from(Span::styled("  NAME", styles::MUTED)),
         Cell::from(Span::styled("STATUS", styles::MUTED)),
+        Cell::from(Span::styled("CREATED", styles::MUTED)),
         Cell::from(Span::styled("AGE", styles::MUTED)),
         Cell::from(Span::styled("IMAGE", styles::MUTED)),
     ])
@@ -19,6 +20,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         .map(|i| {
             let name = app.sandbox_names.get(i).map_or("", String::as_str);
             let phase = app.sandbox_phases.get(i).map_or("", String::as_str);
+            let created = app.sandbox_created.get(i).map_or("", String::as_str);
             let age = app.sandbox_ages.get(i).map_or("", String::as_str);
             let image = app.sandbox_images.get(i).map_or("", String::as_str);
 
@@ -45,6 +47,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             Row::new(vec![
                 name_cell,
                 Cell::from(Span::styled(phase, phase_style)),
+                Cell::from(Span::styled(created, styles::MUTED)),
                 Cell::from(Span::styled(age, styles::MUTED)),
                 Cell::from(Span::styled(image, styles::MUTED)),
             ])
@@ -52,10 +55,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         .collect();
 
     let widths = [
-        Constraint::Percentage(30),
-        Constraint::Percentage(15),
-        Constraint::Percentage(15),
-        Constraint::Percentage(40),
+        Constraint::Percentage(22),
+        Constraint::Percentage(12),
+        Constraint::Percentage(18),
+        Constraint::Percentage(10),
+        Constraint::Percentage(38),
     ];
 
     let border_style = if focused {

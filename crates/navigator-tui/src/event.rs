@@ -8,6 +8,8 @@ pub enum Event {
     Tick,
     #[allow(dead_code)]
     Resize(u16, u16),
+    /// Asynchronous log-fetch result delivered from a background task.
+    LogResult(Vec<String>),
 }
 
 pub struct EventHandler {
@@ -51,5 +53,10 @@ impl EventHandler {
 
     pub async fn next(&mut self) -> Option<Event> {
         self.rx.recv().await
+    }
+
+    /// Get a sender handle for dispatching events from background tasks.
+    pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
+        self._keepalive.clone()
     }
 }

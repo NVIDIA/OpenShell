@@ -7,7 +7,7 @@ use crate::app::{App, Focus};
 use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    // Dynamic height: cluster table gets just enough rows, sandbox table gets the rest.
+    // Dynamic height: cluster table gets just enough rows, rest goes to sandbox area.
     let cluster_height = (app.clusters.len() as u16 + 4).clamp(5, 12);
 
     let chunks = Layout::default()
@@ -16,7 +16,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
 
     draw_cluster_list(frame, app, chunks[0]);
-    super::sandboxes::draw(frame, app, chunks[1], app.focus == Focus::Sandboxes);
+
+    // The bottom panel depends on focus state.
+    match app.focus {
+        Focus::SandboxDetail => super::sandbox_detail::draw(frame, app, chunks[1]),
+        Focus::SandboxLogs => super::sandbox_logs::draw(frame, app, chunks[1]),
+        _ => super::sandboxes::draw(frame, app, chunks[1], app.focus == Focus::Sandboxes),
+    }
 }
 
 fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {

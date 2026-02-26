@@ -1,4 +1,6 @@
 mod dashboard;
+pub(crate) mod sandbox_detail;
+pub(crate) mod sandbox_logs;
 pub(crate) mod sandboxes;
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};

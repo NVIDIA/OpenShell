@@ -16,9 +16,10 @@ use miette::{IntoDiagnostic, Result};
 use navigator_core::proto::navigator_client::NavigatorClient;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
+use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use app::{App, ClusterEntry};
+use app::{App, ClusterEntry, Focus};
 use event::{Event, EventHandler};
 
 /// Launch the Gator TUI.
@@ -49,9 +50,22 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
         match events.next().await {
             Some(Event::Key(key)) => {
                 app.handle_key(key);
+                // Handle async actions triggered by key presses.
                 if app.pending_cluster_switch.is_some() {
                     handle_cluster_switch(&mut app).await;
                 }
+                if app.pending_log_fetch {
+                    app.pending_log_fetch = false;
+                    spawn_log_fetch(&app, events.sender());
+                }
+                if app.pending_sandbox_delete {
+                    app.pending_sandbox_delete = false;
+                    handle_sandbox_delete(&mut app).await;
+                }
+            }
+            Some(Event::LogResult(lines)) => {
+                app.sandbox_log_lines = lines;
+                app.sandbox_log_scroll = 0;
             }
             Some(Event::Tick) => {
                 refresh_cluster_list(&mut app);
@@ -182,6 +196,79 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox actions
+// ---------------------------------------------------------------------------
+
+/// Kick off a non-blocking log fetch for the currently selected sandbox.
+///
+/// Immediately switches focus to the log view with a "Loading..." placeholder,
+/// then spawns a background task that calls the unary `GetSandboxLogs` RPC and
+/// delivers the result via the event channel.
+fn spawn_log_fetch(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let sandbox_id = match app.selected_sandbox_id() {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::GetSandboxLogsRequest {
+            sandbox_id,
+            lines: 500,
+            since_ms: 0,
+            sources: vec![],
+            min_level: String::new(),
+        };
+
+        let lines = match tokio::time::timeout(Duration::from_secs(5), client.get_sandbox_logs(req))
+            .await
+        {
+            Ok(Ok(resp)) => {
+                let logs = resp.into_inner().logs;
+                if logs.is_empty() {
+                    vec!["No logs available.".to_string()]
+                } else {
+                    logs.iter()
+                        .map(|log| {
+                            let ts = format_short_time(log.timestamp_ms);
+                            format!("{ts}  {:<5}  {}", log.level, log.message)
+                        })
+                        .collect()
+                }
+            }
+            Ok(Err(e)) => vec![format!("Failed to fetch logs: {}", e.message())],
+            Err(_) => vec!["Timed out fetching logs.".to_string()],
+        };
+
+        let _ = tx.send(Event::LogResult(lines));
+    });
+}
+
+/// Delete the currently selected sandbox.
+async fn handle_sandbox_delete(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    let req = navigator_core::proto::DeleteSandboxRequest {
+        name: sandbox_name,
+    };
+    match app.client.delete_sandbox(req).await {
+        Ok(_) => {
+            // Return to sandbox list and refresh.
+            app.focus = Focus::Sandboxes;
+            refresh_sandboxes(app).await;
+        }
+        Err(e) => {
+            app.status_text = format!("delete failed: {}", e.message());
+            app.focus = Focus::Sandboxes;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Data refresh
 // ---------------------------------------------------------------------------
 
@@ -192,8 +279,9 @@ async fn refresh_data(app: &mut App) {
 
 async fn refresh_health(app: &mut App) {
     let req = navigator_core::proto::HealthRequest {};
-    match app.client.health(req).await {
-        Ok(resp) => {
+    let result = tokio::time::timeout(Duration::from_secs(5), app.client.health(req)).await;
+    match result {
+        Ok(Ok(resp)) => {
             let status = resp.into_inner().status;
             app.status_text = match status {
                 1 => "Healthy".to_string(),
@@ -202,8 +290,11 @@ async fn refresh_health(app: &mut App) {
                 _ => format!("Unknown ({status})"),
             };
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             app.status_text = format!("error: {}", e.message());
+        }
+        Err(_) => {
+            app.status_text = "timeout".to_string();
         }
     }
 }
@@ -213,10 +304,21 @@ async fn refresh_sandboxes(app: &mut App) {
         limit: 100,
         offset: 0,
     };
-    match app.client.list_sandboxes(req).await {
-        Ok(resp) => {
+    let result =
+        tokio::time::timeout(Duration::from_secs(5), app.client.list_sandboxes(req)).await;
+    match result {
+        Ok(Err(e)) => {
+            tracing::warn!("failed to list sandboxes: {}", e.message());
+            return;
+        }
+        Err(_) => {
+            tracing::warn!("list sandboxes timed out");
+            return;
+        }
+        Ok(Ok(resp)) => {
             let sandboxes = resp.into_inner().sandboxes;
             app.sandbox_count = sandboxes.len();
+            app.sandbox_ids = sandboxes.iter().map(|s| s.id.clone()).collect();
             app.sandbox_names = sandboxes.iter().map(|s| s.name.clone()).collect();
             app.sandbox_phases = sandboxes.iter().map(|s| phase_label(s.phase)).collect();
             app.sandbox_images = sandboxes
@@ -225,20 +327,23 @@ async fn refresh_sandboxes(app: &mut App) {
                     s.spec
                         .as_ref()
                         .and_then(|spec| spec.template.as_ref())
-                        .map(|t| t.image.clone())
-                        .unwrap_or_default()
+                        .map(|t| t.image.as_str())
+                        .filter(|img| !img.is_empty())
+                        .unwrap_or("-")
+                        .to_string()
                 })
                 .collect();
             app.sandbox_ages = sandboxes
                 .iter()
                 .map(|s| format_age(s.created_at_ms))
                 .collect();
+            app.sandbox_created = sandboxes
+                .iter()
+                .map(|s| format_timestamp(s.created_at_ms))
+                .collect();
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
                 app.sandbox_selected = app.sandbox_count - 1;
             }
-        }
-        Err(e) => {
-            tracing::warn!("failed to list sandboxes: {}", e.message());
         }
     }
 }
@@ -276,4 +381,52 @@ fn format_age(epoch_ms: i64) -> String {
     } else {
         format!("{}d {}h", diff / 86400, (diff % 86400) / 3600)
     }
+}
+
+/// Format epoch milliseconds as a human-readable UTC timestamp: `YYYY-MM-DD HH:MM`.
+fn format_timestamp(epoch_ms: i64) -> String {
+    if epoch_ms <= 0 {
+        return String::from("-");
+    }
+    let secs = epoch_ms / 1000;
+    // Days since Unix epoch.
+    let days = secs / 86400;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+
+    // Convert days since epoch to year-month-day (Gregorian).
+    let (year, month, day) = days_to_ymd(days);
+    format!("{year:04}-{month:02}-{day:02} {hours:02}:{minutes:02}")
+}
+
+/// Format epoch milliseconds as a short time string: `HH:MM:SS`.
+fn format_short_time(epoch_ms: i64) -> String {
+    if epoch_ms <= 0 {
+        return String::from("--:--:--");
+    }
+    let secs = epoch_ms / 1000;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
+///
+/// Uses a civil calendar algorithm (no external crate needed).
+fn days_to_ymd(days: i64) -> (i64, i64, i64) {
+    // Algorithm from https://howardhinnant.github.io/date_algorithms.html
+    let z = days + 719468;
+    let era = if z >= 0 { z } else { z - 146096 } / 146097;
+    let doe = z - era * 146097; // day of era [0, 146096]
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // year of era [0, 399]
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // day of year [0, 365]
+    let mp = (5 * doy + 2) / 153; // month proxy [0, 11]
+    let d = doy - (153 * mp + 2) / 5 + 1; // day [1, 31]
+    let m = if mp < 10 { mp + 3 } else { mp - 9 }; // month [1, 12]
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
