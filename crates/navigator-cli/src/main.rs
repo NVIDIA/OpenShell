@@ -127,6 +127,9 @@ enum Commands {
         command: ProviderCommands,
     },
 
+    /// Launch the Gator interactive TUI.
+    Gator,
+
     /// SSH proxy (used by `ProxyCommand`).
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
@@ -1124,6 +1127,12 @@ async fn main() -> Result<()> {
                     run::provider_delete(endpoint, &names, &tls).await?;
                 }
             }
+        }
+        Some(Commands::Gator) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let tls = tls.with_cluster_name(&ctx.name);
+            let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
+            navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
         }
         Some(Commands::SshProxy {
             gateway,

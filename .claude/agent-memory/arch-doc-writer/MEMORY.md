@@ -1,7 +1,7 @@
 # Arch Doc Writer Memory
 
 ## Project Structure
-- Crates: `navigator-cli`, `navigator-server`, `navigator-sandbox`, `navigator-bootstrap`, `navigator-core`, `navigator-providers`, `navigator-router`
+- Crates: `navigator-cli`, `navigator-server`, `navigator-sandbox`, `navigator-bootstrap`, `navigator-core`, `navigator-providers`, `navigator-router`, `navigator-tui`
 - CLI entry: `crates/navigator-cli/src/main.rs` (clap parser + dispatch)
 - CLI logic: `crates/navigator-cli/src/run.rs` (all command implementations)
 - Sandbox entry: `crates/navigator-sandbox/src/lib.rs` (`run_sandbox()`)
@@ -18,7 +18,7 @@
 
 ## Architecture Docs
 - Files renamed from numbered prefix format to descriptive names (e.g., `2 - server-architecture.md` -> `gateway-architecture.md`)
-- Current files: README.md, sandbox-providers.md, cluster-single-node.md, build-containers.md, sandbox-connect.md, sandbox.md, security-policy.md, gateway.md, gateway-security.md, sandbox-custom-containers.md, inference-routing.md
+- Current files: README.md, sandbox-providers.md, cluster-single-node.md, build-containers.md, sandbox-connect.md, sandbox.md, security-policy.md, gateway.md, gateway-security.md, sandbox-custom-containers.md, inference-routing.md, gator.md
 - Cross-references use plain filenames: `[text](gateway.md)`
 - Naming convention: "gateway" in prose for the control plane component; code identifiers like `navigator-server` stay unchanged
 
@@ -163,3 +163,18 @@
 - The project name "Navigator" appears in code but docs should use generic terms per user preference
 - CLI binary: `navigator` (aliased as `nav` in dev via mise)
 - Provider types: claude, codex, opencode, openclaw, generic, nvidia, gitlab, github, outlook
+
+## Gator TUI Details
+- Crate: `crates/navigator-tui/` — separate workspace crate, CLI launches via `Commands::Gator` variant
+- Entry: `lib.rs` — `pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str)`
+- App state: `app.rs` — View enum (Dashboard, Sandboxes), InputMode enum (Normal, Command)
+- Event loop: `event.rs` — crossterm poll on tokio::spawn, 2s tick_rate, unbounded mpsc channel
+- Theme: `theme.rs` — NVIDIA Green #76b900, Everglade #123123, Black bg, White fg; semantic style constants
+- UI layout: `ui/mod.rs` — 4 vertical zones: title bar (1), content (flex), nav bar (1), command bar (1)
+- Dashboard: `ui/dashboard.rs` — cluster info + resource summary (sandbox count)
+- Sandboxes: `ui/sandboxes.rs` — table with NAME/STATUS/AGE/IMAGE, phase-colored status
+- Health codes: 1=Healthy, 2=Degraded, 3=Unhealthy (from HealthRequest gRPC)
+- Phase codes: 1=Provisioning, 2=Ready, 3=Error, 4=Deleting (from ListSandboxes gRPC)
+- Status indicators: ● Healthy, ◐ Degraded, ○ Unhealthy, … connecting
+- CLI integration: main.rs resolves cluster, builds gRPC channel via tls::build_channel(), calls navigator_tui::run()
+- Design plan: `architecture/plans/gator-tui.md`
