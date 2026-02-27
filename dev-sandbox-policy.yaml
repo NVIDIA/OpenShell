@@ -132,6 +132,20 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/gh }
 
+  vscode:
+    name: vscode
+    endpoints:
+      - { host: update.code.visualstudio.com, port: 443 }
+      - { host: "*.vo.msecnd.net", port: 443 }
+      - { host: vscode.download.prss.microsoft.com, port: 443 }
+      - { host: marketplace.visualstudio.com, port: 443 }
+      - { host: "*.gallerycdn.vsassets.io", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: "/sandbox/.vscode-server/**" }
+      - { path: "/sandbox/.vscode-remote-containers/**" }
+
 inference:
   allowed_routes:
     - local

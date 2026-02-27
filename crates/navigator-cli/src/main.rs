@@ -1,8 +1,10 @@
 //! Navigator CLI - command-line interface for Navigator.
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
+use std::io::Write;
 use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
@@ -130,21 +132,113 @@ enum Commands {
     /// Launch the Gator interactive TUI.
     Gator,
 
+    /// Generate shell completions.
+    #[command(after_long_help = COMPLETIONS_HELP)]
+    Completions {
+        /// Shell to generate completions for.
+        shell: CompletionShell,
+    },
+
     /// SSH proxy (used by `ProxyCommand`).
+    ///
+    /// Two mutually exclusive modes:
+    ///
+    /// **Token mode** (used internally by `sandbox connect`):
+    ///   `nav ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///
+    /// **Name mode** (for use in `~/.ssh/config`):
+    ///   `nav ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
+        /// Required in token mode.
         #[arg(long)]
-        gateway: String,
+        gateway: Option<String>,
 
-        /// Sandbox id.
+        /// Sandbox id. Required in token mode.
         #[arg(long)]
-        sandbox_id: String,
+        sandbox_id: Option<String>,
 
-        /// SSH session token.
+        /// SSH session token. Required in token mode.
         #[arg(long)]
-        token: String,
+        token: Option<String>,
+
+        /// Cluster endpoint URL. Used in name mode. Deprecated: prefer --cluster.
+        #[arg(long)]
+        server: Option<String>,
+
+        /// Cluster name (resolves endpoint from stored metadata). Used in name mode.
+        #[arg(long, short)]
+        cluster: Option<String>,
+
+        /// Sandbox name. Used in name mode.
+        #[arg(long)]
+        name: Option<String>,
     },
 }
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CompletionShell {
+    Bash,
+    Fish,
+    Zsh,
+    Powershell,
+}
+
+impl std::fmt::Display for CompletionShell {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bash => write!(f, "bash"),
+            Self::Fish => write!(f, "fish"),
+            Self::Zsh => write!(f, "zsh"),
+            Self::Powershell => write!(f, "powershell"),
+        }
+    }
+}
+
+const COMPLETIONS_HELP: &str = "\
+Enable tab completion for Bash, Fish, Zsh, or PowerShell.
+
+The script is output on stdout, allowing you to redirect the output
+to the file of your choosing. Where you place the file will depend
+on which shell and operating system you are using.
+
+BASH:
+
+    $ mkdir -p ~/.local/share/bash-completion/completions
+    $ navigator completions bash > ~/.local/share/bash-completion/completions/navigator
+
+  On macOS with Homebrew (install bash-completion first):
+
+    $ mkdir -p $(brew --prefix)/etc/bash_completion.d
+    $ navigator completions bash > $(brew --prefix)/etc/bash_completion.d/navigator.bash-completion
+
+FISH:
+
+    $ mkdir -p ~/.config/fish/completions
+    $ navigator completions fish > ~/.config/fish/completions/navigator.fish
+
+ZSH:
+
+    $ mkdir -p ~/.zfunc
+    $ navigator completions zsh > ~/.zfunc/_navigator
+
+  Then add the following to your .zshrc before compinit:
+
+    fpath+=~/.zfunc
+
+  And reload with:
+
+    $ exec zsh
+
+POWERSHELL:
+
+    > navigator completions powershell >> $PROFILE
+
+  If no profile exists yet, create one first:
+
+    > New-Item -Path $PROFILE -Type File -Force
+
+You may need to log out and back in for changes to take effect.";
 
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderType {
@@ -513,6 +607,15 @@ enum SandboxCommands {
         #[arg(long, default_value = "")]
         level: String,
     },
+
+    /// Print an SSH config entry for a sandbox.
+    ///
+    /// Outputs a Host block suitable for appending to ~/.ssh/config,
+    /// enabling tools like `VSCode` Remote-SSH to connect to the sandbox.
+    SshConfig {
+        /// Sandbox name.
+        name: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -675,6 +778,8 @@ enum InferenceCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    CompleteEnv::with_factory(Cli::command).complete();
+
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
@@ -1009,6 +1114,9 @@ async fn main() -> Result<()> {
                             )
                             .await?;
                         }
+                        SandboxCommands::SshConfig { name } => {
+                            run::print_ssh_config(&ctx.name, &name);
+                        }
                     }
                 }
             }
@@ -1134,12 +1242,57 @@ async fn main() -> Result<()> {
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
         }
+        Some(Commands::Completions { shell }) => {
+            let exe = std::env::current_exe()
+                .map_err(|e| miette::miette!("failed to find current executable: {e}"))?;
+            let output = std::process::Command::new(exe)
+                .env("COMPLETE", shell.to_string())
+                .output()
+                .map_err(|e| miette::miette!("failed to generate completions: {e}"))?;
+            std::io::stdout()
+                .write_all(&output.stdout)
+                .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
+        }
         Some(Commands::SshProxy {
             gateway,
             sandbox_id,
             token,
+            server,
+            cluster,
+            name,
         }) => {
-            run::sandbox_ssh_proxy(&gateway, &sandbox_id, &token, &tls).await?;
+            match (gateway, sandbox_id, token, server, cluster, name) {
+                // Token mode (existing behavior): pre-created session credentials.
+                (Some(gw), Some(sid), Some(tok), _, _, _) => {
+                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &tls).await?;
+                }
+                // Name mode with --cluster: resolve endpoint from metadata.
+                (_, _, _, server_override, Some(c), Some(n)) => {
+                    let endpoint = if let Some(srv) = server_override {
+                        srv
+                    } else {
+                        let meta = load_cluster_metadata(&c).map_err(|_| {
+                            miette::miette!(
+                                "Unknown cluster '{c}'.\n\
+                                 Deploy it first: nav cluster admin deploy --name {c}\n\
+                                 Or list available clusters: nav cluster list"
+                            )
+                        })?;
+                        meta.gateway_endpoint
+                    };
+                    let tls = tls.with_cluster_name(&c);
+                    run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
+                }
+                // Legacy name mode with --server only (no --cluster).
+                (_, _, _, Some(srv), None, Some(n)) => {
+                    run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
+                }
+                _ => {
+                    return Err(miette::miette!(
+                        "provide either --gateway/--sandbox-id/--token or --cluster/--name (or --server/--name)"
+                    ));
+                }
+            }
         }
         None => {
             Cli::command().print_help().expect("Failed to print help");
@@ -1147,4 +1300,43 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    #[test]
+    fn cli_debug_assert() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn completions_engine_returns_candidates() {
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec!["navigator".into(), "".into()];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
+            .expect("completion engine failed");
+        assert!(
+            !candidates.is_empty(),
+            "expected subcommand completions for empty input"
+        );
+    }
+
+    #[test]
+    fn completions_subcommand_appears_in_candidates() {
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec!["navigator".into(), "comp".into()];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
+            .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.contains(&"completions".to_string()),
+            "expected 'completions' in candidates, got: {names:?}"
+        );
+    }
 }

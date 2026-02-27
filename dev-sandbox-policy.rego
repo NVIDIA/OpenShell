@@ -120,12 +120,10 @@ binary_allowed(policy, exec) if {
 
 # Binary matching: glob pattern against path, any ancestor, or any cmdline path.
 binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
+	some b in policy.binaries
 	contains(b.path, "*")
 	all_paths := array.concat(array.concat([exec.path], exec.ancestors), exec.cmdline_paths)
-	some p
-	p := all_paths[_]
+	some p in all_paths
 	glob.match(b.path, ["/"], p)
 }
 

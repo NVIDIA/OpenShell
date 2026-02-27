@@ -17,7 +17,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -334,6 +334,12 @@ impl russh::server::Handler for SshHandler {
         session: &mut Session,
     ) -> Result<(), Self::Error> {
         session.channel_success(channel)?;
+        // Only allocate a PTY when the client explicitly requested one via
+        // pty_request.  VS Code Remote-SSH sends shell_request *without* a
+        // preceding pty_request and expects pipe-based I/O with clean LF line
+        // endings.  Forcing a PTY here caused CRLF translation which made
+        // VS Code misdetect the platform as Windows (and then try to run
+        // `powershell`).
         self.start_shell(channel, session.handle(), None)?;
         Ok(())
     }
@@ -353,6 +359,21 @@ impl russh::server::Handler for SshHandler {
         Ok(())
     }
 
+    async fn env_request(
+        &mut self,
+        channel: ChannelId,
+        variable_name: &str,
+        variable_value: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Accept the env request so the client knows we handled it, but we
+        // don't actually propagate the variables — the sandbox environment is
+        // controlled via policy.  We must reply so VSCode doesn't stall.
+        let _ = (variable_name, variable_value);
+        session.channel_success(channel)?;
+        Ok(())
+    }
+
     async fn data(
         &mut self,
         _channel: ChannelId,
@@ -362,18 +383,6 @@ impl russh::server::Handler for SshHandler {
         if let Some(sender) = self.input_sender.as_ref() {
             let _ = sender.send(data.to_vec());
         }
-        Ok(())
-    }
-
-    async fn channel_eof(
-        &mut self,
-        _channel: ChannelId,
-        _session: &mut Session,
-    ) -> Result<(), Self::Error> {
-        // Drop the input sender so the writer thread exits and the child's
-        // stdin pipe is closed.  Without this, commands like `tar xf -` that
-        // read until EOF on stdin would hang forever in pipe-based sessions.
-        self.input_sender.take();
         Ok(())
     }
 }
@@ -386,6 +395,8 @@ impl SshHandler {
         command: Option<String>,
     ) -> anyhow::Result<()> {
         if let Some(pty) = self.pty_request.take() {
+            // PTY was requested — allocate a real PTY (interactive shell or
+            // exec that explicitly asked for a terminal).
             let (pty_master, input_sender) = spawn_pty_shell(
                 &self.policy,
                 self.workdir.clone(),
@@ -401,7 +412,10 @@ impl SshHandler {
             self.pty_master = Some(pty_master);
             self.input_sender = Some(input_sender);
         } else {
-            let input_sender = spawn_pipe_shell(
+            // No PTY requested — use plain pipes so stdout/stderr are
+            // separate and output has clean LF line endings.  This is the
+            // path VSCode Remote-SSH exec commands take.
+            let input_sender = spawn_pipe_exec(
                 &self.policy,
                 self.workdir.clone(),
                 command,
@@ -537,12 +551,15 @@ fn spawn_pty_shell(
         pty.term.as_str()
     };
 
-    cmd.stdin(stdin)
+    cmd.env_clear()
+        .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
         .env("NAVIGATOR_SANDBOX", "1")
         .env("HOME", "/sandbox")
         .env("USER", "sandbox")
+        .env("SHELL", "/bin/bash")
+        .env("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin")
         .env("TERM", term);
 
     // Set proxy environment variables so cooperative tools (curl, wget, etc.)
@@ -660,14 +677,13 @@ fn spawn_pty_shell(
     Ok((master_file, sender))
 }
 
-/// Spawn a shell process with plain pipes (no PTY) for non-interactive sessions.
+/// Spawn a command using plain pipes (no PTY).
 ///
-/// This is used when the SSH client did not request a PTY (e.g. `ssh -T`).
-/// Unlike [`spawn_pty_shell`], stdout and stderr are separate streams and no
-/// terminal output processing (LF→CRLF) is applied, making this safe for
-/// binary data transfer (e.g. tar archives).
+/// stdout is forwarded as SSH channel data and stderr as SSH extended data
+/// (type 1), preserving the separation that clients like `VSCode` Remote-SSH
+/// expect.  Output retains clean LF line endings (no CRLF translation).
 #[allow(clippy::too_many_arguments)]
-fn spawn_pipe_shell(
+fn spawn_pipe_exec(
     policy: &SandboxPolicy,
     workdir: Option<String>,
     command: Option<String>,
@@ -680,23 +696,30 @@ fn spawn_pipe_shell(
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
     let mut cmd = command.map_or_else(
         || {
-            let mut c = Command::new("/bin/bash");
-            c.arg("-i");
-            c
+            // No command — read from stdin.  Do *not* pass `-i`; interactive
+            // mode reads .bashrc, writes prompts to stderr, and can introduce
+            // just enough latency for VS Code Remote-SSH's platform detection
+            // to time out and fall back to "windows".  Plain `bash` with piped
+            // stdin already reads commands line-by-line (script mode), which is
+            // exactly what VS Code's local server expects.
+            Command::new("/bin/bash")
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            c.arg("-lc").arg(command);
+            c.arg("-c").arg(command);
             c
         },
     );
 
-    cmd.stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+    cmd.env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .env("NAVIGATOR_SANDBOX", "1")
         .env("HOME", "/sandbox")
         .env("USER", "sandbox")
+        .env("SHELL", "/bin/bash")
+        .env("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin")
         .env("TERM", "dumb");
 
     if let Some(ref url) = proxy_url {
@@ -726,7 +749,7 @@ fn spawn_pipe_shell(
 
     #[cfg(unix)]
     {
-        unsafe_pipe::install_pre_exec(&mut cmd, policy.clone(), workdir.clone(), netns_fd);
+        unsafe_pty::install_pre_exec_no_pty(&mut cmd, policy.clone(), workdir.clone(), netns_fd);
     }
 
     let mut child = cmd.spawn()?;
@@ -735,88 +758,74 @@ fn spawn_pipe_shell(
     #[cfg(target_os = "linux")]
     register_managed_child(child_pid);
 
-    let child_stdin = child.stdin.take().expect("stdin was piped");
-    let child_stdout = child.stdout.take().expect("stdout was piped");
-    let child_stderr = child.stderr.take().expect("stderr was piped");
+    let child_stdin = child.stdin.take();
+    let child_stdout = child.stdout.take().expect("stdout must be piped");
+    let child_stderr = child.stderr.take().expect("stderr must be piped");
 
-    // Writer thread: forwards SSH channel data to the child's stdin.
+    // stdin writer thread
     let (sender, receiver) = mpsc::channel::<Vec<u8>>();
-    let mut writer = child_stdin;
     std::thread::spawn(move || {
+        let Some(mut stdin) = child_stdin else {
+            return;
+        };
         while let Ok(bytes) = receiver.recv() {
-            if writer.write_all(&bytes).is_err() {
+            if stdin.write_all(&bytes).is_err() {
                 break;
             }
-            let _ = writer.flush();
+            let _ = stdin.flush();
         }
     });
 
     let runtime = tokio::runtime::Handle::current();
 
-    // We need both stdout and stderr readers to finish before sending EOF.
-    // Use an Arc<AtomicUsize> to count completions.
-    let readers_remaining = Arc::new(std::sync::atomic::AtomicUsize::new(2));
+    // Signal from the reader threads to the exit thread that all output has
+    // been forwarded.
     let (reader_done_tx, reader_done_rx) = mpsc::channel::<()>();
 
-    // Stdout reader thread: forwards child stdout to the SSH channel.
-    let handle_stdout = handle.clone();
-    let runtime_stdout = runtime.clone();
-    let readers_remaining_stdout = readers_remaining.clone();
-    let reader_done_tx_stdout = reader_done_tx.clone();
+    // stdout reader
+    let stdout_handle = handle.clone();
+    let stdout_runtime = runtime.clone();
+    let reader_done_stdout = reader_done_tx.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
         let mut reader = child_stdout;
+        let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = CryptoVec::from_slice(&buf[..n]);
-                    let h = handle_stdout.clone();
-                    drop(runtime_stdout.spawn(async move {
+                    let h = stdout_handle.clone();
+                    drop(stdout_runtime.spawn(async move {
                         let _ = h.data(channel, data).await;
                     }));
                 }
             }
         }
-        if readers_remaining_stdout.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-            let eof_handle = handle_stdout.clone();
-            drop(runtime_stdout.spawn(async move {
-                let _ = eof_handle.eof(channel).await;
-            }));
-            let _ = reader_done_tx_stdout.send(());
-        }
+        let _ = reader_done_stdout.send(());
     });
 
-    // Stderr reader thread: forwards child stderr to the SSH channel as
-    // extended data (type 1 = stderr).
-    let handle_stderr = handle.clone();
-    let runtime_stderr = runtime.clone();
-    let readers_remaining_stderr = readers_remaining;
+    // stderr reader — sends as extended data (type 1)
+    let stderr_handle = handle.clone();
+    let stderr_runtime = runtime.clone();
     std::thread::spawn(move || {
-        let mut buf = [0u8; 4096];
         let mut reader = child_stderr;
+        let mut buf = [0u8; 4096];
         loop {
             match reader.read(&mut buf) {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let data = CryptoVec::from_slice(&buf[..n]);
-                    let h = handle_stderr.clone();
-                    drop(runtime_stderr.spawn(async move {
+                    let h = stderr_handle.clone();
+                    drop(stderr_runtime.spawn(async move {
                         let _ = h.extended_data(channel, 1, data).await;
                     }));
                 }
             }
         }
-        if readers_remaining_stderr.fetch_sub(1, std::sync::atomic::Ordering::AcqRel) == 1 {
-            let eof_handle = handle_stderr.clone();
-            drop(runtime_stderr.spawn(async move {
-                let _ = eof_handle.eof(channel).await;
-            }));
-            let _ = reader_done_tx.send(());
-        }
+        let _ = reader_done_tx.send(());
     });
 
-    // Exit thread: waits for process exit, then sends exit-status and close.
+    // Exit waiter thread
     let handle_exit = handle;
     let runtime_exit = runtime;
     std::thread::spawn(move || {
@@ -824,51 +833,17 @@ fn spawn_pipe_shell(
         #[cfg(target_os = "linux")]
         unregister_managed_child(child_pid);
         let code = status.and_then(|s| s.code()).unwrap_or(1).unsigned_abs();
-        // Wait for reader threads to finish forwarding output before sending
-        // exit-status and close.
+        // Wait for both reader threads.
         let _ = reader_done_rx.recv_timeout(Duration::from_secs(2));
+        let _ = reader_done_rx.recv_timeout(Duration::from_secs(1));
         drop(runtime_exit.spawn(async move {
+            let _ = handle_exit.eof(channel).await;
             let _ = handle_exit.exit_status_request(channel, code).await;
             let _ = handle_exit.close(channel).await;
         }));
     });
 
     Ok(sender)
-}
-
-mod unsafe_pipe {
-    use super::{Command, RawFd, SandboxPolicy, drop_privileges, sandbox};
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
-    #[allow(unsafe_code)]
-    pub fn install_pre_exec(
-        cmd: &mut Command,
-        policy: SandboxPolicy,
-        workdir: Option<String>,
-        netns_fd: Option<RawFd>,
-    ) {
-        unsafe {
-            cmd.pre_exec(move || {
-                // Enter network namespace before dropping privileges.
-                #[cfg(target_os = "linux")]
-                if let Some(fd) = netns_fd {
-                    let result = libc::setns(fd, libc::CLONE_NEWNET);
-                    if result != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-
-                #[cfg(not(target_os = "linux"))]
-                let _ = netns_fd;
-
-                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))?;
-                sandbox::apply(&policy, workdir.as_deref())
-                    .map_err(|err| std::io::Error::other(err.to_string()))?;
-                Ok(())
-            });
-        }
-    }
 }
 
 mod unsafe_pty {
@@ -907,30 +882,53 @@ mod unsafe_pty {
                 setsid().map_err(|err| std::io::Error::other(err.to_string()))?;
                 set_controlling_tty(slave_fd)?;
 
-                // Enter network namespace before dropping privileges.
-                // This ensures SSH shell processes are isolated to the same
-                // network namespace as the entrypoint, forcing all traffic
-                // through the veth pair and CONNECT proxy.
-                #[cfg(target_os = "linux")]
-                if let Some(fd) = netns_fd {
-                    let result = libc::setns(fd, libc::CLONE_NEWNET);
-                    if result != 0 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                }
-
-                #[cfg(not(target_os = "linux"))]
-                let _ = netns_fd;
-
-                // Drop privileges before applying sandbox restrictions.
-                // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
-                // which may be blocked by Landlock.
-                drop_privileges(&policy).map_err(|err| std::io::Error::other(err.to_string()))?;
-                sandbox::apply(&policy, workdir.as_deref())
-                    .map_err(|err| std::io::Error::other(err.to_string()))?;
-                Ok(())
+                enter_netns_and_sandbox(netns_fd, &policy, workdir.as_deref())
             });
         }
+    }
+
+    /// Pre-exec hook for pipe-based (non-PTY) exec.
+    ///
+    /// Skips `setsid` and `TIOCSCTTY` since there is no controlling terminal.
+    #[allow(unsafe_code)]
+    pub fn install_pre_exec_no_pty(
+        cmd: &mut Command,
+        policy: SandboxPolicy,
+        workdir: Option<String>,
+        netns_fd: Option<RawFd>,
+    ) {
+        unsafe {
+            cmd.pre_exec(move || enter_netns_and_sandbox(netns_fd, &policy, workdir.as_deref()));
+        }
+    }
+
+    fn enter_netns_and_sandbox(
+        netns_fd: Option<RawFd>,
+        policy: &SandboxPolicy,
+        workdir: Option<&str>,
+    ) -> std::io::Result<()> {
+        // Enter network namespace before dropping privileges.
+        // This ensures SSH shell processes are isolated to the same
+        // network namespace as the entrypoint, forcing all traffic
+        // through the veth pair and CONNECT proxy.
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = netns_fd {
+            #[allow(unsafe_code)]
+            let result = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        let _ = netns_fd;
+
+        // Drop privileges before applying sandbox restrictions.
+        // initgroups/setgid/setuid need access to /etc/group and /etc/passwd
+        // which may be blocked by Landlock.
+        drop_privileges(policy).map_err(|err| std::io::Error::other(err.to_string()))?;
+        sandbox::apply(policy, workdir).map_err(|err| std::io::Error::other(err.to_string()))?;
+        Ok(())
     }
 }
 
