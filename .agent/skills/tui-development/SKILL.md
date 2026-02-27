@@ -236,23 +236,37 @@ Gator actions should parallel `nav` CLI commands so users have familiar mental m
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
+### Scrollable views follow k9s conventions
+
+Any scrollable content (logs, future long lists) should follow the k9s autoscroll pattern:
+
+- **Autoscroll on by default** — when entering a scrollable view, it auto-follows new content
+- **Scrolling up pauses** — any upward scroll (keyboard or mouse) disables autoscroll
+- **`f` or `G` re-enables** — jump to bottom and resume following
+- **Visual indicator** — show `● FOLLOWING` (green) or `○ PAUSED` (yellow) in the panel footer
+- **Mouse scroll supported** — `ScrollUp`/`ScrollDown` events move by 3 lines and respect autoscroll state
+- **Scroll position shown** — `[current/total]` in the panel footer
+
+State is tracked via `log_autoscroll: bool` on `App`. The `scroll_logs(delta)` method handles both keyboard and mouse input uniformly.
+
 ### Vim-style navigation
 
 | Key | Action |
 | --- | --- |
 | `j` / `Down` | Move selection down |
 | `k` / `Up` | Move selection up |
-| `g` | Jump to top (logs) |
-| `G` | Jump to bottom (logs) |
+| `g` | Jump to top (logs), disables autoscroll |
+| `G` | Jump to bottom (logs), re-enables autoscroll |
+| `f` | Follow / re-enable autoscroll (logs) |
 | `Tab` / `BackTab` | Switch between panels on Dashboard |
 | `Enter` | Select / drill into item |
 | `Esc` | Go back one level |
 | `q` | Quit (from any screen) |
 | `Ctrl+C` | Force quit |
 
-### Keyboard-first
+### Keyboard-first, mouse-augmented
 
-All actions are accessible via keyboard shortcuts displayed in the nav bar. The nav bar is context-sensitive — it shows different hints depending on the current screen and focus state.
+All actions are accessible via keyboard shortcuts displayed in the nav bar. The nav bar is context-sensitive — it shows different hints depending on the current screen and focus state. Mouse scrolling is supported as a convenience but never required — every action must have a keyboard equivalent.
 
 ### Command mode
 
@@ -274,7 +288,7 @@ Same as above.
 `[l] Logs  [d] Delete  │  [Esc] Back to Dashboard  [q] Quit`
 
 **Sandbox (Logs focus):**
-`[j/k] Scroll  [g/G] Top/Bottom  [s] Source: <filter>  │  [Esc] Back  [q] Quit`
+`[j/k] Scroll  [g/G] Top/Bottom  [f] Follow  [s] Source: <filter>  │  [Esc] Back  [q] Quit`
 
 ## 7. Architecture & Key Files
 
@@ -283,7 +297,7 @@ Same as above.
 | `crates/navigator-tui/Cargo.toml` | Crate manifest — dependencies on `navigator-core`, `navigator-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
 | `crates/navigator-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_health`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), cluster switching, mTLS channel building |
 | `crates/navigator-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter` enums, `LogLine` struct, `ClusterEntry`, all key handling logic |
-| `crates/navigator-tui/src/event.rs` | `Event` enum (`Key`, `Tick`, `Resize`, `LogLines`), `EventHandler` with mpsc channels and crossterm polling |
+| `crates/navigator-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Resize`, `LogLines`), `EventHandler` with mpsc channels and crossterm polling |
 | `crates/navigator-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
 | `crates/navigator-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar`, `draw_nav_bar`, `draw_command_bar`, screen routing |
 | `crates/navigator-tui/src/ui/dashboard.rs` | Dashboard screen — cluster list table (top) + sandbox table (bottom) |

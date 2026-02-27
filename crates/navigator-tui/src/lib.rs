@@ -7,7 +7,7 @@ use std::io;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{DisableMouseCapture, EnableMouseCapture, MouseEventKind};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -44,7 +44,7 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
 
     while app.running {
         terminal
-            .draw(|frame| ui::draw(frame, &app))
+            .draw(|frame| ui::draw(frame, &mut app))
             .into_diagnostic()?;
 
         match events.next().await {
@@ -65,10 +65,17 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
-                // Auto-scroll to bottom if already near the end.
-                let filtered_len = app.filtered_log_lines().len();
-                if app.sandbox_log_scroll + 5 >= filtered_len.saturating_sub(1) {
-                    app.sandbox_log_scroll = filtered_len.saturating_sub(1);
+                if app.log_autoscroll {
+                    app.sandbox_log_scroll = app.log_autoscroll_offset();
+                }
+            }
+            Some(Event::Mouse(mouse)) => {
+                if app.focus == Focus::SandboxLogs {
+                    match mouse.kind {
+                        MouseEventKind::ScrollUp => app.scroll_logs(-3),
+                        MouseEventKind::ScrollDown => app.scroll_logs(3),
+                        _ => {}
+                    }
                 }
             }
             Some(Event::Tick) => {

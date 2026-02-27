@@ -1,4 +1,4 @@
-use crossterm::event::{self, Event as TermEvent, KeyEvent};
+use crossterm::event::{self, Event as TermEvent, KeyEvent, MouseEvent};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -7,6 +7,7 @@ use crate::app::LogLine;
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
+    Mouse(MouseEvent),
     Tick,
     #[allow(dead_code)]
     Resize(u16, u16),
@@ -31,6 +32,11 @@ impl EventHandler {
                     match event::read() {
                         Ok(TermEvent::Key(key)) => {
                             if tx.send(Event::Key(key)).is_err() {
+                                return;
+                            }
+                        }
+                        Ok(TermEvent::Mouse(mouse)) => {
+                            if tx.send(Event::Mouse(mouse)).is_err() {
                                 return;
                             }
                         }

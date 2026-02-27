@@ -127,6 +127,10 @@ pub struct App {
     pub sandbox_log_lines: Vec<LogLine>,
     pub sandbox_log_scroll: usize,
     pub log_source_filter: LogSourceFilter,
+    /// When true, new log lines auto-scroll to the bottom (k9s-style).
+    pub log_autoscroll: bool,
+    /// Visible line count in the log viewport (set by the draw pass).
+    pub log_viewport_height: usize,
     /// Handle for the streaming log task. Dropped to cancel.
     pub log_stream_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -160,6 +164,8 @@ impl App {
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
             log_source_filter: LogSourceFilter::All,
+            log_autoscroll: true,
+            log_viewport_height: 0,
             log_stream_handle: None,
         }
     }
@@ -295,6 +301,7 @@ impl App {
                 self.sandbox_log_lines.clear();
                 self.sandbox_log_scroll = 0;
                 self.log_source_filter = LogSourceFilter::All;
+                self.log_autoscroll = true;
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
@@ -317,23 +324,40 @@ impl App {
                 let filtered_len = self.filtered_log_lines().len();
                 let max_scroll = filtered_len.saturating_sub(1);
                 self.sandbox_log_scroll = (self.sandbox_log_scroll + 1).min(max_scroll);
+                // Don't disable autoscroll when scrolling down — only up.
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(1);
+                self.log_autoscroll = false;
             }
-            KeyCode::Char('G') => {
-                let filtered_len = self.filtered_log_lines().len();
-                self.sandbox_log_scroll = filtered_len.saturating_sub(1);
+            KeyCode::Char('G') | KeyCode::Char('f') => {
+                // Jump to bottom and re-enable autoscroll (k9s-style follow).
+                self.sandbox_log_scroll = self.log_autoscroll_offset();
+                self.log_autoscroll = true;
             }
             KeyCode::Char('g') => {
                 self.sandbox_log_scroll = 0;
+                self.log_autoscroll = false;
             }
             KeyCode::Char('s') => {
                 // Cycle source filter: all -> gateway -> sandbox -> all
                 self.log_source_filter = self.log_source_filter.next();
                 self.sandbox_log_scroll = 0;
+                // Keep autoscroll state — user is just filtering.
             }
             _ => {}
+        }
+    }
+
+    /// Scroll logs by a delta (positive = down, negative = up). Used for mouse scrolling.
+    pub fn scroll_logs(&mut self, delta: isize) {
+        let max_scroll = self.log_autoscroll_offset();
+        if delta < 0 {
+            // Scrolling up — disable autoscroll.
+            self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(delta.unsigned_abs());
+            self.log_autoscroll = false;
+        } else {
+            self.sandbox_log_scroll = (self.sandbox_log_scroll + delta as usize).min(max_scroll);
         }
     }
 
@@ -382,6 +406,20 @@ impl App {
             .map(String::as_str)
     }
 
+    /// Compute the scroll offset that pins the last log line near the bottom,
+    /// leaving a small padding of empty lines (k9s-style).
+    pub fn log_autoscroll_offset(&self) -> usize {
+        const BOTTOM_PAD: usize = 3;
+        let filtered_len = self.filtered_log_lines().len();
+        let vh = self.log_viewport_height;
+        if vh == 0 || filtered_len == 0 {
+            return 0;
+        }
+        // Show as many lines as fit, with BOTTOM_PAD empty lines at the end.
+        let usable = vh.saturating_sub(BOTTOM_PAD);
+        filtered_len.saturating_sub(usable)
+    }
+
     /// Cancel any running log stream task.
     pub fn cancel_log_stream(&mut self) {
         if let Some(handle) = self.log_stream_handle.take() {
@@ -402,6 +440,7 @@ impl App {
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();
         self.sandbox_log_scroll = 0;
+        self.log_autoscroll = true;
         self.confirm_delete = false;
         self.status_text = String::from("connecting...");
         // Return to dashboard if in sandbox screen.

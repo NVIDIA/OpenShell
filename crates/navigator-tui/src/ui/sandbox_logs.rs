@@ -6,7 +6,7 @@ use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 use crate::app::{App, LogLine};
 use crate::theme::styles;
 
-pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let name = app
         .sandbox_names
         .get(app.sandbox_selected)
@@ -22,6 +22,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Calculate visible area inside the block (borders + padding).
     let inner_height = area.height.saturating_sub(2) as usize;
+    // Store viewport height so autoscroll calculations can use it.
+    app.log_viewport_height = inner_height;
 
     let filtered: Vec<&LogLine> = app.filtered_log_lines();
 
@@ -43,7 +45,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .map(|log| render_log_line(log))
         .collect();
 
-    // Scroll position.
+    // Scroll position + autoscroll indicator.
     let total = filtered.len();
     let pos = app.sandbox_log_scroll + 1;
     let scroll_info = if total > 0 {
@@ -52,7 +54,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         String::new()
     };
 
+    let autoscroll_span = if app.log_autoscroll {
+        Span::styled(" ● FOLLOWING ", styles::STATUS_OK)
+    } else {
+        Span::styled(" ○ PAUSED ", styles::STATUS_WARN)
+    };
+
     let block = block.title_bottom(Line::from(vec![
+        autoscroll_span,
         Span::styled(scroll_info, styles::MUTED),
         Span::styled(format!(" filter: {filter_label} "), styles::MUTED),
     ]));

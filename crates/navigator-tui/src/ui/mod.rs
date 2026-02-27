@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, Borders, Paragraph};
 use crate::app::{App, Focus, InputMode, Screen};
 use crate::theme::styles;
 
-pub fn draw(frame: &mut Frame<'_>, app: &App) {
+pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -37,7 +37,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App) {
 // Sandbox full-screen
 // ---------------------------------------------------------------------------
 
-fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &App, area: Rect) {
+fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     match app.focus {
         Focus::SandboxLogs => sandbox_logs::draw(frame, app, area),
         _ => sandbox_detail::draw(frame, app, area),
@@ -106,6 +106,16 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Screen::Sandbox => match app.focus {
             Focus::SandboxLogs => {
                 let filter_label = app.log_source_filter.label();
+                let autoscroll_label = if app.log_autoscroll {
+                    " Autoscroll"
+                } else {
+                    " Follow"
+                };
+                let autoscroll_style = if app.log_autoscroll {
+                    styles::STATUS_OK
+                } else {
+                    styles::TEXT
+                };
                 vec![
                     Span::styled(" ", styles::TEXT),
                     Span::styled("[j/k]", styles::KEY_HINT),
@@ -113,6 +123,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled("  ", styles::TEXT),
                     Span::styled("[g/G]", styles::KEY_HINT),
                     Span::styled(" Top/Bottom", styles::TEXT),
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[f]", styles::KEY_HINT),
+                    Span::styled(autoscroll_label, autoscroll_style),
                     Span::styled("  ", styles::TEXT),
                     Span::styled("[s]", styles::KEY_HINT),
                     Span::styled(format!(" Source: {filter_label}"), styles::TEXT),
