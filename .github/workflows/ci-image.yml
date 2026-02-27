@@ -8,13 +8,6 @@ on:
       - 'mise.toml'
       - 'build/**'
       - '.github/workflows/ci-image.yml'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'deploy/docker/Dockerfile.ci'
-      - 'mise.toml'
-      - 'build/**'
-      - '.github/workflows/ci-image.yml'
   workflow_dispatch:
 
 env:
@@ -51,18 +44,7 @@ jobs:
           MISE_TASK_RUN_AUTO_INSTALL: "0"
           MISE_NOT_FOUND_AUTO_INSTALL: "0"
 
-      - name: Build CI image
-        if: github.event_name == 'pull_request'
-        run: |
-          docker buildx build \
-            --platform linux/amd64,linux/arm64 \
-            --cache-from type=registry,ref=${{ env.CI_IMAGE }}:buildcache \
-            -t ${{ env.CI_IMAGE }}:${{ github.sha }} \
-            -f deploy/docker/Dockerfile.ci \
-            .
-
       - name: Build and push CI image
-        if: github.event_name != 'pull_request'
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
