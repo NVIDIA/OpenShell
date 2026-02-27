@@ -1,0 +1,62 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: build-amd64
+    container:
+      image: ${{ env.REGISTRY }}/${{ github.repository }}/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
+
+      - name: Format
+        run: mise run rust:format:check
+
+      - name: Lint
+        run: mise run rust:lint
+
+      - name: Test
+        run: mise run test:rust
+
+  python:
+    name: Python
+    runs-on: build-amd64
+    container:
+      image: ${{ env.REGISTRY }}/${{ github.repository }}/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: mise run python:lint
+
+      - name: Test
+        run: mise run test:python
