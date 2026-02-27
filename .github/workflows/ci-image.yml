@@ -32,13 +32,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Install mise
-        uses: jdx/mise-action@6d1e696aa24c1aa1bcc1adea0212707c71ab78a8
-        with:
-          install: false
-
       - name: Set up Docker Buildx
-        run: mise run docker:buildx:setup
+        uses: ./.github/actions/setup-buildx
 
       - name: Build and push CI image
         run: |

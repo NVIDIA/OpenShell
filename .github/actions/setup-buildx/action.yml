@@ -1,0 +1,30 @@
+name: Setup Docker Buildx
+description: >
+  Create a multi-arch Docker Buildx builder using remote BuildKit nodes.
+  The builder is automatically removed when the job finishes (cleanup is
+  enabled by default in docker/setup-buildx-action).
+
+inputs:
+  amd64-endpoint:
+    description: BuildKit endpoint for linux/amd64
+    default: tcp://buildkit-amd64.buildkit:1234
+  arm64-endpoint:
+    description: BuildKit endpoint for linux/arm64
+    default: tcp://buildkit-arm64.buildkit:1234
+  name:
+    description: Builder instance name
+    default: navigator
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+      with:
+        name: ${{ inputs.name }}
+        driver: remote
+        endpoint: ${{ inputs.amd64-endpoint }}
+        platforms: linux/amd64
+        append: |
+          - endpoint: ${{ inputs.arm64-endpoint }}
+            platforms: linux/arm64
