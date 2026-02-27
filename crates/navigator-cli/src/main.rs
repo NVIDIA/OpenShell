@@ -489,9 +489,9 @@ enum SandboxCommands {
         #[arg(long)]
         ssh_key: Option<String>,
 
-        /// Additional provider types required for this sandbox.
-        #[arg(long = "provider", value_enum)]
-        providers: Vec<CliProviderType>,
+        /// Provider names to attach to this sandbox.
+        #[arg(long = "provider")]
+        providers: Vec<String>,
 
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `NAVIGATOR_SANDBOX_POLICY` env var.
@@ -903,12 +903,6 @@ async fn main() -> Result<()> {
                     forward,
                     command,
                 } => {
-                    let provider_types = providers
-                        .iter()
-                        .map(CliProviderType::as_str)
-                        .map(str::to_string)
-                        .collect::<Vec<_>>();
-
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_cluster(&cli.cluster) {
@@ -923,7 +917,7 @@ async fn main() -> Result<()> {
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
-                                &provider_types,
+                                &providers,
                                 policy.as_deref(),
                                 forward,
                                 &command,
@@ -940,7 +934,7 @@ async fn main() -> Result<()> {
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
-                                &provider_types,
+                                &providers,
                                 policy.as_deref(),
                                 forward,
                                 &command,
