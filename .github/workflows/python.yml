@@ -9,7 +9,6 @@ permissions:
 
 jobs:
   python:
-    name: Python
     runs-on: build-amd64
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
