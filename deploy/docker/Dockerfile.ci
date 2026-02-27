@@ -60,6 +60,7 @@ RUN curl https://mise.run | sh
 COPY mise.toml /opt/mise/mise.toml
 COPY build/ /opt/mise/build/
 WORKDIR /opt/mise
+ARG MISE_GITHUB_TOKEN
 RUN mise trust /opt/mise/mise.toml && \
     env -u RUSTC_WRAPPER mise install && \
     /root/.cargo/bin/rustup component remove rust-docs || true && \
