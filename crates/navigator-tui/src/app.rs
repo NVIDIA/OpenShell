@@ -126,11 +126,15 @@ pub struct App {
     // Sandbox logs
     pub sandbox_log_lines: Vec<LogLine>,
     pub sandbox_log_scroll: usize,
+    /// Cursor position relative to `sandbox_log_scroll` (0 = first visible line).
+    pub log_cursor: usize,
     pub log_source_filter: LogSourceFilter,
     /// When true, new log lines auto-scroll to the bottom (k9s-style).
     pub log_autoscroll: bool,
     /// Visible line count in the log viewport (set by the draw pass).
     pub log_viewport_height: usize,
+    /// When `Some(idx)`, a detail popup is shown for the filtered log line at this index.
+    pub log_detail_index: Option<usize>,
     /// Handle for the streaming log task. Dropped to cancel.
     pub log_stream_handle: Option<tokio::task::JoinHandle<()>>,
 }
@@ -163,9 +167,11 @@ impl App {
             pending_sandbox_delete: false,
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
+            log_cursor: 0,
             log_source_filter: LogSourceFilter::All,
             log_autoscroll: true,
             log_viewport_height: 0,
+            log_detail_index: None,
             log_stream_handle: None,
         }
     }
@@ -300,8 +306,10 @@ impl App {
                 // actual fetch runs asynchronously in the background.
                 self.sandbox_log_lines.clear();
                 self.sandbox_log_scroll = 0;
+                self.log_cursor = 0;
                 self.log_source_filter = LogSourceFilter::All;
                 self.log_autoscroll = true;
+                self.log_detail_index = None;
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
@@ -314,35 +322,83 @@ impl App {
     }
 
     fn handle_logs_key(&mut self, key: KeyEvent) {
+        // If the detail popup is open, only Enter/Esc close it.
+        if self.log_detail_index.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.log_detail_index = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let filtered_len = self.filtered_log_lines().len();
+        let vh = self.log_viewport_height;
+
         match key.code {
             KeyCode::Esc => {
                 self.cancel_log_stream();
                 self.focus = Focus::SandboxDetail;
             }
             KeyCode::Char('q') => self.running = false,
+            KeyCode::Enter => {
+                // Open detail popup for the line under the cursor.
+                if filtered_len > 0 {
+                    let abs = self.sandbox_log_scroll + self.log_cursor;
+                    if abs < filtered_len {
+                        self.log_detail_index = Some(abs);
+                    }
+                }
+            }
             KeyCode::Char('j') | KeyCode::Down => {
-                let filtered_len = self.filtered_log_lines().len();
-                let max_scroll = filtered_len.saturating_sub(1);
-                self.sandbox_log_scroll = (self.sandbox_log_scroll + 1).min(max_scroll);
-                // Don't disable autoscroll when scrolling down — only up.
+                if filtered_len == 0 {
+                    return;
+                }
+                let visible = filtered_len.saturating_sub(self.sandbox_log_scroll).min(vh);
+                let max_cursor = visible.saturating_sub(1);
+                if self.log_cursor < max_cursor {
+                    // Move cursor down within viewport.
+                    self.log_cursor += 1;
+                } else {
+                    // Cursor at bottom of viewport — scroll the view down.
+                    let max_scroll = filtered_len.saturating_sub(vh.min(filtered_len));
+                    if self.sandbox_log_scroll < max_scroll {
+                        self.sandbox_log_scroll += 1;
+                    }
+                }
+                // Don't disable autoscroll when moving down — only up.
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.sandbox_log_scroll = self.sandbox_log_scroll.saturating_sub(1);
+                if self.log_cursor > 0 {
+                    // Move cursor up within viewport.
+                    self.log_cursor -= 1;
+                } else {
+                    // Cursor at top of viewport — scroll the view up.
+                    if self.sandbox_log_scroll > 0 {
+                        self.sandbox_log_scroll -= 1;
+                    }
+                }
                 self.log_autoscroll = false;
             }
-            KeyCode::Char('G') | KeyCode::Char('f') => {
+            KeyCode::Char('G' | 'f') => {
                 // Jump to bottom and re-enable autoscroll (k9s-style follow).
                 self.sandbox_log_scroll = self.log_autoscroll_offset();
                 self.log_autoscroll = true;
+                // Pin cursor to the last visible line.
+                let visible = filtered_len.saturating_sub(self.sandbox_log_scroll);
+                self.log_cursor = visible.saturating_sub(1).min(vh.saturating_sub(1));
             }
             KeyCode::Char('g') => {
                 self.sandbox_log_scroll = 0;
+                self.log_cursor = 0;
                 self.log_autoscroll = false;
             }
             KeyCode::Char('s') => {
                 // Cycle source filter: all -> gateway -> sandbox -> all
                 self.log_source_filter = self.log_source_filter.next();
                 self.sandbox_log_scroll = 0;
+                self.log_cursor = 0;
                 // Keep autoscroll state — user is just filtering.
             }
             _ => {}
@@ -351,6 +407,7 @@ impl App {
 
     /// Scroll logs by a delta (positive = down, negative = up). Used for mouse scrolling.
     pub fn scroll_logs(&mut self, delta: isize) {
+        let filtered_len = self.filtered_log_lines().len();
         let max_scroll = self.log_autoscroll_offset();
         if delta < 0 {
             // Scrolling up — disable autoscroll.
@@ -358,6 +415,15 @@ impl App {
             self.log_autoscroll = false;
         } else {
             self.sandbox_log_scroll = (self.sandbox_log_scroll + delta as usize).min(max_scroll);
+        }
+        // Clamp cursor to the visible range after scroll.
+        let visible = filtered_len
+            .saturating_sub(self.sandbox_log_scroll)
+            .min(self.log_viewport_height);
+        if visible > 0 {
+            self.log_cursor = self.log_cursor.min(visible - 1);
+        } else {
+            self.log_cursor = 0;
         }
     }
 
@@ -440,7 +506,9 @@ impl App {
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();
         self.sandbox_log_scroll = 0;
+        self.log_cursor = 0;
         self.log_autoscroll = true;
+        self.log_detail_index = None;
         self.confirm_delete = false;
         self.status_text = String::from("connecting...");
         // Return to dashboard if in sandbox screen.

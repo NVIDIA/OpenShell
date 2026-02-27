@@ -249,6 +249,18 @@ Any scrollable content (logs, future long lists) should follow the k9s autoscrol
 
 State is tracked via `log_autoscroll: bool` on `App`. The `scroll_logs(delta)` method handles both keyboard and mouse input uniformly.
 
+### Long content: truncate + detail popup
+
+When content can exceed the viewport width (log lines, field lists, etc.):
+
+- **Truncate in the list view** — hard-cut at the viewport's inner width and append `…`. This keeps density high and avoids wrapping that breaks the 1-line-per-entry model.
+- **Enter opens a detail popup** — a centered overlay showing the full untruncated content with word-wrap. `Esc` or `Enter` closes it. Track the open state via `Option<usize>` index.
+- **Drop noise in the list view** — omit empty fields, remove developer-internal info (like module paths / tracing targets) that the user doesn't need at a glance.
+- **Smart field ordering** — for known message types (e.g. CONNECT, L7_REQUEST), put the most important fields first and trail with process ancestry / noise. Unknown types sort alphabetically.
+- **Show everything in the popup** — the detail popup is where target, all fields (including empty ones if useful), and the full message are visible.
+
+This pattern should be reused for any future view with potentially long entries.
+
 ### Vim-style navigation
 
 | Key | Action |
@@ -259,7 +271,7 @@ State is tracked via `log_autoscroll: bool` on `App`. The `scroll_logs(delta)` m
 | `G` | Jump to bottom (logs), re-enables autoscroll |
 | `f` | Follow / re-enable autoscroll (logs) |
 | `Tab` / `BackTab` | Switch between panels on Dashboard |
-| `Enter` | Select / drill into item |
+| `Enter` | Select / drill into item; open detail popup in logs |
 | `Esc` | Go back one level |
 | `q` | Quit (from any screen) |
 | `Ctrl+C` | Force quit |
@@ -288,7 +300,7 @@ Same as above.
 `[l] Logs  [d] Delete  │  [Esc] Back to Dashboard  [q] Quit`
 
 **Sandbox (Logs focus):**
-`[j/k] Scroll  [g/G] Top/Bottom  [f] Follow  [s] Source: <filter>  │  [Esc] Back  [q] Quit`
+`[j/k] Scroll  [Enter] Detail  [g/G] Top/Bottom  [f] Follow  [s] Source: <filter>  │  [Esc] Back  [q] Quit`
 
 ## 7. Architecture & Key Files
 

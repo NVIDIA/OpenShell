@@ -3,10 +3,10 @@ pub(crate) mod sandbox_detail;
 pub(crate) mod sandbox_logs;
 pub(crate) mod sandboxes;
 
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::Frame;
 
 use crate::app::{App, Focus, InputMode, Screen};
 use crate::theme::styles;
@@ -119,7 +119,10 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 vec![
                     Span::styled(" ", styles::TEXT),
                     Span::styled("[j/k]", styles::KEY_HINT),
-                    Span::styled(" Scroll", styles::TEXT),
+                    Span::styled(" Navigate", styles::TEXT),
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[Enter]", styles::KEY_HINT),
+                    Span::styled(" Detail", styles::TEXT),
                     Span::styled("  ", styles::TEXT),
                     Span::styled("[g/G]", styles::KEY_HINT),
                     Span::styled(" Top/Bottom", styles::TEXT),

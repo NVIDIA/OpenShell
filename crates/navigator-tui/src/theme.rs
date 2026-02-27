@@ -26,6 +26,8 @@ pub mod styles {
     pub const STATUS_WARN: Style = Style::new().fg(Color::Yellow);
     pub const STATUS_ERR: Style = Style::new().fg(Color::Red);
     pub const KEY_HINT: Style = Style::new().fg(colors::NVIDIA_GREEN);
+    /// Background highlight for the cursor line in log viewer.
+    pub const LOG_CURSOR: Style = Style::new().bg(colors::EVERGLADE);
     pub const TITLE_BAR: Style = Style::new()
         .fg(colors::FG)
         .bg(colors::EVERGLADE)

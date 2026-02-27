@@ -67,6 +67,12 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 app.sandbox_log_lines.extend(lines);
                 if app.log_autoscroll {
                     app.sandbox_log_scroll = app.log_autoscroll_offset();
+                    // Pin cursor to the last visible line during autoscroll.
+                    let filtered_len = app.filtered_log_lines().len();
+                    let visible = filtered_len
+                        .saturating_sub(app.sandbox_log_scroll)
+                        .min(app.log_viewport_height);
+                    app.log_cursor = visible.saturating_sub(1);
                 }
             }
             Some(Event::Mouse(mouse)) => {
