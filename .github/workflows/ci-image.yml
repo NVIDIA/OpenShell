@@ -39,10 +39,6 @@ jobs:
 
       - name: Set up Docker Buildx
         run: mise run docker:buildx:setup
-        env:
-          MISE_AUTO_INSTALL: "0"
-          MISE_TASK_RUN_AUTO_INSTALL: "0"
-          MISE_NOT_FOUND_AUTO_INSTALL: "0"
 
       - name: Build and push CI image
         run: |
@@ -50,6 +46,7 @@ jobs:
             --platform linux/amd64,linux/arm64 \
             --cache-from type=registry,ref=${{ env.CI_IMAGE }}:buildcache \
             --cache-to type=registry,ref=${{ env.CI_IMAGE }}:buildcache,mode=max \
+            --build-arg MISE_GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
             --push \
             -t ${{ env.CI_IMAGE }}:${{ github.sha }} \
             -t ${{ env.CI_IMAGE }}:latest \
