@@ -3,9 +3,6 @@ name: Python
 on:
   pull_request:
 
-env:
-  REGISTRY: ghcr.io
-
 permissions:
   contents: read
   packages: read
@@ -15,7 +12,7 @@ jobs:
     name: Python
     runs-on: build-amd64
     container:
-      image: ${{ env.REGISTRY }}/${{ github.repository }}/ci:latest
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}

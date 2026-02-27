@@ -6,7 +6,6 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  REGISTRY: ghcr.io
 
 permissions:
   contents: read
@@ -17,7 +16,7 @@ jobs:
     name: Rust
     runs-on: build-amd64
     container:
-      image: ${{ env.REGISTRY }}/${{ github.repository }}/ci:latest
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -25,10 +24,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Check formatting
-        run: mise run fmt:check
+        run: mise run rust:format:check
 
-      - name: Clippy
-        run: mise run clippy
+      - name: Lint
+        run: mise run rust:lint
 
       - name: Test
         run: mise run test:rust
