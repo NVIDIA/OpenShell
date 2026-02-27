@@ -25,6 +25,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Setup Rust PATH
+        run: echo "/root/.cargo/bin" >> "$GITHUB_PATH"
+
       - name: Format
         run: mise run rust:format:check
 
