@@ -15,6 +15,7 @@ on:
       - 'mise.toml'
       - 'build/**'
       - '.github/workflows/ci-image.yml'
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -26,7 +27,7 @@ permissions:
 
 jobs:
   build-ci-image:
-    name: Build CI Image
+    name: Build
     runs-on: build-amd64
     steps:
       - uses: actions/checkout@v4
@@ -51,7 +52,7 @@ jobs:
           MISE_NOT_FOUND_AUTO_INSTALL: "0"
 
       - name: Build CI image
-        if: github.ref != 'refs/heads/main'
+        if: github.event_name == 'pull_request'
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
@@ -61,7 +62,7 @@ jobs:
             .
 
       - name: Build and push CI image
-        if: github.ref == 'refs/heads/main'
+        if: github.event_name != 'pull_request'
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
