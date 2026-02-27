@@ -194,18 +194,6 @@ impl std::fmt::Display for CompletionShell {
     }
 }
 
-#[derive(Clone, Debug, ValueEnum)]
-enum CliProviderType {
-    Claude,
-    Opencode,
-    Codex,
-    Generic,
-    Nvidia,
-    Gitlab,
-    Github,
-    Outlook,
-}
-
 const COMPLETIONS_HELP: &str = "\
 Generate shell completion scripts for Navigator CLI.
 
@@ -250,6 +238,18 @@ If no profile exists yet, create one first:
 
    New-Item -Path $PROFILE -Type File -Force
 ";
+
+#[derive(Clone, Debug, ValueEnum)]
+enum CliProviderType {
+    Claude,
+    Opencode,
+    Codex,
+    Generic,
+    Nvidia,
+    Gitlab,
+    Github,
+    Outlook,
+}
 
 impl CliProviderType {
     fn as_str(&self) -> &'static str {
