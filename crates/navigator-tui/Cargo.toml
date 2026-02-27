@@ -10,6 +10,8 @@ repository.workspace = true
 [dependencies]
 navigator-core = { path = "../navigator-core" }
 navigator-bootstrap = { path = "../navigator-bootstrap" }
+navigator-policy = { path = "../navigator-policy" }
+navigator-providers = { path = "../navigator-providers" }
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }

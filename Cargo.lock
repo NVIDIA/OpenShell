@@ -2659,6 +2659,7 @@ dependencies = [
  "miette",
  "navigator-bootstrap",
  "navigator-core",
+ "navigator-policy",
  "navigator-providers",
  "navigator-tui",
  "owo-colors",
@@ -2695,6 +2696,16 @@ dependencies = [
  "thiserror 2.0.18",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "navigator-policy"
+version = "0.1.0"
+dependencies = [
+ "miette",
+ "navigator-core",
+ "serde",
+ "serde_yaml",
 ]
 
 [[package]]
@@ -2817,6 +2828,8 @@ dependencies = [
  "miette",
  "navigator-bootstrap",
  "navigator-core",
+ "navigator-policy",
+ "navigator-providers",
  "owo-colors",
  "ratatui",
  "serde",

@@ -1,3 +1,4 @@
+mod create_sandbox;
 mod dashboard;
 pub(crate) mod sandbox_detail;
 pub(crate) mod sandbox_logs;
@@ -31,6 +32,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     draw_nav_bar(frame, app, chunks[2]);
     draw_command_bar(frame, app, chunks[3]);
+
+    // Modal overlay (drawn last so it's on top).
+    if app.create_form.is_some() {
+        create_sandbox::draw(frame, app, frame.size());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -87,22 +93,43 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spans = match app.screen {
-        Screen::Dashboard => vec![
-            Span::styled(" ", styles::TEXT),
-            Span::styled("[Tab]", styles::KEY_HINT),
-            Span::styled(" Switch Panel", styles::TEXT),
-            Span::styled("  ", styles::TEXT),
-            Span::styled("[Enter]", styles::KEY_HINT),
-            Span::styled(" Select", styles::TEXT),
-            Span::styled("  ", styles::TEXT),
-            Span::styled("[j/k]", styles::KEY_HINT),
-            Span::styled(" Navigate", styles::TEXT),
-            Span::styled("  │  ", styles::BORDER),
-            Span::styled("[:]", styles::MUTED),
-            Span::styled(" Command  ", styles::MUTED),
-            Span::styled("[q]", styles::MUTED),
-            Span::styled(" Quit", styles::MUTED),
-        ],
+        Screen::Dashboard => match app.focus {
+            Focus::Sandboxes => vec![
+                Span::styled(" ", styles::TEXT),
+                Span::styled("[j/k]", styles::KEY_HINT),
+                Span::styled(" Navigate", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[Enter]", styles::KEY_HINT),
+                Span::styled(" Select", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[c]", styles::KEY_HINT),
+                Span::styled(" Create Sandbox", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[Tab]", styles::KEY_HINT),
+                Span::styled(" Switch Panel", styles::TEXT),
+                Span::styled("  │  ", styles::BORDER),
+                Span::styled("[:]", styles::MUTED),
+                Span::styled(" Command  ", styles::MUTED),
+                Span::styled("[q]", styles::MUTED),
+                Span::styled(" Quit", styles::MUTED),
+            ],
+            _ => vec![
+                Span::styled(" ", styles::TEXT),
+                Span::styled("[j/k]", styles::KEY_HINT),
+                Span::styled(" Navigate", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[Enter]", styles::KEY_HINT),
+                Span::styled(" Select", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[Tab]", styles::KEY_HINT),
+                Span::styled(" Switch Panel", styles::TEXT),
+                Span::styled("  │  ", styles::BORDER),
+                Span::styled("[:]", styles::MUTED),
+                Span::styled(" Command  ", styles::MUTED),
+                Span::styled("[q]", styles::MUTED),
+                Span::styled(" Quit", styles::MUTED),
+            ],
+        },
         Screen::Sandbox => match app.focus {
             Focus::SandboxLogs => {
                 let filter_label = app.log_source_filter.label();

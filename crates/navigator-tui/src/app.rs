@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use navigator_core::proto::navigator_client::NavigatorClient;
@@ -86,6 +87,92 @@ pub struct ClusterEntry {
 }
 
 // ---------------------------------------------------------------------------
+// Create sandbox form
+// ---------------------------------------------------------------------------
+
+/// Which field is focused in the create sandbox modal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateFormField {
+    Name,
+    Image,
+    Command,
+    Providers,
+    Submit,
+}
+
+impl CreateFormField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Name => Self::Image,
+            Self::Image => Self::Command,
+            Self::Command => Self::Providers,
+            Self::Providers => Self::Submit,
+            Self::Submit => Self::Name,
+        }
+    }
+
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Name => Self::Submit,
+            Self::Image => Self::Name,
+            Self::Command => Self::Image,
+            Self::Providers => Self::Command,
+            Self::Submit => Self::Providers,
+        }
+    }
+}
+
+/// A known provider type for the create form.
+#[derive(Debug, Clone)]
+pub struct ProviderEntry {
+    pub name: String,
+    pub selected: bool,
+}
+
+/// Tracks which phase the create sandbox modal is in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CreatePhase {
+    /// Filling out the form.
+    Form,
+    /// Resolving providers (background task running).
+    Resolving,
+    /// Resolution complete — showing results, waiting for user to confirm.
+    Confirm,
+    /// Creating the sandbox (background task running).
+    Creating,
+}
+
+/// Minimum time to show the Creating phase (pacman + results) before closing.
+pub const MIN_CREATING_DISPLAY: Duration = Duration::from_secs(4);
+
+/// State for the create sandbox modal form.
+pub struct CreateSandboxForm {
+    pub focused_field: CreateFormField,
+    pub name: String,
+    pub image: String,
+    pub command: String,
+    pub providers: Vec<ProviderEntry>,
+    pub provider_cursor: usize,
+    /// Status message shown after submit attempt.
+    pub status: Option<String>,
+    /// Current phase of the create flow.
+    pub phase: CreatePhase,
+    /// When the create animation started (for pacman timing).
+    pub anim_start: Option<Instant>,
+    /// Per-provider resolution status, shown during creation.
+    pub provider_statuses: Vec<(String, crate::event::ProviderResolution)>,
+    /// Providers already registered on the gateway: `(type, name)`.
+    pub existing_providers: Vec<(String, String)>,
+    /// Missing provider types with user toggle: `(type, should_create)`.
+    /// Defaults to `true` (matching CLI's default-yes behavior).
+    pub missing_providers: Vec<(String, bool)>,
+    /// Cursor position in the confirm view (indexes into missing_providers).
+    pub confirm_cursor: usize,
+    /// Buffered create result — held until min display time elapses.
+    pub create_result: Option<Result<String, String>>,
+}
+
+// ---------------------------------------------------------------------------
 // App state
 // ---------------------------------------------------------------------------
 
@@ -122,6 +209,14 @@ pub struct App {
     pub confirm_delete: bool,
     pub pending_log_fetch: bool,
     pub pending_sandbox_delete: bool,
+
+    // Create sandbox modal
+    pub create_form: Option<CreateSandboxForm>,
+    pub pending_create_sandbox: bool,
+    /// Set when user confirms creation after provider resolution.
+    pub pending_confirm_create: bool,
+    /// Animation ticker handle — aborted when animation stops.
+    pub anim_handle: Option<tokio::task::JoinHandle<()>>,
 
     // Sandbox logs
     pub sandbox_log_lines: Vec<LogLine>,
@@ -165,6 +260,10 @@ impl App {
             confirm_delete: false,
             pending_log_fetch: false,
             pending_sandbox_delete: false,
+            create_form: None,
+            pending_create_sandbox: false,
+            pending_confirm_create: false,
+            anim_handle: None,
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
             log_cursor: 0,
@@ -199,6 +298,12 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.running = false;
+            return;
+        }
+
+        // Create sandbox modal intercepts all keys when open.
+        if self.create_form.is_some() {
+            self.handle_create_form_key(key);
             return;
         }
 
@@ -263,6 +368,9 @@ impl App {
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 self.sandbox_selected = self.sandbox_selected.saturating_sub(1);
+            }
+            KeyCode::Char('c') => {
+                self.open_create_form();
             }
             KeyCode::Enter => {
                 if self.sandbox_count > 0 {
@@ -427,6 +535,160 @@ impl App {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Create sandbox modal
+    // ------------------------------------------------------------------
+
+    fn open_create_form(&mut self) {
+        let known = navigator_providers::ProviderRegistry::new().known_types();
+        let providers = known
+            .into_iter()
+            .map(|t| ProviderEntry {
+                name: t.to_string(),
+                selected: false,
+            })
+            .collect();
+
+        self.create_form = Some(CreateSandboxForm {
+            focused_field: CreateFormField::Name,
+            name: String::new(),
+            image: String::new(),
+            command: String::from("/bin/bash"),
+            providers,
+            provider_cursor: 0,
+            status: None,
+            phase: CreatePhase::Form,
+            anim_start: None,
+            provider_statuses: Vec::new(),
+            existing_providers: Vec::new(),
+            missing_providers: Vec::new(),
+            confirm_cursor: 0,
+            create_result: None,
+        });
+    }
+
+    fn handle_create_form_key(&mut self, key: KeyEvent) {
+        let Some(form) = self.create_form.as_mut() else {
+            return;
+        };
+
+        match form.phase {
+            // --- Resolving: no input accepted (background task running) ---
+            CreatePhase::Resolving => {}
+
+            // --- Confirm: show resolution results, toggle missing providers ---
+            CreatePhase::Confirm => match key.code {
+                KeyCode::Enter => {
+                    form.phase = CreatePhase::Creating;
+                    form.anim_start = Some(Instant::now());
+                    form.provider_statuses.clear();
+                    self.pending_confirm_create = true;
+                }
+                KeyCode::Esc => {
+                    self.create_form = None;
+                }
+                KeyCode::Char('j') | KeyCode::Down => {
+                    if !form.missing_providers.is_empty() {
+                        form.confirm_cursor =
+                            (form.confirm_cursor + 1).min(form.missing_providers.len() - 1);
+                    }
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    form.confirm_cursor = form.confirm_cursor.saturating_sub(1);
+                }
+                KeyCode::Char(' ') => {
+                    if let Some(entry) = form.missing_providers.get_mut(form.confirm_cursor) {
+                        entry.1 = !entry.1;
+                    }
+                }
+                _ => {}
+            },
+
+            // --- Creating: no input accepted (background task running) ---
+            CreatePhase::Creating => {}
+
+            // --- Form: normal form editing ---
+            CreatePhase::Form => match key.code {
+                KeyCode::Esc => {
+                    self.create_form = None;
+                }
+                KeyCode::Tab => {
+                    form.status = None;
+                    form.focused_field = form.focused_field.next();
+                }
+                KeyCode::BackTab => {
+                    form.status = None;
+                    form.focused_field = form.focused_field.prev();
+                }
+                _ => match form.focused_field {
+                    CreateFormField::Name => Self::handle_text_input(&mut form.name, key),
+                    CreateFormField::Image => Self::handle_text_input(&mut form.image, key),
+                    CreateFormField::Command => Self::handle_text_input(&mut form.command, key),
+                    CreateFormField::Providers => {
+                        match key.code {
+                            KeyCode::Char('j') | KeyCode::Down => {
+                                if !form.providers.is_empty() {
+                                    form.provider_cursor =
+                                        (form.provider_cursor + 1).min(form.providers.len() - 1);
+                                }
+                            }
+                            KeyCode::Char('k') | KeyCode::Up => {
+                                form.provider_cursor = form.provider_cursor.saturating_sub(1);
+                            }
+                            // Space or Enter toggles provider selection.
+                            KeyCode::Char(' ') | KeyCode::Enter => {
+                                if let Some(p) = form.providers.get_mut(form.provider_cursor) {
+                                    p.selected = !p.selected;
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                    CreateFormField::Submit => {
+                        if key.code == KeyCode::Enter {
+                            let has_providers = form.providers.iter().any(|p| p.selected);
+                            form.anim_start = Some(Instant::now());
+                            form.status = None;
+                            form.provider_statuses.clear();
+                            if has_providers {
+                                // Resolve providers first.
+                                form.phase = CreatePhase::Resolving;
+                                self.pending_create_sandbox = true;
+                            } else {
+                                // No providers — go straight to creating.
+                                form.phase = CreatePhase::Creating;
+                                self.pending_confirm_create = true;
+                            }
+                        }
+                    }
+                },
+            },
+        }
+    }
+
+    fn handle_text_input(field: &mut String, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char(c) => field.push(c),
+            KeyCode::Backspace => {
+                field.pop();
+            }
+            _ => {}
+        }
+    }
+
+    /// Build the form data needed for the gRPC `CreateSandbox` request.
+    /// Returns `(name, image, selected_provider_names)`.
+    pub fn create_form_data(&self) -> Option<(String, String, Vec<String>)> {
+        let form = self.create_form.as_ref()?;
+        let providers: Vec<String> = form
+            .providers
+            .iter()
+            .filter(|p| p.selected)
+            .map(|p| p.name.clone())
+            .collect();
+        Some((form.name.clone(), form.image.clone(), providers))
+    }
+
     fn handle_command_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc => {
@@ -493,8 +755,16 @@ impl App {
         }
     }
 
+    /// Stop the animation ticker if running.
+    pub fn stop_anim(&mut self) {
+        if let Some(h) = self.anim_handle.take() {
+            h.abort();
+        }
+    }
+
     /// Reset sandbox state after switching clusters.
     pub fn reset_sandbox_state(&mut self) {
+        self.stop_anim();
         self.cancel_log_stream();
         self.sandbox_ids.clear();
         self.sandbox_names.clear();

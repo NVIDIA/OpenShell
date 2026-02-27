@@ -62,6 +62,34 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     app.pending_sandbox_delete = false;
                     handle_sandbox_delete(&mut app).await;
                 }
+                if app.pending_create_sandbox {
+                    app.pending_create_sandbox = false;
+                    spawn_resolve_providers(&app, events.sender());
+                    // Spawn a fast animation ticker (~7 fps).
+                    let anim_tx = events.sender();
+                    app.anim_handle = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(140)).await;
+                            if anim_tx.send(Event::Redraw).is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                if app.pending_confirm_create {
+                    app.pending_confirm_create = false;
+                    spawn_create_sandbox(&app, events.sender());
+                    // Spawn animation ticker for the creating phase.
+                    let anim_tx = events.sender();
+                    app.anim_handle = Some(tokio::spawn(async move {
+                        loop {
+                            tokio::time::sleep(Duration::from_millis(140)).await;
+                            if anim_tx.send(Event::Redraw).is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -73,6 +101,37 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                         .saturating_sub(app.sandbox_log_scroll)
                         .min(app.log_viewport_height);
                     app.log_cursor = visible.saturating_sub(1);
+                }
+            }
+            Some(Event::ProviderStatus(ptype, resolution)) => {
+                if let Some(form) = app.create_form.as_mut() {
+                    // Update or append status for this provider type.
+                    if let Some(entry) = form.provider_statuses.iter_mut().find(|(t, _)| t == &ptype) {
+                        entry.1 = resolution;
+                    } else {
+                        form.provider_statuses.push((ptype, resolution));
+                    }
+                }
+            }
+            Some(Event::GatewayCheckComplete(existing, missing)) => {
+                // Stop the animation ticker.
+                if let Some(h) = app.anim_handle.take() {
+                    h.abort();
+                }
+                if let Some(form) = app.create_form.as_mut() {
+                    form.existing_providers = existing;
+                    // Default all missing providers to "create from local creds" (yes).
+                    form.missing_providers = missing.into_iter().map(|t| (t, true)).collect();
+                    form.confirm_cursor = 0;
+                    form.phase = app::CreatePhase::Confirm;
+                    form.anim_start = None;
+                }
+            }
+            Some(Event::CreateResult(result)) => {
+                // Buffer the result — don't close yet. The Redraw handler
+                // will finalize once MIN_CREATING_DISPLAY has elapsed.
+                if let Some(form) = app.create_form.as_mut() {
+                    form.create_result = Some(result);
                 }
             }
             Some(Event::Mouse(mouse)) => {
@@ -88,13 +147,48 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 refresh_cluster_list(&mut app);
                 refresh_data(&mut app).await;
             }
+            Some(Event::Redraw) => {
+                // Check if a buffered CreateResult is ready to finalize.
+                if let Some(form) = app.create_form.as_ref() {
+                    if form.create_result.is_some() {
+                        let elapsed = form.anim_start.map_or(
+                            app::MIN_CREATING_DISPLAY,
+                            |s| s.elapsed(),
+                        );
+                        if elapsed >= app::MIN_CREATING_DISPLAY {
+                            // Take the result and finalize.
+                            let result = app.create_form.as_mut()
+                                .and_then(|f| f.create_result.take());
+                            if let Some(h) = app.anim_handle.take() {
+                                h.abort();
+                            }
+                            match result {
+                                Some(Ok(name)) => {
+                                    app.create_form = None;
+                                    app.status_text = format!("Created sandbox: {name}");
+                                    refresh_sandboxes(&mut app).await;
+                                }
+                                Some(Err(msg)) => {
+                                    if let Some(form) = app.create_form.as_mut() {
+                                        form.phase = app::CreatePhase::Form;
+                                        form.anim_start = None;
+                                        form.status = Some(format!("Create failed: {msg}"));
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+            }
             Some(Event::Resize(_, _)) => {} // ratatui handles resize on next draw
             None => break,
         }
     }
 
-    // Cancel any running log stream.
+    // Cancel any running background tasks.
     app.cancel_log_stream();
+    app.stop_anim();
 
     disable_raw_mode().into_diagnostic()?;
     execute!(
@@ -348,6 +442,206 @@ async fn handle_sandbox_delete(app: &mut App) {
             app.focus = Focus::Sandboxes;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Create sandbox
+// ---------------------------------------------------------------------------
+
+/// Phase 1: Query the gateway for existing providers.
+///
+/// Sends `GatewayCheckComplete(existing, missing)` — no credential
+/// discovery happens here. The UI shows the results and lets the user
+/// decide per-provider whether to create from local creds.
+fn spawn_resolve_providers(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some((_name, _image, selected_types)) = app.create_form_data() else {
+        return;
+    };
+
+    tokio::spawn(async move {
+        // Build type → name map from existing providers on the gateway.
+        let mut type_to_name = std::collections::HashMap::<String, String>::new();
+        let mut offset = 0u32;
+        let limit = 100u32;
+        loop {
+            let req = navigator_core::proto::ListProvidersRequest { limit, offset };
+            match tokio::time::timeout(Duration::from_secs(5), client.list_providers(req)).await {
+                Ok(Ok(resp)) => {
+                    let providers = resp.into_inner().providers;
+                    let batch_len = providers.len();
+                    for p in &providers {
+                        if !p.r#type.is_empty() {
+                            type_to_name
+                                .entry(p.r#type.to_ascii_lowercase())
+                                .or_insert_with(|| p.name.clone());
+                        }
+                    }
+                    if batch_len < limit as usize {
+                        break;
+                    }
+                    offset += limit;
+                }
+                Ok(Err(_)) | Err(_) => break,
+            }
+        }
+
+        let mut existing = Vec::new();
+        let mut missing = Vec::new();
+
+        for ptype in &selected_types {
+            let key = ptype.to_ascii_lowercase();
+            if let Some(name) = type_to_name.get(&key) {
+                existing.push((ptype.clone(), name.clone()));
+            } else {
+                missing.push(ptype.clone());
+            }
+        }
+
+        let _ = tx.send(Event::GatewayCheckComplete(existing, missing));
+    });
+}
+
+/// Phase 2: Discover + auto-create confirmed providers, then create the sandbox.
+///
+/// Called after the user reviews which missing providers to create from
+/// local creds. Sends `ProviderStatus` events for each discovery attempt,
+/// then `CreateResult` when done.
+fn spawn_create_sandbox(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some(form) = &app.create_form else {
+        return;
+    };
+
+    let name = form.name.clone();
+    let image = form.image.clone();
+
+    // Providers already on the gateway.
+    let mut resolved_names: Vec<String> = form
+        .existing_providers
+        .iter()
+        .map(|(_, n)| n.clone())
+        .collect();
+
+    // Missing providers the user confirmed for local discovery.
+    let to_discover: Vec<String> = form
+        .missing_providers
+        .iter()
+        .filter(|(_, create)| *create)
+        .map(|(t, _)| t.clone())
+        .collect();
+
+    tokio::spawn(async move {
+        use event::ProviderResolution;
+
+        // -- Discover + auto-create confirmed missing providers --
+        let registry = navigator_providers::ProviderRegistry::new();
+        for ptype in &to_discover {
+            let _ = tx.send(Event::ProviderStatus(
+                ptype.clone(),
+                ProviderResolution::Discovering,
+            ));
+
+            let discovered = registry.discover_existing(ptype).ok().flatten();
+            let Some(discovered) = discovered else {
+                let _ = tx.send(Event::ProviderStatus(
+                    ptype.clone(),
+                    ProviderResolution::NotFound,
+                ));
+                continue;
+            };
+
+            // Try to register with the gateway (name-collision retry).
+            let mut created = false;
+            for attempt in 0..5u32 {
+                let provider_name = if attempt == 0 {
+                    ptype.clone()
+                } else {
+                    format!("{ptype}-{attempt}")
+                };
+
+                let req = navigator_core::proto::CreateProviderRequest {
+                    provider: Some(navigator_core::proto::Provider {
+                        id: String::new(),
+                        name: provider_name.clone(),
+                        r#type: ptype.clone(),
+                        credentials: discovered.credentials.clone(),
+                        config: discovered.config.clone(),
+                    }),
+                };
+
+                match client.create_provider(req).await {
+                    Ok(resp) => {
+                        let name = resp
+                            .into_inner()
+                            .provider
+                            .map_or(provider_name, |p| p.name);
+                        let _ = tx.send(Event::ProviderStatus(
+                            ptype.clone(),
+                            ProviderResolution::Created(name.clone()),
+                        ));
+                        resolved_names.push(name);
+                        created = true;
+                        break;
+                    }
+                    Err(status) if status.code() == tonic::Code::AlreadyExists => {}
+                    Err(e) => {
+                        let _ = tx.send(Event::ProviderStatus(
+                            ptype.clone(),
+                            ProviderResolution::Failed(e.message().to_string()),
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if !created {
+                // ProviderStatus already sent (NotFound or Failed).
+            }
+        }
+
+        // -- Build and send the create request --
+        let has_custom_image = !image.is_empty();
+        let template = if has_custom_image {
+            Some(navigator_core::proto::SandboxTemplate {
+                image,
+                ..Default::default()
+            })
+        } else {
+            None
+        };
+
+        let mut policy = navigator_policy::default_sandbox_policy();
+        if has_custom_image {
+            navigator_policy::clear_process_identity(&mut policy);
+        }
+
+        let req = navigator_core::proto::CreateSandboxRequest {
+            name,
+            spec: Some(navigator_core::proto::SandboxSpec {
+                providers: resolved_names,
+                template,
+                policy: Some(policy),
+                ..Default::default()
+            }),
+        };
+
+        match tokio::time::timeout(Duration::from_secs(30), client.create_sandbox(req)).await {
+            Ok(Ok(resp)) => {
+                let sandbox_name = resp
+                    .into_inner()
+                    .sandbox
+                    .map_or_else(|| "unknown".to_string(), |s| s.name);
+                let _ = tx.send(Event::CreateResult(Ok(sandbox_name)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::CreateResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::CreateResult(Err("request timed out".to_string())));
+            }
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------
