@@ -1,6 +1,7 @@
 //! Navigator CLI - command-line interface for Navigator.
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
@@ -8,6 +9,7 @@ use std::io::Write;
 use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
+use navigator_cli::completers;
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;
 
@@ -193,49 +195,49 @@ impl std::fmt::Display for CompletionShell {
 }
 
 const COMPLETIONS_HELP: &str = "\
-Enable tab completion for Bash, Fish, Zsh, or PowerShell.
+Generate shell completion scripts for Navigator CLI.
 
-The script is output on stdout, allowing you to redirect the output
-to the file of your choosing. Where you place the file will depend
-on which shell and operating system you are using.
+Supported shells: bash, fish, zsh, powershell.
 
-BASH:
+The script is output on stdout, allowing you to redirect the output to the file of your choosing.
 
-    $ mkdir -p ~/.local/share/bash-completion/completions
-    $ navigator completions bash > ~/.local/share/bash-completion/completions/navigator
+The exact config file locations might vary based on your system. Make sure to restart your
+shell before testing whether completions are working.
 
-  On macOS with Homebrew (install bash-completion first):
+## bash
 
-    $ mkdir -p $(brew --prefix)/etc/bash_completion.d
-    $ navigator completions bash > $(brew --prefix)/etc/bash_completion.d/navigator.bash-completion
+First, ensure that you install `bash-completion` using your package manager.
 
-FISH:
+  mkdir -p ~/.local/share/bash-completion/completions
+  navigator completions bash > ~/.local/share/bash-completion/completions/navigator
 
-    $ mkdir -p ~/.config/fish/completions
-    $ navigator completions fish > ~/.config/fish/completions/navigator.fish
+On macOS with Homebrew (install bash-completion first):
 
-ZSH:
+  mkdir -p $(brew --prefix)/etc/bash_completion.d
+  navigator completions bash > $(brew --prefix)/etc/bash_completion.d/navigator.bash-completion
 
-    $ mkdir -p ~/.zfunc
-    $ navigator completions zsh > ~/.zfunc/_navigator
+## fish
 
-  Then add the following to your .zshrc before compinit:
+  mkdir -p ~/.config/fish/completions
+  navigator completions fish > ~/.config/fish/completions/navigator.fish
 
-    fpath+=~/.zfunc
+## zsh
 
-  And reload with:
+  mkdir -p ~/.zfunc
+  navigator completions zsh > ~/.zfunc/_navigator
 
-    $ exec zsh
+Then add the following to your .zshrc before compinit:
 
-POWERSHELL:
+  fpath+=~/.zfunc
 
-    > navigator completions powershell >> $PROFILE
+## powershell
 
-  If no profile exists yet, create one first:
+   navigator completions powershell >> $PROFILE
 
-    > New-Item -Path $PROFILE -Type File -Force
+If no profile exists yet, create one first:
 
-You may need to log out and back in for changes to take effect.";
+   New-Item -Path $PROFILE -Type File -Force
+";
 
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderType {
@@ -296,6 +298,7 @@ enum ProviderCommands {
     /// Fetch a provider by name.
     Get {
         /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
     },
 
@@ -317,6 +320,7 @@ enum ProviderCommands {
     /// Update an existing provider config.
     Update {
         /// Provider name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
 
         /// Provider type.
@@ -343,7 +347,7 @@ enum ProviderCommands {
     /// Delete providers by name.
     Delete {
         /// Provider names.
-        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_provider_names))]
         names: Vec<String>,
     },
 }
@@ -356,6 +360,7 @@ enum ClusterCommands {
     /// Set the active cluster.
     Use {
         /// Cluster name to make active.
+        #[arg(add = ArgValueCompleter::new(completers::complete_cluster_names))]
         name: String,
     },
 
@@ -506,6 +511,7 @@ enum SandboxCommands {
     /// Fetch a sandbox by name.
     Get {
         /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: String,
     },
 
@@ -531,13 +537,14 @@ enum SandboxCommands {
     /// Delete a sandbox by name.
     Delete {
         /// Sandbox names.
-        #[arg(required = true, num_args = 1.., value_name = "NAME")]
+        #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         names: Vec<String>,
     },
 
     /// Connect to a sandbox.
     Connect {
         /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: String,
     },
 
@@ -550,6 +557,7 @@ enum SandboxCommands {
     /// Sync files to or from a sandbox.
     Sync {
         /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: String,
 
         /// Push local files up to the sandbox.
@@ -668,6 +676,7 @@ enum ForwardCommands {
         port: u16,
 
         /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: String,
 
         /// Run the forward in the background and exit immediately.
@@ -681,6 +690,7 @@ enum ForwardCommands {
         port: u16,
 
         /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: String,
     },
 
@@ -775,11 +785,13 @@ enum InferenceCommands {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    CompleteEnv::with_factory(Cli::command).complete();
-
+    // Install the rustls crypto provider before completion runs — completers may
+    // establish TLS connections to the gateway.
     rustls::crypto::aws_lc_rs::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
+
+    CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
     let tls = TlsOptions::new(cli.tls_ca, cli.tls_cert, cli.tls_key);
