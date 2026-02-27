@@ -1,0 +1,56 @@
+name: Checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: build-amd64
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Format
+        run: mise run rust:format:check
+
+      - name: Lint
+        run: mise run rust:lint
+
+      - name: Test
+        run: mise run test:rust
+
+  python:
+    name: Python
+    runs-on: build-amd64
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: mise run python:lint
+
+      - name: Test
+        run: mise run test:python

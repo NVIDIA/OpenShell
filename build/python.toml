@@ -112,7 +112,7 @@ depends = ["python:proto"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run ruff check {{vars.python_paths}}"
 
-["python:fmt"]
+["python:format"]
 description = "Format Python code with ruff"
 run = "uv run ruff format {{vars.python_paths}}"
 
