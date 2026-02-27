@@ -1,0 +1,32 @@
+name: Python
+
+on:
+  pull_request:
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  python:
+    name: Python
+    runs-on: build-amd64
+    container:
+      image: ${{ env.REGISTRY }}/${{ github.repository }}/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: mise run python:lint
+
+      - name: Test
+        run: mise run test:python

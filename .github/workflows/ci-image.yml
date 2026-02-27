@@ -1,0 +1,74 @@
+name: CI Image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/docker/Dockerfile.ci'
+      - 'mise.toml'
+      - 'build/**'
+      - '.github/workflows/ci-image.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/docker/Dockerfile.ci'
+      - 'mise.toml'
+      - 'build/**'
+      - '.github/workflows/ci-image.yml'
+
+env:
+  REGISTRY: ghcr.io
+  CI_IMAGE: ghcr.io/${{ github.repository }}/ci
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-ci-image:
+    name: Build CI Image
+    runs-on: build-amd64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install mise
+        uses: jdx/mise-action@6d1e696aa24c1aa1bcc1adea0212707c71ab78a8
+        with:
+          install: false
+
+      - name: Set up Docker Buildx
+        run: mise run docker:buildx:setup
+        env:
+          MISE_AUTO_INSTALL: "0"
+          MISE_TASK_RUN_AUTO_INSTALL: "0"
+          MISE_NOT_FOUND_AUTO_INSTALL: "0"
+
+      - name: Build CI image
+        if: github.ref != 'refs/heads/main'
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --cache-from type=registry,ref=${{ env.CI_IMAGE }}:buildcache \
+            -t ${{ env.CI_IMAGE }}:${{ github.sha }} \
+            -f deploy/docker/Dockerfile.ci \
+            .
+
+      - name: Build and push CI image
+        if: github.ref == 'refs/heads/main'
+        run: |
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --cache-from type=registry,ref=${{ env.CI_IMAGE }}:buildcache \
+            --cache-to type=registry,ref=${{ env.CI_IMAGE }}:buildcache,mode=max \
+            --push \
+            -t ${{ env.CI_IMAGE }}:${{ github.sha }} \
+            -t ${{ env.CI_IMAGE }}:latest \
+            -f deploy/docker/Dockerfile.ci \
+            .

@@ -1,0 +1,34 @@
+name: Rust
+
+on:
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: build-amd64
+    container:
+      image: ${{ env.REGISTRY }}/${{ github.repository }}/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: mise run fmt:check
+
+      - name: Clippy
+        run: mise run clippy
+
+      - name: Test
+        run: mise run test:rust

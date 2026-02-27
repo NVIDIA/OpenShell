@@ -1,5 +1,45 @@
 # Docker image build tasks
 
+["docker:buildx:setup"]
+description = "Create a multi-arch buildx builder with remote BuildKit nodes"
+usage = """
+flag "--amd64 <endpoint>" default="tcp://buildkit-amd64.buildkit:1234" help="BuildKit endpoint for linux/amd64"
+flag "--arm64 <endpoint>" default="tcp://buildkit-arm64.buildkit:1234" help="BuildKit endpoint for linux/arm64"
+flag "--name <name>" default="navigator" help="Builder instance name"
+"""
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+BUILDER="${usage_name}"
+AMD64="${usage_amd64}"
+ARM64="${usage_arm64}"
+
+# Remove existing builder if present so we get a clean config
+if docker buildx inspect "${BUILDER}" >/dev/null 2>&1; then
+  echo "Removing existing builder: ${BUILDER}"
+  docker buildx rm "${BUILDER}"
+fi
+
+echo "Creating builder: ${BUILDER}"
+docker buildx create \
+  --name "${BUILDER}" \
+  --driver remote \
+  --platform linux/amd64 \
+  "${AMD64}"
+
+docker buildx create \
+  --name "${BUILDER}" \
+  --append \
+  --driver remote \
+  --platform linux/arm64 \
+  "${ARM64}"
+
+docker buildx use "${BUILDER}"
+echo "Builder '${BUILDER}' is now active:"
+docker buildx inspect "${BUILDER}"
+"""
+
 ["docker:build"]
 description = "Build all Docker images"
 depends = [
