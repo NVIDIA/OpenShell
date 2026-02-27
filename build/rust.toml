@@ -12,15 +12,15 @@ run = "cargo build --workspace --release"
 description = "Check all Rust crates for errors"
 run = "cargo check --workspace"
 
-[clippy]
-description = "Run Clippy lints"
+["rust:lint"]
+description = "Lint Rust code with Clippy"
 run = "cargo clippy --workspace --all-targets"
 
-[fmt]
+["rust:format"]
 description = "Format Rust code"
 run = "cargo fmt --all"
 
-["fmt:check"]
+["rust:format:check"]
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 

@@ -7,15 +7,11 @@ FROM ubuntu:24.04
 ARG DOCKER_VERSION=27.5.1
 ARG BUILDX_VERSION=v0.21.1
 ARG TARGETARCH
-ARG KUBECTL_VERSION=v1.35.1
-ARG HELM_VERSION=v4.1.1
-ARG PROTOC_VERSION=29.6
-ARG SCCACHE_VERSION=v0.14.0
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MISE_DATA_DIR=/opt/mise
 ENV MISE_CACHE_DIR=/opt/mise/cache
-ENV PATH="/opt/mise/shims:/root/.local/bin:$PATH"
+ENV PATH="/opt/mise/shims:/root/.cargo/bin:/root/.local/bin:$PATH"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -28,7 +24,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 \
     python3-venv \
     cmake \
-    protobuf-compiler \
     socat \
     unzip \
     xz-utils \
@@ -58,50 +53,18 @@ RUN case "$TARGETARCH" in \
     && /tmp/aws/install \
     && rm -rf /tmp/aws /tmp/awscliv2.zip
 
-# Install kubectl, helm, and protoc without GitHub API lookups
-RUN case "$TARGETARCH" in \
-      amd64) karch=amd64; helm_arch=amd64; protoc_arch=x86_64 ;; \
-      arm64) karch=arm64; helm_arch=arm64; protoc_arch=aarch_64 ;; \
-      *) echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
-    esac \
-    && curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/${karch}/kubectl" -o /usr/local/bin/kubectl \
-    && chmod +x /usr/local/bin/kubectl \
-    && curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${helm_arch}.tar.gz" -o /tmp/helm.tgz \
-    && tar -xzf /tmp/helm.tgz -C /tmp \
-    && mv "/tmp/linux-${helm_arch}/helm" /usr/local/bin/helm \
-    && chmod +x /usr/local/bin/helm \
-    && rm -rf /tmp/helm.tgz "/tmp/linux-${helm_arch}" \
-    && curl -fsSL "https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${protoc_arch}.zip" -o /tmp/protoc.zip \
-    && unzip -q /tmp/protoc.zip -d /tmp/protoc \
-    && mv /tmp/protoc/bin/protoc /usr/local/bin/protoc \
-    && chmod +x /usr/local/bin/protoc \
-    && rm -rf /tmp/protoc /tmp/protoc.zip
-
-# Install sccache directly on amd64 (mise/aqua plugin is arch-limited)
-RUN if [ "$TARGETARCH" = "amd64" ]; then \
-      curl -fsSL "https://github.com/mozilla/sccache/releases/download/${SCCACHE_VERSION}/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl.tar.gz" -o /tmp/sccache.tgz \
-      && tar -xzf /tmp/sccache.tgz -C /tmp \
-      && mv "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl/sccache" /usr/local/bin/sccache \
-      && chmod +x /usr/local/bin/sccache \
-      && rm -rf /tmp/sccache.tgz "/tmp/sccache-${SCCACHE_VERSION}-x86_64-unknown-linux-musl"; \
-    else \
-      echo "Skipping sccache install on $TARGETARCH"; \
-    fi
-
 # Install mise
 RUN curl https://mise.run | sh
 
-# Copy mise.toml and build task includes, then install core tools
+# Copy mise.toml and build task includes, then install all tools via mise
 COPY mise.toml /opt/mise/mise.toml
 COPY build/ /opt/mise/build/
 WORKDIR /opt/mise
+ARG MISE_GITHUB_TOKEN
 RUN mise trust /opt/mise/mise.toml && \
-    env -u RUSTC_WRAPPER mise install python rust 'cargo:cargo-edit' && \
+    env -u RUSTC_WRAPPER mise install && \
     /root/.cargo/bin/rustup component remove rust-docs || true && \
     rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man
-
-# Install uv directly to avoid GitHub API rate limits in CI image builds
-RUN curl -LsSf https://astral.sh/uv/0.10.2/install.sh | sh
 
 # Set working directory for CI jobs
 WORKDIR /builds

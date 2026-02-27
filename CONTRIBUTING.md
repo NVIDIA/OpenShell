@@ -154,12 +154,12 @@ mise run test:e2e:sandbox # Sandbox Python e2e tests
 
 ```bash
 # Rust
-mise run fmt             # Format code
-mise run fmt:check       # Check formatting
-mise run clippy          # Run Clippy lints
+mise run rust:format         # Format code
+mise run rust:format:check   # Check formatting
+mise run rust:lint           # Lint with Clippy
 
 # Python
-mise run python:fmt      # Format with ruff
+mise run python:format   # Format with ruff
 mise run python:lint     # Lint with ruff
 mise run python:typecheck # Type check with ty
 
