@@ -1,6 +1,6 @@
 ---
 name: review-security-issue
-description: Given a GitLab issue, review the issue for security implications. You'll make a determination if the claim in the issue is legitimate and should be addressed or will be a "won't fix." Trigger keywords - security issue, review security ticket, review security issue.
+description: Given a GitHub issue, review the issue for security implications. You'll make a determination if the claim in the issue is legitimate and should be addressed or will be a "won't fix." Trigger keywords - security issue, review security ticket, review security issue.
 ---
 
 # Review Security Issue
@@ -9,18 +9,8 @@ Review an issue that outlines a security, vulnerability, or privacy concern.
 
 ## Prerequisites
 
-- The `glab` CLI must be configured for `gitlab-master.nvidia.com`
-- You must be in a git repository with a GitLab remote
-
-## Shell Permissions
-
-When running `glab` commands, always use `required_permissions: ["all"]` to avoid TLS certificate verification issues with the corporate GitLab instance.
-
-**Troubleshooting:** If glab commands fail with TLS errors, try prefixing with:
-
-```bash
-SSL_CERT_FILE=/etc/ssl/cert.pem glab ...
-```
+- The `gh` CLI must be authenticated (`gh auth status`)
+- You must be in a git repository with a GitHub remote
 
 ## Agent Comment Marker
 
@@ -37,19 +27,13 @@ This marker is used in Step 2 to detect prior reviews and in Step 5 to distingui
 The user will provide an issue ID (e.g., `#42` or `42`). Strip any leading `#` and fetch the issue contents.
 
 ```bash
-glab issue view <id>
+gh issue view <id>
 ```
 
 To also retrieve the full issue body as JSON (useful for parsing):
 
 ```bash
-glab api "projects/:id/issues/<id>" | jq '{
-  title: .title,
-  description: .description,
-  state: .state,
-  labels: .labels,
-  author: .author.username
-}'
+gh issue view <id> --json title,body,state,labels,author
 ```
 
 ## Step 2: Check if Review is Needed
@@ -61,7 +45,7 @@ First, check the issue's labels from the metadata fetched in Step 1.
 Next, fetch existing comments on the issue:
 
 ```bash
-glab api "projects/:id/issues/<id>/notes" --paginate | jq '.[].body'
+gh issue view <id> --json comments --jq '.comments[].body'
 ```
 
 Search the comments for the agent marker (`> **🔒 security-review-agent**`).
@@ -96,7 +80,7 @@ Based on the analysis from Step 3, post a comment on the issue.
 Post a comment with a remediation plan:
 
 ```bash
-glab issue note <id> -m "$(cat <<'EOF'
+gh issue comment <id> --body "$(cat <<'EOF'
 > **🔒 security-review-agent**
 
 ## Security Review
@@ -133,7 +117,7 @@ EOF
 Post a comment with a rationale:
 
 ```bash
-glab issue note <id> -m "$(cat <<'EOF'
+gh issue comment <id> --body "$(cat <<'EOF'
 > **🔒 security-review-agent**
 
 ## Security Review
@@ -154,7 +138,7 @@ EOF
 After posting the review comment (whether legitimate or not actionable), add the `review-ready` label to the issue:
 
 ```bash
-glab api --method PUT "projects/:id/issues/<id>" -f "add_labels=review-ready"
+gh issue edit <id> --add-label "review-ready"
 ```
 
 This signals to humans and downstream skills (e.g., `fix-security-issue`) that the review is complete.
@@ -175,11 +159,11 @@ For each unanswered human comment:
 
 | Command | Description |
 | --- | --- |
-| `glab issue view <id>` | View issue details |
-| `glab api "projects/:id/issues/<id>"` | Fetch full issue metadata as JSON |
-| `glab api "projects/:id/issues/<id>/notes" --paginate` | Fetch all comments on an issue |
-| `glab issue note <id> -m "..."` | Post a comment on an issue |
-| `glab api --method PUT "projects/:id/issues/<id>" -f "add_labels=review-ready"` | Add a label to an issue |
+| `gh issue view <id>` | View issue details |
+| `gh issue view <id> --json title,body,state,labels,author` | Fetch full issue metadata as JSON |
+| `gh issue view <id> --json comments --jq '.comments[].body'` | Fetch all comments on an issue |
+| `gh issue comment <id> --body "..."` | Post a comment on an issue |
+| `gh issue edit <id> --add-label "review-ready"` | Add a label to an issue |
 
 ## Example Usage
 
@@ -187,7 +171,7 @@ For each unanswered human comment:
 
 User says: "Review security issue #42"
 
-1. Fetch issue #42 via `glab issue view 42`
+1. Fetch issue #42 via `gh issue view 42`
 2. Fetch comments and check for the `security-review-agent` marker
 3. No prior review found -- pass issue to `principal-engineer-reviewer` with security lens
 4. Reviewer determines it's a legitimate XSS vulnerability in the API response handler

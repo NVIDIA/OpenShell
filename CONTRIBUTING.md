@@ -277,14 +277,14 @@ Useful env flags for fast deploy:
 - `DEPLOY_FAST_MODE=full` - force full component rebuild behavior through fast deploy
 - `DOCKER_BUILD_CACHE_DIR=.cache/buildkit` - local BuildKit cache directory used by component image builds
 
-GitLab Container Registry mapping (CI or shared dev):
+GitHub Container Registry mapping (CI or shared dev):
 
 ```bash
-export NAVIGATOR_REGISTRY_HOST=${CI_REGISTRY}
-export NAVIGATOR_REGISTRY_NAMESPACE=${CI_PROJECT_PATH}
-export NAVIGATOR_REGISTRY_USERNAME=${CI_REGISTRY_USER}
-export NAVIGATOR_REGISTRY_PASSWORD=${CI_REGISTRY_PASSWORD}
-export IMAGE_REPO_BASE=${CI_REGISTRY}/${CI_PROJECT_PATH}
+export NAVIGATOR_REGISTRY_HOST=ghcr.io
+export NAVIGATOR_REGISTRY_NAMESPACE=${GITHUB_REPOSITORY}
+export NAVIGATOR_REGISTRY_USERNAME=${GITHUB_ACTOR}
+export NAVIGATOR_REGISTRY_PASSWORD=${GITHUB_TOKEN}
+export IMAGE_REPO_BASE=ghcr.io/${GITHUB_REPOSITORY}
 ```
 
 The cluster exposes ports 80/443 for gateway traffic and 6443 for the Kubernetes API.
@@ -356,7 +356,7 @@ Docker publishing in CI uses AWS credentials for ECR. Python publishing uses
 
 - Push a semver tag (`vX.Y.Z`) to trigger release jobs.
 - CI publishes Docker multiarch images to ECR as `:X.Y.Z` (no `:latest`).
-- CI publishes Linux + macOS (arm64) Python wheels to Artifactory and creates GitLab release notes.
+- CI publishes Linux + macOS (arm64) Python wheels to Artifactory and creates GitHub release notes.
 
 **Tagging a release:**
 
@@ -456,4 +456,4 @@ chore(deps): bump tokio to 1.40
 3. Run `mise run all` to verify
 4. Open a PR with a clear description
 
-Use the `create-gitlab-mr` skill to help with opening your pull request.
+Use the `create-github-pr` skill to help with opening your pull request.

@@ -9,24 +9,14 @@ Implement a code fix for a security issue that has already been reviewed by the 
 
 ## Prerequisites
 
-- The `glab` CLI must be configured for `gitlab-master.nvidia.com`
-- You must be in a git repository with a GitLab remote
+- The `gh` CLI must be authenticated (`gh auth status`)
+- You must be in a git repository with a GitHub remote
 - The issue **must** have both the `security` and `agent-ready` labels. If either is missing, do not proceed.
 - The issue must have a prior security review comment (posted by `review-security-issue`) with a **Legitimate concern** determination and a remediation plan
 
-## Shell Permissions
-
-When running `glab` commands, always use `required_permissions: ["all"]` to avoid TLS certificate verification issues with the corporate GitLab instance.
-
-**Troubleshooting:** If glab commands fail with TLS errors, try prefixing with:
-
-```bash
-SSL_CERT_FILE=/etc/ssl/cert.pem glab ...
-```
-
 ## Agent Comment Marker
 
-All MR descriptions and comments posted by this skill **must** begin with the following marker line:
+All PR descriptions and comments posted by this skill **must** begin with the following marker line:
 
 ```
 > **🔧 security-fix-agent**
@@ -47,12 +37,7 @@ Strip any leading `#` and proceed to Step 2 with that issue ID.
 Scan for open issues labeled `security` and `agent-ready`:
 
 ```bash
-glab api "projects/:id/issues?labels=security,agent-ready&state=opened" --paginate | jq '[.[] | {
-  iid: .iid,
-  title: .title,
-  labels: .labels,
-  updated_at: .updated_at
-}]'
+gh issue list --label "security" --label "agent-ready" --state open --json number,title,labels,updatedAt
 ```
 
 - **If no issues are found**, report to the user that there are no security issues ready for fixing and stop.
@@ -64,14 +49,7 @@ glab api "projects/:id/issues?labels=security,agent-ready&state=opened" --pagina
 Fetch the issue details:
 
 ```bash
-glab api "projects/:id/issues/<id>" | jq '{
-  iid: .iid,
-  title: .title,
-  description: .description,
-  state: .state,
-  labels: .labels,
-  author: .author.username
-}'
+gh issue view <id> --json number,title,body,state,labels,author
 ```
 
 ### Require both `security` and `agent-ready` labels
@@ -94,7 +72,7 @@ If **either label is missing**, do **not** proceed. Report to the user which lab
 Once labels are confirmed, fetch the comments to find the security review:
 
 ```bash
-glab api "projects/:id/issues/<id>/notes" --paginate | jq '[.[] | select(.body | contains("security-review-agent")) | {id: .id, body: .body, created_at: .created_at}]'
+gh issue view <id> --json comments --jq '[.comments[] | select(.body | contains("security-review-agent"))]'
 ```
 
 - **If no `security-review-agent` comment is found**, report to the user that this issue has not been reviewed yet. Suggest running the `review-security-issue` skill first. Stop.
@@ -198,7 +176,7 @@ The `arch-doc-writer` will determine which docs need updating and make the chang
 
 If the fix is purely internal (e.g., switching to parameterized queries with no external behavior change), documentation updates may not be needed -- let the `arch-doc-writer` make that determination.
 
-## Step 8: Commit, Push, and Open MR
+## Step 8: Commit, Push, and Open PR
 
 ### Commit
 
@@ -222,25 +200,16 @@ EOF
 git push -u origin HEAD
 ```
 
-### Get the current GitLab username
+### Create the PR
+
+Create a PR that closes the security issue. Put the full fix summary in the PR description rather than commenting on the issue -- the `Closes #<id>` directive will auto-close the issue when merged.
 
 ```bash
-USERNAME=$(glab api user | jq -r '.username')
-```
-
-### Create the MR
-
-Create an MR that closes the security issue. Put the full fix summary in the MR description rather than commenting on the issue -- the `Closes #<id>` directive will auto-close the issue when merged.
-
-```bash
-glab mr create \
+gh pr create \
   --title "fix(security): <short description>" \
-  --assignee "$USERNAME" \
+  --assignee "@me" \
   --label "security" \
-  --remove-source-branch \
-  --squash-before-merge \
-  --yes \
-  --description "$(cat <<'EOF'
+  --body "$(cat <<'EOF'
 > **🔧 security-fix-agent**
 
 Closes #<issue-id>
@@ -267,15 +236,15 @@ Closes #<issue-id>
 - `<architecture/doc.md>`: <what was updated>
 
 ### Verification
-<how the fix was verified — tests passed, exploit scenario tested, etc.>
+<how the fix was verified -- tests passed, exploit scenario tested, etc.>
 EOF
 )"
 ```
 
-**Display the MR URL** so it's easily clickable:
+**Display the PR URL** so it's easily clickable:
 
 ```
-Created MR [!<iid>](https://gitlab-master.nvidia.com/navigator/navigator/-/merge_requests/<iid>)
+Created PR [#<number>](https://github.com/OWNER/REPO/pull/<number>)
 ```
 
 ## Step 9: Report to User
@@ -287,18 +256,18 @@ Summarize what was done:
 3. What changes were made (files, approach)
 4. What tests were added and at which level (unit, integration, e2e)
 5. What documentation was updated
-6. Link to the MR
+6. Link to the PR
 
 ## Useful Commands Reference
 
 | Command | Description |
 | --- | --- |
-| `glab api "projects/:id/issues?labels=security,agent-ready&state=opened"` | Find open security issues ready for fixing |
-| `glab api "projects/:id/issues/<id>"` | Fetch full issue metadata |
-| `glab api "projects/:id/issues/<id>/notes" --paginate` | Fetch all comments on an issue |
-| `glab mr create --title "..." --description "..."` | Create a merge request |
-| `glab api user \| jq -r '.username'` | Get current GitLab username |
-| `glab issue view <id>` | View issue details |
+| `gh issue list --label "security" --label "agent-ready" --state open` | Find open security issues ready for fixing |
+| `gh issue view <id> --json number,title,body,state,labels,author` | Fetch full issue metadata |
+| `gh issue view <id> --json comments` | Fetch all comments on an issue |
+| `gh pr create --title "..." --body "..."` | Create a pull request |
+| `gh api user --jq '.login'` | Get current GitHub username |
+| `gh issue view <id>` | View issue details |
 | `mise run pre-commit` | Run pre-commit checks |
 
 ## Example Usage
@@ -314,8 +283,8 @@ User says: "Fix security issue #42"
 5. Implement the fix
 6. Add unit tests for the sanitization function and an integration test for the endpoint
 7. Run `arch-doc-writer` to update `architecture/sandbox.md` with the new input validation layer
-8. Commit, push, and open MR with `Closes #42`
-9. Report the MR link and changes to the user
+8. Commit, push, and open PR with `Closes #42`
+9. Report the PR link and changes to the user
 
 ### Scan and fix agent-ready issues
 
@@ -327,7 +296,7 @@ User says: "Fix any ready security issues"
 4. Implement parameterized queries
 5. Add `test_rejects_sql_injection_in_search_query` unit test and e2e test for the search endpoint
 6. `arch-doc-writer` updates API docs to note the query parameter validation
-7. Commit, push, open MR with `Closes #78`, report to user
+7. Commit, push, open PR with `Closes #78`, report to user
 
 ### Issue with non-actionable review
 
