@@ -1,38 +1,40 @@
 ---
-name: create-gitlab-issue
-description: Create GitLab issues using the glab CLI. Use when the user wants to create a new issue, report a bug, request a feature, or create a task in GitLab. Trigger keywords - create issue, new issue, file bug, report bug, feature request, gitlab issue.
+name: create-github-issue
+description: Create GitHub issues using the gh CLI. Use when the user wants to create a new issue, report a bug, request a feature, or create a task in GitHub. Trigger keywords - create issue, new issue, file bug, report bug, feature request, github issue.
 ---
 
-# Create GitLab Issue
+# Create GitHub Issue
 
-Create issues in GitLab using the `glab` CLI.
+Create issues on GitHub using the `gh` CLI.
 
 ## Prerequisites
 
-The `glab` CLI must be configured for `gitlab-master.nvidia.com`. See the project's glab rule for setup instructions.
-
-## Shell Permissions
-
-When running `glab` commands, always use `required_permissions: ["all"]` to avoid TLS certificate verification issues with the corporate GitLab instance.
+The `gh` CLI must be authenticated (`gh auth status`).
 
 ## Creating an Issue
 
-Use `glab issue create` with title and description:
+Use `gh issue create` with title and body:
 
 ```bash
-glab issue create --title "Issue title" --description "Issue description"
+gh issue create --title "Issue title" --body "Issue description"
 ```
 
 ### With Labels
 
 ```bash
-glab issue create --title "Title" --description "Description" --label "bug" --label "priority::high"
+gh issue create --title "Title" --body "Description" --label "bug" --label "priority:high"
 ```
 
 ### Assign to Someone
 
 ```bash
-glab issue create --title "Title" --description "Description" --assignee "username"
+gh issue create --title "Title" --body "Description" --assignee "username"
+```
+
+### Assign to Yourself
+
+```bash
+gh issue create --title "Title" --body "Description" --assignee "@me"
 ```
 
 ## Issue Formatting Guidelines
@@ -64,21 +66,16 @@ Include:
 - Any context or dependencies
 - Definition of done
 
-## Examples
-
-TODO
-
 ## Useful Options
 
 | Option              | Description                        |
 | ------------------- | ---------------------------------- |
 | `--title, -t`       | Issue title (required)             |
-| `--description, -d` | Issue description                  |
+| `--body, -b`        | Issue description                  |
 | `--label, -l`       | Add label (can use multiple times) |
 | `--assignee, -a`    | Assign to user                     |
-| `--weight, -w`      | Story points (1, 2, 3, 5, or 8)    |
 | `--milestone, -m`   | Add to milestone                   |
-| `--confidential`    | Mark as confidential               |
+| `--project, -p`     | Add to project                     |
 | `--web`             | Open in browser after creation     |
 
 ## After Creating
@@ -88,7 +85,7 @@ The command outputs the issue URL and number.
 **Display the URL using markdown link syntax** so it's easily clickable:
 
 ```
-Created issue [#123](https://gitlab-master.nvidia.com/navigator/navigator/-/issues/123)
+Created issue [#123](https://github.com/OWNER/REPO/issues/123)
 ```
 
 Use the issue number to:
