@@ -15,7 +15,7 @@ ARG SCCACHE_VERSION=v0.14.0
 ENV DEBIAN_FRONTEND=noninteractive
 ENV MISE_DATA_DIR=/opt/mise
 ENV MISE_CACHE_DIR=/opt/mise/cache
-ENV PATH="/opt/mise/shims:/root/.local/bin:$PATH"
+ENV PATH="/opt/mise/shims:/root/.cargo/bin:/root/.local/bin:$PATH"
 
 # Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

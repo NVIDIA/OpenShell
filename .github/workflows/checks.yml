@@ -25,9 +25,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install tools
-        run: mise install && mise reshim
-
       - name: Format
         run: mise run rust:format:check
 
@@ -47,9 +44,6 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install tools
-        run: mise install
 
       - name: Install dependencies
         run: uv sync --frozen
