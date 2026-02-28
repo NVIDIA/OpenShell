@@ -1001,8 +1001,9 @@ pub async fn sandbox_create(
         }
     };
 
-    let required_providers = required_provider_types(command, providers);
-    let configured_providers = ensure_required_providers(&mut client, &required_providers).await?;
+    let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
+    let configured_providers =
+        ensure_required_providers(&mut client, providers, &inferred_types).await?;
 
     let mut policy = load_sandbox_policy(policy)?;
 
@@ -1979,166 +1980,174 @@ pub async fn sandbox_image_push(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn required_provider_types(command: &[String], providers: &[String]) -> Vec<String> {
-    let mut required = Vec::new();
-    let mut seen = HashSet::new();
-
-    if let Some(inferred) = detect_provider_from_command(command)
-        && seen.insert(inferred.to_string())
-    {
-        required.push(inferred.to_string());
-    }
-
-    for provider in providers {
-        let normalized = normalize_provider_type(provider)
-            .map_or_else(|| provider.to_ascii_lowercase(), str::to_string);
-        if seen.insert(normalized.clone()) {
-            required.push(normalized);
-        }
-    }
-
-    required
+/// Return the provider type inferred from the trailing command, if any.
+fn inferred_provider_type(command: &[String]) -> Option<String> {
+    detect_provider_from_command(command).map(str::to_string)
 }
 
-/// Ensure all required provider types exist, creating them interactively if needed.
+/// Ensure all required providers exist.
 ///
-/// Returns a list of provider **names** (not type slugs) that were resolved for each
-/// required type. These names are suitable for passing in `SandboxSpec.providers`.
+/// `explicit_names` are provider **names** supplied via `--provider`. They are
+/// passed through directly; the server validates they exist at sandbox creation.
+///
+/// `inferred_types` are provider **types** inferred from the trailing command
+/// (e.g. `claude` → type `"claude"`). These are resolved to provider names via
+/// a type→name lookup, and missing types may be auto-created interactively.
+///
+/// Returns a deduplicated list of provider **names** suitable for
+/// `SandboxSpec.providers`.
 async fn ensure_required_providers(
     client: &mut NavigatorClient<Channel>,
-    required_types: &[String],
+    explicit_names: &[String],
+    inferred_types: &[String],
 ) -> Result<Vec<String>> {
-    if required_types.is_empty() {
+    if explicit_names.is_empty() && inferred_types.is_empty() {
         return Ok(Vec::new());
     }
 
-    // Map from lowercase type -> first provider name found with that type.
-    let mut type_to_name: HashMap<String, String> = HashMap::new();
-    let mut offset = 0_u32;
-    let limit = 100_u32;
+    let mut configured_names: Vec<String> = Vec::new();
+    let mut seen_names: HashSet<String> = HashSet::new();
 
-    loop {
-        let response = client
-            .list_providers(ListProvidersRequest { limit, offset })
-            .await
-            .into_diagnostic()?;
-        let providers = response.into_inner().providers;
-        for provider in &providers {
-            if !provider.r#type.is_empty() {
-                let type_lower = provider.r#type.to_ascii_lowercase();
-                type_to_name
-                    .entry(type_lower)
-                    .or_insert_with(|| provider.name.clone());
+    // ── Explicit provider names (validated server-side) ───────────────────
+    for name in explicit_names {
+        if seen_names.insert(name.clone()) {
+            configured_names.push(name.clone());
+        }
+    }
+
+    // ── Resolve inferred provider types ───────────────────────────────────
+    if !inferred_types.is_empty() {
+        // Map from lowercase type -> first provider name found with that type.
+        let mut type_to_name: HashMap<String, String> = HashMap::new();
+        let mut offset = 0_u32;
+        let limit = 100_u32;
+
+        loop {
+            let response = client
+                .list_providers(ListProvidersRequest { limit, offset })
+                .await
+                .into_diagnostic()?;
+            let providers = response.into_inner().providers;
+            for provider in &providers {
+                if !provider.r#type.is_empty() {
+                    let type_lower = provider.r#type.to_ascii_lowercase();
+                    type_to_name
+                        .entry(type_lower)
+                        .or_insert_with(|| provider.name.clone());
+                }
+            }
+
+            if providers.len() < limit as usize {
+                break;
+            }
+            offset = offset.saturating_add(limit);
+        }
+
+        // Collect resolved names for types that already have a provider.
+        for t in inferred_types {
+            if let Some(name) = type_to_name.get(&t.to_ascii_lowercase())
+                && seen_names.insert(name.clone())
+            {
+                configured_names.push(name.clone());
             }
         }
 
-        if providers.len() < limit as usize {
-            break;
-        }
-        offset = offset.saturating_add(limit);
-    }
+        let missing = inferred_types
+            .iter()
+            .filter(|t| !type_to_name.contains_key(&t.to_ascii_lowercase()))
+            .cloned()
+            .collect::<Vec<_>>();
 
-    let missing = required_types
-        .iter()
-        .filter(|t| !type_to_name.contains_key(&t.to_ascii_lowercase()))
-        .cloned()
-        .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            if !std::io::stdin().is_terminal() {
+                return Err(miette::miette!(
+                    "missing required providers: {}. Create them first with `nav provider create --type <type> --name <name> --from-existing`, or set them up manually from inside the sandbox",
+                    missing.join(", ")
+                ));
+            }
 
-    let mut configured_names: Vec<String> = required_types
-        .iter()
-        .filter_map(|t| type_to_name.get(&t.to_ascii_lowercase()).cloned())
-        .collect();
+            let registry = ProviderRegistry::new();
+            for provider_type in missing {
+                eprintln!("Missing provider: {provider_type}");
+                let should_create = Confirm::new()
+                    .with_prompt("Create from local credentials?")
+                    .default(true)
+                    .interact()
+                    .into_diagnostic()?;
 
-    if missing.is_empty() {
-        return Ok(configured_names);
-    }
-
-    if !std::io::stdin().is_terminal() {
-        return Err(miette::miette!(
-            "missing required providers: {}. Create them first with `nav provider create --type <type> --name <name> --from-existing`, or set them up manually from inside the sandbox",
-            missing.join(", ")
-        ));
-    }
-
-    let registry = ProviderRegistry::new();
-    for provider_type in missing {
-        eprintln!("Missing provider: {provider_type}");
-        let should_create = Confirm::new()
-            .with_prompt("Create from local credentials?")
-            .default(true)
-            .interact()
-            .into_diagnostic()?;
-
-        if !should_create {
-            eprintln!("{} Skipping provider '{provider_type}'", "!".yellow(),);
-            eprintln!();
-            continue;
-        }
-
-        let discovered = registry.discover_existing(&provider_type).map_err(|err| {
-            miette::miette!("failed to discover provider '{provider_type}': {err}")
-        })?;
-        let Some(discovered) = discovered else {
-            eprintln!(
-                "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
-                "!".yellow(),
-                provider_type
-            );
-            eprintln!();
-            continue;
-        };
-
-        let mut created = false;
-        for attempt in 0..5 {
-            let name = if attempt == 0 {
-                provider_type.clone()
-            } else {
-                format!("{provider_type}-{attempt}")
-            };
-
-            let request = CreateProviderRequest {
-                provider: Some(Provider {
-                    id: String::new(),
-                    name: name.clone(),
-                    r#type: provider_type.clone(),
-                    credentials: discovered.credentials.clone(),
-                    config: discovered.config.clone(),
-                }),
-            };
-
-            match client.create_provider(request).await {
-                Ok(response) => {
-                    let provider = response
-                        .into_inner()
-                        .provider
-                        .ok_or_else(|| miette::miette!("provider missing from response"))?;
-                    eprintln!(
-                        "{} Created provider {} ({}) from existing local state",
-                        "✓".green().bold(),
-                        provider.name,
-                        provider.r#type
-                    );
-                    configured_names.push(provider.name);
-                    created = true;
-                    break;
+                if !should_create {
+                    eprintln!("{} Skipping provider '{provider_type}'", "!".yellow(),);
+                    eprintln!();
+                    continue;
                 }
-                Err(status) if status.code() == Code::AlreadyExists => {}
-                Err(status) => {
+
+                let discovered = registry.discover_existing(&provider_type).map_err(|err| {
+                    miette::miette!("failed to discover provider '{provider_type}': {err}")
+                })?;
+                let Some(discovered) = discovered else {
+                    eprintln!(
+                        "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
+                        "!".yellow(),
+                        provider_type
+                    );
+                    eprintln!();
+                    continue;
+                };
+
+                let mut created = false;
+                for attempt in 0..5 {
+                    let name = if attempt == 0 {
+                        provider_type.clone()
+                    } else {
+                        format!("{provider_type}-{attempt}")
+                    };
+
+                    let request = CreateProviderRequest {
+                        provider: Some(Provider {
+                            id: String::new(),
+                            name: name.clone(),
+                            r#type: provider_type.clone(),
+                            credentials: discovered.credentials.clone(),
+                            config: discovered.config.clone(),
+                        }),
+                    };
+
+                    match client.create_provider(request).await {
+                        Ok(response) => {
+                            let provider = response
+                                .into_inner()
+                                .provider
+                                .ok_or_else(|| miette::miette!("provider missing from response"))?;
+                            eprintln!(
+                                "{} Created provider {} ({}) from existing local state",
+                                "✓".green().bold(),
+                                provider.name,
+                                provider.r#type
+                            );
+                            if seen_names.insert(provider.name.clone()) {
+                                configured_names.push(provider.name);
+                            }
+                            created = true;
+                            break;
+                        }
+                        Err(status) if status.code() == Code::AlreadyExists => {}
+                        Err(status) => {
+                            return Err(miette::miette!(
+                                "failed to create provider for type '{provider_type}': {status}"
+                            ));
+                        }
+                    }
+                }
+
+                if !created {
                     return Err(miette::miette!(
-                        "failed to create provider for type '{provider_type}': {status}"
+                        "failed to create provider for type '{provider_type}' after name retries"
                     ));
                 }
+
+                eprintln!();
             }
         }
-
-        if !created {
-            return Err(miette::miette!(
-                "failed to create provider for type '{provider_type}' after name retries"
-            ));
-        }
-
-        eprintln!();
     }
 
     Ok(configured_names)
@@ -3257,7 +3266,7 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_credential_pairs, resolve_route_protocols};
+    use super::{inferred_provider_type, parse_credential_pairs, resolve_route_protocols};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -3374,5 +3383,40 @@ mod tests {
             err.to_string()
                 .contains("could not detect any supported protocols")
         );
+    }
+
+    #[test]
+    fn inferred_provider_type_returns_type_for_known_command() {
+        let result = inferred_provider_type(&["claude".to_string(), "--help".to_string()]);
+        assert_eq!(result, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn inferred_provider_type_returns_none_for_unknown_command() {
+        let result = inferred_provider_type(&["bash".to_string()]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn inferred_provider_type_returns_none_for_empty_command() {
+        let result = inferred_provider_type(&[]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn inferred_provider_type_normalizes_aliases() {
+        // `glab` should resolve to `gitlab`
+        let result = inferred_provider_type(&["glab".to_string()]);
+        assert_eq!(result, Some("gitlab".to_string()));
+
+        // `gh` should resolve to `github`
+        let result = inferred_provider_type(&["gh".to_string()]);
+        assert_eq!(result, Some("github".to_string()));
+    }
+
+    #[test]
+    fn inferred_provider_type_handles_full_path() {
+        let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
+        assert_eq!(result, Some("claude".to_string()));
     }
 }
