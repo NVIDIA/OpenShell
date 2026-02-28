@@ -1,28 +1,18 @@
 ---
 name: build-from-issue
-description: Given a GitLab issue number, plan and implement the work described in the issue. Operates iteratively - creates an implementation plan, responds to feedback, and only builds when 'agent-ready' label is applied. Includes tests, documentation updates, and MR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
+description: Given a GitHub issue number, plan and implement the work described in the issue. Operates iteratively - creates an implementation plan, responds to feedback, and only builds when 'agent-ready' label is applied. Includes tests, documentation updates, and PR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
 ---
 
 # Build From Issue
 
-Plan, iterate on feedback, and implement work described in a GitLab issue.
+Plan, iterate on feedback, and implement work described in a GitHub issue.
 
 This skill operates as a stateful workflow — it can be run repeatedly against the same issue. Each invocation inspects the issue's labels, plan comment, and conversation history to determine the correct next action.
 
 ## Prerequisites
 
-- The `glab` CLI must be configured for `gitlab-master.nvidia.com`
-- You must be in a git repository with a GitLab remote
-
-## Shell Permissions
-
-When running `glab` commands, always use `required_permissions: ["all"]` to avoid TLS certificate verification issues with the corporate GitLab instance.
-
-**Troubleshooting:** If glab commands fail with TLS errors, try prefixing with:
-
-```bash
-SSL_CERT_FILE=/etc/ssl/cert.pem glab ...
-```
+- The `gh` CLI must be authenticated (`gh auth status`)
+- You must be in a git repository with a GitHub remote
 
 ## Agent Comment Markers
 
@@ -38,7 +28,7 @@ The implementation plan lives in a **single comment** that is edited in place as
 
 ### Conversation marker
 
-All other comments (responses to human feedback, status updates, MR announcements) use this marker:
+All other comments (responses to human feedback, status updates, PR announcements) use this marker:
 
 ```
 > **🏗️ build-from-issue-agent**
@@ -64,17 +54,17 @@ Fetch issue + comments
   │   → Update the plan comment if feedback requires plan changes
   │   → STOP
   │
-  ├─ Plan exists + 'agent-ready' label + no 'in-progress' or 'mr-opened' label?
+  ├─ Plan exists + 'agent-ready' label + no 'in-progress' or 'pr-opened' label?
   │   → Run scope check (warn if high complexity)
-  │   → Check for conflicting branches/MRs
+  │   → Check for conflicting branches/PRs
   │   → BUILD (Steps 6–14)
   │
   ├─ 'in-progress' label present?
   │   → Detect existing branch and resume if possible
   │   → Otherwise report current state
   │
-  ├─ 'mr-opened' label present?
-  │   → Report that MR already exists, link to it
+  ├─ 'pr-opened' label present?
+  │   → Report that PR already exists, link to it
   │   → STOP
   │
   └─ Plan exists + no new comments + no 'agent-ready'?
@@ -87,14 +77,7 @@ Fetch issue + comments
 The user provides an issue ID (e.g., `#42` or `42`). Strip any leading `#` and fetch:
 
 ```bash
-glab api "projects/:id/issues/<id>" | jq '{
-  iid: .iid,
-  title: .title,
-  description: .description,
-  state: .state,
-  labels: .labels,
-  author: .author.username
-}'
+gh issue view <id> --json number,title,body,state,labels,author
 ```
 
 If the issue is closed, report that and stop.
@@ -104,23 +87,16 @@ If the issue is closed, report that and stop.
 Fetch all comments:
 
 ```bash
-glab api "projects/:id/issues/<id>/notes" --paginate | jq '[.[] | {
-  id: .id,
-  body: .body,
-  author: .author.username,
-  created_at: .created_at,
-  updated_at: .updated_at,
-  system: .system
-}]'
+gh issue view <id> --json comments --jq '.comments[] | {id: .id, body: .body, author: .author.login, createdAt: .createdAt, updatedAt: .updatedAt}'
 ```
 
-Classify each non-system comment into one of:
+Classify each comment into one of:
 
 - **Plan comment**: body starts with `> **🏗️ build-plan**`
 - **Agent comment**: body starts with `> **🏗️ build-from-issue-agent**`
-- **Human comment**: everything else (not system, not agent-marked)
+- **Human comment**: everything else (not agent-marked)
 
-Record the plan comment's `id` (needed for editing via PUT) and its `updated_at` timestamp.
+Record the plan comment's `id` (needed for editing via API) and its `updatedAt` timestamp.
 
 ## Step 3: Determine Action
 
@@ -128,7 +104,7 @@ Using the state machine above, determine what to do based on:
 
 1. Whether a plan comment exists
 2. Whether there are human comments newer than the last agent comment (plan or conversation)
-3. Which labels are present (`review-ready`, `agent-ready`, `in-progress`, `mr-opened`)
+3. Which labels are present (`review-ready`, `agent-ready`, `in-progress`, `pr-opened`)
 
 Follow the appropriate branch below.
 
@@ -165,7 +141,7 @@ In the prompt, instruct the reviewer to:
 Post the plan as a comment on the issue. This is the **canonical plan comment** that will be edited in place as the plan evolves.
 
 ```bash
-glab issue note <id> -m "$(cat <<'EOF'
+gh issue comment <id> --body "$(cat <<'EOF'
 > **🏗️ build-plan**
 
 ## Implementation Plan
@@ -207,7 +183,7 @@ EOF
 ### A3: Add the `review-ready` Label
 
 ```bash
-glab api --method PUT "projects/:id/issues/<id>" -f "add_labels=review-ready"
+gh issue edit <id> --add-label "review-ready"
 ```
 
 Report to the user that the plan has been posted and is awaiting review. Stop.
@@ -220,7 +196,7 @@ If a plan exists and there are human comments newer than the last agent response
 
 ### B1: Process Each Unanswered Human Comment
 
-For each human comment that is newer than the most recent agent comment (plan `updated_at` or conversation comment `created_at`):
+For each human comment that is newer than the most recent agent comment (plan `updatedAt` or conversation comment `createdAt`):
 
 1. Read the comment.
 2. Quote the relevant portion using `>` blockquote syntax.
@@ -228,7 +204,7 @@ For each human comment that is newer than the most recent agent comment (plan `u
 4. Post a response with the conversation marker.
 
 ```bash
-glab issue note <id> -m "$(cat <<'EOF'
+gh issue comment <id> --body "$(cat <<'EOF'
 > **🏗️ build-from-issue-agent**
 
 > <quoted portion of human's comment>
@@ -240,10 +216,22 @@ EOF
 
 ### B2: Update the Plan if Needed
 
-If any feedback requires changes to the plan, **edit the existing plan comment** rather than posting a new one. Use the plan comment's `id` from Step 2:
+If any feedback requires changes to the plan, **edit the existing plan comment** rather than posting a new one. Use the GitHub API with the comment's node ID:
 
 ```bash
-glab api --method PUT "projects/:id/issues/<id>/notes/<note-id>" -f body="$(cat <<'EOF'
+gh api graphql -f query='
+  mutation {
+    updateIssueComment(input: {id: "<comment-node-id>", body: "<updated body>"}) {
+      issueComment { id }
+    }
+  }
+'
+```
+
+Or use the REST API:
+
+```bash
+gh api repos/{owner}/{repo}/issues/comments/<comment-id> -X PATCH -f body="$(cat <<'EOF'
 > **🏗️ build-plan**
 
 ## Implementation Plan
@@ -266,7 +254,7 @@ Report to the user what feedback was addressed and whether the plan was updated.
 
 ## Branch C: Build
 
-If the plan exists and the `agent-ready` label is present (and neither `in-progress` nor `mr-opened` is set), proceed with implementation.
+If the plan exists and the `agent-ready` label is present (and neither `in-progress` nor `pr-opened` is set), proceed with implementation.
 
 ### Step 4: Scope Check
 
@@ -291,13 +279,13 @@ git branch -r | grep -i "<issue-id>"
 
 If a remote branch referencing this issue ID exists, report it and ask the user whether to continue on that branch or abort.
 
-#### Check for existing MRs
+#### Check for existing PRs
 
 ```bash
-glab api "projects/:id/merge_requests?state=opened&search=<issue-id>" | jq '[.[] | select(.description | contains("Closes #<issue-id>") or contains("closes #<issue-id>")) | {iid: .iid, title: .title, web_url: .web_url}]'
+gh pr list --state open --search "Closes #<issue-id>" --json number,title,url
 ```
 
-If an open MR already references this issue, report it and stop. Do not create a competing MR.
+If an open PR already references this issue, report it and stop. Do not create a competing PR.
 
 ### Step 6: Create Branch
 
@@ -315,7 +303,7 @@ Determine the branch prefix from the issue type in the plan:
 Get the current username and create the branch:
 
 ```bash
-USERNAME=$(glab api user | jq -r '.username')
+USERNAME=$(gh api user --jq '.login')
 git checkout main
 git pull origin main
 git checkout -b <prefix><issue-id>-<short-description>/$USERNAME
@@ -324,7 +312,7 @@ git checkout -b <prefix><issue-id>-<short-description>/$USERNAME
 ### Step 7: Add `in-progress` Label
 
 ```bash
-glab api --method PUT "projects/:id/issues/<id>" -f "add_labels=in-progress"
+gh issue edit <id> --add-label "in-progress"
 ```
 
 ### Step 8: Implement the Changes
@@ -333,7 +321,7 @@ Follow the implementation steps from the plan. Principles:
 
 - **Follow the plan**: The plan was reviewed and approved. Stick to it unless you discover something that requires deviation.
 - **Minimal scope**: Only change what the plan calls for. No unrelated refactors.
-- **If you must deviate**: Note the deviation — it will be included in the MR description.
+- **If you must deviate**: Note the deviation — it will be included in the PR description.
 
 Read the relevant source files before making changes. Implement step by step per the plan's sequence.
 
@@ -388,7 +376,7 @@ mise run pre-commit
 - The specific errors from the last attempt
 - That manual intervention is needed
 
-Do not proceed to MR creation if verification is not green.
+Do not proceed to PR creation if verification is not green.
 
 ### Step 11: Update Documentation
 
@@ -427,20 +415,15 @@ Push:
 git push -u origin HEAD
 ```
 
-### Step 13: Open MR
+### Step 13: Open PR
 
-Get the current username and create the MR:
+Create the PR:
 
 ```bash
-USERNAME=$(glab api user | jq -r '.username')
-
-glab mr create \
+gh pr create \
   --title "<type>(<scope>): <short description>" \
-  --assignee "$USERNAME" \
-  --remove-source-branch \
-  --squash-before-merge \
-  --yes \
-  --description "$(cat <<'EOF'
+  --assignee "@me" \
+  --body "$(cat <<'EOF'
 > **🏗️ build-from-issue-agent**
 
 Closes #<issue-id>
@@ -471,10 +454,10 @@ EOF
 )"
 ```
 
-**Display the MR URL** so it's easily clickable:
+**Display the PR URL** so it's easily clickable:
 
 ```
-Created MR [!<iid>](https://gitlab-master.nvidia.com/navigator/navigator/-/merge_requests/<iid>)
+Created PR [#<number>](https://github.com/OWNER/REPO/pull/<number>)
 ```
 
 ### Step 14: Post-Build Cleanup
@@ -482,12 +465,12 @@ Created MR [!<iid>](https://gitlab-master.nvidia.com/navigator/navigator/-/merge
 #### Post summary comment on the issue
 
 ```bash
-glab issue note <id> -m "$(cat <<'EOF'
+gh issue comment <id> --body "$(cat <<'EOF'
 > **🏗️ build-from-issue-agent**
 
 ## Implementation Complete
 
-MR: [!<mr-iid>](https://gitlab-master.nvidia.com/navigator/navigator/-/merge_requests/<mr-iid>)
+PR: [#<pr-number>](https://github.com/OWNER/REPO/pull/<pr-number>)
 
 ### What was built
 <1-2 sentence summary>
@@ -500,28 +483,29 @@ MR: [!<mr-iid>](https://gitlab-master.nvidia.com/navigator/navigator/-/merge_req
 ### Docs updated
 - <list of updated architecture docs, or "None needed">
 
-The issue will auto-close when the MR is merged.
+The issue will auto-close when the PR is merged.
 EOF
 )"
 ```
 
 #### Update labels
 
-Remove `in-progress` and `review-ready`, add `mr-opened`:
+Remove `in-progress` and `review-ready`, add `pr-opened`:
 
 ```bash
-glab api --method PUT "projects/:id/issues/<id>" -f "remove_labels=in-progress,review-ready" -f "add_labels=mr-opened"
+gh issue edit <id> --remove-label "in-progress" --remove-label "review-ready" --add-label "pr-opened"
 ```
 
-#### Report pipeline URL
+#### Report workflow run URL
 
-Get the pipeline URL from the MR so the user can monitor CI:
+Get the workflow run URL from the PR so the user can monitor CI:
 
 ```bash
-glab api "projects/:id/merge_requests/<mr-iid>/pipelines" | jq '.[0] | {id: .id, status: .status, web_url: .web_url}'
+BRANCH=$(gh pr view <pr-number> --json headRefName --jq '.headRefName')
+gh run list --branch "$BRANCH" --limit 1 --json databaseId,status,url
 ```
 
-Report the pipeline URL and suggest the user can use the `watch-gitlab-pipeline` skill to monitor it.
+Report the workflow run URL and suggest the user can use the `watch-github-actions` skill to monitor it.
 
 ---
 
@@ -533,7 +517,7 @@ If the `in-progress` label is present, the skill was previously started but may 
    ```bash
    git branch -r | grep -i "<issue-id>"
    ```
-2. If found, check it out and inspect the state (are there uncommitted changes? committed but not pushed? pushed but no MR?).
+2. If found, check it out and inspect the state (are there uncommitted changes? committed but not pushed? pushed but no PR?).
 3. Resume from the appropriate step (9, 10, 12, or 13).
 4. If the state is unrecoverable, report to the user and suggest starting fresh (remove `in-progress` label and re-run).
 
@@ -543,15 +527,15 @@ If the `in-progress` label is present, the skill was previously started but may 
 
 | Command | Description |
 | --- | --- |
-| `glab api "projects/:id/issues/<id>"` | Fetch full issue metadata |
-| `glab api "projects/:id/issues/<id>/notes" --paginate` | Fetch all comments on an issue |
-| `glab issue note <id> -m "..."` | Post a comment on an issue |
-| `glab api --method PUT "projects/:id/issues/<id>/notes/<note-id>" -f body="..."` | Edit an existing comment |
-| `glab api --method PUT "projects/:id/issues/<id>" -f "add_labels=..."` | Add labels |
-| `glab api --method PUT "projects/:id/issues/<id>" -f "remove_labels=..."` | Remove labels |
-| `glab api "projects/:id/merge_requests?state=opened&search=..."` | Search for open MRs |
-| `glab mr create --title "..." --description "..."` | Create a merge request |
-| `glab api user \| jq -r '.username'` | Get current GitLab username |
+| `gh issue view <id> --json number,title,body,state,labels,author` | Fetch full issue metadata |
+| `gh issue view <id> --json comments` | Fetch all comments on an issue |
+| `gh issue comment <id> --body "..."` | Post a comment on an issue |
+| `gh api repos/{owner}/{repo}/issues/comments/<id> -X PATCH -f body="..."` | Edit an existing comment |
+| `gh issue edit <id> --add-label "..."` | Add labels |
+| `gh issue edit <id> --remove-label "..."` | Remove labels |
+| `gh pr list --state open --search "..."` | Search for open PRs |
+| `gh pr create --title "..." --body "..."` | Create a pull request |
+| `gh api user --jq '.login'` | Get current GitHub username |
 | `mise test` | Run project tests |
 | `mise run pre-commit` | Run pre-commit checks |
 
@@ -595,25 +579,25 @@ User says: "Build issue #42"
 
 1. Fetch issue #42 — labels include `agent-ready`
 2. Plan exists (Revision 2), complexity: Medium, confidence: High
-3. No conflicting branches or MRs
+3. No conflicting branches or PRs
 4. Create branch `feat/42-add-pagination/jmyers`
 5. Add `in-progress` label
 6. Implement pagination for both endpoints per the plan
 7. Add unit tests for pagination logic, integration tests for both endpoints
 8. `mise test` and `mise run pre-commit` pass on first attempt
 9. `arch-doc-writer` updates `architecture/gateway.md` with pagination details
-10. Commit, push, create MR with `Closes #42`
-11. Post summary comment on issue with MR link
-12. Update labels: remove `in-progress` + `review-ready`, add `mr-opened`
-13. Report MR URL and pipeline status to user
+10. Commit, push, create PR with `Closes #42`
+11. Post summary comment on issue with PR link
+12. Update labels: remove `in-progress` + `review-ready`, add `pr-opened`
+13. Report PR URL and workflow run status to user
 
-### Run on issue with existing MR
+### Run on issue with existing PR
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — `mr-opened` label present
-2. Find existing MR !789 linked to the issue
-3. Report: "MR [!789](...) already exists for issue #42. Nothing to build."
+1. Fetch issue #42 — `pr-opened` label present
+2. Find existing PR #789 linked to the issue
+3. Report: "PR [#789](...) already exists for issue #42. Nothing to build."
 
 ### Run on high-complexity issue
 

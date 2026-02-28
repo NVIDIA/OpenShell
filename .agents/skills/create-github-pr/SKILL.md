@@ -1,0 +1,228 @@
+---
+name: create-github-pr
+description: Create GitHub pull requests using the gh CLI. Use when the user wants to create a new PR, submit code for review, or open a pull request. Trigger keywords - create PR, pull request, new PR, submit for review, code review.
+---
+
+# Create GitHub Pull Request
+
+Create pull requests on GitHub using the `gh` CLI.
+
+## Prerequisites
+
+- The `gh` CLI must be authenticated (`gh auth status`)
+- You must have commits on a branch that's pushed to the remote
+- Branch should follow naming convention: `<issue-number>-<description>/<username>`
+
+## Before Creating a PR
+
+### Run Pre-commit Checks
+
+Run the local pre-commit task before opening a PR:
+
+```bash
+mise run pre-commit
+```
+
+### Verify Branch State
+
+Before creating a PR, verify:
+
+1. **You're not on main** - Never create PRs directly from main:
+
+   ```bash
+   # Should NOT be "main"
+   git branch --show-current
+   ```
+
+2. **Branch follows naming convention** - Format: `<issue-number>-<description>/<initials>`
+
+   ```bash
+   # Example: 1234-add-pagination/jd
+   git branch --show-current
+   ```
+
+3. **Consider squashing commits** - For cleaner history, squash related commits before pushing:
+
+   ```bash
+   # Squash last N commits into one
+   git reset --soft HEAD~N
+   git commit -m "feat(component): description"
+   ```
+
+### Push Your Branch
+
+Ensure your branch is pushed to the remote:
+
+```bash
+git push -u origin HEAD
+```
+
+## Creating a PR
+
+Basic PR creation (opens editor for description):
+
+```bash
+gh pr create
+```
+
+With title and body:
+
+```bash
+gh pr create --title "PR title" --body "PR description"
+```
+
+## PR Title Format
+
+**PR titles must follow the conventional commit format:**
+
+```
+<type>(<scope>): <description>
+```
+
+**Types:**
+
+- `feat` - New feature
+- `fix` - Bug fix
+- `docs` - Documentation only
+- `refactor` - Code change that neither fixes a bug nor adds a feature
+- `test` - Adding or updating tests
+- `chore` - Maintenance tasks (CI, build, dependencies)
+- `perf` - Performance improvement
+
+**Scope** is typically the component name (e.g., `evaluator`, `cli`, `sdk`, `jobs`).
+
+**Examples:**
+
+- `feat(evaluator): add support for custom rubrics`
+- `fix(jobs): handle timeout errors gracefully`
+- `docs(sdk): update authentication examples`
+- `refactor(models): simplify deployment logic`
+- `chore(ci): update Python version in pipeline`
+
+## Required PR Fields
+
+Every PR **must** have:
+
+1. **Assignee** - Always assign to yourself
+
+## Assignee and Reviewer
+
+### Always Assign to Yourself
+
+**Every PR must be assigned to the user creating it.** Use the `--assignee` flag:
+
+```bash
+gh pr create --title "Title" --assignee "@me"
+```
+
+### Link to an Issue
+
+Use `Closes #<issue-number>` in the body to auto-close the issue when merged:
+
+```bash
+gh pr create \
+  --title "Fix validation error for empty requests" \
+  --assignee "@me" \
+  --body "Closes #123
+
+## Summary
+- Added validation for empty request bodies
+- Returns 400 instead of 500"
+```
+
+### Create as Draft
+
+For work-in-progress that's not ready for review:
+
+```bash
+gh pr create --draft --title "WIP: New feature" --assignee "@me"
+```
+
+### With Labels
+
+```bash
+gh pr create --title "Title" --label "component::evaluator" --label "bug"
+```
+
+### Target a Different Branch
+
+Default target is `main`. To target a different branch:
+
+```bash
+gh pr create --base "release-1.0"
+```
+
+## PR Description Guidelines
+
+A good PR description includes:
+
+### Summary
+
+Brief description of changes (2-3 bullet points).
+
+### Test Plan
+
+How the changes were tested:
+
+- Unit tests added/updated
+- Manual testing performed
+- Integration tests
+
+### Related Issues
+
+Link to related issues using `Closes #123` or `Related to #456`.
+
+## Example PR (Complete)
+
+```bash
+gh pr create \
+  --title "feat(files): add pagination to dataset list endpoint" \
+  --assignee "@me" \
+  --milestone "Platform 26.02" \
+  --body "Closes #456
+
+## Summary
+- Added \`offset\` and \`limit\` query parameters to GET /datasets
+- Default limit is 20, max is 100
+- Response includes \`total_count\` field"
+```
+
+## Useful Options
+
+| Option              | Description                                |
+| ------------------- | ------------------------------------------ |
+| `--title, -t`       | PR title (use conventional commit format)  |
+| `--body, -b`        | PR description                             |
+| `--assignee, -a`    | Assign to user (use `@me` for yourself)    |
+| `--reviewer, -r`    | Request review from user                   |
+| `--draft`           | Create as draft (WIP)                      |
+| `--label, -l`       | Add label (can use multiple times)         |
+| `--base, -B`        | Target branch (default: main)              |
+| `--head, -H`        | Source branch (default: current)           |
+| `--web`             | Open in browser after creation             |
+
+## After Creating
+
+The command outputs the PR URL and number.
+
+**Display the URL using markdown link syntax** so it's easily clickable:
+
+```
+Created PR [#123](https://github.com/OWNER/REPO/pull/123)
+```
+
+### Monitor Workflow Run (Optional)
+
+If the user asks to wait for a green CI before posting the RFR, use this snippet to monitor the workflow run:
+
+```bash
+# Watch the latest workflow run for the current branch
+gh run watch
+```
+
+Or poll manually:
+
+```bash
+RUN_ID=$(gh run list --branch "$(git branch --show-current)" --limit 1 --json databaseId --jq '.[0].databaseId')
+gh run watch "$RUN_ID"
+```
