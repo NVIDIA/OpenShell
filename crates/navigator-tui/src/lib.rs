@@ -64,31 +64,26 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 }
                 if app.pending_create_sandbox {
                     app.pending_create_sandbox = false;
-                    spawn_resolve_providers(&app, events.sender());
-                    // Spawn a fast animation ticker (~7 fps).
-                    let anim_tx = events.sender();
-                    app.anim_handle = Some(tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(140)).await;
-                            if anim_tx.send(Event::Redraw).is_err() {
-                                break;
-                            }
-                        }
-                    }));
-                }
-                if app.pending_confirm_create {
-                    app.pending_confirm_create = false;
                     spawn_create_sandbox(&app, events.sender());
-                    // Spawn animation ticker for the creating phase.
-                    let anim_tx = events.sender();
-                    app.anim_handle = Some(tokio::spawn(async move {
-                        loop {
-                            tokio::time::sleep(Duration::from_millis(140)).await;
-                            if anim_tx.send(Event::Redraw).is_err() {
-                                break;
-                            }
-                        }
-                    }));
+                    start_anim_ticker(&mut app, events.sender());
+                }
+                // --- Provider CRUD ---
+                if app.pending_provider_create {
+                    app.pending_provider_create = false;
+                    spawn_create_provider(&app, events.sender());
+                    start_anim_ticker(&mut app, events.sender());
+                }
+                if app.pending_provider_get {
+                    app.pending_provider_get = false;
+                    spawn_get_provider(&app, events.sender());
+                }
+                if app.pending_provider_update {
+                    app.pending_provider_update = false;
+                    spawn_update_provider(&app, events.sender());
+                }
+                if app.pending_provider_delete {
+                    app.pending_provider_delete = false;
+                    spawn_delete_provider(&app, events.sender());
                 }
             }
             Some(Event::LogLines(lines)) => {
@@ -103,35 +98,66 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     app.log_cursor = visible.saturating_sub(1);
                 }
             }
-            Some(Event::ProviderStatus(ptype, resolution)) => {
-                if let Some(form) = app.create_form.as_mut() {
-                    // Update or append status for this provider type.
-                    if let Some(entry) = form.provider_statuses.iter_mut().find(|(t, _)| t == &ptype) {
-                        entry.1 = resolution;
-                    } else {
-                        form.provider_statuses.push((ptype, resolution));
-                    }
-                }
-            }
-            Some(Event::GatewayCheckComplete(existing, missing)) => {
-                // Stop the animation ticker.
-                if let Some(h) = app.anim_handle.take() {
-                    h.abort();
-                }
-                if let Some(form) = app.create_form.as_mut() {
-                    form.existing_providers = existing;
-                    // Default all missing providers to "create from local creds" (yes).
-                    form.missing_providers = missing.into_iter().map(|t| (t, true)).collect();
-                    form.confirm_cursor = 0;
-                    form.phase = app::CreatePhase::Confirm;
-                    form.anim_start = None;
-                }
-            }
             Some(Event::CreateResult(result)) => {
                 // Buffer the result — don't close yet. The Redraw handler
                 // will finalize once MIN_CREATING_DISPLAY has elapsed.
                 if let Some(form) = app.create_form.as_mut() {
                     form.create_result = Some(result);
+                }
+            }
+            Some(Event::ProviderCreateResult(result)) => {
+                // Buffer the result for min-display handling in Redraw.
+                if let Some(form) = app.create_provider_form.as_mut() {
+                    form.create_result = Some(result);
+                }
+            }
+            Some(Event::ProviderDetailFetched(result)) => {
+                match result {
+                    Ok(provider) => {
+                        let cred_key = provider.credentials.keys().next().cloned().unwrap_or_default();
+                        let masked = if let Some(val) = provider.credentials.values().next() {
+                            mask_secret(val)
+                        } else {
+                            "-".to_string()
+                        };
+                        app.provider_detail = Some(app::ProviderDetailView {
+                            name: provider.name.clone(),
+                            provider_type: provider.r#type.clone(),
+                            credential_key: cred_key,
+                            masked_value: masked,
+                        });
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("get provider failed: {msg}");
+                    }
+                }
+            }
+            Some(Event::ProviderUpdateResult(result)) => {
+                match result {
+                    Ok(name) => {
+                        app.update_provider_form = None;
+                        app.status_text = format!("Updated provider: {name}");
+                        refresh_providers(&mut app).await;
+                    }
+                    Err(msg) => {
+                        if let Some(form) = app.update_provider_form.as_mut() {
+                            form.status = Some(format!("Failed: {msg}"));
+                        }
+                    }
+                }
+            }
+            Some(Event::ProviderDeleteResult(result)) => {
+                match result {
+                    Ok(true) => {
+                        app.status_text = "Provider deleted.".to_string();
+                        refresh_providers(&mut app).await;
+                    }
+                    Ok(false) => {
+                        app.status_text = "Provider not found.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("delete provider failed: {msg}");
+                    }
                 }
             }
             Some(Event::Mouse(mouse)) => {
@@ -148,7 +174,7 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 refresh_data(&mut app).await;
             }
             Some(Event::Redraw) => {
-                // Check if a buffered CreateResult is ready to finalize.
+                // Check if a buffered sandbox CreateResult is ready to finalize.
                 if let Some(form) = app.create_form.as_ref() {
                     if form.create_result.is_some() {
                         let elapsed = form.anim_start.map_or(
@@ -156,7 +182,6 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                             |s| s.elapsed(),
                         );
                         if elapsed >= app::MIN_CREATING_DISPLAY {
-                            // Take the result and finalize.
                             let result = app.create_form.as_mut()
                                 .and_then(|f| f.create_result.take());
                             if let Some(h) = app.anim_handle.take() {
@@ -171,6 +196,37 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                                 Some(Err(msg)) => {
                                     if let Some(form) = app.create_form.as_mut() {
                                         form.phase = app::CreatePhase::Form;
+                                        form.anim_start = None;
+                                        form.status = Some(format!("Create failed: {msg}"));
+                                    }
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
+                // Check if a buffered provider CreateResult is ready to finalize.
+                if let Some(form) = app.create_provider_form.as_ref() {
+                    if form.create_result.is_some() {
+                        let elapsed = form.anim_start.map_or(
+                            app::MIN_CREATING_DISPLAY,
+                            |s| s.elapsed(),
+                        );
+                        if elapsed >= app::MIN_CREATING_DISPLAY {
+                            let result = app.create_provider_form.as_mut()
+                                .and_then(|f| f.create_result.take());
+                            if let Some(h) = app.anim_handle.take() {
+                                h.abort();
+                            }
+                            match result {
+                                Some(Ok(name)) => {
+                                    app.create_provider_form = None;
+                                    app.status_text = format!("Created provider: {name}");
+                                    refresh_providers(&mut app).await;
+                                }
+                                Some(Err(msg)) => {
+                                    if let Some(form) = app.create_provider_form.as_mut() {
+                                        form.phase = app::CreateProviderPhase::EnterKey;
                                         form.anim_start = None;
                                         form.status = Some(format!("Create failed: {msg}"));
                                     }
@@ -445,162 +501,33 @@ async fn handle_sandbox_delete(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
-// Create sandbox
+// Animation helper
 // ---------------------------------------------------------------------------
 
-/// Phase 1: Query the gateway for existing providers.
-///
-/// Sends `GatewayCheckComplete(existing, missing)` — no credential
-/// discovery happens here. The UI shows the results and lets the user
-/// decide per-provider whether to create from local creds.
-fn spawn_resolve_providers(app: &App, tx: mpsc::UnboundedSender<Event>) {
-    let mut client = app.client.clone();
-    let Some((_name, _image, selected_types)) = app.create_form_data() else {
-        return;
-    };
-
-    tokio::spawn(async move {
-        // Build type → name map from existing providers on the gateway.
-        let mut type_to_name = std::collections::HashMap::<String, String>::new();
-        let mut offset = 0u32;
-        let limit = 100u32;
+/// Spawn a fast animation ticker (~7 fps) and store the handle on the app.
+fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
+    let anim_tx = tx;
+    app.anim_handle = Some(tokio::spawn(async move {
         loop {
-            let req = navigator_core::proto::ListProvidersRequest { limit, offset };
-            match tokio::time::timeout(Duration::from_secs(5), client.list_providers(req)).await {
-                Ok(Ok(resp)) => {
-                    let providers = resp.into_inner().providers;
-                    let batch_len = providers.len();
-                    for p in &providers {
-                        if !p.r#type.is_empty() {
-                            type_to_name
-                                .entry(p.r#type.to_ascii_lowercase())
-                                .or_insert_with(|| p.name.clone());
-                        }
-                    }
-                    if batch_len < limit as usize {
-                        break;
-                    }
-                    offset += limit;
-                }
-                Ok(Err(_)) | Err(_) => break,
+            tokio::time::sleep(Duration::from_millis(140)).await;
+            if anim_tx.send(Event::Redraw).is_err() {
+                break;
             }
         }
-
-        let mut existing = Vec::new();
-        let mut missing = Vec::new();
-
-        for ptype in &selected_types {
-            let key = ptype.to_ascii_lowercase();
-            if let Some(name) = type_to_name.get(&key) {
-                existing.push((ptype.clone(), name.clone()));
-            } else {
-                missing.push(ptype.clone());
-            }
-        }
-
-        let _ = tx.send(Event::GatewayCheckComplete(existing, missing));
-    });
+    }));
 }
 
-/// Phase 2: Discover + auto-create confirmed providers, then create the sandbox.
-///
-/// Called after the user reviews which missing providers to create from
-/// local creds. Sends `ProviderStatus` events for each discovery attempt,
-/// then `CreateResult` when done.
+// ---------------------------------------------------------------------------
+// Create sandbox (simplified — uses pre-selected provider names)
+// ---------------------------------------------------------------------------
+
 fn spawn_create_sandbox(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
-    let Some(form) = &app.create_form else {
+    let Some((name, image, _command, selected_providers)) = app.create_form_data() else {
         return;
     };
 
-    let name = form.name.clone();
-    let image = form.image.clone();
-
-    // Providers already on the gateway.
-    let mut resolved_names: Vec<String> = form
-        .existing_providers
-        .iter()
-        .map(|(_, n)| n.clone())
-        .collect();
-
-    // Missing providers the user confirmed for local discovery.
-    let to_discover: Vec<String> = form
-        .missing_providers
-        .iter()
-        .filter(|(_, create)| *create)
-        .map(|(t, _)| t.clone())
-        .collect();
-
     tokio::spawn(async move {
-        use event::ProviderResolution;
-
-        // -- Discover + auto-create confirmed missing providers --
-        let registry = navigator_providers::ProviderRegistry::new();
-        for ptype in &to_discover {
-            let _ = tx.send(Event::ProviderStatus(
-                ptype.clone(),
-                ProviderResolution::Discovering,
-            ));
-
-            let discovered = registry.discover_existing(ptype).ok().flatten();
-            let Some(discovered) = discovered else {
-                let _ = tx.send(Event::ProviderStatus(
-                    ptype.clone(),
-                    ProviderResolution::NotFound,
-                ));
-                continue;
-            };
-
-            // Try to register with the gateway (name-collision retry).
-            let mut created = false;
-            for attempt in 0..5u32 {
-                let provider_name = if attempt == 0 {
-                    ptype.clone()
-                } else {
-                    format!("{ptype}-{attempt}")
-                };
-
-                let req = navigator_core::proto::CreateProviderRequest {
-                    provider: Some(navigator_core::proto::Provider {
-                        id: String::new(),
-                        name: provider_name.clone(),
-                        r#type: ptype.clone(),
-                        credentials: discovered.credentials.clone(),
-                        config: discovered.config.clone(),
-                    }),
-                };
-
-                match client.create_provider(req).await {
-                    Ok(resp) => {
-                        let name = resp
-                            .into_inner()
-                            .provider
-                            .map_or(provider_name, |p| p.name);
-                        let _ = tx.send(Event::ProviderStatus(
-                            ptype.clone(),
-                            ProviderResolution::Created(name.clone()),
-                        ));
-                        resolved_names.push(name);
-                        created = true;
-                        break;
-                    }
-                    Err(status) if status.code() == tonic::Code::AlreadyExists => {}
-                    Err(e) => {
-                        let _ = tx.send(Event::ProviderStatus(
-                            ptype.clone(),
-                            ProviderResolution::Failed(e.message().to_string()),
-                        ));
-                        break;
-                    }
-                }
-            }
-
-            if !created {
-                // ProviderStatus already sent (NotFound or Failed).
-            }
-        }
-
-        // -- Build and send the create request --
         let has_custom_image = !image.is_empty();
         let template = if has_custom_image {
             Some(navigator_core::proto::SandboxTemplate {
@@ -619,7 +546,7 @@ fn spawn_create_sandbox(app: &App, tx: mpsc::UnboundedSender<Event>) {
         let req = navigator_core::proto::CreateSandboxRequest {
             name,
             spec: Some(navigator_core::proto::SandboxSpec {
-                providers: resolved_names,
+                providers: selected_providers,
                 template,
                 policy: Some(policy),
                 ..Default::default()
@@ -645,12 +572,222 @@ fn spawn_create_sandbox(app: &App, tx: mpsc::UnboundedSender<Event>) {
 }
 
 // ---------------------------------------------------------------------------
+// Provider CRUD
+// ---------------------------------------------------------------------------
+
+/// Create a provider on the gateway.
+fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some(form) = &app.create_provider_form else {
+        return;
+    };
+
+    let ptype = form.types.get(form.type_cursor).cloned().unwrap_or_default();
+    let name = if form.name.is_empty() {
+        ptype.clone()
+    } else {
+        form.name.clone()
+    };
+    let credentials = form.discovered_credentials.clone().unwrap_or_default();
+
+    tokio::spawn(async move {
+        // Try with the chosen name, retry with suffix on collision.
+        for attempt in 0..5u32 {
+            let provider_name = if attempt == 0 {
+                name.clone()
+            } else {
+                format!("{name}-{attempt}")
+            };
+
+            let req = navigator_core::proto::CreateProviderRequest {
+                provider: Some(navigator_core::proto::Provider {
+                    id: String::new(),
+                    name: provider_name.clone(),
+                    r#type: ptype.clone(),
+                    credentials: credentials.clone(),
+                    config: Default::default(),
+                }),
+            };
+
+            match client.create_provider(req).await {
+                Ok(resp) => {
+                    let final_name = resp
+                        .into_inner()
+                        .provider
+                        .map_or(provider_name, |p| p.name);
+                    let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
+                    return;
+                }
+                Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                    // Retry with a different name.
+                }
+                Err(e) => {
+                    let _ = tx.send(Event::ProviderCreateResult(Err(e.message().to_string())));
+                    return;
+                }
+            }
+        }
+        let _ = tx.send(Event::ProviderCreateResult(Err(
+            "name collision after 5 attempts".to_string(),
+        )));
+    });
+}
+
+/// Fetch a single provider's details.
+fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_provider_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::GetProviderRequest { name };
+        match tokio::time::timeout(Duration::from_secs(5), client.get_provider(req)).await {
+            Ok(Ok(resp)) => {
+                if let Some(provider) = resp.into_inner().provider {
+                    let _ = tx.send(Event::ProviderDetailFetched(Ok(Box::new(provider))));
+                } else {
+                    let _ = tx.send(Event::ProviderDetailFetched(Err(
+                        "provider not found in response".to_string(),
+                    )));
+                }
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::ProviderDetailFetched(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::ProviderDetailFetched(Err(
+                    "request timed out".to_string(),
+                )));
+            }
+        }
+    });
+}
+
+/// Update a provider's credentials.
+fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let Some(form) = &app.update_provider_form else {
+        return;
+    };
+
+    let name = form.provider_name.clone();
+    let ptype = form.provider_type.clone();
+    let cred_key = form.credential_key.clone();
+    let new_value = form.new_value.clone();
+
+    tokio::spawn(async move {
+        let mut credentials = std::collections::HashMap::new();
+        credentials.insert(cred_key, new_value);
+
+        let req = navigator_core::proto::UpdateProviderRequest {
+            provider: Some(navigator_core::proto::Provider {
+                id: String::new(),
+                name: name.clone(),
+                r#type: ptype,
+                credentials,
+                config: Default::default(),
+            }),
+        };
+
+        match tokio::time::timeout(Duration::from_secs(5), client.update_provider(req)).await {
+            Ok(Ok(_)) => {
+                let _ = tx.send(Event::ProviderUpdateResult(Ok(name)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::ProviderUpdateResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::ProviderUpdateResult(Err(
+                    "request timed out".to_string(),
+                )));
+            }
+        }
+    });
+}
+
+/// Delete a provider by name.
+fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_provider_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::DeleteProviderRequest { name };
+        match tokio::time::timeout(Duration::from_secs(5), client.delete_provider(req)).await {
+            Ok(Ok(resp)) => {
+                let _ = tx.send(Event::ProviderDeleteResult(Ok(resp.into_inner().deleted)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::ProviderDeleteResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::ProviderDeleteResult(Err(
+                    "request timed out".to_string(),
+                )));
+            }
+        }
+    });
+}
+
+/// Mask a secret value, showing only the first and last 2 chars.
+fn mask_secret(value: &str) -> String {
+    let len = value.len();
+    if len <= 6 {
+        "*".repeat(len)
+    } else {
+        let start: String = value.chars().take(2).collect();
+        let end: String = value.chars().skip(len - 2).collect();
+        format!("{start}{}…{end}", "*".repeat(len.saturating_sub(4).min(20)))
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Data refresh
 // ---------------------------------------------------------------------------
 
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
+    refresh_providers(app).await;
     refresh_sandboxes(app).await;
+}
+
+async fn refresh_providers(app: &mut App) {
+    let req = navigator_core::proto::ListProvidersRequest {
+        limit: 100,
+        offset: 0,
+    };
+    let result = tokio::time::timeout(Duration::from_secs(5), app.client.list_providers(req)).await;
+    match result {
+        Ok(Err(e)) => {
+            tracing::warn!("failed to list providers: {}", e.message());
+        }
+        Err(_) => {
+            tracing::warn!("list providers timed out");
+        }
+        Ok(Ok(resp)) => {
+            let providers = resp.into_inner().providers;
+            app.provider_count = providers.len();
+            app.provider_names = providers.iter().map(|p| p.name.clone()).collect();
+            app.provider_types = providers.iter().map(|p| p.r#type.clone()).collect();
+            app.provider_cred_keys = providers
+                .iter()
+                .map(|p| {
+                    p.credentials
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_else(|| "-".to_string())
+                })
+                .collect();
+            if app.provider_selected >= app.provider_count && app.provider_count > 0 {
+                app.provider_selected = app.provider_count - 1;
+            }
+        }
+    }
 }
 
 async fn refresh_health(app: &mut App) {

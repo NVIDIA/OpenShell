@@ -1,5 +1,7 @@
-mod create_sandbox;
+pub(crate) mod create_provider;
+pub(crate) mod create_sandbox;
 mod dashboard;
+pub(crate) mod providers;
 pub(crate) mod sandbox_detail;
 pub(crate) mod sandbox_logs;
 pub(crate) mod sandboxes;
@@ -33,9 +35,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_nav_bar(frame, app, chunks[2]);
     draw_command_bar(frame, app, chunks[3]);
 
-    // Modal overlay (drawn last so it's on top).
+    // Modal overlays (drawn last so they're on top).
     if app.create_form.is_some() {
         create_sandbox::draw(frame, app, frame.size());
+    }
+    if app.create_provider_form.is_some() {
+        create_provider::draw(frame, app, frame.size());
+    }
+    if app.provider_detail.is_some() {
+        create_provider::draw_detail(frame, app, frame.size());
+    }
+    if app.update_provider_form.is_some() {
+        create_provider::draw_update(frame, app, frame.size());
     }
 }
 
@@ -64,13 +75,13 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut parts: Vec<Span<'_>> = vec![
         Span::styled(" Gator", styles::ACCENT_BOLD),
-        Span::styled(" │ ", styles::MUTED),
+        Span::styled(" | ", styles::MUTED),
         Span::styled("Current Cluster: ", styles::TEXT),
         Span::styled(&app.cluster_name, styles::HEADING),
         Span::styled(" (", styles::MUTED),
         status_span,
         Span::styled(")", styles::MUTED),
-        Span::styled(" │ ", styles::MUTED),
+        Span::styled(" | ", styles::MUTED),
     ];
 
     match app.screen {
@@ -94,8 +105,36 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spans = match app.screen {
         Screen::Dashboard => match app.focus {
+            Focus::Providers => vec![
+                Span::styled(" ", styles::TEXT),
+                Span::styled("[Tab]", styles::KEY_HINT),
+                Span::styled(" Switch Panel", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[j/k]", styles::KEY_HINT),
+                Span::styled(" Navigate", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[Enter]", styles::KEY_HINT),
+                Span::styled(" Detail", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[c]", styles::KEY_HINT),
+                Span::styled(" Create", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[u]", styles::KEY_HINT),
+                Span::styled(" Update", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[d]", styles::KEY_HINT),
+                Span::styled(" Delete", styles::TEXT),
+                Span::styled("  |  ", styles::BORDER),
+                Span::styled("[:]", styles::MUTED),
+                Span::styled(" Command  ", styles::MUTED),
+                Span::styled("[q]", styles::MUTED),
+                Span::styled(" Quit", styles::MUTED),
+            ],
             Focus::Sandboxes => vec![
                 Span::styled(" ", styles::TEXT),
+                Span::styled("[Tab]", styles::KEY_HINT),
+                Span::styled(" Switch Panel", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
                 Span::styled("[j/k]", styles::KEY_HINT),
                 Span::styled(" Navigate", styles::TEXT),
                 Span::styled("  ", styles::TEXT),
@@ -104,10 +143,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[c]", styles::KEY_HINT),
                 Span::styled(" Create Sandbox", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[Tab]", styles::KEY_HINT),
-                Span::styled(" Switch Panel", styles::TEXT),
-                Span::styled("  │  ", styles::BORDER),
+                Span::styled("  |  ", styles::BORDER),
                 Span::styled("[:]", styles::MUTED),
                 Span::styled(" Command  ", styles::MUTED),
                 Span::styled("[q]", styles::MUTED),
@@ -115,15 +151,15 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
             ],
             _ => vec![
                 Span::styled(" ", styles::TEXT),
+                Span::styled("[Tab]", styles::KEY_HINT),
+                Span::styled(" Switch Panel", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
                 Span::styled("[j/k]", styles::KEY_HINT),
                 Span::styled(" Navigate", styles::TEXT),
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[Enter]", styles::KEY_HINT),
                 Span::styled(" Select", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[Tab]", styles::KEY_HINT),
-                Span::styled(" Switch Panel", styles::TEXT),
-                Span::styled("  │  ", styles::BORDER),
+                Span::styled("  |  ", styles::BORDER),
                 Span::styled("[:]", styles::MUTED),
                 Span::styled(" Command  ", styles::MUTED),
                 Span::styled("[q]", styles::MUTED),
@@ -159,7 +195,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled("  ", styles::TEXT),
                     Span::styled("[s]", styles::KEY_HINT),
                     Span::styled(format!(" Source: {filter_label}"), styles::TEXT),
-                    Span::styled("  │  ", styles::BORDER),
+                    Span::styled("  |  ", styles::BORDER),
                     Span::styled("[Esc]", styles::MUTED),
                     Span::styled(" Back", styles::MUTED),
                     Span::styled("  ", styles::TEXT),
@@ -174,7 +210,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[d]", styles::KEY_HINT),
                 Span::styled(" Delete", styles::TEXT),
-                Span::styled("  │  ", styles::BORDER),
+                Span::styled("  |  ", styles::BORDER),
                 Span::styled("[Esc]", styles::MUTED),
                 Span::styled(" Back to Dashboard", styles::MUTED),
                 Span::styled("  ", styles::TEXT),
@@ -192,7 +228,7 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         InputMode::Command => Line::from(vec![
             Span::styled(" :", styles::ACCENT_BOLD),
             Span::styled(&app.command_input, styles::TEXT),
-            Span::styled("█", styles::ACCENT),
+            Span::styled("_", styles::ACCENT),
         ]),
         InputMode::Normal => Line::from(vec![Span::styled("", styles::MUTED)]),
     };

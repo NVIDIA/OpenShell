@@ -46,6 +46,14 @@ pub trait ProviderPlugin: Send + Sync {
     /// Discover provider credentials and config from the local machine.
     fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError>;
 
+    /// Return the known credential environment variable names for this provider type.
+    ///
+    /// Used by the TUI to label BYO key entry fields and to choose which
+    /// env var name to store a manually-entered credential under.
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Apply provider data to sandbox runtime context.
     ///
     /// Default implementation is a no-op; provider-specific runtime projection
@@ -92,6 +100,12 @@ impl ProviderRegistry {
             return Err(ProviderError::UnsupportedProvider(id.to_string()));
         };
         plugin.discover_existing()
+    }
+
+    /// Return the known credential env var names for a provider type.
+    #[must_use]
+    pub fn credential_env_vars(&self, id: &str) -> &'static [&'static str] {
+        self.get(id).map_or(&[], ProviderPlugin::credential_env_vars)
     }
 
     #[must_use]

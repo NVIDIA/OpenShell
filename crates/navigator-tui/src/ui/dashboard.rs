@@ -7,17 +7,18 @@ use crate::app::{App, Focus};
 use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    // Dynamic height: cluster table gets just enough rows, rest goes to sandbox table.
-    #[allow(clippy::cast_possible_truncation)]
-    let cluster_height = (app.clusters.len() as u16 + 4).clamp(5, 12);
-
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(cluster_height), Constraint::Min(0)])
+        .constraints([
+            Constraint::Percentage(25),
+            Constraint::Percentage(25),
+            Constraint::Percentage(50),
+        ])
         .split(area);
 
     draw_cluster_list(frame, app, chunks[0]);
-    super::sandboxes::draw(frame, app, chunks[1], app.focus == Focus::Sandboxes);
+    super::providers::draw(frame, app, chunks[1], app.focus == Focus::Providers);
+    super::sandboxes::draw(frame, app, chunks[2], app.focus == Focus::Sandboxes);
 }
 
 fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -25,7 +26,6 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let header = Row::new(vec![
         Cell::from(Span::styled("  NAME", styles::MUTED)),
-        Cell::from(Span::styled("ENDPOINT", styles::MUTED)),
         Cell::from(Span::styled("TYPE", styles::MUTED)),
         Cell::from(Span::styled("STATUS", styles::MUTED)),
     ])
@@ -39,9 +39,8 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
             let is_active = entry.name == app.cluster_name;
             let is_cursor = focused && i == app.cluster_selected;
 
-            // Name cell: cursor marker (▌) + active dot (●).
-            let cursor = if is_cursor { "▌" } else { " " };
-            let dot = if is_active { "● " } else { "  " };
+            let cursor = if is_cursor { ">" } else { " " };
+            let dot = if is_active { "* " } else { "  " };
             let dot_style = if is_active {
                 styles::STATUS_OK
             } else {
@@ -70,17 +69,13 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     styles::MUTED
                 };
-                Cell::from(Line::from(vec![
-                    Span::styled("● ", status_style),
-                    Span::styled(&app.status_text, status_style),
-                ]))
+                Cell::from(Span::styled(&app.status_text, status_style))
             } else {
-                Cell::from(Span::styled("─", styles::MUTED))
+                Cell::from(Span::styled("-", styles::MUTED))
             };
 
             Row::new(vec![
                 name_cell,
-                Cell::from(Span::styled(&entry.endpoint, styles::MUTED)),
                 Cell::from(Span::styled(type_label, styles::MUTED)),
                 status_cell,
             ])
@@ -100,10 +95,9 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .padding(Padding::horizontal(1));
 
     let widths = [
-        Constraint::Percentage(25),
+        Constraint::Percentage(45),
+        Constraint::Percentage(20),
         Constraint::Percentage(35),
-        Constraint::Percentage(15),
-        Constraint::Percentage(25),
     ];
 
     let table = Table::new(rows, widths).header(header).block(block);
@@ -117,10 +111,7 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(3),
         };
-        let msg = Paragraph::new(Span::styled(
-            " No clusters found. Run `nav cluster admin deploy` to create one.",
-            styles::MUTED,
-        ));
+        let msg = Paragraph::new(Span::styled(" No clusters found.", styles::MUTED));
         frame.render_widget(msg, inner);
     }
 }

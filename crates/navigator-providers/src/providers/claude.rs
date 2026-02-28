@@ -17,6 +17,10 @@ impl ProviderPlugin for ClaudeProvider {
     fn discover_existing(&self) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
         discover_with_spec(&SPEC, &RealDiscoveryContext)
     }
+
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        SPEC.credential_env_vars
+    }
 }
 
 #[cfg(test)]

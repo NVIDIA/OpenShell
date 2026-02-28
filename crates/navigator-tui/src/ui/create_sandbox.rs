@@ -4,7 +4,6 @@ use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{App, CreateFormField, CreatePhase};
-use crate::event::ProviderResolution;
 use crate::theme::styles;
 
 /// Draw the create sandbox modal overlay.
@@ -15,8 +14,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     match form.phase {
         CreatePhase::Form => draw_form(frame, app, area),
-        CreatePhase::Resolving => draw_resolving(frame, app, area),
-        CreatePhase::Confirm => draw_confirm(frame, app, area),
         CreatePhase::Creating => draw_creating(frame, app, area),
     }
 }
@@ -119,11 +116,11 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         chunks[4],
     );
 
-    // --- Provider list ---
+    // --- Provider list (existing providers by name + type) ---
     if form.providers.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
-                "  (none available)",
+                "  (none — create providers first)",
                 styles::MUTED,
             ))),
             chunks[5],
@@ -143,9 +140,15 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 } else {
                     styles::TEXT
                 };
+                let type_display = if p.provider_type.is_empty() {
+                    String::new()
+                } else {
+                    format!(" ({})", p.provider_type)
+                };
                 Line::from(vec![
                     Span::styled(format!("  {marker} {checkbox} "), style),
                     Span::styled(&p.name, style),
+                    Span::styled(type_display, styles::MUTED),
                 ])
             })
             .collect();
@@ -203,186 +206,6 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Resolving view — shown while discovering providers
-// ---------------------------------------------------------------------------
-
-fn draw_resolving(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(form) = &app.create_form else {
-        return;
-    };
-
-    #[allow(clippy::cast_possible_truncation)]
-    let provider_lines = form.provider_statuses.len().max(1) as u16;
-    // content: header(1) + spacer(1) + providers + spacer(1) + animation(1)
-    // chrome:  border(2) + padding top/bottom(2)
-    let content_height = 1 + 1 + provider_lines + 1 + 1;
-    let modal_width = 60u16.min(area.width.saturating_sub(4));
-    let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
-    let popup_area = centered_rect(modal_width, modal_height, area);
-
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default()
-        .title(Span::styled(" Resolving Providers ", styles::HEADING))
-        .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
-        .padding(Padding::new(2, 2, 1, 1));
-
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),              // status text
-            Constraint::Length(1),              // spacer
-            Constraint::Length(provider_lines), // provider status lines
-            Constraint::Length(1),              // spacer
-            Constraint::Length(1),              // animation
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "Checking providers...",
-            styles::TEXT,
-        ))),
-        chunks[0],
-    );
-
-    if form.provider_statuses.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                "  Querying gateway...",
-                styles::MUTED,
-            ))),
-            chunks[2],
-        );
-    } else {
-        frame.render_widget(Paragraph::new(provider_status_lines(form)), chunks[2]);
-    }
-
-    let elapsed_ms = form.anim_start.map_or(0, |s| s.elapsed().as_millis());
-    let track_width = chunks[4].width.saturating_sub(1) as usize;
-    let anim_line = render_chase(track_width, elapsed_ms);
-    frame.render_widget(Paragraph::new(anim_line), chunks[4]);
-}
-
-// ---------------------------------------------------------------------------
-// Confirm view — show resolution results, wait for user to proceed
-// ---------------------------------------------------------------------------
-
-fn draw_confirm(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let Some(form) = &app.create_form else {
-        return;
-    };
-
-    #[allow(clippy::cast_possible_truncation)]
-    let existing_count = form.existing_providers.len() as u16;
-    #[allow(clippy::cast_possible_truncation)]
-    let missing_count = form.missing_providers.len() as u16;
-    let has_missing = missing_count > 0;
-
-    // Missing providers: compact single-line format with inline checkbox.
-    let provider_lines = existing_count + missing_count;
-
-    // content: header(1) + spacer(1) + providers + spacer(1) + hints(1)
-    // chrome:  border(2) + padding top/bottom(2)
-    let content_height = 1 + 1 + provider_lines + 1 + 1;
-    let modal_width = 60u16.min(area.width.saturating_sub(4));
-    let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
-    let popup_area = centered_rect(modal_width, modal_height, area);
-
-    frame.render_widget(Clear, popup_area);
-
-    let block = Block::default()
-        .title(Span::styled(" Provider Resolution ", styles::HEADING))
-        .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
-        .padding(Padding::new(2, 2, 1, 1));
-
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
-
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),              // header
-            Constraint::Length(1),              // spacer
-            Constraint::Length(provider_lines), // provider lines
-            Constraint::Length(1),              // spacer
-            Constraint::Length(1),              // nav hints
-            Constraint::Min(0),
-        ])
-        .split(inner);
-
-    // Header.
-    let header = if has_missing {
-        format!("{existing_count} on gateway, {missing_count} missing")
-    } else {
-        format!("All {existing_count} provider(s) found on gateway")
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(header, styles::TEXT))),
-        chunks[0],
-    );
-
-    // Provider lines: existing (checkmark) + missing (compact inline toggle).
-    let mut lines: Vec<Line<'_>> = Vec::new();
-
-    for (ptype, pname) in &form.existing_providers {
-        lines.push(Line::from(vec![
-            Span::styled("  ✓ ", styles::STATUS_OK),
-            Span::styled(format!("{ptype} -> {pname}"), styles::STATUS_OK),
-        ]));
-    }
-
-    for (i, (ptype, should_create)) in form.missing_providers.iter().enumerate() {
-        let is_cursor = i == form.confirm_cursor;
-        let marker = if is_cursor { ">" } else { " " };
-        let checkbox = if *should_create { "[x]" } else { "[ ]" };
-        let style = if is_cursor {
-            styles::ACCENT
-        } else {
-            styles::STATUS_ERR
-        };
-        let cb_style = if is_cursor {
-            styles::ACCENT
-        } else {
-            styles::MUTED
-        };
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {marker}✗ "), style),
-            Span::styled(format!("{ptype}"), style),
-            Span::styled(format!("  {checkbox} create from local creds?"), cb_style),
-        ]));
-    }
-
-    frame.render_widget(Paragraph::new(lines), chunks[2]);
-
-    // Nav hints.
-    let mut hint_spans = vec![
-        Span::styled("[Enter]", styles::KEY_HINT),
-        Span::styled(" Create ", styles::MUTED),
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Cancel", styles::MUTED),
-    ];
-    if has_missing {
-        hint_spans.splice(
-            0..0,
-            [
-                Span::styled("[j/k]", styles::KEY_HINT),
-                Span::styled(" Nav ", styles::MUTED),
-                Span::styled("[Space]", styles::KEY_HINT),
-                Span::styled(" Toggle ", styles::MUTED),
-            ],
-        );
-    }
-    frame.render_widget(Paragraph::new(Line::from(hint_spans)), chunks[4]);
-}
-
-// ---------------------------------------------------------------------------
 // Creating view — shown after user confirms, sandbox being created
 // ---------------------------------------------------------------------------
 
@@ -391,20 +214,9 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
         return;
     };
 
-    let has_statuses = !form.provider_statuses.is_empty();
-
-    #[allow(clippy::cast_possible_truncation)]
-    let status_lines = if has_statuses {
-        form.provider_statuses.len() as u16
-    } else {
-        0
-    };
-    // Spacer between statuses and animation only if there are statuses.
-    let status_spacer = u16::from(has_statuses);
-
-    // content: header(1) + spacer(1) + statuses + status_spacer + animation(1)
+    // content: header(1) + spacer(1) + animation(1)
     // chrome:  border(2) + padding top/bottom(2)
-    let content_height = 1 + 1 + status_lines + status_spacer + 1;
+    let content_height = 1 + 1 + 1;
     let modal_width = 60u16.min(area.width.saturating_sub(4));
     let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
@@ -423,11 +235,9 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1),             // header
-            Constraint::Length(1),             // spacer
-            Constraint::Length(status_lines),  // provider discovery progress
-            Constraint::Length(status_spacer), // spacer (only if statuses)
-            Constraint::Length(1),             // animation
+            Constraint::Length(1), // header
+            Constraint::Length(1), // spacer
+            Constraint::Length(1), // animation
             Constraint::Min(0),
         ])
         .split(inner);
@@ -443,66 +253,17 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
         chunks[0],
     );
 
-    // Provider discovery progress.
-    if has_statuses {
-        frame.render_widget(Paragraph::new(provider_status_lines(form)), chunks[2]);
-    }
-
     // Pacman chase animation.
     let elapsed_ms = form.anim_start.map_or(0, |s| s.elapsed().as_millis());
-    let track_width = chunks[4].width.saturating_sub(1) as usize;
+    let track_width = chunks[2].width.saturating_sub(1) as usize;
     let anim_line = render_chase(track_width, elapsed_ms);
-    frame.render_widget(Paragraph::new(anim_line), chunks[4]);
-}
-
-// ---------------------------------------------------------------------------
-// Shared provider status line rendering
-// ---------------------------------------------------------------------------
-
-fn provider_status_lines(form: &crate::app::CreateSandboxForm) -> Vec<Line<'static>> {
-    form.provider_statuses
-        .iter()
-        .map(|(ptype, resolution)| {
-            let (icon, desc, style) = match resolution {
-                ProviderResolution::Exists(name) => (
-                    "✓",
-                    format!("{ptype} -> {name} (exists)"),
-                    styles::STATUS_OK,
-                ),
-                ProviderResolution::Missing => {
-                    ("✗", format!("{ptype}: not on gateway"), styles::STATUS_ERR)
-                }
-                ProviderResolution::Discovering => (
-                    "…",
-                    format!("{ptype}: discovering local credentials"),
-                    styles::MUTED,
-                ),
-                ProviderResolution::Created(name) => (
-                    "✓",
-                    format!("{ptype} -> {name} (created from local creds)"),
-                    styles::STATUS_OK,
-                ),
-                ProviderResolution::NotFound => (
-                    "✗",
-                    format!("{ptype}: no local credentials found"),
-                    styles::STATUS_ERR,
-                ),
-                ProviderResolution::Failed(msg) => {
-                    ("✗", format!("{ptype}: {msg}"), styles::STATUS_ERR)
-                }
-            };
-            Line::from(vec![
-                Span::styled(format!("  {icon} "), style),
-                Span::styled(desc, style),
-            ])
-        })
-        .collect()
+    frame.render_widget(Paragraph::new(anim_line), chunks[2]);
 }
 
 /// Render the NVIDIA pacman chasing a maroon claw across a dot track.
 ///
 /// The sprite scrolls right across `track_width`, wrapping around.
-fn render_chase(track_width: usize, elapsed_ms: u128) -> Line<'static> {
+pub fn render_chase(track_width: usize, elapsed_ms: u128) -> Line<'static> {
     if track_width < 10 {
         return Line::from(Span::styled("...", styles::MUTED));
     }

@@ -4,24 +4,6 @@ use tokio::sync::mpsc;
 
 use crate::app::LogLine;
 
-/// Per-provider resolution outcome, displayed during create sandbox flow.
-#[derive(Debug, Clone)]
-#[allow(dead_code)]
-pub enum ProviderResolution {
-    /// Provider already registered on the gateway.
-    Exists(String), // provider name
-    /// Provider not found on the gateway (user must decide whether to create).
-    Missing,
-    /// Discovered local credentials, attempting to create on gateway.
-    Discovering,
-    /// Successfully auto-created on gateway from local credentials.
-    Created(String), // provider name
-    /// No local credentials found for this type.
-    NotFound,
-    /// Failed to create on gateway.
-    Failed(String), // error message
-}
-
 #[derive(Debug)]
 pub enum Event {
     Key(KeyEvent),
@@ -33,12 +15,16 @@ pub enum Event {
     Resize(u16, u16),
     /// A batch of log lines from the streaming log task.
     LogLines(Vec<LogLine>),
-    /// Gateway check complete: `(existing: [(type, name)], missing: [type])`.
-    GatewayCheckComplete(Vec<(String, String)>, Vec<String>),
-    /// Per-provider resolution progress update (during creation phase).
-    ProviderStatus(String, ProviderResolution),
     /// Result of a create sandbox request: `Ok(name)` or `Err(message)`.
     CreateResult(Result<String, String>),
+    /// Result of creating a provider on the gateway: `Ok(name)` or `Err(message)`.
+    ProviderCreateResult(Result<String, String>),
+    /// Provider detail fetched from gateway.
+    ProviderDetailFetched(Result<Box<navigator_core::proto::Provider>, String>),
+    /// Provider update result: `Ok(name)` or `Err(message)`.
+    ProviderUpdateResult(Result<String, String>),
+    /// Provider delete result: `Ok(deleted)` or `Err(message)`.
+    ProviderDeleteResult(Result<bool, String>),
 }
 
 pub struct EventHandler {
