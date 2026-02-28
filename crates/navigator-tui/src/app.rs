@@ -31,8 +31,9 @@ pub enum Focus {
     Clusters,
     Providers,
     Sandboxes,
-    // Sandbox screen
-    SandboxDetail,
+    // Sandbox screen — metadata pane is always visible (non-interactive);
+    // the focused pane is always the bottom one (policy or logs).
+    SandboxPolicy,
     SandboxLogs,
 }
 
@@ -300,6 +301,13 @@ pub struct App {
     pub confirm_delete: bool,
     pub pending_log_fetch: bool,
     pub pending_sandbox_delete: bool,
+    pub pending_sandbox_detail: bool,
+
+    // Sandbox policy viewer
+    pub sandbox_policy: Option<navigator_core::proto::SandboxPolicy>,
+    pub sandbox_providers_list: Vec<String>,
+    pub policy_lines: Vec<ratatui::text::Line<'static>>,
+    pub policy_scroll: usize,
 
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
@@ -362,6 +370,11 @@ impl App {
             confirm_delete: false,
             pending_log_fetch: false,
             pending_sandbox_delete: false,
+            pending_sandbox_detail: false,
+            sandbox_policy: None,
+            sandbox_providers_list: Vec::new(),
+            policy_lines: Vec::new(),
+            policy_scroll: 0,
             create_form: None,
             pending_create_sandbox: false,
             anim_handle: None,
@@ -431,7 +444,7 @@ impl App {
             Focus::Clusters => self.handle_clusters_key(key),
             Focus::Providers => self.handle_providers_key(key),
             Focus::Sandboxes => self.handle_sandboxes_key(key),
-            Focus::SandboxDetail => self.handle_detail_key(key),
+            Focus::SandboxPolicy => self.handle_policy_key(key),
             Focus::SandboxLogs => self.handle_logs_key(key),
         }
     }
@@ -545,8 +558,9 @@ impl App {
             KeyCode::Enter => {
                 if self.sandbox_count > 0 {
                     self.screen = Screen::Sandbox;
-                    self.focus = Focus::SandboxDetail;
+                    self.focus = Focus::SandboxPolicy;
                     self.confirm_delete = false;
+                    self.pending_sandbox_detail = true;
                 }
             }
             KeyCode::Esc => {
@@ -556,7 +570,7 @@ impl App {
         }
     }
 
-    fn handle_detail_key(&mut self, key: KeyEvent) {
+    fn handle_policy_key(&mut self, key: KeyEvent) {
         if self.confirm_delete {
             match key.code {
                 KeyCode::Char('y') => {
@@ -590,8 +604,34 @@ impl App {
             KeyCode::Char('d') => {
                 self.confirm_delete = true;
             }
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.scroll_policy(1);
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.scroll_policy(-1);
+            }
+            KeyCode::Char('G') => {
+                // Scroll to bottom.
+                self.policy_scroll = self.policy_lines.len().saturating_sub(1);
+            }
+            KeyCode::Char('g') => {
+                self.policy_scroll = 0;
+            }
             KeyCode::Char('q') => self.running = false,
             _ => {}
+        }
+    }
+
+    /// Scroll policy pane by a delta (positive = down, negative = up).
+    pub fn scroll_policy(&mut self, delta: isize) {
+        let max = self.policy_lines.len().saturating_sub(1);
+        if delta < 0 {
+            self.policy_scroll = self.policy_scroll.saturating_sub(delta.unsigned_abs());
+        } else {
+            #[allow(clippy::cast_sign_loss)]
+            {
+                self.policy_scroll = (self.policy_scroll + delta as usize).min(max);
+            }
         }
     }
 
@@ -612,7 +652,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.cancel_log_stream();
-                self.focus = Focus::SandboxDetail;
+                self.focus = Focus::SandboxPolicy;
             }
             KeyCode::Char('q') => self.running = false,
             KeyCode::Enter => {
@@ -1223,6 +1263,10 @@ impl App {
         self.log_autoscroll = true;
         self.log_detail_index = None;
         self.confirm_delete = false;
+        self.sandbox_policy = None;
+        self.sandbox_providers_list.clear();
+        self.policy_lines.clear();
+        self.policy_scroll = 0;
         // Reset provider state too.
         self.provider_names.clear();
         self.provider_types.clear();

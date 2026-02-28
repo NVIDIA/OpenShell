@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{App, CreateProviderPhase, ProviderKeyField};
 use crate::theme::styles;

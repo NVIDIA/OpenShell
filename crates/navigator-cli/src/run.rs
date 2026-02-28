@@ -24,9 +24,8 @@ use navigator_core::proto::{
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
     InferenceRoute, InferenceRouteSpec, ListInferenceRoutesRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec,
-    SandboxTemplate, UpdateInferenceRouteRequest, UpdateProviderRequest,
-    UpdateSandboxPolicyRequest, WatchSandboxRequest,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, UpdateInferenceRouteRequest,
+    UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,

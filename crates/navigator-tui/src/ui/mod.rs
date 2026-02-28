@@ -4,14 +4,15 @@ mod dashboard;
 pub(crate) mod providers;
 pub(crate) mod sandbox_detail;
 pub(crate) mod sandbox_logs;
+mod sandbox_policy;
 pub(crate) mod sandboxes;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
-use crate::app::{App, Focus, InputMode, Screen};
+use crate::app::{self, App, Focus, InputMode, Screen};
 use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
@@ -55,9 +56,29 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 // ---------------------------------------------------------------------------
 
 fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20), // metadata
+            Constraint::Percentage(80), // policy or logs
+        ])
+        .split(area);
+
+    sandbox_detail::draw(frame, app, chunks[0]);
+
     match app.focus {
-        Focus::SandboxLogs => sandbox_logs::draw(frame, app, area),
-        _ => sandbox_detail::draw(frame, app, area),
+        Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
+        _ => sandbox_policy::draw(frame, app, chunks[1]),
+    }
+
+    // Log detail popup renders over the full frame (not constrained to pane).
+    if app.focus == Focus::SandboxLogs {
+        if let Some(detail_idx) = app.log_detail_index {
+            let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
+            if let Some(log) = filtered.get(detail_idx) {
+                sandbox_logs::draw_detail_popup(frame, log, frame.size());
+            }
+        }
     }
 }
 
@@ -197,7 +218,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled(format!(" Source: {filter_label}"), styles::TEXT),
                     Span::styled("  |  ", styles::BORDER),
                     Span::styled("[Esc]", styles::MUTED),
-                    Span::styled(" Back", styles::MUTED),
+                    Span::styled(" Policy", styles::MUTED),
                     Span::styled("  ", styles::TEXT),
                     Span::styled("[q]", styles::MUTED),
                     Span::styled(" Quit", styles::MUTED),
@@ -205,6 +226,12 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
             }
             _ => vec![
                 Span::styled(" ", styles::TEXT),
+                Span::styled("[j/k]", styles::KEY_HINT),
+                Span::styled(" Scroll", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[g/G]", styles::KEY_HINT),
+                Span::styled(" Top/Bottom", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
                 Span::styled("[l]", styles::KEY_HINT),
                 Span::styled(" Logs", styles::TEXT),
                 Span::styled("  ", styles::TEXT),
@@ -212,7 +239,7 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled(" Delete", styles::TEXT),
                 Span::styled("  |  ", styles::BORDER),
                 Span::styled("[Esc]", styles::MUTED),
-                Span::styled(" Back to Dashboard", styles::MUTED),
+                Span::styled(" Back", styles::MUTED),
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[q]", styles::MUTED),
                 Span::styled(" Quit", styles::MUTED),

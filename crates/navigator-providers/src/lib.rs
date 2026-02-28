@@ -105,7 +105,8 @@ impl ProviderRegistry {
     /// Return the known credential env var names for a provider type.
     #[must_use]
     pub fn credential_env_vars(&self, id: &str) -> &'static [&'static str] {
-        self.get(id).map_or(&[], ProviderPlugin::credential_env_vars)
+        self.get(id)
+            .map_or(&[], ProviderPlugin::credential_env_vars)
     }
 
     #[must_use]

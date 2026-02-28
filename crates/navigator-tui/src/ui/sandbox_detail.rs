@@ -1,11 +1,15 @@
+use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
-use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme::styles;
 
+/// Draw a compact metadata pane for the currently selected sandbox.
+///
+/// This is non-interactive (no focus state) — always rendered with the
+/// unfocused border style in the top ~20% of the sandbox screen.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let idx = app.sandbox_selected;
     let name = app.sandbox_names.get(idx).map_or("-", String::as_str);
@@ -28,31 +32,39 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         _ => "…",
     };
 
-    let mut lines = vec![
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("  Name:     ", styles::MUTED),
-            Span::styled(name, styles::HEADING),
-        ]),
-        Line::from(vec![
-            Span::styled("  Status:   ", styles::MUTED),
-            Span::styled(format!("{status_indicator} "), phase_style),
-            Span::styled(phase, phase_style),
-        ]),
-        Line::from(vec![
-            Span::styled("  Image:    ", styles::MUTED),
-            Span::styled(image, styles::TEXT),
-        ]),
-        Line::from(vec![
-            Span::styled("  Created:  ", styles::MUTED),
-            Span::styled(created, styles::TEXT),
-        ]),
-        Line::from(vec![
-            Span::styled("  Age:      ", styles::MUTED),
-            Span::styled(age, styles::TEXT),
-        ]),
-    ];
+    // Row 1: Name + Status
+    let row1 = Line::from(vec![
+        Span::styled("  Name: ", styles::MUTED),
+        Span::styled(name, styles::HEADING),
+        Span::styled("              Status: ", styles::MUTED),
+        Span::styled(format!("{status_indicator} "), phase_style),
+        Span::styled(phase, phase_style),
+    ]);
 
+    // Row 2: Image + Created + Age
+    let row2 = Line::from(vec![
+        Span::styled("  Image: ", styles::MUTED),
+        Span::styled(image, styles::TEXT),
+        Span::styled("   Created: ", styles::MUTED),
+        Span::styled(created, styles::TEXT),
+        Span::styled("   Age: ", styles::MUTED),
+        Span::styled(age, styles::TEXT),
+    ]);
+
+    // Row 3: Providers
+    let providers_str = if app.sandbox_providers_list.is_empty() {
+        "none".to_string()
+    } else {
+        app.sandbox_providers_list.join(", ")
+    };
+    let row3 = Line::from(vec![
+        Span::styled("  Providers: ", styles::MUTED),
+        Span::styled(providers_str, styles::TEXT),
+    ]);
+
+    let mut lines = vec![Line::from(""), row1, row2, row3];
+
+    // Delete confirmation in title area (same pattern as provider delete).
     if app.confirm_delete {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -70,7 +82,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let block = Block::default()
         .title(Span::styled(format!(" Sandbox: {name} "), styles::HEADING))
         .borders(Borders::ALL)
-        .border_style(styles::BORDER_FOCUSED)
+        .border_style(styles::BORDER) // non-interactive — unfocused border
         .padding(Padding::horizontal(1));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);

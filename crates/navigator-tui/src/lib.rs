@@ -85,6 +85,10 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     app.pending_provider_delete = false;
                     spawn_delete_provider(&app, events.sender());
                 }
+                if app.pending_sandbox_detail {
+                    app.pending_sandbox_detail = false;
+                    fetch_sandbox_detail(&mut app).await;
+                }
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -111,64 +115,69 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     form.create_result = Some(result);
                 }
             }
-            Some(Event::ProviderDetailFetched(result)) => {
-                match result {
-                    Ok(provider) => {
-                        let cred_key = provider.credentials.keys().next().cloned().unwrap_or_default();
-                        let masked = if let Some(val) = provider.credentials.values().next() {
-                            mask_secret(val)
-                        } else {
-                            "-".to_string()
-                        };
-                        app.provider_detail = Some(app::ProviderDetailView {
-                            name: provider.name.clone(),
-                            provider_type: provider.r#type.clone(),
-                            credential_key: cred_key,
-                            masked_value: masked,
-                        });
-                    }
-                    Err(msg) => {
-                        app.status_text = format!("get provider failed: {msg}");
+            Some(Event::ProviderDetailFetched(result)) => match result {
+                Ok(provider) => {
+                    let cred_key = provider
+                        .credentials
+                        .keys()
+                        .next()
+                        .cloned()
+                        .unwrap_or_default();
+                    let masked = if let Some(val) = provider.credentials.values().next() {
+                        mask_secret(val)
+                    } else {
+                        "-".to_string()
+                    };
+                    app.provider_detail = Some(app::ProviderDetailView {
+                        name: provider.name.clone(),
+                        provider_type: provider.r#type.clone(),
+                        credential_key: cred_key,
+                        masked_value: masked,
+                    });
+                }
+                Err(msg) => {
+                    app.status_text = format!("get provider failed: {msg}");
+                }
+            },
+            Some(Event::ProviderUpdateResult(result)) => match result {
+                Ok(name) => {
+                    app.update_provider_form = None;
+                    app.status_text = format!("Updated provider: {name}");
+                    refresh_providers(&mut app).await;
+                }
+                Err(msg) => {
+                    if let Some(form) = app.update_provider_form.as_mut() {
+                        form.status = Some(format!("Failed: {msg}"));
                     }
                 }
-            }
-            Some(Event::ProviderUpdateResult(result)) => {
-                match result {
-                    Ok(name) => {
-                        app.update_provider_form = None;
-                        app.status_text = format!("Updated provider: {name}");
-                        refresh_providers(&mut app).await;
-                    }
-                    Err(msg) => {
-                        if let Some(form) = app.update_provider_form.as_mut() {
-                            form.status = Some(format!("Failed: {msg}"));
-                        }
-                    }
+            },
+            Some(Event::ProviderDeleteResult(result)) => match result {
+                Ok(true) => {
+                    app.status_text = "Provider deleted.".to_string();
+                    refresh_providers(&mut app).await;
                 }
-            }
-            Some(Event::ProviderDeleteResult(result)) => {
-                match result {
-                    Ok(true) => {
-                        app.status_text = "Provider deleted.".to_string();
-                        refresh_providers(&mut app).await;
-                    }
-                    Ok(false) => {
-                        app.status_text = "Provider not found.".to_string();
-                    }
-                    Err(msg) => {
-                        app.status_text = format!("delete provider failed: {msg}");
-                    }
+                Ok(false) => {
+                    app.status_text = "Provider not found.".to_string();
                 }
-            }
-            Some(Event::Mouse(mouse)) => {
-                if app.focus == Focus::SandboxLogs {
-                    match mouse.kind {
-                        MouseEventKind::ScrollUp => app.scroll_logs(-3),
-                        MouseEventKind::ScrollDown => app.scroll_logs(3),
-                        _ => {}
-                    }
+                Err(msg) => {
+                    app.status_text = format!("delete provider failed: {msg}");
                 }
-            }
+            },
+            Some(Event::Mouse(mouse)) => match mouse.kind {
+                MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
+                    app.scroll_logs(-3);
+                }
+                MouseEventKind::ScrollDown if app.focus == Focus::SandboxLogs => {
+                    app.scroll_logs(3);
+                }
+                MouseEventKind::ScrollUp if app.focus == Focus::SandboxPolicy => {
+                    app.scroll_policy(-3);
+                }
+                MouseEventKind::ScrollDown if app.focus == Focus::SandboxPolicy => {
+                    app.scroll_policy(3);
+                }
+                _ => {}
+            },
             Some(Event::Tick) => {
                 refresh_cluster_list(&mut app);
                 refresh_data(&mut app).await;
@@ -177,12 +186,13 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 // Check if a buffered sandbox CreateResult is ready to finalize.
                 if let Some(form) = app.create_form.as_ref() {
                     if form.create_result.is_some() {
-                        let elapsed = form.anim_start.map_or(
-                            app::MIN_CREATING_DISPLAY,
-                            |s| s.elapsed(),
-                        );
+                        let elapsed = form
+                            .anim_start
+                            .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
                         if elapsed >= app::MIN_CREATING_DISPLAY {
-                            let result = app.create_form.as_mut()
+                            let result = app
+                                .create_form
+                                .as_mut()
                                 .and_then(|f| f.create_result.take());
                             if let Some(h) = app.anim_handle.take() {
                                 h.abort();
@@ -208,12 +218,13 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 // Check if a buffered provider CreateResult is ready to finalize.
                 if let Some(form) = app.create_provider_form.as_ref() {
                     if form.create_result.is_some() {
-                        let elapsed = form.anim_start.map_or(
-                            app::MIN_CREATING_DISPLAY,
-                            |s| s.elapsed(),
-                        );
+                        let elapsed = form
+                            .anim_start
+                            .map_or(app::MIN_CREATING_DISPLAY, |s| s.elapsed());
                         if elapsed >= app::MIN_CREATING_DISPLAY {
-                            let result = app.create_provider_form.as_mut()
+                            let result = app
+                                .create_provider_form
+                                .as_mut()
                                 .and_then(|f| f.create_result.take());
                             if let Some(h) = app.anim_handle.take() {
                                 h.abort();
@@ -501,6 +512,200 @@ async fn handle_sandbox_delete(app: &mut App) {
 }
 
 // ---------------------------------------------------------------------------
+// Sandbox detail + policy rendering
+// ---------------------------------------------------------------------------
+
+/// Fetch sandbox details (policy + providers) when entering the sandbox screen.
+async fn fetch_sandbox_detail(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    let req = navigator_core::proto::GetSandboxRequest { name: sandbox_name };
+
+    match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
+        Ok(Ok(resp)) => {
+            if let Some(sandbox) = resp.into_inner().sandbox {
+                if let Some(spec) = &sandbox.spec {
+                    app.sandbox_providers_list = spec.providers.clone();
+                    if let Some(policy) = &spec.policy {
+                        app.policy_lines = render_policy_lines(policy);
+                        app.sandbox_policy = Some(policy.clone());
+                    }
+                }
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("failed to fetch sandbox detail: {}", e.message());
+        }
+        Err(_) => {
+            tracing::warn!("sandbox detail request timed out");
+        }
+    }
+
+    app.policy_scroll = 0;
+}
+
+/// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
+fn render_policy_lines(
+    policy: &navigator_core::proto::SandboxPolicy,
+) -> Vec<ratatui::text::Line<'static>> {
+    use crate::theme::styles;
+    use ratatui::text::{Line, Span};
+
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // --- Filesystem Access ---
+    if let Some(fs) = &policy.filesystem {
+        lines.push(Line::from(Span::styled(
+            "Filesystem Access",
+            styles::HEADING,
+        )));
+
+        if !fs.read_only.is_empty() {
+            let paths = fs.read_only.join(", ");
+            lines.push(Line::from(vec![
+                Span::styled("  Read-only:  ", styles::MUTED),
+                Span::styled(paths, styles::TEXT),
+            ]));
+        }
+
+        if !fs.read_write.is_empty() {
+            let paths = fs.read_write.join(", ");
+            lines.push(Line::from(vec![
+                Span::styled("  Read-write: ", styles::MUTED),
+                Span::styled(paths, styles::TEXT),
+            ]));
+        }
+
+        lines.push(Line::from(""));
+    }
+
+    // --- Inference ---
+    if let Some(inference) = &policy.inference {
+        if !inference.allowed_routes.is_empty() {
+            lines.push(Line::from(Span::styled("Inference", styles::HEADING)));
+            let routes = inference.allowed_routes.join(", ");
+            lines.push(Line::from(vec![
+                Span::styled("  Allowed routes: ", styles::MUTED),
+                Span::styled(routes, styles::TEXT),
+            ]));
+            lines.push(Line::from(""));
+        }
+    }
+
+    // --- Network Rules ---
+    if !policy.network_policies.is_empty() {
+        // Sort keys for deterministic display.
+        let mut rule_names: Vec<&String> = policy.network_policies.keys().collect();
+        rule_names.sort();
+
+        let header = format!("Network Rules ({})", rule_names.len());
+        lines.push(Line::from(Span::styled(header, styles::HEADING)));
+        lines.push(Line::from(""));
+
+        for name in rule_names {
+            let Some(rule) = policy.network_policies.get(name) else {
+                continue;
+            };
+
+            // Skip rules with no endpoints (useless policies).
+            if rule.endpoints.is_empty() {
+                continue;
+            }
+
+            // Rule header — include L7/TLS annotation if any endpoint has it.
+            let has_l7 = rule.endpoints.iter().any(|e| !e.protocol.is_empty());
+            let has_tls_term = rule.endpoints.iter().any(|e| e.tls == "terminate");
+            let mut annotations = Vec::new();
+            if has_l7 {
+                // Use the first L7 endpoint's protocol for the label.
+                if let Some(proto) = rule
+                    .endpoints
+                    .iter()
+                    .find(|e| !e.protocol.is_empty())
+                    .map(|e| e.protocol.to_uppercase())
+                {
+                    annotations.push(format!("L7 {proto}"));
+                }
+            }
+            if has_tls_term {
+                annotations.push("TLS terminate".to_string());
+            }
+
+            let title = if annotations.is_empty() {
+                format!("  {name}")
+            } else {
+                format!("  {name} ({})", annotations.join(", "))
+            };
+            lines.push(Line::from(Span::styled(title, styles::ACCENT)));
+
+            // Endpoints.
+            for ep in &rule.endpoints {
+                let addr = if ep.port > 0 {
+                    format!("    {}:{}", ep.host, ep.port)
+                } else {
+                    format!("    {}", ep.host)
+                };
+                lines.push(Line::from(Span::styled(addr, styles::TEXT)));
+
+                // L7 allow rules.
+                for l7 in &ep.rules {
+                    if let Some(allow) = &l7.allow {
+                        let method = if allow.method.is_empty() {
+                            "*"
+                        } else {
+                            &allow.method
+                        };
+                        let target = if !allow.path.is_empty() {
+                            &allow.path
+                        } else if !allow.command.is_empty() {
+                            &allow.command
+                        } else {
+                            "*"
+                        };
+                        lines.push(Line::from(vec![
+                            Span::styled("      Allow: ", styles::MUTED),
+                            Span::styled(format!("{:<6} {}", method, target), styles::TEXT),
+                        ]));
+                    }
+                }
+
+                // Access preset (if set instead of explicit rules).
+                if !ep.access.is_empty() && ep.rules.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("      Access: ", styles::MUTED),
+                        Span::styled(ep.access.clone(), styles::TEXT),
+                    ]));
+                }
+            }
+
+            // Binaries.
+            let binary_paths: Vec<&str> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
+            if !binary_paths.is_empty() {
+                lines.push(Line::from(vec![
+                    Span::styled("    Binaries: ", styles::MUTED),
+                    Span::styled(binary_paths.join(", "), styles::TEXT),
+                ]));
+            }
+
+            lines.push(Line::from(""));
+        }
+    }
+
+    // If nothing was rendered, add a placeholder.
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No policy data available.",
+            styles::MUTED,
+        )));
+    }
+
+    lines
+}
+
+// ---------------------------------------------------------------------------
 // Animation helper
 // ---------------------------------------------------------------------------
 
@@ -582,7 +787,11 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
         return;
     };
 
-    let ptype = form.types.get(form.type_cursor).cloned().unwrap_or_default();
+    let ptype = form
+        .types
+        .get(form.type_cursor)
+        .cloned()
+        .unwrap_or_default();
     let name = if form.name.is_empty() {
         ptype.clone()
     } else {
@@ -611,10 +820,7 @@ fn spawn_create_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
             match client.create_provider(req).await {
                 Ok(resp) => {
-                    let final_name = resp
-                        .into_inner()
-                        .provider
-                        .map_or(provider_name, |p| p.name);
+                    let final_name = resp.into_inner().provider.map_or(provider_name, |p| p.name);
                     let _ = tx.send(Event::ProviderCreateResult(Ok(final_name)));
                     return;
                 }
@@ -658,7 +864,7 @@ fn spawn_get_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
             Err(_) => {
                 let _ = tx.send(Event::ProviderDetailFetched(Err(
-                    "request timed out".to_string(),
+                    "request timed out".to_string()
                 )));
             }
         }
@@ -700,7 +906,7 @@ fn spawn_update_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
             Err(_) => {
                 let _ = tx.send(Event::ProviderUpdateResult(Err(
-                    "request timed out".to_string(),
+                    "request timed out".to_string()
                 )));
             }
         }
@@ -726,7 +932,7 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
             Err(_) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Err(
-                    "request timed out".to_string(),
+                    "request timed out".to_string()
                 )));
             }
         }

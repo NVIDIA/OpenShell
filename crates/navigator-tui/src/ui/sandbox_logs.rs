@@ -1,7 +1,7 @@
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 use crate::app::{App, LogLine};
 use crate::theme::styles;
@@ -95,19 +95,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 
-    // Detail popup overlay.
-    if let Some(detail_idx) = app.log_detail_index
-        && let Some(log) = filtered.get(detail_idx)
-    {
-        draw_detail_popup(frame, log, area);
-    }
+    // NOTE: Detail popup overlay is now rendered by draw_sandbox_screen() in
+    // mod.rs using frame.size() so it renders over the full screen, not
+    // constrained to this pane.
 }
 
 // ---------------------------------------------------------------------------
 // Detail popup (Enter key)
 // ---------------------------------------------------------------------------
 
-fn draw_detail_popup(frame: &mut Frame<'_>, log: &LogLine, area: Rect) {
+pub fn draw_detail_popup(frame: &mut Frame<'_>, log: &LogLine, area: Rect) {
     // Center the popup — 80% width, up to 20 lines tall.
     let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
