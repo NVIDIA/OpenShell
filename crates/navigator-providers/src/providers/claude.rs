@@ -1,5 +1,5 @@
 use crate::{
-    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
+    discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
 };
 
 pub struct ClaudeProvider;
@@ -7,11 +7,6 @@ pub struct ClaudeProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "claude",
     credential_env_vars: &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
-    config_paths: &[
-        "~/.claude.json",
-        "~/.claude/credentials.json",
-        "~/.config/claude/config.json",
-    ],
 };
 
 impl ProviderPlugin for ClaudeProvider {
@@ -28,7 +23,7 @@ impl ProviderPlugin for ClaudeProvider {
 mod tests {
     use super::SPEC;
     use crate::discover_with_spec;
-    use crate::test_helpers::{MockDiscoveryContext, home_join};
+    use crate::test_helpers::MockDiscoveryContext;
 
     #[test]
     fn discovers_claude_env_credentials() {
@@ -40,24 +35,5 @@ mod tests {
             discovered.credentials.get("ANTHROPIC_API_KEY"),
             Some(&"test-key".to_string())
         );
-    }
-
-    #[test]
-    fn discovers_claude_json_file_credentials_only() {
-        let home = "/mock/home";
-        let config_path = home_join(home, ".claude/credentials.json");
-        let ctx = MockDiscoveryContext::new()
-            .with_home(home)
-            .with_file(config_path, r#"{"api_key":"abc","profile":"dev"}"#);
-
-        let discovered = discover_with_spec(&SPEC, &ctx)
-            .expect("discovery")
-            .expect("provider");
-
-        assert_eq!(
-            discovered.credentials.get("api_key"),
-            Some(&"abc".to_string())
-        );
-        assert!(discovered.config.is_empty());
     }
 }

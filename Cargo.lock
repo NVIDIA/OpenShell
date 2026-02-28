@@ -2741,7 +2741,6 @@ name = "navigator-providers"
 version = "0.1.0"
 dependencies = [
  "navigator-core",
- "serde_json",
  "thiserror 2.0.18",
 ]
 

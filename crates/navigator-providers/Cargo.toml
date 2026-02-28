@@ -9,7 +9,6 @@ repository.workspace = true
 
 [dependencies]
 navigator-core = { path = "../navigator-core" }
-serde_json = { workspace = true }
 thiserror = { workspace = true }
 
 [lints]

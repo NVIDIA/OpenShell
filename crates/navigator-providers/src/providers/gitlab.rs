@@ -1,5 +1,5 @@
 use crate::{
-    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
+    discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
 };
 
 pub struct GitlabProvider;
@@ -7,7 +7,6 @@ pub struct GitlabProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "gitlab",
     credential_env_vars: &["GITLAB_TOKEN", "GLAB_TOKEN", "CI_JOB_TOKEN"],
-    config_paths: &["~/.config/glab-cli/config.yml"],
 };
 
 impl ProviderPlugin for GitlabProvider {
@@ -24,7 +23,7 @@ impl ProviderPlugin for GitlabProvider {
 mod tests {
     use super::SPEC;
     use crate::discover_with_spec;
-    use crate::test_helpers::{MockDiscoveryContext, home_join};
+    use crate::test_helpers::MockDiscoveryContext;
 
     #[test]
     fn discovers_gitlab_env_credentials() {
@@ -36,16 +35,5 @@ mod tests {
             discovered.credentials.get("GLAB_TOKEN"),
             Some(&"glab-token".to_string())
         );
-    }
-
-    #[test]
-    fn config_path_existence_alone_does_not_produce_discovery() {
-        let home = "/mock/home";
-        let path = home_join(home, ".config/glab-cli/config.yml");
-        let ctx = MockDiscoveryContext::new()
-            .with_home(home)
-            .with_existing_path(path);
-        let discovered = discover_with_spec(&SPEC, &ctx).expect("discovery");
-        assert!(discovered.is_none());
     }
 }

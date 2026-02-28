@@ -1,5 +1,5 @@
 use crate::{
-    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
+    discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
 };
 
 pub struct NvidiaProvider;
@@ -7,7 +7,6 @@ pub struct NvidiaProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "nvidia",
     credential_env_vars: &["NVIDIA_API_KEY"],
-    config_paths: &[],
 };
 
 impl ProviderPlugin for NvidiaProvider {

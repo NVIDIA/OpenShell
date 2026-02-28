@@ -18,8 +18,6 @@ pub use discovery::discover_with_spec;
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
     UnsupportedProvider(String),
-    #[error("failed to parse JSON in {path}: {message}")]
-    ParseJson { path: String, message: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,7 +37,6 @@ impl DiscoveredProvider {
 pub struct ProviderDiscoverySpec {
     pub id: &'static str,
     pub credential_env_vars: &'static [&'static str],
-    pub config_paths: &'static [&'static str],
 }
 
 pub trait ProviderPlugin: Send + Sync {
