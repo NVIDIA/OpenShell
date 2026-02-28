@@ -272,6 +272,7 @@ impl CliProviderType {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]))]
     Create {
         /// Provider name.
         #[arg(long)]

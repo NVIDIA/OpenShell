@@ -1669,6 +1669,11 @@ async fn create_provider_record(
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
     }
+    if provider.credentials.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider.credentials must not be empty",
+        ));
+    }
 
     let existing = store
         .get_message_by_name::<Provider>(&provider.name)

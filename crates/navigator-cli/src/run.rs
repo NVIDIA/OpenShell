@@ -2057,6 +2057,13 @@ pub async fn provider_create(
         }
     }
 
+    if credential_map.is_empty() {
+        return Err(miette::miette!(
+            "no credentials resolved for provider type '{provider_type}'. \
+             Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+        ));
+    }
+
     let response = client
         .create_provider(CreateProviderRequest {
             provider: Some(Provider {
