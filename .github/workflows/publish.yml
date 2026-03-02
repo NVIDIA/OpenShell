@@ -171,11 +171,6 @@ jobs:
     needs: [build-python-wheels]
     runs-on: [self-hosted, nv]
     timeout-minutes: 60
-    container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
@@ -189,6 +184,15 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install publish dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip uv awscli
 
       - name: List and download versioned wheels from S3
         run: |
