@@ -65,8 +65,12 @@ async fn ssh_session_config(
         "{}://{}:{}{}",
         session.gateway_scheme, gateway_host, gateway_port, session.connect_path
     );
+    let cluster_flag = tls
+        .cluster_name()
+        .map(|c| format!(" --cluster {}", shell_escape(c)))
+        .unwrap_or_default();
     let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {}",
+        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {}{cluster_flag}",
         gateway_url, session.sandbox_id, session.token,
     );
 

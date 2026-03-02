@@ -1271,8 +1271,12 @@ async fn main() -> Result<()> {
         }) => {
             match (gateway, sandbox_id, token, server, cluster, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, _, _) => {
-                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &tls).await?;
+                (Some(gw), Some(sid), Some(tok), _, cluster_opt, _) => {
+                    let effective_tls = match cluster_opt {
+                        Some(ref c) => tls.with_cluster_name(c),
+                        None => tls,
+                    };
+                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
                 // Name mode with --cluster: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(c), Some(n)) => {
