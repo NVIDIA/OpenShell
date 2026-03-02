@@ -22,36 +22,21 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-    services:
-      docker:
-        image: docker:24-dind
-        options: --privileged
-        env:
-          DOCKER_TLS_CERTDIR: ""
+      options: --privileged
     env:
-      DOCKER_TLS_CERTDIR: ""
-      DOCKER_TLS_VERIFY: ""
-      DOCKER_CERT_PATH: ""
       IMAGE_TAG: ${{ github.sha }}
       NAVIGATOR_REGISTRY_INSECURE: "false"
       DOCKER_BUILDER: ci-builder
     steps:
       - uses: actions/checkout@v4
 
-      - name: Wait for Docker daemon
-        env:
-          DOCKER_HOST: tcp://docker:2375
+      - name: Start Docker daemon
         run: |
+          dockerd &
           for i in $(seq 1 30); do
             docker info >/dev/null 2>&1 && break
             sleep 1
           done
-          docker info
-
-      - name: Bridge Docker socket
-        run: |
-          socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
-          sleep 1
           docker info
 
       - name: Log in to GHCR
