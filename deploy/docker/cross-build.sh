@@ -11,8 +11,24 @@
 : "${TARGETARCH:?TARGETARCH must be set}"
 : "${BUILDARCH:?BUILDARCH must be set}"
 
+SCCACHE_VERSION="${SCCACHE_VERSION:-0.14.0}"
+
 # True when the build host and target differ.
 is_cross() { [ "$TARGETARCH" != "$BUILDARCH" ]; }
+
+# Install sccache binary for the build host architecture.
+# Uses SCCACHE_VERSION (default: 0.14.0).
+install_sccache() {
+  case "$BUILDARCH" in
+    amd64) sccache_arch=x86_64-unknown-linux-musl ;;
+    arm64) sccache_arch=aarch64-unknown-linux-musl ;;
+    *)     echo "unsupported BUILDARCH for sccache: $BUILDARCH" >&2; return 1 ;;
+  esac
+  local url="https://github.com/mozilla/sccache/releases/download/v${SCCACHE_VERSION}/sccache-v${SCCACHE_VERSION}-${sccache_arch}.tar.gz"
+  curl -fsSL "$url" | tar xz --strip-components=1 -C /usr/local/bin \
+    "sccache-v${SCCACHE_VERSION}-${sccache_arch}/sccache"
+  chmod +x /usr/local/bin/sccache
+}
 
 # Map Docker arch name to Rust target triple.
 rust_target() {
@@ -62,8 +78,12 @@ export_cross_env() {
 
 # Run cargo build with the correct --target flag and env vars.
 # All extra arguments are forwarded to cargo (e.g. --release -p my-crate).
+# Automatically wraps with sccache when available.
 cargo_cross_build() {
   export_cross_env
+  if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER=sccache
+  fi
   local target_flag=""
   if is_cross; then target_flag="--target $(rust_target)"; fi
   cargo build $target_flag "$@"

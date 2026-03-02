@@ -10,11 +10,13 @@ ARG BUILDARCH
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
+    cmake g++ make protobuf-compiler curl && rm -rf /var/lib/apt/lists/*
 
-# Install cross-compilation toolchain + Rust target (no-ops for native builds)
+# Install cross-compilation toolchain, sccache, + Rust target (no-ops for native builds)
 COPY deploy/docker/cross-build.sh /usr/local/bin/
-RUN . cross-build.sh && install_cross_toolchain && add_rust_target
+RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
+
+ENV SCCACHE_DIR=/tmp/sccache
 
 WORKDIR /build
 
@@ -45,6 +47,7 @@ COPY dev-sandbox-policy.rego ./
 # Build dependencies only (cached unless Cargo.toml/lock changes)
 RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-sandbox-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-sandbox-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build -p navigator-sandbox 2>/dev/null || true
 
 # Copy actual source code
@@ -62,6 +65,7 @@ RUN touch crates/navigator-sandbox/src/main.rs \
 # don't corrupt each other's cargo registry or build artifacts.
 RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-sandbox-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-sandbox-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     if [ "$RUST_BUILD_PROFILE" = "release" ]; then \
     cargo_cross_build --release -p navigator-sandbox; \
