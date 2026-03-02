@@ -85,13 +85,6 @@ pick_random_port() {
   return 1
 }
 
-list_6443_conflicts() {
-  docker ps --format '{{.Names}} {{.Ports}}' | awk '
-    $0 ~ /0\.0\.0\.0:6443->6443\/tcp/ || $0 ~ /:::6443->6443\/tcp/ {
-      print $1
-    }'
-}
-
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 
 if [ -n "${GATEWAY_PORT:-}" ]; then
@@ -210,25 +203,6 @@ CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
 VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
 
 if [ "${MODE}" = "fast" ]; then
-  mapfile -t port_conflicts < <(list_6443_conflicts || true)
-  for cname in "${port_conflicts[@]:-}"; do
-    [ -n "${cname}" ] || continue
-    if [ "${cname}" = "${CONTAINER_NAME}" ]; then
-      continue
-    fi
-
-    if [[ "${cname}" == navigator-cluster-* ]]; then
-      other_cluster=${cname#navigator-cluster-}
-      echo "Removing conflicting local cluster '${other_cluster}' (holds host port 6443)..."
-      nav cluster admin destroy --name "${other_cluster}"
-      continue
-    fi
-
-    echo "Error: container '${cname}' is using host port 6443, which Navigator clusters require." >&2
-    echo "Stop/remove that container, then retry 'mise run cluster'." >&2
-    exit 1
-  done
-
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
     nav cluster admin destroy --name "${CLUSTER_NAME}"
@@ -243,9 +217,10 @@ elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
   done
 fi
 
-GATEWAY_HOST_ARGS=()
+DEPLOY_CMD=(nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
+
 if [ -n "${GATEWAY_HOST:-}" ]; then
-  GATEWAY_HOST_ARGS+=(--gateway-host "${GATEWAY_HOST}")
+  DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")
 
   # Ensure the gateway host resolves from the current environment.
   # On Linux CI runners host.docker.internal is not set automatically
@@ -260,7 +235,15 @@ if [ -n "${GATEWAY_HOST:-}" ]; then
   fi
 fi
 
-nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" "${GATEWAY_HOST_ARGS[@]}" --update-kube-config
+if [ -n "${KUBE_PORT:-}" ]; then
+  # Explicit port requested — pass it through.
+  DEPLOY_CMD+=(--kube-port "${KUBE_PORT}")
+else
+  # Auto-select a free port so kubectl works during local development.
+  DEPLOY_CMD+=(--kube-port)
+fi
+
+"${DEPLOY_CMD[@]}"
 
 echo ""
 echo "Cluster '${CLUSTER_NAME}' is ready."

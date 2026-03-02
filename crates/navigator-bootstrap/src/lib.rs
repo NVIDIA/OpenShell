@@ -76,6 +76,15 @@ impl RemoteOptions {
 /// Default host port that maps to the k3s `NodePort` (30051) for the gateway.
 pub const DEFAULT_GATEWAY_PORT: u16 = 8080;
 
+/// Find a random available TCP port by binding to port 0.
+///
+/// Binds to `127.0.0.1:0` and returns the OS-assigned port.
+pub fn pick_available_port() -> Result<u16> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").into_diagnostic()?;
+    let port = listener.local_addr().into_diagnostic()?.port();
+    Ok(port)
+}
+
 #[derive(Debug, Clone)]
 pub struct DeployOptions {
     pub name: String,
@@ -90,6 +99,10 @@ pub struct DeployOptions {
     /// Useful in CI where `127.0.0.1` is not reachable from the test runner
     /// (e.g., `host.docker.internal`).
     pub gateway_host: Option<String>,
+    /// Host port to expose the k3s Kubernetes control plane on.
+    /// When `None`, the control plane port (6443) is not exposed on the host,
+    /// allowing multiple clusters to run simultaneously without port conflicts.
+    pub kube_port: Option<u16>,
 }
 
 impl DeployOptions {
@@ -100,6 +113,7 @@ impl DeployOptions {
             remote: None,
             port: DEFAULT_GATEWAY_PORT,
             gateway_host: None,
+            kube_port: None,
         }
     }
 
@@ -121,6 +135,14 @@ impl DeployOptions {
     #[must_use]
     pub fn with_gateway_host(mut self, host: impl Into<String>) -> Self {
         self.gateway_host = Some(host.into());
+        self
+    }
+
+    /// Set the host port for the k3s Kubernetes control plane.
+    /// When set, the control plane is accessible via `kubectl` at this port.
+    #[must_use]
+    pub fn with_kube_port(mut self, kube_port: u16) -> Self {
+        self.kube_port = Some(kube_port);
         self
     }
 }
@@ -184,6 +206,7 @@ where
     let image_ref = options.image_ref.unwrap_or_else(default_cluster_image_ref);
     let port = options.port;
     let gateway_host = options.gateway_host;
+    let kube_port = options.kube_port;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -273,6 +296,7 @@ where
         &extra_sans,
         ssh_gateway_host.as_deref(),
         port,
+        kube_port,
     )
     .await?;
     log("[status] Starting cluster container".to_string());
@@ -283,8 +307,8 @@ where
 
     // Rewrite kubeconfig based on deployment mode
     let rewritten = remote_opts.as_ref().map_or_else(
-        || rewrite_kubeconfig(&raw_kubeconfig, &name),
-        |opts| rewrite_kubeconfig_remote(&raw_kubeconfig, &name, &opts.destination),
+        || rewrite_kubeconfig(&raw_kubeconfig, &name, kube_port),
+        |opts| rewrite_kubeconfig_remote(&raw_kubeconfig, &name, &opts.destination, kube_port),
     );
     log("[status] Writing kubeconfig".to_string());
     store_kubeconfig(&kubeconfig_path, &rewritten)?;
@@ -384,6 +408,7 @@ where
         &name,
         remote_opts.as_ref(),
         port,
+        kube_port,
         ssh_gateway_host.as_deref(),
     );
     store_cluster_metadata(&name, &metadata)?;
@@ -407,9 +432,9 @@ pub fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<Clus
     };
     let kubeconfig_path = stored_kubeconfig_path(name)?;
     // Try to load existing metadata, fall back to creating new metadata
-    // with the default port (the actual port is only known at deploy time).
+    // with the default ports (the actual ports are only known at deploy time).
     let metadata = load_cluster_metadata(name)
-        .unwrap_or_else(|_| create_cluster_metadata(name, remote, DEFAULT_GATEWAY_PORT));
+        .unwrap_or_else(|_| create_cluster_metadata(name, remote, DEFAULT_GATEWAY_PORT, None));
     Ok(ClusterHandle {
         name: name.to_string(),
         kubeconfig_path,

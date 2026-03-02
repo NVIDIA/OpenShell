@@ -94,26 +94,36 @@ pub fn store_kubeconfig(path: &Path, contents: &str) -> Result<()> {
 
 /// Rewrite kubeconfig for remote deployment.
 ///
-/// The kubeconfig points to 127.0.0.1:6443, which works with an SSH tunnel:
-/// `ssh -L 6443:127.0.0.1:6443 user@host`
+/// The kubeconfig points to `127.0.0.1:<kube_port>`, which works with an SSH tunnel:
+/// `ssh -L <kube_port>:127.0.0.1:6443 user@host`
 ///
 /// The cluster name includes "-remote" suffix to distinguish from local clusters.
-pub fn rewrite_kubeconfig_remote(contents: &str, cluster_name: &str, _destination: &str) -> String {
-    // Use the same rewrite logic but with a remote-specific cluster name
-    // The server address stays as 127.0.0.1:6443 because users will use SSH tunneling
+pub fn rewrite_kubeconfig_remote(
+    contents: &str,
+    cluster_name: &str,
+    _destination: &str,
+    kube_port: Option<u16>,
+) -> String {
     let remote_name = format!("{cluster_name}-remote");
-    rewrite_kubeconfig(contents, &remote_name)
+    rewrite_kubeconfig(contents, &remote_name, kube_port)
 }
 
-pub fn rewrite_kubeconfig(contents: &str, cluster_name: &str) -> String {
+/// Rewrite the raw k3s kubeconfig for use on the host.
+///
+/// When `kube_port` is `Some`, the server URL is rewritten to
+/// `https://127.0.0.1:<kube_port>`. When `None`, the original server URL
+/// is left intact (the control plane is not exposed on the host).
+pub fn rewrite_kubeconfig(contents: &str, cluster_name: &str, kube_port: Option<u16>) -> String {
     let mut replaced = Vec::new();
     for line in contents.lines() {
         let trimmed = line.trim_start();
-        if trimmed.starts_with("server:") {
-            let indent_len = line.len() - trimmed.len();
-            let indent = &line[..indent_len];
-            replaced.push(format!("{indent}server: https://127.0.0.1:6443"));
-            continue;
+        if let Some(kp) = kube_port {
+            if trimmed.starts_with("server:") {
+                let indent_len = line.len() - trimmed.len();
+                let indent = &line[..indent_len];
+                replaced.push(format!("{indent}server: https://127.0.0.1:{kp}"));
+                continue;
+            }
         }
         // Rename default cluster/context/user to the cluster name
         // Handle both "name: default" and "- name: default" (YAML list item)
@@ -237,16 +247,34 @@ mod tests {
     use super::rewrite_kubeconfig;
 
     #[test]
-    fn rewrite_updates_server_address() {
+    fn rewrite_updates_server_address_with_kube_port() {
         let input = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://10.0.0.1:6443\n";
-        let output = rewrite_kubeconfig(input, "test-cluster");
+        let output = rewrite_kubeconfig(input, "test-cluster", Some(6443));
         assert!(output.contains("server: https://127.0.0.1:6443"));
+    }
+
+    #[test]
+    fn rewrite_updates_server_address_custom_port() {
+        let input = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://10.0.0.1:6443\n";
+        let output = rewrite_kubeconfig(input, "test-cluster", Some(7443));
+        assert!(output.contains("server: https://127.0.0.1:7443"));
+        assert!(!output.contains("server: https://127.0.0.1:6443"));
+    }
+
+    #[test]
+    fn rewrite_preserves_server_when_no_kube_port() {
+        let input = "apiVersion: v1\nclusters:\n- cluster:\n    server: https://10.0.0.1:6443\n";
+        let output = rewrite_kubeconfig(input, "test-cluster", None);
+        assert!(
+            output.contains("server: https://10.0.0.1:6443"),
+            "server address should be preserved when kube_port is None"
+        );
     }
 
     #[test]
     fn rewrite_preserves_trailing_newline() {
         let input = "apiVersion: v1\nserver: https://10.0.0.1\n";
-        let output = rewrite_kubeconfig(input, "test-cluster");
+        let output = rewrite_kubeconfig(input, "test-cluster", Some(6443));
         assert!(output.ends_with('\n'));
     }
 
@@ -266,7 +294,7 @@ mod tests {
  - name: default
  current-context: default
  ";
-        let output = rewrite_kubeconfig(input, "my-cluster");
+        let output = rewrite_kubeconfig(input, "my-cluster", Some(6443));
         assert!(
             output.contains("name: my-cluster"),
             "should contain 'name: my-cluster'"
