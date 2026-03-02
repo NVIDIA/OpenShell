@@ -67,8 +67,9 @@ jobs:
       - name: Bootstrap and deploy cluster
         env:
           GATEWAY_HOST: host.docker.internal
+          GATEWAY_PORT: "8080"
           SKIP_IMAGE_PUSH: "1"
-        run: mise run --no-prepare --skip-deps cluster:build
+        run: mise run --no-prepare --skip-deps cluster
 
       - name: Run E2E tests
         run: mise run --no-prepare --skip-deps test:e2e:sandbox
