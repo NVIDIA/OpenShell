@@ -28,8 +28,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run sccache-cache
-        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Configure sccache
+        run: |
+          echo "ACTIONS_RESULTS_URL=$ACTIONS_RESULTS_URL" >> "$GITHUB_ENV"
+          echo "ACTIONS_RUNTIME_TOKEN=$ACTIONS_RUNTIME_TOKEN" >> "$GITHUB_ENV"
 
       - name: Format
         run: mise run rust:format:check
@@ -39,6 +41,10 @@ jobs:
 
       - name: Test
         run: mise run test:rust
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
 
   python:
     name: Python
