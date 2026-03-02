@@ -3,21 +3,7 @@ name: Publish
 on:
   push:
     branches: [main]
-  pull_request:
-    branches: [main]
-    paths:
-      - .github/workflows/publish.yml
   workflow_dispatch:
-    inputs:
-      publish_python_only:
-        description: "Skip build jobs and only publish wheels from S3"
-        required: false
-        type: boolean
-        default: false
-      wheel_version:
-        description: "Wheel version in S3 (required for publish_python_only)"
-        required: false
-        type: string
 
 permissions:
   contents: read
@@ -32,31 +18,19 @@ jobs:
   # Build container images to GHCR (same as E2E pipeline)
   # ---------------------------------------------------------------------------
   build-server:
-    if: >-
-      (github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an') &&
-      !(github.event_name == 'workflow_dispatch' && inputs.publish_python_only)
     uses: ./.github/workflows/docker-build.yml
     with:
       component: server
-      push: ${{ github.event_name != 'pull_request' }}
 
   build-sandbox:
-    if: >-
-      (github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an') &&
-      !(github.event_name == 'workflow_dispatch' && inputs.publish_python_only)
     uses: ./.github/workflows/docker-build.yml
     with:
       component: sandbox
-      push: ${{ github.event_name != 'pull_request' }}
 
   build-cluster:
-    if: >-
-      (github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an') &&
-      !(github.event_name == 'workflow_dispatch' && inputs.publish_python_only)
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
-      push: ${{ github.event_name != 'pull_request' }}
 
   # ---------------------------------------------------------------------------
   # Run E2E tests against the built images (temporarily disabled)
@@ -71,9 +45,6 @@ jobs:
   # Publish multi-arch container images to ECR
   # ---------------------------------------------------------------------------
   publish-containers:
-    if: >-
-      github.event_name != 'pull_request' &&
-      !(github.event_name == 'workflow_dispatch' && inputs.publish_python_only)
     name: Publish Containers
     needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
@@ -114,9 +85,6 @@ jobs:
   # Build Python wheels and stage them in S3
   # ---------------------------------------------------------------------------
   build-python-wheels:
-    if: >-
-      (github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an') &&
-      !(github.event_name == 'workflow_dispatch' && inputs.publish_python_only)
     name: Stage Python Wheels
     needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
@@ -186,13 +154,6 @@ jobs:
   # Publish Python wheels to Artifactory from S3 staging
   # ---------------------------------------------------------------------------
   publish-python:
-    if: >-
-      always() &&
-      (github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an') &&
-      (
-        needs.build-python-wheels.result == 'success' ||
-        (github.event_name == 'workflow_dispatch' && inputs.publish_python_only && inputs.wheel_version != '')
-      )
     name: Publish Python
     needs: [build-python-wheels]
     runs-on: [self-hosted, nv]
@@ -244,32 +205,11 @@ jobs:
           aws --version
           uv --version
 
-      - name: Resolve wheel version and S3 prefix
-        id: source
-        run: |
-          set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.publish_python_only }}" = "true" ]; then
-            WHEEL_VERSION="${{ inputs.wheel_version }}"
-            if [ -z "$WHEEL_VERSION" ]; then
-              echo "wheel_version input is required when publish_python_only=true" >&2
-              exit 1
-            fi
-            S3_PREFIX="navigator/${WHEEL_VERSION}"
-          else
-            WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
-            S3_PREFIX="${{ needs.build-python-wheels.outputs.s3_prefix }}"
-          fi
-
-          echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
-          echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
-          echo "Using wheel version: ${WHEEL_VERSION}"
-          echo "Using S3 prefix: ${S3_PREFIX}"
-
       - name: List and download versioned wheels from S3
         run: |
           set -euo pipefail
-          WHEEL_VERSION="${{ steps.source.outputs.wheel_version }}"
-          S3_PREFIX="${{ steps.source.outputs.s3_prefix }}"
+          WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
+          S3_PREFIX="${{ needs.build-python-wheels.outputs.s3_prefix }}"
           OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "length(Contents)" --output text)
           if [ "$OBJECT_COUNT" = "None" ] || [ "$OBJECT_COUNT" = "0" ]; then
             echo "No wheel artifacts found for ${WHEEL_VERSION} at s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" >&2
@@ -283,5 +223,5 @@ jobs:
       - name: Publish wheels to Artifactory
         run: |
           set -euo pipefail
-          WHEEL_VERSION="${{ steps.source.outputs.wheel_version }}"
+          WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
           uv run python build/scripts/release.py python-publish --version "$WHEEL_VERSION"
