@@ -37,34 +37,29 @@ jobs:
 
       - name: Configure local registry
         run: |
-          # The CI container runs on Docker's bridge network while the Docker
-          # daemon is on the host. Containers started via `docker run -p 5000:5000`
-          # bind to the host's 127.0.0.1, which is unreachable from this container.
-          # Resolve the host gateway IP so the bootstrap scripts can reach the
-          # local registry.
-          GATEWAY=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
-          echo "Docker host gateway: ${GATEWAY}"
-
-          # Start the registry now so bootstrap doesn't have to.
+          # The Docker daemon runs on the host and already trusts 127.0.0.0/8 as
+          # insecure registries. All docker commands (push/pull/run) are executed
+          # by the daemon, so using 127.0.0.1:5000 for image operations works even
+          # though the CI container can't reach that address directly.
+          #
+          # Start the registry, then verify it's reachable by the daemon.
           docker rm -f navigator-local-registry 2>/dev/null || true
           docker run -d --restart=always --name navigator-local-registry -p 5000:5000 registry:2
 
-          # Wait for the registry to be reachable via the gateway IP
+          # Verify the daemon can reach the registry (docker exec into a helper)
           for i in $(seq 1 30); do
-            curl -fsS --max-time 2 "http://${GATEWAY}:5000/v2/" >/dev/null 2>&1 && break
+            docker exec navigator-local-registry wget -qO- http://localhost:5000/v2/ >/dev/null 2>&1 && break
             sleep 1
           done
-          curl -fsS "http://${GATEWAY}:5000/v2/"
+          docker exec navigator-local-registry wget -qO- http://localhost:5000/v2/
 
-          # Tell cluster-bootstrap.sh to use the gateway IP for the registry.
-          # NAVIGATOR_REGISTRY / _HOST: used by the CI container to tag+push images.
-          # NAVIGATOR_REGISTRY_ENDPOINT: used by the k3s cluster container to pull
-          # images — host.docker.internal resolves to the Docker host from inside
-          # any container on the bridge network.
-          echo "NAVIGATOR_REGISTRY=${GATEWAY}:5000/navigator" >> "$GITHUB_ENV"
-          echo "NAVIGATOR_REGISTRY_HOST=${GATEWAY}:5000" >> "$GITHUB_ENV"
+          # Use 127.0.0.1:5000 for push/tag (daemon-side, works with insecure registries)
+          # Use host.docker.internal:5000 for k3s pull endpoint (works from any container)
+          echo "NAVIGATOR_REGISTRY=127.0.0.1:5000/navigator" >> "$GITHUB_ENV"
+          echo "NAVIGATOR_REGISTRY_HOST=127.0.0.1:5000" >> "$GITHUB_ENV"
           echo "NAVIGATOR_REGISTRY_ENDPOINT=host.docker.internal:5000" >> "$GITHUB_ENV"
           echo "NAVIGATOR_REGISTRY_INSECURE=true" >> "$GITHUB_ENV"
+          echo "NAVIGATOR_SKIP_REGISTRY_CHECK=1" >> "$GITHUB_ENV"
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

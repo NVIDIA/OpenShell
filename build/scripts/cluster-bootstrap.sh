@@ -206,7 +206,7 @@ if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY:-}" ] && [ -n "${CI_REGISTRY_USER:-}"
   export NAVIGATOR_REGISTRY_PASSWORD=${NAVIGATOR_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD}}
 fi
 
-if is_local_registry_host; then
+if is_local_registry_host && [ -z "${NAVIGATOR_SKIP_REGISTRY_CHECK:-}" ]; then
   ensure_local_registry
 fi
 
