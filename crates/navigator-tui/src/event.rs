@@ -1,4 +1,6 @@
 use crossterm::event::{self, Event as TermEvent, KeyEvent, MouseEvent};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
@@ -31,16 +33,33 @@ pub struct EventHandler {
     rx: mpsc::UnboundedReceiver<Event>,
     // Kept alive so the spawned task's `tx` doesn't see a closed channel.
     _keepalive: mpsc::UnboundedSender<Event>,
+    /// When true, the background reader stops polling stdin.
+    paused: Arc<AtomicBool>,
 }
 
 impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let keepalive = tx.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_flag = paused.clone();
 
         tokio::spawn(async move {
+            // Use a short poll interval so we check the paused flag frequently.
+            // The tick event fires when the full tick_rate elapses without input.
+            let poll_interval = Duration::from_millis(50);
+            let mut since_tick = std::time::Instant::now();
+
             loop {
-                if event::poll(tick_rate).unwrap_or(false) {
+                // When paused, sleep instead of polling stdin so the child
+                // process (e.g. SSH shell) gets uncontested access to stdin.
+                if paused_flag.load(Ordering::Relaxed) {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    since_tick = std::time::Instant::now();
+                    continue;
+                }
+
+                if event::poll(poll_interval).unwrap_or(false) {
                     match event::read() {
                         Ok(TermEvent::Key(key)) => {
                             if tx.send(Event::Key(key)).is_err() {
@@ -59,8 +78,11 @@ impl EventHandler {
                         }
                         _ => {}
                     }
-                } else if tx.send(Event::Tick).is_err() {
-                    return;
+                } else if since_tick.elapsed() >= tick_rate {
+                    since_tick = std::time::Instant::now();
+                    if tx.send(Event::Tick).is_err() {
+                        return;
+                    }
                 }
             }
         });
@@ -68,6 +90,7 @@ impl EventHandler {
         Self {
             rx,
             _keepalive: keepalive,
+            paused,
         }
     }
 
@@ -78,5 +101,15 @@ impl EventHandler {
     /// Get a sender handle for dispatching events from background tasks.
     pub fn sender(&self) -> mpsc::UnboundedSender<Event> {
         self._keepalive.clone()
+    }
+
+    /// Pause stdin polling (call before suspending TUI for a child process).
+    pub fn pause(&self) {
+        self.paused.store(true, Ordering::Relaxed);
+    }
+
+    /// Resume stdin polling (call after child process exits and TUI resumes).
+    pub fn resume(&self) {
+        self.paused.store(false, Ordering::Relaxed);
     }
 }

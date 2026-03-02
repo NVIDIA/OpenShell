@@ -302,6 +302,7 @@ pub struct App {
     pub pending_log_fetch: bool,
     pub pending_sandbox_delete: bool,
     pub pending_sandbox_detail: bool,
+    pub pending_shell_connect: bool,
 
     // Sandbox policy viewer
     pub sandbox_policy: Option<navigator_core::proto::SandboxPolicy>,
@@ -371,6 +372,7 @@ impl App {
             pending_log_fetch: false,
             pending_sandbox_delete: false,
             pending_sandbox_detail: false,
+            pending_shell_connect: false,
             sandbox_policy: None,
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
@@ -600,6 +602,11 @@ impl App {
                 self.log_detail_index = None;
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
+            }
+            KeyCode::Char('s') => {
+                if self.sandbox_count > 0 {
+                    self.pending_shell_connect = true;
+                }
             }
             KeyCode::Char('d') => {
                 self.confirm_delete = true;

@@ -2863,6 +2863,7 @@ dependencies = [
  "tokio",
  "tonic",
  "tracing",
+ "url",
 ]
 
 [[package]]

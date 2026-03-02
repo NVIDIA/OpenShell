@@ -89,6 +89,11 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     app.pending_sandbox_detail = false;
                     fetch_sandbox_detail(&mut app).await;
                 }
+                if app.pending_shell_connect {
+                    app.pending_shell_connect = false;
+                    handle_shell_connect(&mut app, &mut terminal, &events).await;
+                    refresh_data(&mut app).await;
+                }
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -545,6 +550,199 @@ async fn fetch_sandbox_detail(app: &mut App) {
     }
 
     app.policy_scroll = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Shell connect (suspend TUI, launch SSH, resume)
+// ---------------------------------------------------------------------------
+
+/// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
+///
+/// This replicates the `nav sandbox connect` flow but uses `Command::status()`
+/// instead of `exec()` so the TUI process survives.
+async fn handle_shell_connect(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    events: &EventHandler,
+) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    // Step 1: Get sandbox ID.
+    let sandbox_id = {
+        let req = navigator_core::proto::GetSandboxRequest {
+            name: sandbox_name.clone(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
+            Ok(Ok(resp)) => match resp.into_inner().sandbox {
+                Some(s) => s.id,
+                None => {
+                    app.status_text = "sandbox not found".to_string();
+                    return;
+                }
+            },
+            Ok(Err(e)) => {
+                app.status_text = format!("failed to get sandbox: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "get sandbox timed out".to_string();
+                return;
+            }
+        }
+    };
+
+    // Step 2: Create SSH session.
+    let session = {
+        let req = navigator_core::proto::CreateSshSessionRequest {
+            sandbox_id: sandbox_id.clone(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
+        {
+            Ok(Ok(resp)) => resp.into_inner(),
+            Ok(Err(e)) => {
+                app.status_text = format!("SSH session failed: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "SSH session request timed out".to_string();
+                return;
+            }
+        }
+    };
+
+    // Step 3: Resolve gateway address (handle loopback override).
+    #[allow(clippy::cast_possible_truncation)]
+    let gateway_port_u16 = session.gateway_port as u16;
+    let (gateway_host, gateway_port) =
+        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &app.endpoint);
+    let gateway_url = format!(
+        "{}://{}:{gateway_port}{}",
+        session.gateway_scheme, gateway_host, session.connect_path
+    );
+
+    // Step 4: Build the ProxyCommand using our own binary.
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            app.status_text = format!("failed to find executable: {e}");
+            return;
+        }
+    };
+    let exe_str = shell_escape(&exe.to_string_lossy());
+    let proxy_command = format!(
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {}",
+        session.sandbox_id, session.token,
+    );
+
+    // Step 5: Build the SSH command.
+    let mut command = std::process::Command::new("ssh");
+    command
+        .arg("-o")
+        .arg(format!("ProxyCommand={proxy_command}"))
+        .arg("-o")
+        .arg("StrictHostKeyChecking=no")
+        .arg("-o")
+        .arg("UserKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("GlobalKnownHostsFile=/dev/null")
+        .arg("-o")
+        .arg("LogLevel=ERROR")
+        .arg("-tt")
+        .arg("-o")
+        .arg("RequestTTY=force")
+        .arg("-o")
+        .arg("SetEnv=TERM=xterm-256color")
+        .arg("sandbox")
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
+
+    // Step 6: Cancel log stream and pause event handler before suspending.
+    app.cancel_log_stream();
+    events.pause();
+    // Wait for the reader task to finish its current poll cycle (tick_rate = 2s max).
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Step 7: Suspend TUI — leave alternate screen, disable raw mode.
+    let _ = execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    );
+    let _ = disable_raw_mode();
+
+    // Step 8: Spawn SSH as child process and wait.
+    let status = tokio::task::spawn_blocking(move || command.status()).await;
+    match &status {
+        Ok(Ok(s)) if !s.success() => {
+            app.status_text = format!("ssh exited with status {s}");
+        }
+        Ok(Err(e)) => {
+            app.status_text = format!("failed to launch ssh: {e}");
+        }
+        Err(e) => {
+            app.status_text = format!("shell task failed: {e}");
+        }
+        _ => {
+            app.status_text = format!("Disconnected from {sandbox_name}");
+        }
+    }
+
+    // Step 9: Resume TUI — re-enter alternate screen, enable raw mode, unpause events.
+    let _ = enable_raw_mode();
+    let _ = execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    );
+    let _ = terminal.clear();
+    events.resume();
+}
+
+/// If the gateway host is a loopback address, override it with the host and port
+/// from the cluster endpoint URL. Mirrors `resolve_ssh_gateway` in `ssh.rs`.
+fn resolve_ssh_gateway(gateway_host: &str, gateway_port: u16, cluster_url: &str) -> (String, u16) {
+    let is_loopback = gateway_host == "127.0.0.1"
+        || gateway_host == "0.0.0.0"
+        || gateway_host == "localhost"
+        || gateway_host == "::1";
+
+    if !is_loopback {
+        return (gateway_host.to_string(), gateway_port);
+    }
+
+    if let Ok(url) = url::Url::parse(cluster_url) {
+        if let Some(host) = url.host_str() {
+            let cluster_port = url.port().unwrap_or(gateway_port);
+            let cluster_is_loopback =
+                host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
+            if !cluster_is_loopback {
+                return (host.to_string(), cluster_port);
+            }
+            // Both loopback — use cluster URL's port (Docker-mapped).
+            return (gateway_host.to_string(), cluster_port);
+        }
+    }
+
+    (gateway_host.to_string(), gateway_port)
+}
+
+/// Shell-escape a value for use inside a ProxyCommand string.
+fn shell_escape(value: &str) -> String {
+    if value.is_empty() {
+        return "''".to_string();
+    }
+    let safe = value
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
+    if safe {
+        return value.to_string();
+    }
+    let escaped = value.replace('\'', "'\"'\"'");
+    format!("'{escaped}'")
 }
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
