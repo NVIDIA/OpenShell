@@ -26,8 +26,8 @@ use crate::docker::{
 };
 use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
 use crate::metadata::{
-    create_cluster_metadata, extract_host_from_ssh_destination, local_gateway_host,
-    resolve_ssh_hostname,
+    create_cluster_metadata, create_cluster_metadata_with_host, extract_host_from_ssh_destination,
+    local_gateway_host, resolve_ssh_hostname,
 };
 use crate::mtls::store_pki_bundle;
 use crate::pki::generate_pki;
@@ -84,6 +84,12 @@ pub struct DeployOptions {
     pub remote: Option<RemoteOptions>,
     /// Host port to map to the gateway `NodePort` (30051). Defaults to 8080.
     pub port: u16,
+    /// Override the gateway host advertised in cluster metadata and passed to
+    /// the server. When set, the metadata will use this host instead of
+    /// `127.0.0.1` and the container will receive `SSH_GATEWAY_HOST`.
+    /// Useful in CI where `127.0.0.1` is not reachable from the test runner
+    /// (e.g., `host.docker.internal`).
+    pub gateway_host: Option<String>,
 }
 
 impl DeployOptions {
@@ -93,6 +99,7 @@ impl DeployOptions {
             image_ref: None,
             remote: None,
             port: DEFAULT_GATEWAY_PORT,
+            gateway_host: None,
         }
     }
 
@@ -107,6 +114,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_port(mut self, port: u16) -> Self {
         self.port = port;
+        self
+    }
+
+    /// Override the gateway host advertised in cluster metadata.
+    #[must_use]
+    pub fn with_gateway_host(mut self, host: impl Into<String>) -> Self {
+        self.gateway_host = Some(host.into());
         self
     }
 }
@@ -169,6 +183,7 @@ where
     let name = options.name;
     let image_ref = options.image_ref.unwrap_or_else(default_cluster_image_ref);
     let port = options.port;
+    let gateway_host = options.gateway_host;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -220,24 +235,35 @@ where
     // API server certificates include the remote host's IP/hostname.
     // Also determine the SSH gateway host so the server returns the correct
     // address to CLI clients for SSH proxy CONNECT requests.
+    //
+    // When `gateway_host` is provided (e.g., `host.docker.internal` in CI),
+    // it is added to the SAN list and used as `ssh_gateway_host` so the
+    // server advertises the correct address even for local clusters.
     let (extra_sans, ssh_gateway_host): (Vec<String>, Option<String>) =
-        remote_opts.as_ref().map_or_else(
-            || {
-                let sans = local_gateway_host().into_iter().collect();
-                (sans, None)
-            },
-            |opts| {
-                let ssh_host = extract_host_from_ssh_destination(&opts.destination);
-                let resolved = resolve_ssh_hostname(&ssh_host);
-                // Include both the SSH alias and resolved IP if they differ, so the
-                // certificate covers both names.
-                let mut sans = vec![resolved.clone()];
-                if ssh_host != resolved {
-                    sans.push(ssh_host);
-                }
-                (sans, Some(resolved))
-            },
-        );
+        if let Some(opts) = remote_opts.as_ref() {
+            let ssh_host = extract_host_from_ssh_destination(&opts.destination);
+            let resolved = resolve_ssh_hostname(&ssh_host);
+            // Include both the SSH alias and resolved IP if they differ, so the
+            // certificate covers both names.
+            let mut sans = vec![resolved.clone()];
+            if ssh_host != resolved {
+                sans.push(ssh_host);
+            }
+            if let Some(ref host) = gateway_host
+                && !sans.contains(host)
+            {
+                sans.push(host.clone());
+            }
+            (sans, gateway_host.or(Some(resolved)))
+        } else {
+            let mut sans: Vec<String> = local_gateway_host().into_iter().collect();
+            if let Some(ref host) = gateway_host
+                && !sans.contains(host)
+            {
+                sans.push(host.clone());
+            }
+            (sans, gateway_host)
+        };
 
     log("[status] Creating cluster container".to_string());
     ensure_container(
@@ -354,7 +380,12 @@ where
 
     // Create and store cluster metadata
     log("[status] Persisting cluster metadata".to_string());
-    let metadata = create_cluster_metadata(&name, remote_opts.as_ref(), port);
+    let metadata = create_cluster_metadata_with_host(
+        &name,
+        remote_opts.as_ref(),
+        port,
+        ssh_gateway_host.as_deref(),
+    );
     store_cluster_metadata(&name, &metadata)?;
 
     Ok(ClusterHandle {

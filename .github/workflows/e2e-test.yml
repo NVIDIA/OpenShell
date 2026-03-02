@@ -1,0 +1,57 @@
+name: E2E Test
+
+on:
+  workflow_call:
+    inputs:
+      image-tag:
+        description: "Image tag to test (typically the commit SHA)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  e2e:
+    name: E2E
+    runs-on: build-amd64
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      IMAGE_TAG: ${{ inputs.image-tag }}
+      NAVIGATOR_REGISTRY: ghcr.io/nvidia/nv-agent-env
+      NAVIGATOR_REGISTRY_HOST: ghcr.io
+      NAVIGATOR_REGISTRY_NAMESPACE: nvidia/nv-agent-env
+      NAVIGATOR_REGISTRY_USERNAME: ${{ github.actor }}
+      NAVIGATOR_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Pull cluster image
+        run: docker pull ghcr.io/nvidia/nv-agent-env/cluster:${{ inputs.image-tag }}
+
+      - name: Install Python dependencies and generate protobuf stubs
+        run: uv sync --frozen && mise run --no-prepare python:proto
+
+      - name: Bootstrap and deploy cluster
+        env:
+          GATEWAY_HOST: host.docker.internal
+          GATEWAY_PORT: "8080"
+          SKIP_IMAGE_PUSH: "1"
+          NAVIGATOR_CLUSTER_IMAGE: ghcr.io/nvidia/nv-agent-env/cluster:${{ inputs.image-tag }}
+        run: mise run --no-prepare --skip-deps cluster
+
+      - name: Run E2E tests
+        run: mise run --no-prepare --skip-deps test:e2e:sandbox

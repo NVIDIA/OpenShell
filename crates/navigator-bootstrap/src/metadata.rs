@@ -28,9 +28,26 @@ pub fn create_cluster_metadata(
     remote: Option<&RemoteOptions>,
     port: u16,
 ) -> ClusterMetadata {
+    create_cluster_metadata_with_host(name, remote, port, None)
+}
+
+/// Create cluster metadata, optionally overriding the gateway host.
+///
+/// When `gateway_host` is `Some`, that value is used as the host portion of
+/// `gateway_endpoint` instead of the default (`127.0.0.1` for local clusters,
+/// or the resolved SSH host for remote clusters).
+pub fn create_cluster_metadata_with_host(
+    name: &str,
+    remote: Option<&RemoteOptions>,
+    port: u16,
+    gateway_host: Option<&str>,
+) -> ClusterMetadata {
     let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
         || {
-            let host = local_gateway_host().unwrap_or_else(|| "127.0.0.1".to_string());
+            let host = gateway_host.map_or_else(
+                || local_gateway_host().unwrap_or_else(|| "127.0.0.1".to_string()),
+                String::from,
+            );
             (format!("https://{host}:{port}"), false, None, None)
         },
         |opts| {
@@ -38,7 +55,8 @@ pub fn create_cluster_metadata(
             // via `ssh -G` to get the actual hostname/IP (handles SSH config aliases).
             let ssh_host = extract_host_from_ssh_destination(&opts.destination);
             let resolved = resolve_ssh_hostname(&ssh_host);
-            let endpoint = format!("https://{resolved}:{port}");
+            let host = gateway_host.unwrap_or(&resolved);
+            let endpoint = format!("https://{host}:{port}");
             (
                 endpoint,
                 true,
@@ -378,5 +396,24 @@ mod tests {
         }"#;
         let parsed: ClusterMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
+    }
+
+    #[test]
+    fn local_cluster_metadata_with_gateway_host_override() {
+        let meta =
+            create_cluster_metadata_with_host("test", None, 8080, Some("host.docker.internal"));
+        assert_eq!(meta.name, "test");
+        assert_eq!(meta.gateway_endpoint, "https://host.docker.internal:8080");
+        assert_eq!(meta.gateway_port, 8080);
+        assert!(!meta.is_remote);
+        assert!(meta.remote_host.is_none());
+        assert!(meta.resolved_host.is_none());
+    }
+
+    #[test]
+    fn local_cluster_metadata_with_no_gateway_host_override() {
+        // When gateway_host is None, behaviour matches create_cluster_metadata.
+        let meta = create_cluster_metadata_with_host("test", None, 8080, None);
+        assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
     }
 }

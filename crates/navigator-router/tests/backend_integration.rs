@@ -1,6 +1,6 @@
 use navigator_router::Router;
 use navigator_router::config::{ResolvedRoute, RouteConfig, RouterConfig};
-use wiremock::matchers::{bearer_token, body_partial_json, method, path};
+use wiremock::matchers::{bearer_token, body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
@@ -267,6 +267,105 @@ async fn proxy_inserts_model_when_absent_from_body() {
             "/v1/chat/completions",
             vec![("content-type".to_string(), "application/json".to_string())],
             bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+}
+
+#[tokio::test]
+async fn proxy_uses_x_api_key_for_anthropic_protocol() {
+    let mock_server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "test-anthropic-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "msg_123",
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "text", "text": "Hello"}],
+            "model": "claude-sonnet-4-20250514",
+            "stop_reason": "end_turn",
+            "usage": {"input_tokens": 10, "output_tokens": 5}
+        })))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        routing_hint: "frontier".to_string(),
+        endpoint: mock_server.uri(),
+        model: "claude-sonnet-4-20250514".to_string(),
+        api_key: "test-anthropic-key".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+
+    let response = router
+        .proxy_with_candidates(
+            "anthropic_messages",
+            "POST",
+            "/v1/messages",
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("anthropic-version".to_string(), "2023-06-01".to_string()),
+            ],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status, 200);
+    let resp_body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+    assert_eq!(resp_body["type"], "message");
+}
+
+#[tokio::test]
+async fn proxy_anthropic_does_not_send_bearer_auth() {
+    let mock_server = MockServer::start().await;
+
+    // This mock rejects requests that have a Bearer token — ensuring we DON'T send one
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "anthropic-key"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    // Also mount a catch-all that returns 401 if Bearer is used
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(bearer_token("anthropic-key"))
+        .respond_with(ResponseTemplate::new(401).set_body_string("should not use bearer"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        routing_hint: "frontier".to_string(),
+        endpoint: mock_server.uri(),
+        model: "claude-sonnet-4-20250514".to_string(),
+        api_key: "anthropic-key".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+    }];
+
+    let response = router
+        .proxy_with_candidates(
+            "anthropic_messages",
+            "POST",
+            "/v1/messages",
+            vec![("content-type".to_string(), "application/json".to_string())],
+            bytes::Bytes::from(b"{}".to_vec()),
             &candidates,
         )
         .await

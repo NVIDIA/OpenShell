@@ -82,7 +82,16 @@ impl Router {
             return Ok(mock::mock_response(route, &normalized_source));
         }
 
-        backend::proxy_to_backend(&self.client, route, method, path, headers, body).await
+        backend::proxy_to_backend(
+            &self.client,
+            route,
+            &normalized_source,
+            method,
+            path,
+            headers,
+            body,
+        )
+        .await
     }
 }
 

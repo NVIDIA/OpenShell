@@ -727,9 +727,9 @@ The sandbox is designed to operate both as part of a Navigator cluster and as a 
 In cluster mode, `fetch_inference_bundle()` failures are handled based on the error type:
 - gRPC `PermissionDenied` or `NotFound` (detected via error message string matching): sandbox has no inference policy -- inference routing is silently disabled.
 - Other errors: logged as a warning, inference routing is disabled.
-- Empty route bundle: inference routing is disabled (no routes available).
+- Empty initial route bundle: inference routing stays enabled with an empty cache and background refresh continues.
 
-Both route sources handle empty route lists the same way: inference routing is gracefully disabled. The difference is that file *loading errors* (missing file, parse failure) are fatal, while cluster *fetch errors* are non-fatal.
+Route sources handle empty route lists differently: file mode disables inference routing when the file resolves to zero routes, while cluster mode keeps inference routing active with an empty cache so refresh can pick up routes created later. File *loading errors* (missing file, parse failure) are fatal, while cluster *fetch errors* are non-fatal.
 
 #### Background route cache refresh
 
@@ -748,12 +748,13 @@ flowchart TD
     I --> J{Success?}
     J -- Yes --> K{Routes non-empty?}
     K -- Yes --> F
-    K -- No --> L
+    K -- No --> G[Create InferenceContext with empty cache]
     J -- No --> M{PermissionDenied / NotFound?}
     M -- Yes --> L
     M -- No --> N[Warn + None]
     H -- No --> L
     F --> O[spawn_route_refresh if cluster mode]
+    G --> O
 ```
 
 #### API key security
@@ -1106,6 +1107,7 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | SSRF: DNS resolution failure | Deny the specific CONNECT request |
 | Inference route file load/parse error | Fatal -- sandbox startup aborts |
 | Inference route file with empty routes | Inference routing disabled (graceful) |
+| Inference cluster bundle with empty routes | Inference routing stays enabled with empty cache; refresh can activate routes later |
 | Inference cluster bundle fetch failure | Warn + inference routing disabled (graceful) |
 | Inference interception: missing InferenceContext | Denied outcome + structured CONNECT deny log |
 | Inference interception: missing TLS state | Denied outcome + structured CONNECT deny log |

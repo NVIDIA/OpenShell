@@ -9,6 +9,10 @@ backend (configured with `mock://` for testing).
 
 from __future__ import annotations
 
+import time
+
+import grpc
+
 from typing import TYPE_CHECKING
 
 from navigator._proto import datamodel_pb2, sandbox_pb2
@@ -16,7 +20,7 @@ from navigator._proto import datamodel_pb2, sandbox_pb2
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from navigator import Sandbox
+    from navigator import InferenceRouteClient, Sandbox
 
 
 # =============================================================================
@@ -32,7 +36,9 @@ _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
 _BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
 
 
-def _inference_routing_policy() -> sandbox_pb2.SandboxPolicy:
+def _inference_routing_policy(
+    allowed_route: str = "e2e_mock_local",
+) -> sandbox_pb2.SandboxPolicy:
     """Policy with inference routing enabled.
 
     No network_policies needed — any connection from any binary to an endpoint
@@ -41,7 +47,7 @@ def _inference_routing_policy() -> sandbox_pb2.SandboxPolicy:
     """
     return sandbox_pb2.SandboxPolicy(
         version=1,
-        inference=sandbox_pb2.InferencePolicy(allowed_routes=["e2e_mock_local"]),
+        inference=sandbox_pb2.InferencePolicy(allowed_routes=[allowed_route]),
         filesystem=_BASE_FILESYSTEM,
         landlock=_BASE_LANDLOCK,
         process=_BASE_PROCESS,
@@ -51,6 +57,103 @@ def _inference_routing_policy() -> sandbox_pb2.SandboxPolicy:
 # =============================================================================
 # Tests
 # =============================================================================
+
+
+def test_route_refresh_picks_up_route_created_after_sandbox_start(
+    sandbox: Callable[..., Sandbox],
+    inference_client: InferenceRouteClient,
+) -> None:
+    """Route refresh picks up a route created after sandbox startup.
+
+    Regression scenario:
+    1. Sandbox starts with inference allowed_routes configured but no matching route exists yet.
+    2. Initial inference request should be intercepted and return 503 (empty route cache).
+    3. Create the route after sandbox startup.
+    4. Background refresh should load the new route and subsequent requests should succeed.
+    """
+    route_name = "e2e-mock-refresh-late"
+    route_hint = "e2e_mock_refresh_late"
+    spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy(route_hint))
+
+    def call_chat_completions() -> str:
+        import json
+        import ssl
+        import urllib.error
+        import urllib.request
+
+        body = json.dumps(
+            {
+                "model": "test-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+        ).encode()
+
+        req = urllib.request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer dummy-key",
+            },
+            method="POST",
+        )
+
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+
+        try:
+            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+            return resp.read().decode()
+        except urllib.error.HTTPError as e:
+            body = e.read().decode("utf-8", errors="replace")
+            return f"http_error_{e.code}:{body}"
+        except Exception as e:
+            return f"error:{type(e).__name__}:{e}"
+
+    try:
+        inference_client.delete(route_name)
+    except grpc.RpcError:
+        pass
+
+    try:
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            initial = sb.exec_python(call_chat_completions, timeout_seconds=60)
+            assert initial.exit_code == 0, f"stderr: {initial.stderr}"
+            initial_output = initial.stdout.strip()
+            assert initial_output.startswith("http_error_503"), initial_output
+            assert "no inference routes configured" in initial_output, initial_output
+
+            inference_client.create(
+                name=route_name,
+                routing_hint=route_hint,
+                base_url="mock://e2e-refresh-late",
+                protocols=["openai_chat_completions"],
+                api_key="mock",
+                model_id="mock/late-route-model",
+                enabled=True,
+            )
+
+            deadline = time.time() + 95
+            last_output = initial_output
+
+            while time.time() < deadline:
+                result = sb.exec_python(call_chat_completions, timeout_seconds=60)
+                assert result.exit_code == 0, f"stderr: {result.stderr}"
+                last_output = result.stdout.strip()
+
+                if "Hello from navigator mock backend" in last_output:
+                    break
+
+                time.sleep(5)
+
+            assert "Hello from navigator mock backend" in last_output, last_output
+            assert "mock/late-route-model" in last_output, last_output
+    finally:
+        try:
+            inference_client.delete(route_name)
+        except grpc.RpcError:
+            pass
 
 
 def test_inference_call_routed_to_backend(
@@ -121,6 +224,7 @@ def test_non_inference_request_denied(
 
     def make_non_inference_request() -> str:
         import ssl
+        import urllib.error
         import urllib.request
 
         ctx = ssl.create_default_context()

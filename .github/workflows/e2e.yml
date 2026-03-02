@@ -1,0 +1,34 @@
+name: E2E
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build-server:
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: server
+
+  build-sandbox:
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+
+  build-cluster:
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+
+  e2e:
+    needs: [build-server, build-sandbox, build-cluster]
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      image-tag: ${{ github.sha }}
