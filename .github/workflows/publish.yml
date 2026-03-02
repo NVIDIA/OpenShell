@@ -236,7 +236,8 @@ jobs:
               "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
               --output awscliv2.zip
             python -c "import zipfile; zipfile.ZipFile('awscliv2.zip').extractall('.')"
-            ./aws/install --bin-dir "$HOME/.local/bin" --install-dir "$HOME/.local/aws-cli" --update
+            chmod +x ./aws/install
+            sh ./aws/install --bin-dir "$HOME/.local/bin" --install-dir "$HOME/.local/aws-cli" --update
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.local/bin:$PATH"
           fi
