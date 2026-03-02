@@ -90,7 +90,7 @@ def reset_version() -> None:
 
 
 def python_publish(
-    version: str | None = None, wheel_glob: str = "navigator-*.whl"
+    version: str | None = None, wheel_glob: str = "nemoclaw-*.whl"
 ) -> None:
     if version is None:
         version = _compute_versions().python
@@ -153,7 +153,7 @@ def get_version(format: str) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Navigator release tooling.")
+    parser = argparse.ArgumentParser(description="OpenClaw release tooling.")
     sub = parser.add_subparsers(dest="command", required=True)
 
     get_version_parser = sub.add_parser("get-version", help="Print computed version.")
@@ -186,8 +186,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     python_publish_parser.add_argument(
         "--wheel-glob",
-        default="navigator-*.whl",
-        help="Filename glob for wheels to publish (defaults to all navigator wheels).",
+        default="nemoclaw-*.whl",
+        help="Filename glob for wheels to publish (defaults to all nemoclaw wheels).",
     )
 
     return parser
