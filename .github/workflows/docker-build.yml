@@ -20,7 +20,6 @@ on:
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  GHCR_CACHE: ghcr.io/nvidia/nv-agent-env/cache
 
 permissions:
   contents: read
@@ -55,6 +54,4 @@ jobs:
       - name: Build ${{ inputs.component }} image
         env:
           DOCKER_BUILDER: navigator
-          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/${{ inputs.component }}:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/${{ inputs.component }}:buildcache,mode=max"
         run: mise run --no-prepare docker:build:${{ inputs.component }}
