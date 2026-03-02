@@ -7,6 +7,7 @@ on:
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GHCR_CACHE: ghcr.io/nvidia/nv-agent-env/cache
 
 permissions:
   contents: read
@@ -50,20 +51,20 @@ jobs:
 
       - name: Build server image
         env:
-          DOCKER_CACHE_FROM: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/server:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/server:buildcache,mode=max"
+          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/server:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/server:buildcache,mode=max"
         run: mise run --no-prepare docker:build:server
 
       - name: Build sandbox image
         env:
-          DOCKER_CACHE_FROM: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/sandbox:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/sandbox:buildcache,mode=max"
+          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/sandbox:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/sandbox:buildcache,mode=max"
         run: mise run --no-prepare docker:build:sandbox
 
       - name: Build cluster image
         env:
-          DOCKER_CACHE_FROM: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/cluster:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/cluster:buildcache,mode=max"
+          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/cluster:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/cluster:buildcache,mode=max"
         run: mise run --no-prepare docker:build:cluster
 
       - name: Generate protobuf stubs
