@@ -48,6 +48,9 @@ webpki-roots = { workspace = true }
 # HTTP
 bytes = { workspace = true }
 
+# IP network / CIDR parsing
+ipnet = "2"
+
 # Serialization
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }

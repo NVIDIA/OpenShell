@@ -83,6 +83,7 @@ struct NetworkPolicyRuleDef {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NetworkEndpointDef {
+    #[serde(default)]
     host: String,
     port: u32,
     #[serde(default)]
@@ -95,6 +96,8 @@ struct NetworkEndpointDef {
     access: String,
     #[serde(default)]
     rules: Vec<L7RuleDef>,
+    #[serde(default)]
+    allowed_ips: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -160,6 +163,7 @@ fn convert_policy(raw: PolicyFile) -> SandboxPolicy {
                                 }),
                             })
                             .collect(),
+                        allowed_ips: e.allowed_ips,
                     })
                     .collect(),
                 binaries: rule

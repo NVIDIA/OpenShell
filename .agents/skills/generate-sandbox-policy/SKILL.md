@@ -109,6 +109,7 @@ Ask these when the user's intent is broad and more specificity is possible:
 | Multiple hosts in one policy | "Do all of these hosts need the same access level? If some need tighter restrictions, I can split them into separate policies." |
 | `access: full` with `enforcement: audit` | "Full access in audit mode means nothing is actually restricted — all traffic flows through and violations are only logged. Is that intentional, or did you want to enforce restrictions?" |
 | `**` path glob on all rules | "Using `**` on all paths allows any URL path. Do you know the specific API path prefixes you need (e.g., `/api/v1/`)?" |
+| Private/internal IP destination | "Does this service resolve to a private IP (10.x, 172.16.x, 192.168.x)? If so, you'll need `allowed_ips` to permit access — what CIDR range should be allowed?" |
 
 ### Auto-Discovery of API Docs for Well-Known Services
 
@@ -160,9 +161,10 @@ Read architecture/security-policy.md
 Key sections to reference:
 - **Full YAML Policy Schema** — top-level structure
 - **`network_policies`** — rule structure
-- **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules
+- **`NetworkEndpoint`** fields — host, port, protocol, tls, enforcement, access, rules, allowed_ips
 - **`L7Rule` / `L7Allow`** — method + path matching
 - **Access Presets** — `read-only`, `read-write`, `full`
+- **Private IP Access via `allowed_ips`** — CIDR allowlist for private IP space
 - **Validation Rules** — what combinations are valid/invalid
 
 Also read the example policy for real-world patterns:
@@ -257,8 +259,33 @@ network_policies:
           - allow:
               method: <METHOD>
               path: "<glob_pattern>"
+        # Optional: allow private IP destinations (CIDR or exact IP)
+        # allowed_ips:
+        #   - "10.0.5.0/24"
     binaries:
       - { path: <binary_path> }
+```
+
+### Private IP Destinations
+
+When the endpoint resolves to a private IP (RFC 1918), the proxy's SSRF protection blocks the connection by default. Use `allowed_ips` to selectively allow specific private IP ranges:
+
+- **Host + allowlist**: `host` + `allowed_ips` — domain must resolve to an IP in the allowlist
+- **Hostless allowlist**: `allowed_ips` only (no `host`) — any domain on the port is allowed if it resolves to an IP in the allowlist
+
+Loopback (`127.0.0.0/8`) and link-local (`169.254.0.0/16`) are **always blocked** regardless of `allowed_ips`.
+
+```yaml
+# Example: Allow access to internal service at a known private IP range
+internal_api:
+  name: internal_api
+  endpoints:
+    - host: api.internal.corp
+      port: 8080
+      allowed_ips:
+        - "10.0.5.0/24"
+  binaries:
+    - { path: /usr/bin/curl }
 ```
 
 ### Policy Key Naming
@@ -309,6 +336,8 @@ Evaluate the generated policy for overly broad access and **include warnings in 
 | **Wildcard binary** (`*` or `**` in binary path) | "This policy allows any binary matching the glob pattern. A compromised or unexpected binary in that directory could use this policy. Consider listing specific binary paths." |
 | **`**` path glob** on all explicit rules | "All rules use `**` path patterns, which match any URL path. This is equivalent to a preset — consider using `access: read-only` (or similar) for clarity, or narrowing paths if you know the API structure." |
 | **Multiple broad endpoints** in one policy | "This policy grants the same broad access to N different hosts. If any of these hosts needs tighter restrictions later, you'll need to split the policy." |
+| **Hostless `allowed_ips`** (no `host` field) | "This endpoint has no `host` — any domain resolving to the allowed IP range on this port will be permitted. Consider adding a `host` field to restrict which domains can use this allowlist." |
+| **Broad CIDR** in `allowed_ips` (e.g., `10.0.0.0/8`) | "This `allowed_ips` entry covers a very broad range. Consider narrowing to a specific subnet (e.g., `10.0.5.0/24`) to minimize exposure." |
 
 Format breadth warnings clearly in the output, e.g.:
 
@@ -480,6 +509,34 @@ internal_svc:
         - allow:
             method: POST
             path: "/api/v1/jobs"
+  binaries:
+    - { path: /usr/bin/curl }
+```
+
+### Private IP Access (Host + Allowlist)
+
+```yaml
+internal_db:
+  name: internal_db
+  endpoints:
+    - host: db.internal.corp
+      port: 5432
+      allowed_ips:
+        - "10.0.5.0/24"
+  binaries:
+    - { path: /usr/bin/curl }
+```
+
+### Private IP Access (Hostless — Any Domain in Range)
+
+```yaml
+private_services:
+  name: private_services
+  endpoints:
+    - port: 8080
+      allowed_ips:
+        - "10.0.5.0/24"
+        - "10.0.6.0/24"
   binaries:
     - { path: /usr/bin/curl }
 ```

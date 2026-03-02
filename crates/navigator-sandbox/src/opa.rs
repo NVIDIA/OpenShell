@@ -401,6 +401,19 @@ impl OpaEngine {
         }
     }
 
+    /// Query `allowed_ips` from the matched endpoint config for a given request.
+    ///
+    /// Returns the list of CIDR/IP strings from the endpoint's `allowed_ips`
+    /// field, or an empty vec if the field is absent or the endpoint has no
+    /// match. This is used by the proxy to decide between full SSRF blocking
+    /// and allowlist-based IP validation.
+    pub fn query_allowed_ips(&self, input: &NetworkInput) -> Result<Vec<String>> {
+        match self.query_endpoint_config(input)? {
+            Some(val) => Ok(get_str_array(&val, "allowed_ips")),
+            None => Ok(vec![]),
+        }
+    }
+
     /// Clone the inner regorus engine for per-tunnel L7 evaluation.
     ///
     /// With the `arc` feature enabled, this shares compiled policy via Arc
@@ -608,6 +621,9 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                             })
                             .collect();
                         ep["rules"] = rules.into();
+                    }
+                    if !e.allowed_ips.is_empty() {
+                        ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
                     ep
                 })
@@ -1762,5 +1778,203 @@ process:
                 matched_policy: Some("github".to_string())
             },
         );
+    }
+
+    // ========================================================================
+    // allowed_ips tests
+    // ========================================================================
+
+    const ALLOWED_IPS_TEST_DATA: &str = r#"
+network_policies:
+  # Mode 2: host + allowed_ips
+  internal_api:
+    name: internal_api
+    endpoints:
+      - host: my-service.corp.net
+        port: 8080
+        allowed_ips: ["10.0.5.0/24"]
+    binaries:
+      - { path: /usr/bin/curl }
+  # Mode 3: allowed_ips only (no host) — uses port 9443 to avoid overlap
+  private_network:
+    name: private_network
+    endpoints:
+      - port: 9443
+        allowed_ips: ["172.16.0.0/12", "192.168.1.1"]
+    binaries:
+      - { path: /usr/bin/curl }
+  # Mode 1: host only (no allowed_ips) — standard behavior
+  public_api:
+    name: public_api
+    endpoints:
+      - { host: api.github.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: ""
+  run_as_group: ""
+"#;
+
+    fn allowed_ips_engine() -> OpaEngine {
+        OpaEngine::from_strings(TEST_POLICY, ALLOWED_IPS_TEST_DATA)
+            .expect("Failed to load allowed_ips test data")
+    }
+
+    #[test]
+    fn allowed_ips_mode2_host_plus_ips_allows() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Mode 2 (host+IPs) should allow: {}",
+            decision.reason
+        );
+        assert_eq!(decision.matched_policy.as_deref(), Some("internal_api"));
+    }
+
+    #[test]
+    fn allowed_ips_mode2_returns_allowed_ips() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "my-service.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let ips = engine.query_allowed_ips(&input).unwrap();
+        assert_eq!(ips, vec!["10.0.5.0/24"]);
+    }
+
+    #[test]
+    fn allowed_ips_mode3_hostless_allows_any_domain() {
+        let engine = allowed_ips_engine();
+        // Any hostname on port 9443 should match the private_network policy
+        let input = NetworkInput {
+            host: "anything.example.com".into(),
+            port: 9443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Mode 3 (IPs only) should allow any domain on matching port: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn allowed_ips_mode3_returns_allowed_ips() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "anything.example.com".into(),
+            port: 9443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let ips = engine.query_allowed_ips(&input).unwrap();
+        assert_eq!(ips, vec!["172.16.0.0/12", "192.168.1.1"]);
+    }
+
+    #[test]
+    fn allowed_ips_mode1_no_ips_returns_empty() {
+        let engine = allowed_ips_engine();
+        let input = NetworkInput {
+            host: "api.github.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let ips = engine.query_allowed_ips(&input).unwrap();
+        assert!(ips.is_empty(), "Mode 1 should return no allowed_ips");
+    }
+
+    #[test]
+    fn allowed_ips_mode3_wrong_port_denied() {
+        let engine = allowed_ips_engine();
+        // Port 12345 doesn't match any policy
+        let input = NetworkInput {
+            host: "anything.example.com".into(),
+            port: 12345,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed, "Mode 3: wrong port should deny");
+    }
+
+    #[test]
+    fn allowed_ips_proto_round_trip() {
+        // Test that allowed_ips survives proto → OPA data → query
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "internal".to_string(),
+            NetworkPolicyRule {
+                name: "internal".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "internal.corp.net".to_string(),
+                    port: 8080,
+                    allowed_ips: vec!["10.0.5.0/24".to_string(), "10.0.6.0/24".to_string()],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(navigator_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "".to_string(),
+                run_as_group: "".to_string(),
+            }),
+            network_policies,
+            inference: None,
+        };
+        let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
+
+        let input = NetworkInput {
+            host: "internal.corp.net".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let ips = engine.query_allowed_ips(&input).unwrap();
+        assert_eq!(ips, vec!["10.0.5.0/24", "10.0.6.0/24"]);
     }
 }

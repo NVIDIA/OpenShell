@@ -2771,6 +2771,7 @@ dependencies = [
  "clap",
  "hex",
  "hmac",
+ "ipnet",
  "landlock",
  "libc",
  "miette",
