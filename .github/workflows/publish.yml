@@ -60,21 +60,6 @@ jobs:
       AWS_DEFAULT_REGION: us-west-2
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history needed for setuptools_scm version
-
-      - name: Install Python dependencies
-        run: uv sync --frozen
-
-      - name: Compute version
-        id: version
-        run: |
-          VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
-          echo "docker=$VERSION_DOCKER" >> "$GITHUB_OUTPUT"
-          echo "Docker image version: $VERSION_DOCKER"
-
-      - name: Set version in source files
-        run: mise run --no-prepare version:set
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -90,7 +75,6 @@ jobs:
           DOCKER_BUILDER: navigator
           IMAGE_TAG: dev
           TAG_LATEST: "true"
-          EXTRA_DOCKER_TAGS: ${{ steps.version.outputs.docker }}
         run: mise run --no-prepare docker:publish:cluster:multiarch
 
   # ---------------------------------------------------------------------------
