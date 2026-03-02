@@ -57,11 +57,6 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Pull pre-built images
-        run: |
-          docker pull ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }}
-          docker tag ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }} navigator/cluster:${{ github.sha }}
-
       - name: Install Python dependencies and generate protobuf stubs
         run: uv sync --frozen && mise run --no-prepare python:proto
 
@@ -70,6 +65,7 @@ jobs:
           GATEWAY_HOST: host.docker.internal
           GATEWAY_PORT: "8080"
           SKIP_IMAGE_PUSH: "1"
+          NAVIGATOR_CLUSTER_IMAGE: ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }}
         run: mise run --no-prepare --skip-deps cluster
 
       - name: Run E2E tests
