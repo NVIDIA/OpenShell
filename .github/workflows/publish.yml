@@ -3,6 +3,10 @@ name: Publish
 on:
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/publish.yml
   workflow_dispatch:
 
 permissions:
@@ -14,19 +18,25 @@ jobs:
   # Build container images to GHCR (same as E2E pipeline)
   # ---------------------------------------------------------------------------
   build-server:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an'
     uses: ./.github/workflows/docker-build.yml
     with:
       component: server
+      push: ${{ github.event_name != 'pull_request' }}
 
   build-sandbox:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an'
     uses: ./.github/workflows/docker-build.yml
     with:
       component: sandbox
+      push: ${{ github.event_name != 'pull_request' }}
 
   build-cluster:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an'
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
+      push: ${{ github.event_name != 'pull_request' }}
 
   # ---------------------------------------------------------------------------
   # Run E2E tests against the built images (temporarily disabled)
@@ -41,6 +51,7 @@ jobs:
   # Publish multi-arch container images to ECR
   # ---------------------------------------------------------------------------
   publish-containers:
+    if: github.event_name != 'pull_request'
     name: Publish Containers
     needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
@@ -81,6 +92,7 @@ jobs:
   # Build Python wheels and stage them in S3
   # ---------------------------------------------------------------------------
   build-python-wheels:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an'
     name: Stage Python Wheels
     needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
@@ -150,6 +162,7 @@ jobs:
   # Publish Python wheels to Artifactory from S3 staging
   # ---------------------------------------------------------------------------
   publish-python:
+    if: github.event_name != 'pull_request' || github.head_ref == 'fix-publish-version/an'
     name: Publish Python
     needs: [build-python-wheels]
     runs-on: [self-hosted, nv]
