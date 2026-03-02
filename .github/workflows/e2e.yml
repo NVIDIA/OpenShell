@@ -58,11 +58,8 @@ jobs:
           docker pull ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }}
           docker tag ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }} navigator/cluster:${{ github.sha }}
 
-      - name: Install Python dependencies
-        run: uv sync --frozen
-
-      - name: Generate protobuf stubs
-        run: mise run --no-prepare python:proto
+      - name: Install Python dependencies and generate protobuf stubs
+        run: uv sync --frozen && mise run --no-prepare python:proto
 
       - name: Bootstrap and deploy cluster
         env:
