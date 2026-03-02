@@ -393,10 +393,9 @@ Container builds use Docker BuildKit with local cache directories:
 
 In CI pipelines:
 
-- `.cache/buildkit/` is cached between pipeline runs to avoid recompiling unchanged Rust dependencies.
+- Remote BuildKit daemons (`buildkit-amd64` and `buildkit-arm64`) are used as persistent builders via `driver: remote`. Their built-in layer cache persists across builds, so no external cache (registry-backed or otherwise) is needed in CI.
 - Rust lint/test jobs cache `.cache/sccache/` and `target/` with keys derived from `Cargo.lock` and Rust task config files, scoped per runner architecture.
 - CI sets `CARGO_INCREMENTAL=0` to favor deterministic clean builds over incremental metadata churn.
-- The `build_ci_image` job publishes a registry-backed BuildKit cache at `$CI_REGISTRY_IMAGE/ci:buildcache` so layer cache survives across runners and pipelines even when local cache directories are cold.
 - Publish jobs mirror `crazymax/osxcross:latest` into `$CI_REGISTRY_IMAGE/third_party/osxcross:latest` (when missing) and set `OSXCROSS_IMAGE` so macOS wheel Docker builds consume the mirrored image instead of pulling from Docker Hub on each run.
 - The sandbox e2e test job tags and pushes component images to the GitLab project registry (`$CI_REGISTRY_IMAGE`) and configures cluster bootstrap to pull from that remote registry with CI credentials.
 

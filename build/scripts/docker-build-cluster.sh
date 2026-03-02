@@ -7,8 +7,6 @@
 
 #   DOCKER_PLATFORM          - Target platform (optional)
 #   DOCKER_BUILDER           - Buildx builder name (default: auto-select)
-#   DOCKER_CACHE_FROM        - Explicit --cache-from value (e.g. type=registry,ref=...)
-#   DOCKER_CACHE_TO          - Explicit --cache-to value (e.g. type=registry,ref=...,mode=max)
 #   DOCKER_PUSH              - When set to "1", push instead of loading into local daemon
 #   IMAGE_REGISTRY           - Registry prefix for image name (e.g. ghcr.io/org/repo)
 set -euo pipefail
@@ -34,11 +32,7 @@ elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
 fi
 
 CACHE_ARGS=()
-if [[ -n "${DOCKER_CACHE_FROM:-}" || -n "${DOCKER_CACHE_TO:-}" ]]; then
-  # Explicit cache configuration from the caller (e.g. CI registry cache).
-  [[ -n "${DOCKER_CACHE_FROM:-}" ]] && CACHE_ARGS+=(--cache-from "${DOCKER_CACHE_FROM}")
-  [[ -n "${DOCKER_CACHE_TO:-}" ]]   && CACHE_ARGS+=(--cache-to "${DOCKER_CACHE_TO}")
-elif [[ -z "${CI:-}" ]]; then
+if [[ -z "${CI:-}" ]]; then
   # Local development: use filesystem cache with docker-container driver.
   if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
     CACHE_ARGS=(
