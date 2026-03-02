@@ -72,44 +72,9 @@ jobs:
         run: mise run --no-prepare python:proto
 
       - name: Bootstrap and deploy cluster
+        env:
+          GATEWAY_HOST: host.docker.internal
         run: mise run --no-prepare --skip-deps cluster:build
-
-      - name: Fix gateway endpoint for CI networking
-        run: |
-          # The cluster container binds the gateway port to the Docker host's
-          # 0.0.0.0:8080. From inside the CI container, 127.0.0.1 is our own
-          # loopback — not the host's. We need to reach the host via the Docker
-          # bridge gateway IP.
-          #
-          # "host.docker.internal" is already in the server certificate's SANs,
-          # so we just need DNS resolution + metadata pointing there.
-
-          # Determine the Docker bridge gateway IP (host IP from container's perspective)
-          BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
-          echo "Docker bridge gateway IP: ${BRIDGE_IP}"
-
-          # Ensure host.docker.internal resolves to the bridge gateway
-          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
-            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
-          fi
-
-          # Verify connectivity to the gateway through the bridge IP
-          curl -fsSk --max-time 5 "https://host.docker.internal:8080" || true
-
-          # Patch the cluster metadata so the Python client connects via
-          # host.docker.internal instead of 127.0.0.1
-          CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
-          METADATA="${HOME}/.config/navigator/clusters/${CLUSTER_NAME}_metadata.json"
-          if [ -f "${METADATA}" ]; then
-            echo "Before patching:"
-            cat "${METADATA}"
-            sed -i 's|https://127\.0\.0\.1:|https://host.docker.internal:|g' "${METADATA}"
-            echo "After patching:"
-            cat "${METADATA}"
-          else
-            echo "WARNING: metadata file not found at ${METADATA}"
-            ls -la "${HOME}/.config/navigator/clusters/" || true
-          fi
 
       - name: Run E2E tests
         run: mise run --no-prepare --skip-deps test:e2e:sandbox

@@ -241,7 +241,24 @@ if [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
   done
 fi
 
-nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config
+GATEWAY_HOST_ARGS=()
+if [ -n "${GATEWAY_HOST:-}" ]; then
+  GATEWAY_HOST_ARGS+=(--gateway-host "${GATEWAY_HOST}")
+
+  # Ensure the gateway host resolves from the current environment.
+  # On Linux CI runners host.docker.internal is not set automatically
+  # (it's a Docker Desktop feature). If the hostname doesn't resolve,
+  # add it via the Docker bridge gateway IP.
+  if ! getent hosts "${GATEWAY_HOST}" >/dev/null 2>&1; then
+    BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}' 2>/dev/null || true)
+    if [ -n "${BRIDGE_IP}" ]; then
+      echo "Adding /etc/hosts entry: ${BRIDGE_IP} ${GATEWAY_HOST}"
+      echo "${BRIDGE_IP} ${GATEWAY_HOST}" >> /etc/hosts
+    fi
+  fi
+fi
+
+nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" "${GATEWAY_HOST_ARGS[@]}" --update-kube-config
 
 echo ""
 echo "Cluster '${CLUSTER_NAME}' is ready."

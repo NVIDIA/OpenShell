@@ -401,6 +401,15 @@ enum ClusterAdminCommands {
         /// Host port to map to the gateway (default: 8080).
         #[arg(long, default_value_t = navigator_bootstrap::DEFAULT_GATEWAY_PORT)]
         port: u16,
+
+        /// Override the gateway host written into cluster metadata.
+        ///
+        /// By default, local clusters advertise 127.0.0.1. In environments
+        /// where the test runner cannot reach 127.0.0.1 on the Docker host
+        /// (e.g., CI containers), set this to a reachable hostname such as
+        /// `host.docker.internal`.
+        #[arg(long)]
+        gateway_host: Option<String>,
     },
 
     /// Stop a cluster (preserves state).
@@ -833,6 +842,7 @@ async fn main() -> Result<()> {
                     remote,
                     ssh_key,
                     port,
+                    gateway_host,
                 } => {
                     run::cluster_admin_deploy(
                         &name,
@@ -841,6 +851,7 @@ async fn main() -> Result<()> {
                         remote.as_deref(),
                         ssh_key.as_deref(),
                         port,
+                        gateway_host.as_deref(),
                     )
                     .await?;
                 }
