@@ -23,7 +23,9 @@ jobs:
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
+      options: --privileged --network host
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       IMAGE_TAG: ${{ github.sha }}
       NAVIGATOR_REGISTRY_INSECURE: "false"
@@ -31,26 +33,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Start Docker daemon
-        run: |
-          dockerd &
-          for i in $(seq 1 30); do
-            docker info >/dev/null 2>&1 && break
-            sleep 1
-          done
-          docker info
-
-          # Pre-start the local registry with --network host so it binds
-          # directly to the container's loopback interface. The default bridge
-          # network port-mapping relies on iptables which may not work inside
-          # a privileged container.
-          docker rm -f navigator-local-registry 2>/dev/null || true
-          docker run -d --restart=always --name navigator-local-registry --network host registry:2
-          for i in $(seq 1 30); do
-            curl -fsS --max-time 2 http://127.0.0.1:5000/v2/ >/dev/null 2>&1 && break
-            sleep 1
-          done
-          curl -fsS http://127.0.0.1:5000/v2/
+      - name: Verify Docker access
+        run: docker info
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
