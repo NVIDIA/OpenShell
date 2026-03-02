@@ -14,6 +14,8 @@
 #   IMAGE_TAG          - Image tag (default: dev)
 #   DOCKER_PLATFORM    - Target platform (optional, e.g. linux/amd64)
 #   DOCKER_BUILDER     - Buildx builder name (default: auto-select)
+#   DOCKER_CACHE_FROM  - Explicit --cache-from value (e.g. type=registry,ref=...)
+#   DOCKER_CACHE_TO    - Explicit --cache-to value (e.g. type=registry,ref=...,mode=max)
 set -euo pipefail
 
 COMPONENT=${1:?"Usage: docker-build-component.sh <component> [variant] [extra-args...]"}
@@ -69,13 +71,18 @@ elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
 fi
 
 CACHE_ARGS=()
-if [[ -n "${CI:-}" ]]; then
-  echo "CI environment detected; skipping local build cache export options."
-elif docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
-  CACHE_ARGS=(
-    --cache-from "type=local,src=${CACHE_PATH}"
-    --cache-to "type=local,dest=${CACHE_PATH},mode=max"
-  )
+if [[ -n "${DOCKER_CACHE_FROM:-}" || -n "${DOCKER_CACHE_TO:-}" ]]; then
+  # Explicit cache configuration from the caller (e.g. CI registry cache).
+  [[ -n "${DOCKER_CACHE_FROM:-}" ]] && CACHE_ARGS+=(--cache-from "${DOCKER_CACHE_FROM}")
+  [[ -n "${DOCKER_CACHE_TO:-}" ]]   && CACHE_ARGS+=(--cache-to "${DOCKER_CACHE_TO}")
+elif [[ -z "${CI:-}" ]]; then
+  # Local development: use filesystem cache with docker-container driver.
+  if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
+    CACHE_ARGS=(
+      --cache-from "type=local,src=${CACHE_PATH}"
+      --cache-to "type=local,dest=${CACHE_PATH},mode=max"
+    )
+  fi
 fi
 
 docker buildx build \

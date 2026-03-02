@@ -1,0 +1,89 @@
+name: E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  e2e:
+    name: E2E
+    runs-on: build-amd64
+    timeout-minutes: 45
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    services:
+      docker:
+        image: docker:24-dind
+        options: --privileged
+        env:
+          DOCKER_TLS_CERTDIR: ""
+    env:
+      DOCKER_HOST: tcp://docker:2375
+      DOCKER_TLS_CERTDIR: ""
+      DOCKER_TLS_VERIFY: ""
+      DOCKER_CERT_PATH: ""
+      IMAGE_TAG: ${{ github.sha }}
+      NAVIGATOR_REGISTRY_INSECURE: "false"
+      DOCKER_BUILDER: ci-builder
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Wait for Docker daemon
+        run: |
+          for i in $(seq 1 30); do
+            docker info >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker info
+
+      - name: Bridge Docker socket
+        run: |
+          socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
+          sleep 1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Create buildx builder
+        run: docker buildx create --use --name ci-builder --driver docker-container
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Build server image
+        env:
+          DOCKER_CACHE_FROM: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/server:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/server:buildcache,mode=max"
+        run: mise run --no-prepare docker:build:server
+
+      - name: Build sandbox image
+        env:
+          DOCKER_CACHE_FROM: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/sandbox:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/sandbox:buildcache,mode=max"
+        run: mise run --no-prepare docker:build:sandbox
+
+      - name: Build cluster image
+        env:
+          DOCKER_CACHE_FROM: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/cluster:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=ghcr.io/${{ github.repository }}/cache/cluster:buildcache,mode=max"
+        run: mise run --no-prepare docker:build:cluster
+
+      - name: Generate protobuf stubs
+        run: mise run --no-prepare python:proto
+
+      - name: Bootstrap and deploy cluster
+        run: mise run --no-prepare --skip-deps cluster:build
+
+      - name: Run E2E tests
+        run: mise run --no-prepare --skip-deps test:e2e:sandbox
