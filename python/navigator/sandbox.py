@@ -280,7 +280,12 @@ class SandboxClient:
             timeout_seconds=timeout_seconds or 0,
             stdin=stdin or b"",
         )
-        stream = self._stub.ExecSandbox(request, timeout=self._timeout)
+        # Use whichever is larger: the default client timeout or the command
+        # timeout plus headroom for SSH setup / teardown overhead.
+        grpc_deadline = self._timeout
+        if timeout_seconds and timeout_seconds + 10 > grpc_deadline:
+            grpc_deadline = timeout_seconds + 10
+        stream = self._stub.ExecSandbox(request, timeout=grpc_deadline)
 
         stdout_parts: list[bytes] = []
         stderr_parts: list[bytes] = []
