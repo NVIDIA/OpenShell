@@ -11,12 +11,14 @@ pub struct ProxyResponse {
 
 /// Forward a raw HTTP request to the backend configured in `route`.
 ///
-/// Rewrites the `Authorization` header with the route's API key and the
-/// `Host` header to match the backend endpoint. The original path is
-/// appended to the route's endpoint URL.
+/// Rewrites the auth header with the route's API key (using the
+/// protocol-appropriate mechanism) and the `Host` header to match the
+/// backend endpoint. The original path is appended to the route's
+/// endpoint URL.
 pub async fn proxy_to_backend(
     client: &reqwest::Client,
     route: &ResolvedRoute,
+    source_protocol: &str,
     method: &str,
     path: &str,
     headers: Vec<(String, String)>,
@@ -31,13 +33,18 @@ pub async fn proxy_to_backend(
 
     let mut builder = client.request(reqwest_method, &url);
 
-    // Set the route's API key
-    builder = builder.bearer_auth(&route.api_key);
+    // Set the route's API key using the protocol-appropriate header.
+    // Anthropic uses `x-api-key`; OpenAI and others use `Authorization: Bearer`.
+    if source_protocol.starts_with("anthropic") {
+        builder = builder.header("x-api-key", &route.api_key);
+    } else {
+        builder = builder.bearer_auth(&route.api_key);
+    }
 
     // Forward non-sensitive headers (skip auth and host — we rewrite those)
     for (name, value) in &headers {
         let name_lc = name.to_ascii_lowercase();
-        if name_lc == "authorization" || name_lc == "host" {
+        if name_lc == "authorization" || name_lc == "x-api-key" || name_lc == "host" {
             continue;
         }
         builder = builder.header(name.as_str(), value.as_str());
