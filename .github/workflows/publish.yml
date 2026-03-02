@@ -235,9 +235,8 @@ jobs:
             curl --fail --silent --show-error --location \
               "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
               --output awscliv2.zip
-            python -c "import zipfile; zipfile.ZipFile('awscliv2.zip').extractall('.')"
-            chmod +x ./aws/install
-            sh ./aws/install --bin-dir "$HOME/.local/bin" --install-dir "$HOME/.local/aws-cli" --update
+            unzip -q awscliv2.zip
+            ./aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
             echo "$HOME/.local/bin" >> "$GITHUB_PATH"
             export PATH="$HOME/.local/bin:$PATH"
           fi
