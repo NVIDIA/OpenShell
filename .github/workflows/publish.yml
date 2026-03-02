@@ -1,0 +1,115 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Build container images to GHCR (same as E2E pipeline)
+  # ---------------------------------------------------------------------------
+  build-server:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: server
+
+  build-sandbox:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+
+  build-cluster:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+
+  # ---------------------------------------------------------------------------
+  # Run E2E tests against the built images
+  # ---------------------------------------------------------------------------
+  e2e:
+    needs: [build-server, build-sandbox, build-cluster]
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+
+  # ---------------------------------------------------------------------------
+  # Publish multi-arch container images to ECR
+  # ---------------------------------------------------------------------------
+  publish-containers:
+    name: Publish Containers
+    needs: [e2e]
+    runs-on: build-amd64
+    timeout-minutes: 120
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-west-2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Full history needed for setuptools_scm version
+
+      - name: Install Python dependencies
+        run: uv sync --frozen
+
+      - name: Compute version
+        id: version
+        run: |
+          VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
+          echo "docker=$VERSION_DOCKER" >> "$GITHUB_OUTPUT"
+          echo "Docker image version: $VERSION_DOCKER"
+
+      - name: Set version in source files
+        run: mise run --no-prepare version:set
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Log in to ECR
+        run: aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Build and push multi-arch images to ECR
+        env:
+          DOCKER_BUILDER: navigator
+          IMAGE_TAG: dev
+          TAG_LATEST: "true"
+          EXTRA_DOCKER_TAGS: ${{ steps.version.outputs.docker }}
+        run: mise run --no-prepare docker:publish:cluster:multiarch
+
+  # ---------------------------------------------------------------------------
+  # Publish Python packages (placeholder)
+  # ---------------------------------------------------------------------------
+  publish-python:
+    name: Publish Python
+    needs: [e2e]
+    runs-on: build-amd64
+    if: false  # TODO: Enable when Python packaging is ready
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Placeholder
+        run: echo "Python packaging not yet implemented"

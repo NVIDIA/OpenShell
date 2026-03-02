@@ -1,8 +1,6 @@
 name: E2E
 
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
 
@@ -12,64 +10,25 @@ permissions:
 
 jobs:
   build-server:
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: server
 
   build-sandbox:
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: sandbox
 
   build-cluster:
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
 
   e2e:
-    name: E2E
     needs: [build-server, build-sandbox, build-cluster]
-    runs-on: build-amd64
-    timeout-minutes: 30
-    container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      IMAGE_TAG: ${{ github.sha }}
-      # Use GHCR as the image registry for both push (from CI) and pull (from k3s).
-      NAVIGATOR_REGISTRY: ghcr.io/nvidia/nv-agent-env
-      NAVIGATOR_REGISTRY_HOST: ghcr.io
-      NAVIGATOR_REGISTRY_NAMESPACE: nvidia/nv-agent-env
-      NAVIGATOR_REGISTRY_USERNAME: ${{ github.actor }}
-      NAVIGATOR_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Pull cluster image
-        run: docker pull ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }}
-
-      - name: Install Python dependencies and generate protobuf stubs
-        run: uv sync --frozen && mise run --no-prepare python:proto
-
-      - name: Bootstrap and deploy cluster
-        env:
-          GATEWAY_HOST: host.docker.internal
-          GATEWAY_PORT: "8080"
-          SKIP_IMAGE_PUSH: "1"
-          NAVIGATOR_CLUSTER_IMAGE: ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }}
-        run: mise run --no-prepare --skip-deps cluster
-
-      - name: Run E2E tests
-        run: mise run --no-prepare --skip-deps test:e2e:sandbox
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      image-tag: ${{ github.sha }}
