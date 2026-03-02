@@ -7,9 +7,17 @@
 
 #   DOCKER_PLATFORM          - Target platform (optional)
 #   DOCKER_BUILDER           - Buildx builder name (default: auto-select)
+#   DOCKER_CACHE_FROM        - Explicit --cache-from value (e.g. type=registry,ref=...)
+#   DOCKER_CACHE_TO          - Explicit --cache-to value (e.g. type=registry,ref=...,mode=max)
+#   DOCKER_PUSH              - When set to "1", push instead of loading into local daemon
+#   IMAGE_REGISTRY           - Registry prefix for image name (e.g. ghcr.io/org/repo)
 set -euo pipefail
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
+IMAGE_NAME="navigator/cluster"
+if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
+  IMAGE_NAME="${IMAGE_REGISTRY}/cluster"
+fi
 DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}
 CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/cluster"
 
@@ -26,13 +34,18 @@ elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
 fi
 
 CACHE_ARGS=()
-if [[ -n "${CI:-}" ]]; then
-  echo "CI environment detected; skipping local build cache export options."
-elif docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
-  CACHE_ARGS=(
-    --cache-from "type=local,src=${CACHE_PATH}"
-    --cache-to "type=local,dest=${CACHE_PATH},mode=max"
-  )
+if [[ -n "${DOCKER_CACHE_FROM:-}" || -n "${DOCKER_CACHE_TO:-}" ]]; then
+  # Explicit cache configuration from the caller (e.g. CI registry cache).
+  [[ -n "${DOCKER_CACHE_FROM:-}" ]] && CACHE_ARGS+=(--cache-from "${DOCKER_CACHE_FROM}")
+  [[ -n "${DOCKER_CACHE_TO:-}" ]]   && CACHE_ARGS+=(--cache-to "${DOCKER_CACHE_TO}")
+elif [[ -z "${CI:-}" ]]; then
+  # Local development: use filesystem cache with docker-container driver.
+  if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
+    CACHE_ARGS=(
+      --cache-from "type=local,src=${CACHE_PATH}"
+      --cache-to "type=local,dest=${CACHE_PATH},mode=max"
+    )
+  fi
 fi
 
 # Create build directory for charts
@@ -45,14 +58,20 @@ helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 # Build cluster image (no bundled component images — they are pulled at runtime
 # from the distribution registry; credentials are injected at deploy time)
 echo "Building cluster image..."
+
+OUTPUT_FLAG="--load"
+if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
+  OUTPUT_FLAG="--push"
+fi
+
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
   -f deploy/docker/Dockerfile.cluster \
-  -t navigator/cluster:${IMAGE_TAG} \
+  -t ${IMAGE_NAME}:${IMAGE_TAG} \
   --build-arg K3S_VERSION=${K3S_VERSION} \
-  --load \
+  ${OUTPUT_FLAG} \
   .
 
-echo "Done! Cluster image: navigator/cluster:${IMAGE_TAG}"
+echo "Done! Cluster image: ${IMAGE_NAME}:${IMAGE_TAG}"

@@ -748,7 +748,7 @@ impl Navigator for NavigatorService {
         let (tx, rx) = mpsc::channel::<Result<ExecSandboxEvent, Status>>(256);
         tokio::spawn(async move {
             if let Err(err) = stream_exec_over_ssh(
-                tx,
+                tx.clone(),
                 &sandbox_id,
                 &target_host,
                 target_port,
@@ -760,6 +760,7 @@ impl Navigator for NavigatorService {
             .await
             {
                 warn!(sandbox_id = %sandbox_id, error = %err, "ExecSandbox failed");
+                let _ = tx.send(Err(err)).await;
             }
         });
 

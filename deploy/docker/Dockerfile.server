@@ -9,11 +9,13 @@ ARG BUILDARCH
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    cmake g++ make protobuf-compiler && rm -rf /var/lib/apt/lists/*
+    cmake g++ make protobuf-compiler curl && rm -rf /var/lib/apt/lists/*
 
-# Install cross-compilation toolchain + Rust target (no-ops for native builds)
+# Install cross-compilation toolchain, sccache, + Rust target (no-ops for native builds)
 COPY deploy/docker/cross-build.sh /usr/local/bin/
-RUN . cross-build.sh && install_cross_toolchain && add_rust_target
+RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
+
+ENV SCCACHE_DIR=/tmp/sccache
 
 WORKDIR /build
 
@@ -43,6 +45,7 @@ COPY proto/ proto/
 # Build dependencies only (cached unless Cargo.toml/lock changes)
 RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-server-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p navigator-server 2>/dev/null || true
 
 # Copy actual source code
@@ -58,6 +61,7 @@ RUN touch crates/navigator-server/src/main.rs \
 # Build the actual application
 RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-server-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     cargo_cross_build --release -p navigator-server && \
     cp "$(cross_output_dir release)/navigator-server" /build/navigator-server

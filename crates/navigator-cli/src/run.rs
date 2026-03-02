@@ -714,6 +714,7 @@ pub async fn cluster_admin_deploy(
     remote: Option<&str>,
     ssh_key: Option<&str>,
     port: u16,
+    gateway_host: Option<&str>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -724,6 +725,9 @@ pub async fn cluster_admin_deploy(
             remote_opts = remote_opts.with_ssh_key(key);
         }
         options = options.with_remote(remote_opts);
+    }
+    if let Some(host) = gateway_host {
+        options = options.with_gateway_host(host);
     }
 
     let interactive = std::io::stderr().is_terminal();

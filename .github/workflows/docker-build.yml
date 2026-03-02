@@ -1,0 +1,60 @@
+name: Docker Build
+
+on:
+  workflow_call:
+    inputs:
+      component:
+        description: "Component to build (server, sandbox, cluster)"
+        required: true
+        type: string
+      timeout-minutes:
+        description: "Job timeout in minutes"
+        required: false
+        type: number
+        default: 20
+      push:
+        description: "Push image to registry"
+        required: false
+        type: boolean
+        default: true
+
+env:
+  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GHCR_CACHE: ghcr.io/nvidia/nv-agent-env/cache
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    name: Build ${{ inputs.component }}
+    runs-on: build-amd64
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+      IMAGE_REGISTRY: ghcr.io/nvidia/nv-agent-env
+      DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Build ${{ inputs.component }} image
+        env:
+          DOCKER_BUILDER: navigator
+          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/${{ inputs.component }}:buildcache"
+          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/${{ inputs.component }}:buildcache,mode=max"
+        run: mise run --no-prepare docker:build:${{ inputs.component }}

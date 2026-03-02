@@ -254,7 +254,9 @@ mod tests {
             .unwrap();
 
         std::thread::sleep(Duration::from_millis(5));
-        std::fs::write(&path, b"fedcba9876543210").unwrap();
+        // Use different-length content so the fingerprint's `len` field
+        // always differs, regardless of filesystem timestamp resolution.
+        std::fs::write(&path, b"tampered").unwrap();
         std::fs::OpenOptions::new()
             .write(true)
             .open(&path)

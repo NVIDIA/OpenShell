@@ -14,6 +14,10 @@
 #   IMAGE_TAG          - Image tag (default: dev)
 #   DOCKER_PLATFORM    - Target platform (optional, e.g. linux/amd64)
 #   DOCKER_BUILDER     - Buildx builder name (default: auto-select)
+#   DOCKER_CACHE_FROM  - Explicit --cache-from value (e.g. type=registry,ref=...)
+#   DOCKER_CACHE_TO    - Explicit --cache-to value (e.g. type=registry,ref=...,mode=max)
+#   DOCKER_PUSH        - When set to "1", push instead of loading into local daemon
+#   IMAGE_REGISTRY     - Registry prefix for image name (e.g. ghcr.io/org/repo)
 set -euo pipefail
 
 COMPONENT=${1:?"Usage: docker-build-component.sh <component> [variant] [extra-args...]"}
@@ -48,6 +52,13 @@ if [[ ! -f "${DOCKERFILE}" ]]; then
   exit 1
 fi
 
+# Prefix with registry when set (e.g. ghcr.io/org/repo/server:tag).
+# Replaces the default "navigator/" prefix with the registry path.
+if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
+  _suffix="${IMAGE_NAME#navigator/}"
+  IMAGE_NAME="${IMAGE_REGISTRY}/${_suffix}"
+fi
+
 IMAGE_TAG=${IMAGE_TAG:-dev}
 DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit}
 CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/${COMPONENT}${VARIANT:+-${VARIANT}}"
@@ -69,13 +80,23 @@ elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
 fi
 
 CACHE_ARGS=()
-if [[ -n "${CI:-}" ]]; then
-  echo "CI environment detected; skipping local build cache export options."
-elif docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
-  CACHE_ARGS=(
-    --cache-from "type=local,src=${CACHE_PATH}"
-    --cache-to "type=local,dest=${CACHE_PATH},mode=max"
-  )
+if [[ -n "${DOCKER_CACHE_FROM:-}" || -n "${DOCKER_CACHE_TO:-}" ]]; then
+  # Explicit cache configuration from the caller (e.g. CI registry cache).
+  [[ -n "${DOCKER_CACHE_FROM:-}" ]] && CACHE_ARGS+=(--cache-from "${DOCKER_CACHE_FROM}")
+  [[ -n "${DOCKER_CACHE_TO:-}" ]]   && CACHE_ARGS+=(--cache-to "${DOCKER_CACHE_TO}")
+elif [[ -z "${CI:-}" ]]; then
+  # Local development: use filesystem cache with docker-container driver.
+  if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
+    CACHE_ARGS=(
+      --cache-from "type=local,src=${CACHE_PATH}"
+      --cache-to "type=local,dest=${CACHE_PATH},mode=max"
+    )
+  fi
+fi
+
+OUTPUT_FLAG="--load"
+if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
+  OUTPUT_FLAG="--push"
 fi
 
 docker buildx build \
@@ -86,5 +107,5 @@ docker buildx build \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
   --provenance=false \
   "$@" \
-  --load \
+  ${OUTPUT_FLAG} \
   .
