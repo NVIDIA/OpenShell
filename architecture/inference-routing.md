@@ -133,7 +133,7 @@ The proto response is converted to `Vec<ResolvedRoute>` by `bundle_to_resolved_r
 
 **File:** `crates/navigator-sandbox/src/lib.rs` -- `spawn_route_refresh()`
 
-In cluster mode, a background `tokio::spawn` task refreshes the route cache every 30 seconds by calling `fetch_inference_bundle()` again. The routes are stored behind `Arc<RwLock<Vec<ResolvedRoute>>>`, shared between the proxy and the refresh task. If a refresh fails, the sandbox logs a warning and keeps the stale routes.
+In cluster mode, a background `tokio::spawn` task refreshes the route cache every 30 seconds by calling `fetch_inference_bundle()` again. The routes are stored behind `Arc<RwLock<Vec<ResolvedRoute>>>`, shared between the proxy and the refresh task. The refresh task is started even when the initial cluster bundle is empty, so newly created routes become available without restarting the sandbox. If a refresh fails, the sandbox logs a warning and keeps the stale routes.
 
 File mode does not spawn a refresh task -- routes are static for the sandbox lifetime.
 
@@ -141,7 +141,8 @@ File mode does not spawn a refresh task -- routes are static for the sandbox lif
 
 Both route source modes degrade gracefully when routes are unavailable:
 
-- **Empty routes from either source**: If `routes: []` in the file, or the cluster bundle returns zero routes, `build_inference_context()` returns `None` and inference routing is disabled. The sandbox starts normally without inference interception. This is confirmed by the `build_inference_context_empty_route_file_returns_none` test.
+- **Empty routes in file mode**: If `routes: []` in the file, `build_inference_context()` returns `None` and inference routing is disabled. This is confirmed by the `build_inference_context_empty_route_file_returns_none` test.
+- **Empty routes in cluster mode**: If the initial cluster bundle has zero routes, the sandbox still creates `InferenceContext` with an empty cache and starts background refresh. Intercepted inference requests return `503` (`{"error": "no inference routes configured"}`) until a later refresh provides routes.
 - **Cluster mode errors**: `PermissionDenied` or `NotFound` errors (detected via string matching on the gRPC error message) indicate no inference policy is configured for this sandbox. The sandbox logs this and proceeds without inference routing. Other gRPC errors also result in graceful degradation: inference routing is disabled, but the sandbox starts normally.
 - **File mode errors**: Parse failures or missing files in standalone mode are fatal -- `build_inference_context()` propagates the error and the sandbox refuses to start. Only an empty-but-valid routes list is gracefully disabled.
 

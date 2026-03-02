@@ -43,6 +43,31 @@ pub use process::{ProcessHandle, ProcessStatus};
 /// startup and never refreshed.
 const ROUTE_REFRESH_INTERVAL_SECS: u64 = 30;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InferenceRouteSource {
+    File,
+    Cluster,
+    None,
+}
+
+fn infer_route_source(
+    sandbox_id: Option<&str>,
+    navigator_endpoint: Option<&str>,
+    inference_routes: Option<&str>,
+) -> InferenceRouteSource {
+    if inference_routes.is_some() {
+        InferenceRouteSource::File
+    } else if sandbox_id.is_some() && navigator_endpoint.is_some() {
+        InferenceRouteSource::Cluster
+    } else {
+        InferenceRouteSource::None
+    }
+}
+
+fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
+    !matches!(source, InferenceRouteSource::Cluster)
+}
+
 #[cfg(target_os = "linux")]
 static MANAGED_CHILDREN: LazyLock<Mutex<HashSet<i32>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
@@ -485,53 +510,71 @@ async fn build_inference_context(
     use navigator_router::Router;
     use navigator_router::config::RouterConfig;
 
-    let routes = if let Some(path) = inference_routes {
-        // Standalone mode: load routes from file (fail-fast on errors)
-        if sandbox_id.is_some() {
-            info!(
-                inference_routes = %path,
-                "Inference routes file takes precedence over cluster bundle"
-            );
-        }
-        info!(inference_routes = %path, "Loading inference routes from file");
-        let config = RouterConfig::load_from_file(std::path::Path::new(path))
-            .map_err(|e| miette::miette!("failed to load inference routes {path}: {e}"))?;
-        config
-            .resolve_routes()
-            .map_err(|e| miette::miette!("failed to resolve routes from {path}: {e}"))?
-    } else if let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint) {
-        // Cluster mode: fetch bundle from gateway
-        info!(sandbox_id = %id, endpoint = %endpoint, "Fetching inference route bundle from gateway");
-        match grpc_client::fetch_inference_bundle(endpoint, id).await {
-            Ok(bundle) => {
+    let source = infer_route_source(sandbox_id, navigator_endpoint, inference_routes);
+
+    let routes = match source {
+        InferenceRouteSource::File => {
+            let Some(path) = inference_routes else {
+                return Ok(None);
+            };
+
+            // Standalone mode: load routes from file (fail-fast on errors)
+            if sandbox_id.is_some() {
                 info!(
-                    route_count = bundle.routes.len(),
-                    revision = %bundle.revision,
-                    "Loaded inference route bundle"
+                    inference_routes = %path,
+                    "Inference routes file takes precedence over cluster bundle"
                 );
-                bundle_to_resolved_routes(&bundle)
             }
-            Err(e) => {
-                // Distinguish "no inference policy" (expected) from server errors.
-                // gRPC PermissionDenied/NotFound means inference is not configured
-                // for this sandbox — skip gracefully. Other errors are unexpected.
-                let msg = e.to_string();
-                if msg.contains("permission denied") || msg.contains("not found") {
-                    info!(error = %e, "Sandbox has no inference policy, inference routing disabled");
+            info!(inference_routes = %path, "Loading inference routes from file");
+            let config = RouterConfig::load_from_file(std::path::Path::new(path))
+                .map_err(|e| miette::miette!("failed to load inference routes {path}: {e}"))?;
+            config
+                .resolve_routes()
+                .map_err(|e| miette::miette!("failed to resolve routes from {path}: {e}"))?
+        }
+        InferenceRouteSource::Cluster => {
+            let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint) else {
+                return Ok(None);
+            };
+
+            // Cluster mode: fetch bundle from gateway
+            info!(sandbox_id = %id, endpoint = %endpoint, "Fetching inference route bundle from gateway");
+            match grpc_client::fetch_inference_bundle(endpoint, id).await {
+                Ok(bundle) => {
+                    info!(
+                        route_count = bundle.routes.len(),
+                        revision = %bundle.revision,
+                        "Loaded inference route bundle"
+                    );
+                    bundle_to_resolved_routes(&bundle)
+                }
+                Err(e) => {
+                    // Distinguish "no inference policy" (expected) from server errors.
+                    // gRPC PermissionDenied/NotFound means inference is not configured
+                    // for this sandbox — skip gracefully. Other errors are unexpected.
+                    let msg = e.to_string();
+                    if msg.contains("permission denied") || msg.contains("not found") {
+                        info!(error = %e, "Sandbox has no inference policy, inference routing disabled");
+                        return Ok(None);
+                    }
+                    warn!(error = %e, "Failed to fetch inference bundle, inference routing disabled");
                     return Ok(None);
                 }
-                warn!(error = %e, "Failed to fetch inference bundle, inference routing disabled");
-                return Ok(None);
             }
         }
-    } else {
-        // No route source — inference routing is not configured
-        return Ok(None);
+        InferenceRouteSource::None => {
+            // No route source — inference routing is not configured
+            return Ok(None);
+        }
     };
 
-    if routes.is_empty() {
+    if routes.is_empty() && disable_inference_on_empty_routes(source) {
         info!("No usable inference routes, inference routing disabled");
         return Ok(None);
+    }
+
+    if routes.is_empty() {
+        info!("Inference route bundle is empty; keeping routing enabled and waiting for refresh");
     }
 
     info!(
@@ -545,7 +588,7 @@ async fn build_inference_context(
     let ctx = Arc::new(proxy::InferenceContext::new(patterns, router, routes));
 
     // Spawn background route cache refresh for cluster mode
-    if inference_routes.is_none()
+    if matches!(source, InferenceRouteSource::Cluster)
         && let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint)
     {
         spawn_route_refresh(ctx.route_cache(), id.to_string(), endpoint.to_string());
@@ -964,5 +1007,46 @@ routes:
         let cache = ctx.route_cache();
         let routes = cache.read().await;
         assert_eq!(routes[0].routing_hint, "file-route");
+    }
+
+    #[test]
+    fn infer_route_source_prefers_file_mode() {
+        assert_eq!(
+            infer_route_source(
+                Some("sb-1"),
+                Some("http://localhost:50051"),
+                Some("routes.yaml")
+            ),
+            InferenceRouteSource::File
+        );
+    }
+
+    #[test]
+    fn infer_route_source_cluster_requires_id_and_endpoint() {
+        assert_eq!(
+            infer_route_source(Some("sb-1"), Some("http://localhost:50051"), None),
+            InferenceRouteSource::Cluster
+        );
+        assert_eq!(
+            infer_route_source(Some("sb-1"), None, None),
+            InferenceRouteSource::None
+        );
+        assert_eq!(
+            infer_route_source(None, Some("http://localhost:50051"), None),
+            InferenceRouteSource::None
+        );
+    }
+
+    #[test]
+    fn disable_inference_on_empty_routes_depends_on_source() {
+        assert!(disable_inference_on_empty_routes(
+            InferenceRouteSource::File
+        ));
+        assert!(!disable_inference_on_empty_routes(
+            InferenceRouteSource::Cluster
+        ));
+        assert!(disable_inference_on_empty_routes(
+            InferenceRouteSource::None
+        ));
     }
 }
