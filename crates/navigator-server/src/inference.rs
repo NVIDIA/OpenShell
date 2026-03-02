@@ -7,7 +7,6 @@ use navigator_core::proto::{
 use prost::Message;
 use std::sync::Arc;
 use tonic::{Request, Response, Status};
-use tracing::info;
 
 use crate::{
     ServerState,
@@ -249,12 +248,6 @@ async fn resolve_sandbox_inference_bundle(
     };
 
     let routes = list_sandbox_routes(store, &allowed_routes).await?;
-
-    info!(
-        sandbox_id = %sandbox_id,
-        route_count = routes.len(),
-        "serving inference bundle"
-    );
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
