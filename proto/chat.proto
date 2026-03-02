@@ -1,0 +1,79 @@
+syntax = "proto3";
+
+package navigator.chat.v1;
+
+option java_multiple_files = true;
+option java_package = "com.anthropic.navigator.chat.v1";
+
+// Chat service provides streaming LLM completions with tool calling support.
+//
+// The server resolves an inference route by routing_hint (default "agent"),
+// translates the request to the backend's native protocol (OpenAI or Anthropic),
+// and streams token deltas back to the client.
+service Chat {
+  // Stream a single chat completion. Returns token chunks followed by
+  // a final message containing any tool_calls.
+  rpc ChatStream(ChatStreamRequest) returns (stream ChatStreamEvent);
+}
+
+// --- Request ---
+
+message ChatStreamRequest {
+  // Conversation history (system, user, assistant, tool messages).
+  repeated ChatMessage messages = 1;
+  // Tool definitions available to the model.
+  repeated Tool tools = 2;
+  // Routing hint to select the inference route (default: "agent").
+  string routing_hint = 3;
+}
+
+message ChatMessage {
+  // One of: "system", "user", "assistant", "tool".
+  string role = 1;
+  // Text content (for system/user/assistant text, or tool result).
+  string content = 2;
+  // Tool calls returned by the assistant (only present when role=assistant).
+  repeated ToolCall tool_calls = 3;
+  // Tool call ID this message is responding to (only present when role=tool).
+  string tool_call_id = 4;
+}
+
+message Tool {
+  // Function name.
+  string name = 1;
+  // Human-readable description of what the tool does.
+  string description = 2;
+  // JSON Schema string describing the parameters.
+  string parameters_schema = 3;
+}
+
+message ToolCall {
+  // Unique ID for this tool invocation.
+  string id = 1;
+  // Function name to call.
+  string name = 2;
+  // JSON string of arguments.
+  string arguments = 3;
+}
+
+// --- Response (streaming) ---
+
+message ChatStreamEvent {
+  oneof event {
+    // Incremental text chunk (streamed as tokens arrive).
+    ContentDelta content_delta = 1;
+    // Final complete message (always the last event).
+    ChatMessage message = 2;
+    // Error from the LLM backend.
+    ChatError error = 3;
+  }
+}
+
+message ContentDelta {
+  string text = 1;
+}
+
+message ChatError {
+  string message = 1;
+  uint32 status_code = 2;
+}

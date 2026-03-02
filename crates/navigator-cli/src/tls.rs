@@ -1,4 +1,5 @@
 use miette::{IntoDiagnostic, Result, WrapErr};
+use navigator_core::proto::chat_client::ChatClient;
 use navigator_core::proto::inference_client::InferenceClient;
 use navigator_core::proto::navigator_client::NavigatorClient;
 use rustls::{
@@ -210,6 +211,19 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClie
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     let channel = endpoint.connect().await.into_diagnostic()?;
     Ok(NavigatorClient::new(channel))
+}
+
+pub async fn grpc_chat_client(server: &str, tls: &TlsOptions) -> Result<ChatClient<Channel>> {
+    let mut endpoint = Endpoint::from_shared(server.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true);
+    let materials = require_tls_materials(server, tls)?;
+    let tls_config = build_tonic_tls_config(&materials);
+    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
+    let channel = endpoint.connect().await.into_diagnostic()?;
+    Ok(ChatClient::new(channel))
 }
 
 pub async fn grpc_inference_client(

@@ -6,6 +6,7 @@
 //! - Protocol multiplexing (gRPC + HTTP on same port)
 //! - mTLS support
 
+mod chat;
 mod grpc;
 mod http;
 mod inference;

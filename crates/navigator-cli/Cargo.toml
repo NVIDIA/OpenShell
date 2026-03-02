@@ -45,6 +45,12 @@ rustls-pemfile = { workspace = true }
 tokio-rustls = { workspace = true }
 reqwest = { workspace = true }
 
+# Streams
+tokio-stream = { workspace = true }
+
+# REPL
+rustyline = "15"
+
 # Error handling
 miette = { workspace = true }
 thiserror = { workspace = true }

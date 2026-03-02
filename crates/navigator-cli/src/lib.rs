@@ -2,6 +2,7 @@
 //!
 //! This crate provides the CLI implementation for Navigator.
 
+pub mod agent;
 pub mod bootstrap;
 pub mod completers;
 pub mod run;

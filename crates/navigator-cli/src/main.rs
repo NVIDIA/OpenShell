@@ -131,6 +131,24 @@ enum Commands {
         command: ProviderCommands,
     },
 
+    /// Interactive agent for cluster operations.
+    ///
+    /// Starts an interactive REPL that uses an LLM (via the gateway Chat service)
+    /// to help operate the cluster. The agent can list sandboxes, view logs,
+    /// check cluster status, and more by calling Navigator CLI commands as tools.
+    ///
+    /// Requires an inference route with the matching routing hint (default: "agent").
+    /// Create one with: nav inference create --routing-hint agent --base-url <url> --model-id <model> --api-key <key>
+    Agent {
+        /// Routing hint to select the inference route (default: "agent").
+        #[arg(long, default_value = "agent")]
+        routing_hint: String,
+
+        /// Path to a custom system prompt file.
+        #[arg(long)]
+        system_prompt: Option<PathBuf>,
+    },
+
     /// Generate shell completions.
     #[command(after_long_help = COMPLETIONS_HELP)]
     Completions {
@@ -1238,6 +1256,28 @@ async fn main() -> Result<()> {
                     run::provider_delete(endpoint, &names, &tls).await?;
                 }
             }
+        }
+        Some(Commands::Agent {
+            routing_hint,
+            system_prompt,
+        }) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let tls = tls.with_cluster_name(&ctx.name);
+            let prompt = system_prompt
+                .map(|p| {
+                    std::fs::read_to_string(&p).map_err(|e| {
+                        miette::miette!("failed to read system prompt from {}: {e}", p.display())
+                    })
+                })
+                .transpose()?;
+            navigator_cli::agent::run_agent(
+                &ctx.endpoint,
+                &ctx.name,
+                &routing_hint,
+                prompt.as_deref(),
+                &tls,
+            )
+            .await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()

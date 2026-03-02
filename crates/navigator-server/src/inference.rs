@@ -286,7 +286,7 @@ async fn resolve_sandbox_inference_bundle(
 ///
 /// Routes are matched by `routing_hint` against the `allowed_routes` list
 /// from the sandbox's inference policy. Only enabled routes are returned.
-async fn list_sandbox_routes(
+pub(crate) async fn list_sandbox_routes(
     store: &Store,
     allowed_routes: &[String],
 ) -> Result<Vec<SandboxResolvedRoute>, Status> {

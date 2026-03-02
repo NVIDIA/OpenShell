@@ -61,6 +61,7 @@ kube = { workspace = true }
 kube-runtime = { workspace = true }
 k8s-openapi = { workspace = true }
 uuid = { workspace = true }
+reqwest = { workspace = true, features = ["stream"] }
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"

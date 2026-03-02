@@ -12,7 +12,9 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use navigator_core::proto::{inference_server::InferenceServer, navigator_server::NavigatorServer};
+use navigator_core::proto::{
+    chat_server::ChatServer, inference_server::InferenceServer, navigator_server::NavigatorServer,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -20,7 +22,9 @@ use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tower::ServiceExt;
 
-use crate::{NavigatorService, ServerState, http_router, inference::InferenceService};
+use crate::{
+    NavigatorService, ServerState, chat::ChatService, http_router, inference::InferenceService,
+};
 
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
@@ -43,7 +47,8 @@ impl MultiplexService {
     {
         let navigator = NavigatorServer::new(NavigatorService::new(self.state.clone()));
         let inference = InferenceServer::new(InferenceService::new(self.state.clone()));
-        let grpc_service = GrpcRouter::new(navigator, inference);
+        let chat = ChatServer::new(ChatService::new(self.state.clone()));
+        let grpc_service = GrpcRouter::new(navigator, inference, chat);
         let http_service = http_router(self.state.clone());
 
         let service = MultiplexedService::new(grpc_service, http_service);
@@ -56,26 +61,29 @@ impl MultiplexService {
     }
 }
 
-/// Combined gRPC service that routes between Navigator and Inference services
-/// based on the request path prefix.
+/// Combined gRPC service that routes between Navigator, Inference, and Chat
+/// services based on the request path prefix.
 #[derive(Clone)]
-pub struct GrpcRouter<N, I> {
+pub struct GrpcRouter<N, I, C> {
     navigator: N,
     inference: I,
+    chat: C,
 }
 
-impl<N, I> GrpcRouter<N, I> {
-    fn new(navigator: N, inference: I) -> Self {
+impl<N, I, C> GrpcRouter<N, I, C> {
+    fn new(navigator: N, inference: I, chat: C) -> Self {
         Self {
             navigator,
             inference,
+            chat,
         }
     }
 }
 
 const INFERENCE_PATH_PREFIX: &str = "/navigator.inference.v1.Inference/";
+const CHAT_PATH_PREFIX: &str = "/navigator.chat.v1.Chat/";
 
-impl<N, I, B> tower::Service<Request<B>> for GrpcRouter<N, I>
+impl<N, I, C, B> tower::Service<Request<B>> for GrpcRouter<N, I, C>
 where
     N: tower::Service<Request<B>> + Clone + Send + 'static,
     N::Response: Send,
@@ -86,6 +94,11 @@ where
         + Send
         + 'static,
     I::Future: Send,
+    C: tower::Service<Request<B>, Response = N::Response, Error = N::Error>
+        + Clone
+        + Send
+        + 'static,
+    C::Future: Send,
     B: Send + 'static,
 {
     type Response = N::Response;
@@ -97,9 +110,12 @@ where
     }
 
     fn call(&mut self, req: Request<B>) -> Self::Future {
-        let is_inference = req.uri().path().starts_with(INFERENCE_PATH_PREFIX);
+        let path = req.uri().path();
 
-        if is_inference {
+        if path.starts_with(CHAT_PATH_PREFIX) {
+            let mut svc = self.chat.clone();
+            Box::pin(async move { svc.ready().await?.call(req).await })
+        } else if path.starts_with(INFERENCE_PATH_PREFIX) {
             let mut svc = self.inference.clone();
             Box::pin(async move { svc.ready().await?.call(req).await })
         } else {
