@@ -198,6 +198,7 @@ pub async fn ensure_container(
     extra_sans: &[String],
     ssh_gateway_host: Option<&str>,
     gateway_port: u16,
+    kube_port: Option<u16>,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -256,13 +257,15 @@ pub async fn ensure_container(
     }
 
     let mut port_bindings = HashMap::new();
-    port_bindings.insert(
-        "6443/tcp".to_string(),
-        Some(vec![PortBinding {
-            host_ip: Some("0.0.0.0".to_string()),
-            host_port: Some("6443".to_string()),
-        }]),
-    );
+    if let Some(kp) = kube_port {
+        port_bindings.insert(
+            "6443/tcp".to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".to_string()),
+                host_port: Some(kp.to_string()),
+            }]),
+        );
+    }
     port_bindings.insert(
         "30051/tcp".to_string(),
         Some(vec![PortBinding {
@@ -270,7 +273,10 @@ pub async fn ensure_container(
             host_port: Some(gateway_port.to_string()),
         }]),
     );
-    let exposed_ports = vec!["6443/tcp".to_string(), "30051/tcp".to_string()];
+    let mut exposed_ports = vec!["30051/tcp".to_string()];
+    if kube_port.is_some() {
+        exposed_ports.push("6443/tcp".to_string());
+    }
 
     let host_config = HostConfig {
         privileged: Some(true),

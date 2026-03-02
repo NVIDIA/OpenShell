@@ -65,9 +65,15 @@ async fn ssh_session_config(
         "{}://{}:{}{}",
         session.gateway_scheme, gateway_host, gateway_port, session.connect_path
     );
+    let cluster_name = tls
+        .cluster_name()
+        .ok_or_else(|| miette::miette!("cluster name is required to build SSH proxy command"))?;
     let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {}",
-        gateway_url, session.sandbox_id, session.token,
+        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --cluster {}",
+        gateway_url,
+        session.sandbox_id,
+        session.token,
+        shell_escape(cluster_name),
     );
 
     Ok(SshSessionConfig {

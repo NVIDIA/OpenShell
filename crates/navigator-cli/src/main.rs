@@ -414,6 +414,13 @@ enum ClusterAdminCommands {
         /// `host.docker.internal`.
         #[arg(long)]
         gateway_host: Option<String>,
+
+        /// Expose the Kubernetes control plane on a host port for kubectl access.
+        /// Pass without a value to auto-select a free port, or pass a specific
+        /// port number. When omitted entirely, the control plane is not exposed,
+        /// allowing multiple clusters to coexist without port conflicts.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        kube_port: Option<u16>,
     },
 
     /// Stop a cluster (preserves state).
@@ -847,6 +854,7 @@ async fn main() -> Result<()> {
                     ssh_key,
                     port,
                     gateway_host,
+                    kube_port,
                 } => {
                     run::cluster_admin_deploy(
                         &name,
@@ -856,6 +864,7 @@ async fn main() -> Result<()> {
                         ssh_key.as_deref(),
                         port,
                         gateway_host.as_deref(),
+                        kube_port,
                     )
                     .await?;
                 }
@@ -1281,8 +1290,12 @@ async fn main() -> Result<()> {
         }) => {
             match (gateway, sandbox_id, token, server, cluster, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, _, _) => {
-                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &tls).await?;
+                (Some(gw), Some(sid), Some(tok), _, cluster_opt, _) => {
+                    let effective_tls = match cluster_opt {
+                        Some(ref c) => tls.with_cluster_name(c),
+                        None => tls,
+                    };
+                    run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
                 // Name mode with --cluster: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(c), Some(n)) => {

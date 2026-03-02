@@ -714,10 +714,19 @@ pub async fn cluster_admin_deploy(
     ssh_key: Option<&str>,
     port: u16,
     gateway_host: Option<&str>,
+    kube_port: Option<u16>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
     let mut options = DeployOptions::new(name).with_port(port);
+    if let Some(kp) = kube_port {
+        let resolved_kp = if kp == 0 {
+            navigator_bootstrap::pick_available_port()?
+        } else {
+            kp
+        };
+        options = options.with_kube_port(resolved_kp);
+    }
     if let Some(dest) = remote {
         let mut remote_opts = RemoteOptions::new(dest);
         if let Some(key) = ssh_key {
@@ -876,6 +885,10 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
         kubeconfig_path.display()
     );
 
+    if let Some(kube_port) = metadata.kube_port {
+        println!("  {} {kube_port}", "Kube port:".dimmed());
+    }
+
     if metadata.is_remote {
         if let Some(ref host) = metadata.remote_host {
             println!("  {} {host}", "Remote host:".dimmed());
@@ -884,12 +897,12 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
             println!("  {} {resolved}", "Resolved host:".dimmed());
         }
 
-        if let Some(ref host) = metadata.remote_host {
+        if let (Some(host), Some(kube_port)) = (&metadata.remote_host, metadata.kube_port) {
             println!();
             println!("{}", "SSH tunnel for kubectl access:".dimmed());
             println!("  nav cluster admin tunnel --name {name}");
             println!("Or manually:");
-            println!("  ssh -L 6443:127.0.0.1:6443 {host}");
+            println!("  ssh -L {kube_port}:127.0.0.1:6443 {host}");
         }
     }
 
@@ -910,9 +923,18 @@ pub fn cluster_admin_tunnel(
         )
     })?;
 
+    let kube_port = get_cluster_metadata(name)
+        .and_then(|m| m.kube_port)
+        .ok_or_else(|| {
+            miette::miette!(
+                "Cluster '{name}' was deployed without --kube-port.\n\
+                 Redeploy with --kube-port <port> to enable kubectl access via SSH tunnel."
+            )
+        })?;
+
     let ssh_cmd = ssh_key.map_or_else(
-        || format!("ssh -L 6443:127.0.0.1:6443 -N {remote}"),
-        |key| format!("ssh -i {key} -L 6443:127.0.0.1:6443 -N {remote}"),
+        || format!("ssh -L {kube_port}:127.0.0.1:6443 -N {remote}"),
+        |key| format!("ssh -i {key} -L {kube_port}:127.0.0.1:6443 -N {remote}"),
     );
 
     if print_command {

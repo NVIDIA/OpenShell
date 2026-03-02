@@ -15,6 +15,11 @@ pub struct ClusterMetadata {
     pub is_remote: bool,
     /// Host port mapped to the gateway `NodePort`.
     pub gateway_port: u16,
+    /// Host port mapped to the k3s Kubernetes control plane (6443 inside the container).
+    /// `None` means the control plane is not exposed on the host.
+    /// Old metadata files without this field are deserialized as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kube_port: Option<u16>,
     /// For remote clusters, the SSH destination (e.g., `user@hostname`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_host: Option<String>,
@@ -27,8 +32,9 @@ pub fn create_cluster_metadata(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
+    kube_port: Option<u16>,
 ) -> ClusterMetadata {
-    create_cluster_metadata_with_host(name, remote, port, None)
+    create_cluster_metadata_with_host(name, remote, port, kube_port, None)
 }
 
 /// Create cluster metadata, optionally overriding the gateway host.
@@ -40,6 +46,7 @@ pub fn create_cluster_metadata_with_host(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
+    kube_port: Option<u16>,
     gateway_host: Option<&str>,
 ) -> ClusterMetadata {
     let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
@@ -71,6 +78,7 @@ pub fn create_cluster_metadata_with_host(
         gateway_endpoint,
         is_remote,
         gateway_port: port,
+        kube_port,
         remote_host,
         resolved_host,
     }
@@ -317,10 +325,11 @@ mod tests {
 
     #[test]
     fn local_cluster_metadata() {
-        let meta = create_cluster_metadata("test", None, 8080);
+        let meta = create_cluster_metadata("test", None, 8080, None);
         assert_eq!(meta.name, "test");
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
         assert_eq!(meta.gateway_port, 8080);
+        assert!(meta.kube_port.is_none());
         assert!(!meta.is_remote);
         assert!(meta.remote_host.is_none());
         assert!(meta.resolved_host.is_none());
@@ -328,9 +337,21 @@ mod tests {
 
     #[test]
     fn local_cluster_metadata_custom_port() {
-        let meta = create_cluster_metadata("test", None, 9090);
+        let meta = create_cluster_metadata("test", None, 9090, None);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:9090");
         assert_eq!(meta.gateway_port, 9090);
+    }
+
+    #[test]
+    fn local_cluster_metadata_with_kube_port() {
+        let meta = create_cluster_metadata("test", None, 8080, Some(7443));
+        assert_eq!(meta.kube_port, Some(7443));
+    }
+
+    #[test]
+    fn local_cluster_metadata_without_kube_port() {
+        let meta = create_cluster_metadata("test", None, 8080, None);
+        assert!(meta.kube_port.is_none());
     }
 
     #[test]
@@ -354,7 +375,7 @@ mod tests {
     #[test]
     fn remote_cluster_metadata_has_resolved_host() {
         let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta = create_cluster_metadata("test", Some(&opts), 8080);
+        let meta = create_cluster_metadata("test", Some(&opts), 8080, Some(6443));
         assert!(meta.is_remote);
         assert_eq!(meta.remote_host.as_deref(), Some("user@10.0.0.5"));
         // When the host is a plain IP, ssh -G should resolve it to itself
@@ -364,15 +385,17 @@ mod tests {
             format!("https://{}:8080", meta.resolved_host.as_ref().unwrap())
         );
         assert_eq!(meta.gateway_port, 8080);
+        assert_eq!(meta.kube_port, Some(6443));
     }
 
     #[test]
-    fn metadata_roundtrip_with_resolved_host() {
+    fn metadata_roundtrip_with_kube_port() {
         let meta = ClusterMetadata {
             name: "test".to_string(),
             gateway_endpoint: "https://10.0.0.5:8080".to_string(),
             is_remote: true,
             gateway_port: 8080,
+            kube_port: Some(7443),
             remote_host: Some("user@navigator-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
         };
@@ -381,11 +404,32 @@ mod tests {
         assert_eq!(parsed.resolved_host.as_deref(), Some("10.0.0.5"));
         assert_eq!(parsed.gateway_endpoint, "https://10.0.0.5:8080");
         assert_eq!(parsed.gateway_port, 8080);
+        assert_eq!(parsed.kube_port, Some(7443));
+    }
+
+    #[test]
+    fn metadata_roundtrip_without_kube_port() {
+        let meta = ClusterMetadata {
+            name: "test".to_string(),
+            gateway_endpoint: "https://10.0.0.5:8080".to_string(),
+            is_remote: true,
+            gateway_port: 8080,
+            kube_port: None,
+            remote_host: Some("user@navigator-dev".to_string()),
+            resolved_host: Some("10.0.0.5".to_string()),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            !json.contains("kube_port"),
+            "None should be omitted from JSON"
+        );
+        let parsed: ClusterMetadata = serde_json::from_str(&json).unwrap();
+        assert!(parsed.kube_port.is_none());
     }
 
     #[test]
     fn metadata_deserialize_without_resolved_host() {
-        // Existing metadata files won't have the resolved_host field.
+        // Existing metadata files won't have the resolved_host or kube_port fields.
         // Ensure backwards compatibility via serde(default).
         let json = r#"{
             "name": "test",
@@ -396,12 +440,19 @@ mod tests {
         }"#;
         let parsed: ClusterMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
+        // kube_port should default to None when not present in JSON
+        assert!(parsed.kube_port.is_none());
     }
 
     #[test]
     fn local_cluster_metadata_with_gateway_host_override() {
-        let meta =
-            create_cluster_metadata_with_host("test", None, 8080, Some("host.docker.internal"));
+        let meta = create_cluster_metadata_with_host(
+            "test",
+            None,
+            8080,
+            None,
+            Some("host.docker.internal"),
+        );
         assert_eq!(meta.name, "test");
         assert_eq!(meta.gateway_endpoint, "https://host.docker.internal:8080");
         assert_eq!(meta.gateway_port, 8080);
@@ -413,7 +464,7 @@ mod tests {
     #[test]
     fn local_cluster_metadata_with_no_gateway_host_override() {
         // When gateway_host is None, behaviour matches create_cluster_metadata.
-        let meta = create_cluster_metadata_with_host("test", None, 8080, None);
+        let meta = create_cluster_metadata_with_host("test", None, 8080, None, None);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
     }
 }

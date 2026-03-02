@@ -33,6 +33,11 @@ impl TlsOptions {
         self.ca.is_some() || self.cert.is_some() || self.key.is_some()
     }
 
+    /// Return the cluster name, if set.
+    pub fn cluster_name(&self) -> Option<&str> {
+        self.cluster_name.as_deref()
+    }
+
     /// Set the cluster name for cert directory resolution.
     #[must_use]
     pub fn with_cluster_name(&self, name: &str) -> Self {
