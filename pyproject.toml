@@ -45,6 +45,7 @@ package = false
 bindings = "bin"
 manifest-path = "crates/navigator-cli/Cargo.toml"
 python-source = "python"
+module-name = "navigator"
 
 [tool.ruff]
 target-version = "py312"
