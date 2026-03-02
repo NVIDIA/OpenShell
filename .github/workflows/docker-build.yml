@@ -49,12 +49,12 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Create buildx builder
-        run: docker buildx create --use --name ci-builder --driver docker-container
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
 
       - name: Build ${{ inputs.component }} image
         env:
-          DOCKER_BUILDER: ci-builder
+          DOCKER_BUILDER: navigator
           DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/${{ inputs.component }}:buildcache"
           DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/${{ inputs.component }}:buildcache,mode=max"
         run: mise run --no-prepare docker:build:${{ inputs.component }}
