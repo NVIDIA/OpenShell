@@ -31,7 +31,7 @@ RUSTC_WRAPPER = "sccache"
 SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
 # Artifact registries
-NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local"
+NAV_PYPI_REPOSITORY_URL = "https://pypi.pkg.github.com/NVIDIA/nv-agent-env/"
 
 # Shared build constants (overridable via environment)
 K3S_VERSION = "{{env.K3S_VERSION | default(value='v1.29.8-k3s1')}}"

@@ -78,22 +78,36 @@ jobs:
         run: mise run --no-prepare docker:publish:cluster:multiarch
 
   # ---------------------------------------------------------------------------
-  # Publish Python packages (placeholder)
+  # Publish Python wheels to GitHub Packages PyPI
   # ---------------------------------------------------------------------------
   publish-python:
     name: Publish Python
     needs: [e2e]
     runs-on: build-amd64
-    if: false  # TODO: Enable when Python packaging is ready
+    timeout-minutes: 120
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NAV_PYPI_REPOSITORY_URL: https://pypi.pkg.github.com/NVIDIA/nv-agent-env/
+      NAV_PYPI_USERNAME: ${{ github.actor }}
+      NAV_PYPI_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Placeholder
-        run: echo "Python packaging not yet implemented"
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Build and publish Python wheels
+        run: mise run --no-prepare python:publish

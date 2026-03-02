@@ -40,7 +40,7 @@ uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON
 """
 
 ["publish:tag"]
-description = "Tag release publish: versioned Docker to ECR and Python to Artifactory"
+description = "Tag release publish: versioned Docker to ECR and Python to GitHub Packages"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
