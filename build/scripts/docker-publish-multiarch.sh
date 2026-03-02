@@ -64,14 +64,6 @@ case "$MODE" in
   registry)
     REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
     IMAGE_PREFIX="navigator-"
-
-    # Ensure a multi-platform builder exists
-    if ! docker buildx inspect multiarch >/dev/null 2>&1; then
-      echo "Creating multi-platform buildx builder..."
-      docker buildx create --name multiarch --use --bootstrap
-    else
-      docker buildx use multiarch
-    fi
     ;;
   ecr)
     AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-524473328983}
@@ -80,20 +72,26 @@ case "$MODE" in
     REGISTRY="${ECR_HOST}/navigator"
     IMAGE_PREFIX=""
     EXTRA_BUILD_FLAGS="--provenance=false --sbom=false"
-
-    # Ensure a multi-platform builder exists
-    if ! docker buildx inspect multiarch >/dev/null 2>&1; then
-      echo "Creating multi-platform buildx builder..."
-      docker buildx create --name multiarch --use --bootstrap
-    else
-      docker buildx use multiarch
-    fi
     ;;
   *)
     echo "Unknown mode: $MODE (expected 'registry' or 'ecr')" >&2
     exit 1
     ;;
 esac
+
+# ---------------------------------------------------------------------------
+# Select or create a multi-platform buildx builder.
+# If DOCKER_BUILDER is set (e.g. by CI with remote BuildKit nodes), use it.
+# Otherwise fall back to creating a local "multiarch" builder.
+# ---------------------------------------------------------------------------
+BUILDER_NAME=${DOCKER_BUILDER:-multiarch}
+if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
+  echo "Using existing buildx builder: ${BUILDER_NAME}"
+  docker buildx use "${BUILDER_NAME}"
+else
+  echo "Creating multi-platform buildx builder: ${BUILDER_NAME}..."
+  docker buildx create --name "${BUILDER_NAME}" --use --bootstrap
+fi
 
 # ---------------------------------------------------------------------------
 # Resolve Dockerfile path for a component.
