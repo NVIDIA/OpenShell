@@ -192,7 +192,31 @@ jobs:
       - name: Install publish dependencies
         run: |
           set -euo pipefail
-          python -m pip install --upgrade pip uv awscli
+          python -m pip install --upgrade pip uv
+
+          if ! command -v aws >/dev/null 2>&1; then
+            ARCH="$(uname -m)"
+            case "$ARCH" in
+              x86_64|amd64) AWSCLI_ARCH="x86_64" ;;
+              aarch64|arm64) AWSCLI_ARCH="aarch64" ;;
+              *)
+                echo "Unsupported architecture for AWS CLI installer: $ARCH" >&2
+                exit 1
+                ;;
+            esac
+
+            rm -rf aws awscliv2.zip
+            curl --fail --silent --show-error --location \
+              "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
+              --output awscliv2.zip
+            python -c "import zipfile; zipfile.ZipFile('awscliv2.zip').extractall('.')"
+            ./aws/install --bin-dir "$HOME/.local/bin" --install-dir "$HOME/.local/aws-cli" --update
+            echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            export PATH="$HOME/.local/bin:$PATH"
+          fi
+
+          aws --version
+          uv --version
 
       - name: List and download versioned wheels from S3
         run: |
