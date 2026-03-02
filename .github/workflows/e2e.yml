@@ -4,6 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
+    types: [opened, synchronize, reopened, labeled]
 
 permissions:
   contents: read
@@ -11,16 +12,19 @@ permissions:
 
 jobs:
   build-server:
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: server
 
   build-sandbox:
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: sandbox
 
   build-cluster:
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
