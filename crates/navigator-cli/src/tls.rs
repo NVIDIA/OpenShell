@@ -199,7 +199,7 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
-pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClient<Channel>> {
+pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
@@ -208,7 +208,11 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClie
     let materials = require_tls_materials(server, tls)?;
     let tls_config = build_tonic_tls_config(&materials);
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    let channel = endpoint.connect().await.into_diagnostic()?;
+    endpoint.connect().await.into_diagnostic()
+}
+
+pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClient<Channel>> {
+    let channel = build_channel(server, tls).await?;
     Ok(NavigatorClient::new(channel))
 }
 

@@ -20,7 +20,9 @@ use navigator_core::proto::{
     UpdateSandboxPolicyRequest, UpdateSandboxPolicyResponse, WatchSandboxRequest,
     navigator_server::Navigator,
 };
-use navigator_core::proto::{Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy};
+use navigator_core::proto::{
+    Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
+};
 use prost::Message;
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
@@ -87,6 +89,14 @@ impl Navigator for NavigatorService {
                 .ok_or_else(|| {
                     Status::failed_precondition(format!("provider '{name}' not found"))
                 })?;
+        }
+
+        // Ensure the template always carries the resolved image so clients
+        // (CLI, TUI, etc.) can read the actual image from the stored sandbox.
+        let mut spec = spec;
+        let template = spec.template.get_or_insert_with(SandboxTemplate::default);
+        if template.image.is_empty() {
+            template.image = self.state.sandbox_client.default_image().to_string();
         }
 
         let id = uuid::Uuid::new_v4().to_string();
@@ -1659,6 +1669,11 @@ async fn create_provider_record(
     }
     if provider.r#type.trim().is_empty() {
         return Err(Status::invalid_argument("provider.type is required"));
+    }
+    if provider.credentials.is_empty() {
+        return Err(Status::invalid_argument(
+            "provider.credentials must not be empty",
+        ));
     }
 
     let existing = store

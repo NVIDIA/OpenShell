@@ -1,6 +1,6 @@
 [package]
-name = "navigator-providers"
-description = "Provider discovery and registry for Navigator"
+name = "navigator-policy"
+description = "Shared sandbox policy parsing and defaults for Navigator"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,7 +9,9 @@ repository.workspace = true
 
 [dependencies]
 navigator-core = { path = "../navigator-core" }
-thiserror = { workspace = true }
+serde = { workspace = true }
+serde_yaml = { workspace = true }
+miette = { workspace = true }
 
 [lints]
 workspace = true

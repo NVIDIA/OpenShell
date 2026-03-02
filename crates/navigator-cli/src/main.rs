@@ -131,6 +131,9 @@ enum Commands {
         command: ProviderCommands,
     },
 
+    /// Launch the Gator interactive TUI.
+    Gator,
+
     /// Generate shell completions.
     #[command(after_long_help = COMPLETIONS_HELP)]
     Completions {
@@ -269,6 +272,7 @@ impl CliProviderType {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]))]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -1249,6 +1253,12 @@ async fn main() -> Result<()> {
                     run::provider_delete(endpoint, &names, &tls).await?;
                 }
             }
+        }
+        Some(Commands::Gator) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let tls = tls.with_cluster_name(&ctx.name);
+            let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
+            navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()

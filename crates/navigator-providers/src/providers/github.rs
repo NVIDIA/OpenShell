@@ -7,7 +7,6 @@ pub struct GithubProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "github",
     credential_env_vars: &["GITHUB_TOKEN", "GH_TOKEN"],
-    config_paths: &["~/.config/gh/hosts.yml"],
 };
 
 impl ProviderPlugin for GithubProvider {
@@ -18,13 +17,17 @@ impl ProviderPlugin for GithubProvider {
     fn discover_existing(&self) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
         discover_with_spec(&SPEC, &RealDiscoveryContext)
     }
+
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        SPEC.credential_env_vars
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::SPEC;
     use crate::discover_with_spec;
-    use crate::test_helpers::{MockDiscoveryContext, home_join};
+    use crate::test_helpers::MockDiscoveryContext;
 
     #[test]
     fn discovers_github_env_credentials() {
@@ -36,16 +39,5 @@ mod tests {
             discovered.credentials.get("GH_TOKEN"),
             Some(&"gh-token".to_string())
         );
-    }
-
-    #[test]
-    fn config_path_existence_alone_does_not_produce_discovery() {
-        let home = "/mock/home";
-        let path = home_join(home, ".config/gh/hosts.yml");
-        let ctx = MockDiscoveryContext::new()
-            .with_home(home)
-            .with_existing_path(path);
-        let discovered = discover_with_spec(&SPEC, &ctx).expect("discovery");
-        assert!(discovered.is_none());
     }
 }

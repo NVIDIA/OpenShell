@@ -18,8 +18,6 @@ pub use discovery::discover_with_spec;
 pub enum ProviderError {
     #[error("unsupported provider type: {0}")]
     UnsupportedProvider(String),
-    #[error("failed to parse JSON in {path}: {message}")]
-    ParseJson { path: String, message: String },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -39,7 +37,6 @@ impl DiscoveredProvider {
 pub struct ProviderDiscoverySpec {
     pub id: &'static str,
     pub credential_env_vars: &'static [&'static str],
-    pub config_paths: &'static [&'static str],
 }
 
 pub trait ProviderPlugin: Send + Sync {
@@ -48,6 +45,14 @@ pub trait ProviderPlugin: Send + Sync {
 
     /// Discover provider credentials and config from the local machine.
     fn discover_existing(&self) -> Result<Option<DiscoveredProvider>, ProviderError>;
+
+    /// Return the known credential environment variable names for this provider type.
+    ///
+    /// Used by the TUI to label BYO key entry fields and to choose which
+    /// env var name to store a manually-entered credential under.
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        &[]
+    }
 
     /// Apply provider data to sandbox runtime context.
     ///
@@ -95,6 +100,13 @@ impl ProviderRegistry {
             return Err(ProviderError::UnsupportedProvider(id.to_string()));
         };
         plugin.discover_existing()
+    }
+
+    /// Return the known credential env var names for a provider type.
+    #[must_use]
+    pub fn credential_env_vars(&self, id: &str) -> &'static [&'static str] {
+        self.get(id)
+            .map_or(&[], ProviderPlugin::credential_env_vars)
     }
 
     #[must_use]

@@ -1,0 +1,27 @@
+[package]
+name = "navigator-tui"
+description = "Gator – Navigator interactive TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+navigator-core = { path = "../navigator-core" }
+navigator-bootstrap = { path = "../navigator-bootstrap" }
+navigator-policy = { path = "../navigator-policy" }
+navigator-providers = { path = "../navigator-providers" }
+
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["tls"] }
+miette = { workspace = true }
+owo-colors = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[lints]
+workspace = true

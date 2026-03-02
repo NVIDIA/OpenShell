@@ -7,7 +7,6 @@ pub struct NvidiaProvider;
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "nvidia",
     credential_env_vars: &["NVIDIA_API_KEY"],
-    config_paths: &[],
 };
 
 impl ProviderPlugin for NvidiaProvider {
@@ -17,6 +16,10 @@ impl ProviderPlugin for NvidiaProvider {
 
     fn discover_existing(&self) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
         discover_with_spec(&SPEC, &RealDiscoveryContext)
+    }
+
+    fn credential_env_vars(&self) -> &'static [&'static str] {
+        SPEC.credential_env_vars
     }
 }
 

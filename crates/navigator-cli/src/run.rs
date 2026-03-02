@@ -23,17 +23,16 @@ use navigator_core::proto::{
     DeleteInferenceRouteRequest, DeleteProviderRequest, DeleteSandboxRequest, GetProviderRequest,
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
     InferenceRoute, InferenceRouteSpec, ListInferenceRoutesRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, NetworkBinary, NetworkEndpoint,
-    NetworkPolicyRule, PolicyStatus, Provider, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec,
-    SandboxTemplate, UpdateInferenceRouteRequest, UpdateProviderRequest,
-    UpdateSandboxPolicyRequest, WatchSandboxRequest,
+    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider, Sandbox,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, UpdateInferenceRouteRequest,
+    UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
 };
 use owo_colors::OwoColorize;
 use reqwest::StatusCode as ReqwestStatusCode;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1258,206 +1257,12 @@ pub async fn sandbox_create(
 }
 
 /// Default sandbox policy YAML, baked in at compile time.
-const DEFAULT_SANDBOX_POLICY_YAML: &str = include_str!("../../../dev-sandbox-policy.yaml");
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevSandboxPolicyFile {
-    version: u32,
-    #[serde(default)]
-    inference: Option<DevInferencePolicy>,
-    #[serde(default)]
-    filesystem_policy: Option<DevFilesystemPolicy>,
-    #[serde(default)]
-    landlock: Option<DevLandlockPolicy>,
-    #[serde(default)]
-    process: Option<DevProcessPolicy>,
-    #[serde(default)]
-    network_policies: HashMap<String, DevNetworkPolicyRule>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevFilesystemPolicy {
-    #[serde(default)]
-    include_workdir: bool,
-    #[serde(default)]
-    read_only: Vec<String>,
-    #[serde(default)]
-    read_write: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevLandlockPolicy {
-    #[serde(default)]
-    compatibility: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevProcessPolicy {
-    #[serde(default)]
-    run_as_user: String,
-    #[serde(default)]
-    run_as_group: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevInferencePolicy {
-    #[serde(default)]
-    allowed_routes: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevNetworkPolicyRule {
-    #[serde(default)]
-    name: String,
-    #[serde(default)]
-    endpoints: Vec<DevNetworkEndpoint>,
-    #[serde(default)]
-    binaries: Vec<DevNetworkBinary>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevNetworkEndpoint {
-    host: String,
-    port: u32,
-    #[serde(default)]
-    protocol: String,
-    #[serde(default)]
-    tls: String,
-    #[serde(default)]
-    enforcement: String,
-    #[serde(default)]
-    access: String,
-    #[serde(default)]
-    rules: Vec<DevL7Rule>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevL7Rule {
-    allow: DevL7Allow,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevL7Allow {
-    #[serde(default)]
-    method: String,
-    #[serde(default)]
-    path: String,
-    #[serde(default)]
-    command: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct DevNetworkBinary {
-    path: String,
-    /// Deprecated: ignored. Kept for backward compat with existing YAML files.
-    #[serde(default)]
-    #[allow(dead_code)]
-    harness: bool,
-}
-
 /// Load sandbox policy YAML.
 ///
 /// Resolution order: `--policy` flag > `NAVIGATOR_SANDBOX_POLICY` env var > built-in default.
+/// Delegates to `navigator_policy::load_sandbox_policy`.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
-    let contents = if let Some(p) = cli_path {
-        let path = Path::new(p);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else if let Ok(policy_path) = std::env::var("NAVIGATOR_SANDBOX_POLICY") {
-        let path = Path::new(&policy_path);
-        std::fs::read_to_string(path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else {
-        DEFAULT_SANDBOX_POLICY_YAML.to_string()
-    };
-    let raw: DevSandboxPolicyFile = serde_yaml::from_str(&contents)
-        .into_diagnostic()
-        .wrap_err("failed to parse sandbox policy yaml")?;
-
-    let network_policies = raw
-        .network_policies
-        .into_iter()
-        .map(|(key, rule)| {
-            let proto_rule = NetworkPolicyRule {
-                name: if rule.name.is_empty() {
-                    key.clone()
-                } else {
-                    rule.name
-                },
-                endpoints: rule
-                    .endpoints
-                    .into_iter()
-                    .map(|e| NetworkEndpoint {
-                        host: e.host,
-                        port: e.port,
-                        protocol: e.protocol,
-                        tls: e.tls,
-                        enforcement: e.enforcement,
-                        access: e.access,
-                        rules: e
-                            .rules
-                            .into_iter()
-                            .map(|r| navigator_core::proto::L7Rule {
-                                allow: Some(navigator_core::proto::L7Allow {
-                                    method: r.allow.method,
-                                    path: r.allow.path,
-                                    command: r.allow.command,
-                                }),
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                binaries: rule
-                    .binaries
-                    .into_iter()
-                    .map(|b| NetworkBinary {
-                        path: b.path,
-                        ..Default::default()
-                    })
-                    .collect(),
-            };
-            (key, proto_rule)
-        })
-        .collect();
-
-    Ok(SandboxPolicy {
-        version: raw.version,
-        filesystem: raw
-            .filesystem_policy
-            .map(|fs| navigator_core::proto::FilesystemPolicy {
-                include_workdir: fs.include_workdir,
-                read_only: fs.read_only,
-                read_write: fs.read_write,
-            }),
-        landlock: raw
-            .landlock
-            .map(|ll| navigator_core::proto::LandlockPolicy {
-                compatibility: ll.compatibility,
-            }),
-        process: raw.process.map(|p| navigator_core::proto::ProcessPolicy {
-            run_as_user: p.run_as_user,
-            run_as_group: p.run_as_group,
-        }),
-        network_policies,
-        inference: raw
-            .inference
-            .map(|inf| navigator_core::proto::InferencePolicy {
-                allowed_routes: inf.allowed_routes,
-                ..Default::default()
-            }),
-    })
+    navigator_policy::load_sandbox_policy(cli_path)
 }
 
 /// Sync files to or from a sandbox.
@@ -2253,6 +2058,13 @@ pub async fn provider_create(
         for (key, value) in discovered.config {
             config_map.entry(key).or_insert(value);
         }
+    }
+
+    if credential_map.is_empty() {
+        return Err(miette::miette!(
+            "no credentials resolved for provider type '{provider_type}'. \
+             Use --credential KEY[=VALUE] or --from-existing with the appropriate env vars set."
+        ));
     }
 
     let response = client

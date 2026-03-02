@@ -1,0 +1,9 @@
+# Gator TUI tasks
+
+[gator]
+description = "Launch the Gator TUI"
+run = "nav gator"
+
+["gator:dev"]
+description = "Launch the Gator TUI with hot-reload on file changes"
+run = "cargo watch -s 'nav gator'"
