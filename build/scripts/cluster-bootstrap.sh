@@ -153,15 +153,19 @@ ensure_local_registry() {
       docker start "${LOCAL_REGISTRY_CONTAINER}" >/dev/null
     fi
 
-    port_map=$(docker port "${LOCAL_REGISTRY_CONTAINER}" 5000/tcp 2>/dev/null || true)
-    case "${port_map}" in
-      *:5000*)
-        ;;
-      *)
-        docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
-        docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
-        ;;
-    esac
+    # If the registry is already reachable (e.g. started with --network host),
+    # skip the port-mapping check.
+    if ! registry_reachable; then
+      port_map=$(docker port "${LOCAL_REGISTRY_CONTAINER}" 5000/tcp 2>/dev/null || true)
+      case "${port_map}" in
+        *:5000*)
+          ;;
+        *)
+          docker rm -f "${LOCAL_REGISTRY_CONTAINER}" >/dev/null 2>&1 || true
+          docker run -d --restart=always --name "${LOCAL_REGISTRY_CONTAINER}" -p 5000:5000 registry:2 >/dev/null
+          ;;
+      esac
+    fi
   fi
 
   if wait_for_registry_ready 20 1; then
