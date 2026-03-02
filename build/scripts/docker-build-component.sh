@@ -16,6 +16,8 @@
 #   DOCKER_BUILDER     - Buildx builder name (default: auto-select)
 #   DOCKER_CACHE_FROM  - Explicit --cache-from value (e.g. type=registry,ref=...)
 #   DOCKER_CACHE_TO    - Explicit --cache-to value (e.g. type=registry,ref=...,mode=max)
+#   DOCKER_PUSH        - When set to "1", push instead of loading into local daemon
+#   IMAGE_REGISTRY     - Registry prefix for image name (e.g. ghcr.io/org/repo)
 set -euo pipefail
 
 COMPONENT=${1:?"Usage: docker-build-component.sh <component> [variant] [extra-args...]"}
@@ -48,6 +50,13 @@ fi
 if [[ ! -f "${DOCKERFILE}" ]]; then
   echo "Error: Dockerfile not found: ${DOCKERFILE}" >&2
   exit 1
+fi
+
+# Prefix with registry when set (e.g. ghcr.io/org/repo/server:tag).
+# Replaces the default "navigator/" prefix with the registry path.
+if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
+  _suffix="${IMAGE_NAME#navigator/}"
+  IMAGE_NAME="${IMAGE_REGISTRY}/${_suffix}"
 fi
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
@@ -85,6 +94,11 @@ elif [[ -z "${CI:-}" ]]; then
   fi
 fi
 
+OUTPUT_FLAG="--load"
+if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
+  OUTPUT_FLAG="--push"
+fi
+
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
@@ -93,5 +107,5 @@ docker buildx build \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
   --provenance=false \
   "$@" \
-  --load \
+  ${OUTPUT_FLAG} \
   .

@@ -5,19 +5,31 @@ on:
     branches: [main]
   pull_request:
 
-env:
-  MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  GHCR_CACHE: ghcr.io/nvidia/nv-agent-env/cache
-
 permissions:
   contents: read
   packages: write
 
 jobs:
+  build-server:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: server
+
+  build-sandbox:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: sandbox
+
+  build-cluster:
+    uses: ./.github/workflows/docker-build.yml
+    with:
+      component: cluster
+
   e2e:
     name: E2E
+    needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
-    timeout-minutes: 45
+    timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
@@ -27,8 +39,8 @@ jobs:
       volumes:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ github.sha }}
-      DOCKER_BUILDER: ci-builder
       # Use GHCR as the image registry for both push (from CI) and pull (from k3s).
       NAVIGATOR_REGISTRY: ghcr.io/nvidia/nv-agent-env
       NAVIGATOR_REGISTRY_HOST: ghcr.io
@@ -38,35 +50,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Verify Docker access
-        run: docker info
-
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Create buildx builder
-        run: docker buildx create --use --name ci-builder --driver docker-container
+      - name: Pull pre-built images
+        run: |
+          docker pull ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }}
+          docker tag ghcr.io/nvidia/nv-agent-env/cluster:${{ github.sha }} navigator/cluster:${{ github.sha }}
 
       - name: Install Python dependencies
         run: uv sync --frozen
-
-      - name: Build server image
-        env:
-          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/server:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/server:buildcache,mode=max"
-        run: mise run --no-prepare docker:build:server
-
-      - name: Build sandbox image
-        env:
-          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/sandbox:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/sandbox:buildcache,mode=max"
-        run: mise run --no-prepare docker:build:sandbox
-
-      - name: Build cluster image
-        env:
-          DOCKER_CACHE_FROM: "type=registry,ref=${{ env.GHCR_CACHE }}/cluster:buildcache"
-          DOCKER_CACHE_TO: "type=registry,ref=${{ env.GHCR_CACHE }}/cluster:buildcache,mode=max"
-        run: mise run --no-prepare docker:build:cluster
 
       - name: Generate protobuf stubs
         run: mise run --no-prepare python:proto
@@ -74,6 +67,7 @@ jobs:
       - name: Bootstrap and deploy cluster
         env:
           GATEWAY_HOST: host.docker.internal
+          SKIP_IMAGE_PUSH: "1"
         run: mise run --no-prepare --skip-deps cluster:build
 
       - name: Run E2E tests
