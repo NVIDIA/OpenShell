@@ -9,8 +9,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  SCCACHE_GHA_ENABLED: "true"
-  RUSTC_WRAPPER: "sccache"
 
 permissions:
   contents: read
@@ -28,10 +26,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Configure sccache
-        run: |
-          echo "ACTIONS_RESULTS_URL=$ACTIONS_RESULTS_URL" >> "$GITHUB_ENV"
-          echo "ACTIONS_RUNTIME_TOKEN=$ACTIONS_RUNTIME_TOKEN" >> "$GITHUB_ENV"
+      - name: Cache sccache
+        uses: actions/cache@v4
+        with:
+          path: .cache/sccache
+          key: sccache-rust-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            sccache-rust-${{ runner.arch }}-
 
       - name: Format
         run: mise run rust:format:check
