@@ -450,6 +450,13 @@ mise run docker:publish:cluster:multiarch
 mise run publish:main
 ```
 
+GitHub Actions stages Python wheels in S3 before final publication to
+Artifactory:
+
+- Wheels are uploaded to `s3://navigator-pypi-artifacts/navigator/<wheel-version>/`.
+- A follow-up job on the `nv` runner lists that version prefix, downloads the
+  wheels, and publishes them to Artifactory.
+
 ### Auto-Deployed Components in Cluster
 
 When the cluster container starts, k3s automatically deploys these HelmChart CRs from `/var/lib/rancher/k3s/server/manifests/`:
