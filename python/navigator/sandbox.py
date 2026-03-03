@@ -151,7 +151,7 @@ class SandboxClient:
         cluster_name = cluster or _resolve_active_cluster()
         metadata_path = (
             _xdg_config_home()
-            / "navigator"
+            / "nemoclaw"
             / "clusters"
             / f"{cluster_name}_metadata.json"
         )
@@ -162,7 +162,7 @@ class SandboxClient:
         endpoint = f"{host}:{port}"
         if parsed.scheme == "https":
             mtls_dir = (
-                _xdg_config_home() / "navigator" / "clusters" / cluster_name / "mtls"
+                _xdg_config_home() / "nemoclaw" / "clusters" / cluster_name / "mtls"
             )
             tls = TlsConfig(
                 ca_path=mtls_dir / "ca.crt",
