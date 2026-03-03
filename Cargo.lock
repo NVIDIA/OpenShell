@@ -2687,6 +2687,7 @@ dependencies = [
  "miette",
  "navigator-bootstrap",
  "navigator-core",
+ "navigator-gateway",
  "navigator-policy",
  "navigator-providers",
  "navigator-tui",
@@ -2724,6 +2725,15 @@ dependencies = [
  "thiserror 2.0.18",
  "tonic",
  "tonic-build",
+]
+
+[[package]]
+name = "navigator-gateway"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "thiserror 2.0.18",
+ "tracing",
 ]
 
 [[package]]

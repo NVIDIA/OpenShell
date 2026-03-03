@@ -8,4 +8,11 @@ BINARY="$PROJECT_ROOT/target/debug/navigator"
 # Build if needed (cargo handles change detection)
 cargo build --package navigator-cli --quiet
 
+# macOS: codesign with hypervisor entitlement if the binary changed.
+# libkrun requires com.apple.security.hypervisor to access Hypervisor.framework.
+ENTITLEMENTS="$PROJECT_ROOT/crates/navigator-gateway/entitlements.plist"
+if [ -f "$ENTITLEMENTS" ]; then
+  codesign --entitlements "$ENTITLEMENTS" --force -s - "$BINARY" 2>/dev/null || true
+fi
+
 exec "$BINARY" "$@"

@@ -119,6 +119,12 @@ enum Commands {
         command: ProviderCommands,
     },
 
+    /// Hardware-isolated microVM gateway.
+    Gateway {
+        #[command(subcommand)]
+        command: GatewayCommands,
+    },
+
     /// Launch the Gator interactive TUI.
     Gator,
 
@@ -465,6 +471,90 @@ enum ClusterAdminCommands {
         /// Only print the SSH command instead of running it.
         #[arg(long)]
         print_command: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum GatewayCommands {
+    /// Run a command inside a hardware-isolated microVM.
+    ///
+    /// Boots a lightweight microVM using libkrun (Apple Hypervisor.framework on
+    /// macOS ARM64, KVM on Linux) and executes the specified command inside it.
+    /// The rootfs directory is mapped into the VM via virtio-fs.
+    ///
+    /// NOTE: This command takes over the current process. The process will exit
+    /// with the guest workload's exit code when the VM shuts down.
+    Run {
+        /// Path to the root filesystem directory (aarch64 Linux userspace).
+        ///
+        /// Must contain the executable specified by EXEC_PATH. For a quick
+        /// start, download the Alpine minirootfs:
+        ///
+        ///   curl -L https://dl-cdn.alpinelinux.org/alpine/v3.21/releases/aarch64/alpine-minirootfs-3.21.3-aarch64.tar.gz | tar xz -C ./rootfs
+        #[arg(long)]
+        rootfs: PathBuf,
+
+        /// Number of virtual CPUs for the microVM.
+        #[arg(long, default_value_t = 1)]
+        vcpus: u8,
+
+        /// Amount of RAM in MiB for the microVM.
+        #[arg(long, default_value_t = 128)]
+        mem: u32,
+
+        /// Working directory inside the VM (relative to rootfs).
+        #[arg(long, default_value = "/")]
+        workdir: String,
+
+        /// libkrun log level (0=Off, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace).
+        #[arg(long, default_value_t = 2)]
+        krun_log_level: u32,
+
+        /// Path to the executable inside the rootfs.
+        exec_path: String,
+
+        /// Arguments passed to the executable.
+        #[arg(trailing_var_arg = true)]
+        args: Vec<String>,
+    },
+
+    /// Boot the cluster container in a hardware-isolated microVM.
+    ///
+    /// Extracts a rootfs from the cluster Docker image, then boots k3s inside
+    /// a libkrun microVM with port forwarding and persistent storage.
+    /// The parent process stays alive to monitor the VM.
+    Cluster {
+        /// Cluster Docker image to extract rootfs from.
+        ///
+        /// Defaults to the same image used by `cluster admin deploy`.
+        #[arg(long)]
+        image: Option<String>,
+
+        /// Host port for the navigator gateway (mapped to guest port 30051).
+        #[arg(long, default_value_t = 8080)]
+        port: u16,
+
+        /// Host port for the k3s API server (mapped to guest port 6443).
+        /// If not set, the API server is not exposed to the host.
+        #[arg(long)]
+        kube_port: Option<u16>,
+
+        /// Number of virtual CPUs for the microVM.
+        #[arg(long, default_value_t = 2)]
+        vcpus: u8,
+
+        /// Amount of RAM in MiB for the microVM.
+        #[arg(long, default_value_t = 2048)]
+        mem: u32,
+
+        /// Directory for persistent k3s state. Created if it doesn't exist.
+        /// Defaults to $XDG_DATA_HOME/navigator/gateway-cluster/k3s-state.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+
+        /// libkrun log level (0=Off, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace).
+        #[arg(long, default_value_t = 2)]
+        krun_log_level: u32,
     },
 }
 
@@ -1262,6 +1352,46 @@ async fn main() -> Result<()> {
                 }
             }
         }
+        Some(Commands::Gateway { command }) => match command {
+            GatewayCommands::Run {
+                rootfs,
+                vcpus,
+                mem,
+                workdir,
+                krun_log_level,
+                exec_path,
+                args,
+            } => {
+                run::gateway_run(
+                    &rootfs,
+                    vcpus,
+                    mem,
+                    &workdir,
+                    krun_log_level,
+                    &exec_path,
+                    &args,
+                )?;
+            }
+            GatewayCommands::Cluster {
+                image,
+                port,
+                kube_port,
+                vcpus,
+                mem,
+                state_dir,
+                krun_log_level,
+            } => {
+                run::gateway_cluster(
+                    image.as_deref(),
+                    port,
+                    kube_port,
+                    vcpus,
+                    mem,
+                    state_dir.as_deref(),
+                    krun_log_level,
+                )?;
+            }
+        },
         Some(Commands::Gator) => {
             let ctx = resolve_cluster(&cli.cluster)?;
             let tls = tls.with_cluster_name(&ctx.name);

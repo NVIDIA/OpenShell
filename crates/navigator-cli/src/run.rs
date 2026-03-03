@@ -3103,6 +3103,380 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Gateway (microVM)
+// ---------------------------------------------------------------------------
+
+/// Boot a hardware-isolated microVM and execute a command inside it.
+///
+/// This function **never returns on success** -- the libkrun VMM takes over
+/// the process and calls `exit()` with the guest workload's exit code.
+pub fn gateway_run(
+    rootfs: &Path,
+    vcpus: u8,
+    mem: u32,
+    workdir: &str,
+    log_level: u32,
+    exec_path: &str,
+    args: &[String],
+) -> Result<()> {
+    use navigator_gateway::KrunContext;
+
+    println!("Booting microVM...");
+    println!("  rootfs:    {}", rootfs.display());
+    println!("  vcpus:     {vcpus}");
+    println!("  memory:    {mem} MiB");
+    println!("  workdir:   {workdir}");
+    println!("  exec:      {exec_path}");
+    if !args.is_empty() {
+        println!("  args:      {}", args.join(" "));
+    }
+    println!();
+
+    let arg_strs: Vec<&str> = args.iter().map(String::as_str).collect();
+
+    let ctx = KrunContext::builder()
+        .vcpus(vcpus)
+        .memory_mib(mem)
+        .rootfs(rootfs)
+        .workdir(workdir)
+        .exec(exec_path, &arg_strs)
+        .log_level(log_level)
+        .build()
+        .map_err(|e| miette::miette!("failed to configure microVM: {e}"))?;
+
+    // This never returns on success -- the process exits with the guest's
+    // exit code. If it does return, it means something went wrong.
+    ctx.start_enter()
+        .map_err(|e| miette::miette!("failed to start microVM: {e}"))?;
+
+    Ok(())
+}
+
+/// Boot the cluster container in a hardware-isolated microVM.
+///
+/// This function:
+/// 1. Extracts a rootfs from the cluster Docker image (if not already cached)
+/// 2. Creates a persistent state directory for k3s data
+/// 3. Boots k3s inside a libkrun microVM with port forwarding
+/// 4. Waits for the child VM process to exit
+#[allow(clippy::too_many_arguments)]
+pub fn gateway_cluster(
+    image: Option<&str>,
+    gateway_port: u16,
+    kube_port: Option<u16>,
+    vcpus: u8,
+    mem: u32,
+    state_dir: Option<&Path>,
+    log_level: u32,
+) -> Result<()> {
+    use navigator_gateway::KrunContext;
+
+    // Resolve the cluster image. Priority:
+    // 1. Explicit --image flag
+    // 2. NAVIGATOR_CLUSTER_IMAGE env var
+    // 3. Default: navigator/cluster:dev (local build)
+    let resolved_image;
+    let image_ref = if let Some(img) = image {
+        img
+    } else if let Ok(img) = std::env::var("NAVIGATOR_CLUSTER_IMAGE") {
+        resolved_image = img;
+        &resolved_image
+    } else {
+        "navigator/cluster:dev"
+    };
+
+    // Determine directories.
+    let data_dir = if let Some(dir) = state_dir {
+        dir.to_path_buf()
+    } else {
+        let base = std::env::var("XDG_DATA_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| {
+                let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+                PathBuf::from(home).join(".local/share")
+            });
+        base.join("navigator/gateway-cluster")
+    };
+    let rootfs_dir = data_dir.join("rootfs");
+    let k3s_state_dir = data_dir.join("k3s-state");
+    let console_log = data_dir.join("console.log");
+
+    // Step 1: Extract rootfs from Docker image if not already present.
+    if !rootfs_dir.join("bin").is_dir() {
+        println!("Extracting rootfs from Docker image: {image_ref}");
+        extract_rootfs_from_docker(image_ref, &rootfs_dir)?;
+    } else {
+        println!("Using cached rootfs: {}", rootfs_dir.display());
+    }
+
+    // Create k3s state directory.
+    std::fs::create_dir_all(&k3s_state_dir)
+        .map_err(|e| miette::miette!("failed to create k3s state dir: {e}"))?;
+
+    // Step 2: Start gvproxy for virtio-net networking.
+    //
+    // gvproxy provides a user-mode network backend that gives the guest a real
+    // eth0 interface with DHCP (192.168.127.0/24). This replaces TSI, which
+    // breaks k3s by intercepting all localhost connections.
+    //
+    // Port forwarding is handled via gvproxy's HTTP API, not krun_set_port_map.
+    let gvproxy_sock = data_dir.join("gvproxy.sock");
+    let gvproxy_api_sock = data_dir.join("gvproxy-api.sock");
+
+    // Clean up stale sockets from previous runs.
+    let _ = std::fs::remove_file(&gvproxy_sock);
+    let _ = std::fs::remove_file(&gvproxy_api_sock);
+
+    println!("Starting gvproxy network backend...");
+    let mut gvproxy_child = Command::new("/opt/podman/bin/gvproxy")
+        .arg("-listen-vfkit")
+        .arg(format!("unixgram://{}", gvproxy_sock.display()))
+        .arg("-listen")
+        .arg(format!("unix://{}", gvproxy_api_sock.display()))
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| miette::miette!("failed to start gvproxy: {e}"))?;
+
+    // Wait for gvproxy to create its sockets.
+    for _ in 0..20 {
+        if gvproxy_sock.exists() && gvproxy_api_sock.exists() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if !gvproxy_sock.exists() {
+        gvproxy_child.kill().ok();
+        return Err(miette::miette!(
+            "gvproxy failed to create socket at {}",
+            gvproxy_sock.display()
+        ));
+    }
+
+    // Step 3: Configure port forwarding via gvproxy HTTP API.
+    //
+    // gvproxy's DHCP server assigns guest IPs from 192.168.127.0/24.
+    // The gateway itself is .1, and the first (and only) DHCP client
+    // gets .3 (observed empirically — .2 may be reserved internally).
+    let guest_ip = "192.168.127.3";
+    let forward_ports = |local_port: u16, remote_port: u16| -> Result<()> {
+        let body = format!(
+            r#"{{"local":":{}","remote":"{}:{}","protocol":"tcp"}}"#,
+            local_port, guest_ip, remote_port
+        );
+        let output = Command::new("curl")
+            .args([
+                "--unix-socket",
+                &gvproxy_api_sock.to_string_lossy(),
+                "-s",
+                "-X",
+                "POST",
+                "http://localhost/services/forwarder/expose",
+                "-d",
+                &body,
+            ])
+            .output()
+            .map_err(|e| miette::miette!("failed to configure port forwarding: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(miette::miette!("gvproxy port forward failed: {stderr}"));
+        }
+        Ok(())
+    };
+
+    // Forward the navigator gateway port.
+    forward_ports(gateway_port, 30051)?;
+    // Optionally forward the kube API port.
+    if let Some(kp) = kube_port {
+        forward_ports(kp, 6443)?;
+    }
+
+    // Step 4: Build the microVM configuration.
+    println!("Booting k3s cluster in microVM...");
+    println!("  image:     {image_ref}");
+    println!("  rootfs:    {}", rootfs_dir.display());
+    println!("  vcpus:     {vcpus}");
+    println!("  memory:    {mem} MiB");
+    println!("  network:   gvproxy (guest IP: {guest_ip})");
+    println!("  gateway:   localhost:{gateway_port} -> guest:30051");
+    if let Some(kp) = kube_port {
+        println!("  kube API:  localhost:{kp} -> guest:6443");
+    }
+    println!("  state:     {}", k3s_state_dir.display());
+    println!("  console:   {}", console_log.display());
+    println!();
+
+    // vm-init.sh handles network setup then execs into k3s with these args.
+    // The libkrunfw kernel does not include netfilter/iptables modules, so we
+    // must disable kube-proxy and flannel (both require iptables). This is fine
+    // because the microVM only needs the API server + controllers for navigator.
+    //
+    // --data-dir /run/k3s puts k3s state on tmpfs. SQLite (used by kine) has
+    // file locking issues on virtio-fs, causing RBAC bootstrap timeouts. tmpfs
+    // provides proper POSIX locking and much faster I/O. State is lost on VM
+    // restart, but this is acceptable for development clusters.
+    let init_args: Vec<&str> = vec![
+        "server",
+        "--data-dir=/run/k3s",
+        "--disable=traefik,servicelb,metrics-server",
+        "--disable-kube-proxy",
+        "--flannel-backend=none",
+        "--disable-network-policy",
+        "--tls-san=127.0.0.1",
+        "--tls-san=localhost",
+        "--tls-san=192.168.127.2",
+        "--tls-san=192.168.127.3",
+    ];
+
+    // Environment variables for the VM.
+    let env_vars = vec![
+        "HOME=/root".to_string(),
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".to_string(),
+        "TERM=xterm".to_string(),
+    ];
+
+    let builder = KrunContext::builder()
+        .vcpus(vcpus)
+        .memory_mib(mem)
+        .rootfs(&rootfs_dir)
+        .workdir("/")
+        .exec("/usr/local/bin/vm-init.sh", &init_args)
+        .env(Some(env_vars))
+        .log_level(log_level)
+        .console_output(&console_log)
+        // Use gvproxy for networking — this disables TSI automatically.
+        // TSI cannot be used with k3s because it intercepts ALL guest inet
+        // connect() calls and proxies them to the host, which breaks the
+        // k3s API server's internal localhost connections.
+        .net_gvproxy(&gvproxy_sock);
+
+    let ctx = builder
+        .build()
+        .map_err(|e| miette::miette!("failed to configure cluster microVM: {e}"))?;
+
+    // Step 5: Fork and start the VM.
+    let child_pid = ctx
+        .fork_start()
+        .map_err(|e| miette::miette!("failed to start cluster microVM: {e}"))?;
+
+    println!("microVM started (child PID: {child_pid})");
+    println!("Waiting for k3s to become ready...");
+    println!(
+        "  (tail -f {} for VM console output)",
+        console_log.display()
+    );
+
+    // Step 6: Wait for the child process.
+    let status = wait_for_child(child_pid)?;
+    if status == 0 {
+        println!("microVM exited cleanly");
+    } else {
+        eprintln!("microVM exited with status {status}");
+    }
+
+    // Clean up gvproxy.
+    gvproxy_child.kill().ok();
+    gvproxy_child.wait().ok();
+    let _ = std::fs::remove_file(&gvproxy_sock);
+    let _ = std::fs::remove_file(&gvproxy_api_sock);
+
+    Ok(())
+}
+
+/// Extract a rootfs from a Docker image by creating a temporary container
+/// and exporting its filesystem.
+fn extract_rootfs_from_docker(image_ref: &str, rootfs_dir: &Path) -> Result<()> {
+    use std::process::Command;
+
+    // Ensure the image exists locally.
+    let pull_status = Command::new("docker")
+        .args(["image", "inspect", image_ref])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map_err(|e| miette::miette!("failed to run docker: {e}"))?;
+
+    if !pull_status.success() {
+        println!("  Pulling image {image_ref}...");
+        let pull = Command::new("docker")
+            .args(["pull", image_ref])
+            .status()
+            .map_err(|e| miette::miette!("docker pull failed: {e}"))?;
+        if !pull.success() {
+            return Err(miette::miette!("docker pull failed for {image_ref}"));
+        }
+    }
+
+    // Create a temporary container (don't start it).
+    let container_name = format!("navigator-rootfs-extract-{}", std::process::id());
+    let create = Command::new("docker")
+        .args(["create", "--name", &container_name, image_ref, "/bin/true"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .map_err(|e| miette::miette!("docker create failed: {e}"))?;
+    if !create.success() {
+        return Err(miette::miette!("docker create failed for {image_ref}"));
+    }
+
+    // Export the container filesystem as a tar stream and extract it.
+    std::fs::create_dir_all(rootfs_dir)
+        .map_err(|e| miette::miette!("failed to create rootfs dir: {e}"))?;
+
+    println!("  Exporting container filesystem...");
+    let export = Command::new("docker")
+        .args(["export", &container_name])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| miette::miette!("docker export failed: {e}"))?;
+
+    let tar_status = Command::new("tar")
+        .args(["xf", "-", "-C"])
+        .arg(rootfs_dir)
+        .stdin(export.stdout.unwrap())
+        .status()
+        .map_err(|e| miette::miette!("tar extract failed: {e}"))?;
+
+    if !tar_status.success() {
+        // Clean up on failure.
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .status();
+        return Err(miette::miette!(
+            "failed to extract rootfs from Docker image"
+        ));
+    }
+
+    // Clean up the temporary container.
+    let _ = Command::new("docker")
+        .args(["rm", "-f", &container_name])
+        .status();
+
+    // Copy the VM init script into the rootfs. This script sets up networking
+    // (dummy interface + default route) so k3s can find /proc/net/route, then
+    // execs into k3s.
+    let init_script = include_bytes!("../../../deploy/gateway/vm-init.sh");
+    let init_path = rootfs_dir.join("usr/local/bin/vm-init.sh");
+    std::fs::write(&init_path, init_script)
+        .map_err(|e| miette::miette!("failed to write vm-init.sh: {e}"))?;
+
+    // Make executable (0o755).
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| miette::miette!("failed to chmod vm-init.sh: {e}"))?;
+    }
+
+    println!("  Rootfs extracted to {}", rootfs_dir.display());
+    Ok(())
+}
+
+/// Wait for a child process to exit and return its exit status.
+fn wait_for_child(pid: u32) -> Result<i32> {
+    navigator_gateway::wait_for_pid(pid).map_err(|e| miette::miette!("waitpid failed: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{inferred_provider_type, parse_credential_pairs, resolve_route_protocols};
