@@ -430,12 +430,15 @@ pub async fn run_sandbox(
         // entrypoint process. This prevents exec requests from racing against
         // SSH server startup when Kubernetes marks the pod Ready.
         match timeout(Duration::from_secs(10), ssh_ready_rx).await {
-            Ok(Ok(())) => {
+            Ok(Ok(Ok(()))) => {
                 info!("SSH server is ready to accept connections");
+            }
+            Ok(Ok(Err(err))) => {
+                return Err(err.context("SSH server failed during startup"));
             }
             Ok(Err(_)) => {
                 return Err(miette::miette!(
-                    "SSH server task failed before signaling ready"
+                    "SSH server task panicked before signaling ready"
                 ));
             }
             Err(_) => {
