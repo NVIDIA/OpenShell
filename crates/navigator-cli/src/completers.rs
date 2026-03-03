@@ -71,7 +71,7 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 fn resolve_active_cluster() -> Option<(String, String)> {
-    let name = std::env::var("NAVIGATOR_CLUSTER")
+    let name = std::env::var("NEMOCLAW_CLUSTER")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(load_active_cluster)?;
@@ -134,7 +134,7 @@ mod tests {
 
     #[test]
     fn sandbox_completer_returns_empty_when_no_active_cluster() {
-        unsafe { std::env::remove_var("NAVIGATOR_CLUSTER") };
+        unsafe { std::env::remove_var("NEMOCLAW_CLUSTER") };
         let temp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.path()) };
         let result = complete_sandbox_names(OsStr::new(""));
@@ -144,7 +144,7 @@ mod tests {
 
     #[test]
     fn provider_completer_returns_empty_when_no_active_cluster() {
-        unsafe { std::env::remove_var("NAVIGATOR_CLUSTER") };
+        unsafe { std::env::remove_var("NEMOCLAW_CLUSTER") };
         let temp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.path()) };
         let result = complete_provider_names(OsStr::new(""));

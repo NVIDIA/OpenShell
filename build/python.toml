@@ -37,7 +37,7 @@ sha256_16_stdin() {
 }
 
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
-CARGO_VERSION=${NAVIGATOR_CARGO_VERSION:-}
+CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
 if [ -z "$CARGO_VERSION" ]; then
   CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 fi
@@ -48,7 +48,7 @@ CACHE_SCOPE_INPUT="v1|python-wheels|base|${LOCK_HASH}|${RUST_SCOPE}"
 CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 
 VERSION_ARGS=(
-  --build-arg "NAVIGATOR_CARGO_VERSION=${CARGO_VERSION}"
+  --build-arg "NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}"
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
 )
 
@@ -105,7 +105,7 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$(uname -s)" = "Darwin" ] && [ -z "${NAVIGATOR_CARGO_VERSION:-}" ]; then
+if [ "$(uname -s)" = "Darwin" ] && [ -z "${NEMOCLAW_CARGO_VERSION:-}" ]; then
   # Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
   if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER="$(command -v sccache)"
@@ -149,7 +149,7 @@ sha256_16_stdin() {
   fi
 }
 
-CARGO_VERSION=${NAVIGATOR_CARGO_VERSION:-}
+CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
 OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
 if [ -z "$CARGO_VERSION" ]; then
   CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
@@ -166,7 +166,7 @@ docker build \
   -f deploy/docker/Dockerfile.python-wheels-macos \
   --target wheels \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
-  --build-arg "NAVIGATOR_CARGO_VERSION=${CARGO_VERSION}" \
+  --build-arg "NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}" \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
   --output type=local,dest=target/wheels \
   .

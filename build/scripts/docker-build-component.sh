@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Generic Docker image builder for Navigator components.
+# Generic Docker image builder for NemoClaw components.
 # Usage: docker-build-component.sh <component> [variant] [extra docker build args...]
 #
 # Components with a subdirectory layout (e.g. deploy/docker/sandbox/) support

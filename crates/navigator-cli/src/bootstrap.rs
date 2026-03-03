@@ -16,7 +16,7 @@ use std::io::IsTerminal;
 use crate::run::{deploy_cluster_with_panel, print_deploy_summary};
 
 /// Default cluster name used during auto-bootstrap.
-const DEFAULT_CLUSTER_NAME: &str = "navigator";
+const DEFAULT_CLUSTER_NAME: &str = "nemoclaw";
 
 /// Determines if a gRPC connection error indicates the cluster is unreachable
 /// and bootstrap should be offered.
@@ -103,7 +103,7 @@ pub fn confirm_bootstrap() -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         return Err(miette::miette!(
             "Cluster not reachable and bootstrap requires confirmation from an interactive terminal.\n\
-             Run 'navigator cluster admin deploy' first, then retry."
+             Run 'nemoclaw cluster admin deploy' first, then retry."
         ));
     }
 
@@ -198,7 +198,7 @@ mod tests {
     #[test]
     fn missing_default_tls_files_triggers_bootstrap() {
         let err = report(
-            "failed to read TLS CA from /home/user/.config/navigator/clusters/navigator/mtls/ca.crt: No such file or directory",
+            "failed to read TLS CA from /home/user/.config/nemoclaw/clusters/nemoclaw/mtls/ca.crt: No such file or directory",
         );
         assert!(should_attempt_bootstrap(&err, &TlsOptions::default()));
     }

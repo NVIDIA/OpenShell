@@ -12,7 +12,7 @@ FROM ${OSXCROSS_IMAGE} AS osxcross
 FROM python:${PYTHON_VERSION}-slim AS builder
 
 ARG TARGETARCH
-ARG NAVIGATOR_CARGO_VERSION
+ARG NEMOCLAW_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
@@ -96,8 +96,8 @@ RUN touch crates/navigator-cli/src/main.rs \
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    if [ -n "${NAVIGATOR_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NAVIGATOR_CARGO_VERSION}"'"/}' Cargo.toml; \
+    if [ -n "${NEMOCLAW_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NEMOCLAW_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
     maturin build --release --target aarch64-apple-darwin --out /wheels
 

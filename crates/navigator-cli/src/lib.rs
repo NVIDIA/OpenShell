@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Navigator CLI library.
+//! NemoClaw CLI library.
 //!
-//! This crate provides the CLI implementation for Navigator.
+//! This crate provides the CLI implementation for NemoClaw.
 
 pub mod bootstrap;
 pub mod completers;

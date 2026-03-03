@@ -1,26 +1,26 @@
 # Syncing Files To and From a Sandbox
 
-Move code, data, and artifacts between your local machine and a Navigator
-sandbox using `navigator sandbox sync`.
+Move code, data, and artifacts between your local machine and a NemoClaw
+sandbox using `nemoclaw sandbox sync`.
 
 ## Push local files into a sandbox
 
 Upload your current project directory into `/sandbox` on the sandbox:
 
 ```bash
-navigator sandbox sync my-sandbox --up .
+nemoclaw sandbox sync my-sandbox --up .
 ```
 
 Push a specific directory to a custom destination:
 
 ```bash
-navigator sandbox sync my-sandbox --up ./src /sandbox/src
+nemoclaw sandbox sync my-sandbox --up ./src /sandbox/src
 ```
 
 Push a single file:
 
 ```bash
-navigator sandbox sync my-sandbox --up ./config.yaml /sandbox/config.yaml
+nemoclaw sandbox sync my-sandbox --up ./config.yaml /sandbox/config.yaml
 ```
 
 ## Pull files from a sandbox
@@ -28,13 +28,13 @@ navigator sandbox sync my-sandbox --up ./config.yaml /sandbox/config.yaml
 Download sandbox output to your local machine:
 
 ```bash
-navigator sandbox sync my-sandbox --down /sandbox/output ./output
+nemoclaw sandbox sync my-sandbox --down /sandbox/output ./output
 ```
 
 Pull results to the current directory:
 
 ```bash
-navigator sandbox sync my-sandbox --down /sandbox/results
+nemoclaw sandbox sync my-sandbox --down /sandbox/results
 ```
 
 ## Sync on create
@@ -42,7 +42,7 @@ navigator sandbox sync my-sandbox --down /sandbox/results
 Push all git-tracked files into a new sandbox automatically:
 
 ```bash
-navigator sandbox create --sync -- python main.py
+nemoclaw sandbox create --sync -- python main.py
 ```
 
 This collects tracked and untracked (non-ignored) files via
@@ -52,17 +52,17 @@ This collects tracked and untracked (non-ignored) files via
 
 ```bash
 # Create a sandbox and sync your repo
-navigator sandbox create --name dev --sync --keep
+nemoclaw sandbox create --name dev --sync --keep
 
 # Make local changes, then push them
-navigator sandbox sync dev --up ./src /sandbox/src
+nemoclaw sandbox sync dev --up ./src /sandbox/src
 
 # Run tests inside the sandbox
-navigator sandbox connect dev
+nemoclaw sandbox connect dev
 # (inside sandbox) pytest
 
 # Pull test artifacts back
-navigator sandbox sync dev --down /sandbox/coverage ./coverage
+nemoclaw sandbox sync dev --down /sandbox/coverage ./coverage
 ```
 
 ## How it works

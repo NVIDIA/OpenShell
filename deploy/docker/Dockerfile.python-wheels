@@ -28,7 +28,7 @@ FROM base AS builder
 
 ARG TARGETARCH
 ARG BUILDARCH
-ARG NAVIGATOR_CARGO_VERSION
+ARG NEMOCLAW_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ARG SCCACHE_MEMCACHED_ENDPOINT
@@ -94,8 +94,8 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=loc
     export_cross_env && \
     export RUSTC_WRAPPER=sccache && \
     export CARGO_BUILD_TARGET="$(rust_target)" && \
-    if [ -n "${NAVIGATOR_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NAVIGATOR_CARGO_VERSION}"'"/}' Cargo.toml; \
+    if [ -n "${NEMOCLAW_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NEMOCLAW_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
     maturin build --release --target "${CARGO_BUILD_TARGET}" --out /wheels
 

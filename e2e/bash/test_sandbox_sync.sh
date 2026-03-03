@@ -12,8 +12,8 @@
 #   4. Single-file round-trip
 #
 # Prerequisites:
-#   - A running navigator cluster (navigator cluster admin deploy)
-#   - The `navigator` binary on PATH (or set NAV_BIN)
+#   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
+#   - The `nemoclaw` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_sandbox_sync.sh
@@ -29,8 +29,8 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 if [[ -n "${NAV_BIN:-}" ]]; then
   NAV="${NAV_BIN}"
-elif [[ -x "${PROJECT_ROOT}/target/debug/navigator" ]]; then
-  NAV="${PROJECT_ROOT}/target/debug/navigator"
+elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
+  NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
   NAV="nav"
 fi

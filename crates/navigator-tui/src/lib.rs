@@ -27,7 +27,7 @@ use event::{Event, EventHandler};
 
 /// Launch the Gator TUI.
 ///
-/// `channel` must be a connected gRPC channel to the Navigator gateway.
+/// `channel` must be a connected gRPC channel to the NemoClaw gateway.
 pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result<()> {
     let client = NavigatorClient::new(channel);
     let mut app = App::new(client, cluster_name.to_string(), endpoint.to_string());
@@ -376,7 +376,7 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
         .ok()?;
     Some(
         config_dir
-            .join("navigator")
+            .join("nemoclaw")
             .join("clusters")
             .join(name)
             .join("mtls"),

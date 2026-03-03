@@ -1226,7 +1226,7 @@ pub async fn sandbox_create(
                     "✓".green().bold(),
                 );
                 eprintln!("Access at: http://127.0.0.1:{port}/");
-                eprintln!("Stop with: navigator sandbox forward stop {port} {sandbox_name}",);
+                eprintln!("Stop with: nemoclaw sandbox forward stop {port} {sandbox_name}",);
             }
 
             if command.is_empty() {
@@ -1285,7 +1285,7 @@ pub async fn sandbox_create(
 /// Default sandbox policy YAML, baked in at compile time.
 /// Load sandbox policy YAML.
 ///
-/// Resolution order: `--policy` flag > `NAVIGATOR_SANDBOX_POLICY` env var > built-in default.
+/// Resolution order: `--policy` flag > `NEMOCLAW_SANDBOX_POLICY` env var > built-in default.
 /// Delegates to `navigator_policy::load_sandbox_policy`.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
     navigator_policy::load_sandbox_policy(cli_path)

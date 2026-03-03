@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub fn stored_kubeconfig_path(name: &str) -> Result<PathBuf> {
     let base = xdg_config_dir()?;
     Ok(base
-        .join("navigator")
+        .join("nemoclaw")
         .join("clusters")
         .join(name)
         .join("kubeconfig"))

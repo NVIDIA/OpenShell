@@ -19,7 +19,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 | `crates/navigator-core/src/inference.rs` | `normalize_protocols()` -- shared protocol normalization logic |
 | `proto/inference.proto` | Protobuf definitions: `InferenceRoute`, `InferenceRouteSpec`, `GetSandboxInferenceBundle` RPC, CRUD RPCs |
 | `proto/sandbox.proto` | `InferencePolicy` message (field on `SandboxPolicy`) |
-| `crates/navigator-sandbox/src/main.rs` | Sandbox binary CLI: `--inference-routes` / `NAVIGATOR_INFERENCE_ROUTES` flag definition |
+| `crates/navigator-sandbox/src/main.rs` | Sandbox binary CLI: `--inference-routes` / `NEMOCLAW_INFERENCE_ROUTES` flag definition |
 | `build/ci.toml` | `[sandbox]` task: mounts `inference-routes.yaml`, sets env vars for dev sandbox |
 | `inference-routes.yaml` | Default standalone routes for dev sandbox (NVIDIA API endpoint) |
 | `dev-sandbox-policy.rego` | `network_action` Rego rule -- tri-state decision logic |
@@ -93,7 +93,7 @@ Routes reach the sandbox through one of two modes, determined at sandbox startup
 
 The `build_inference_context()` function determines the route source. Priority order:
 
-1. **Standalone mode (route file)**: If `--inference-routes` (or `NAVIGATOR_INFERENCE_ROUTES`) is set, routes load from a YAML file via `RouterConfig::load_from_file()`. The file format matches the `navigator-router` `RouterConfig` schema. This mode always takes precedence -- if both a route file and cluster credentials are present, the route file wins.
+1. **Standalone mode (route file)**: If `--inference-routes` (or `NEMOCLAW_INFERENCE_ROUTES`) is set, routes load from a YAML file via `RouterConfig::load_from_file()`. The file format matches the `navigator-router` `RouterConfig` schema. This mode always takes precedence -- if both a route file and cluster credentials are present, the route file wins.
 
 2. **Cluster mode (gateway bundle)**: If `sandbox_id` and `navigator_endpoint` are available (and no route file is set), the sandbox fetches a pre-filtered bundle from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetSandboxInferenceBundle` gRPC RPC.
 
@@ -516,7 +516,7 @@ When `allowed_routes` is non-empty, the OPA engine returns `inspect_for_inferenc
 
 ### Route configuration (file mode)
 
-For standalone sandboxes (no cluster), routes are configured in a YAML file and passed via `--inference-routes` or `NAVIGATOR_INFERENCE_ROUTES`:
+For standalone sandboxes (no cluster), routes are configured in a YAML file and passed via `--inference-routes` or `NEMOCLAW_INFERENCE_ROUTES`:
 
 ```yaml
 routes:
@@ -571,7 +571,7 @@ Running `mise run sandbox` starts a standalone sandbox container with inference 
 - `dev-sandbox-policy.yaml` as `/var/navigator/data.yaml`
 - `inference-routes.yaml` as `/var/navigator/inference-routes.yaml`
 
-The container receives `NAVIGATOR_INFERENCE_ROUTES=/var/navigator/inference-routes.yaml` to enable standalone inference routing. `NVIDIA_API_KEY` is always forwarded from the host environment (empty string if unset).
+The container receives `NEMOCLAW_INFERENCE_ROUTES=/var/navigator/inference-routes.yaml` to enable standalone inference routing. `NVIDIA_API_KEY` is always forwarded from the host environment (empty string if unset).
 
 The default `inference-routes.yaml` defines a single route:
 

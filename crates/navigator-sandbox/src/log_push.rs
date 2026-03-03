@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Push sandbox tracing events to the Navigator server via gRPC.
+//! Push sandbox tracing events to the NemoClaw server via gRPC.
 //!
 //! A [`tracing`] layer captures log events and sends them through an mpsc
 //! channel to a background task. The task batches lines and streams them to
@@ -15,7 +15,7 @@ use tracing::{Event, Subscriber};
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 
-/// Tracing layer that pushes log events to the Navigator server.
+/// Tracing layer that pushes log events to the NemoClaw server.
 ///
 /// Events are sent best-effort via `try_send` — if the channel is full the
 /// event is dropped. Logging must never block the sandbox.
@@ -28,7 +28,7 @@ pub struct LogPushLayer {
 
 impl LogPushLayer {
     pub fn new(sandbox_id: String, tx: mpsc::Sender<SandboxLogLine>) -> Self {
-        let max_level = std::env::var("NAVIGATOR_LOG_PUSH_LEVEL")
+        let max_level = std::env::var("NEMOCLAW_LOG_PUSH_LEVEL")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(tracing::Level::INFO);

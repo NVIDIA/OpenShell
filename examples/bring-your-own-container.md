@@ -5,7 +5,7 @@ languages, libraries, and tools so they're available in every sandbox session.
 
 ## Prerequisites
 
-- A running navigator cluster (`nav cluster admin deploy`)
+- A running nemoclaw cluster (`nav cluster admin deploy`)
 - Docker daemon running
 
 ## Quick start
@@ -54,10 +54,10 @@ nav sandbox create --image my-python:latest
 
 ## How it works
 
-Navigator handles all the wiring automatically. You just build a standard
-Linux container image with the tools you need -- no navigator-specific
+NemoClaw handles all the wiring automatically. You just build a standard
+Linux container image with the tools you need -- no nemoclaw-specific
 dependencies or configuration required in your Dockerfile. When you create a
-sandbox with `--image`, Navigator ensures that sandboxing (network policy,
+sandbox with `--image`, NemoClaw ensures that sandboxing (network policy,
 filesystem isolation, SSH access) works the same as with the default image.
 
 ### Tips

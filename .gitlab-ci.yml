@@ -238,8 +238,8 @@ python_e2e_sandbox_test:
     DOCKER_CERT_PATH: ""
     IMAGE_TAG: "$CI_COMMIT_SHA"
     IMAGE_REPO_BASE: "$CI_REGISTRY_IMAGE"
-    NAVIGATOR_CLUSTER_IMAGE: "navigator/cluster:$CI_COMMIT_SHA"
-    NAVIGATOR_REGISTRY_INSECURE: "false"
+    NEMOCLAW_CLUSTER_IMAGE: "navigator/cluster:$CI_COMMIT_SHA"
+    NEMOCLAW_REGISTRY_INSECURE: "false"
   before_script:
     - uv sync --frozen
     - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"

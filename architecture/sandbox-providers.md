@@ -2,7 +2,7 @@
 
 ## Overview
 
-Navigator uses a first-class `Provider` entity to represent external tool credentials and
+NemoClaw uses a first-class `Provider` entity to represent external tool credentials and
 configuration (for example `claude`, `gitlab`, `github`, `outlook`, `generic`, `nvidia`).
 
 Providers exist as an abstraction layer for configuring tools that rely on third-party
@@ -233,7 +233,7 @@ Key behaviors:
 ### Sandbox Supervisor: Fetching Credentials
 
 The sandbox pod runs `navigator-sandbox` (`crates/navigator-sandbox/src/main.rs`). On
-startup it receives `NAVIGATOR_SANDBOX_ID` and `NAVIGATOR_ENDPOINT` as environment
+startup it receives `NEMOCLAW_SANDBOX_ID` and `NEMOCLAW_ENDPOINT` as environment
 variables (injected into the pod spec by the gateway's Kubernetes sandbox creation code).
 
 In `run_sandbox()` (`crates/navigator-sandbox/src/lib.rs`):
@@ -255,7 +255,7 @@ process spawning paths inside the sandbox:
 ```rust
 let mut cmd = Command::new(program);
 cmd.args(args)
-    .env("NAVIGATOR_SANDBOX", "1");
+    .env("NEMOCLAW_SANDBOX", "1");
 
 // Set provider environment variables (credentials fetched at runtime).
 for (key, value) in provider_env {
@@ -276,7 +276,7 @@ When a user connects via `nav sandbox connect`, a PTY shell is spawned:
 
 ```rust
 let mut cmd = Command::new(shell);
-cmd.env("NAVIGATOR_SANDBOX", "1")
+cmd.env("NEMOCLAW_SANDBOX", "1")
     .env("HOME", "/sandbox")
     .env("USER", "sandbox")
     .env("TERM", term);
@@ -307,7 +307,7 @@ CLI: nav sandbox create -- claude
           +-- Creates K8s Sandbox CRD (no credentials in pod spec)
                 |
                 K8s: pod starts navigator-sandbox binary
-                  +-- NAVIGATOR_SANDBOX_ID and NAVIGATOR_ENDPOINT set in pod env
+                  +-- NEMOCLAW_SANDBOX_ID and NEMOCLAW_ENDPOINT set in pod env
                   |
                   Sandbox supervisor: run_sandbox()
                     +-- Fetches policy via gRPC

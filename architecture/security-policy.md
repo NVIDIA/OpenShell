@@ -24,8 +24,8 @@ navigator-sandbox \
 
 | Flag             | Environment Variable     | Description                                      |
 | ---------------- | ------------------------ | ------------------------------------------------ |
-| `--policy-rules` | `NAVIGATOR_POLICY_RULES` | Path to `.rego` file containing evaluation rules |
-| `--policy-data`  | `NAVIGATOR_POLICY_DATA`  | Path to YAML file containing policy data         |
+| `--policy-rules` | `NEMOCLAW_POLICY_RULES` | Path to `.rego` file containing evaluation rules |
+| `--policy-data`  | `NEMOCLAW_POLICY_DATA`  | Path to YAML file containing policy data         |
 
 The YAML data file is preprocessed before loading into the OPA engine: L7 policies are validated, and `access` presets are expanded into explicit `rules` arrays. See `crates/navigator-sandbox/src/opa.rs` -- `preprocess_yaml_data()`.
 
@@ -36,14 +36,14 @@ When the sandbox runs inside a managed cluster, it fetches its typed protobuf po
 ```bash
 navigator-sandbox \
   --sandbox-id abc123 \
-  --navigator-endpoint https://navigator:8080 \
+  --nemoclaw-endpoint https://navigator:8080 \
   -- /bin/bash
 ```
 
 | Flag                   | Environment Variable   | Description                  |
 | ---------------------- | ---------------------- | ---------------------------- |
-| `--sandbox-id`         | `NAVIGATOR_SANDBOX_ID` | Sandbox ID for policy lookup |
-| `--navigator-endpoint` | `NAVIGATOR_ENDPOINT`   | Gateway gRPC endpoint        |
+| `--sandbox-id`         | `NEMOCLAW_SANDBOX_ID` | Sandbox ID for policy lookup |
+| `--nemoclaw-endpoint` | `NEMOCLAW_ENDPOINT`   | Gateway gRPC endpoint        |
 
 The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`dev-sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
 
@@ -53,9 +53,9 @@ The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbo
 flowchart TD
     START[Sandbox Startup] --> CHECK{File mode?<br/>--policy-rules +<br/>--policy-data}
     CHECK -->|Yes| FILE[Read .rego + .yaml from disk]
-    CHECK -->|No| GRPC{gRPC mode?<br/>--sandbox-id +<br/>--navigator-endpoint}
-    GRPC -->|Yes| FETCH[Fetch SandboxPolicy proto via gRPC]
-    GRPC -->|No| ERR[Error: no policy source]
+    CHECK -->|No| NEMOCLAW{gRPC mode?<br/>--sandbox-id +<br/>--nemoclaw-endpoint}
+    NEMOCLAW -->|Yes| FETCH[Fetch SandboxPolicy proto via gRPC]
+    NEMOCLAW -->|No| ERR[Error: no policy source]
 
     FILE --> PREPROCESS[Preprocess YAML:<br/>validate L7, expand presets]
     FETCH --> PROTO2JSON[Convert proto to JSON<br/>validate L7, expand presets]
@@ -69,7 +69,7 @@ flowchart TD
 
 ### Priority
 
-File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--navigator-endpoint` are provided, file mode is used. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`.
+File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--nemoclaw-endpoint` are provided, file mode is used. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`.
 
 ## Live Policy Updates
 
@@ -182,7 +182,7 @@ In gRPC mode, the sandbox spawns a background task that periodically polls the g
 
 | Parameter | Default | Override |
 |-----------|---------|----------|
-| Poll interval | 30 seconds | `NAVIGATOR_POLICY_POLL_INTERVAL_SECS` environment variable |
+| Poll interval | 30 seconds | `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` environment variable |
 
 The poll loop:
 
@@ -729,7 +729,7 @@ See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
 ## Control Plane Bypass
 
-When `--navigator-endpoint` is set, the proxy automatically allows connections to the gateway endpoint without OPA evaluation. This ensures the sandbox can always reach the gateway for inference routing and provider environment updates. The endpoint is parsed from the URL and added to a `control_plane_endpoints` allowlist. Control plane endpoints are also exempt from the SSRF internal-IP check (see below) because they legitimately resolve to private IPs in cluster deployments. See `crates/navigator-sandbox/src/proxy.rs` -- `is_control_plane` check.
+When `--nemoclaw-endpoint` is set, the proxy automatically allows connections to the gateway endpoint without OPA evaluation. This ensures the sandbox can always reach the gateway for inference routing and provider environment updates. The endpoint is parsed from the URL and added to a `control_plane_endpoints` allowlist. Control plane endpoints are also exempt from the SSRF internal-IP check (see below) because they legitimately resolve to private IPs in cluster deployments. See `crates/navigator-sandbox/src/proxy.rs` -- `is_control_plane` check.
 
 ---
 

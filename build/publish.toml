@@ -10,7 +10,7 @@ run = """
 set -euo pipefail
 VERSION=$(uv run python build/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
-NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:all
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:all
 uv run python build/scripts/release.py python-publish --version "$VERSION"
 """
 
@@ -21,7 +21,7 @@ run = """
 set -euo pipefail
 VERSION=$(uv run python build/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
-NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
 uv run python build/scripts/release.py python-publish --version "$VERSION" --wheel-glob "*macosx*arm64.whl"
 """
 
@@ -34,8 +34,8 @@ VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
 VERSION_PYTHON=$(uv run python build/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 IMAGE_TAG=dev TAG_LATEST=true EXTRA_DOCKER_TAGS="$VERSION_DOCKER" mise run docker:publish:cluster:multiarch
-NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
 uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """
 
@@ -48,7 +48,7 @@ VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
 VERSION_PYTHON=$(uv run python build/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 IMAGE_TAG="$VERSION_DOCKER" TAG_LATEST=false mise run docker:publish:cluster:multiarch
-NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
 uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """

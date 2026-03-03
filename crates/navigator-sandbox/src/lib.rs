@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Navigator Sandbox library.
+//! NemoClaw Sandbox library.
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
@@ -486,7 +486,7 @@ pub async fn run_sandbox(
         let poll_id = id.clone();
         let poll_endpoint = endpoint.clone();
         let poll_engine = engine.clone();
-        let poll_interval_secs: u64 = std::env::var("NAVIGATOR_POLICY_POLL_INTERVAL_SECS")
+        let poll_interval_secs: u64 = std::env::var("NEMOCLAW_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
@@ -745,8 +745,8 @@ async fn load_policy(
     // No policy source available
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
-         - --policy-rules and --policy-data (or NAVIGATOR_POLICY_RULES and NAVIGATOR_POLICY_DATA env vars)\n\
-         - --sandbox-id and --navigator-endpoint (or NAVIGATOR_SANDBOX_ID and NAVIGATOR_ENDPOINT env vars)"
+         - --policy-rules and --policy-data (or NEMOCLAW_POLICY_RULES and NEMOCLAW_POLICY_DATA env vars)\n\
+         - --sandbox-id and --navigator-endpoint (or NEMOCLAW_SANDBOX_ID and NEMOCLAW_ENDPOINT env vars)"
     ))
 }
 

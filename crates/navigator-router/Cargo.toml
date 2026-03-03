@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-router"
-description = "Inference routing library for Navigator"
+description = "Inference routing library for NemoClaw"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

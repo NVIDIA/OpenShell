@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Navigator Sandbox - process sandbox and monitor.
+//! NemoClaw Sandbox - process sandbox and monitor.
 
 use clap::Parser;
 use miette::Result;
@@ -11,13 +11,13 @@ use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
 use navigator_sandbox::run_sandbox;
 
-/// Navigator Sandbox - process isolation and monitoring.
+/// NemoClaw Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
 #[command(name = "navigator-sandbox")]
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.
-    /// Can also be provided via `NAVIGATOR_SANDBOX_COMMAND` environment variable.
+    /// Can also be provided via `NEMOCLAW_SANDBOX_COMMAND` environment variable.
     /// Defaults to `/bin/bash` if neither is provided.
     #[arg(trailing_var_arg = true)]
     command: Vec<String>,
@@ -34,46 +34,46 @@ struct Args {
     #[arg(long, short = 'i')]
     interactive: bool,
 
-    /// Sandbox ID for fetching policy via gRPC from Navigator server.
+    /// Sandbox ID for fetching policy via gRPC from NemoClaw server.
     /// Requires --navigator-endpoint to be set.
-    #[arg(long, env = "NAVIGATOR_SANDBOX_ID")]
+    #[arg(long, env = "NEMOCLAW_SANDBOX_ID")]
     sandbox_id: Option<String>,
 
-    /// Navigator server gRPC endpoint for fetching policy.
+    /// NemoClaw server gRPC endpoint for fetching policy.
     /// Required when using --sandbox-id.
-    #[arg(long, env = "NAVIGATOR_ENDPOINT")]
+    #[arg(long, env = "NEMOCLAW_ENDPOINT")]
     navigator_endpoint: Option<String>,
 
     /// Path to Rego policy file for OPA-based network access control.
     /// Requires --policy-data to also be set.
-    #[arg(long, env = "NAVIGATOR_POLICY_RULES")]
+    #[arg(long, env = "NEMOCLAW_POLICY_RULES")]
     policy_rules: Option<String>,
 
     /// Path to YAML data file containing network policies and sandbox config.
     /// Requires --policy-rules to also be set.
-    #[arg(long, env = "NAVIGATOR_POLICY_DATA")]
+    #[arg(long, env = "NEMOCLAW_POLICY_DATA")]
     policy_data: Option<String>,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(long, default_value = "warn", env = "NAVIGATOR_LOG_LEVEL")]
+    #[arg(long, default_value = "warn", env = "NEMOCLAW_LOG_LEVEL")]
     log_level: String,
 
     /// SSH listen address for sandbox access.
-    #[arg(long, env = "NAVIGATOR_SSH_LISTEN_ADDR")]
+    #[arg(long, env = "NEMOCLAW_SSH_LISTEN_ADDR")]
     ssh_listen_addr: Option<String>,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[arg(long, env = "NAVIGATOR_SSH_HANDSHAKE_SECRET")]
+    #[arg(long, env = "NEMOCLAW_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: Option<String>,
 
     /// Allowed clock skew for SSH handshake validation.
-    #[arg(long, env = "NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS", default_value = "300")]
+    #[arg(long, env = "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS", default_value = "300")]
     ssh_handshake_skew_secs: u64,
 
     /// Path to YAML inference routes for standalone routing.
     /// When set, inference routes are loaded from this file instead of
     /// fetching a bundle from the gateway.
-    #[arg(long, env = "NAVIGATOR_INFERENCE_ROUTES")]
+    #[arg(long, env = "NEMOCLAW_INFERENCE_ROUTES")]
     inference_routes: Option<String>,
 
     /// Enable health check endpoint.
@@ -157,7 +157,7 @@ async fn main() -> Result<()> {
     // Get command - either from CLI args, environment variable, or default to /bin/bash
     let command = if !args.command.is_empty() {
         args.command
-    } else if let Ok(c) = std::env::var("NAVIGATOR_SANDBOX_COMMAND") {
+    } else if let Ok(c) = std::env::var("NEMOCLAW_SANDBOX_COMMAND") {
         // Simple shell-like splitting on whitespace
         c.split_whitespace().map(String::from).collect()
     } else {

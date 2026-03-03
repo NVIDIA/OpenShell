@@ -4,5 +4,5 @@
 # Helm chart tasks
 
 ["helm:lint"]
-description = "Lint the navigator helm chart"
+description = "Lint the nemoclaw helm chart"
 run = "helm lint deploy/helm/navigator"

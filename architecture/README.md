@@ -244,7 +244,7 @@ The CLI is the primary way users interact with the platform. It provides command
 - **Provider management** (`nav provider`): Create, update, list, and delete external service credentials.
 - **Inference management** (`nav inference`): Configure routing rules for AI model API endpoints.
 
-The CLI resolves which cluster to operate on through a priority chain: explicit `--cluster` flag, then the `NAVIGATOR_CLUSTER` environment variable, then the active cluster set by `nav cluster use`. It supports TLS client certificates for mutual authentication with the gateway.
+The CLI resolves which cluster to operate on through a priority chain: explicit `--cluster` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `nav cluster use`. It supports TLS client certificates for mutual authentication with the gateway.
 
 ## How Users Get Started
 

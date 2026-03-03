@@ -86,7 +86,7 @@ pub struct TlsMaterials {
 /// Resolve the TLS cert directory for a known cluster name.
 fn tls_dir_for_cluster(name: &str) -> Option<PathBuf> {
     let safe_name = sanitize_name(name);
-    let base = xdg_config_dir().ok()?.join("navigator").join("clusters");
+    let base = xdg_config_dir().ok()?.join("nemoclaw").join("clusters");
     Some(base.join(safe_name).join("mtls"))
 }
 
@@ -94,7 +94,7 @@ fn tls_dir_for_cluster(name: &str) -> Option<PathBuf> {
 ///
 /// Used when no cluster name is set (e.g., `SshProxy` which receives a raw URL).
 fn default_tls_dir(server: &str) -> Option<PathBuf> {
-    let mut name = std::env::var("NAVIGATOR_CLUSTER_NAME")
+    let mut name = std::env::var("NEMOCLAW_CLUSTER_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
 
@@ -104,16 +104,16 @@ fn default_tls_dir(server: &str) -> Option<PathBuf> {
     {
         name = Some(
             if host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") {
-                "navigator".to_string()
+                "nemoclaw".to_string()
             } else {
                 host.to_string()
             },
         );
     }
 
-    let name = name.unwrap_or_else(|| "navigator".to_string());
+    let name = name.unwrap_or_else(|| "nemoclaw".to_string());
     let safe_name = sanitize_name(&name);
-    let base = xdg_config_dir().ok()?.join("navigator").join("clusters");
+    let base = xdg_config_dir().ok()?.join("nemoclaw").join("clusters");
     Some(base.join(safe_name).join("mtls"))
 }
 

@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Navigator Server - gRPC/HTTP server with protocol multiplexing.
+//! NemoClaw Server - gRPC/HTTP server with protocol multiplexing.
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -12,78 +12,78 @@ use tracing_subscriber::EnvFilter;
 
 use navigator_server::{run_server, tracing_bus::TracingLogBus};
 
-/// Navigator Server - gRPC and HTTP server with protocol multiplexing.
+/// NemoClaw Server - gRPC and HTTP server with protocol multiplexing.
 #[derive(Parser, Debug)]
 #[command(name = "navigator-server")]
-#[command(about = "Navigator gRPC/HTTP server", long_about = None)]
+#[command(about = "NemoClaw gRPC/HTTP server", long_about = None)]
 struct Args {
     /// Port to bind the server to (all interfaces).
-    #[arg(long, default_value_t = 8080, env = "NAVIGATOR_SERVER_PORT")]
+    #[arg(long, default_value_t = 8080, env = "NEMOCLAW_SERVER_PORT")]
     port: u16,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(long, default_value = "info", env = "NAVIGATOR_LOG_LEVEL")]
+    #[arg(long, default_value = "info", env = "NEMOCLAW_LOG_LEVEL")]
     log_level: String,
 
     /// Path to TLS certificate file.
-    #[arg(long, env = "NAVIGATOR_TLS_CERT")]
+    #[arg(long, env = "NEMOCLAW_TLS_CERT")]
     tls_cert: PathBuf,
 
     /// Path to TLS private key file.
-    #[arg(long, env = "NAVIGATOR_TLS_KEY")]
+    #[arg(long, env = "NEMOCLAW_TLS_KEY")]
     tls_key: PathBuf,
 
     /// Path to CA certificate for client certificate verification (mTLS).
-    #[arg(long, env = "NAVIGATOR_TLS_CLIENT_CA")]
+    #[arg(long, env = "NEMOCLAW_TLS_CLIENT_CA")]
     tls_client_ca: PathBuf,
 
     /// Database URL for persistence.
-    #[arg(long, env = "NAVIGATOR_DB_URL", required = true)]
+    #[arg(long, env = "NEMOCLAW_DB_URL", required = true)]
     db_url: String,
 
     /// Kubernetes namespace for sandboxes.
-    #[arg(long, env = "NAVIGATOR_SANDBOX_NAMESPACE", default_value = "default")]
+    #[arg(long, env = "NEMOCLAW_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
 
     /// Default container image for sandboxes.
-    #[arg(long, env = "NAVIGATOR_SANDBOX_IMAGE")]
+    #[arg(long, env = "NEMOCLAW_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
-    /// gRPC endpoint for sandboxes to callback to Navigator.
+    /// gRPC endpoint for sandboxes to callback to NemoClaw.
     /// This should be reachable from within the Kubernetes cluster.
-    #[arg(long, env = "NAVIGATOR_GRPC_ENDPOINT")]
+    #[arg(long, env = "NEMOCLAW_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
 
     /// Public host for the SSH gateway.
-    #[arg(long, env = "NAVIGATOR_SSH_GATEWAY_HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "NEMOCLAW_SSH_GATEWAY_HOST", default_value = "127.0.0.1")]
     ssh_gateway_host: String,
 
     /// Public port for the SSH gateway.
-    #[arg(long, env = "NAVIGATOR_SSH_GATEWAY_PORT", default_value_t = 8080)]
+    #[arg(long, env = "NEMOCLAW_SSH_GATEWAY_PORT", default_value_t = 8080)]
     ssh_gateway_port: u16,
 
     /// HTTP path for SSH CONNECT/upgrade.
     #[arg(
         long,
-        env = "NAVIGATOR_SSH_CONNECT_PATH",
+        env = "NEMOCLAW_SSH_CONNECT_PATH",
         default_value = "/connect/ssh"
     )]
     ssh_connect_path: String,
 
     /// SSH port inside sandbox pods.
-    #[arg(long, env = "NAVIGATOR_SANDBOX_SSH_PORT", default_value_t = 2222)]
+    #[arg(long, env = "NEMOCLAW_SANDBOX_SSH_PORT", default_value_t = 2222)]
     sandbox_ssh_port: u16,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[arg(long, env = "NAVIGATOR_SSH_HANDSHAKE_SECRET")]
+    #[arg(long, env = "NEMOCLAW_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: Option<String>,
 
     /// Allowed clock skew in seconds for SSH handshake.
-    #[arg(long, env = "NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
+    #[arg(long, env = "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
     ssh_handshake_skew_secs: u64,
 
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
-    #[arg(long, env = "NAVIGATOR_CLIENT_TLS_SECRET_NAME")]
+    #[arg(long, env = "NEMOCLAW_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
 }
 
@@ -139,7 +139,7 @@ async fn main() -> Result<()> {
         config = config.with_client_tls_secret_name(name);
     }
 
-    info!(bind = %config.bind_address, "Starting Navigator server");
+    info!(bind = %config.bind_address, "Starting NemoClaw server");
 
     run_server(config, tracing_log_bus).await.into_diagnostic()
 }

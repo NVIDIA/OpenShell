@@ -145,12 +145,12 @@ def test_route_refresh_picks_up_route_created_after_sandbox_start(
                 assert result.exit_code == 0, f"stderr: {result.stderr}"
                 last_output = result.stdout.strip()
 
-                if "Hello from navigator mock backend" in last_output:
+                if "Hello from nemoclaw mock backend" in last_output:
                     break
 
                 time.sleep(5)
 
-            assert "Hello from navigator mock backend" in last_output, last_output
+            assert "Hello from nemoclaw mock backend" in last_output, last_output
             assert "mock/late-route-model" in last_output, last_output
     finally:
         try:
@@ -209,7 +209,7 @@ def test_inference_call_routed_to_backend(
         result = sb.exec_python(call_chat_completions, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        assert "Hello from navigator mock backend" in output
+        assert "Hello from nemoclaw mock backend" in output
         assert "mock/test-model" in output
 
 
@@ -304,7 +304,7 @@ def test_inference_anthropic_messages_protocol(
         result = sb.exec_python(call_anthropic_messages, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        assert "Hello from navigator mock backend" in output
+        assert "Hello from nemoclaw mock backend" in output
         assert "mock/claude-test" in output
 
 
@@ -356,5 +356,5 @@ def test_inference_route_filtering_by_allowed_routes(
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
         # The allowed route (e2e_mock_local) should serve the request
-        assert "Hello from navigator mock backend" in output
+        assert "Hello from nemoclaw mock backend" in output
         assert "mock/test-model" in output

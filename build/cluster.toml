@@ -8,7 +8,7 @@ description = "Fast local cluster recreate using prebuilt images"
 run = "build/scripts/cluster-bootstrap.sh fast"
 
 ["cluster:build"]
-description = "Build and deploy local k3s cluster with Navigator"
+description = "Build and deploy local k3s cluster with NemoClaw"
 depends = [
   "docker:build:server",
   "docker:build:sandbox",

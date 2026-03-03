@@ -1,15 +1,15 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Common error types for Navigator.
+//! Common error types for NemoClaw.
 
 use miette::Diagnostic;
 use thiserror::Error;
 
-/// Result type alias using Navigator's error type.
+/// Result type alias using NemoClaw's error type.
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// Navigator error type.
+/// NemoClaw error type.
 #[derive(Debug, Error, Diagnostic)]
 pub enum Error {
     /// Configuration error.

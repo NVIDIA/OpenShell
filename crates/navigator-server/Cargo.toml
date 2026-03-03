@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-server"
-description = "Navigator gRPC/HTTP server with protocol multiplexing"
+description = "NemoClaw gRPC/HTTP server with protocol multiplexing"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
