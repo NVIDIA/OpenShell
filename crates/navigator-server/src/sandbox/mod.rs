@@ -243,7 +243,7 @@ pub fn spawn_sandbox_watcher(
                     Event::Restarted(objs) => {
                         info!(
                             count = objs.len(),
-                            "Sandbox watcher restarted, re-syncing sandboxes"
+                            "Sandbox watcher restarted, re-syncing sandboxes, hi"
                         );
                         for obj in objs {
                             let obj_name = obj.metadata.name.clone().unwrap_or_default();
