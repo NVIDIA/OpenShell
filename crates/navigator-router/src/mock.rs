@@ -58,7 +58,7 @@ fn openai_chat_completion_body(model: &str) -> Vec<u8> {
             "index": 0,
             "message": {
                 "role": "assistant",
-                "content": "Hello from navigator mock backend"
+                "content": "Hello from nemoclaw mock backend"
             },
             "finish_reason": "stop"
         }],
@@ -79,7 +79,7 @@ fn openai_completion_body(model: &str) -> Vec<u8> {
         "model": model,
         "choices": [{
             "index": 0,
-            "text": "Hello from navigator mock backend",
+            "text": "Hello from nemoclaw mock backend",
             "finish_reason": "stop"
         }],
         "usage": {
@@ -99,7 +99,7 @@ fn anthropic_messages_body(model: &str) -> Vec<u8> {
         "model": model,
         "content": [{
             "type": "text",
-            "text": "Hello from navigator mock backend"
+            "text": "Hello from nemoclaw mock backend"
         }],
         "stop_reason": "end_turn",
         "usage": {
@@ -114,7 +114,7 @@ fn generic_body(model: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "mock": true,
         "model": model,
-        "message": "Hello from navigator mock backend"
+        "message": "Hello from nemoclaw mock backend"
     }))
     .expect("static JSON must serialize")
 }
@@ -172,7 +172,7 @@ mod tests {
         assert_eq!(body["object"], "chat.completion");
         assert_eq!(
             body["choices"][0]["message"]["content"],
-            "Hello from navigator mock backend"
+            "Hello from nemoclaw mock backend"
         );
     }
 
@@ -187,7 +187,7 @@ mod tests {
         assert_eq!(body["type"], "message");
         assert_eq!(
             body["content"][0]["text"],
-            "Hello from navigator mock backend"
+            "Hello from nemoclaw mock backend"
         );
     }
 
