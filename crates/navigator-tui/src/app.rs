@@ -823,16 +823,10 @@ impl App {
                         _ => {}
                     },
                     CreateFormField::Ports => {
-                        // Only allow digits, commas, and spaces for port input.
-                        match key.code {
-                            KeyCode::Char(c) if c.is_ascii_digit() || c == ',' => {
-                                form.ports.push(c);
-                            }
-                            KeyCode::Backspace => {
-                                form.ports.pop();
-                            }
-                            _ => {}
-                        }
+                        // Use the same text input handler as Name/Image/Command,
+                        // then strip anything that isn't a digit or comma.
+                        Self::handle_text_input(&mut form.ports, key);
+                        form.ports.retain(|c| c.is_ascii_digit() || c == ',');
                     }
                     CreateFormField::Submit => {
                         if key.code == KeyCode::Enter {
