@@ -17,14 +17,36 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
+sha256_16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+sha256_16_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
 CARGO_VERSION=${NAVIGATOR_CARGO_VERSION:-}
 if [ -z "$CARGO_VERSION" ]; then
   CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 fi
 
+LOCK_HASH=$(sha256_16 Cargo.lock)
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-stable}
+CACHE_SCOPE_INPUT="v1|python-wheels|base|${LOCK_HASH}|${RUST_SCOPE}"
+CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
+
 VERSION_ARGS=(
   --build-arg "NAVIGATOR_CARGO_VERSION=${CARGO_VERSION}"
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
 )
 
 if ! docker buildx inspect multiarch >/dev/null 2>&1; then
@@ -108,11 +130,32 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
+sha256_16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+sha256_16_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
 CARGO_VERSION=${NAVIGATOR_CARGO_VERSION:-}
 OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
 if [ -z "$CARGO_VERSION" ]; then
   CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 fi
+
+LOCK_HASH=$(sha256_16 Cargo.lock)
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-rustup-stable}
+CACHE_SCOPE_INPUT="v1|python-wheels-macos|base|${LOCK_HASH}|${RUST_SCOPE}"
+CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 
 mkdir -p target/wheels
 
@@ -121,6 +164,7 @@ docker build \
   --target wheels \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
   --build-arg "NAVIGATOR_CARGO_VERSION=${CARGO_VERSION}" \
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
   --output type=local,dest=target/wheels \
   .
 
