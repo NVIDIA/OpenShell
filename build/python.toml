@@ -18,11 +18,14 @@ run = """
 set -euo pipefail
 
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
-VERSION=${NAVIGATOR_VERSION:-}
-if [ -z "$VERSION" ]; then
-  VERSION=$(uv run python build/scripts/release.py get-version --python)
+CARGO_VERSION=${NAVIGATOR_CARGO_VERSION:-}
+if [ -z "$CARGO_VERSION" ]; then
+  CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 fi
-VERSION_ARGS=(--build-arg "NAVIGATOR_VERSION=${VERSION}")
+
+VERSION_ARGS=(
+  --build-arg "NAVIGATOR_CARGO_VERSION=${CARGO_VERSION}"
+)
 
 if ! docker buildx inspect multiarch >/dev/null 2>&1; then
   echo "Creating multi-platform buildx builder..."
@@ -33,11 +36,33 @@ fi
 
 mkdir -p target/wheels
 
+USE_LOCAL_CACHE=0
+if [ -z "${CI:-}" ] && docker buildx inspect multiarch 2>/dev/null | grep -q "Driver: docker-container"; then
+  USE_LOCAL_CACHE=1
+fi
+
+DOCKER_BUILD_CACHE_DIR=${DOCKER_BUILD_CACHE_DIR:-.cache/buildkit/python-wheels}
+if [ "$USE_LOCAL_CACHE" -eq 1 ]; then
+  mkdir -p "$DOCKER_BUILD_CACHE_DIR"
+fi
+
 for platform in ${PLATFORMS//,/ }; do
   echo "Building wheel for ${platform}..."
+  CACHE_ARGS=()
+  if [ "$USE_LOCAL_CACHE" -eq 1 ]; then
+    PLATFORM_CACHE_KEY=$(printf '%s' "$platform" | tr '/' '-')
+    PLATFORM_CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/${PLATFORM_CACHE_KEY}"
+    mkdir -p "$PLATFORM_CACHE_PATH"
+    CACHE_ARGS=(
+      --cache-from "type=local,src=${PLATFORM_CACHE_PATH}"
+      --cache-to "type=local,dest=${PLATFORM_CACHE_PATH},mode=max"
+    )
+  fi
+
   docker buildx build \
     --builder multiarch \
     --platform "${platform}" \
+    "${CACHE_ARGS[@]}" \
     -f deploy/docker/Dockerfile.python-wheels \
     --target wheels \
     "${VERSION_ARGS[@]}" \
@@ -55,7 +80,7 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [ "$(uname -s)" = "Darwin" ]; then
+if [ "$(uname -s)" = "Darwin" ] && [ -z "${NAVIGATOR_CARGO_VERSION:-}" ]; then
   # Avoid failures when RUSTC_WRAPPER is set to an unresolved `sccache` binary.
   if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER="$(command -v sccache)"
@@ -83,10 +108,10 @@ run = """
 #!/usr/bin/env bash
 set -euo pipefail
 
-VERSION=${NAVIGATOR_VERSION:-}
+CARGO_VERSION=${NAVIGATOR_CARGO_VERSION:-}
 OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
-if [ -z "$VERSION" ]; then
-  VERSION=$(uv run python build/scripts/release.py get-version --python)
+if [ -z "$CARGO_VERSION" ]; then
+  CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
 fi
 
 mkdir -p target/wheels
@@ -95,7 +120,7 @@ docker build \
   -f deploy/docker/Dockerfile.python-wheels-macos \
   --target wheels \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
-  --build-arg "NAVIGATOR_VERSION=${VERSION}" \
+  --build-arg "NAVIGATOR_CARGO_VERSION=${CARGO_VERSION}" \
   --output type=local,dest=target/wheels \
   .
 

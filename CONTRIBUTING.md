@@ -327,14 +327,16 @@ automatically, so you generally do not need to generate stubs manually.
 ### Publishing
 
 Versions are derived from git tags using `setuptools_scm`. No version bumps need to be committed.
+Python wheel builds inject version at build time via
+`NAVIGATOR_CARGO_VERSION` (Cargo/SemVer), applied inside wheel-builder Docker
+layers, so publish flows do not edit `Cargo.toml`/`Cargo.lock` in the working
+tree.
 
 **Version commands:**
 
 ```bash
 mise run version:print             # Show computed versions (python, cargo, docker)
 mise run version:print -- --cargo  # Show cargo version only
-mise run version:set               # Update Cargo.toml with git-derived version (or specified with --version)
-mise run version:reset             # Restore Cargo.toml to git state
 ```
 
 **Publishing credentials (one-time setup):**

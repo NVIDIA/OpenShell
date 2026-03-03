@@ -65,30 +65,6 @@ def _compute_versions() -> Versions:
     )
 
 
-def _cargo_files_clean() -> bool:
-    """Check if Cargo.toml and Cargo.lock have no uncommitted changes."""
-    status = _git(["status", "--porcelain", "Cargo.toml", "Cargo.lock"])
-    return status == ""
-
-
-def set_version(version: str | None = None) -> None:
-    """Set Cargo workspace version. Fails if Cargo files have uncommitted changes."""
-    if not _cargo_files_clean():
-        raise SystemExit(
-            "Cargo.toml or Cargo.lock have uncommitted changes. "
-            "Commit or stash them before setting version."
-        )
-    if version is None:
-        version = _compute_versions().cargo
-    _run(["cargo", "set-version", "--workspace", version])
-    print(f"Set version to {version}")
-
-
-def reset_version() -> None:
-    """Reset Cargo.toml and Cargo.lock to their git state."""
-    _run(["git", "checkout", "--", "Cargo.toml", "Cargo.lock"])
-
-
 def python_publish(
     version: str | None = None, wheel_glob: str = "nemoclaw-*.whl"
 ) -> None:
@@ -167,17 +143,6 @@ def build_parser() -> argparse.ArgumentParser:
         "--docker", action="store_true", help="Print Docker version only."
     )
 
-    set_version_parser = sub.add_parser(
-        "set-version", help="Set Cargo version (fails if uncommitted changes)."
-    )
-    set_version_parser.add_argument(
-        "--version", help="Version to set (defaults to computed version from git)."
-    )
-
-    sub.add_parser(
-        "reset-version", help="Reset Cargo.toml and Cargo.lock to git state."
-    )
-
     python_publish_parser = sub.add_parser(
         "python-publish", help="Publish python wheel."
     )
@@ -206,10 +171,6 @@ def main() -> None:
             get_version("docker")
         else:
             get_version("all")
-    elif args.command == "set-version":
-        set_version(version=args.version)
-    elif args.command == "reset-version":
-        reset_version()
     elif args.command == "python-publish":
         python_publish(version=args.version, wheel_glob=args.wheel_glob)
 
