@@ -328,6 +328,8 @@ pub struct App {
     pub pending_create_sandbox: bool,
     /// Ports to forward after sandbox creation completes.
     pub pending_forward_ports: Vec<u16>,
+    /// Command to exec via SSH after sandbox creation completes.
+    pub pending_exec_command: String,
     /// Animation ticker handle — aborted when animation stops.
     pub anim_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -396,6 +398,7 @@ impl App {
             create_form: None,
             pending_create_sandbox: false,
             pending_forward_ports: Vec::new(),
+            pending_exec_command: String::new(),
             anim_handle: None,
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
