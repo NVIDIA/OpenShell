@@ -108,13 +108,17 @@ cargo_cross_build() {
   # "No such file or directory" writing .d files if deps/ is missing.
   mkdir -p "$(cross_output_dir "$profile")/deps"
   # Retry once after cleaning if the build fails. BuildKit cargo-target cache
-  # mounts can retain stale .rmeta files from prior builds with different
-  # dependency versions; cargo clean purges them so the retry succeeds.
-  # sccache still has the compiled objects, so the clean rebuild is fast.
+  # mounts can retain stale .rmeta/.rlib files from prior builds with different
+  # dependency versions or profiles. We wipe the entire target directory
+  # (rm -rf is more thorough than cargo clean, which relies on its own stale
+  # metadata) and disable sccache for the retry — a corrupt sccache cache
+  # entry can cause "extern location does not exist" errors even on a
+  # freshly-cleaned target dir, so falling back to raw rustc is safer.
   if ! cargo build $target_flag "$@"; then
-    echo "cargo build failed; cleaning stale target cache and retrying..." >&2
-    cargo clean 2>/dev/null || true
+    echo "cargo build failed; cleaning stale target cache and retrying without sccache..." >&2
+    rm -rf /build/target/*
     mkdir -p "$(cross_output_dir "$profile")/deps"
+    unset RUSTC_WRAPPER 2>/dev/null || true
     cargo build $target_flag "$@"
   fi
 }
