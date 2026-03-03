@@ -34,3 +34,34 @@ pub fn clusters_dir() -> Result<PathBuf> {
 pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
     Ok(clusters_dir()?.join(cluster).join("last_sandbox"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    #[allow(unsafe_code)]
+    fn last_sandbox_path_layout() {
+        let _guard = XDG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let tmp = tempfile::tempdir().unwrap();
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path());
+        }
+        let path = last_sandbox_path("my-cluster").unwrap();
+        assert!(
+            path.ends_with("navigator/clusters/my-cluster/last_sandbox"),
+            "unexpected path: {path:?}"
+        );
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+}

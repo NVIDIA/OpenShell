@@ -1510,4 +1510,35 @@ mod tests {
             "expected path completion for --up, got: {names:?}"
         );
     }
+
+    #[test]
+    fn resolve_sandbox_name_returns_explicit_name() {
+        // When a name is provided, it should be returned regardless of any
+        // stored last-sandbox state.
+        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-cluster");
+        assert_eq!(result.unwrap(), "explicit");
+    }
+
+    #[test]
+    fn resolve_sandbox_name_falls_back_to_last_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("test-cluster", "remembered-sb").unwrap();
+            let result = resolve_sandbox_name(None, "test-cluster");
+            assert_eq!(result.unwrap(), "remembered-sb");
+        });
+    }
+
+    #[test]
+    fn resolve_sandbox_name_errors_without_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            let err = resolve_sandbox_name(None, "unknown-cluster").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nav sandbox connect"),
+                "expected helpful hint in error, got: {msg}"
+            );
+        });
+    }
 }

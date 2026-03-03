@@ -2482,4 +2482,41 @@ mod tests {
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
     }
+
+    // ── petname default name generation ───────────────────────────────
+
+    /// Verify that `petname::petname(2, "-")` produces names matching the
+    /// expected two-word, hyphen-separated, lowercase pattern.
+    #[test]
+    fn sandbox_name_defaults_to_petname_format() {
+        for _ in 0..50 {
+            let name = petname::petname(2, "-").expect("petname should produce a name");
+            let parts: Vec<&str> = name.split('-').collect();
+            assert_eq!(
+                parts.len(),
+                2,
+                "expected two hyphen-separated words, got: {name}"
+            );
+            for part in &parts {
+                assert!(
+                    !part.is_empty() && part.chars().all(|c| c.is_ascii_lowercase()),
+                    "each word should be non-empty lowercase ascii: {name}"
+                );
+            }
+        }
+    }
+
+    /// The `generate_name` fallback is still a valid 6-char lowercase name.
+    #[test]
+    fn generate_name_fallback_is_valid() {
+        use crate::persistence::generate_name;
+        for _ in 0..50 {
+            let name = generate_name();
+            assert_eq!(name.len(), 6, "unexpected length for fallback name: {name}");
+            assert!(
+                name.chars().all(|c| c.is_ascii_lowercase()),
+                "fallback name should be all lowercase: {name}"
+            );
+        }
+    }
 }
