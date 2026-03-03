@@ -415,16 +415,33 @@ pub async fn ensure_container(
 
 pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {
     let container_name = container_name(name);
-    let response = docker
-        .start_container(&container_name, None::<StartContainerOptions>)
-        .await;
-    match response {
-        Ok(()) => Ok(()),
-        Err(err) if is_conflict(&err) => Ok(()),
-        Err(err) => Err(err)
-            .into_diagnostic()
-            .wrap_err("failed to start cluster container"),
+
+    // Retry with backoff when the start fails due to a port binding conflict.
+    // After a container is destroyed the OS may take a moment to release the
+    // TCP socket, so the new container's start can transiently fail with
+    // "port is already allocated".
+    let max_attempts: u64 = 5;
+    for attempt in 1..=max_attempts {
+        let response = docker
+            .start_container(&container_name, None::<StartContainerOptions>)
+            .await;
+        match response {
+            Ok(()) => return Ok(()),
+            Err(err) if is_conflict(&err) => return Ok(()),
+            Err(ref err) if attempt < max_attempts && is_port_conflict(err) => {
+                tracing::debug!(
+                    "Port conflict on start attempt {attempt}/{max_attempts}, retrying after backoff"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err("failed to start cluster container")
+            }
+        }
     }
+    unreachable!()
 }
 
 pub async fn stop_container(docker: &Docker, container_name: &str) -> Result<()> {
@@ -678,6 +695,19 @@ fn is_conflict(err: &BollardError) -> bool {
             status_code: 409,
             ..
         }
+    )
+}
+
+/// Detect Docker "port is already allocated" errors that can occur transiently
+/// after a container using the same port was just destroyed.
+fn is_port_conflict(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 500,
+            message,
+            ..
+        } if message.contains("port is already allocated")
     )
 }
 
