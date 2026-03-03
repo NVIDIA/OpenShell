@@ -67,7 +67,7 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 }
                 if app.pending_create_sandbox {
                     app.pending_create_sandbox = false;
-                    spawn_create_sandbox(&app, events.sender());
+                    spawn_create_sandbox(&mut app, events.sender());
                     start_anim_ticker(&mut app, events.sender());
                 }
                 // --- Provider CRUD ---
@@ -171,6 +171,17 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     app.status_text = format!("delete provider failed: {msg}");
                 }
             },
+            Some(Event::ForwardResult(result)) => {
+                match result {
+                    Ok(msg) => {
+                        app.status_text = msg;
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("forward failed: {msg}");
+                    }
+                }
+                refresh_sandboxes(&mut app).await;
+            }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
                     app.scroll_logs(-3);
@@ -208,6 +219,15 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                             match result {
                                 Some(Ok(name)) => {
                                     app.create_form = None;
+                                    let ports = std::mem::take(&mut app.pending_forward_ports);
+                                    if !ports.is_empty() {
+                                        spawn_forward_ports(
+                                            &app,
+                                            events.sender(),
+                                            name.clone(),
+                                            ports,
+                                        );
+                                    }
                                     app.status_text = format!("Created sandbox: {name}");
                                     refresh_sandboxes(&mut app).await;
                                 }
@@ -503,6 +523,13 @@ async fn handle_sandbox_delete(app: &mut App) {
         None => return,
     };
 
+    // Stop any active port forwards before deleting (mirrors CLI behavior).
+    if let Ok(stopped) = navigator_core::forward::stop_forwards_for_sandbox(&sandbox_name) {
+        for port in &stopped {
+            tracing::info!("stopped forward of port {port} for sandbox {sandbox_name}");
+        }
+    }
+
     let req = navigator_core::proto::DeleteSandboxRequest { name: sandbox_name };
     match app.client.delete_sandbox(req).await {
         Ok(_) => {
@@ -747,48 +774,8 @@ async fn handle_shell_connect(
     events.resume();
 }
 
-/// If the gateway host is a loopback address, override it with the host and port
-/// from the cluster endpoint URL. Mirrors `resolve_ssh_gateway` in `ssh.rs`.
-fn resolve_ssh_gateway(gateway_host: &str, gateway_port: u16, cluster_url: &str) -> (String, u16) {
-    let is_loopback = gateway_host == "127.0.0.1"
-        || gateway_host == "0.0.0.0"
-        || gateway_host == "localhost"
-        || gateway_host == "::1";
-
-    if !is_loopback {
-        return (gateway_host.to_string(), gateway_port);
-    }
-
-    if let Ok(url) = url::Url::parse(cluster_url) {
-        if let Some(host) = url.host_str() {
-            let cluster_port = url.port().unwrap_or(gateway_port);
-            let cluster_is_loopback =
-                host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
-            if !cluster_is_loopback {
-                return (host.to_string(), cluster_port);
-            }
-            // Both loopback — use cluster URL's port (Docker-mapped).
-            return (gateway_host.to_string(), cluster_port);
-        }
-    }
-
-    (gateway_host.to_string(), gateway_port)
-}
-
-/// Shell-escape a value for use inside a ProxyCommand string.
-fn shell_escape(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-    let safe = value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
-    if safe {
-        return value.to_string();
-    }
-    let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
-}
+// SSH utility functions are shared via navigator_core::forward.
+use navigator_core::forward::{resolve_ssh_gateway, shell_escape};
 
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
@@ -986,11 +973,14 @@ fn start_anim_ticker(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 // Create sandbox (simplified — uses pre-selected provider names)
 // ---------------------------------------------------------------------------
 
-fn spawn_create_sandbox(app: &App, tx: mpsc::UnboundedSender<Event>) {
+fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
-    let Some((name, image, _command, selected_providers)) = app.create_form_data() else {
+    let Some((name, image, _command, selected_providers, ports)) = app.create_form_data() else {
         return;
     };
+
+    // Stash ports so we can start forwarding after sandbox creation succeeds.
+    app.pending_forward_ports = ports;
 
     tokio::spawn(async move {
         let has_custom_image = !image.is_empty();
@@ -1032,6 +1022,174 @@ fn spawn_create_sandbox(app: &App, tx: mpsc::UnboundedSender<Event>) {
             Err(_) => {
                 let _ = tx.send(Event::CreateResult(Err("request timed out".to_string())));
             }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Port forwarding (background SSH tunnels)
+// ---------------------------------------------------------------------------
+
+/// Spawn background SSH port forwards for the given sandbox and ports.
+///
+/// For each port, creates an SSH session via gRPC, then spawns an `ssh -N -f -L`
+/// process. PID tracking uses the shared `navigator_core::forward` functions.
+fn spawn_forward_ports(
+    app: &App,
+    tx: mpsc::UnboundedSender<Event>,
+    sandbox_name: String,
+    ports: Vec<u16>,
+) {
+    let mut client = app.client.clone();
+    let endpoint = app.endpoint.clone();
+
+    tokio::spawn(async move {
+        // Wait for the sandbox to reach Ready state before attempting to forward.
+        let mut attempts = 0;
+        let sandbox_id = loop {
+            attempts += 1;
+            if attempts > 30 {
+                let _ = tx.send(Event::ForwardResult(Err(
+                    "timed out waiting for sandbox to be ready".to_string(),
+                )));
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+
+            let req = navigator_core::proto::GetSandboxRequest {
+                name: sandbox_name.clone(),
+            };
+            match client.get_sandbox(req).await {
+                Ok(resp) => {
+                    if let Some(sandbox) = resp.into_inner().sandbox {
+                        // Phase 2 = Ready
+                        if sandbox.phase == 2 {
+                            break sandbox.id;
+                        }
+                        // Phase 3 = Error
+                        if sandbox.phase == 3 {
+                            let _ = tx.send(Event::ForwardResult(Err(
+                                "sandbox entered error state, cannot forward".to_string(),
+                            )));
+                            return;
+                        }
+                    }
+                }
+                Err(_) => {
+                    // Retry on transient errors.
+                }
+            }
+        };
+
+        // Create SSH session.
+        let session = {
+            let req = navigator_core::proto::CreateSshSessionRequest {
+                sandbox_id: sandbox_id.clone(),
+            };
+            match tokio::time::timeout(Duration::from_secs(10), client.create_ssh_session(req))
+                .await
+            {
+                Ok(Ok(resp)) => resp.into_inner(),
+                Ok(Err(e)) => {
+                    let _ = tx.send(Event::ForwardResult(Err(format!(
+                        "SSH session failed: {}",
+                        e.message()
+                    ))));
+                    return;
+                }
+                Err(_) => {
+                    let _ = tx.send(Event::ForwardResult(Err(
+                        "SSH session timed out".to_string()
+                    )));
+                    return;
+                }
+            }
+        };
+
+        // Resolve gateway address.
+        #[allow(clippy::cast_possible_truncation)]
+        let gateway_port_u16 = session.gateway_port as u16;
+        let (gateway_host, gateway_port) =
+            resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, &endpoint);
+        let gateway_url = format!(
+            "{}://{}:{gateway_port}{}",
+            session.gateway_scheme, gateway_host, session.connect_path
+        );
+
+        // Build ProxyCommand.
+        let exe = match std::env::current_exe() {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = tx.send(Event::ForwardResult(Err(format!(
+                    "failed to find executable: {e}"
+                ))));
+                return;
+            }
+        };
+        let exe_str = shell_escape(&exe.to_string_lossy());
+        let proxy_command = format!(
+            "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {}",
+            session.sandbox_id, session.token,
+        );
+
+        // Start a forward for each port.
+        let mut forwarded = Vec::new();
+        for port in &ports {
+            let mut command = std::process::Command::new("ssh");
+            command
+                .arg("-o")
+                .arg(format!("ProxyCommand={proxy_command}"))
+                .arg("-o")
+                .arg("StrictHostKeyChecking=no")
+                .arg("-o")
+                .arg("UserKnownHostsFile=/dev/null")
+                .arg("-o")
+                .arg("GlobalKnownHostsFile=/dev/null")
+                .arg("-o")
+                .arg("LogLevel=ERROR")
+                .arg("-N")
+                .arg("-f")
+                .arg("-L")
+                .arg(format!("{port}:127.0.0.1:{port}"))
+                .arg("sandbox")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+
+            let port_val = *port;
+            let sid = session.sandbox_id.clone();
+            let name = sandbox_name.clone();
+            let status = tokio::task::spawn_blocking(move || command.status()).await;
+
+            match status {
+                Ok(Ok(s)) if s.success() => {
+                    // Find and track the backgrounded SSH PID.
+                    if let Some(pid) = navigator_core::forward::find_ssh_forward_pid(&sid, port_val)
+                    {
+                        let _ =
+                            navigator_core::forward::write_forward_pid(&name, port_val, pid, &sid);
+                    }
+                    forwarded.push(port_val);
+                }
+                _ => {
+                    tracing::warn!("failed to start forward for port {port_val}");
+                }
+            }
+        }
+
+        if forwarded.is_empty() {
+            let _ = tx.send(Event::ForwardResult(Err(
+                "failed to start any port forwards".to_string(),
+            )));
+        } else {
+            let port_list = forwarded
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let _ = tx.send(Event::ForwardResult(Ok(format!(
+                "Forwarding port(s) {port_list} to {sandbox_name}"
+            ))));
         }
     });
 }
@@ -1317,6 +1475,14 @@ async fn refresh_sandboxes(app: &mut App) {
                 .iter()
                 .map(|s| format_timestamp(s.created_at_ms))
                 .collect();
+
+            // Build NOTES column from active port forwards.
+            let forwards = navigator_core::forward::list_forwards().unwrap_or_default();
+            app.sandbox_notes = sandboxes
+                .iter()
+                .map(|s| navigator_core::forward::build_sandbox_notes(&s.name, &forwards))
+                .collect();
+
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
                 app.sandbox_selected = app.sandbox_count - 1;
             }

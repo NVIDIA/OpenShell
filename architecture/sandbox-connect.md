@@ -170,6 +170,36 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
   when no trailing command is provided.
 - `ncl sandbox delete` auto-stops any active forwards for the deleted sandbox.
 
+#### TUI (Gator)
+
+The TUI (`crates/navigator-tui/`) supports port forwarding through the create sandbox modal. Users
+specify comma-separated ports in the **Ports** field. After sandbox creation:
+
+1. Gator polls for `Ready` state (up to 30 attempts at 2-second intervals).
+2. Creates an SSH session via `CreateSshSession` gRPC.
+3. Spawns background SSH tunnels (`ssh -N -f -L <port>:127.0.0.1:<port>`) for each port.
+4. Sends a `ForwardResult` event back to the main loop with the outcome.
+
+Active forwards are displayed in the sandbox table's NOTES column (e.g., `fwd:8080,3000`) and in
+the sandbox detail view's Forwards row.
+
+When deleting a sandbox, Gator calls `stop_forwards_for_sandbox()` before sending the delete
+request. PID tracking uses the same `~/.config/nemoclaw/forwards/` directory as the CLI.
+
+#### Shared forward module
+
+**File**: `crates/navigator-core/src/forward.rs`
+
+Port forwarding PID management and SSH utility functions are shared between the CLI and TUI:
+
+- `forward_dir()` -- returns `~/.config/nemoclaw/forwards/`, creating it if needed
+- `save_forward_pid()` / `read_forward_pid()` / `remove_forward_pid()` -- PID file I/O
+- `list_forwards()` -- lists all active forwards from PID files
+- `stop_forward()` / `stop_forwards_for_sandbox()` -- kills forwarding processes by PID
+- `resolve_ssh_gateway()` -- loopback gateway resolution (see Gateway Loopback Resolution)
+- `shell_escape()` -- safe shell argument escaping for SSH commands
+- `build_sandbox_notes()` -- builds notes strings (e.g., `fwd:8080,3000`) from active forwards
+
 #### Supervisor `direct-tcpip` handling
 
 The sandbox SSH server (`crates/navigator-sandbox/src/ssh.rs`) implements
@@ -473,11 +503,13 @@ The gateway builds the remote command by shell-escaping arguments, prepending so
 
 ## Gateway Loopback Resolution
 
-**File**: `crates/navigator-cli/src/ssh.rs` -- `resolve_ssh_gateway()`
+**File**: `crates/navigator-core/src/forward.rs` -- `resolve_ssh_gateway()`
 
-When the gateway returns a loopback address (`127.0.0.1`, `0.0.0.0`, `localhost`, or `::1`), the CLI overrides it with the host from the cluster endpoint URL. This handles the common case where the gateway defaults to `127.0.0.1` but the cluster is running on a remote machine.
+When the gateway returns a loopback address (`127.0.0.1`, `0.0.0.0`, `localhost`, or `::1`), the client overrides it with the host from the cluster endpoint URL. This handles the common case where the gateway defaults to `127.0.0.1` but the cluster is running on a remote machine.
 
 The override only applies if the cluster endpoint itself is not also a loopback address. If both are loopback, the original address is kept.
+
+This function is shared between the CLI and TUI via the `navigator-core::forward` module.
 
 ## Authentication and Security Model
 

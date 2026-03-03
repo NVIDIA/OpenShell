@@ -95,6 +95,10 @@ pub struct ClusterEntry {
 // Create sandbox form (simplified — providers chosen by name)
 // ---------------------------------------------------------------------------
 
+/// Data extracted from the create sandbox form:
+/// `(name, image, command, selected_provider_names, forward_ports)`.
+pub type CreateFormData = (String, String, String, Vec<String>, Vec<u16>);
+
 /// Which field is focused in the create sandbox modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateFormField {
@@ -102,6 +106,7 @@ pub enum CreateFormField {
     Image,
     Command,
     Providers,
+    Ports,
     Submit,
 }
 
@@ -111,7 +116,8 @@ impl CreateFormField {
             Self::Name => Self::Image,
             Self::Image => Self::Command,
             Self::Command => Self::Providers,
-            Self::Providers => Self::Submit,
+            Self::Providers => Self::Ports,
+            Self::Ports => Self::Submit,
             Self::Submit => Self::Name,
         }
     }
@@ -122,7 +128,8 @@ impl CreateFormField {
             Self::Image => Self::Name,
             Self::Command => Self::Image,
             Self::Providers => Self::Command,
-            Self::Submit => Self::Providers,
+            Self::Ports => Self::Providers,
+            Self::Submit => Self::Ports,
         }
     }
 }
@@ -155,6 +162,8 @@ pub struct CreateSandboxForm {
     pub command: String,
     pub providers: Vec<ProviderEntry>,
     pub provider_cursor: usize,
+    /// Comma-separated port numbers to forward (e.g. "8080,3000").
+    pub ports: String,
     /// Status message shown after submit attempt.
     pub status: Option<String>,
     /// Current phase of the create flow.
@@ -297,6 +306,7 @@ pub struct App {
     pub sandbox_ages: Vec<String>,
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
+    pub sandbox_notes: Vec<String>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
 
@@ -316,6 +326,8 @@ pub struct App {
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
     pub pending_create_sandbox: bool,
+    /// Ports to forward after sandbox creation completes.
+    pub pending_forward_ports: Vec<u16>,
     /// Animation ticker handle — aborted when animation stops.
     pub anim_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -369,6 +381,7 @@ impl App {
             sandbox_ages: Vec::new(),
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
+            sandbox_notes: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
             confirm_delete: false,
@@ -382,6 +395,7 @@ impl App {
             policy_scroll: 0,
             create_form: None,
             pending_create_sandbox: false,
+            pending_forward_ports: Vec::new(),
             anim_handle: None,
             sandbox_log_lines: Vec::new(),
             sandbox_log_scroll: 0,
@@ -759,6 +773,7 @@ impl App {
             command: String::from("/bin/bash"),
             providers,
             provider_cursor: 0,
+            ports: String::new(),
             status: None,
             phase: CreatePhase::Form,
             anim_start: None,
@@ -807,6 +822,18 @@ impl App {
                         }
                         _ => {}
                     },
+                    CreateFormField::Ports => {
+                        // Only allow digits, commas, and spaces for port input.
+                        match key.code {
+                            KeyCode::Char(c) if c.is_ascii_digit() || c == ',' => {
+                                form.ports.push(c);
+                            }
+                            KeyCode::Backspace => {
+                                form.ports.pop();
+                            }
+                            _ => {}
+                        }
+                    }
                     CreateFormField::Submit => {
                         if key.code == KeyCode::Enter {
                             form.anim_start = Some(Instant::now());
@@ -821,8 +848,8 @@ impl App {
     }
 
     /// Build the form data needed for the gRPC `CreateSandbox` request.
-    /// Returns `(name, image, command, selected_provider_names)`.
-    pub fn create_form_data(&self) -> Option<(String, String, String, Vec<String>)> {
+    /// Returns `(name, image, command, selected_provider_names, forward_ports)`.
+    pub fn create_form_data(&self) -> Option<CreateFormData> {
         let form = self.create_form.as_ref()?;
         let providers: Vec<String> = form
             .providers
@@ -830,11 +857,18 @@ impl App {
             .filter(|p| p.selected)
             .map(|p| p.name.clone())
             .collect();
+        let ports: Vec<u16> = form
+            .ports
+            .split(',')
+            .filter_map(|s| s.trim().parse::<u16>().ok())
+            .filter(|&p| p > 0)
+            .collect();
         Some((
             form.name.clone(),
             form.image.clone(),
             form.command.clone(),
             providers,
+            ports,
         ))
     }
 
@@ -1265,6 +1299,7 @@ impl App {
         self.sandbox_ages.clear();
         self.sandbox_created.clear();
         self.sandbox_images.clear();
+        self.sandbox_notes.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();

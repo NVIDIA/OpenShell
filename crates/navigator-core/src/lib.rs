@@ -10,6 +10,7 @@
 
 pub mod config;
 pub mod error;
+pub mod forward;
 pub mod inference;
 pub mod proto;
 

@@ -30,6 +30,8 @@ pub enum Event {
     ProviderUpdateResult(Result<String, String>),
     /// Provider delete result: `Ok(deleted)` or `Err(message)`.
     ProviderDeleteResult(Result<bool, String>),
+    /// Result of starting a port forward: `Ok(message)` or `Err(message)`.
+    ForwardResult(Result<String, String>),
 }
 
 pub struct EventHandler {

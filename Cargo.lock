@@ -2724,6 +2724,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tonic",
  "tonic-build",
+ "url",
 ]
 
 [[package]]
