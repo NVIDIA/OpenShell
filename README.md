@@ -16,7 +16,7 @@ It transforms the data center from a static deployment target into a continuous 
 ### Install
 
 ```bash
-uv pip install navigator --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
+uv pip install nemoclaw --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
 The `navigator` binary is installed into your Python environment. Use `uv run navigator` to invoke it, or activate your venv first (`source .venv/bin/activate`).
