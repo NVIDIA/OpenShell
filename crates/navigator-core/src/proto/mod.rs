@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Generated protocol buffer code.
 //!
 //! This module re-exports the generated protobuf types and service definitions.

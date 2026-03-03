@@ -28,6 +28,36 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 
 Project uses Rust 1.88+ and Python 3.12+. Docker must be running for cluster and sandbox workflows.
 
+## Developer Certificate of Origin (DCO)
+
+All contributions to this project must include a `Signed-off-by` line in the commit message, certifying that you wrote or have the right to submit the code under the project's open-source license. This is the [Developer Certificate of Origin (DCO)](https://developercertificate.org/).
+
+Add the sign-off automatically with `git commit -s`:
+
+```bash
+git commit -s -m "feat(sandbox): add new capability"
+```
+
+This appends a line like:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+A DCO check runs on every pull request and will fail if any commit is missing the sign-off.
+
+## License Headers
+
+All source files must include an SPDX copyright header. Use the license header script to add or check headers:
+
+```bash
+# Add/update headers on all source files
+mise run license:update
+
+# Check that all files have headers (runs in CI and pre-commit)
+mise run license:check
+```
+
 ## Getting started
 
 ```bash

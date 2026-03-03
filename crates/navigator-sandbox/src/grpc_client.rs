@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! gRPC client for fetching sandbox policy, provider environment, and inference
 //! route bundles from Navigator server.
 

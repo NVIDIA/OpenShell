@@ -1,4 +1,8 @@
 #!/bin/sh
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # Shared Rust cross-compilation helpers for multi-arch Docker builds.
 #
 # Source this script in Dockerfile RUN layers:

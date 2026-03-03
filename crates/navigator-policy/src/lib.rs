@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Shared sandbox policy parsing and defaults for Navigator.
 //!
 //! Provides YAML→proto conversion for sandbox policies, with a built-in

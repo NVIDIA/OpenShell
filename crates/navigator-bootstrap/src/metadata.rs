@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::RemoteOptions;
 use crate::paths::{active_cluster_path, clusters_dir, xdg_config_dir};
 use miette::{IntoDiagnostic, Result, WrapErr};

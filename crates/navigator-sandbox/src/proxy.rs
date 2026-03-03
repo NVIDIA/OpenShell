@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
 use crate::identity::BinaryIdentityCache;

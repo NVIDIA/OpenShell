@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use navigator_router::Router;
 use navigator_router::config::{ResolvedRoute, RouteConfig, RouterConfig};
 use wiremock::matchers::{bearer_token, body_partial_json, header, method, path};

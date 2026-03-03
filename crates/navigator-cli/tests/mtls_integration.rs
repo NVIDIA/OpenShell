@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use navigator_cli::tls::{TlsOptions, grpc_client};
 use navigator_core::proto::{
     CreateProviderRequest, CreateSshSessionRequest, CreateSshSessionResponse,

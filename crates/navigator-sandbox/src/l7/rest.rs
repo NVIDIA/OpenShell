@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! REST (HTTP/1.1) L7 provider.
 //!
 //! Parses HTTP/1.1 request lines and headers, evaluates method+path against

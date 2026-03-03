@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """E2e tests for provider credential injection into sandboxes.
 
 Provider credentials are fetched at runtime by the sandbox supervisor via the

@@ -1,8 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # CI, pre-commit, and sandbox runner tasks
 
 [lint]
 description = "Run all linters and format checks"
-depends = ["rust:format:check", "rust:lint", "python:lint"]
+depends = ["license:check", "rust:format:check", "rust:lint", "python:lint"]
 
 [all]
 description = "Build, lint, and test everything"

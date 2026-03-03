@@ -1,0 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# License header check and update tasks
+
+["license:check"]
+description = "Check that all source files have SPDX license headers"
+run = "uv run python scripts/update_license_headers.py --check"
+
+["license:update"]
+description = "Add or update SPDX license headers on all source files"
+run = "uv run python scripts/update_license_headers.py"

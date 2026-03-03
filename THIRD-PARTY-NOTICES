@@ -1,0 +1,2278 @@
+THIRD-PARTY SOFTWARE NOTICES
+
+This file lists the third-party software packages used by NemoClaw,
+along with their respective licenses.
+
+To regenerate: uv run python scripts/generate_third_party_notices.py
+
+================================================================================
+Rust Dependencies
+================================================================================
+
+Package: addr2line 0.25.1
+License: See crates.io
+Repository: https://crates.io/crates/addr2line
+
+Package: adler2 2.0.1
+License: See crates.io
+Repository: https://crates.io/crates/adler2
+
+Package: aead 0.5.2
+License: See crates.io
+Repository: https://crates.io/crates/aead
+
+Package: aes 0.8.4
+License: See crates.io
+Repository: https://crates.io/crates/aes
+
+Package: aes-gcm 0.10.3
+License: See crates.io
+Repository: https://crates.io/crates/aes-gcm
+
+Package: ahash 0.8.12
+License: See crates.io
+Repository: https://crates.io/crates/ahash
+
+Package: aho-corasick 1.1.4
+License: See crates.io
+Repository: https://crates.io/crates/aho-corasick
+
+Package: allocator-api2 0.2.21
+License: See crates.io
+Repository: https://crates.io/crates/allocator-api2
+
+Package: android_system_properties 0.1.5
+License: See crates.io
+Repository: https://crates.io/crates/android_system_properties
+
+Package: anstream 0.6.21
+License: See crates.io
+Repository: https://crates.io/crates/anstream
+
+Package: anstyle 1.0.13
+License: See crates.io
+Repository: https://crates.io/crates/anstyle
+
+Package: anstyle-parse 0.2.7
+License: See crates.io
+Repository: https://crates.io/crates/anstyle-parse
+
+Package: anstyle-query 1.1.5
+License: See crates.io
+Repository: https://crates.io/crates/anstyle-query
+
+Package: anstyle-wincon 3.0.11
+License: See crates.io
+Repository: https://crates.io/crates/anstyle-wincon
+
+Package: anyhow 1.0.101
+License: See crates.io
+Repository: https://crates.io/crates/anyhow
+
+Package: argon2 0.5.3
+License: See crates.io
+Repository: https://crates.io/crates/argon2
+
+Package: assert-json-diff 2.0.2
+License: See crates.io
+Repository: https://crates.io/crates/assert-json-diff
+
+Package: async-stream 0.3.6
+License: See crates.io
+Repository: https://crates.io/crates/async-stream
+
+Package: async-stream-impl 0.3.6
+License: See crates.io
+Repository: https://crates.io/crates/async-stream-impl
+
+Package: async-trait 0.1.89
+License: See crates.io
+Repository: https://crates.io/crates/async-trait
+
+Package: atoi 2.0.0
+License: See crates.io
+Repository: https://crates.io/crates/atoi
+
+Package: atomic-waker 1.1.2
+License: See crates.io
+Repository: https://crates.io/crates/atomic-waker
+
+Package: autocfg 1.5.0
+License: See crates.io
+Repository: https://crates.io/crates/autocfg
+
+Package: autotools 0.2.7
+License: See crates.io
+Repository: https://crates.io/crates/autotools
+
+Package: aws-lc-rs 1.15.4
+License: See crates.io
+Repository: https://crates.io/crates/aws-lc-rs
+
+Package: aws-lc-sys 0.37.0
+License: See crates.io
+Repository: https://crates.io/crates/aws-lc-sys
+
+Package: axum 0.7.9
+License: See crates.io
+Repository: https://crates.io/crates/axum
+
+Package: axum 0.8.8
+License: See crates.io
+Repository: https://crates.io/crates/axum
+
+Package: axum-core 0.4.5
+License: See crates.io
+Repository: https://crates.io/crates/axum-core
+
+Package: axum-core 0.5.6
+License: See crates.io
+Repository: https://crates.io/crates/axum-core
+
+Package: backoff 0.4.0
+License: See crates.io
+Repository: https://crates.io/crates/backoff
+
+Package: backtrace 0.3.76
+License: See crates.io
+Repository: https://crates.io/crates/backtrace
+
+Package: backtrace-ext 0.2.1
+License: See crates.io
+Repository: https://crates.io/crates/backtrace-ext
+
+Package: base16ct 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/base16ct
+
+Package: base16ct 1.0.0
+License: See crates.io
+Repository: https://crates.io/crates/base16ct
+
+Package: base64 0.21.7
+License: See crates.io
+Repository: https://crates.io/crates/base64
+
+Package: base64 0.22.1
+License: See crates.io
+Repository: https://crates.io/crates/base64
+
+Package: base64ct 1.8.3
+License: See crates.io
+Repository: https://crates.io/crates/base64ct
+
+Package: bcrypt-pbkdf 0.10.0
+License: See crates.io
+Repository: https://crates.io/crates/bcrypt-pbkdf
+
+Package: bitflags 2.10.0
+License: See crates.io
+Repository: https://crates.io/crates/bitflags
+
+Package: blake2 0.10.6
+License: See crates.io
+Repository: https://crates.io/crates/blake2
+
+Package: block-buffer 0.10.4
+License: See crates.io
+Repository: https://crates.io/crates/block-buffer
+
+Package: block-buffer 0.11.0
+License: See crates.io
+Repository: https://crates.io/crates/block-buffer
+
+Package: block-padding 0.3.3
+License: See crates.io
+Repository: https://crates.io/crates/block-padding
+
+Package: blowfish 0.9.1
+License: See crates.io
+Repository: https://crates.io/crates/blowfish
+
+Package: bollard 0.20.1
+License: See crates.io
+Repository: https://crates.io/crates/bollard
+
+Package: bollard-stubs 1.52.1-rc.29.1.3
+License: See crates.io
+Repository: https://crates.io/crates/bollard-stubs
+
+Package: bstr 1.12.1
+License: See crates.io
+Repository: https://crates.io/crates/bstr
+
+Package: bumpalo 3.19.1
+License: See crates.io
+Repository: https://crates.io/crates/bumpalo
+
+Package: byteorder 1.5.0
+License: See crates.io
+Repository: https://crates.io/crates/byteorder
+
+Package: bytes 1.11.1
+License: See crates.io
+Repository: https://crates.io/crates/bytes
+
+Package: cassowary 0.3.0
+License: See crates.io
+Repository: https://crates.io/crates/cassowary
+
+Package: castaway 0.2.4
+License: See crates.io
+Repository: https://crates.io/crates/castaway
+
+Package: cbc 0.1.2
+License: See crates.io
+Repository: https://crates.io/crates/cbc
+
+Package: cc 1.2.55
+License: See crates.io
+Repository: https://crates.io/crates/cc
+
+Package: cfg-if 1.0.4
+License: See crates.io
+Repository: https://crates.io/crates/cfg-if
+
+Package: cfg_aliases 0.2.1
+License: See crates.io
+Repository: https://crates.io/crates/cfg_aliases
+
+Package: chacha20 0.9.1
+License: See crates.io
+Repository: https://crates.io/crates/chacha20
+
+Package: chrono 0.4.43
+License: See crates.io
+Repository: https://crates.io/crates/chrono
+
+Package: cipher 0.4.4
+License: See crates.io
+Repository: https://crates.io/crates/cipher
+
+Package: clap 4.5.57
+License: See crates.io
+Repository: https://crates.io/crates/clap
+
+Package: clap_builder 4.5.57
+License: See crates.io
+Repository: https://crates.io/crates/clap_builder
+
+Package: clap_complete 4.5.66
+License: See crates.io
+Repository: https://crates.io/crates/clap_complete
+
+Package: clap_derive 4.5.55
+License: See crates.io
+Repository: https://crates.io/crates/clap_derive
+
+Package: clap_lex 0.7.7
+License: See crates.io
+Repository: https://crates.io/crates/clap_lex
+
+Package: clap_lex 1.0.0
+License: See crates.io
+Repository: https://crates.io/crates/clap_lex
+
+Package: cmake 0.1.57
+License: See crates.io
+Repository: https://crates.io/crates/cmake
+
+Package: cmov 0.5.0-pre.0
+License: See crates.io
+Repository: https://crates.io/crates/cmov
+
+Package: colorchoice 1.0.4
+License: See crates.io
+Repository: https://crates.io/crates/colorchoice
+
+Package: compact_str 0.7.1
+License: See crates.io
+Repository: https://crates.io/crates/compact_str
+
+Package: concurrent-queue 2.5.0
+License: See crates.io
+Repository: https://crates.io/crates/concurrent-queue
+
+Package: console 0.15.11
+License: See crates.io
+Repository: https://crates.io/crates/console
+
+Package: const-oid 0.9.6
+License: See crates.io
+Repository: https://crates.io/crates/const-oid
+
+Package: const-oid 0.10.2
+License: See crates.io
+Repository: https://crates.io/crates/const-oid
+
+Package: core-foundation 0.10.1
+License: See crates.io
+Repository: https://crates.io/crates/core-foundation
+
+Package: core-foundation-sys 0.8.7
+License: See crates.io
+Repository: https://crates.io/crates/core-foundation-sys
+
+Package: core-models 0.0.4
+License: See crates.io
+Repository: https://crates.io/crates/core-models
+
+Package: cpufeatures 0.2.17
+License: See crates.io
+Repository: https://crates.io/crates/cpufeatures
+
+Package: crc 3.4.0
+License: See crates.io
+Repository: https://crates.io/crates/crc
+
+Package: crc-catalog 2.4.0
+License: See crates.io
+Repository: https://crates.io/crates/crc-catalog
+
+Package: crc32fast 1.5.0
+License: See crates.io
+Repository: https://crates.io/crates/crc32fast
+
+Package: crossbeam-channel 0.5.15
+License: See crates.io
+Repository: https://crates.io/crates/crossbeam-channel
+
+Package: crossbeam-queue 0.3.12
+License: See crates.io
+Repository: https://crates.io/crates/crossbeam-queue
+
+Package: crossbeam-utils 0.8.21
+License: See crates.io
+Repository: https://crates.io/crates/crossbeam-utils
+
+Package: crossterm 0.27.0
+License: See crates.io
+Repository: https://crates.io/crates/crossterm
+
+Package: crossterm 0.28.1
+License: See crates.io
+Repository: https://crates.io/crates/crossterm
+
+Package: crossterm_winapi 0.9.1
+License: See crates.io
+Repository: https://crates.io/crates/crossterm_winapi
+
+Package: crypto-bigint 0.5.5
+License: See crates.io
+Repository: https://crates.io/crates/crypto-bigint
+
+Package: crypto-bigint 0.7.0-rc.18
+License: See crates.io
+Repository: https://crates.io/crates/crypto-bigint
+
+Package: crypto-common 0.1.7
+License: See crates.io
+Repository: https://crates.io/crates/crypto-common
+
+Package: crypto-common 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/crypto-common
+
+Package: crypto-primes 0.7.0-pre.6
+License: See crates.io
+Repository: https://crates.io/crates/crypto-primes
+
+Package: ctr 0.9.2
+License: See crates.io
+Repository: https://crates.io/crates/ctr
+
+Package: ctutils 0.3.2
+License: See crates.io
+Repository: https://crates.io/crates/ctutils
+
+Package: curve25519-dalek 4.1.3
+License: See crates.io
+Repository: https://crates.io/crates/curve25519-dalek
+
+Package: curve25519-dalek-derive 0.1.1
+License: See crates.io
+Repository: https://crates.io/crates/curve25519-dalek-derive
+
+Package: darling 0.20.11
+License: See crates.io
+Repository: https://crates.io/crates/darling
+
+Package: darling_core 0.20.11
+License: See crates.io
+Repository: https://crates.io/crates/darling_core
+
+Package: darling_macro 0.20.11
+License: See crates.io
+Repository: https://crates.io/crates/darling_macro
+
+Package: data-encoding 2.10.0
+License: See crates.io
+Repository: https://crates.io/crates/data-encoding
+
+Package: deadpool 0.12.3
+License: See crates.io
+Repository: https://crates.io/crates/deadpool
+
+Package: deadpool-runtime 0.1.4
+License: See crates.io
+Repository: https://crates.io/crates/deadpool-runtime
+
+Package: delegate 0.13.5
+License: See crates.io
+Repository: https://crates.io/crates/delegate
+
+Package: der 0.7.10
+License: See crates.io
+Repository: https://crates.io/crates/der
+
+Package: der 0.8.0-rc.10
+License: See crates.io
+Repository: https://crates.io/crates/der
+
+Package: deranged 0.5.5
+License: See crates.io
+Repository: https://crates.io/crates/deranged
+
+Package: derivative 2.2.0
+License: See crates.io
+Repository: https://crates.io/crates/derivative
+
+Package: dialoguer 0.11.0
+License: See crates.io
+Repository: https://crates.io/crates/dialoguer
+
+Package: digest 0.10.7
+License: See crates.io
+Repository: https://crates.io/crates/digest
+
+Package: digest 0.11.0-rc.11
+License: See crates.io
+Repository: https://crates.io/crates/digest
+
+Package: displaydoc 0.2.5
+License: See crates.io
+Repository: https://crates.io/crates/displaydoc
+
+Package: dotenvy 0.15.7
+License: See crates.io
+Repository: https://crates.io/crates/dotenvy
+
+Package: dunce 1.0.5
+License: See crates.io
+Repository: https://crates.io/crates/dunce
+
+Package: dyn-clone 1.0.20
+License: See crates.io
+Repository: https://crates.io/crates/dyn-clone
+
+Package: ecdsa 0.16.9
+License: See crates.io
+Repository: https://crates.io/crates/ecdsa
+
+Package: ed25519 2.2.3
+License: See crates.io
+Repository: https://crates.io/crates/ed25519
+
+Package: ed25519-dalek 2.2.0
+License: See crates.io
+Repository: https://crates.io/crates/ed25519-dalek
+
+Package: either 1.15.0
+License: See crates.io
+Repository: https://crates.io/crates/either
+
+Package: elliptic-curve 0.13.8
+License: See crates.io
+Repository: https://crates.io/crates/elliptic-curve
+
+Package: encode_unicode 1.0.0
+License: See crates.io
+Repository: https://crates.io/crates/encode_unicode
+
+Package: enum_dispatch 0.3.13
+License: See crates.io
+Repository: https://crates.io/crates/enum_dispatch
+
+Package: enumflags2 0.7.12
+License: See crates.io
+Repository: https://crates.io/crates/enumflags2
+
+Package: enumflags2_derive 0.7.12
+License: See crates.io
+Repository: https://crates.io/crates/enumflags2_derive
+
+Package: equivalent 1.0.2
+License: See crates.io
+Repository: https://crates.io/crates/equivalent
+
+Package: errno 0.3.14
+License: See crates.io
+Repository: https://crates.io/crates/errno
+
+Package: etcetera 0.8.0
+License: See crates.io
+Repository: https://crates.io/crates/etcetera
+
+Package: event-listener 5.4.1
+License: See crates.io
+Repository: https://crates.io/crates/event-listener
+
+Package: fastrand 2.3.0
+License: See crates.io
+Repository: https://crates.io/crates/fastrand
+
+Package: ff 0.13.1
+License: See crates.io
+Repository: https://crates.io/crates/ff
+
+Package: fiat-crypto 0.2.9
+License: See crates.io
+Repository: https://crates.io/crates/fiat-crypto
+
+Package: filetime 0.2.27
+License: See crates.io
+Repository: https://crates.io/crates/filetime
+
+Package: find-msvc-tools 0.1.9
+License: See crates.io
+Repository: https://crates.io/crates/find-msvc-tools
+
+Package: fixedbitset 0.5.7
+License: See crates.io
+Repository: https://crates.io/crates/fixedbitset
+
+Package: flate2 1.1.9
+License: See crates.io
+Repository: https://crates.io/crates/flate2
+
+Package: flume 0.11.1
+License: See crates.io
+Repository: https://crates.io/crates/flume
+
+Package: fnv 1.0.7
+License: See crates.io
+Repository: https://crates.io/crates/fnv
+
+Package: foldhash 0.1.5
+License: See crates.io
+Repository: https://crates.io/crates/foldhash
+
+Package: form_urlencoded 1.2.2
+License: See crates.io
+Repository: https://crates.io/crates/form_urlencoded
+
+Package: fs_extra 1.3.0
+License: See crates.io
+Repository: https://crates.io/crates/fs_extra
+
+Package: futures 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures
+
+Package: futures-channel 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-channel
+
+Package: futures-core 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-core
+
+Package: futures-executor 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-executor
+
+Package: futures-intrusive 0.5.0
+License: See crates.io
+Repository: https://crates.io/crates/futures-intrusive
+
+Package: futures-io 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-io
+
+Package: futures-macro 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-macro
+
+Package: futures-sink 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-sink
+
+Package: futures-task 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-task
+
+Package: futures-util 0.3.31
+License: See crates.io
+Repository: https://crates.io/crates/futures-util
+
+Package: generic-array 0.14.7
+License: See crates.io
+Repository: https://crates.io/crates/generic-array
+
+Package: generic-array 1.3.5
+License: See crates.io
+Repository: https://crates.io/crates/generic-array
+
+Package: getrandom 0.2.17
+License: See crates.io
+Repository: https://crates.io/crates/getrandom
+
+Package: getrandom 0.3.4
+License: See crates.io
+Repository: https://crates.io/crates/getrandom
+
+Package: ghash 0.5.1
+License: See crates.io
+Repository: https://crates.io/crates/ghash
+
+Package: gimli 0.32.3
+License: See crates.io
+Repository: https://crates.io/crates/gimli
+
+Package: globset 0.4.18
+License: See crates.io
+Repository: https://crates.io/crates/globset
+
+Package: group 0.13.0
+License: See crates.io
+Repository: https://crates.io/crates/group
+
+Package: h2 0.4.13
+License: See crates.io
+Repository: https://crates.io/crates/h2
+
+Package: hashbrown 0.12.3
+License: See crates.io
+Repository: https://crates.io/crates/hashbrown
+
+Package: hashbrown 0.14.5
+License: See crates.io
+Repository: https://crates.io/crates/hashbrown
+
+Package: hashbrown 0.15.5
+License: See crates.io
+Repository: https://crates.io/crates/hashbrown
+
+Package: hashbrown 0.16.1
+License: See crates.io
+Repository: https://crates.io/crates/hashbrown
+
+Package: hashlink 0.10.0
+License: See crates.io
+Repository: https://crates.io/crates/hashlink
+
+Package: hax-lib 0.3.5
+License: See crates.io
+Repository: https://crates.io/crates/hax-lib
+
+Package: hax-lib-macros 0.3.5
+License: See crates.io
+Repository: https://crates.io/crates/hax-lib-macros
+
+Package: hax-lib-macros-types 0.3.5
+License: See crates.io
+Repository: https://crates.io/crates/hax-lib-macros-types
+
+Package: heck 0.5.0
+License: See crates.io
+Repository: https://crates.io/crates/heck
+
+Package: hermit-abi 0.5.2
+License: See crates.io
+Repository: https://crates.io/crates/hermit-abi
+
+Package: hex 0.4.3
+License: See crates.io
+Repository: https://crates.io/crates/hex
+
+Package: hex-literal 0.4.1
+License: See crates.io
+Repository: https://crates.io/crates/hex-literal
+
+Package: hkdf 0.12.4
+License: See crates.io
+Repository: https://crates.io/crates/hkdf
+
+Package: hmac 0.12.1
+License: See crates.io
+Repository: https://crates.io/crates/hmac
+
+Package: home 0.5.12
+License: See crates.io
+Repository: https://crates.io/crates/home
+
+Package: http 1.4.0
+License: See crates.io
+Repository: https://crates.io/crates/http
+
+Package: http-body 1.0.1
+License: See crates.io
+Repository: https://crates.io/crates/http-body
+
+Package: http-body-util 0.1.3
+License: See crates.io
+Repository: https://crates.io/crates/http-body-util
+
+Package: httparse 1.10.1
+License: See crates.io
+Repository: https://crates.io/crates/httparse
+
+Package: httpdate 1.0.3
+License: See crates.io
+Repository: https://crates.io/crates/httpdate
+
+Package: hybrid-array 0.4.7
+License: See crates.io
+Repository: https://crates.io/crates/hybrid-array
+
+Package: hyper 1.8.1
+License: See crates.io
+Repository: https://crates.io/crates/hyper
+
+Package: hyper-named-pipe 0.1.0
+License: See crates.io
+Repository: https://crates.io/crates/hyper-named-pipe
+
+Package: hyper-rustls 0.27.7
+License: See crates.io
+Repository: https://crates.io/crates/hyper-rustls
+
+Package: hyper-timeout 0.5.2
+License: See crates.io
+Repository: https://crates.io/crates/hyper-timeout
+
+Package: hyper-util 0.1.20
+License: See crates.io
+Repository: https://crates.io/crates/hyper-util
+
+Package: hyperlocal 0.9.1
+License: See crates.io
+Repository: https://crates.io/crates/hyperlocal
+
+Package: iana-time-zone 0.1.65
+License: See crates.io
+Repository: https://crates.io/crates/iana-time-zone
+
+Package: iana-time-zone-haiku 0.1.2
+License: See crates.io
+Repository: https://crates.io/crates/iana-time-zone-haiku
+
+Package: icu_collections 2.1.1
+License: See crates.io
+Repository: https://crates.io/crates/icu_collections
+
+Package: icu_locale_core 2.1.1
+License: See crates.io
+Repository: https://crates.io/crates/icu_locale_core
+
+Package: icu_normalizer 2.1.1
+License: See crates.io
+Repository: https://crates.io/crates/icu_normalizer
+
+Package: icu_normalizer_data 2.1.1
+License: See crates.io
+Repository: https://crates.io/crates/icu_normalizer_data
+
+Package: icu_properties 2.1.2
+License: See crates.io
+Repository: https://crates.io/crates/icu_properties
+
+Package: icu_properties_data 2.1.2
+License: See crates.io
+Repository: https://crates.io/crates/icu_properties_data
+
+Package: icu_provider 2.1.1
+License: See crates.io
+Repository: https://crates.io/crates/icu_provider
+
+Package: ident_case 1.0.1
+License: See crates.io
+Repository: https://crates.io/crates/ident_case
+
+Package: idna 1.1.0
+License: See crates.io
+Repository: https://crates.io/crates/idna
+
+Package: idna_adapter 1.2.1
+License: See crates.io
+Repository: https://crates.io/crates/idna_adapter
+
+Package: indexmap 1.9.3
+License: See crates.io
+Repository: https://crates.io/crates/indexmap
+
+Package: indexmap 2.13.0
+License: See crates.io
+Repository: https://crates.io/crates/indexmap
+
+Package: indicatif 0.17.11
+License: See crates.io
+Repository: https://crates.io/crates/indicatif
+
+Package: inout 0.1.4
+License: See crates.io
+Repository: https://crates.io/crates/inout
+
+Package: instant 0.1.13
+License: See crates.io
+Repository: https://crates.io/crates/instant
+
+Package: internal-russh-forked-ssh-key 0.6.16+upstream-0.6.7
+License: See crates.io
+Repository: https://crates.io/crates/internal-russh-forked-ssh-key
+
+Package: ipnet 2.11.0
+License: See crates.io
+Repository: https://crates.io/crates/ipnet
+
+Package: iri-string 0.7.10
+License: See crates.io
+Repository: https://crates.io/crates/iri-string
+
+Package: is_ci 1.2.0
+License: See crates.io
+Repository: https://crates.io/crates/is_ci
+
+Package: is_executable 1.0.5
+License: See crates.io
+Repository: https://crates.io/crates/is_executable
+
+Package: is_terminal_polyfill 1.70.2
+License: See crates.io
+Repository: https://crates.io/crates/is_terminal_polyfill
+
+Package: itertools 0.12.1
+License: See crates.io
+Repository: https://crates.io/crates/itertools
+
+Package: itertools 0.13.0
+License: See crates.io
+Repository: https://crates.io/crates/itertools
+
+Package: itertools 0.14.0
+License: See crates.io
+Repository: https://crates.io/crates/itertools
+
+Package: itoa 1.0.17
+License: See crates.io
+Repository: https://crates.io/crates/itoa
+
+Package: jobserver 0.1.34
+License: See crates.io
+Repository: https://crates.io/crates/jobserver
+
+Package: js-sys 0.3.85
+License: See crates.io
+Repository: https://crates.io/crates/js-sys
+
+Package: json-patch 1.4.0
+License: See crates.io
+Repository: https://crates.io/crates/json-patch
+
+Package: jsonpath-rust 0.5.1
+License: See crates.io
+Repository: https://crates.io/crates/jsonpath-rust
+
+Package: k8s-openapi 0.21.1
+License: See crates.io
+Repository: https://crates.io/crates/k8s-openapi
+
+Package: kube 0.90.0
+License: See crates.io
+Repository: https://crates.io/crates/kube
+
+Package: kube-client 0.90.0
+License: See crates.io
+Repository: https://crates.io/crates/kube-client
+
+Package: kube-core 0.90.0
+License: See crates.io
+Repository: https://crates.io/crates/kube-core
+
+Package: kube-derive 0.90.0
+License: See crates.io
+Repository: https://crates.io/crates/kube-derive
+
+Package: kube-runtime 0.90.0
+License: See crates.io
+Repository: https://crates.io/crates/kube-runtime
+
+Package: landlock 0.4.4
+License: See crates.io
+Repository: https://crates.io/crates/landlock
+
+Package: lazy_static 1.5.0
+License: See crates.io
+Repository: https://crates.io/crates/lazy_static
+
+Package: libc 0.2.180
+License: See crates.io
+Repository: https://crates.io/crates/libc
+
+Package: libcrux-intrinsics 0.0.4
+License: See crates.io
+Repository: https://crates.io/crates/libcrux-intrinsics
+
+Package: libcrux-ml-kem 0.0.4
+License: See crates.io
+Repository: https://crates.io/crates/libcrux-ml-kem
+
+Package: libcrux-platform 0.0.2
+License: See crates.io
+Repository: https://crates.io/crates/libcrux-platform
+
+Package: libcrux-secrets 0.0.4
+License: See crates.io
+Repository: https://crates.io/crates/libcrux-secrets
+
+Package: libcrux-sha3 0.0.4
+License: See crates.io
+Repository: https://crates.io/crates/libcrux-sha3
+
+Package: libcrux-traits 0.0.4
+License: See crates.io
+Repository: https://crates.io/crates/libcrux-traits
+
+Package: libm 0.2.16
+License: See crates.io
+Repository: https://crates.io/crates/libm
+
+Package: libredox 0.1.12
+License: See crates.io
+Repository: https://crates.io/crates/libredox
+
+Package: libsqlite3-sys 0.30.1
+License: See crates.io
+Repository: https://crates.io/crates/libsqlite3-sys
+
+Package: linux-raw-sys 0.4.15
+License: See crates.io
+Repository: https://crates.io/crates/linux-raw-sys
+
+Package: linux-raw-sys 0.11.0
+License: See crates.io
+Repository: https://crates.io/crates/linux-raw-sys
+
+Package: litemap 0.8.1
+License: See crates.io
+Repository: https://crates.io/crates/litemap
+
+Package: lock_api 0.4.14
+License: See crates.io
+Repository: https://crates.io/crates/lock_api
+
+Package: log 0.4.29
+License: See crates.io
+Repository: https://crates.io/crates/log
+
+Package: lru 0.12.5
+License: See crates.io
+Repository: https://crates.io/crates/lru
+
+Package: lru-slab 0.1.2
+License: See crates.io
+Repository: https://crates.io/crates/lru-slab
+
+Package: matchers 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/matchers
+
+Package: matchit 0.7.3
+License: See crates.io
+Repository: https://crates.io/crates/matchit
+
+Package: matchit 0.8.4
+License: See crates.io
+Repository: https://crates.io/crates/matchit
+
+Package: md-5 0.10.6
+License: See crates.io
+Repository: https://crates.io/crates/md-5
+
+Package: md5 0.7.0
+License: See crates.io
+Repository: https://crates.io/crates/md5
+
+Package: memchr 2.7.6
+License: See crates.io
+Repository: https://crates.io/crates/memchr
+
+Package: miette 7.6.0
+License: See crates.io
+Repository: https://crates.io/crates/miette
+
+Package: miette-derive 7.6.0
+License: See crates.io
+Repository: https://crates.io/crates/miette-derive
+
+Package: mime 0.3.17
+License: See crates.io
+Repository: https://crates.io/crates/mime
+
+Package: miniz_oxide 0.8.9
+License: See crates.io
+Repository: https://crates.io/crates/miniz_oxide
+
+Package: mio 0.8.11
+License: See crates.io
+Repository: https://crates.io/crates/mio
+
+Package: mio 1.1.1
+License: See crates.io
+Repository: https://crates.io/crates/mio
+
+Package: msvc_spectre_libs 0.1.3
+License: See crates.io
+Repository: https://crates.io/crates/msvc_spectre_libs
+
+Package: multimap 0.10.1
+License: See crates.io
+Repository: https://crates.io/crates/multimap
+
+Package: nix 0.29.0
+License: See crates.io
+Repository: https://crates.io/crates/nix
+
+Package: nu-ansi-term 0.50.3
+License: See crates.io
+Repository: https://crates.io/crates/nu-ansi-term
+
+Package: num-bigint 0.4.6
+License: See crates.io
+Repository: https://crates.io/crates/num-bigint
+
+Package: num-bigint-dig 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/num-bigint-dig
+
+Package: num-conv 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/num-conv
+
+Package: num-integer 0.1.46
+License: See crates.io
+Repository: https://crates.io/crates/num-integer
+
+Package: num-iter 0.1.45
+License: See crates.io
+Repository: https://crates.io/crates/num-iter
+
+Package: num-traits 0.2.19
+License: See crates.io
+Repository: https://crates.io/crates/num-traits
+
+Package: num_cpus 1.17.0
+License: See crates.io
+Repository: https://crates.io/crates/num_cpus
+
+Package: number_prefix 0.4.0
+License: See crates.io
+Repository: https://crates.io/crates/number_prefix
+
+Package: object 0.37.3
+License: See crates.io
+Repository: https://crates.io/crates/object
+
+Package: once_cell 1.21.3
+License: See crates.io
+Repository: https://crates.io/crates/once_cell
+
+Package: once_cell_polyfill 1.70.2
+License: See crates.io
+Repository: https://crates.io/crates/once_cell_polyfill
+
+Package: opaque-debug 0.3.1
+License: See crates.io
+Repository: https://crates.io/crates/opaque-debug
+
+Package: openssh 0.11.6
+License: See crates.io
+Repository: https://crates.io/crates/openssh
+
+Package: openssl-probe 0.2.1
+License: See crates.io
+Repository: https://crates.io/crates/openssl-probe
+
+Package: ordered-float 2.10.1
+License: See crates.io
+Repository: https://crates.io/crates/ordered-float
+
+Package: owo-colors 4.2.3
+License: See crates.io
+Repository: https://crates.io/crates/owo-colors
+
+Package: p256 0.13.2
+License: See crates.io
+Repository: https://crates.io/crates/p256
+
+Package: p384 0.13.1
+License: See crates.io
+Repository: https://crates.io/crates/p384
+
+Package: p521 0.13.3
+License: See crates.io
+Repository: https://crates.io/crates/p521
+
+Package: pageant 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/pageant
+
+Package: parking 2.2.1
+License: See crates.io
+Repository: https://crates.io/crates/parking
+
+Package: parking_lot 0.12.5
+License: See crates.io
+Repository: https://crates.io/crates/parking_lot
+
+Package: parking_lot_core 0.9.12
+License: See crates.io
+Repository: https://crates.io/crates/parking_lot_core
+
+Package: password-hash 0.5.0
+License: See crates.io
+Repository: https://crates.io/crates/password-hash
+
+Package: paste 1.0.15
+License: See crates.io
+Repository: https://crates.io/crates/paste
+
+Package: pastey 0.1.1
+License: See crates.io
+Repository: https://crates.io/crates/pastey
+
+Package: pbkdf2 0.12.2
+License: See crates.io
+Repository: https://crates.io/crates/pbkdf2
+
+Package: pem 3.0.6
+License: See crates.io
+Repository: https://crates.io/crates/pem
+
+Package: pem-rfc7468 0.7.0
+License: See crates.io
+Repository: https://crates.io/crates/pem-rfc7468
+
+Package: pem-rfc7468 1.0.0
+License: See crates.io
+Repository: https://crates.io/crates/pem-rfc7468
+
+Package: percent-encoding 2.3.2
+License: See crates.io
+Repository: https://crates.io/crates/percent-encoding
+
+Package: pest 2.8.6
+License: See crates.io
+Repository: https://crates.io/crates/pest
+
+Package: pest_derive 2.8.6
+License: See crates.io
+Repository: https://crates.io/crates/pest_derive
+
+Package: pest_generator 2.8.6
+License: See crates.io
+Repository: https://crates.io/crates/pest_generator
+
+Package: pest_meta 2.8.6
+License: See crates.io
+Repository: https://crates.io/crates/pest_meta
+
+Package: petgraph 0.7.1
+License: See crates.io
+Repository: https://crates.io/crates/petgraph
+
+Package: pin-project 1.1.10
+License: See crates.io
+Repository: https://crates.io/crates/pin-project
+
+Package: pin-project-internal 1.1.10
+License: See crates.io
+Repository: https://crates.io/crates/pin-project-internal
+
+Package: pin-project-lite 0.2.16
+License: See crates.io
+Repository: https://crates.io/crates/pin-project-lite
+
+Package: pin-utils 0.1.0
+License: See crates.io
+Repository: https://crates.io/crates/pin-utils
+
+Package: pkcs1 0.7.5
+License: See crates.io
+Repository: https://crates.io/crates/pkcs1
+
+Package: pkcs1 0.8.0-rc.4
+License: See crates.io
+Repository: https://crates.io/crates/pkcs1
+
+Package: pkcs5 0.7.1
+License: See crates.io
+Repository: https://crates.io/crates/pkcs5
+
+Package: pkcs8 0.10.2
+License: See crates.io
+Repository: https://crates.io/crates/pkcs8
+
+Package: pkcs8 0.11.0-rc.10
+License: See crates.io
+Repository: https://crates.io/crates/pkcs8
+
+Package: pkg-config 0.3.32
+License: See crates.io
+Repository: https://crates.io/crates/pkg-config
+
+Package: poly1305 0.8.0
+License: See crates.io
+Repository: https://crates.io/crates/poly1305
+
+Package: polyval 0.6.2
+License: See crates.io
+Repository: https://crates.io/crates/polyval
+
+Package: portable-atomic 1.13.1
+License: See crates.io
+Repository: https://crates.io/crates/portable-atomic
+
+Package: potential_utf 0.1.4
+License: See crates.io
+Repository: https://crates.io/crates/potential_utf
+
+Package: powerfmt 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/powerfmt
+
+Package: ppv-lite86 0.2.21
+License: See crates.io
+Repository: https://crates.io/crates/ppv-lite86
+
+Package: prettyplease 0.2.37
+License: See crates.io
+Repository: https://crates.io/crates/prettyplease
+
+Package: primeorder 0.13.6
+License: See crates.io
+Repository: https://crates.io/crates/primeorder
+
+Package: proc-macro-error-attr2 2.0.0
+License: See crates.io
+Repository: https://crates.io/crates/proc-macro-error-attr2
+
+Package: proc-macro-error2 2.0.1
+License: See crates.io
+Repository: https://crates.io/crates/proc-macro-error2
+
+Package: proc-macro2 1.0.106
+License: See crates.io
+Repository: https://crates.io/crates/proc-macro2
+
+Package: prost 0.13.5
+License: See crates.io
+Repository: https://crates.io/crates/prost
+
+Package: prost-build 0.13.5
+License: See crates.io
+Repository: https://crates.io/crates/prost-build
+
+Package: prost-derive 0.13.5
+License: See crates.io
+Repository: https://crates.io/crates/prost-derive
+
+Package: prost-types 0.13.5
+License: See crates.io
+Repository: https://crates.io/crates/prost-types
+
+Package: protobuf-src 1.1.0+21.5
+License: See crates.io
+Repository: https://crates.io/crates/protobuf-src
+
+Package: quinn 0.11.9
+License: See crates.io
+Repository: https://crates.io/crates/quinn
+
+Package: quinn-proto 0.11.13
+License: See crates.io
+Repository: https://crates.io/crates/quinn-proto
+
+Package: quinn-udp 0.5.14
+License: See crates.io
+Repository: https://crates.io/crates/quinn-udp
+
+Package: quote 1.0.44
+License: See crates.io
+Repository: https://crates.io/crates/quote
+
+Package: r-efi 5.3.0
+License: See crates.io
+Repository: https://crates.io/crates/r-efi
+
+Package: rand 0.8.5
+License: See crates.io
+Repository: https://crates.io/crates/rand
+
+Package: rand 0.9.2
+License: See crates.io
+Repository: https://crates.io/crates/rand
+
+Package: rand_chacha 0.3.1
+License: See crates.io
+Repository: https://crates.io/crates/rand_chacha
+
+Package: rand_chacha 0.9.0
+License: See crates.io
+Repository: https://crates.io/crates/rand_chacha
+
+Package: rand_core 0.6.4
+License: See crates.io
+Repository: https://crates.io/crates/rand_core
+
+Package: rand_core 0.9.5
+License: See crates.io
+Repository: https://crates.io/crates/rand_core
+
+Package: rand_core 0.10.0-rc-3
+License: See crates.io
+Repository: https://crates.io/crates/rand_core
+
+Package: ratatui 0.26.3
+License: See crates.io
+Repository: https://crates.io/crates/ratatui
+
+Package: rcgen 0.13.2
+License: See crates.io
+Repository: https://crates.io/crates/rcgen
+
+Package: redox_syscall 0.5.18
+License: See crates.io
+Repository: https://crates.io/crates/redox_syscall
+
+Package: redox_syscall 0.7.0
+License: See crates.io
+Repository: https://crates.io/crates/redox_syscall
+
+Package: regex 1.12.3
+License: See crates.io
+Repository: https://crates.io/crates/regex
+
+Package: regex-automata 0.4.14
+License: See crates.io
+Repository: https://crates.io/crates/regex-automata
+
+Package: regex-syntax 0.8.9
+License: See crates.io
+Repository: https://crates.io/crates/regex-syntax
+
+Package: regorus 0.9.0
+License: See crates.io
+Repository: https://crates.io/crates/regorus
+
+Package: reqwest 0.12.28
+License: See crates.io
+Repository: https://crates.io/crates/reqwest
+
+Package: rfc6979 0.4.0
+License: See crates.io
+Repository: https://crates.io/crates/rfc6979
+
+Package: ring 0.17.14
+License: See crates.io
+Repository: https://crates.io/crates/ring
+
+Package: rsa 0.9.10
+License: See crates.io
+Repository: https://crates.io/crates/rsa
+
+Package: rsa 0.10.0-rc.12
+License: See crates.io
+Repository: https://crates.io/crates/rsa
+
+Package: russh 0.57.0
+License: See crates.io
+Repository: https://crates.io/crates/russh
+
+Package: russh-cryptovec 0.52.0
+License: See crates.io
+Repository: https://crates.io/crates/russh-cryptovec
+
+Package: russh-util 0.52.0
+License: See crates.io
+Repository: https://crates.io/crates/russh-util
+
+Package: rustc-demangle 0.1.27
+License: See crates.io
+Repository: https://crates.io/crates/rustc-demangle
+
+Package: rustc-hash 2.1.1
+License: See crates.io
+Repository: https://crates.io/crates/rustc-hash
+
+Package: rustc_version 0.4.1
+License: See crates.io
+Repository: https://crates.io/crates/rustc_version
+
+Package: rustix 0.38.44
+License: See crates.io
+Repository: https://crates.io/crates/rustix
+
+Package: rustix 1.1.3
+License: See crates.io
+Repository: https://crates.io/crates/rustix
+
+Package: rustls 0.23.36
+License: See crates.io
+Repository: https://crates.io/crates/rustls
+
+Package: rustls-native-certs 0.8.3
+License: See crates.io
+Repository: https://crates.io/crates/rustls-native-certs
+
+Package: rustls-pemfile 2.2.0
+License: See crates.io
+Repository: https://crates.io/crates/rustls-pemfile
+
+Package: rustls-pki-types 1.14.0
+License: See crates.io
+Repository: https://crates.io/crates/rustls-pki-types
+
+Package: rustls-webpki 0.103.9
+License: See crates.io
+Repository: https://crates.io/crates/rustls-webpki
+
+Package: rustversion 1.0.22
+License: See crates.io
+Repository: https://crates.io/crates/rustversion
+
+Package: ryu 1.0.22
+License: See crates.io
+Repository: https://crates.io/crates/ryu
+
+Package: salsa20 0.10.2
+License: See crates.io
+Repository: https://crates.io/crates/salsa20
+
+Package: schannel 0.1.28
+License: See crates.io
+Repository: https://crates.io/crates/schannel
+
+Package: schemars 0.8.22
+License: See crates.io
+Repository: https://crates.io/crates/schemars
+
+Package: schemars_derive 0.8.22
+License: See crates.io
+Repository: https://crates.io/crates/schemars_derive
+
+Package: scopeguard 1.2.0
+License: See crates.io
+Repository: https://crates.io/crates/scopeguard
+
+Package: scrypt 0.11.0
+License: See crates.io
+Repository: https://crates.io/crates/scrypt
+
+Package: sec1 0.7.3
+License: See crates.io
+Repository: https://crates.io/crates/sec1
+
+Package: seccompiler 0.5.0
+License: See crates.io
+Repository: https://crates.io/crates/seccompiler
+
+Package: secrecy 0.8.0
+License: See crates.io
+Repository: https://crates.io/crates/secrecy
+
+Package: security-framework 3.5.1
+License: See crates.io
+Repository: https://crates.io/crates/security-framework
+
+Package: security-framework-sys 2.15.0
+License: See crates.io
+Repository: https://crates.io/crates/security-framework-sys
+
+Package: semver 1.0.27
+License: See crates.io
+Repository: https://crates.io/crates/semver
+
+Package: serde 1.0.228
+License: See crates.io
+Repository: https://crates.io/crates/serde
+
+Package: serde-value 0.7.0
+License: See crates.io
+Repository: https://crates.io/crates/serde-value
+
+Package: serde_core 1.0.228
+License: See crates.io
+Repository: https://crates.io/crates/serde_core
+
+Package: serde_derive 1.0.228
+License: See crates.io
+Repository: https://crates.io/crates/serde_derive
+
+Package: serde_derive_internals 0.29.1
+License: See crates.io
+Repository: https://crates.io/crates/serde_derive_internals
+
+Package: serde_json 1.0.149
+License: See crates.io
+Repository: https://crates.io/crates/serde_json
+
+Package: serde_path_to_error 0.1.20
+License: See crates.io
+Repository: https://crates.io/crates/serde_path_to_error
+
+Package: serde_repr 0.1.20
+License: See crates.io
+Repository: https://crates.io/crates/serde_repr
+
+Package: serde_urlencoded 0.7.1
+License: See crates.io
+Repository: https://crates.io/crates/serde_urlencoded
+
+Package: serde_yaml 0.9.34+deprecated
+License: See crates.io
+Repository: https://crates.io/crates/serde_yaml
+
+Package: serdect 0.4.2
+License: See crates.io
+Repository: https://crates.io/crates/serdect
+
+Package: sha1 0.10.6
+License: See crates.io
+Repository: https://crates.io/crates/sha1
+
+Package: sha1 0.11.0-rc.5
+License: See crates.io
+Repository: https://crates.io/crates/sha1
+
+Package: sha2 0.10.9
+License: See crates.io
+Repository: https://crates.io/crates/sha2
+
+Package: sha2 0.11.0-rc.5
+License: See crates.io
+Repository: https://crates.io/crates/sha2
+
+Package: sharded-slab 0.1.7
+License: See crates.io
+Repository: https://crates.io/crates/sharded-slab
+
+Package: shell-escape 0.1.5
+License: See crates.io
+Repository: https://crates.io/crates/shell-escape
+
+Package: shell-words 1.1.1
+License: See crates.io
+Repository: https://crates.io/crates/shell-words
+
+Package: shlex 1.3.0
+License: See crates.io
+Repository: https://crates.io/crates/shlex
+
+Package: signal-hook 0.3.18
+License: See crates.io
+Repository: https://crates.io/crates/signal-hook
+
+Package: signal-hook-mio 0.2.5
+License: See crates.io
+Repository: https://crates.io/crates/signal-hook-mio
+
+Package: signal-hook-registry 1.4.8
+License: See crates.io
+Repository: https://crates.io/crates/signal-hook-registry
+
+Package: signature 2.2.0
+License: See crates.io
+Repository: https://crates.io/crates/signature
+
+Package: signature 3.0.0-rc.6
+License: See crates.io
+Repository: https://crates.io/crates/signature
+
+Package: simd-adler32 0.3.8
+License: See crates.io
+Repository: https://crates.io/crates/simd-adler32
+
+Package: slab 0.4.12
+License: See crates.io
+Repository: https://crates.io/crates/slab
+
+Package: smallvec 1.15.1
+License: See crates.io
+Repository: https://crates.io/crates/smallvec
+
+Package: socket2 0.5.10
+License: See crates.io
+Repository: https://crates.io/crates/socket2
+
+Package: socket2 0.6.2
+License: See crates.io
+Repository: https://crates.io/crates/socket2
+
+Package: spin 0.9.8
+License: See crates.io
+Repository: https://crates.io/crates/spin
+
+Package: spki 0.7.3
+License: See crates.io
+Repository: https://crates.io/crates/spki
+
+Package: spki 0.8.0-rc.4
+License: See crates.io
+Repository: https://crates.io/crates/spki
+
+Package: sqlx 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx
+
+Package: sqlx-core 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx-core
+
+Package: sqlx-macros 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx-macros
+
+Package: sqlx-macros-core 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx-macros-core
+
+Package: sqlx-mysql 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx-mysql
+
+Package: sqlx-postgres 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx-postgres
+
+Package: sqlx-sqlite 0.8.6
+License: See crates.io
+Repository: https://crates.io/crates/sqlx-sqlite
+
+Package: ssh-cipher 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/ssh-cipher
+
+Package: ssh-encoding 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/ssh-encoding
+
+Package: stability 0.2.1
+License: See crates.io
+Repository: https://crates.io/crates/stability
+
+Package: stable_deref_trait 1.2.1
+License: See crates.io
+Repository: https://crates.io/crates/stable_deref_trait
+
+Package: static_assertions 1.1.0
+License: See crates.io
+Repository: https://crates.io/crates/static_assertions
+
+Package: stringprep 0.1.5
+License: See crates.io
+Repository: https://crates.io/crates/stringprep
+
+Package: strsim 0.11.1
+License: See crates.io
+Repository: https://crates.io/crates/strsim
+
+Package: strum 0.26.3
+License: See crates.io
+Repository: https://crates.io/crates/strum
+
+Package: strum_macros 0.26.4
+License: See crates.io
+Repository: https://crates.io/crates/strum_macros
+
+Package: subtle 2.6.1
+License: See crates.io
+Repository: https://crates.io/crates/subtle
+
+Package: supports-color 3.0.2
+License: See crates.io
+Repository: https://crates.io/crates/supports-color
+
+Package: supports-hyperlinks 3.2.0
+License: See crates.io
+Repository: https://crates.io/crates/supports-hyperlinks
+
+Package: supports-unicode 3.0.0
+License: See crates.io
+Repository: https://crates.io/crates/supports-unicode
+
+Package: syn 1.0.109
+License: See crates.io
+Repository: https://crates.io/crates/syn
+
+Package: syn 2.0.114
+License: See crates.io
+Repository: https://crates.io/crates/syn
+
+Package: sync_wrapper 1.0.2
+License: See crates.io
+Repository: https://crates.io/crates/sync_wrapper
+
+Package: synstructure 0.13.2
+License: See crates.io
+Repository: https://crates.io/crates/synstructure
+
+Package: tar 0.4.44
+License: See crates.io
+Repository: https://crates.io/crates/tar
+
+Package: tempfile 3.24.0
+License: See crates.io
+Repository: https://crates.io/crates/tempfile
+
+Package: terminal_size 0.4.3
+License: See crates.io
+Repository: https://crates.io/crates/terminal_size
+
+Package: textwrap 0.16.2
+License: See crates.io
+Repository: https://crates.io/crates/textwrap
+
+Package: thiserror 1.0.69
+License: See crates.io
+Repository: https://crates.io/crates/thiserror
+
+Package: thiserror 2.0.18
+License: See crates.io
+Repository: https://crates.io/crates/thiserror
+
+Package: thiserror-impl 1.0.69
+License: See crates.io
+Repository: https://crates.io/crates/thiserror-impl
+
+Package: thiserror-impl 2.0.18
+License: See crates.io
+Repository: https://crates.io/crates/thiserror-impl
+
+Package: thread_local 1.1.9
+License: See crates.io
+Repository: https://crates.io/crates/thread_local
+
+Package: time 0.3.47
+License: See crates.io
+Repository: https://crates.io/crates/time
+
+Package: time-core 0.1.8
+License: See crates.io
+Repository: https://crates.io/crates/time-core
+
+Package: time-macros 0.2.27
+License: See crates.io
+Repository: https://crates.io/crates/time-macros
+
+Package: tinystr 0.8.2
+License: See crates.io
+Repository: https://crates.io/crates/tinystr
+
+Package: tinyvec 1.10.0
+License: See crates.io
+Repository: https://crates.io/crates/tinyvec
+
+Package: tinyvec_macros 0.1.1
+License: See crates.io
+Repository: https://crates.io/crates/tinyvec_macros
+
+Package: tls_codec 0.4.2
+License: See crates.io
+Repository: https://crates.io/crates/tls_codec
+
+Package: tls_codec_derive 0.4.2
+License: See crates.io
+Repository: https://crates.io/crates/tls_codec_derive
+
+Package: tokio 1.49.0
+License: See crates.io
+Repository: https://crates.io/crates/tokio
+
+Package: tokio-macros 2.6.0
+License: See crates.io
+Repository: https://crates.io/crates/tokio-macros
+
+Package: tokio-rustls 0.26.4
+License: See crates.io
+Repository: https://crates.io/crates/tokio-rustls
+
+Package: tokio-stream 0.1.18
+License: See crates.io
+Repository: https://crates.io/crates/tokio-stream
+
+Package: tokio-util 0.7.18
+License: See crates.io
+Repository: https://crates.io/crates/tokio-util
+
+Package: tonic 0.12.3
+License: See crates.io
+Repository: https://crates.io/crates/tonic
+
+Package: tonic-build 0.12.3
+License: See crates.io
+Repository: https://crates.io/crates/tonic-build
+
+Package: tower 0.4.13
+License: See crates.io
+Repository: https://crates.io/crates/tower
+
+Package: tower 0.5.3
+License: See crates.io
+Repository: https://crates.io/crates/tower
+
+Package: tower-http 0.5.2
+License: See crates.io
+Repository: https://crates.io/crates/tower-http
+
+Package: tower-http 0.6.8
+License: See crates.io
+Repository: https://crates.io/crates/tower-http
+
+Package: tower-layer 0.3.3
+License: See crates.io
+Repository: https://crates.io/crates/tower-layer
+
+Package: tower-service 0.3.3
+License: See crates.io
+Repository: https://crates.io/crates/tower-service
+
+Package: tracing 0.1.44
+License: See crates.io
+Repository: https://crates.io/crates/tracing
+
+Package: tracing-appender 0.2.4
+License: See crates.io
+Repository: https://crates.io/crates/tracing-appender
+
+Package: tracing-attributes 0.1.31
+License: See crates.io
+Repository: https://crates.io/crates/tracing-attributes
+
+Package: tracing-core 0.1.36
+License: See crates.io
+Repository: https://crates.io/crates/tracing-core
+
+Package: tracing-log 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/tracing-log
+
+Package: tracing-serde 0.2.0
+License: See crates.io
+Repository: https://crates.io/crates/tracing-serde
+
+Package: tracing-subscriber 0.3.22
+License: See crates.io
+Repository: https://crates.io/crates/tracing-subscriber
+
+Package: try-lock 0.2.5
+License: See crates.io
+Repository: https://crates.io/crates/try-lock
+
+Package: typenum 1.19.0
+License: See crates.io
+Repository: https://crates.io/crates/typenum
+
+Package: ucd-trie 0.1.7
+License: See crates.io
+Repository: https://crates.io/crates/ucd-trie
+
+Package: unicode-bidi 0.3.18
+License: See crates.io
+Repository: https://crates.io/crates/unicode-bidi
+
+Package: unicode-ident 1.0.22
+License: See crates.io
+Repository: https://crates.io/crates/unicode-ident
+
+Package: unicode-linebreak 0.1.5
+License: See crates.io
+Repository: https://crates.io/crates/unicode-linebreak
+
+Package: unicode-normalization 0.1.25
+License: See crates.io
+Repository: https://crates.io/crates/unicode-normalization
+
+Package: unicode-properties 0.1.4
+License: See crates.io
+Repository: https://crates.io/crates/unicode-properties
+
+Package: unicode-segmentation 1.12.0
+License: See crates.io
+Repository: https://crates.io/crates/unicode-segmentation
+
+Package: unicode-truncate 1.1.0
+License: See crates.io
+Repository: https://crates.io/crates/unicode-truncate
+
+Package: unicode-width 0.1.14
+License: See crates.io
+Repository: https://crates.io/crates/unicode-width
+
+Package: unicode-width 0.2.2
+License: See crates.io
+Repository: https://crates.io/crates/unicode-width
+
+Package: universal-hash 0.5.1
+License: See crates.io
+Repository: https://crates.io/crates/universal-hash
+
+Package: unsafe-libyaml 0.2.11
+License: See crates.io
+Repository: https://crates.io/crates/unsafe-libyaml
+
+Package: untrusted 0.7.1
+License: See crates.io
+Repository: https://crates.io/crates/untrusted
+
+Package: untrusted 0.9.0
+License: See crates.io
+Repository: https://crates.io/crates/untrusted
+
+Package: url 2.5.8
+License: See crates.io
+Repository: https://crates.io/crates/url
+
+Package: utf8_iter 1.0.4
+License: See crates.io
+Repository: https://crates.io/crates/utf8_iter
+
+Package: utf8parse 0.2.2
+License: See crates.io
+Repository: https://crates.io/crates/utf8parse
+
+Package: uuid 1.20.0
+License: See crates.io
+Repository: https://crates.io/crates/uuid
+
+Package: valuable 0.1.1
+License: See crates.io
+Repository: https://crates.io/crates/valuable
+
+Package: vcpkg 0.2.15
+License: See crates.io
+Repository: https://crates.io/crates/vcpkg
+
+Package: version_check 0.9.5
+License: See crates.io
+Repository: https://crates.io/crates/version_check
+
+Package: want 0.3.1
+License: See crates.io
+Repository: https://crates.io/crates/want
+
+Package: wasi 0.11.1+wasi-snapshot-preview1
+License: See crates.io
+Repository: https://crates.io/crates/wasi
+
+Package: wasip2 1.0.2+wasi-0.2.9
+License: See crates.io
+Repository: https://crates.io/crates/wasip2
+
+Package: wasite 0.1.0
+License: See crates.io
+Repository: https://crates.io/crates/wasite
+
+Package: wasm-bindgen 0.2.108
+License: See crates.io
+Repository: https://crates.io/crates/wasm-bindgen
+
+Package: wasm-bindgen-futures 0.4.58
+License: See crates.io
+Repository: https://crates.io/crates/wasm-bindgen-futures
+
+Package: wasm-bindgen-macro 0.2.108
+License: See crates.io
+Repository: https://crates.io/crates/wasm-bindgen-macro
+
+Package: wasm-bindgen-macro-support 0.2.108
+License: See crates.io
+Repository: https://crates.io/crates/wasm-bindgen-macro-support
+
+Package: wasm-bindgen-shared 0.2.108
+License: See crates.io
+Repository: https://crates.io/crates/wasm-bindgen-shared
+
+Package: web-sys 0.3.85
+License: See crates.io
+Repository: https://crates.io/crates/web-sys
+
+Package: web-time 1.1.0
+License: See crates.io
+Repository: https://crates.io/crates/web-time
+
+Package: webpki-roots 0.26.11
+License: See crates.io
+Repository: https://crates.io/crates/webpki-roots
+
+Package: webpki-roots 1.0.6
+License: See crates.io
+Repository: https://crates.io/crates/webpki-roots
+
+Package: whoami 1.6.1
+License: See crates.io
+Repository: https://crates.io/crates/whoami
+
+Package: winapi 0.3.9
+License: See crates.io
+Repository: https://crates.io/crates/winapi
+
+Package: winapi-i686-pc-windows-gnu 0.4.0
+License: See crates.io
+Repository: https://crates.io/crates/winapi-i686-pc-windows-gnu
+
+Package: winapi-x86_64-pc-windows-gnu 0.4.0
+License: See crates.io
+Repository: https://crates.io/crates/winapi-x86_64-pc-windows-gnu
+
+Package: windows 0.62.2
+License: See crates.io
+Repository: https://crates.io/crates/windows
+
+Package: windows-collections 0.3.2
+License: See crates.io
+Repository: https://crates.io/crates/windows-collections
+
+Package: windows-core 0.62.2
+License: See crates.io
+Repository: https://crates.io/crates/windows-core
+
+Package: windows-future 0.3.2
+License: See crates.io
+Repository: https://crates.io/crates/windows-future
+
+Package: windows-implement 0.60.2
+License: See crates.io
+Repository: https://crates.io/crates/windows-implement
+
+Package: windows-interface 0.59.3
+License: See crates.io
+Repository: https://crates.io/crates/windows-interface
+
+Package: windows-link 0.2.1
+License: See crates.io
+Repository: https://crates.io/crates/windows-link
+
+Package: windows-numerics 0.3.1
+License: See crates.io
+Repository: https://crates.io/crates/windows-numerics
+
+Package: windows-result 0.4.1
+License: See crates.io
+Repository: https://crates.io/crates/windows-result
+
+Package: windows-strings 0.5.1
+License: See crates.io
+Repository: https://crates.io/crates/windows-strings
+
+Package: windows-sys 0.48.0
+License: See crates.io
+Repository: https://crates.io/crates/windows-sys
+
+Package: windows-sys 0.52.0
+License: See crates.io
+Repository: https://crates.io/crates/windows-sys
+
+Package: windows-sys 0.59.0
+License: See crates.io
+Repository: https://crates.io/crates/windows-sys
+
+Package: windows-sys 0.60.2
+License: See crates.io
+Repository: https://crates.io/crates/windows-sys
+
+Package: windows-sys 0.61.2
+License: See crates.io
+Repository: https://crates.io/crates/windows-sys
+
+Package: windows-targets 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows-targets
+
+Package: windows-targets 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows-targets
+
+Package: windows-targets 0.53.5
+License: See crates.io
+Repository: https://crates.io/crates/windows-targets
+
+Package: windows-threading 0.2.1
+License: See crates.io
+Repository: https://crates.io/crates/windows-threading
+
+Package: windows_aarch64_gnullvm 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_aarch64_gnullvm
+
+Package: windows_aarch64_gnullvm 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_aarch64_gnullvm
+
+Package: windows_aarch64_gnullvm 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_aarch64_gnullvm
+
+Package: windows_aarch64_msvc 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_aarch64_msvc
+
+Package: windows_aarch64_msvc 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_aarch64_msvc
+
+Package: windows_aarch64_msvc 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_aarch64_msvc
+
+Package: windows_i686_gnu 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_gnu
+
+Package: windows_i686_gnu 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_gnu
+
+Package: windows_i686_gnu 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_gnu
+
+Package: windows_i686_gnullvm 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_gnullvm
+
+Package: windows_i686_gnullvm 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_gnullvm
+
+Package: windows_i686_msvc 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_msvc
+
+Package: windows_i686_msvc 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_msvc
+
+Package: windows_i686_msvc 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_i686_msvc
+
+Package: windows_x86_64_gnu 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_gnu
+
+Package: windows_x86_64_gnu 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_gnu
+
+Package: windows_x86_64_gnu 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_gnu
+
+Package: windows_x86_64_gnullvm 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_gnullvm
+
+Package: windows_x86_64_gnullvm 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_gnullvm
+
+Package: windows_x86_64_gnullvm 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_gnullvm
+
+Package: windows_x86_64_msvc 0.48.5
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_msvc
+
+Package: windows_x86_64_msvc 0.52.6
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_msvc
+
+Package: windows_x86_64_msvc 0.53.1
+License: See crates.io
+Repository: https://crates.io/crates/windows_x86_64_msvc
+
+Package: wiremock 0.6.5
+License: See crates.io
+Repository: https://crates.io/crates/wiremock
+
+Package: wit-bindgen 0.51.0
+License: See crates.io
+Repository: https://crates.io/crates/wit-bindgen
+
+Package: writeable 0.6.2
+License: See crates.io
+Repository: https://crates.io/crates/writeable
+
+Package: xattr 1.6.1
+License: See crates.io
+Repository: https://crates.io/crates/xattr
+
+Package: yasna 0.5.2
+License: See crates.io
+Repository: https://crates.io/crates/yasna
+
+Package: yoke 0.8.1
+License: See crates.io
+Repository: https://crates.io/crates/yoke
+
+Package: yoke-derive 0.8.1
+License: See crates.io
+Repository: https://crates.io/crates/yoke-derive
+
+Package: zerocopy 0.8.39
+License: See crates.io
+Repository: https://crates.io/crates/zerocopy
+
+Package: zerocopy-derive 0.8.39
+License: See crates.io
+Repository: https://crates.io/crates/zerocopy-derive
+
+Package: zerofrom 0.1.6
+License: See crates.io
+Repository: https://crates.io/crates/zerofrom
+
+Package: zerofrom-derive 0.1.6
+License: See crates.io
+Repository: https://crates.io/crates/zerofrom-derive
+
+Package: zeroize 1.8.2
+License: See crates.io
+Repository: https://crates.io/crates/zeroize
+
+Package: zeroize_derive 1.4.3
+License: See crates.io
+Repository: https://crates.io/crates/zeroize_derive
+
+Package: zerotrie 0.2.3
+License: See crates.io
+Repository: https://crates.io/crates/zerotrie
+
+Package: zerovec 0.11.5
+License: See crates.io
+Repository: https://crates.io/crates/zerovec
+
+Package: zerovec-derive 0.11.2
+License: See crates.io
+Repository: https://crates.io/crates/zerovec-derive
+
+Package: zmij 1.0.19
+License: See crates.io
+Repository: https://crates.io/crates/zmij
+
+================================================================================
+Python Dependencies
+================================================================================
+
+Package: cloudpickle >=3.0
+License: See PyPI
+Repository: https://pypi.org/project/cloudpickle/
+
+Package: grpcio >=1.60
+License: See PyPI
+Repository: https://pypi.org/project/grpcio/
+
+Package: protobuf >=4.25
+License: See PyPI
+Repository: https://pypi.org/project/protobuf/

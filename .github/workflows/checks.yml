@@ -16,6 +16,23 @@ permissions:
   packages: read
 
 jobs:
+  license-headers:
+    name: License Headers
+    runs-on: build-amd64
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
+
+      - name: Check license headers
+        run: mise run license:check
+
   rust:
     name: Rust (${{ matrix.runner }})
     strategy:

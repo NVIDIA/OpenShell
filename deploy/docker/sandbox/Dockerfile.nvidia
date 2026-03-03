@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # NVIDIA GPU-enabled sandbox variant
 #
 # Inherits from the base sandbox image and adds NVIDIA GPU tooling.
