@@ -770,7 +770,7 @@ impl App {
             focused_field: CreateFormField::Name,
             name: String::new(),
             image: String::new(),
-            command: String::from("/bin/bash"),
+            command: String::new(),
             providers,
             provider_cursor: 0,
             ports: String::new(),

@@ -96,7 +96,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         "Command",
         &form.command,
-        "entrypoint to run in the sandbox",
+        "optional — image entrypoint used if empty",
         form.focused_field == CreateFormField::Command,
         chunks[2],
     );
