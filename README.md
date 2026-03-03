@@ -1,7 +1,3 @@
-**NOTICE: Repository has moved to Github**
-
-Please use https://github.com/NVIDIA/nv-agent-env
-
 # Navigator 🗺️
 
 Navigator is the runtime environment for autonomous agents—the "Matrix" where they live, work, and verify.
