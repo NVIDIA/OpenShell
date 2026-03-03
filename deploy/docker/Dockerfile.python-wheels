@@ -26,7 +26,8 @@ ARG TARGETARCH
 ARG BUILDARCH
 ARG NAVIGATOR_CARGO_VERSION
 
-ENV SCCACHE_DIR=/tmp/sccache
+ARG SCCACHE_MEMCACHED_ENDPOINT
+ENV SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}
 
 WORKDIR /build
 
@@ -58,7 +59,6 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p navigator-cli 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
@@ -84,7 +84,6 @@ RUN touch crates/navigator-cli/src/main.rs \
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     export_cross_env && \
     export RUSTC_WRAPPER=sccache && \

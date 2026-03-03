@@ -16,7 +16,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY deploy/docker/cross-build.sh /usr/local/bin/
 RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
 
-ENV SCCACHE_DIR=/tmp/sccache
+ARG SCCACHE_MEMCACHED_ENDPOINT
+ENV SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}
 
 WORKDIR /build
 
@@ -47,7 +48,6 @@ COPY dev-sandbox-policy.rego ./
 # Build dependencies only (cached unless Cargo.toml/lock changes)
 RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-sandbox-${TARGETARCH},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-sandbox-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build -p navigator-sandbox 2>/dev/null || true
 
 # Copy actual source code
@@ -65,7 +65,6 @@ RUN touch crates/navigator-sandbox/src/main.rs \
 # don't corrupt each other's cargo registry or build artifacts.
 RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-sandbox-${TARGETARCH},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-sandbox-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     if [ "$RUST_BUILD_PROFILE" = "release" ]; then \
     cargo_cross_build --release -p navigator-sandbox; \

@@ -21,6 +21,7 @@ variables:
   MISE_AUTO_INSTALL: "0"
   MISE_TASK_RUN_AUTO_INSTALL: "0"
   MISE_NOT_FOUND_AUTO_INSTALL: "0"
+  SCCACHE_MEMCACHED_ENDPOINT: tcp://memcached.sccache:11211
 
 default:
   image: $CI_IMAGE
@@ -34,12 +35,6 @@ cache:
     paths:
       - .venv/
       - .cache/uv/
-  - key:
-      files:
-        - Cargo.lock
-      prefix: "sccache-$CI_RUNNER_EXECUTABLE_ARCH"
-    paths:
-      - .cache/sccache/
   - key:
       files:
         - Cargo.lock

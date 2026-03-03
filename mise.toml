@@ -27,7 +27,7 @@ UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 
 # Enable sccache for faster Rust builds
 RUSTC_WRAPPER = "sccache"
-SCCACHE_DIR = "{{config_root}}/.cache/sccache"
+SCCACHE_MEMCACHED_ENDPOINT = "{{env.SCCACHE_MEMCACHED_ENDPOINT | default(value='tcp://memcached.sccache:11211')}}"
 
 # Artifact registries
 NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local"

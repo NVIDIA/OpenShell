@@ -9,6 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SCCACHE_MEMCACHED_ENDPOINT: tcp://memcached.sccache:11211
 
 permissions:
   contents: read
@@ -25,14 +26,6 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Cache sccache
-        uses: actions/cache@v4
-        with:
-          path: .cache/sccache
-          key: sccache-rust-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-rust-${{ runner.arch }}-
 
       - name: Format
         run: mise run rust:format:check
