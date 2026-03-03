@@ -15,7 +15,7 @@ kubectl = "1.35.1"
 uv = "0.10.2"
 protoc = "29.6"
 helm = "4.1.1"
-"ubi:mozilla/sccache" = "0.14.0"
+"github:mozilla/sccache" = "0.14.0"
 
 [env]
 _.path = ["{{config_root}}/scripts/bin"]
