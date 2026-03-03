@@ -54,9 +54,11 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
     touch crates/navigator-router/src/lib.rs && \
     touch crates/navigator-bootstrap/src/lib.rs
 
-# Build dependencies only (sccache caches compiled artifacts externally).
+# Build dependencies only (cached unless Cargo.toml/lock changes).
+# sccache uses memcached in CI or the local disk cache mount for local dev.
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p navigator-cli 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
@@ -67,6 +69,7 @@ COPY python/ python/
 
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     export_cross_env && \
     export RUSTC_WRAPPER=sccache && \

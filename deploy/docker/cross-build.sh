@@ -81,11 +81,14 @@ export_cross_env() {
 # Automatically wraps with sccache when available.
 cargo_cross_build() {
   export_cross_env
-  # Unset empty SCCACHE_MEMCACHED_ENDPOINT so sccache falls back to local
-  # disk cache instead of erroring on an empty endpoint string.
+  # Unset empty SCCACHE_MEMCACHED_ENDPOINT so sccache falls back to the
+  # local disk cache instead of erroring on an empty endpoint string.
   if [ -z "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
     unset SCCACHE_MEMCACHED_ENDPOINT 2>/dev/null || true
   fi
+  # Default sccache local disk cache to /tmp/sccache (matches BuildKit
+  # cache mount target in Dockerfiles) when no dir is explicitly set.
+  export SCCACHE_DIR="${SCCACHE_DIR:-/tmp/sccache}"
   if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER=sccache
   fi
