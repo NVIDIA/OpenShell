@@ -27,7 +27,11 @@ The `navigator` binary is installed into your Python environment. Use `uv run na
 uv run navigator sandbox create -- claude  # or opencode or codex
 ```
 
+If you want to run a sandbox on a remote machine, pass `--remote [remote-ssh-host]`. This will start a sandbox on the remote host.
+
 The sandbox container includes a minimal networking toolset by default: `ping`, `dig`, `nslookup`, `nc`, `traceroute`, and `netstat`.
+
+It also includes common coding harnesses such as: `opencode`, `claude`, and `codex`.
 
 ## Developing
 
