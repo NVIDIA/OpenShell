@@ -26,9 +26,10 @@ KUBECONFIG = "{{config_root}}/kubeconfig"
 UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 
 # Enable sccache for faster Rust builds.
-# Set SCCACHE_MEMCACHED_ENDPOINT in your environment (or .env) for shared
-# memcached caching; CI sets this automatically via repository variables.
+# Local builds use a disk cache (SCCACHE_DIR); CI sets SCCACHE_MEMCACHED_ENDPOINT
+# via repository variables to use a shared memcached backend instead.
 RUSTC_WRAPPER = "sccache"
+SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
 # Artifact registries
 NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local"
