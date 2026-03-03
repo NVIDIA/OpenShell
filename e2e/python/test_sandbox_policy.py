@@ -537,6 +537,141 @@ def test_ssrf_log_shows_internal_address_block(
 
 
 # =============================================================================
+# SSRF Tests -- allowed_ips (CIDR-based private IP access)
+#
+# When an endpoint has `allowed_ips`, the proxy validates resolved IPs against
+# the CIDR allowlist instead of blanket-blocking all private IPs.
+# Loopback and link-local remain always-blocked regardless.
+#
+# SSRF-4: Private IP allowed with allowed_ips (mode 2: host + IPs)
+# SSRF-5: Private IP allowed with allowed_ips (mode 3: IPs only, no host)
+# SSRF-6: Private IP still blocked without allowed_ips (default behavior)
+# SSRF-7: Loopback always blocked even with allowed_ips covering 127.0.0.0/8
+# =============================================================================
+
+
+def test_ssrf_allowed_ips_permits_private_ip(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-4: CONNECT to private IP succeeds when allowed_ips covers it.
+
+    Uses 10.200.0.1 (the proxy's own host-side veth IP) as the target.
+    The connection attempt will fail at the TCP level (nothing listening on
+    port 19999) but the proxy should return 200 Connection Established
+    instead of 403, proving the SSRF check passed.
+    """
+    policy = _base_policy(
+        network_policies={
+            "internal": sandbox_pb2.NetworkPolicyRule(
+                name="internal",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="10.200.0.1",
+                        port=19999,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("10.200.0.1", 19999))
+        assert result.exit_code == 0, result.stderr
+        # Should get 200 (connection established) — not 403.
+        # The actual TCP connection may fail but the SSRF check passed.
+        assert "403" not in result.stdout, (
+            "Expected SSRF check to pass with allowed_ips, but got 403"
+        )
+
+
+def test_ssrf_allowed_ips_hostless_permits_private_ip(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-5: CONNECT to private IP succeeds with hostless allowed_ips (mode 3).
+
+    An endpoint with no host but with allowed_ips matches any hostname on the
+    given port. The resolved IP must be in the allowlist.
+    """
+    policy = _base_policy(
+        network_policies={
+            "private_net": sandbox_pb2.NetworkPolicyRule(
+                name="private_net",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        # No host — matches any hostname on this port
+                        port=19999,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("10.200.0.1", 19999))
+        assert result.exit_code == 0, result.stderr
+        assert "403" not in result.stdout, (
+            "Expected SSRF check to pass with hostless allowed_ips, but got 403"
+        )
+
+
+def test_ssrf_private_ip_blocked_without_allowed_ips(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-6: Private IP blocked when endpoint has no allowed_ips (default)."""
+    policy = _base_policy(
+        network_policies={
+            "internal": sandbox_pb2.NetworkPolicyRule(
+                name="internal",
+                endpoints=[
+                    # No allowed_ips — private IP should be blocked
+                    sandbox_pb2.NetworkEndpoint(host="10.200.0.1", port=19999),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("10.200.0.1", 19999))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            "Expected private IP to be blocked without allowed_ips"
+        )
+
+
+def test_ssrf_loopback_blocked_even_with_allowed_ips(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """SSRF-7: Loopback always blocked even when allowed_ips covers 127.0.0.0/8."""
+    policy = _base_policy(
+        network_policies={
+            "internal": sandbox_pb2.NetworkPolicyRule(
+                name="internal",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="127.0.0.1",
+                        port=80,
+                        allowed_ips=["127.0.0.0/8"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("127.0.0.1", 80))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            "Expected loopback to be blocked even with allowed_ips"
+        )
+
+
+# =============================================================================
 # L7 Tests -- TLS termination HTTPS inspection (Phase 2: tls=terminate)
 #
 # These tests use api.anthropic.com:443 as a real HTTPS endpoint since the
@@ -1012,9 +1147,7 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-6: Fetch logs (one-shot) and verify both sources ---
         # Resolve sandbox ID for log RPCs
-        get_resp = stub.GetSandbox(
-            navigator_pb2.GetSandboxRequest(name=sandbox_name)
-        )
+        get_resp = stub.GetSandbox(navigator_pb2.GetSandboxRequest(name=sandbox_name))
         sandbox_id = get_resp.sandbox.id
 
         logs_resp = stub.GetSandboxLogs(

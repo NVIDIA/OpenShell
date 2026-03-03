@@ -14,6 +14,17 @@ This skill operates as a stateful workflow — it can be run repeatedly against 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
 
+## Critical: `agent-ready` Label Is Human-Only
+
+The `agent-ready` label is a **human gate**. It signals that a human has reviewed the plan and authorized the agent to build. Under **no circumstances** should this skill or any agent:
+
+- Apply the `agent-ready` label
+- Ask the user to let the agent apply it
+- Suggest automating its application
+- Bypass the check by proceeding without it
+
+If the label is not present, the agent **must stop and wait**. This is a non-negotiable safety control — it ensures a human explicitly authorizes every build.
+
 ## Agent Comment Markers
 
 This skill uses two distinct markers to identify its comments:
@@ -355,13 +366,14 @@ Use descriptive names that document intent:
 
 ### Step 10: Verify — Tests, Lint, Pre-commit (Retry Loop)
 
-Run verification with up to **3 attempts**. On each attempt:
+Verification has two phases: unit tests + pre-commit, then E2E tests (if applicable). Run with up to **3 attempts per phase**.
+
+#### Phase 1: Unit Tests and Pre-commit
+
+On each attempt:
 
 ```bash
-# Run tests relevant to changed components
-mise test
-
-# Run pre-commit checks (includes linting, formatting)
+# Run pre-commit checks (includes unit tests, linting, formatting)
 mise run pre-commit
 ```
 
@@ -376,7 +388,49 @@ mise run pre-commit
 - The specific errors from the last attempt
 - That manual intervention is needed
 
-Do not proceed to PR creation if verification is not green.
+Do not proceed to Phase 2 or PR creation if Phase 1 is not green.
+
+#### Phase 2: E2E Tests (Conditional)
+
+**Trigger**: Run this phase if any files under `e2e/` were added or modified in this build. Check with:
+
+```bash
+git diff --name-only main -- e2e/
+```
+
+If there are no changes under `e2e/`, skip this phase entirely.
+
+If E2E files were modified, deploy to the local cluster and run the E2E test suite:
+
+```bash
+# Deploy all changes to the local k3s cluster
+mise run cluster:deploy
+
+# Run the E2E sandbox tests
+mise run test:e2e:sandbox
+```
+
+`mise run test:e2e:sandbox` depends on `cluster:deploy` and `python:proto`, then runs `uv run pytest -o python_files='test_*.py' e2e/python`. However, since the cluster may need explicit deploy for code changes beyond just E2E test files, always run `mise run cluster:deploy` first as a separate step to ensure all sandbox/proxy/policy changes are live on the cluster before running E2E tests.
+
+**E2E retry loop** (up to 3 attempts):
+
+1. Run `mise run cluster:deploy` (only on the first attempt, or if code was changed between attempts).
+2. Run `mise run test:e2e:sandbox`.
+3. If tests fail:
+   - Read the pytest output carefully — identify which tests failed and why.
+   - Distinguish between **test bugs** (the test itself is wrong) and **implementation bugs** (the code under test is wrong).
+   - Fix the failing code or tests.
+   - If code changes were made (not just test fixes), re-run `mise run cluster:deploy` before retrying.
+   - Decrement the retry counter and try again.
+4. If tests pass, Phase 2 is green.
+
+**If all 3 E2E attempts fail**, stop and report to the user:
+- Which E2E tests are failing
+- The pytest output from the last attempt
+- Whether the failures appear to be test issues or implementation issues
+- That manual intervention is needed
+
+Do not proceed to PR creation if E2E verification is not green.
 
 ### Step 11: Update Documentation
 
@@ -447,8 +501,8 @@ Closes #<issue-id>
 - `<architecture/doc.md>`: <what was updated>
 
 ## Verification
-- [x] All tests passing
-- [x] Pre-commit checks passing
+- [x] Pre-commit checks passing (unit tests, lint, format)
+- [x] E2E tests passing (if e2e/ files were modified)
 - [x] Architecture documentation updated
 EOF
 )"
@@ -487,6 +541,53 @@ The issue will auto-close when the PR is merged.
 EOF
 )"
 ```
+
+#### Post E2E attestation comment on the PR
+
+If E2E tests were run in Phase 2 of Step 10, post an attestation comment on the **PR** documenting that local E2E tests passed. This is necessary because E2E tests are not yet running in CI — this comment serves as the verification record for reviewers.
+
+Collect the metadata before posting:
+
+```bash
+# Get the commit SHA that was tested
+COMMIT_SHA=$(git rev-parse HEAD)
+
+# Get the test output summary (last few lines of pytest output)
+# This was captured during the Phase 2 run — include the pass/fail/skip counts
+```
+
+Post the attestation:
+
+```bash
+gh pr comment <pr-number> --body "$(cat <<'EOF'
+> **🏗️ build-from-issue-agent**
+
+## E2E Test Attestation
+
+Local E2E tests passed. CI does not currently run E2E tests, so this comment serves as the verification record.
+
+| Field | Value |
+|-------|-------|
+| **Commit** | `<commit-sha>` |
+| **Command** | `mise run test:e2e:sandbox` |
+| **Cluster deploy** | `mise run cluster:deploy` (completed before test run) |
+| **Result** | ✅ All passed |
+
+### Test Summary
+
+```
+<paste the pytest summary line, e.g.: "12 passed, 1 skipped in 45.32s">
+```
+
+### Tests Executed
+- `<test_file.py>::<test_name>` — PASSED
+- `<test_file.py>::<test_name>` — PASSED
+- ...
+EOF
+)"
+```
+
+Include **every test** that ran (not just the new ones) so the reviewer can see full coverage. If any tests were skipped, note them and explain why.
 
 #### Update labels
 
@@ -536,8 +637,9 @@ If the `in-progress` label is present, the skill was previously started but may 
 | `gh pr list --state open --search "..."` | Search for open PRs |
 | `gh pr create --title "..." --body "..."` | Create a pull request |
 | `gh api user --jq '.login'` | Get current GitHub username |
-| `mise test` | Run project tests |
-| `mise run pre-commit` | Run pre-commit checks |
+| `mise run pre-commit` | Run pre-commit checks (includes unit tests, lint, format) |
+| `mise run cluster:deploy` | Deploy all changes to local k3s cluster |
+| `mise run test:e2e:sandbox` | Run E2E sandbox tests (depends on cluster:deploy) |
 
 ## Example Usage
 
@@ -584,8 +686,9 @@ User says: "Build issue #42"
 5. Add `in-progress` label
 6. Implement pagination for both endpoints per the plan
 7. Add unit tests for pagination logic, integration tests for both endpoints
-8. `mise test` and `mise run pre-commit` pass on first attempt
-9. `arch-doc-writer` updates `architecture/gateway.md` with pagination details
+8. `mise run pre-commit` passes on first attempt
+9. E2E tests skipped (no changes under `e2e/`)
+10. `arch-doc-writer` updates `architecture/gateway.md` with pagination details
 10. Commit, push, create PR with `Closes #42`
 11. Post summary comment on issue with PR link
 12. Update labels: remove `in-progress` + `review-ready`, add `pr-opened`

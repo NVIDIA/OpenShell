@@ -88,6 +88,17 @@ endpoint_allowed(policy, network) if {
 	endpoint.port == network.port
 }
 
+# Endpoint matching: hostless with allowed_ips — match any host on port.
+# When an endpoint has allowed_ips but no host, it matches any hostname on the
+# given port. The actual IP validation happens in Rust post-DNS-resolution.
+endpoint_allowed(policy, network) if {
+	some endpoint
+	endpoint := policy.endpoints[_]
+	object.get(endpoint, "host", "") == ""
+	count(object.get(endpoint, "allowed_ips", [])) > 0
+	endpoint.port == network.port
+}
+
 # Binary matching: exact path.
 # SHA256 integrity is enforced in Rust via trust-on-first-use (TOFU) cache,
 # not in Rego. The proxy computes and caches binary hashes at runtime.
@@ -220,9 +231,10 @@ command_matches(actual, expected) if {
 	upper(actual) == upper(expected)
 }
 
-# --- Matched endpoint config (for L7 config extraction) ---
+# --- Matched endpoint config (for L7 and allowed_ips extraction) ---
 # Returns the raw endpoint object for the matched policy + host:port.
-# Used by Rust to extract L7 config (protocol, tls, enforcement).
+# Used by Rust to extract L7 config (protocol, tls, enforcement) and/or
+# allowed_ips for SSRF allowlist validation.
 
 matched_endpoint_config := ep if {
 	some name
@@ -231,7 +243,28 @@ matched_endpoint_config := ep if {
 	binary_allowed(policy, input.exec)
 	some ep
 	ep := policy.endpoints[_]
-	lower(ep.host) == lower(input.network.host)
-	ep.port == input.network.port
+	endpoint_matches_request(ep, input.network)
+	endpoint_has_extended_config(ep)
+}
+
+# Hosted endpoint: match on host (case-insensitive) + port.
+endpoint_matches_request(ep, network) if {
+	lower(ep.host) == lower(network.host)
+	ep.port == network.port
+}
+
+# Hostless endpoint with allowed_ips: match on port only.
+endpoint_matches_request(ep, network) if {
+	object.get(ep, "host", "") == ""
+	count(object.get(ep, "allowed_ips", [])) > 0
+	ep.port == network.port
+}
+
+# An endpoint has extended config if it specifies L7 protocol or allowed_ips.
+endpoint_has_extended_config(ep) if {
 	ep.protocol
+}
+
+endpoint_has_extended_config(ep) if {
+	count(object.get(ep, "allowed_ips", [])) > 0
 }

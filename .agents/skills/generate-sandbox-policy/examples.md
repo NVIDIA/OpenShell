@@ -625,6 +625,108 @@ network_policies:
 
 ## File Operation Examples (update existing / create new)
 
+## Private IP Access Examples (allowed_ips)
+
+### Example P1: Internal Service with Known IP Range
+
+**User**: "Allow curl to reach our internal API at api.internal.corp on port 8080. It resolves to 10.0.5.x addresses."
+
+The user knows the service resolves to private IPs. Use `allowed_ips` to permit the specific subnet.
+
+```yaml
+network_policies:
+  internal_api:
+    name: internal_api
+    endpoints:
+      - host: api.internal.corp
+        port: 8080
+        allowed_ips:
+          - "10.0.5.0/24"
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+**What this allows**: Connections to `api.internal.corp:8080` when DNS resolves to any IP in `10.0.5.0/24`.
+**What this blocks**: Connections if the domain resolves outside the allowlist, or to any loopback/link-local address.
+
+---
+
+### Example P2: Multiple Internal Subnets
+
+**User**: "Our microservices are spread across 10.0.5.x and 10.0.6.x on port 8080. Let opencode reach any of them without listing every hostname."
+
+Use a hostless endpoint with `allowed_ips` — any domain on port 8080 is allowed if it resolves to an IP in the listed ranges.
+
+```yaml
+network_policies:
+  private_services:
+    name: private_services
+    endpoints:
+      - port: 8080
+        allowed_ips:
+          - "10.0.5.0/24"
+          - "10.0.6.0/24"
+    binaries:
+      - { path: /usr/local/bin/opencode }
+```
+
+**What this allows**: Any hostname on port 8080 whose DNS resolves to `10.0.5.0/24` or `10.0.6.0/24`.
+**What this blocks**: Any hostname resolving outside these ranges, or to loopback/link-local addresses.
+
+**Note**: No `host` field means any domain name is accepted — only the resolved IP is checked. This is broader; use `host` when you know the specific hostname.
+
+---
+
+### Example P3: Private IP with L7 Inspection
+
+**User**: "Allow read-only REST access to db-proxy.internal on port 3128. It's at 172.16.1.50."
+
+Combine `allowed_ips` with L7 inspection for fine-grained control over a private service.
+
+```yaml
+network_policies:
+  db_proxy_readonly:
+    name: db_proxy_readonly
+    endpoints:
+      - host: db-proxy.internal
+        port: 3128
+        protocol: rest
+        enforcement: enforce
+        access: read-only
+        allowed_ips:
+          - "172.16.1.50"
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+**What this allows**: GET, HEAD, OPTIONS on any path to `db-proxy.internal:3128`, only if it resolves to `172.16.1.50`.
+**What this blocks**: POST, PUT, PATCH, DELETE, and connections resolving to any other IP.
+
+---
+
+### Example P4: Exact IP (No CIDR)
+
+**User**: "Allow curl to reach exactly 10.0.5.20 on port 9090 via metrics.internal."
+
+```yaml
+network_policies:
+  metrics_internal:
+    name: metrics_internal
+    endpoints:
+      - host: metrics.internal
+        port: 9090
+        allowed_ips:
+          - "10.0.5.20"
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+An exact IP is treated as `/32` — only that specific address is permitted.
+
+---
+
+## File Operation Examples (update existing / create new)
+
 ### Example F1: Add a New Policy to an Existing File
 
 **User**: "Add read-only access to api.github.com for curl to my dev-sandbox-policy.yaml"

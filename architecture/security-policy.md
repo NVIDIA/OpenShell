@@ -406,13 +406,14 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 
 | Field         | Type       | Default         | Description                                                                                                         |
 | ------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `host`        | `string`   | _(required)_    | Hostname to match (case-insensitive)                                                                                |
-| `port`        | `integer`  | _(required)_    | TCP port to match                                                                                                   |
-| `protocol`    | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
-| `tls`         | `string`   | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination).                  |
-| `enforcement` | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
-| `access`      | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
-| `rules`       | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
+| `host`         | `string`   | _(required)_    | Hostname to match (case-insensitive). Optional when `allowed_ips` is set (see [Hostless Endpoints](#hostless-endpoints-allowed_ips-without-host)). |
+| `port`         | `integer`  | _(required)_    | TCP port to match                                                                                                   |
+| `protocol`     | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
+| `tls`          | `string`   | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination).                  |
+| `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
+| `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
+| `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
+| `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips).       |
 
 #### `NetworkBinary`
 
@@ -738,26 +739,41 @@ As a defense-in-depth measure, the proxy resolves DNS before connecting to upstr
 
 The check runs after OPA policy allows the connection but before the TCP connection to the upstream is established. Even if an attacker controls a DNS record that maps an allowed hostname to an internal IP, the proxy blocks the connection.
 
-### Blocked IP Ranges
+### Always-Blocked IP Ranges
+
+These IP ranges are **always blocked**, even when `allowed_ips` is configured on an endpoint:
+
+| Range | Description | Reason |
+|-------|-------------|--------|
+| `127.0.0.0/8` | IPv4 loopback | Prevents proxy bypass via localhost |
+| `169.254.0.0/16` | IPv4 link-local | Prevents cloud metadata SSRF (`169.254.169.254`) |
+| `::1` | IPv6 loopback | Prevents proxy bypass via IPv6 localhost |
+| `fe80::/10` | IPv6 link-local | Prevents IPv6 link-local access |
+| `::ffff:0:0/96` (mapped) | IPv4-mapped IPv6 addresses are unwrapped and checked as IPv4 | |
+
+### Default-Blocked IP Ranges (Private)
+
+These ranges are blocked by default but can be selectively allowed via the `allowed_ips` field on an endpoint:
 
 | Range | Description |
 |-------|-------------|
-| `127.0.0.0/8` | IPv4 loopback |
 | `10.0.0.0/8` | RFC 1918 private (Class A) |
 | `172.16.0.0/12` | RFC 1918 private (Class B) |
 | `192.168.0.0/16` | RFC 1918 private (Class C) |
-| `169.254.0.0/16` | IPv4 link-local (includes cloud metadata endpoints) |
-| `::1` | IPv6 loopback |
-| `fe80::/10` | IPv6 link-local |
-| `::ffff:0:0/96` (mapped) | IPv4-mapped IPv6 addresses are unwrapped and checked as IPv4 |
 
 ### Implementation
 
-Two functions in `crates/navigator-sandbox/src/proxy.rs` implement this check:
+Functions in `crates/navigator-sandbox/src/proxy.rs` implement the SSRF checks:
 
-- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. For IPv6, it checks loopback and link-local ranges directly, then unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks.
+- **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Checks loopback, link-local, and RFC 1918 ranges. For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the default (no `allowed_ips`) code path.
 
-- **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected. On success, returns the resolved addresses for direct use with `TcpStream::connect()`.
+- **`is_always_blocked_ip(ip: IpAddr) -> bool`**: Checks if an IP is always blocked regardless of policy — loopback and link-local only. Used in the `allowed_ips` code path to enforce the hard block on loopback and link-local even when private IPs are permitted.
+
+- **`resolve_and_reject_internal(host, port) -> Result<Vec<SocketAddr>, String>`**: Default SSRF check. Resolves DNS via `tokio::net::lookup_host()`, then checks every resolved address against `is_internal_ip()`. If any address is internal, the entire connection is rejected.
+
+- **`resolve_and_check_allowed_ips(host, port, allowed_ips) -> Result<Vec<SocketAddr>, String>`**: Allowlist-based SSRF check. Resolves DNS, rejects any always-blocked IPs, then verifies every resolved address matches at least one entry in the `allowed_ips` list.
+
+- **`parse_allowed_ips(raw) -> Result<Vec<IpNet>, String>`**: Parses CIDR/IP strings into typed `IpNet` values. Rejects entries that cover loopback or link-local ranges. Accepts both CIDR notation (`10.0.5.0/24`) and bare IPs (`10.0.5.20`, treated as `/32`).
 
 ### Placement in Proxy Flow
 
@@ -768,12 +784,77 @@ flowchart TD
     B -- No --> D[OPA policy evaluation]
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
-    E -- Yes --> G["resolve_and_reject_internal(host, port)"]
-    G --> H{All IPs public?}
-    H -- No --> I["403 Forbidden + log warning"]
-    H -- Yes --> J["TcpStream::connect(resolved addrs)"]
-    J --> K[200 Connection Established]
+    E -- Yes --> G{allowed_ips on endpoint?}
+    G -- Yes --> H["resolve_and_check_allowed_ips(host, port, nets)"]
+    H --> I{All IPs in allowlist<br/>and not loopback/link-local?}
+    I -- No --> J["403 Forbidden + log warning"]
+    I -- Yes --> K["TcpStream::connect(resolved addrs)"]
+    G -- No --> L["resolve_and_reject_internal(host, port)"]
+    L --> M{All IPs public?}
+    M -- No --> J
+    M -- Yes --> K
+    K --> N[200 Connection Established]
 ```
+
+### Private IP Access via `allowed_ips`
+
+The `allowed_ips` field on a `NetworkEndpoint` enables controlled access to private IP space. When present, the default SSRF internal-IP rejection is replaced by an allowlist check: resolved IPs must match at least one entry in `allowed_ips`, and loopback/link-local are still always blocked.
+
+This supports three usage modes:
+
+| Mode | Endpoint Configuration | Behavior |
+|------|----------------------|----------|
+| **Default** | `host` only, no `allowed_ips` | Standard SSRF protection: all private IPs blocked |
+| **Host + allowlist** | `host` + `allowed_ips` | Domain must match `host` AND resolve to an IP in `allowed_ips` |
+| **Hostless allowlist** | `allowed_ips` only (no `host`) | Any domain allowed on the specified `port`, as long as it resolves to an IP in `allowed_ips` |
+
+#### `allowed_ips` Format
+
+Entries can be:
+- **CIDR notation**: `10.0.5.0/24`, `172.16.0.0/12`, `192.168.1.0/24`
+- **Exact IP**: `10.0.5.20` (treated as `/32` for IPv4 or `/128` for IPv6)
+
+Entries that cover loopback (`127.0.0.0/8`) or link-local (`169.254.0.0/16`) ranges are rejected at parse time.
+
+#### Hostless Endpoints (`allowed_ips` without `host`)
+
+When an endpoint has `allowed_ips` but no `host`, it matches **any hostname** on the specified port. This is useful for allowing access to a range of internal services without enumerating every hostname. The resolved IP must still fall within the allowlist.
+
+**OPA behavior**: The Rego `endpoint_allowed` rule has a clause that matches hostless endpoints by port only. The `matched_endpoint_config` rule includes these endpoints via `endpoint_has_extended_config`. Well-authored policies should ensure hostless endpoints use different ports than host-based endpoints to avoid OPA complete-rule conflicts.
+
+#### Example: Host + Allowlist (Mode 2)
+
+```yaml
+network_policies:
+  internal_api:
+    name: internal_api
+    endpoints:
+      - host: api.internal.corp
+        port: 8080
+        allowed_ips:
+          - "10.0.5.0/24"
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+The sandbox can connect to `api.internal.corp:8080` only if DNS resolves to an IP within `10.0.5.0/24`. Connections to any other host, or to `api.internal.corp` resolving outside the allowlist, are blocked.
+
+#### Example: Hostless Allowlist (Mode 3)
+
+```yaml
+network_policies:
+  private_network:
+    name: private_network
+    endpoints:
+      - port: 8080
+        allowed_ips:
+          - "10.0.5.0/24"
+          - "10.0.6.0/24"
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+Any hostname on port 8080 is allowed, provided DNS resolves to an IP within `10.0.5.0/24` or `10.0.6.0/24`. This allows access to multiple internal services without listing each hostname.
 
 ### Control Plane Exemption
 
@@ -883,6 +964,28 @@ network_policies:
     binaries:
       - { path: "/usr/bin/*" }
 
+  # Private IP access: host + allowed_ips (SSRF allowlist)
+  internal_database:
+    name: internal_database
+    endpoints:
+      - host: db.internal.corp
+        port: 5432
+        allowed_ips:
+          - "10.0.5.0/24"
+    binaries:
+      - { path: /usr/bin/curl }
+
+  # Hostless private IP access: any hostname on port 8080 within the allowlist
+  private_services:
+    name: private_services
+    endpoints:
+      - port: 8080
+        allowed_ips:
+          - "10.0.5.0/24"
+          - "10.0.6.0/24"
+    binaries:
+      - { path: /usr/bin/curl }
+
 inference:
   allowed_routing_hints:
     - local
@@ -910,7 +1013,7 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `NetworkPolicyRule` | `name`                                                              | `network_policies.<key>.name`               |
 | `NetworkPolicyRule` | `endpoints`                                                         | `network_policies.<key>.endpoints`          |
 | `NetworkPolicyRule` | `binaries`                                                          | `network_policies.<key>.binaries`           |
-| `NetworkEndpoint`   | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules` | Same field names                            |
+| `NetworkEndpoint`   | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules`, `allowed_ips` | Same field names                            |
 | `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
 | `InferencePolicy`   | `allowed_routing_hints`                                             | `inference.allowed_routing_hints`           |
@@ -943,7 +1046,7 @@ The OPA engine evaluates two categories of rules:
 | `allow_network`           | `input.network.host`, `input.network.port`, `input.exec.path`, `input.exec.ancestors`, `input.exec.cmdline_paths` | `true` if any policy matches both endpoint and binary                                         |
 | `deny_reason`             | Same input                                                                                                        | Human-readable string explaining why access was denied                                        |
 | `matched_network_policy`  | Same input                                                                                                        | Name of the matched policy (for audit logging)                                                |
-| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (only returned if endpoint has `protocol` field) |
+| `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol` or `allowed_ips` field) |
 
 ### L7 Rules (per-request within tunnel)
 

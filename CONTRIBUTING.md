@@ -9,6 +9,7 @@ Install [mise](https://mise.jdx.dev/). This is used to setup the development env
 curl https://mise.run | sh
 ```
 
+
 After installing `mise` be sure to activate the environment by running `mise activate` or [add it to your shell](https://mise.jdx.dev/getting-started.html).
 
 Shell installation examples:
