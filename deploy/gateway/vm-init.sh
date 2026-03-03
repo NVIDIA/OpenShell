@@ -45,46 +45,22 @@ fi
 # Enable the loopback interface.
 ip link set lo up 2>/dev/null || true
 
-# Configure eth0 via DHCP from gvproxy.
-# gvproxy provides DHCP on 192.168.127.0/24:
-#   gateway: 192.168.127.1
-#   guest:   192.168.127.2
-#   DNS:     192.168.127.1
+# Configure eth0 with a static IP.
+#
+# gvproxy provides a 192.168.127.0/24 network with gateway at .1.
+# We use a static IP instead of DHCP because gvproxy's DHCP server
+# assigns IPs nondeterministically (.2 or .3 depending on timing),
+# which breaks port forwarding configured before the VM boots.
+# Static assignment guarantees the IP matches what the host expects.
+GUEST_IP="192.168.127.2"
+GATEWAY_IP="192.168.127.1"
+
 if ip link show eth0 >/dev/null 2>&1; then
-    echo "[vm-init] Configuring eth0 via DHCP..."
+    echo "[vm-init] Configuring eth0 with static IP ${GUEST_IP}..."
     ip link set eth0 up
-
-    # BusyBox udhcpc needs a script to apply the lease. Create a minimal one.
-    mkdir -p /usr/share/udhcpc
-    cat > /usr/share/udhcpc/default.script << 'DHCP_SCRIPT'
-#!/bin/sh
-case "$1" in
-    bound|renew)
-        ip addr add "$ip/$mask" dev "$interface" 2>/dev/null || true
-        if [ -n "$router" ]; then
-            ip route add default via "$router" dev "$interface" 2>/dev/null || true
-        fi
-        if [ -n "$dns" ]; then
-            : > /etc/resolv.conf
-            for ns in $dns; do
-                echo "nameserver $ns" >> /etc/resolv.conf
-            done
-        fi
-        ;;
-esac
-DHCP_SCRIPT
-    chmod +x /usr/share/udhcpc/default.script
-
-    # Run DHCP (foreground, quit after lease obtained).
-    udhcpc -i eth0 -n -q -f -t 5 2>/dev/null || {
-        echo "[vm-init] DHCP failed, using static config"
-        ip addr add 192.168.127.2/24 dev eth0 2>/dev/null || true
-        ip route add default via 192.168.127.1 dev eth0 2>/dev/null || true
-        echo "nameserver 192.168.127.1" > /etc/resolv.conf
-    }
-
-    GUEST_IP=$(ip -4 addr show eth0 2>/dev/null | sed -n 's/.*inet \([0-9.]*\).*/\1/p' | head -1)
-    GUEST_IP="${GUEST_IP:-192.168.127.3}"
+    ip addr add "${GUEST_IP}/24" dev eth0 2>/dev/null || true
+    ip route add default via "${GATEWAY_IP}" dev eth0 2>/dev/null || true
+    echo "nameserver ${GATEWAY_IP}" > /etc/resolv.conf
     echo "[vm-init] Network configured: eth0 = ${GUEST_IP}"
 else
     # Fallback: no eth0 (TSI-only mode). Add dummy routing on lo so k3s

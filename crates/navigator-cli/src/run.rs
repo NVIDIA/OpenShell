@@ -3211,6 +3211,11 @@ pub fn gateway_cluster(
         println!("Using cached rootfs: {}", rootfs_dir.display());
     }
 
+    // Always update vm-init.sh in the rootfs — it's embedded at build time
+    // and may contain fixes (e.g., networking changes) that the cached rootfs
+    // doesn't have.
+    update_vm_init_script(&rootfs_dir)?;
+
     // Create k3s state directory.
     std::fs::create_dir_all(&k3s_state_dir)
         .map_err(|e| miette::miette!("failed to create k3s state dir: {e}"))?;
@@ -3258,9 +3263,10 @@ pub fn gateway_cluster(
     // Step 3: Configure port forwarding via gvproxy HTTP API.
     //
     // gvproxy's DHCP server assigns guest IPs from 192.168.127.0/24.
-    // The gateway itself is .1, and the first (and only) DHCP client
-    // gets .3 (observed empirically — .2 may be reserved internally).
-    let guest_ip = "192.168.127.3";
+    // The gateway is .1. The guest uses a static IP (.2) configured in
+    // vm-init.sh — we don't use DHCP because gvproxy assigns IPs
+    // nondeterministically (.2 or .3 depending on timing).
+    let guest_ip = "192.168.127.2";
 
     // We always need the kube API port forwarded for health checking and
     // kubeconfig extraction. If the user didn't specify --kube-port, pick
@@ -3590,21 +3596,7 @@ fn extract_rootfs_from_docker(image_ref: &str, rootfs_dir: &Path) -> Result<()> 
         .args(["rm", "-f", &container_name])
         .status();
 
-    // Copy the VM init script into the rootfs. This script sets up networking
-    // (dummy interface + default route) so k3s can find /proc/net/route, then
-    // execs into k3s.
-    let init_script = include_bytes!("../../../deploy/gateway/vm-init.sh");
-    let init_path = rootfs_dir.join("usr/local/bin/vm-init.sh");
-    std::fs::write(&init_path, init_script)
-        .map_err(|e| miette::miette!("failed to write vm-init.sh: {e}"))?;
-
-    // Make executable (0o755).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))
-            .map_err(|e| miette::miette!("failed to chmod vm-init.sh: {e}"))?;
-    }
+    update_vm_init_script(rootfs_dir)?;
 
     println!("  Rootfs extracted to {}", rootfs_dir.display());
     Ok(())
@@ -3613,6 +3605,28 @@ fn extract_rootfs_from_docker(image_ref: &str, rootfs_dir: &Path) -> Result<()> 
 /// Wait for a child process to exit and return its exit status.
 fn wait_for_child(pid: u32) -> Result<i32> {
     navigator_gateway::wait_for_pid(pid).map_err(|e| miette::miette!("waitpid failed: {e}"))
+}
+
+/// Write the embedded vm-init.sh script into the rootfs.
+///
+/// This is called both during initial rootfs extraction and on every
+/// cluster boot (to pick up fixes baked into the binary without requiring
+/// a full rootfs re-extract).
+fn update_vm_init_script(rootfs_dir: &Path) -> Result<()> {
+    let init_script = include_bytes!("../../../deploy/gateway/vm-init.sh");
+    let init_path = rootfs_dir.join("usr/local/bin/vm-init.sh");
+    std::fs::create_dir_all(init_path.parent().unwrap())
+        .map_err(|e| miette::miette!("failed to create vm-init.sh parent dir: {e}"))?;
+    std::fs::write(&init_path, init_script)
+        .map_err(|e| miette::miette!("failed to write vm-init.sh: {e}"))?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&init_path, std::fs::Permissions::from_mode(0o755))
+            .map_err(|e| miette::miette!("failed to chmod vm-init.sh: {e}"))?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]

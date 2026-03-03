@@ -23,6 +23,10 @@ use crate::ffi;
 /// `start_enter`, which never returns).
 pub struct KrunContext {
     ctx_id: u32,
+    /// If set, `fork_start()` redirects the child's stderr to this file
+    /// so that libkrun VMM warnings (e.g., virtio-fs passthrough) don't
+    /// leak to the parent's terminal.
+    console_output: Option<PathBuf>,
 }
 
 impl KrunContext {
@@ -102,7 +106,15 @@ impl KrunContext {
         }
 
         if pid == 0 {
-            // Child process: start the VM. This never returns on success.
+            // Child process: redirect stderr to the console log file (if
+            // configured) so libkrun VMM warnings don't leak to the parent
+            // terminal. The VMM's virtio-fs passthrough generates WARN-level
+            // logs on stderr that are confusing when mixed with CLI output.
+            if let Some(ref console_path) = this.console_output {
+                redirect_stderr_to_file(console_path);
+            }
+
+            // Start the VM. This never returns on success.
             let ret = unsafe { ffi::krun_start_enter(this.ctx_id) };
             // If we reach here, start failed. Exit with an error code so the
             // parent can detect it.
@@ -402,7 +414,10 @@ impl KrunContextBuilder {
 
         // From here on, if we hit an error we need to clean up the context.
         // We'll create KrunContext now so Drop handles it.
-        let ctx = KrunContext { ctx_id };
+        let ctx = KrunContext {
+            ctx_id,
+            console_output: self.console_output.clone(),
+        };
 
         // Configure VM resources.
         check_ret("krun_set_vm_config", unsafe {
@@ -573,6 +588,23 @@ fn to_ptr_array(strings: &[CString]) -> Vec<*const c_char> {
     let mut ptrs: Vec<*const c_char> = strings.iter().map(|s| s.as_ptr()).collect();
     ptrs.push(ptr::null());
     ptrs
+}
+
+/// Redirect stderr (fd 2) to a file. Used in the forked child process to
+/// prevent libkrun VMM log messages from appearing on the parent's terminal.
+///
+/// Best-effort: if the file can't be opened, stderr is left unchanged.
+fn redirect_stderr_to_file(path: &Path) {
+    use std::fs::OpenOptions;
+    use std::os::unix::io::IntoRawFd;
+
+    if let Ok(file) = OpenOptions::new().create(true).append(true).open(path) {
+        let fd = file.into_raw_fd();
+        unsafe {
+            libc::dup2(fd, libc::STDERR_FILENO);
+            libc::close(fd);
+        }
+    }
 }
 
 /// Raise `RLIMIT_NOFILE` to the maximum allowed value.
