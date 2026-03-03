@@ -127,6 +127,29 @@ navigator sandbox run --policy sandbox.yaml -- /bin/ls
 - Do not copy-paste large blocks of source code — reference it and explain it
 - Do not document test utilities or internal test helpers unless they are part of the public interface
 
+## System Architecture Diagram
+
+The file `architecture/system-architecture.md` contains a top-level Mermaid diagram of the entire Navigator system — all deployable components, external systems, communication protocols, and security boundaries. It is the single source of truth for the system's visual architecture.
+
+**After completing any documentation update**, check whether your changes affect the system-level architecture diagram. You MUST update `architecture/system-architecture.md` if any of the following are true:
+
+- A new deployable component or service was added or removed
+- A new external system, API, or third-party dependency was introduced or removed
+- Communication protocols between components changed (new connections, changed protocols, removed paths)
+- Security boundaries or isolation layers changed
+- Ports, endpoints, or addressing changed
+- Data stores were added, removed, or changed
+
+When updating the diagram:
+- Keep the Mermaid syntax valid and renderable
+- Use the same component names as in the rest of the documentation
+- Annotate arrows with communication types and protocols
+- Avoid overlapping connections — keep the diagram readable
+- Update the "Key Communication Flows" section below the diagram if flows changed
+- Update the "Component Legend" table if new component categories were added
+
+If your documentation update does NOT affect any of the above, you do not need to modify the diagram.
+
 ## Quality Checklist
 
 Before finishing, verify:
@@ -138,6 +161,7 @@ Before finishing, verify:
 - [ ] No orphaned cross-references to removed or renamed components
 - [ ] The document reads coherently from top to bottom
 - [ ] Terminology is consistent with the source code
+- [ ] `architecture/system-architecture.md` is updated if your changes affect system-level components, connections, or boundaries
 
 ## Update your agent memory
 
