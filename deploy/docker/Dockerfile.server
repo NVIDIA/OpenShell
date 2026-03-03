@@ -42,24 +42,15 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 # Copy proto files needed for build
 COPY proto/ proto/
 
-# Build dependencies only (cached unless Cargo.toml/lock changes)
+# Build dependencies only (sccache caches compiled artifacts externally)
 RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-server-${TARGETARCH},sharing=locked,target=/build/target \
     . cross-build.sh && cargo_cross_build --release -p navigator-server 2>/dev/null || true
 
 # Copy actual source code
 COPY crates/ crates/
 
-# Touch source files to ensure they're rebuilt (not the cached dummy).
-# Touch build.rs and proto files to force proto code regeneration when the
-# cargo target cache mount retains stale OUT_DIR artifacts from prior builds.
-RUN touch crates/navigator-server/src/main.rs \
-    crates/navigator-core/build.rs \
-    proto/*.proto
-
 # Build the actual application
 RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-server-${TARGETARCH},sharing=locked,target=/build/target \
     . cross-build.sh && \
     cargo_cross_build --release -p navigator-server && \
     cp "$(cross_output_dir release)/navigator-server" /build/navigator-server
