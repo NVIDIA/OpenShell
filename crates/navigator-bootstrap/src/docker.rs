@@ -437,7 +437,7 @@ pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {
             Err(err) => {
                 return Err(err)
                     .into_diagnostic()
-                    .wrap_err("failed to start cluster container")
+                    .wrap_err("failed to start cluster container");
             }
         }
     }
