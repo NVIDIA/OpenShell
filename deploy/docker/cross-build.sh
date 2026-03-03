@@ -81,12 +81,28 @@ export_cross_env() {
 # Automatically wraps with sccache when available.
 cargo_cross_build() {
   export_cross_env
+  # Unset empty SCCACHE_MEMCACHED_ENDPOINT so sccache falls back to the
+  # local disk cache instead of erroring on an empty endpoint string.
+  if [ -z "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
+    unset SCCACHE_MEMCACHED_ENDPOINT 2>/dev/null || true
+  fi
+  # Default sccache local disk cache to /tmp/sccache (matches BuildKit
+  # cache mount target in Dockerfiles) when no dir is explicitly set.
+  export SCCACHE_DIR="${SCCACHE_DIR:-/tmp/sccache}"
   if command -v sccache >/dev/null 2>&1; then
     export RUSTC_WRAPPER=sccache
   fi
   local target_flag=""
   if is_cross; then target_flag="--target $(rust_target)"; fi
-  cargo build $target_flag "$@"
+  # Retry once after cleaning if the build fails. BuildKit cargo-target cache
+  # mounts can retain stale .rmeta files from prior builds with different
+  # dependency versions; cargo clean purges them so the retry succeeds.
+  # sccache still has the compiled objects, so the clean rebuild is fast.
+  if ! cargo build $target_flag "$@"; then
+    echo "cargo build failed; cleaning stale target cache and retrying..." >&2
+    cargo clean 2>/dev/null || true
+    cargo build $target_flag "$@"
+  fi
 }
 
 # Print the directory containing the compiled binary.

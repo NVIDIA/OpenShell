@@ -16,7 +16,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY deploy/docker/cross-build.sh /usr/local/bin/
 RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
 
-ENV SCCACHE_DIR=/tmp/sccache
+ARG SCCACHE_MEMCACHED_ENDPOINT
 
 WORKDIR /build
 
@@ -44,7 +44,9 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 COPY proto/ proto/
 COPY dev-sandbox-policy.rego ./
 
-# Build dependencies only (cached unless Cargo.toml/lock changes)
+# Build dependencies only (cached unless Cargo.toml/lock changes).
+# sccache uses memcached in CI or the local disk cache mount for local dev.
+# The cargo-target mount gives cargo a persistent target/ dir for incremental rebuilds.
 RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-sandbox-${TARGETARCH},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-sandbox-${TARGETARCH},sharing=locked,target=/tmp/sccache \

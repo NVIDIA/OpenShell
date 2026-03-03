@@ -121,7 +121,7 @@ A k3s image with bundled Helm charts and Kubernetes manifests for single-contain
 
 Two Dockerfiles produce Python wheels for the CLI package distribution. These are not deployed as running containers.
 
-- **`Dockerfile.python-wheels`** -- Builds Linux amd64/arm64 wheels using Maturin with a two-pass Rust build (dependency prebuild + final wheel build), BuildKit cache mounts for cargo registry/git/target and sccache, and `cross-build.sh` for conditional cross-toolchain installation. The final build step patches workspace version inside the container layer from `NAVIGATOR_CARGO_VERSION` (computed before Docker build), preserving cacheable dependency layers and avoiding dirty working-tree edits. Output stage is `scratch` with only the `.whl` files.
+- **`Dockerfile.python-wheels`** -- Builds Linux amd64/arm64 wheels using Maturin with a two-pass Rust build (dependency prebuild + final wheel build), BuildKit cache mounts for cargo registry/git/target, sccache (backed by memcached when `SCCACHE_MEMCACHED_ENDPOINT` build arg is provided), and `cross-build.sh` for conditional cross-toolchain installation. The final build step patches workspace version inside the container layer from `NAVIGATOR_CARGO_VERSION` (computed before Docker build), preserving cacheable dependency layers and avoiding dirty working-tree edits. Output stage is `scratch` with only the `.whl` files.
 - **`Dockerfile.python-wheels-macos`** -- Builds macOS arm64 wheels using osxcross (cross-compiling from Linux) with the same two-pass dependency caching pattern and cargo cache mounts. Version injection uses the same in-container workspace-version patch from `NAVIGATOR_CARGO_VERSION`, avoiding host-side file edits that break Docker layer caching. Uses `crazymax/osxcross:latest` as the cross-toolchain source. The `OSXCROSS_IMAGE` build arg allows using a mirrored registry image instead of Docker Hub.
 
 ### CI Runner Image (`navigator-ci`)
@@ -386,7 +386,7 @@ Container builds use Docker BuildKit with local cache directories:
 - `build/scripts/docker-build-component.sh` stores per-component caches in `.cache/buildkit/<component>`.
 - `build/scripts/docker-build-cluster.sh` stores the cluster image cache in `.cache/buildkit/cluster`.
 - `mise run python:build:multiarch` stores per-platform wheel caches in `.cache/buildkit/python-wheels/<platform>` for local builds when using a `docker-container` buildx driver.
-- Rust-heavy Dockerfiles use BuildKit cache mounts for cargo registry and target directories, keyed by image name and `TARGETARCH`, with `sharing=locked` to prevent concurrent cache corruption in parallel CI builds.
+- Rust-heavy Dockerfiles use BuildKit cache mounts for cargo registry, cargo target, and sccache local disk directories, keyed by image name and `TARGETARCH`, with `sharing=locked` to prevent concurrent cache corruption in parallel CI builds. The cargo target mount gives cargo a persistent `target/` directory for true incremental rebuilds on source-only changes. sccache uses memcached in CI (`SCCACHE_MEMCACHED_ENDPOINT`) and falls back to the local disk cache mount for local dev builds, providing a second layer of caching at the compilation unit level.
 - When the active buildx driver is `docker` (not `docker-container`), local cache import/export flags are skipped automatically because the docker driver cannot export local caches. In CI, cache export is also skipped.
 - For local single-arch builds, the scripts auto-select a builder with the native `docker` driver (matching the active Docker context) so images land directly in the Docker image store without slow tarball export.
 
@@ -395,7 +395,7 @@ Container builds use Docker BuildKit with local cache directories:
 In CI pipelines:
 
 - Remote BuildKit daemons (`buildkit-amd64` and `buildkit-arm64`) are used as persistent builders via `driver: remote`. Their built-in layer cache persists across builds, so no external cache (registry-backed or otherwise) is needed in CI.
-- Rust lint/test jobs cache `.cache/sccache/` and `target/` with keys derived from `Cargo.lock` and Rust task config files, scoped per runner architecture.
+- Rust lint/test jobs cache `target/` with keys derived from `Cargo.lock` and Rust task config files, scoped per runner architecture. sccache uses a shared memcached backend (`SCCACHE_MEMCACHED_ENDPOINT`) instead of local disk.
 - CI sets `CARGO_INCREMENTAL=0` to favor deterministic clean builds over incremental metadata churn.
 - Publish jobs mirror `crazymax/osxcross:latest` into `$CI_REGISTRY_IMAGE/third_party/osxcross:latest` (when missing) and set `OSXCROSS_IMAGE` so macOS wheel Docker builds consume the mirrored image instead of pulling from Docker Hub on each run.
 - The sandbox e2e test job tags and pushes component images to the GitLab project registry (`$CI_REGISTRY_IMAGE`) and configures cluster bootstrap to pull from that remote registry with CI credentials.

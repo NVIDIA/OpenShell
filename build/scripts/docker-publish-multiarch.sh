@@ -121,6 +121,9 @@ for component in sandbox server; do
   if [ "$component" = "sandbox" ]; then
     BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
   fi
+  if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
+    BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
+  fi
   DOCKERFILE=$(resolve_dockerfile "${component}")
   FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
   docker buildx build \

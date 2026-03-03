@@ -26,7 +26,7 @@ ARG TARGETARCH
 ARG BUILDARCH
 ARG NAVIGATOR_CARGO_VERSION
 
-ENV SCCACHE_DIR=/tmp/sccache
+ARG SCCACHE_MEMCACHED_ENDPOINT
 
 WORKDIR /build
 
@@ -55,6 +55,8 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
     touch crates/navigator-bootstrap/src/lib.rs
 
 # Build dependencies only (cached unless Cargo.toml/lock changes).
+# sccache uses memcached in CI or the local disk cache mount for local dev.
+# The cargo-target mount gives cargo a persistent target/ dir for incremental rebuilds.
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
@@ -68,8 +70,6 @@ COPY dev-sandbox-policy.yaml ./
 COPY python/ python/
 
 # Touch source files to ensure they're rebuilt (not the cached dummy).
-# Touch build.rs and proto files to force proto code regeneration when the
-# cargo target cache mount retains stale OUT_DIR artifacts from prior builds.
 RUN touch crates/navigator-cli/src/main.rs \
     crates/navigator-cli/src/lib.rs \
     crates/navigator-bootstrap/src/lib.rs \

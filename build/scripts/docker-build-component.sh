@@ -93,10 +93,16 @@ if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
   OUTPUT_FLAG="--push"
 fi
 
+SCCACHE_ARGS=()
+if [[ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]]; then
+  SCCACHE_ARGS=(--build-arg "SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}")
+fi
+
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
+  ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
   -f "${DOCKERFILE}" \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
   --provenance=false \

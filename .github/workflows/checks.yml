@@ -9,6 +9,7 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
 
 permissions:
   contents: read
@@ -16,8 +17,12 @@ permissions:
 
 jobs:
   rust:
-    name: Rust
-    runs-on: build-amd64
+    name: Rust (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [build-amd64, build-arm64]
+    runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
@@ -26,13 +31,17 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Cache sccache
-        uses: actions/cache@v4
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
-          path: .cache/sccache
-          key: sccache-rust-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            sccache-rust-${{ runner.arch }}-
+          # Separate caches for clippy (check-like) vs test (full build)
+          # so they don't thrash each other's artifacts
+          shared-key: rust-checks-${{ matrix.runner }}
+          # Cache the sccache directory too
+          cache-directories: .cache/sccache
 
       - name: Format
         run: mise run rust:format:check
@@ -45,11 +54,15 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: mise x -- sccache --show-stats
 
   python:
-    name: Python
-    runs-on: build-amd64
+    name: Python (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [build-amd64, build-arm64]
+    runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
@@ -57,6 +70,9 @@ jobs:
         password: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: mise install
 
       - name: Install dependencies
         run: uv sync --frozen
