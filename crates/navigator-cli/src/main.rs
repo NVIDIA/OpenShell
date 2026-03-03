@@ -524,6 +524,10 @@ enum GatewayCommands {
     /// a libkrun microVM with port forwarding and persistent storage.
     /// The parent process stays alive to monitor the VM.
     Cluster {
+        /// Cluster name for kubeconfig context naming.
+        #[arg(long, default_value = "gateway")]
+        name: String,
+
         /// Cluster Docker image to extract rootfs from.
         ///
         /// Defaults to the same image used by `cluster admin deploy`.
@@ -535,7 +539,7 @@ enum GatewayCommands {
         port: u16,
 
         /// Host port for the k3s API server (mapped to guest port 6443).
-        /// If not set, the API server is not exposed to the host.
+        /// If not set, an ephemeral port is used for health checking only.
         #[arg(long)]
         kube_port: Option<u16>,
 
@@ -1373,6 +1377,7 @@ async fn main() -> Result<()> {
                 )?;
             }
             GatewayCommands::Cluster {
+                name,
                 image,
                 port,
                 kube_port,
@@ -1382,6 +1387,7 @@ async fn main() -> Result<()> {
                 krun_log_level,
             } => {
                 run::gateway_cluster(
+                    &name,
                     image.as_deref(),
                     port,
                     kube_port,

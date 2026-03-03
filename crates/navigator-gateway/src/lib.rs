@@ -66,3 +66,13 @@ pub fn wait_for_pid(pid: u32) -> Result<i32, GatewayError> {
         Ok(status)
     }
 }
+
+/// Check if a child process is still alive (non-blocking).
+///
+/// Returns `true` if the process exists and has not yet exited,
+/// `false` if it has exited or the PID is invalid.
+pub fn is_pid_alive(pid: u32) -> bool {
+    // kill(pid, 0) checks if we can signal the process without actually
+    // sending a signal. Returns 0 if the process exists.
+    unsafe { libc::kill(pid.cast_signed(), 0) == 0 }
+}

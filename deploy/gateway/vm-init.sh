@@ -211,5 +211,40 @@ if [ -d "$BUNDLED_MANIFESTS" ]; then
     done
 fi
 
+# Start k3s with a retry wrapper. On tmpfs, k3s sometimes crashes on first
+# boot with "duplicate key given in txn request" or "kine.sock: address
+# already in use" due to a race condition in kine's SQLite initialization.
+# This is transient and always succeeds on the second attempt.
+#
+# We retry up to 3 times with a brief cleanup pause between attempts.
+# On the final attempt, we exec to replace this process with k3s (PID 1).
+MAX_RETRIES=3
+RETRY=0
+
 echo "[vm-init] Starting k3s..."
-exec /bin/k3s "$@"
+while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
+    RETRY=$((RETRY + 1))
+
+    if [ "$RETRY" -eq "$MAX_RETRIES" ]; then
+        # Final attempt: exec into k3s so it becomes PID 1.
+        exec /bin/k3s "$@"
+    fi
+
+    # Non-final attempt: run k3s and check exit code.
+    /bin/k3s "$@" &
+    K3S_PID=$!
+    wait $K3S_PID
+    K3S_EXIT=$?
+
+    if [ "$K3S_EXIT" -eq 0 ]; then
+        exit 0
+    fi
+
+    echo "[vm-init] k3s exited with status $K3S_EXIT (attempt $RETRY/$MAX_RETRIES)"
+
+    # Clean up stale kine socket and lock files before retrying.
+    rm -f /run/k3s/server/kine.sock 2>/dev/null
+    rm -f /run/k3s/server/db/state.db-wal 2>/dev/null
+    rm -f /run/k3s/server/db/state.db-shm 2>/dev/null
+    sleep 2
+done

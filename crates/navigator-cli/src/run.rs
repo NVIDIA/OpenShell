@@ -3162,6 +3162,7 @@ pub fn gateway_run(
 /// 4. Waits for the child VM process to exit
 #[allow(clippy::too_many_arguments)]
 pub fn gateway_cluster(
+    cluster_name: &str,
     image: Option<&str>,
     gateway_port: u16,
     kube_port: Option<u16>,
@@ -3260,6 +3261,13 @@ pub fn gateway_cluster(
     // The gateway itself is .1, and the first (and only) DHCP client
     // gets .3 (observed empirically — .2 may be reserved internally).
     let guest_ip = "192.168.127.3";
+
+    // We always need the kube API port forwarded for health checking and
+    // kubeconfig extraction. If the user didn't specify --kube-port, pick
+    // an ephemeral port.
+    let effective_kube_port =
+        kube_port.unwrap_or_else(|| navigator_bootstrap::pick_available_port().unwrap_or(6444));
+
     let forward_ports = |local_port: u16, remote_port: u16| -> Result<()> {
         let body = format!(
             r#"{{"local":":{}","remote":"{}:{}","protocol":"tcp"}}"#,
@@ -3287,10 +3295,8 @@ pub fn gateway_cluster(
 
     // Forward the navigator gateway port.
     forward_ports(gateway_port, 30051)?;
-    // Optionally forward the kube API port.
-    if let Some(kp) = kube_port {
-        forward_ports(kp, 6443)?;
-    }
+    // Always forward the kube API port (for health checks + kubeconfig).
+    forward_ports(effective_kube_port, 6443)?;
 
     // Step 4: Build the microVM configuration.
     println!("Booting k3s cluster in microVM...");
@@ -3300,9 +3306,14 @@ pub fn gateway_cluster(
     println!("  memory:    {mem} MiB");
     println!("  network:   gvproxy (guest IP: {guest_ip})");
     println!("  gateway:   localhost:{gateway_port} -> guest:30051");
-    if let Some(kp) = kube_port {
-        println!("  kube API:  localhost:{kp} -> guest:6443");
-    }
+    println!(
+        "  kube API:  localhost:{effective_kube_port} -> guest:6443{}",
+        if kube_port.is_none() {
+            " (internal)"
+        } else {
+            ""
+        }
+    );
     println!("  state:     {}", k3s_state_dir.display());
     println!("  console:   {}", console_log.display());
     println!();
@@ -3366,11 +3377,120 @@ pub fn gateway_cluster(
         "  (tail -f {} for VM console output)",
         console_log.display()
     );
+    println!();
 
-    // Step 6: Wait for the child process.
+    // Step 6: Wait for k3s API server to become ready.
+    //
+    // We poll the /readyz endpoint on the forwarded kube port. k3s typically
+    // takes 15-45 seconds to boot, but the kine race condition on tmpfs can
+    // cause it to crash and restart once, so we allow up to 120 seconds.
+    let readyz_url = format!("https://localhost:{effective_kube_port}/readyz");
+    let health_timeout = Duration::from_secs(120);
+    let health_interval = Duration::from_secs(2);
+    let start = Instant::now();
+
+    let mut api_ready = false;
+    while start.elapsed() < health_timeout {
+        // Check if the child process is still alive.
+        if !navigator_gateway::is_pid_alive(child_pid) {
+            // Child exited before becoming ready.
+            return Err(miette::miette!(
+                "microVM exited before k3s became ready (PID: {child_pid})\n\
+                 Check console log: {}",
+                console_log.display()
+            ));
+        }
+
+        // Probe the readyz endpoint (skip TLS verification — self-signed cert).
+        let probe = Command::new("curl")
+            .args(["-sk", "--max-time", "2", &readyz_url])
+            .output();
+
+        if let Ok(output) = probe {
+            let body = String::from_utf8_lossy(&output.stdout);
+            if body.contains("ok") {
+                api_ready = true;
+                break;
+            }
+        }
+
+        std::thread::sleep(health_interval);
+    }
+
+    if !api_ready {
+        // Don't kill the VM — it may still be starting up. Just warn.
+        eprintln!(
+            "warning: k3s API server did not become ready within {}s",
+            health_timeout.as_secs()
+        );
+        eprintln!(
+            "  The VM is still running (PID: {child_pid}). Check: tail -f {}",
+            console_log.display()
+        );
+    }
+
+    // Step 7: Extract and store kubeconfig.
+    //
+    // k3s writes its kubeconfig to /etc/rancher/k3s/k3s.yaml inside the guest.
+    // Since the rootfs is mapped via virtio-fs, we can read it directly from
+    // the host filesystem.
+    if api_ready {
+        let elapsed = start.elapsed();
+        println!("k3s API server ready ({:.1}s)", elapsed.as_secs_f64());
+
+        let kubeconfig_guest_path = rootfs_dir.join("etc/rancher/k3s/k3s.yaml");
+        match std::fs::read_to_string(&kubeconfig_guest_path) {
+            Ok(raw_kubeconfig) if is_valid_kubeconfig(&raw_kubeconfig) => {
+                // Rewrite the kubeconfig: point server URL to the forwarded port
+                // and rename the cluster/context/user entries.
+                let rewritten = navigator_bootstrap::rewrite_kubeconfig(
+                    &raw_kubeconfig,
+                    cluster_name,
+                    Some(effective_kube_port),
+                );
+
+                // Store in the standard navigator kubeconfig location.
+                let kubeconfig_path = navigator_bootstrap::stored_kubeconfig_path(cluster_name)
+                    .map_err(|e| miette::miette!("failed to resolve kubeconfig path: {e}"))?;
+                navigator_bootstrap::store_kubeconfig(&kubeconfig_path, &rewritten)
+                    .map_err(|e| miette::miette!("failed to store kubeconfig: {e}"))?;
+
+                println!("Kubeconfig written to {}", kubeconfig_path.display());
+                println!();
+                println!("Cluster is ready! To use:");
+                println!("  export KUBECONFIG={}", kubeconfig_path.display());
+                println!("  kubectl get nodes");
+            }
+            Ok(_) => {
+                eprintln!(
+                    "warning: kubeconfig at {} is not valid yet",
+                    kubeconfig_guest_path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: could not read kubeconfig from {}: {e}",
+                    kubeconfig_guest_path.display()
+                );
+                eprintln!("  k3s may not have written it yet; the VM is still running.");
+            }
+        }
+    }
+
+    println!();
+    println!("Press Ctrl+C to stop the cluster.");
+
+    // Step 8: Wait for the child process (blocks until VM exits or signal).
+    //
+    // The default SIGINT handler sends SIGINT to the entire process group,
+    // which includes the forked VM child. So Ctrl+C will naturally propagate
+    // to the VM. After the child exits, we clean up gvproxy.
     let status = wait_for_child(child_pid)?;
     if status == 0 {
         println!("microVM exited cleanly");
+    } else if status == 130 {
+        // 128 + SIGINT(2) = 130 — user pressed Ctrl+C.
+        println!("microVM stopped");
     } else {
         eprintln!("microVM exited with status {status}");
     }
@@ -3382,6 +3502,11 @@ pub fn gateway_cluster(
     let _ = std::fs::remove_file(&gvproxy_api_sock);
 
     Ok(())
+}
+
+/// Check if a string looks like a valid kubeconfig.
+fn is_valid_kubeconfig(contents: &str) -> bool {
+    contents.contains("apiVersion:") && contents.contains("clusters:")
 }
 
 /// Extract a rootfs from a Docker image by creating a temporary container
