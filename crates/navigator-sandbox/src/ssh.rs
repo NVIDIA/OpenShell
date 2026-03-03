@@ -29,6 +29,7 @@ const PREFACE_MAGIC: &str = "NSSH1";
 #[allow(clippy::too_many_arguments)]
 pub async fn run_ssh_server(
     listen_addr: SocketAddr,
+    ready_tx: tokio::sync::oneshot::Sender<()>,
     policy: SandboxPolicy,
     workdir: Option<String>,
     handshake_secret: String,
@@ -51,6 +52,11 @@ pub async fn run_ssh_server(
     let ca_paths = ca_file_paths.map(Arc::new);
     let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
     info!(addr = %listen_addr, "SSH server listening");
+
+    // Signal that the SSH server has bound the socket and is ready to accept
+    // connections. The parent task awaits this before spawning the entrypoint
+    // process, ensuring exec requests won't race against server startup.
+    let _ = ready_tx.send(());
 
     loop {
         let (stream, peer) = listener.accept().await.into_diagnostic()?;

@@ -404,9 +404,13 @@ pub async fn run_sandbox(
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
         let provider_env_clone = provider_env.clone();
+
+        let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
+
         tokio::spawn(async move {
             if let Err(err) = ssh::run_ssh_server(
                 addr,
+                ssh_ready_tx,
                 policy_clone,
                 workdir_clone,
                 secret,
@@ -421,6 +425,25 @@ pub async fn run_sandbox(
                 tracing::error!(error = %err, "SSH server failed");
             }
         });
+
+        // Wait for the SSH server to bind its socket before spawning the
+        // entrypoint process. This prevents exec requests from racing against
+        // SSH server startup when Kubernetes marks the pod Ready.
+        match timeout(Duration::from_secs(10), ssh_ready_rx).await {
+            Ok(Ok(())) => {
+                info!("SSH server is ready to accept connections");
+            }
+            Ok(Err(_)) => {
+                return Err(miette::miette!(
+                    "SSH server task failed before signaling ready"
+                ));
+            }
+            Err(_) => {
+                return Err(miette::miette!(
+                    "SSH server did not start within 10 seconds"
+                ));
+            }
+        }
     }
 
     #[cfg(target_os = "linux")]
