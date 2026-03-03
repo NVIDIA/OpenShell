@@ -27,6 +27,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Separate caches for clippy (check-like) vs test (full build)
+          # so they don't thrash each other's artifacts
+          shared-key: rust-checks
+          # Cache the sccache directory too
+          cache-directories: .cache/sccache
+
       - name: Format
         run: mise run rust:format:check
 
