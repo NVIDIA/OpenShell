@@ -80,7 +80,7 @@ async fn completion_grpc_client(
     server: &str,
     cluster_name: &str,
 ) -> Option<NavigatorClient<Channel>> {
-    let tls_opts = TlsOptions::new(None, None, None).with_cluster_name(cluster_name);
+    let tls_opts = TlsOptions::default().with_cluster_name(cluster_name);
     let materials = require_tls_materials(server, &tls_opts).ok()?;
     let tls_config = build_tonic_tls_config(&materials);
     let endpoint = Endpoint::from_shared(server.to_string())

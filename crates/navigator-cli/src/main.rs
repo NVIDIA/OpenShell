@@ -89,18 +89,6 @@ struct Cli {
     #[arg(long, short, global = true, env = "NAVIGATOR_CLUSTER")]
     cluster: Option<String>,
 
-    /// Path to TLS CA certificate (PEM).
-    #[arg(long, env = "NAVIGATOR_TLS_CA", global = true)]
-    tls_ca: Option<PathBuf>,
-
-    /// Path to TLS client certificate (PEM).
-    #[arg(long, env = "NAVIGATOR_TLS_CERT", global = true)]
-    tls_cert: Option<PathBuf>,
-
-    /// Path to TLS client private key (PEM).
-    #[arg(long, env = "NAVIGATOR_TLS_KEY", global = true)]
-    tls_key: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -814,7 +802,7 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
-    let tls = TlsOptions::new(cli.tls_ca, cli.tls_cert, cli.tls_key);
+    let tls = TlsOptions::default();
 
     // Set up logging based on verbosity
     let log_level = match cli.verbose {

@@ -24,8 +24,8 @@ const DEFAULT_CLUSTER_NAME: &str = "navigator";
 /// Returns `false` for explicit TLS configuration errors, auth failures, and other
 /// non-connectivity issues.
 pub fn should_attempt_bootstrap(error: &miette::Report, tls: &TlsOptions) -> bool {
-    // If the user explicitly provided TLS options and they failed, that's a
-    // configuration error, not a missing-cluster situation.
+    // If TLS paths were explicitly provided (e.g. in tests) and they failed,
+    // that's a configuration error, not a missing-cluster situation.
     if tls.has_any() {
         return is_connectivity_error(error);
     }
