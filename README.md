@@ -1,4 +1,4 @@
-# NemoClaw 🗺️
+# NemoClaw 
 
 NemoClaw is the runtime environment for autonomous agents—the "Matrix" where they live, work, and verify.
 
