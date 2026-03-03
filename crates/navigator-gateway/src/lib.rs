@@ -69,10 +69,21 @@ pub fn wait_for_pid(pid: u32) -> Result<i32, GatewayError> {
 
 /// Check if a child process is still alive (non-blocking).
 ///
-/// Returns `true` if the process exists and has not yet exited,
-/// `false` if it has exited or the PID is invalid.
+/// Uses `waitpid(WNOHANG)` to check if the child has exited without blocking.
+/// This correctly detects zombie processes (which `kill(pid, 0)` does not —
+/// zombies are still signalable). If the child has exited, it is reaped.
+///
+/// Returns `true` if the process is still running, `false` if it has exited
+/// or the PID is invalid.
+///
+/// **Warning**: If the child has exited, this function reaps it. A subsequent
+/// call to [`wait_for_pid`] on the same PID will fail with ECHILD.
 pub fn is_pid_alive(pid: u32) -> bool {
-    // kill(pid, 0) checks if we can signal the process without actually
-    // sending a signal. Returns 0 if the process exists.
-    unsafe { libc::kill(pid.cast_signed(), 0) == 0 }
+    let mut status: libc::c_int = 0;
+    // waitpid with WNOHANG returns:
+    //   0        — child still running
+    //   pid      — child has exited (reaped)
+    //   -1       — error (e.g., not our child, invalid pid)
+    let ret = unsafe { libc::waitpid(pid.cast_signed(), &raw mut status, libc::WNOHANG) };
+    ret == 0
 }

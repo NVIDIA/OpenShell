@@ -325,8 +325,9 @@ impl KrunContextBuilder {
     /// When set, libkrun adds a virtio-net device backed by the gvproxy
     /// Unix datagram socket at the given path. This **automatically disables
     /// TSI**, so the guest gets a real `eth0` interface with DHCP from
-    /// gvproxy (default subnet: 192.168.127.0/24, gateway: 192.168.127.1,
-    /// guest IP: 192.168.127.2).
+    /// gvproxy (default subnet: 192.168.127.0/24, gateway: 192.168.127.1).
+    /// The guest IP is assigned by DHCP — with gvproxy v0.8.6, the first
+    /// client gets 192.168.127.3 (not .2 as some docs suggest).
     ///
     /// Port forwarding is handled by gvproxy's HTTP API, not by
     /// `krun_set_port_map` (which is TSI-only).
@@ -523,9 +524,6 @@ impl KrunContextBuilder {
                 c_envp.as_ptr(),
             )
         })?;
-
-        // Keep CStrings alive until after the FFI call.
-        drop(c_env_strings);
 
         info!(
             ctx_id,

@@ -3549,7 +3549,7 @@ fn extract_rootfs_from_docker(image_ref: &str, rootfs_dir: &Path) -> Result<()> 
         .map_err(|e| miette::miette!("failed to create rootfs dir: {e}"))?;
 
     println!("  Exporting container filesystem...");
-    let export = Command::new("docker")
+    let mut export = Command::new("docker")
         .args(["export", &container_name])
         .stdout(std::process::Stdio::piped())
         .spawn()
@@ -3558,9 +3558,22 @@ fn extract_rootfs_from_docker(image_ref: &str, rootfs_dir: &Path) -> Result<()> 
     let tar_status = Command::new("tar")
         .args(["xf", "-", "-C"])
         .arg(rootfs_dir)
-        .stdin(export.stdout.unwrap())
+        .stdin(export.stdout.take().unwrap())
         .status()
         .map_err(|e| miette::miette!("tar extract failed: {e}"))?;
+
+    // Wait for docker export to finish and check its exit status.
+    let export_status = export
+        .wait()
+        .map_err(|e| miette::miette!("failed to wait for docker export: {e}"))?;
+    if !export_status.success() {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &container_name])
+            .status();
+        return Err(miette::miette!(
+            "docker export failed with status {export_status}"
+        ));
+    }
 
     if !tar_status.success() {
         // Clean up on failure.
