@@ -28,7 +28,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Cache Rust target and registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           # Separate caches for clippy (check-like) vs test (full build)
           # so they don't thrash each other's artifacts
