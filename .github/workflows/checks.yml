@@ -35,7 +35,12 @@ jobs:
         run: mise install
 
       - name: Activate mise environment
-        run: echo "$(mise env --shell bash)" >> "$GITHUB_ENV"
+        run: |
+          # Write env vars in dotenv format (KEY=VALUE, no PATH).
+          mise env --dotenv >> "$GITHUB_ENV"
+          # Write mise-managed PATH entries to GITHUB_PATH so tool binaries
+          # (like sccache) resolve directly instead of through mise shims.
+          mise env -s bash | grep '^export PATH=' | sed "s/^export PATH='//;s/'$//" | tr ':' '\n' >> "$GITHUB_PATH"
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
