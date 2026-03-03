@@ -146,6 +146,19 @@ network_policies:
       - { path: "/sandbox/.vscode-server/**" }
       - { path: "/sandbox/.vscode-remote-containers/**" }
 
+  # --- Private network access (allowed_ips demo) ---
+  # Allows any binary to reach services on the k3s cluster pod network
+  # (10.42.0.0/16). Without allowed_ips, the proxy's SSRF check blocks
+  # all connections to private RFC 1918 addresses.
+  cluster_pods:
+    name: cluster_pods
+    endpoints:
+      - port: 8080
+        allowed_ips:
+          - "10.42.0.0/16"
+    binaries:
+      - { path: "/**" }
+
 inference:
   allowed_routes:
     - local

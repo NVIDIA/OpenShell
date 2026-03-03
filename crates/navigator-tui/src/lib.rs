@@ -521,31 +521,73 @@ async fn handle_sandbox_delete(app: &mut App) {
 // ---------------------------------------------------------------------------
 
 /// Fetch sandbox details (policy + providers) when entering the sandbox screen.
+///
+/// Uses `GetSandbox` for metadata/providers, then `GetSandboxPolicy` for the
+/// current live policy (which may have been updated since creation).
 async fn fetch_sandbox_detail(app: &mut App) {
     let sandbox_name = match app.selected_sandbox_name() {
         Some(n) => n.to_string(),
         None => return,
     };
 
-    let req = navigator_core::proto::GetSandboxRequest { name: sandbox_name };
+    let req = navigator_core::proto::GetSandboxRequest {
+        name: sandbox_name.clone(),
+    };
 
-    match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
-        Ok(Ok(resp)) => {
-            if let Some(sandbox) = resp.into_inner().sandbox {
-                if let Some(spec) = &sandbox.spec {
-                    app.sandbox_providers_list = spec.providers.clone();
-                    if let Some(policy) = &spec.policy {
-                        app.policy_lines = render_policy_lines(policy);
-                        app.sandbox_policy = Some(policy.clone());
+    // Step 1: Fetch sandbox metadata (providers, sandbox ID).
+    let sandbox_id =
+        match tokio::time::timeout(Duration::from_secs(5), app.client.get_sandbox(req)).await {
+            Ok(Ok(resp)) => {
+                if let Some(sandbox) = resp.into_inner().sandbox {
+                    if let Some(spec) = &sandbox.spec {
+                        app.sandbox_providers_list = spec.providers.clone();
                     }
+                    if sandbox.id.is_empty() {
+                        None
+                    } else {
+                        Some(sandbox.id)
+                    }
+                } else {
+                    None
                 }
             }
-        }
-        Ok(Err(e)) => {
-            tracing::warn!("failed to fetch sandbox detail: {}", e.message());
-        }
-        Err(_) => {
-            tracing::warn!("sandbox detail request timed out");
+            Ok(Err(e)) => {
+                tracing::warn!("failed to fetch sandbox detail: {}", e.message());
+                None
+            }
+            Err(_) => {
+                tracing::warn!("sandbox detail request timed out");
+                None
+            }
+        };
+
+    // Step 2: Fetch the current live policy (includes updates since creation).
+    if let Some(id) = sandbox_id {
+        let policy_req = navigator_core::proto::GetSandboxPolicyRequest { sandbox_id: id };
+
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            app.client.get_sandbox_policy(policy_req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                if let Some(mut policy) = inner.policy {
+                    // Use the version from the policy history, not from the
+                    // policy proto's own version field (which is always 1).
+                    policy.version = inner.version;
+                    app.policy_lines = render_policy_lines(&policy);
+                    app.sandbox_policy = Some(policy);
+                }
+            }
+            Ok(Err(e)) => {
+                let msg = e.message().to_string();
+                tracing::warn!("failed to fetch sandbox policy: {msg}");
+            }
+            Err(_) => {
+                tracing::warn!("sandbox policy request timed out");
+            }
         }
     }
 
@@ -813,9 +855,10 @@ fn render_policy_lines(
                 continue;
             }
 
-            // Rule header — include L7/TLS annotation if any endpoint has it.
+            // Rule header — include L7/TLS/allowed_ips annotation if any endpoint has it.
             let has_l7 = rule.endpoints.iter().any(|e| !e.protocol.is_empty());
             let has_tls_term = rule.endpoints.iter().any(|e| e.tls == "terminate");
+            let has_allowed_ips = rule.endpoints.iter().any(|e| !e.allowed_ips.is_empty());
             let mut annotations = Vec::new();
             if has_l7 {
                 // Use the first L7 endpoint's protocol for the label.
@@ -831,6 +874,9 @@ fn render_policy_lines(
             if has_tls_term {
                 annotations.push("TLS terminate".to_string());
             }
+            if has_allowed_ips {
+                annotations.push("private IP".to_string());
+            }
 
             let title = if annotations.is_empty() {
                 format!("  {name}")
@@ -841,12 +887,25 @@ fn render_policy_lines(
 
             // Endpoints.
             for ep in &rule.endpoints {
-                let addr = if ep.port > 0 {
+                // Render address: host:port, *:port (hostless), host, or *
+                let addr = if !ep.host.is_empty() && ep.port > 0 {
                     format!("    {}:{}", ep.host, ep.port)
-                } else {
+                } else if !ep.host.is_empty() {
                     format!("    {}", ep.host)
+                } else if ep.port > 0 {
+                    format!("    *:{}", ep.port)
+                } else {
+                    "    *".to_string()
                 };
                 lines.push(Line::from(Span::styled(addr, styles::TEXT)));
+
+                // Allowed IPs (CIDR allowlist for private IP access).
+                if !ep.allowed_ips.is_empty() {
+                    lines.push(Line::from(vec![
+                        Span::styled("      Allowed IPs: ", styles::MUTED),
+                        Span::styled(ep.allowed_ips.join(", "), styles::TEXT),
+                    ]));
+                }
 
                 // L7 allow rules.
                 for l7 in &ep.rules {
