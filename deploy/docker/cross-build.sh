@@ -79,6 +79,8 @@ export_cross_env() {
 # Run cargo build with the correct --target flag and env vars.
 # All extra arguments are forwarded to cargo (e.g. --release -p my-crate).
 # Automatically wraps with sccache when available.
+# If the build fails due to stale artifacts in a cached target directory,
+# cleans the target and retries once.
 cargo_cross_build() {
   export_cross_env
   # Unset empty SCCACHE_MEMCACHED_ENDPOINT so sccache falls back to local
@@ -91,7 +93,11 @@ cargo_cross_build() {
   fi
   local target_flag=""
   if is_cross; then target_flag="--target $(rust_target)"; fi
-  cargo build $target_flag "$@"
+  if ! cargo build $target_flag "$@"; then
+    echo "cargo build failed; cleaning stale target cache and retrying..." >&2
+    cargo clean 2>/dev/null || true
+    cargo build $target_flag "$@"
+  fi
 }
 
 # Print the directory containing the compiled binary.
