@@ -16,7 +16,6 @@ COPY deploy/docker/cross-build.sh /usr/local/bin/
 RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
 
 ARG SCCACHE_MEMCACHED_ENDPOINT
-ENV SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}
 
 WORKDIR /build
 
