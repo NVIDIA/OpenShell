@@ -209,7 +209,7 @@ wheels = [
 ]
 
 [[package]]
-name = "navigator"
+name = "nemoclaw"
 source = { virtual = "." }
 dependencies = [
     { name = "cloudpickle" },

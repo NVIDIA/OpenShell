@@ -3,9 +3,9 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "navigator"
+name = "nemoclaw"
 dynamic = ["version"]
-description = "Navigator is the runtime environment for autonomous agents"
+description = "NemoClaw is the runtime environment for autonomous agents"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
@@ -38,13 +38,14 @@ dev = [
 # Don't try to install the root package with uv sync - use uv pip install . instead
 # This is needed because maturin bin packages don't install the binary with editable installs
 # (both `uv pip install -e .` and `maturin develop` skip binary installation)
-# Use `uv pip install .` (without -e) to install the navigator CLI binary
+# Use `uv pip install .` (without -e) to install the nemoclaw CLI binary
 package = false
 
 [tool.maturin]
 bindings = "bin"
 manifest-path = "crates/navigator-cli/Cargo.toml"
 python-source = "python"
+module-name = "navigator"
 
 [tool.ruff]
 target-version = "py312"

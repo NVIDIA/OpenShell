@@ -8,11 +8,10 @@ FROM ${OSXCROSS_IMAGE} AS osxcross
 FROM python:${PYTHON_VERSION}-slim AS builder
 
 ARG TARGETARCH
-ARG NAVIGATOR_VERSION
+ARG NAVIGATOR_CARGO_VERSION
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/osxcross/lib"
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=${NAVIGATOR_VERSION}
 
 COPY --from=osxcross /osxcross /osxcross
 
@@ -41,10 +40,60 @@ ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
 ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
 
-COPY . .
+# Copy dependency manifests first for better caching.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/navigator-cli/Cargo.toml crates/navigator-cli/Cargo.toml
+COPY crates/navigator-core/Cargo.toml crates/navigator-core/Cargo.toml
+COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
+COPY crates/navigator-router/Cargo.toml crates/navigator-router/Cargo.toml
+COPY crates/navigator-sandbox/Cargo.toml crates/navigator-sandbox/Cargo.toml
+COPY crates/navigator-server/Cargo.toml crates/navigator-server/Cargo.toml
+COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
+COPY crates/navigator-core/build.rs crates/navigator-core/build.rs
+COPY proto/ proto/
+
+# Create dummy source files to build dependencies.
+RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-providers/src crates/navigator-router/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
+    echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
+    echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
+    echo "fn main() {}" > crates/navigator-server/src/main.rs && \
+    touch crates/navigator-core/src/lib.rs && \
+    touch crates/navigator-providers/src/lib.rs && \
+    touch crates/navigator-router/src/lib.rs && \
+    touch crates/navigator-bootstrap/src/lib.rs
+
+# Build dependencies only (cached unless Cargo.toml/lock changes).
+RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH},sharing=locked,target=/build/target \
+    cargo build --release --target aarch64-apple-darwin -p navigator-cli 2>/dev/null || true
+
+# Copy actual source code and Python packaging files.
+COPY crates/ crates/
+COPY pyproject.toml README.md ./
+COPY dev-sandbox-policy.yaml ./
+COPY python/ python/
+
+# Touch source files to ensure they're rebuilt (not the cached dummy).
+# Touch build.rs and proto files to force proto code regeneration when the
+# cargo target cache mount retains stale OUT_DIR artifacts from prior builds.
+RUN touch crates/navigator-cli/src/main.rs \
+    crates/navigator-cli/src/lib.rs \
+    crates/navigator-bootstrap/src/lib.rs \
+    crates/navigator-core/src/lib.rs \
+    crates/navigator-providers/src/lib.rs \
+    crates/navigator-router/src/lib.rs \
+    crates/navigator-sandbox/src/main.rs \
+    crates/navigator-server/src/main.rs \
+    crates/navigator-core/build.rs \
+    proto/*.proto
 
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH},sharing=locked,target=/build/target \
+    if [ -n "${NAVIGATOR_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NAVIGATOR_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
     maturin build --release --target aarch64-apple-darwin --out /wheels
 
 FROM scratch AS wheels

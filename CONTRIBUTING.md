@@ -327,14 +327,16 @@ automatically, so you generally do not need to generate stubs manually.
 ### Publishing
 
 Versions are derived from git tags using `setuptools_scm`. No version bumps need to be committed.
+Python wheel builds inject version at build time via
+`NAVIGATOR_CARGO_VERSION` (Cargo/SemVer), applied inside wheel-builder Docker
+layers, so publish flows do not edit `Cargo.toml`/`Cargo.lock` in the working
+tree.
 
 **Version commands:**
 
 ```bash
 mise run version:print             # Show computed versions (python, cargo, docker)
 mise run version:print -- --cargo  # Show cargo version only
-mise run version:set               # Update Cargo.toml with git-derived version (or specified with --version)
-mise run version:reset             # Restore Cargo.toml to git state
 ```
 
 **Publishing credentials (one-time setup):**
@@ -345,18 +347,24 @@ NAV_PYPI_USERNAME=$USER
 NAV_PYPI_PASSWORD=$ARTIFACTORY_PASSWORD" >> .env
 ```
 
-Docker publishing in CI uses AWS credentials for ECR. Python publishing uses
-`NAV_PYPI_*` credentials for Artifactory.
+Docker publishing in CI uses AWS credentials for ECR. Python publishing uses a
+two-stage flow: wheels are uploaded to S3, then an internal-network runner
+publishes them to Artifactory with `NAV_PYPI_*` credentials.
 
 **Main branch publish (CI):**
 
 - Publishes Docker multiarch images to ECR as `:dev`, `:latest`, and a versioned dev tag.
+- Builds Linux + macOS (arm64) Python wheels and uploads them to
+  `s3://navigator-pypi-artifacts/navigator/<wheel-version>/`.
+- Runs a publish job on the `nv` runner to list that version prefix, download
+  the wheels, and publish them to Artifactory.
 
 **Tag release publish (CI):**
 
 - Push a semver tag (`vX.Y.Z`) to trigger release jobs.
 - CI publishes Docker multiarch images to ECR as `:X.Y.Z` (no `:latest`).
-- CI publishes Linux + macOS (arm64) Python wheels to Artifactory and creates GitHub release notes.
+- CI stages Linux + macOS (arm64) Python wheels in S3 and publishes to
+  Artifactory from the `nv` runner.
 
 **Tagging a release:**
 

@@ -1404,6 +1404,28 @@ fn is_valid_env_key(key: &str) -> bool {
     bytes.all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
 }
 
+/// Maximum number of attempts when establishing the SSH transport to a sandbox.
+/// The sandbox SSH server may not be listening yet when the pod is marked Ready,
+/// so we retry transient connection failures with exponential backoff.
+const SSH_CONNECT_MAX_ATTEMPTS: u32 = 4;
+
+/// Initial backoff duration between SSH connection retries (doubles each attempt).
+const SSH_CONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Returns `true` if the gRPC status represents a transient SSH connection error
+/// that is worth retrying (e.g. the sandbox SSH server is not yet listening).
+fn is_retryable_ssh_error(status: &Status) -> bool {
+    if status.code() != tonic::Code::Internal {
+        return false;
+    }
+    let msg = status.message();
+    msg.contains("Connection reset by peer")
+        || msg.contains("Connection refused")
+        || msg.contains("failed to establish ssh transport")
+        || msg.contains("failed to connect to ssh proxy")
+        || msg.contains("failed to start ssh proxy")
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn stream_exec_over_ssh(
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
@@ -1422,31 +1444,86 @@ async fn stream_exec_over_ssh(
         "ExecSandbox command started"
     );
 
-    let (local_proxy_port, proxy_task) =
-        start_single_use_ssh_proxy(target_host, target_port, handshake_secret)
-            .await
-            .map_err(|e| Status::internal(format!("failed to start ssh proxy: {e}")))?;
+    // Retry loop: the sandbox SSH server may not be accepting connections yet
+    // even though the pod is marked Ready by Kubernetes. We retry transient
+    // connection errors with exponential backoff.
+    let (exit_code, proxy_task) = {
+        let mut last_err: Option<Status> = None;
 
-    let exec = run_exec_with_russh(local_proxy_port, command, stdin_payload, tx.clone());
-    let exit_code = if timeout_seconds == 0 {
-        exec.await?
-    } else if let Ok(result) = tokio::time::timeout(
-        std::time::Duration::from_secs(u64::from(timeout_seconds)),
-        exec,
-    )
-    .await
-    {
-        result?
-    } else {
-        let _ = tx
-            .send(Ok(ExecSandboxEvent {
-                payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Exit(
-                    ExecSandboxExit { exit_code: 124 },
-                )),
-            }))
-            .await;
-        let _ = proxy_task.await;
-        return Ok(());
+        let mut result = None;
+        for attempt in 0..SSH_CONNECT_MAX_ATTEMPTS {
+            if attempt > 0 {
+                let backoff = SSH_CONNECT_INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                warn!(
+                    sandbox_id = %sandbox_id,
+                    attempt = attempt + 1,
+                    backoff_ms = %backoff.as_millis(),
+                    error = %last_err.as_ref().unwrap(),
+                    "Retrying SSH transport establishment"
+                );
+                tokio::time::sleep(backoff).await;
+            }
+
+            let (local_proxy_port, proxy_task) = match start_single_use_ssh_proxy(
+                target_host,
+                target_port,
+                handshake_secret,
+            )
+            .await
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    last_err = Some(Status::internal(format!("failed to start ssh proxy: {e}")));
+                    continue;
+                }
+            };
+
+            let exec =
+                run_exec_with_russh(local_proxy_port, command, stdin_payload.clone(), tx.clone());
+
+            let exec_result = if timeout_seconds == 0 {
+                exec.await
+            } else if let Ok(r) = tokio::time::timeout(
+                std::time::Duration::from_secs(u64::from(timeout_seconds)),
+                exec,
+            )
+            .await
+            {
+                r
+            } else {
+                // Timed out — not retryable, report timeout exit code immediately.
+                let _ = tx
+                    .send(Ok(ExecSandboxEvent {
+                        payload: Some(navigator_core::proto::exec_sandbox_event::Payload::Exit(
+                            ExecSandboxExit { exit_code: 124 },
+                        )),
+                    }))
+                    .await;
+                let _ = proxy_task.await;
+                return Ok(());
+            };
+
+            match exec_result {
+                Ok(exit_code) => {
+                    result = Some((exit_code, proxy_task));
+                    break;
+                }
+                Err(status) => {
+                    let _ = proxy_task.await;
+                    if is_retryable_ssh_error(&status) && attempt + 1 < SSH_CONNECT_MAX_ATTEMPTS {
+                        last_err = Some(status);
+                        continue;
+                    }
+                    return Err(status);
+                }
+            }
+        }
+
+        result.ok_or_else(|| {
+            last_err.unwrap_or_else(|| {
+                Status::internal("ssh connection failed after exhausting retries")
+            })
+        })?
     };
 
     let _ = proxy_task.await;
@@ -1580,24 +1657,30 @@ async fn start_single_use_ssh_proxy(
 
     let task = tokio::spawn(async move {
         let Ok((mut client_conn, _)) = listener.accept().await else {
+            warn!("SSH proxy: failed to accept local connection");
             return;
         };
         let Ok(mut sandbox_conn) = TcpStream::connect((target_host.as_str(), target_port)).await
         else {
+            warn!(target_host = %target_host, target_port, "SSH proxy: failed to connect to sandbox");
             return;
         };
         let Ok(preface) = build_preface(&uuid::Uuid::new_v4().to_string(), &handshake_secret)
         else {
+            warn!("SSH proxy: failed to build handshake preface");
             return;
         };
-        if sandbox_conn.write_all(preface.as_bytes()).await.is_err() {
+        if let Err(e) = sandbox_conn.write_all(preface.as_bytes()).await {
+            warn!(error = %e, "SSH proxy: failed to send handshake preface");
             return;
         }
         let mut response = String::new();
-        if read_line(&mut sandbox_conn, &mut response).await.is_err() {
+        if let Err(e) = read_line(&mut sandbox_conn, &mut response).await {
+            warn!(error = %e, "SSH proxy: failed to read handshake response");
             return;
         }
         if response.trim() != "OK" {
+            warn!(response = %response.trim(), "SSH proxy: handshake rejected by sandbox");
             return;
         }
         let _ = tokio::io::copy_bidirectional(&mut client_conn, &mut sandbox_conn).await;

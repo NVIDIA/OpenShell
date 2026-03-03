@@ -1,45 +1,98 @@
+# syntax=docker/dockerfile:1.6
+
 ARG PYTHON_VERSION=3.12
 
-FROM --platform=$BUILDPLATFORM python:${PYTHON_VERSION}-slim AS builder
-
-ARG TARGETPLATFORM
-ARG NAVIGATOR_VERSION
+FROM --platform=$BUILDPLATFORM python:${PYTHON_VERSION}-slim AS base
 
 ENV PATH="/root/.cargo/bin:${PATH}"
-ENV SETUPTOOLS_SCM_PRETEND_VERSION=${NAVIGATOR_VERSION}
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     curl \
     gcc \
-    gcc-aarch64-linux-gnu \
-    gcc-x86-64-linux-gnu \
     libc6-dev \
-    libc6-dev-arm64-cross \
-    libc6-dev-amd64-cross \
     pkg-config \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-RUN rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
 RUN pip install --no-cache-dir maturin
 
-WORKDIR /build
-COPY . .
+COPY deploy/docker/cross-build.sh /usr/local/bin/
 
-RUN case "${TARGETPLATFORM}" in \
-      "linux/amd64") \
-        export CARGO_BUILD_TARGET="x86_64-unknown-linux-gnu" \
-        && export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER="x86_64-linux-gnu-gcc" ;; \
-      "linux/arm64") \
-        export CARGO_BUILD_TARGET="aarch64-unknown-linux-gnu" \
-        && export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER="aarch64-linux-gnu-gcc" ;; \
-      *) \
-        echo "Unsupported TARGETPLATFORM: ${TARGETPLATFORM}" >&2 \
-        && exit 1 ;; \
-    esac \
-    && maturin build --release --target "${CARGO_BUILD_TARGET}" --out /wheels
+FROM base AS builder
+
+ARG TARGETARCH
+ARG BUILDARCH
+ARG NAVIGATOR_CARGO_VERSION
+
+ENV SCCACHE_DIR=/tmp/sccache
+
+WORKDIR /build
+
+RUN . cross-build.sh && install_cross_toolchain && install_sccache && add_rust_target
+
+# Copy dependency manifests first for better caching.
+COPY Cargo.toml Cargo.lock ./
+COPY crates/navigator-cli/Cargo.toml crates/navigator-cli/Cargo.toml
+COPY crates/navigator-core/Cargo.toml crates/navigator-core/Cargo.toml
+COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
+COPY crates/navigator-router/Cargo.toml crates/navigator-router/Cargo.toml
+COPY crates/navigator-sandbox/Cargo.toml crates/navigator-sandbox/Cargo.toml
+COPY crates/navigator-server/Cargo.toml crates/navigator-server/Cargo.toml
+COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
+COPY crates/navigator-core/build.rs crates/navigator-core/build.rs
+COPY proto/ proto/
+
+# Create dummy source files to build dependencies.
+RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-providers/src crates/navigator-router/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
+    echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
+    echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
+    echo "fn main() {}" > crates/navigator-server/src/main.rs && \
+    touch crates/navigator-core/src/lib.rs && \
+    touch crates/navigator-providers/src/lib.rs && \
+    touch crates/navigator-router/src/lib.rs && \
+    touch crates/navigator-bootstrap/src/lib.rs
+
+# Build dependencies only (cached unless Cargo.toml/lock changes).
+RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
+    . cross-build.sh && cargo_cross_build --release -p navigator-cli 2>/dev/null || true
+
+# Copy actual source code and Python packaging files.
+COPY crates/ crates/
+COPY pyproject.toml README.md ./
+COPY dev-sandbox-policy.yaml ./
+COPY python/ python/
+
+# Touch source files to ensure they're rebuilt (not the cached dummy).
+# Touch build.rs and proto files to force proto code regeneration when the
+# cargo target cache mount retains stale OUT_DIR artifacts from prior builds.
+RUN touch crates/navigator-cli/src/main.rs \
+    crates/navigator-cli/src/lib.rs \
+    crates/navigator-bootstrap/src/lib.rs \
+    crates/navigator-core/src/lib.rs \
+    crates/navigator-providers/src/lib.rs \
+    crates/navigator-router/src/lib.rs \
+    crates/navigator-sandbox/src/main.rs \
+    crates/navigator-server/src/main.rs \
+    crates/navigator-core/build.rs \
+    proto/*.proto
+
+RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
+    . cross-build.sh && \
+    export_cross_env && \
+    export RUSTC_WRAPPER=sccache && \
+    export CARGO_BUILD_TARGET="$(rust_target)" && \
+    if [ -n "${NAVIGATOR_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NAVIGATOR_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
+    maturin build --release --target "${CARGO_BUILD_TARGET}" --out /wheels
 
 FROM scratch AS wheels
 COPY --from=builder /wheels/*.whl /

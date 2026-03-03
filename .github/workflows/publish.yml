@@ -9,6 +9,10 @@ permissions:
   contents: read
   packages: write
 
+defaults:
+  run:
+    shell: bash
+
 jobs:
   # ---------------------------------------------------------------------------
   # Build container images to GHCR (same as E2E pipeline)
@@ -29,20 +33,11 @@ jobs:
       component: cluster
 
   # ---------------------------------------------------------------------------
-  # Run E2E tests against the built images
-  # ---------------------------------------------------------------------------
-  e2e:
-    needs: [build-server, build-sandbox, build-cluster]
-    uses: ./.github/workflows/e2e-test.yml
-    with:
-      image-tag: ${{ github.sha }}
-
-  # ---------------------------------------------------------------------------
   # Publish multi-arch container images to ECR
   # ---------------------------------------------------------------------------
   publish-containers:
     name: Publish Containers
-    needs: [e2e]
+    needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 120
     container:
@@ -60,21 +55,6 @@ jobs:
       AWS_DEFAULT_REGION: us-west-2
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # Full history needed for setuptools_scm version
-
-      - name: Install Python dependencies
-        run: uv sync --frozen
-
-      - name: Compute version
-        id: version
-        run: |
-          VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
-          echo "docker=$VERSION_DOCKER" >> "$GITHUB_OUTPUT"
-          echo "Docker image version: $VERSION_DOCKER"
-
-      - name: Set version in source files
-        run: mise run --no-prepare version:set
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -90,26 +70,148 @@ jobs:
           DOCKER_BUILDER: navigator
           IMAGE_TAG: dev
           TAG_LATEST: "true"
-          EXTRA_DOCKER_TAGS: ${{ steps.version.outputs.docker }}
         run: mise run --no-prepare docker:publish:cluster:multiarch
 
   # ---------------------------------------------------------------------------
-  # Publish Python packages (placeholder)
+  # Build Python wheels and stage them in S3
   # ---------------------------------------------------------------------------
-  publish-python:
-    name: Publish Python
-    needs: [e2e]
+  build-python-wheels:
+    name: Stage Python Wheels
+    needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
-    if: false  # TODO: Enable when Python packaging is ready
+    timeout-minutes: 120
+    outputs:
+      wheel_version: ${{ steps.version.outputs.wheel_version }}
+      s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-west-2
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Placeholder
-        run: echo "Python packaging not yet implemented"
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Compute Python version
+        id: version
+        run: |
+          set -euo pipefail
+          WHEEL_VERSION=$(uv run python build/scripts/release.py get-version --python)
+          echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build Python wheels
+        run: |
+          set -euo pipefail
+          WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
+          CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+          NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
+          NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+          ls -la target/wheels/*.whl
+
+      - name: Upload wheels to S3
+        id: upload
+        run: |
+          set -euo pipefail
+          WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
+          S3_PREFIX="nemoclaw/${WHEEL_VERSION}"
+          aws s3 cp target/wheels/ "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" --recursive --exclude "*" --include "*.whl"
+          aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
+          echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # Publish Python wheels to Artifactory from S3 staging
+  # ---------------------------------------------------------------------------
+  publish-python:
+    name: Publish Python
+    needs: [build-python-wheels]
+    runs-on: [self-hosted, nv]
+    timeout-minutes: 10
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
+      NAV_PYPI_REPOSITORY_URL: https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local
+      NAV_PYPI_USERNAME: ${{ secrets.NAV_PYPI_USERNAME }}
+      NAV_PYPI_PASSWORD: ${{ secrets.NAV_PYPI_PASSWORD }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      AWS_DEFAULT_REGION: us-west-2
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install publish dependencies
+      run: |
+        set -euo pipefail
+        python -m pip install --upgrade pip uv
+        
+        if ! command -v aws >/dev/null 2>&1; then
+          ARCH="$(uname -m)"
+          case "$ARCH" in
+            x86_64|amd64) AWSCLI_ARCH="x86_64" ;;
+            aarch64|arm64) AWSCLI_ARCH="aarch64" ;;
+            *)
+              echo "Unsupported architecture for AWS CLI installer: $ARCH" >&2
+              exit 1
+              ;;
+          esac
+        
+          rm -rf aws awscliv2.zip
+          curl --fail --silent --show-error --location \
+            "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
+            --output awscliv2.zip
+          unzip -q awscliv2.zip
+          ./aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+        fi
+        
+        aws --version
+        uv --version
+
+    - name: List and download versioned wheels from S3
+      run: |
+        set -euo pipefail
+        WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
+        S3_PREFIX="${{ needs.build-python-wheels.outputs.s3_prefix }}"
+        OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "length(Contents)" --output text)
+        if [ "$OBJECT_COUNT" = "None" ] || [ "$OBJECT_COUNT" = "0" ]; then
+          echo "No wheel artifacts found for ${WHEEL_VERSION} at s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" >&2
+          exit 1
+        fi
+        aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "Contents[].Key" --output text
+        mkdir -p target/wheels
+        aws s3 cp "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" target/wheels/ --recursive --exclude "*" --include "*.whl"
+        ls -la target/wheels/*.whl
+
+    - name: Publish wheels to Artifactory
+      run: |
+        set -euo pipefail
+        WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
+        uv run python build/scripts/release.py python-publish --version "$WHEEL_VERSION"
