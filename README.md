@@ -1,3 +1,7 @@
+**NOTICE: Repository has moved to Github**
+
+Please use https://github.com/NVIDIA/nv-agent-env
+
 # Navigator 🗺️
 
 Navigator is the runtime environment for autonomous agents—the "Matrix" where they live, work, and verify.
@@ -11,27 +15,68 @@ It transforms the data center from a static deployment target into a continuous 
 ### Prerequisites
 
 - **Docker** — Docker Desktop (or a Docker daemon) must be running.
-- **Python 3.12+** and [uv](https://docs.astral.sh/uv/)
+- **Python 3.12+**
+- [**uv**](https://docs.astral.sh/uv/) 0.9+
 
 ### Install
 
 ```bash
-uv pip install nemoclaw --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
+uv pip install nemoclaw \
+  --upgrade \
+  --pre \
+  --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
-The `navigator` binary is installed into your Python environment. Use `uv run navigator` to invoke it, or activate your venv first (`source .venv/bin/activate`).
+The `navigator` binary is installed into your Python environment. Use `uv run navigator` to invoke it, or activate your venv first with `source .venv/bin/activate`.
 
 ### Create a sandbox
 
+To install a Openclaw cluster and start a sandbox
+
 ```bash
-uv run navigator sandbox create -- claude  # or opencode or codex
+navigator sandbox create -- claude  # or opencode or codex
 ```
 
-If you want to run a sandbox on a remote machine, pass `--remote [remote-ssh-host]`. This will start a sandbox on the remote host.
+To run a sandbox on a remote machine, pass `--remote [remote-ssh-host]`.
 
-The sandbox container includes a minimal networking toolset by default: `ping`, `dig`, `nslookup`, `nc`, `traceroute`, and `netstat`.
+For more information see `navigator sandbox create --help`.
 
-It also includes common coding harnesses such as: `opencode`, `claude`, and `codex`.
+The sandbox container includes the following tools by default:
+
+| Category   | Tools                                                    |
+| ---------- | -------------------------------------------------------- |
+| Agent      | `claude`, `opencode`, `codex`                            |
+| Language   | `python` (3.12), `node` (22)                             |
+| Developer  | `gh`, `git`, `vim`, `nano`                               |
+| Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
+
+For additional sandbox images see the [NVIDIA/NemoClaw-Community](https://github.com/NVIDIA/NemoClaw-Community) images. You can also [build your own custom images](examples/bring-your-own-container.md).
+
+### Deploy a cluster
+
+**Note:** `navigator sandbox create` automatically deploys a cluster if one isn't already running.
+
+To deploy a cluster explicitly:
+
+```bash
+navigator cluster admin deploy
+```
+
+For remote deployment:
+
+```bash
+navigator cluster admin deploy --remote user@host
+```
+
+### Upgrading
+
+To upgrade, redeploy your cluster to pick up the latest server and sandbox images:
+
+```bash
+navigator cluster admin deploy
+```
+
+This will prompt you to recreate the cluster. Select "yes" to recreate the cluster.
 
 ## Developing
 
