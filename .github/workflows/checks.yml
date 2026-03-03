@@ -36,11 +36,10 @@ jobs:
 
       - name: Activate mise environment
         run: |
-          # Write env vars in dotenv format (KEY=VALUE, no PATH).
-          mise env --dotenv >> "$GITHUB_ENV"
-          # Write mise-managed PATH entries to GITHUB_PATH so tool binaries
-          # (like sccache) resolve directly instead of through mise shims.
-          mise env -s bash | grep '^export PATH=' | sed "s/^export PATH='//;s/'$//" | tr ':' '\n' >> "$GITHUB_PATH"
+          # Resolve RUSTC_WRAPPER to the absolute sccache binary path so that
+          # cargo invokes it directly instead of going through the mise shim
+          # (which fails with "No version is set for shim: sccache").
+          echo "RUSTC_WRAPPER=$(mise which sccache)" >> "$GITHUB_ENV"
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
@@ -62,7 +61,7 @@ jobs:
 
       - name: sccache stats
         if: always()
-        run: sccache --show-stats
+        run: mise x -- sccache --show-stats
 
   python:
     name: Python (${{ matrix.runner }})
