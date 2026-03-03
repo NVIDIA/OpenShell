@@ -24,7 +24,7 @@ use crate::docker::{
     check_existing_cluster, create_ssh_docker_client, destroy_cluster_resources, ensure_container,
     ensure_image, ensure_network, ensure_volume, start_container, stop_container,
 };
-use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
+use crate::kubeconfig::rewrite_kubeconfig_remote;
 use crate::metadata::{
     create_cluster_metadata, create_cluster_metadata_with_host, extract_host_from_ssh_destination,
     local_gateway_host, resolve_ssh_hostname,
@@ -38,8 +38,8 @@ use crate::runtime::{
 
 pub use crate::docker::ExistingClusterInfo;
 pub use crate::kubeconfig::{
-    default_local_kubeconfig_path, print_kubeconfig, stored_kubeconfig_path,
-    update_local_kubeconfig,
+    default_local_kubeconfig_path, print_kubeconfig, rewrite_kubeconfig, store_kubeconfig,
+    stored_kubeconfig_path, update_local_kubeconfig,
 };
 pub use crate::metadata::{
     ClusterMetadata, clear_active_cluster, get_cluster_metadata, list_clusters,
