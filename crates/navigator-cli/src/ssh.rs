@@ -812,7 +812,7 @@ pub fn print_ssh_config(cluster: &str, name: &str) {
 
     let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
 
-    println!("Host nav-{name}");
+    println!("Host nemoclaw-{name}");
     println!("    User sandbox");
     println!("    StrictHostKeyChecking no");
     println!("    UserKnownHostsFile /dev/null");

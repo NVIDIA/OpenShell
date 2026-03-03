@@ -44,16 +44,16 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         .ok_or_else(|| {
             miette::miette!(
                 "No active cluster.\n\
-                 Set one with: nav cluster use <name>\n\
-                 Or deploy a new cluster: nav cluster admin deploy"
+                 Set one with: ncl cluster use <name>\n\
+                 Or deploy a new cluster: ncl cluster admin deploy"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown cluster '{name}'.\n\
-             Deploy it first: nav cluster admin deploy --name {name}\n\
-             Or list available clusters: nav cluster list"
+             Deploy it first: ncl cluster admin deploy --name {name}\n\
+             Or list available clusters: ncl cluster list"
         )
     })?;
 
@@ -137,10 +137,10 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `nav ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `ncl ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `nav ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `ncl ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -927,7 +927,7 @@ async fn main() -> Result<()> {
                             if remote.is_some() {
                                 eprintln!(
                                     "{} --remote ignored: cluster '{}' is already active. \
-                                     To redeploy, use: nav cluster admin deploy",
+                                     To redeploy, use: ncl cluster admin deploy",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -1307,8 +1307,8 @@ async fn main() -> Result<()> {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
                                 "Unknown cluster '{c}'.\n\
-                                 Deploy it first: nav cluster admin deploy --name {c}\n\
-                                 Or list available clusters: nav cluster list"
+                                  Deploy it first: ncl cluster admin deploy --name {c}\n\
+                                  Or list available clusters: ncl cluster list"
                             )
                         })?;
                         meta.gateway_endpoint

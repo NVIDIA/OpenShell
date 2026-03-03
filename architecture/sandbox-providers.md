@@ -49,7 +49,7 @@ The gRPC surface is defined in `proto/navigator.proto`:
   - provider registry and per-provider discovery plugins,
   - shared discovery engine and context abstraction for testability.
 - `crates/navigator-cli`
-  - `nav provider ...` command handlers,
+  - `ncl provider ...` command handlers,
   - sandbox provider requirement resolution in `sandbox create`.
 - `crates/navigator-server` (gateway)
   - provider CRUD gRPC handlers,
@@ -158,7 +158,7 @@ This keeps provider tests isolated from host environment and filesystem.
 
 ### Provider CRUD
 
-`nav provider create --type <type> --name <name> [--from-existing] [--credential k=v]... [--config k=v]...`
+`ncl provider create --type <type> --name <name> [--from-existing] [--credential k=v]... [--config k=v]...`
 
 - `--credential` supports `KEY=VALUE` and `KEY` forms.
   - `KEY=VALUE` sets an explicit credential value.
@@ -169,14 +169,14 @@ This keeps provider tests isolated from host environment and filesystem.
 
 Also supported:
 
-- `nav provider get <name>`
-- `nav provider list`
-- `nav provider update <name> ...`
-- `nav provider delete <name> [<name>...]`
+- `ncl provider get <name>`
+- `ncl provider list`
+- `ncl provider update <name> ...`
+- `ncl provider delete <name> [<name>...]`
 
 ### Sandbox Create
 
-`nav sandbox create --provider gitlab -- claude`
+`ncl sandbox create --provider gitlab -- claude`
 
 Resolution logic (CLI side, `crates/navigator-cli/src/run.rs`):
 
@@ -272,7 +272,7 @@ isolation, privilege dropping, seccomp, and Landlock restrictions via `pre_exec`
 
 **2. SSH shell sessions** (`crates/navigator-sandbox/src/ssh.rs`):
 
-When a user connects via `nav sandbox connect`, a PTY shell is spawned:
+When a user connects via `ncl sandbox connect`, a PTY shell is spawned:
 
 ```rust
 let mut cmd = Command::new(shell);
@@ -293,7 +293,7 @@ passes it to `spawn_pty_shell()` for each new shell or exec request.
 ### End-to-End Flow
 
 ```
-CLI: nav sandbox create -- claude
+CLI: ncl sandbox create -- claude
   |
   +-- detect_provider_from_command(["claude"]) -> "claude"
   +-- ensure_required_providers() -> discovers local ANTHROPIC_API_KEY

@@ -39,18 +39,18 @@ Out of scope:
 
 ## CLI Commands
 
-All cluster lifecycle commands live under `nav cluster admin`:
+All cluster lifecycle commands live under `ncl cluster admin`:
 
 | Command | Description |
 |---|---|
-| `nav cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
-| `nav cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `nav cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
-| `nav cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
-| `nav cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
-| `nav cluster status` | Show gateway health via gRPC/HTTP |
-| `nav cluster use <name>` | Set the active cluster |
-| `nav cluster list` | List all clusters with metadata |
+| `ncl cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
+| `ncl cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
+| `ncl cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
+| `ncl cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
+| `ncl cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
+| `ncl cluster status` | Show gateway health via gRPC/HTTP |
+| `ncl cluster use <name>` | Set the active cluster |
+| `ncl cluster list` | List all clusters with metadata |
 
 The `--name` flag defaults to `"nemoclaw"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--cluster` flag, then `NEMOCLAW_CLUSTER` env, then `~/.config/nemoclaw/active_cluster` file.
 
@@ -77,7 +77,7 @@ sequenceDiagram
   participant L as Local Docker daemon
   participant R as Remote Docker daemon (SSH)
 
-  U->>C: nav cluster admin deploy --remote user@host
+  U->>C: ncl cluster admin deploy --remote user@host
   C->>B: deploy_cluster(DeployOptions)
 
   B->>B: create_ssh_docker_client (ssh://, 600s timeout)
@@ -329,7 +329,7 @@ ssh -L 6443:127.0.0.1:6443 -N user@host
 CLI helper:
 
 ```bash
-nav cluster admin tunnel --name <name>
+ncl cluster admin tunnel --name <name>
 ```
 
 The `--remote` flag is optional; the CLI resolves the SSH destination from stored cluster metadata. Pass `--print-command` to print the SSH command without executing it.
@@ -379,7 +379,7 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 
 ## Auto-Bootstrap from `sandbox create`
 
-When `nav sandbox create` cannot connect to a cluster (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
+When `ncl sandbox create` cannot connect to a cluster (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
 
 1. `should_attempt_bootstrap()` in `crates/navigator-cli/src/bootstrap.rs` checks the error type. It returns `true` for connectivity errors and missing default TLS materials, but `false` for TLS handshake/auth errors.
 2. If running in a terminal, the user is prompted to confirm.

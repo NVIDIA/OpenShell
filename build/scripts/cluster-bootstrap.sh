@@ -209,7 +209,7 @@ VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
 if [ "${MODE}" = "fast" ]; then
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
-    nav cluster admin destroy --name "${CLUSTER_NAME}"
+    ncl cluster admin destroy --name "${CLUSTER_NAME}"
   fi
 fi
 
@@ -221,7 +221,7 @@ elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
   done
 fi
 
-DEPLOY_CMD=(nav cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
+DEPLOY_CMD=(ncl cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
 
 if [ -n "${GATEWAY_HOST:-}" ]; then
   DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")

@@ -71,15 +71,15 @@ mise run cluster
 mise run cluster:build
 
 # Create a sandbox with Claude (or opencode / codex)
-nav sandbox create -- claude
+ncl sandbox create -- claude
 ```
 
-Note: `nav` builds the CLI from source on first run, which takes several minutes while Rust compiles. Subsequent runs are fast.
+Note: `ncl` builds the CLI from source on first run, which takes several minutes while Rust compiles. Subsequent runs are fast.
 
 ### Other useful commands
 
 ```bash
-nav --help                        # CLI help
+ncl --help                        # CLI help
 mise build                        # Debug build (without running)
 mise test                         # Run all project tests
 mise run sandbox                  # Run sandbox container interactively
@@ -89,24 +89,24 @@ mise run sandbox                  # Run sandbox container interactively
 
 The CLI supports dynamic shell completions. Run `nemoclaw completions --help` for full per-shell setup instructions.
 
-For the `nav` wrapper, generate completions from the real binary and rewrite the registration to target `nav`:
+For the `ncl` wrapper, generate completions from the real binary and rewrite the registration to target `ncl`:
 
 **Fish:**
 
 ```bash
-nemoclaw completions fish | sed 's/--command nemoclaw/--command nav/' > ~/.config/fish/completions/nav.fish
+nemoclaw completions fish | sed 's/--command nemoclaw/--command ncl/' > ~/.config/fish/completions/ncl.fish
 ```
 
 **Bash:**
 
 ```bash
-nemoclaw completions bash | sed 's/_clap_complete_nemoclaw/_clap_complete_nav/g; s/ nemoclaw$/ nav/' > ~/.local/share/bash-completion/completions/nav
+nemoclaw completions bash | sed 's/_clap_complete_nemoclaw/_clap_complete_ncl/g; s/ nemoclaw$/ ncl/' > ~/.local/share/bash-completion/completions/ncl
 ```
 
 **Zsh:**
 
 ```bash
-nemoclaw completions zsh | sed 's/_clap_dynamic_completer_nemoclaw/_clap_dynamic_completer_nav/g; s/ nemoclaw$/ nav/' > ~/.zfunc/_nav
+nemoclaw completions zsh | sed 's/_clap_dynamic_completer_nemoclaw/_clap_dynamic_completer_ncl/g; s/ nemoclaw$/ ncl/' > ~/.zfunc/_ncl
 ```
 
 ## Sandbox SSH access
@@ -210,13 +210,13 @@ Use `--image` to run a sandbox with any Linux container image:
 
 ```bash
 # Run an interactive shell in an Ubuntu sandbox
-nav sandbox create --image ubuntu:24.04
+ncl sandbox create --image ubuntu:24.04
 
 # Run a command in a custom image
-nav sandbox create --image python:3.12-slim -- python3 -c "print('hello')"
+ncl sandbox create --image python:3.12-slim -- python3 -c "print('hello')"
 
 # Sync local files and run in a custom image
-nav sandbox create --image node:22 --sync -- npm test
+ncl sandbox create --image node:22 --sync -- npm test
 ```
 
 The supervisor binary is side-loaded from the standard sandbox image via a Kubernetes init
@@ -226,24 +226,24 @@ details on the bootstrap flow and constraints.
 
 #### Building and Pushing Custom Images
 
-Use `nav sandbox image push` to build a Dockerfile and push the resulting image into the
+Use `ncl sandbox image push` to build a Dockerfile and push the resulting image into the
 cluster's containerd runtime so it can be used with `--image`:
 
 ```bash
 # Build and push from a Dockerfile
-nav sandbox image push --dockerfile ./Dockerfile
+ncl sandbox image push --dockerfile ./Dockerfile
 
 # Specify a custom tag
-nav sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+ncl sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
 
 # Specify a build context directory
-nav sandbox image push --dockerfile ./build/Dockerfile --context ./build
+ncl sandbox image push --dockerfile ./build/Dockerfile --context ./build
 
 # Pass build arguments
-nav sandbox image push --dockerfile ./Dockerfile --build-arg PYTHON_VERSION=3.12
+ncl sandbox image push --dockerfile ./Dockerfile --build-arg PYTHON_VERSION=3.12
 
 # Use the pushed image
-nav sandbox create --image my-sandbox:latest
+ncl sandbox create --image my-sandbox:latest
 ```
 
 The command builds the image using the local Docker daemon and pushes it into the cluster
@@ -320,20 +320,20 @@ export IMAGE_REPO_BASE=ghcr.io/${GITHUB_REPOSITORY}
 
 The cluster exposes ports 80/443 for gateway traffic and 6443 for the Kubernetes API.
 
-Once the cluster is deployed. You can interact with the cluster using standard `nav` CLI commands.
+Once the cluster is deployed. You can interact with the cluster using standard `ncl` CLI commands.
 
 ### Gateway mTLS for CLI
 
 When the cluster is configured to terminate TLS at the Gateway with client authentication, the
 CLI needs the generated client certificate bundle. The chart creates a `navigator-cli-client`
-Secret containing `ca.crt`, `tls.crt`, and `tls.key`. During `nav cluster admin deploy`, the
+Secret containing `ca.crt`, `tls.crt`, and `tls.key`. During `ncl cluster admin deploy`, the
 CLI bundle is automatically copied into `~/.config/nemoclaw/clusters/<name>/mtls`, where
 `<name>` comes from `NEMOCLAW_CLUSTER_NAME` or the host in `NEMOCLAW_CLUSTER` (localhost
 defaults to `nemoclaw`).
 
 ### Debugging Cluster Issues
 
-If a cluster fails to start or is unhealthy after `nav cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.agent/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
+If a cluster fails to start or is unhealthy after `ncl cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.agent/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
 
 ### Docker Build Tasks
 
@@ -482,7 +482,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 **Examples:**
 
 ```
-feat(cli): add --verbose flag to nav run
+feat(cli): add --verbose flag to ncl run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
 chore(deps): bump tokio to 1.40

@@ -917,11 +917,7 @@ fn apply_required_env(
         "NEMOCLAW_TLS_CERT",
         "/etc/navigator-tls/client/tls.crt",
     );
-    upsert_env(
-        env,
-        "NEMOCLAW_TLS_KEY",
-        "/etc/navigator-tls/client/tls.key",
-    );
+    upsert_env(env, "NEMOCLAW_TLS_KEY", "/etc/navigator-tls/client/tls.key");
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {

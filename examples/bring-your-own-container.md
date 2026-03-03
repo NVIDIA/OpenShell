@@ -5,7 +5,7 @@ languages, libraries, and tools so they're available in every sandbox session.
 
 ## Prerequisites
 
-- A running nemoclaw cluster (`nav cluster admin deploy`)
+- A running nemoclaw cluster (`ncl cluster admin deploy`)
 - Docker daemon running
 
 ## Quick start
@@ -37,19 +37,19 @@ CMD ["sleep", "infinity"]
 Build and push it into the cluster:
 
 ```bash
-nav sandbox image push --dockerfile Dockerfile --tag my-python:latest
+ncl sandbox image push --dockerfile Dockerfile --tag my-python:latest
 ```
 
 Create a sandbox using the custom image:
 
 ```bash
-nav sandbox create --image my-python:latest -- python -c "import numpy; print(numpy.__version__)"
+ncl sandbox create --image my-python:latest -- python -c "import numpy; print(numpy.__version__)"
 ```
 
 Or start an interactive session:
 
 ```bash
-nav sandbox create --image my-python:latest
+ncl sandbox create --image my-python:latest
 ```
 
 ## How it works
@@ -86,5 +86,5 @@ TODO(#70): Remove this section once custom images are secure by default without 
 Delete the sandbox when you're done:
 
 ```bash
-nav sandbox delete <sandbox-name>
+ncl sandbox delete <sandbox-name>
 ```

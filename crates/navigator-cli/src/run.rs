@@ -514,8 +514,8 @@ pub fn cluster_use(name: &str) -> Result<()> {
     get_cluster_metadata(name).ok_or_else(|| {
         miette::miette!(
             "No cluster metadata found for '{name}'.\n\
-             Deploy a cluster first with: nav cluster admin deploy --name {name}\n\
-             Or list available clusters: nav cluster list"
+             Deploy a cluster first with: ncl cluster admin deploy --name {name}\n\
+             Or list available clusters: ncl cluster list"
         )
     })?;
 
@@ -534,7 +534,7 @@ pub fn cluster_list(cluster_flag: &Option<String>) -> Result<()> {
         println!();
         println!(
             "Deploy a cluster with: {}",
-            "nav cluster admin deploy".dimmed()
+            "ncl cluster admin deploy".dimmed()
         );
         return Ok(());
     }
@@ -869,7 +869,7 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
     let metadata = get_cluster_metadata(name).ok_or_else(|| {
         miette::miette!(
             "No cluster metadata found for '{name}'.\n\
-             Deploy a cluster first with: nav cluster admin deploy --name {name}"
+             Deploy a cluster first with: ncl cluster admin deploy --name {name}"
         )
     })?;
 
@@ -904,7 +904,7 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
         if let (Some(host), Some(kube_port)) = (&metadata.remote_host, metadata.kube_port) {
             println!();
             println!("{}", "SSH tunnel for kubectl access:".dimmed());
-            println!("  nav cluster admin tunnel --name {name}");
+            println!("  ncl cluster admin tunnel --name {name}");
             println!("Or manually:");
             println!("  ssh -L {kube_port}:127.0.0.1:6443 {host}");
         }
@@ -983,8 +983,8 @@ pub async fn sandbox_create_with_bootstrap(
     if !crate::bootstrap::confirm_bootstrap()? {
         return Err(miette::miette!(
             "No active cluster.\n\
-             Set one with: nav cluster use <name>\n\
-             Or deploy a new cluster: nav cluster admin deploy"
+             Set one with: ncl cluster use <name>\n\
+             Or deploy a new cluster: ncl cluster admin deploy"
         ));
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
@@ -1809,7 +1809,7 @@ pub async fn sandbox_image_push(
     eprintln!();
     eprintln!(
         "Use it with: {}",
-        format!("nav sandbox create --image {tag}").dimmed()
+        format!("ncl sandbox create --image {tag}").dimmed()
     );
 
     Ok(())
@@ -1896,7 +1896,7 @@ async fn ensure_required_providers(
         if !missing.is_empty() {
             if !std::io::stdin().is_terminal() {
                 return Err(miette::miette!(
-                    "missing required providers: {}. Create them first with `nav provider create --type <type> --name <name> --from-existing`, or set them up manually from inside the sandbox",
+                    "missing required providers: {}. Create them first with `ncl provider create --type <type> --name <name> --from-existing`, or set them up manually from inside the sandbox",
                     missing.join(", ")
                 ));
             }

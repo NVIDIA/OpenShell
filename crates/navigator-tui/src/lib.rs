@@ -603,7 +603,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
 /// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
 ///
-/// This replicates the `nav sandbox connect` flow but uses `Command::status()`
+/// This replicates the `ncl sandbox connect` flow but uses `Command::status()`
 /// instead of `exec()` so the TUI process survives.
 async fn handle_shell_connect(
     app: &mut App,

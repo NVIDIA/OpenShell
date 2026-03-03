@@ -32,7 +32,7 @@ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 This will append a block like:
 
 ```text
-Host nav-my-sandbox
+Host nemoclaw-my-sandbox
     User sandbox
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
@@ -44,13 +44,13 @@ Host nav-my-sandbox
 ### 3. Open VSCode
 
 Open VSCode and run **Remote-SSH: Connect to Host...** from the command
-palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `nav-my-sandbox` from the
+palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `nemoclaw-my-sandbox` from the
 list. VSCode will open a remote window connected to the sandbox.
 
 Alternatively, from the terminal:
 
 ```bash
-code --remote ssh-remote+nav-my-sandbox /sandbox
+code --remote ssh-remote+nemoclaw-my-sandbox /sandbox
 ```
 
 ### 4. Clean up
