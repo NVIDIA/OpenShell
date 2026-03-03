@@ -36,9 +36,11 @@ jobs:
 
       - name: Activate mise environment
         run: |
-          # Resolve RUSTC_WRAPPER to the absolute sccache binary path so that
-          # cargo invokes it directly instead of going through the mise shim
-          # (which fails with "No version is set for shim: sccache").
+          # Register sccache globally so the mise shim can resolve it.
+          # Without this, the shim fails with "No version is set for shim".
+          mise use -g github:mozilla/sccache@0.14.0
+          # Resolve RUSTC_WRAPPER to the absolute sccache binary so cargo
+          # invokes it directly, bypassing the shim entirely.
           echo "RUSTC_WRAPPER=$(mise which sccache)" >> "$GITHUB_ENV"
 
       - name: Cache Rust target and registry
