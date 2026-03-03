@@ -94,6 +94,15 @@ cargo_cross_build() {
   fi
   local target_flag=""
   if is_cross; then target_flag="--target $(rust_target)"; fi
+  # Detect profile from args: use "release" if --release is present, else "debug".
+  local profile="debug"
+  for arg in "$@"; do
+    case "$arg" in --release) profile="release" ;; esac
+  done
+  # Ensure the target deps directory exists. BuildKit cache mounts keyed by
+  # CARGO_TARGET_CACHE_SCOPE start empty on first use, and rustc fails with
+  # "No such file or directory" writing .d files if deps/ is missing.
+  mkdir -p "$(cross_output_dir "$profile")/deps"
   # Retry once after cleaning if the build fails. BuildKit cargo-target cache
   # mounts can retain stale .rmeta files from prior builds with different
   # dependency versions; cargo clean purges them so the retry succeeds.
@@ -101,6 +110,7 @@ cargo_cross_build() {
   if ! cargo build $target_flag "$@"; then
     echo "cargo build failed; cleaning stale target cache and retrying..." >&2
     cargo clean 2>/dev/null || true
+    mkdir -p "$(cross_output_dir "$profile")/deps"
     cargo build $target_flag "$@"
   fi
 }
