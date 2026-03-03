@@ -358,7 +358,7 @@ where
     // the local Docker daemon and streamed into the cluster's containerd so
     // k3s can resolve them without pulling from the remote registry.
     if remote_opts.is_none()
-        && let Ok(push_images_str) = std::env::var("NAVIGATOR_PUSH_IMAGES")
+        && let Ok(push_images_str) = std::env::var("NEMOCLAW_PUSH_IMAGES")
     {
         let images: Vec<&str> = push_images_str
             .split(',')
@@ -454,7 +454,7 @@ pub async fn ensure_cluster_image(version: &str) -> Result<String> {
 }
 
 fn default_cluster_image_ref() -> String {
-    if let Ok(image) = std::env::var("NAVIGATOR_CLUSTER_IMAGE")
+    if let Ok(image) = std::env::var("NEMOCLAW_CLUSTER_IMAGE")
         && !image.trim().is_empty()
     {
         return image;
@@ -462,7 +462,7 @@ fn default_cluster_image_ref() -> String {
     image::pull_registry_image()
 }
 
-/// Create the three TLS K8s secrets required by the Navigator server and sandbox pods.
+/// Create the three TLS K8s secrets required by the NemoClaw server and sandbox pods.
 ///
 /// Secrets are created via `kubectl` exec'd inside the cluster container:
 /// - `navigator-server-tls` (kubernetes.io/tls): server cert + key

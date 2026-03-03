@@ -6,14 +6,14 @@
 # Integration test for bidirectional file sync with a sandbox.
 #
 # Verifies the full flow:
-#   1. nav sandbox create --keep  (long-running sandbox for sync tests)
-#   2. nav sandbox sync <name> --up <local> <sandbox-dest>  (push)
-#   3. nav sandbox sync <name> --down <sandbox-path> <local-dest>  (pull)
+#   1. ncl sandbox create --keep  (long-running sandbox for sync tests)
+#   2. ncl sandbox sync <name> --up <local> <sandbox-dest>  (push)
+#   3. ncl sandbox sync <name> --down <sandbox-path> <local-dest>  (pull)
 #   4. Single-file round-trip
 #
 # Prerequisites:
-#   - A running navigator cluster (navigator cluster admin deploy)
-#   - The `navigator` binary on PATH (or set NAV_BIN)
+#   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
+#   - The `ncl` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_sandbox_sync.sh
@@ -29,10 +29,10 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 if [[ -n "${NAV_BIN:-}" ]]; then
   NAV="${NAV_BIN}"
-elif [[ -x "${PROJECT_ROOT}/target/debug/navigator" ]]; then
-  NAV="${PROJECT_ROOT}/target/debug/navigator"
+elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
+  NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
-  NAV="nav"
+  NAV="ncl"
 fi
 
 SANDBOX_NAME=""

@@ -6,8 +6,8 @@
 # Integration test for port forwarding through a sandbox.
 #
 # Prerequisites:
-#   - A running navigator cluster (nav cluster admin deploy)
-#   - The `nav` binary on PATH (or set NAV_BIN)
+#   - A running nemoclaw cluster (ncl cluster admin deploy)
+#   - The `ncl` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_port_forward.sh
@@ -18,16 +18,16 @@ set -euo pipefail
 # Configuration
 ###############################################################################
 
-# Resolve the navigator binary: prefer NAV_BIN, then target/debug, then PATH.
+# Resolve the nemoclaw binary: prefer NAV_BIN, then target/debug, then PATH.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 if [[ -n "${NAV_BIN:-}" ]]; then
   NAV="${NAV_BIN}"
-elif [[ -x "${PROJECT_ROOT}/target/debug/navigator" ]]; then
-  NAV="${PROJECT_ROOT}/target/debug/navigator"
+elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
+  NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
-  NAV="nav"
+  NAV="ncl"
 fi
 
 FORWARD_PORT="${FORWARD_PORT:-19876}"

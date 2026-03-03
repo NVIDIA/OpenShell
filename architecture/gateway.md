@@ -108,22 +108,22 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 
 | Flag | Env Var | Default | Description |
 |------|---------|---------|-------------|
-| `--port` | `NAVIGATOR_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
-| `--log-level` | `NAVIGATOR_LOG_LEVEL` | `info` | Tracing log level filter |
-| `--tls-cert` | `NAVIGATOR_TLS_CERT` | None | Path to PEM certificate file |
-| `--tls-key` | `NAVIGATOR_TLS_KEY` | None | Path to PEM private key file |
-| `--tls-client-ca` | `NAVIGATOR_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification |
-| `--client-tls-secret-name` | `NAVIGATOR_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
-| `--db-url` | `NAVIGATOR_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/navigator/navigator.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
-| `--sandbox-namespace` | `NAVIGATOR_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
-| `--sandbox-image` | `NAVIGATOR_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
-| `--grpc-endpoint` | `NAVIGATOR_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
-| `--ssh-gateway-host` | `NAVIGATOR_SSH_GATEWAY_HOST` | `127.0.0.1` | Public hostname returned in SSH session responses |
-| `--ssh-gateway-port` | `NAVIGATOR_SSH_GATEWAY_PORT` | `8080` | Public port returned in SSH session responses |
-| `--ssh-connect-path` | `NAVIGATOR_SSH_CONNECT_PATH` | `/connect/ssh` | HTTP path for SSH CONNECT/upgrade |
-| `--sandbox-ssh-port` | `NAVIGATOR_SANDBOX_SSH_PORT` | `2222` | SSH listen port inside sandbox pods |
-| `--ssh-handshake-secret` | `NAVIGATOR_SSH_HANDSHAKE_SECRET` | None | Shared HMAC-SHA256 secret for gateway-to-sandbox handshake |
-| `--ssh-handshake-skew-secs` | `NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS` | `300` | Allowed clock skew (seconds) for SSH handshake timestamps |
+| `--port` | `NEMOCLAW_SERVER_PORT` | `8080` | TCP listen port (binds `0.0.0.0`) |
+| `--log-level` | `NEMOCLAW_LOG_LEVEL` | `info` | Tracing log level filter |
+| `--tls-cert` | `NEMOCLAW_TLS_CERT` | None | Path to PEM certificate file |
+| `--tls-key` | `NEMOCLAW_TLS_KEY` | None | Path to PEM private key file |
+| `--tls-client-ca` | `NEMOCLAW_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification |
+| `--client-tls-secret-name` | `NEMOCLAW_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
+| `--db-url` | `NEMOCLAW_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/navigator/navigator.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
+| `--sandbox-namespace` | `NEMOCLAW_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
+| `--sandbox-image` | `NEMOCLAW_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
+| `--grpc-endpoint` | `NEMOCLAW_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
+| `--ssh-gateway-host` | `NEMOCLAW_SSH_GATEWAY_HOST` | `127.0.0.1` | Public hostname returned in SSH session responses |
+| `--ssh-gateway-port` | `NEMOCLAW_SSH_GATEWAY_PORT` | `8080` | Public port returned in SSH session responses |
+| `--ssh-connect-path` | `NEMOCLAW_SSH_CONNECT_PATH` | `/connect/ssh` | HTTP path for SSH CONNECT/upgrade |
+| `--sandbox-ssh-port` | `NEMOCLAW_SANDBOX_SSH_PORT` | `2222` | SSH listen port inside sandbox pods |
+| `--ssh-handshake-secret` | `NEMOCLAW_SSH_HANDSHAKE_SECRET` | None | Shared HMAC-SHA256 secret for gateway-to-sandbox handshake |
+| `--ssh-handshake-skew-secs` | `NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS` | `300` | Allowed clock skew (seconds) for SSH handshake timestamps |
 
 ## Shared State
 
@@ -453,7 +453,7 @@ The Helm chart template is at `deploy/helm/navigator/templates/statefulset.yaml`
 
 `SandboxClient` (`crates/navigator-server/src/sandbox/mod.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs.
 
-- **Create**: Translates a `Sandbox` proto into a Kubernetes `DynamicObject` with labels (`navigator.ai/sandbox-id`, `navigator.ai/managed-by: navigator`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`NAVIGATOR_SANDBOX_ID`, `NAVIGATOR_ENDPOINT`, `NAVIGATOR_SSH_LISTEN_ADDR`, etc.).
+- **Create**: Translates a `Sandbox` proto into a Kubernetes `DynamicObject` with labels (`navigator.ai/sandbox-id`, `navigator.ai/managed-by: navigator`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`NEMOCLAW_SANDBOX_ID`, `NEMOCLAW_ENDPOINT`, `NEMOCLAW_SSH_LISTEN_ADDR`, etc.).
 - **Delete**: Calls the Kubernetes API to delete the CRD by name. Returns `false` if already gone (404).
 - **Pod IP resolution**: `agent_pod_ip()` fetches the agent pod and reads `status.podIP`.
 

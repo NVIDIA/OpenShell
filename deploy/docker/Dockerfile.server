@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Navigator Server Docker image
+# NemoClaw Server Docker image
 # Multi-stage build with cross-compilation support for multi-arch
 
 # Stage 1: Rust builder (runs on build platform, cross-compiles for target)

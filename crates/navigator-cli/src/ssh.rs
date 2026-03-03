@@ -53,7 +53,7 @@ async fn ssh_session_config(
 
     let exe = std::env::current_exe()
         .into_diagnostic()
-        .wrap_err("failed to resolve navigator executable")?;
+        .wrap_err("failed to resolve NemoClaw executable")?;
     let exe_command = shell_escape(&exe.to_string_lossy());
 
     // If the server returned a loopback gateway address, override it with the
@@ -243,7 +243,7 @@ fn forward_pid_dir() -> Result<PathBuf> {
             .wrap_err("HOME is not set")?;
         PathBuf::from(home).join(".config")
     };
-    Ok(base.join("navigator").join("forwards"))
+    Ok(base.join("nemoclaw").join("forwards"))
 }
 
 /// PID file path for a specific sandbox + port forward.
@@ -805,14 +805,14 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
 ///
 /// The `ProxyCommand` uses `--cluster` so that `ssh-proxy` resolves the
 /// gateway endpoint and TLS certificates from the cluster metadata directory
-/// (`~/.config/navigator/clusters/<name>/mtls/`).
+/// (`~/.config/nemoclaw/clusters/<name>/mtls/`).
 pub fn print_ssh_config(cluster: &str, name: &str) {
-    let exe = std::env::current_exe().expect("failed to resolve navigator executable");
+    let exe = std::env::current_exe().expect("failed to resolve NemoClaw executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
     let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
 
-    println!("Host nav-{name}");
+    println!("Host nemoclaw-{name}");
     println!("    User sandbox");
     println!("    StrictHostKeyChecking no");
     println!("    UserKnownHostsFile /dev/null");

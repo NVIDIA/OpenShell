@@ -126,7 +126,7 @@ sequenceDiagram
 2. `crates/navigator-cli/src/ssh.rs` -- `sandbox_connect()` calls `ssh_session_config()`:
    - Resolves sandbox name to ID via `GetSandbox` gRPC
    - Creates an SSH session via `CreateSshSession` gRPC
-   - Builds a `ProxyCommand` string: `<navigator-exe> ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+   - Builds a `ProxyCommand` string: `<nemoclaw-exe> ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
    - If the gateway host is loopback but the cluster endpoint is not, `resolve_ssh_gateway()` overrides the host with the cluster endpoint's host
 3. `sandbox_connect()` builds an `ssh` command with:
    - `-o ProxyCommand=...` (the proxy command from step 2)
@@ -152,7 +152,7 @@ The `sandbox exec` path is identical to interactive connect except:
 
 ### Port Forwarding (`sandbox forward start`)
 
-`nav sandbox forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
+`ncl sandbox forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
 on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 
 #### CLI
@@ -161,14 +161,14 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 - Invokes OpenSSH with `-N -L <port>:127.0.0.1:<port> sandbox`.
 - By default stays attached in foreground until interrupted (Ctrl+C).
 - With `-d`/`--background`, SSH forks after auth and the CLI exits. The PID is
-  tracked in `~/.config/navigator/forwards/<name>-<port>.pid` along with sandbox id metadata.
-- `nav sandbox forward stop <port> <name>` validates PID ownership and then kills a background forward.
-- `nav sandbox forward list` shows all tracked forwards.
-- `nav sandbox forward stop` and `nav sandbox forward list` are local operations and do not require
+  tracked in `~/.config/nemoclaw/forwards/<name>-<port>.pid` along with sandbox id metadata.
+- `ncl sandbox forward stop <port> <name>` validates PID ownership and then kills a background forward.
+- `ncl sandbox forward list` shows all tracked forwards.
+- `ncl sandbox forward stop` and `ncl sandbox forward list` are local operations and do not require
   resolving an active cluster.
-- `nav sandbox create --forward <port>` starts a background forward before connect/exec, including
+- `ncl sandbox create --forward <port>` starts a background forward before connect/exec, including
   when no trailing command is provided.
-- `nav sandbox delete` auto-stops any active forwards for the deleted sandbox.
+- `ncl sandbox delete` auto-stops any active forwards for the deleted sandbox.
 
 #### Supervisor `direct-tcpip` handling
 
@@ -257,16 +257,16 @@ When `--sync` is passed to `sandbox create`, the CLI pushes local git-tracked fi
 3. `sandbox_sync_up_files()` creates an SSH session config, spawns `ssh <proxy> sandbox "tar xf - -C /sandbox"`, and streams a tar archive of the file list to the SSH child's stdin using the `tar` crate
 4. Files land in `/sandbox` inside the container
 
-#### `nav sandbox sync` command
+#### `ncl sandbox sync` command
 
 The standalone `sandbox sync` subcommand supports bidirectional file transfer:
 
 ```bash
 # Push local files up to sandbox
-nav sandbox sync <name> --up <local-path> [<sandbox-path>]
+ncl sandbox sync <name> --up <local-path> [<sandbox-path>]
 
 # Pull sandbox files down to local
-nav sandbox sync <name> --down <sandbox-path> [<local-path>]
+ncl sandbox sync <name> --down <sandbox-path> [<local-path>]
 ```
 
 - **Push (`--up`)**: `sandbox_sync_up()` streams a tar archive of the local path to `ssh ... tar xf - -C <dest>` on the sandbox side. Default destination: `/sandbox`.
@@ -284,11 +284,11 @@ nav sandbox sync <name> --down <sandbox-path> [<local-path>]
 | **Incremental sync** | Re-sends everything every time | Only transfers changed blocks (faster for repeated syncs of large repos) |
 | **Compression** | Uncompressed (can add gzip via `flate2` later) | Built-in `-z` flag |
 
-For Navigator's use case — one-shot or on-demand pushes of project files over a local network tunnel — the incremental sync advantage of rsync is marginal. Eliminating the external dependency and getting clean bidirectional support outweigh the delta-transfer benefit. If repeated rapid re-syncs of large repos become a need (e.g., a watch mode), revisit by adding content-hash-based skip lists or gzip compression.
+For NemoClaw's use case — one-shot or on-demand pushes of project files over a local network tunnel — the incremental sync advantage of rsync is marginal. Eliminating the external dependency and getting clean bidirectional support outweigh the delta-transfer benefit. If repeated rapid re-syncs of large repos become a need (e.g., a watch mode), revisit by adding content-hash-based skip lists or gzip compression.
 
 ## NSSH1 Handshake Protocol
 
-The NSSH1 ("Navigator SSH v1") handshake authenticates the gateway to the sandbox daemon, preventing direct pod access from outside the gateway.
+The NSSH1 ("NemoClaw SSH v1") handshake authenticates the gateway to the sandbox daemon, preventing direct pod access from outside the gateway.
 
 ### Wire Format
 
@@ -373,7 +373,7 @@ Authorization is performed by the gateway (token validation + sandbox readiness 
 1. Calls `nix::pty::openpty()` with the requested window size
 2. Clones the master fd for reading and writing
 3. Configures the shell command with environment variables:
-   - `NAVIGATOR_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM=<from pty request>`
+   - `NEMOCLAW_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM=<from pty request>`
    - Proxy vars: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `grpc_proxy`
    - TLS trust vars: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`
    - Provider credential env vars (from the provider registry)
@@ -519,17 +519,17 @@ These are injected into sandbox pods by the gateway:
 
 | Variable                             | Description |
 |--------------------------------------|-------------|
-| `NAVIGATOR_SSH_LISTEN_ADDR`          | Address for the embedded SSH server to bind |
-| `NAVIGATOR_SSH_HANDSHAKE_SECRET`     | Shared secret for NSSH1 handshake validation |
-| `NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS`  | Allowed clock skew for handshake timestamp |
+| `NEMOCLAW_SSH_LISTEN_ADDR`          | Address for the embedded SSH server to bind |
+| `NEMOCLAW_SSH_HANDSHAKE_SECRET`     | Shared secret for NSSH1 handshake validation |
+| `NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS`  | Allowed clock skew for handshake timestamp |
 
 ### CLI TLS options
 
 | Flag / Env Var              | Description |
 |-----------------------------|-------------|
-| `--tls-ca` / `NAVIGATOR_TLS_CA`       | CA certificate for gateway verification |
-| `--tls-cert` / `NAVIGATOR_TLS_CERT`   | Client certificate for mTLS |
-| `--tls-key` / `NAVIGATOR_TLS_KEY`     | Client private key for mTLS |
+| `--tls-ca` / `NEMOCLAW_TLS_CA`       | CA certificate for gateway verification |
+| `--tls-cert` / `NEMOCLAW_TLS_CERT`   | Client certificate for mTLS |
+| `--tls-key` / `NEMOCLAW_TLS_KEY`     | Client private key for mTLS |
 
 ## Failure Modes
 

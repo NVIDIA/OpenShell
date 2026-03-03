@@ -1,24 +1,24 @@
 ---
 name: debug-navigator-cluster
-description: Debug why a navigator cluster failed to start or is unhealthy. Use when the user has a failed `nav cluster admin deploy`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed.
+description: Debug why a nemoclaw cluster failed to start or is unhealthy. Use when the user has a failed `ncl cluster admin deploy`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed.
 ---
 
-# Debug Navigator Cluster
+# Debug NemoClaw Cluster
 
-Diagnose why a navigator cluster failed to start after `nav cluster admin deploy`.
+Diagnose why a nemoclaw cluster failed to start after `ncl cluster admin deploy`.
 
 ## Overview
 
-`nav cluster admin deploy` creates a Docker container running k3s with the Navigator server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
+`ncl cluster admin deploy` creates a Docker container running k3s with the NemoClaw server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
 
-1. **Pre-deploy check**: `nav cluster admin deploy` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
+1. **Pre-deploy check**: `ncl cluster admin deploy` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
 3. Create Docker network (`navigator-cluster`) and volume (`navigator-cluster-{name}`)
 4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
-7. **Prepare local images** (if `NAVIGATOR_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
-7. **Reconcile TLS PKI**: Load existing TLS secrets from the cluster; if missing, incomplete, or malformed, generate fresh PKI (CA + server + client certs). Apply secrets to cluster. If rotation happened and the navigator workload is already running, rollout restart and wait for completion (failed rollout aborts deploy).
+7. **Prepare local images** (if `NEMOCLAW_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
+7. **Reconcile TLS PKI**: Load existing TLS secrets from the cluster; if missing, incomplete, or malformed, generate fresh PKI (CA + server + client certs). Apply secrets to cluster. If rotation happened and the NemoClaw workload is already running, rollout restart and wait for completion (failed rollout aborts deploy).
 8. **Store CLI mTLS credentials**: Persist client cert/key/CA locally for CLI authentication.
 9. Wait for cluster health checks to pass (up to 6 min):
    - k3s API server readiness (`/readyz`)
@@ -31,16 +31,16 @@ For local deploys, metadata endpoint selection now depends on Docker connectivit
 - default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
 - TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
 
-The host port is configurable via `--port` on `nav cluster admin deploy` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
+The host port is configurable via `--port` on `ncl cluster admin deploy` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
 
 The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validation succeeds.
 
-The default cluster name is `navigator`. The container is `navigator-cluster-{name}`.
+The default cluster name is `nemoclaw`. The container is `navigator-cluster-{name}`.
 
 ## Prerequisites
 
 - Docker must be running (locally or on the remote host)
-- The `nav` CLI must be available
+- The `ncl` CLI must be available
 - For remote clusters: SSH access to the remote host
 
 ## Workflow
@@ -51,9 +51,9 @@ When the user asks to debug a cluster failure, **run diagnostics automatically**
 
 Before running commands, establish:
 
-1. **Cluster name**: Default is `navigator`, giving container name `navigator-cluster-navigator`
+1. **Cluster name**: Default is `nemoclaw`, giving container name `navigator-cluster-nemoclaw`
 2. **Remote or local**: If the user deployed with `--remote <host>`, all Docker commands must target that host
-3. **Config directory**: `~/.config/navigator/clusters/{name}/`
+3. **Config directory**: `~/.config/nemoclaw/clusters/{name}/`
 
 For remote clusters, prefix Docker commands with SSH:
 
@@ -87,7 +87,7 @@ If the container does not exist:
 docker images 'navigator/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 ```
 
-If the image is missing, re-deploy so bootstrap can pull the published cluster image (or set `NAVIGATOR_CLUSTER_IMAGE` explicitly).
+If the image is missing, re-deploy so bootstrap can pull the published cluster image (or set `NEMOCLAW_CLUSTER_IMAGE` explicitly).
 
 If the container exists but is not running, inspect it:
 
@@ -132,21 +132,21 @@ If `/readyz` fails, k3s is still starting or has crashed. Check container logs (
 
 If pods are in `CrashLoopBackOff`, `ImagePullBackOff`, or `Pending`, investigate those pods specifically.
 
-### Step 4: Check Navigator Server StatefulSet
+### Step 4: Check NemoClaw Server StatefulSet
 
-The Navigator server is deployed via a HelmChart CR as a StatefulSet with persistent storage. Check its status:
+The NemoClaw server is deployed via a HelmChart CR as a StatefulSet with persistent storage. Check its status:
 
 ```bash
 # StatefulSet status
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get statefulset/navigator -o wide'
 
-# Navigator pod logs
+# NemoClaw pod logs
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator logs statefulset/navigator --tail=100'
 
 # Describe statefulset for events
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator describe statefulset/navigator'
 
-# Helm install job logs (the job that installs the Navigator chart)
+# Helm install job logs (the job that installs the NemoClaw chart)
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n kube-system logs -l job-name=helm-install-navigator --tail=200'
 ```
 
@@ -188,7 +188,7 @@ Component images (server, sandbox, pki-job) can reach kubelet via two paths:
 **Local/external pull mode** (default local via `mise run cluster` / `mise run cluster:build`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/navigator/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). `cluster:build` builds then pushes images; `cluster` pushes prebuilt local tags (`navigator/*:dev`, falling back to `localhost:5000/navigator/*:dev` or `127.0.0.1:5000/navigator/*:dev`).
 
 ```bash
-# Verify image refs currently used by navigator deployment
+# Verify image refs currently used by nemoclaw deployment
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get deploy navigator -o jsonpath="{.spec.template.spec.containers[*].image}"'
 
 # Verify registry mirror/auth endpoint configuration
@@ -208,7 +208,7 @@ If images are missing, re-import with:
 docker save <image-ref> | docker exec -i navigator-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images import -
 ```
 
-**External pull mode** (remote deploy, or local with `NAVIGATOR_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
+**External pull mode** (remote deploy, or local with `NEMOCLAW_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
 
 ```bash
 # Verify registries.yaml exists and has credentials
@@ -218,7 +218,7 @@ docker exec navigator-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull d1i0nduu2f6qxk.cloudfront.net/navigator/pki-job:latest'
 ```
 
-If `registries.yaml` is missing or has wrong values, verify env wiring (`NAVIGATOR_REGISTRY_HOST`, `NAVIGATOR_REGISTRY_INSECURE`, username/password for authenticated registries).
+If `registries.yaml` is missing or has wrong values, verify env wiring (`NEMOCLAW_REGISTRY_HOST`, `NEMOCLAW_REGISTRY_INSECURE`, username/password for authenticated registries).
 
 ### Step 7: Check mTLS / PKI
 
@@ -232,15 +232,15 @@ docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yam
 docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get secret navigator-server-tls -o jsonpath="{.data.tls\.crt}" | base64 -d | openssl x509 -noout -dates 2>/dev/null || echo "openssl not available"'
 
 # Check if CLI-side mTLS files exist locally
-ls -la ~/.config/navigator/clusters/<name>/mtls/
+ls -la ~/.config/nemoclaw/clusters/<name>/mtls/
 ```
 
-On redeploy, bootstrap reuses existing secrets if they are valid PEM. If secrets are missing or malformed, fresh PKI is generated and the navigator workload is automatically restarted. If the rollout restart fails after rotation, the deploy aborts and CLI-side certs are not updated. Certificates use rcgen defaults (effectively never expire).
+On redeploy, bootstrap reuses existing secrets if they are valid PEM. If secrets are missing or malformed, fresh PKI is generated and the NemoClaw workload is automatically restarted. If the rollout restart fails after rotation, the deploy aborts and CLI-side certs are not updated. Certificates use rcgen defaults (effectively never expire).
 
 Common mTLS issues:
 - **Secrets missing**: The `navigator` namespace may not have been created yet (Helm controller race). Bootstrap waits up to 2 minutes for the namespace.
 - **mTLS mismatch after manual secret deletion**: Delete all three secrets and redeploy — bootstrap will regenerate and restart the workload.
-- **CLI can't connect after redeploy**: Check that `~/.config/navigator/clusters/<name>/mtls/` contains `ca.crt`, `tls.crt`, `tls.key` and that they were updated at deploy time.
+- **CLI can't connect after redeploy**: Check that `~/.config/nemoclaw/clusters/<name>/mtls/` contains `ca.crt`, `tls.crt`, `tls.key` and that they were updated at deploy time.
 
 ### Step 8: Check Kubernetes Events
 
@@ -290,10 +290,10 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
 | Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `docker logs` and `docker inspect` for details |
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
-| Navigator pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | Check `kubectl describe pod` for scheduling failures and `kubectl get pvc -n navigator` for volume status |
-| Navigator pods `CrashLoopBackOff` | Server application error | Check `kubectl logs` on the crashing pod |
-| Navigator pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `k3s ctr -n k8s.io images ls` for component images (Step 6) |
-| Navigator pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `/etc/rancher/k3s/registries.yaml` credentials and DNS (Step 8) |
+| NemoClaw pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | Check `kubectl describe pod` for scheduling failures and `kubectl get pvc -n navigator` for volume status |
+| NemoClaw pods `CrashLoopBackOff` | Server application error | Check `kubectl logs` on the crashing pod |
+| NemoClaw pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `k3s ctr -n k8s.io images ls` for component images (Step 6) |
+| NemoClaw pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `/etc/rancher/k3s/registries.yaml` credentials and DNS (Step 8) |
 | Image import fails (`k3s ctr` exit code != 0) | Corrupt tar stream or containerd not ready | Retry after k3s is fully started; check container logs |
 | Push mode images not found by kubelet | Imported into wrong containerd namespace | Must use `k3s ctr -n k8s.io images import`, not `k3s ctr images import` |
 | Gateway not `Programmed` | Envoy Gateway not ready | Check `envoy-gateway-system` pods and Helm install logs |
@@ -331,9 +331,9 @@ docker -H ssh://<host> logs navigator-cluster-<name>
 **Setting up kubectl access** (requires tunnel):
 
 ```bash
-nav cluster admin tunnel --name <name> --remote <host>
+ncl cluster admin tunnel --name <name> --remote <host>
 # Then in another terminal:
-export KUBECONFIG=~/.config/navigator/clusters/<name>/kubeconfig
+export KUBECONFIG=~/.config/nemoclaw/clusters/<name>/kubeconfig
 kubectl get pods -A
 ```
 
@@ -343,7 +343,7 @@ Run all diagnostics at once for a comprehensive report:
 
 ```bash
 HOST="<host>"  # leave empty for local, or set to SSH destination
-NAME="navigator"  # cluster name
+NAME="nemoclaw"  # cluster name
 CONTAINER="navigator-cluster-${NAME}"
 KCFG="KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
 
@@ -369,10 +369,10 @@ run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get pods -A -o wide" 2>&1
 echo "=== Failing Pods ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded" 2>&1
 
-echo "=== Navigator StatefulSet ==="
+echo "=== NemoClaw StatefulSet ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n navigator get statefulset/navigator -o wide" 2>&1
 
-echo "=== Navigator Gateway ==="
+echo "=== NemoClaw Gateway ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n navigator get gateway/navigator-gateway" 2>&1
 
 echo "=== Recent Events ==="
@@ -381,7 +381,7 @@ run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get events -A --sort-by=.
 echo "=== PKI Job Logs ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n navigator logs -l job-name=navigator-gateway-pki --tail=100" 2>&1
 
-echo "=== Helm Install Navigator Logs ==="
+echo "=== Helm Install NemoClaw Logs ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl -n kube-system logs -l job-name=helm-install-navigator --tail=100" 2>&1
 
 echo "=== Registry Configuration ==="

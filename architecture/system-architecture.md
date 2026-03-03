@@ -1,4 +1,4 @@
-# Navigator System Architecture
+# NemoClaw System Architecture
 
 ```mermaid
 graph TB
@@ -6,16 +6,16 @@ graph TB
     %% USER'S MACHINE
     %% ============================================================
     subgraph UserMachine["User's Machine"]
-        CLI["Navigator CLI<br/>(nav)"]
-        TUI["Gator TUI<br/>(nav gator)"]
+        CLI["NemoClaw CLI<br/>(ncl)"]
+        TUI["Gator TUI<br/>(ncl gator)"]
         SDK["Python SDK<br/>(nemoclaw)"]
-        LocalConfig["~/.config/navigator/<br/>clusters, mTLS certs,<br/>active_cluster"]
+        LocalConfig["~/.config/nemoclaw/<br/>clusters, mTLS certs,<br/>active_cluster"]
     end
 
     %% ============================================================
     %% KUBERNETES CLUSTER (single Docker container)
     %% ============================================================
-    subgraph Cluster["Navigator Cluster Container (Docker)"]
+    subgraph Cluster["NemoClaw Cluster Container (Docker)"]
 
         subgraph K3s["k3s (v1.29.8-k3s1)"]
             KubeAPI["Kubernetes API<br/>:6443"]
@@ -177,7 +177,7 @@ graph TB
 
 | Color | Category | Examples |
 |-------|----------|---------|
-| Blue | User-side components | Navigator CLI, Gator TUI, Python SDK |
+| Blue | User-side components | NemoClaw CLI, Gator TUI, Python SDK |
 | Orange | Gateway / Control plane | navigator-server, watch bus, log bus |
 | Green | Sandbox supervisor | SSH server, HTTP CONNECT proxy, OPA engine, inference router |
 | Purple | Agent process & isolation | AI agent, Landlock, Seccomp, network namespace |

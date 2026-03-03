@@ -1,8 +1,8 @@
 # Inference Routing Example
 
-This example demonstrates Navigator's inference interception and routing.
+This example demonstrates NemoClaw's inference interception and routing.
 A sandbox process makes standard API calls (OpenAI, Anthropic, etc.) and
-Navigator transparently intercepts, enforces policy, and reroutes them to
+NemoClaw transparently intercepts, enforces policy, and reroutes them to
 a configured backend — without any code changes in the sandboxed application.
 
 ## How It Works
@@ -30,7 +30,7 @@ routes, multi-sandbox) or **standalone** (single sandbox, routes from a file).
 
 ### Standalone (no cluster)
 
-Run the sandbox binary directly with a route file — no Navigator cluster needed:
+Run the sandbox binary directly with a route file — no NemoClaw cluster needed:
 
 ```bash
 # 1. Edit routes.yaml to point at your local LLM (e.g. LM Studio on :1234)
@@ -49,11 +49,11 @@ requests locally — no gRPC server or cluster required.
 
 ### With a cluster
 
-#### 1. Start a Navigator cluster
+#### 1. Start a NemoClaw cluster
 
 ```bash
 mise run cluster
-navigator cluster status
+nemoclaw cluster status
 ```
 
 #### 2. Create an inference route
@@ -62,39 +62,39 @@ Point the route at any OpenAI-compatible endpoint (local or remote):
 
 ```bash
 # Local model (e.g., LM Studio, Ollama, vLLM)
-navigator inference create \
+nemoclaw inference create \
   --routing-hint local \
   --base-url http://<HOST>:<PORT> \
   --model-id <MODEL_NAME>
 
 # Remote provider (e.g., OpenAI, NVIDIA NIM)
-navigator inference create \
+nemoclaw inference create \
   --routing-hint local \
   --base-url https://api.openai.com \
   --api-key sk-... \
   --model-id gpt-4o-mini
 ```
 
-If `--protocol` is omitted, Navigator auto-detects supported protocols by
+If `--protocol` is omitted, NemoClaw auto-detects supported protocols by
 probing the endpoint (sends minimal requests with `max_tokens: 1`).
 
 Verify the route:
 
 ```bash
-navigator inference list
+nemoclaw inference list
 ```
 
 #### 3. Run the example inside a sandbox
 
 ```bash
-navigator sandbox create \
+nemoclaw sandbox create \
   --policy examples/inference/sandbox-policy.yaml \
   --keep \
   --name inference-demo \
   -- python examples/inference/inference.py
 ```
 
-The script targets `https://api.openai.com` by default, but Navigator
+The script targets `https://api.openai.com` by default, but NemoClaw
 intercepts the connection and routes it to whatever backend the `local`
 route points at.
 
@@ -108,7 +108,7 @@ content=NAV_OK
 #### 4. (Optional) Interactive session
 
 ```bash
-navigator sandbox connect inference-demo
+nemoclaw sandbox connect inference-demo
 # Inside the sandbox:
 python examples/inference/inference.py
 ```
@@ -116,8 +116,8 @@ python examples/inference/inference.py
 #### 5. Cleanup
 
 ```bash
-navigator sandbox delete inference-demo
-navigator inference delete <route-name>
+nemoclaw sandbox delete inference-demo
+nemoclaw inference delete <route-name>
 ```
 
 ## Customizing the Policy
@@ -136,7 +136,7 @@ use. Routes are matched by their `routing_hint` field.
 
 ## Supported Protocols
 
-Navigator detects and routes the following inference API patterns:
+NemoClaw detects and routes the following inference API patterns:
 
 | Pattern | Protocol | Kind |
 |---|---|---|

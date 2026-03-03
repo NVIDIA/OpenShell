@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-core"
-description = "Shared library for Navigator - proto definitions, config, and errors"
+description = "Shared library for NemoClaw - proto definitions, config, and errors"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

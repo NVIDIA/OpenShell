@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-policy"
-description = "Shared sandbox policy parsing and defaults for Navigator"
+description = "Shared sandbox policy parsing and defaults for NemoClaw"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

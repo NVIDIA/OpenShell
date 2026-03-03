@@ -3,9 +3,9 @@
 
 """E2e tests for server mTLS enforcement.
 
-These tests verify that the Navigator server correctly requires valid client
+These tests verify that the NemoClaw server correctly requires valid client
 certificates signed by the cluster CA.  Only callers presenting the provisioned
-mTLS client cert should be able to reach the Navigator gRPC API; all other
+mTLS client cert should be able to reach the NemoClaw gRPC API; all other
 connection attempts must be rejected.
 """
 
@@ -36,22 +36,22 @@ def _xdg_config_home() -> pathlib.Path:
 
 
 def _resolve_cluster_name() -> str:
-    env_cluster = os.environ.get("NAVIGATOR_CLUSTER")
+    env_cluster = os.environ.get("NEMOCLAW_CLUSTER")
     if env_cluster:
         return env_cluster
-    active_file = _xdg_config_home() / "navigator" / "active_cluster"
+    active_file = _xdg_config_home() / "nemoclaw" / "active_cluster"
     return active_file.read_text().strip()
 
 
 def _cluster_metadata(cluster_name: str) -> dict:
     metadata_path = (
-        _xdg_config_home() / "navigator" / "clusters" / f"{cluster_name}_metadata.json"
+        _xdg_config_home() / "nemoclaw" / "clusters" / f"{cluster_name}_metadata.json"
     )
     return json.loads(metadata_path.read_text())
 
 
 def _mtls_dir(cluster_name: str) -> pathlib.Path:
-    return _xdg_config_home() / "navigator" / "clusters" / cluster_name / "mtls"
+    return _xdg_config_home() / "nemoclaw" / "clusters" / cluster_name / "mtls"
 
 
 def _generate_self_signed_cert(
@@ -99,7 +99,7 @@ def cluster_name() -> str:
 
 @pytest.fixture(scope="session")
 def server_endpoint(cluster_name: str) -> tuple[str, int, str]:
-    """Return (host, port, scheme) for the Navigator server."""
+    """Return (host, port, scheme) for the NemoClaw server."""
     metadata = _cluster_metadata(cluster_name)
     parsed = urlparse(metadata["gateway_endpoint"])
     host = parsed.hostname or "127.0.0.1"

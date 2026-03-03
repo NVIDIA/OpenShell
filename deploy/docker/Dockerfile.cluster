@@ -1,11 +1,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# k3s cluster image with Navigator Helm charts and manifests
+# k3s cluster image with NemoClaw Helm charts and manifests
 #
 # This image is based on k3s and includes:
-# - Packaged Navigator Helm chart
-# - HelmChart CR for auto-deploying Navigator
+# - Packaged NemoClaw Helm chart
+# - HelmChart CR for auto-deploying NemoClaw
 # - Custom entrypoint for DNS configuration in Docker environments
 #
 # Component images (navigator/server, navigator/sandbox) are

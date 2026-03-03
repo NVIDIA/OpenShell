@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Navigator CLI - command-line interface for Navigator.
+//! NemoClaw CLI - command-line interface for NemoClaw.
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::engine::ArgValueCompleter;
@@ -28,15 +28,15 @@ struct ClusterContext {
 ///
 /// Resolution priority:
 /// 1. `--cluster` flag (explicit name)
-/// 2. `NAVIGATOR_CLUSTER` environment variable
-/// 3. Active cluster from `~/.config/navigator/active_cluster`
+/// 2. `NEMOCLAW_CLUSTER` environment variable
+/// 3. Active cluster from `~/.config/nemoclaw/active_cluster`
 ///
 /// Once the name is determined, loads the cluster metadata to get the endpoint.
 fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
     let name = cluster_flag
         .clone()
         .or_else(|| {
-            std::env::var("NAVIGATOR_CLUSTER")
+            std::env::var("NEMOCLAW_CLUSTER")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
@@ -44,16 +44,16 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         .ok_or_else(|| {
             miette::miette!(
                 "No active cluster.\n\
-                 Set one with: nav cluster use <name>\n\
-                 Or deploy a new cluster: nav cluster admin deploy"
+                 Set one with: ncl cluster use <name>\n\
+                 Or deploy a new cluster: ncl cluster admin deploy"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown cluster '{name}'.\n\
-             Deploy it first: nav cluster admin deploy --name {name}\n\
-             Or list available clusters: nav cluster list"
+             Deploy it first: ncl cluster admin deploy --name {name}\n\
+             Or list available clusters: ncl cluster list"
         )
     })?;
 
@@ -71,16 +71,16 @@ fn resolve_cluster_name(cluster_flag: &Option<String>) -> Option<String> {
     cluster_flag
         .clone()
         .or_else(|| {
-            std::env::var("NAVIGATOR_CLUSTER")
+            std::env::var("NEMOCLAW_CLUSTER")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
         .or_else(load_active_cluster)
 }
 
-/// Navigator CLI - agent execution and management.
+/// NemoClaw CLI - agent execution and management.
 #[derive(Parser, Debug)]
-#[command(name = "navigator")]
+#[command(name = "nemoclaw")]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 struct Cli {
@@ -89,7 +89,7 @@ struct Cli {
     verbose: u8,
 
     /// Cluster name to operate on (resolved from stored metadata).
-    #[arg(long, short, global = true, env = "NAVIGATOR_CLUSTER")]
+    #[arg(long, short, global = true, env = "NEMOCLAW_CLUSTER")]
     cluster: Option<String>,
 
     #[command(subcommand)]
@@ -137,10 +137,10 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `nav ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `ncl ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `nav ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `ncl ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -189,7 +189,7 @@ impl std::fmt::Display for CompletionShell {
 }
 
 const COMPLETIONS_HELP: &str = "\
-Generate shell completion scripts for Navigator CLI.
+Generate shell completion scripts for NemoClaw CLI.
 
 Supported shells: bash, fish, zsh, powershell.
 
@@ -203,22 +203,22 @@ shell before testing whether completions are working.
 First, ensure that you install `bash-completion` using your package manager.
 
   mkdir -p ~/.local/share/bash-completion/completions
-  navigator completions bash > ~/.local/share/bash-completion/completions/navigator
+  nemoclaw completions bash > ~/.local/share/bash-completion/completions/nemoclaw
 
 On macOS with Homebrew (install bash-completion first):
 
   mkdir -p $(brew --prefix)/etc/bash_completion.d
-  navigator completions bash > $(brew --prefix)/etc/bash_completion.d/navigator.bash-completion
+  nemoclaw completions bash > $(brew --prefix)/etc/bash_completion.d/nemoclaw.bash-completion
 
 ## fish
 
   mkdir -p ~/.config/fish/completions
-  navigator completions fish > ~/.config/fish/completions/navigator.fish
+  nemoclaw completions fish > ~/.config/fish/completions/nemoclaw.fish
 
 ## zsh
 
   mkdir -p ~/.zfunc
-  navigator completions zsh > ~/.zfunc/_navigator
+  nemoclaw completions zsh > ~/.zfunc/_nemoclaw
 
 Then add the following to your .zshrc before compinit:
 
@@ -226,7 +226,7 @@ Then add the following to your .zshrc before compinit:
 
 ## powershell
 
-   navigator completions powershell >> $PROFILE
+   nemoclaw completions powershell >> $PROFILE
 
 If no profile exists yet, create one first:
 
@@ -374,7 +374,7 @@ enum ClusterAdminCommands {
     /// Provision or start a cluster (local or remote).
     Deploy {
         /// Cluster name.
-        #[arg(long, default_value = "navigator")]
+        #[arg(long, default_value = "nemoclaw")]
         name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
@@ -507,7 +507,7 @@ enum SandboxCommands {
         providers: Vec<String>,
 
         /// Path to a custom sandbox policy YAML file.
-        /// Overrides the built-in default and the `NAVIGATOR_SANDBOX_POLICY` env var.
+        /// Overrides the built-in default and the `NEMOCLAW_SANDBOX_POLICY` env var.
         #[arg(long)]
         policy: Option<String>,
 
@@ -868,7 +868,7 @@ async fn main() -> Result<()> {
                 } => {
                     let name = name
                         .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "navigator".to_string());
+                        .unwrap_or_else(|| "nemoclaw".to_string());
                     run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
                 }
                 ClusterAdminCommands::Destroy {
@@ -878,14 +878,14 @@ async fn main() -> Result<()> {
                 } => {
                     let name = name
                         .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "navigator".to_string());
+                        .unwrap_or_else(|| "nemoclaw".to_string());
                     run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref())
                         .await?;
                 }
                 ClusterAdminCommands::Info { name } => {
                     let name = name
                         .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "navigator".to_string());
+                        .unwrap_or_else(|| "nemoclaw".to_string());
                     run::cluster_admin_info(&name)?;
                 }
                 ClusterAdminCommands::Tunnel {
@@ -896,7 +896,7 @@ async fn main() -> Result<()> {
                 } => {
                     let name = name
                         .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "navigator".to_string());
+                        .unwrap_or_else(|| "nemoclaw".to_string());
                     run::cluster_admin_tunnel(
                         &name,
                         remote.as_deref(),
@@ -927,7 +927,7 @@ async fn main() -> Result<()> {
                             if remote.is_some() {
                                 eprintln!(
                                     "{} --remote ignored: cluster '{}' is already active. \
-                                     To redeploy, use: nav cluster admin deploy",
+                                     To redeploy, use: ncl cluster admin deploy",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -1029,7 +1029,7 @@ async fn main() -> Result<()> {
                         build_args,
                     } => {
                         let cluster_name = resolve_cluster_name(&cli.cluster)
-                            .unwrap_or_else(|| "navigator".to_string());
+                            .unwrap_or_else(|| "nemoclaw".to_string());
                         run::sandbox_image_push(
                             &dockerfile,
                             tag.as_deref(),
@@ -1096,7 +1096,7 @@ async fn main() -> Result<()> {
                                     );
                                     eprintln!("  Access at: http://127.0.0.1:{port}/");
                                     eprintln!(
-                                        "  Stop with: navigator sandbox forward stop {port} {name}",
+                                        "  Stop with: nemoclaw sandbox forward stop {port} {name}",
                                     );
                                 }
                             }
@@ -1307,8 +1307,8 @@ async fn main() -> Result<()> {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
                                 "Unknown cluster '{c}'.\n\
-                                 Deploy it first: nav cluster admin deploy --name {c}\n\
-                                 Or list available clusters: nav cluster list"
+                                  Deploy it first: ncl cluster admin deploy --name {c}\n\
+                                  Or list available clusters: ncl cluster list"
                             )
                         })?;
                         meta.gateway_endpoint
@@ -1348,7 +1348,7 @@ mod tests {
     #[test]
     fn completions_engine_returns_candidates() {
         let mut cmd = Cli::command();
-        let args: Vec<OsString> = vec!["navigator".into(), "".into()];
+        let args: Vec<OsString> = vec!["nemoclaw".into(), "".into()];
         let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
             .expect("completion engine failed");
         assert!(
@@ -1360,7 +1360,7 @@ mod tests {
     #[test]
     fn completions_subcommand_appears_in_candidates() {
         let mut cmd = Cli::command();
-        let args: Vec<OsString> = vec!["navigator".into(), "comp".into()];
+        let args: Vec<OsString> = vec!["nemoclaw".into(), "comp".into()];
         let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
             .expect("completion engine failed");
         let names: Vec<String> = candidates

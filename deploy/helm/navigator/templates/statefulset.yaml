@@ -44,27 +44,27 @@ spec:
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
           env:
-            - name: NAVIGATOR_SANDBOX_NAMESPACE
+            - name: NEMOCLAW_SANDBOX_NAMESPACE
               value: {{ .Values.server.sandboxNamespace | quote }}
-            - name: NAVIGATOR_SANDBOX_IMAGE
+            - name: NEMOCLAW_SANDBOX_IMAGE
               value: {{ .Values.server.sandboxImage | quote }}
-            - name: NAVIGATOR_GRPC_ENDPOINT
+            - name: NEMOCLAW_GRPC_ENDPOINT
               value: {{ .Values.server.grpcEndpoint | quote }}
             {{- if .Values.server.sshGatewayHost }}
-            - name: NAVIGATOR_SSH_GATEWAY_HOST
+            - name: NEMOCLAW_SSH_GATEWAY_HOST
               value: {{ .Values.server.sshGatewayHost | quote }}
             {{- end }}
             {{- if .Values.server.sshGatewayPort }}
-            - name: NAVIGATOR_SSH_GATEWAY_PORT
+            - name: NEMOCLAW_SSH_GATEWAY_PORT
               value: {{ .Values.server.sshGatewayPort | quote }}
             {{- end }}
-            - name: NAVIGATOR_TLS_CERT
+            - name: NEMOCLAW_TLS_CERT
               value: /etc/navigator-tls/server/tls.crt
-            - name: NAVIGATOR_TLS_KEY
+            - name: NEMOCLAW_TLS_KEY
               value: /etc/navigator-tls/server/tls.key
-            - name: NAVIGATOR_TLS_CLIENT_CA
+            - name: NEMOCLAW_TLS_CLIENT_CA
               value: /etc/navigator-tls/client-ca/ca.crt
-            - name: NAVIGATOR_CLIENT_TLS_SECRET_NAME
+            - name: NEMOCLAW_CLIENT_TLS_SECRET_NAME
               value: {{ .Values.server.tls.clientTlsSecretName | quote }}
           volumeMounts:
             - name: navigator-data

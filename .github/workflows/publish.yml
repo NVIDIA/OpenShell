@@ -128,8 +128,8 @@ jobs:
           set -euo pipefail
           WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
           CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
-          NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-          NAVIGATOR_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+          NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
+          NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
           ls -la target/wheels/*.whl
 
       - name: Upload wheels to S3

@@ -1,6 +1,6 @@
 # Sandbox Custom Containers
 
-Users can run `nav sandbox create --image <any-linux-image>` to launch a sandbox with an arbitrary container image while keeping the `navigator-sandbox` process supervisor in control.
+Users can run `ncl sandbox create --image <any-linux-image>` to launch a sandbox with an arbitrary container image while keeping the `navigator-sandbox` process supervisor in control.
 
 ## How It Works
 
@@ -21,7 +21,7 @@ flowchart TB
             agent_desc["Image: user-selected workload image
             Command: /opt/navigator/bin/navigator-sandbox
             Mounts shared volume read-only at /opt/navigator/bin/
-            Env: NAVIGATOR_SANDBOX_ID, NAVIGATOR_ENDPOINT, ...
+            Env: NEMOCLAW_SANDBOX_ID, NEMOCLAW_ENDPOINT, ...
             Caps: SYS_ADMIN, NET_ADMIN, SYS_PTRACE"]
         end
     end
@@ -40,7 +40,7 @@ These transforms apply to both generated templates and user-provided `pod_templa
 ### Creating a sandbox with a custom image
 
 ```bash
-nav sandbox create --image myimage:latest -- echo "hello from custom container"
+ncl sandbox create --image myimage:latest -- echo "hello from custom container"
 ```
 
 When `--image` is set the CLI clears the default `run_as_user`/`run_as_group` policy (which expects a `sandbox` user) so that arbitrary images that lack that user can start without error.
@@ -48,11 +48,11 @@ When `--image` is set the CLI clears the default `run_as_user`/`run_as_group` po
 ### Pushing custom images into the cluster
 
 ```bash
-nav sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
-nav sandbox create --image my-sandbox:latest
+ncl sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+ncl sandbox create --image my-sandbox:latest
 ```
 
-`nav sandbox image push` accepts:
+`ncl sandbox image push` accepts:
 
 | Flag | Description |
 |------|-------------|
@@ -68,7 +68,7 @@ The command builds the image locally via the Docker daemon (respecting `.dockeri
 The `navigator-sandbox` supervisor adapts to arbitrary environments:
 
 - **Log file fallback**: Attempts to open `/var/log/navigator.log` for append; silently falls back to stdout-only logging if the path is not writable.
-- **Command resolution**: Executes the command from CLI args, then the `NAVIGATOR_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
+- **Command resolution**: Executes the command from CLI args, then the `NEMOCLAW_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
 - **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable.
 
 ## Design Decisions

@@ -1,6 +1,6 @@
 ---
 name: tui-development
-description: Guide for developing the "Gator" TUI — a ratatui-based terminal UI for the Navigator platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - gator, TUI, terminal UI, ratatui, navigator-tui, tui development, gator feature, gator bug.
+description: Guide for developing the "Gator" TUI — a ratatui-based terminal UI for the NemoClaw platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - gator, TUI, terminal UI, ratatui, navigator-tui, tui development, gator feature, gator bug.
 ---
 
 # Gator TUI Development Guide
@@ -9,14 +9,14 @@ Comprehensive reference for any agent working on the Gator TUI.
 
 ## 1. Overview
 
-Gator is a ratatui-based terminal UI for the Navigator platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `nav` CLI, but with a live, interactive dashboard.
+Gator is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `ncl` CLI, but with a live, interactive dashboard.
 
-- **Launched via:** `nav gator` or `mise run gator`
+- **Launched via:** `ncl gator` or `mise run gator`
 - **Crate:** `crates/navigator-tui/`
 - **Key dependencies:**
   - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
   - `crossterm` (workspace version) — terminal backend and event polling
-  - `tonic` with TLS — gRPC client for the Navigator gateway
+  - `tonic` with TLS — gRPC client for the NemoClaw gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
   - `navigator-core` — proto-generated types (`NavigatorClient`, request/response structs)
   - `navigator-bootstrap` — cluster discovery (`list_clusters()`)
@@ -104,8 +104,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` Gator │ Current Cluster: navigator (Healthy) │ Dashboard`
-- Sandbox detail: ` Gator │ Current Cluster: navigator (Healthy) │ Sandbox: my-sandbox`
+- Dashboard: ` Gator │ Current Cluster: nemoclaw (Healthy) │ Dashboard`
+- Sandbox detail: ` Gator │ Current Cluster: nemoclaw (Healthy) │ Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -225,14 +225,14 @@ The `confirm_delete` flag in `App` gates destructive key handling — while true
 
 ### CLI parity
 
-Gator actions should parallel `nav` CLI commands so users have familiar mental models:
+Gator actions should parallel `ncl` CLI commands so users have familiar mental models:
 
 | CLI Command | Gator Equivalent |
 | --- | --- |
-| `nav sandbox list` | Sandbox table on Dashboard |
-| `nav sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
-| `nav sandbox logs <name>` | `[l]` on sandbox detail to open log viewer |
-| `nav cluster health` | Status in title bar + cluster list |
+| `ncl sandbox list` | Sandbox table on Dashboard |
+| `ncl sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
+| `ncl sandbox logs <name>` | `[l]` on sandbox detail to open log viewer |
+| `ncl cluster health` | Status in title bar + cluster list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
@@ -337,7 +337,7 @@ lib.rs (event loop, gRPC, async tasks)
 ### Dependency constraints
 
 - **`navigator-tui` cannot depend on `navigator-cli`** — this would create a circular dependency. TLS channel building for cluster switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
-- mTLS certs are read from `~/.config/navigator/clusters/<name>/mtls/` (ca.crt, tls.crt, tls.key).
+- mTLS certs are read from `~/.config/nemoclaw/clusters/<name>/mtls/` (ca.crt, tls.crt, tls.key).
 
 ### Proto generated code
 

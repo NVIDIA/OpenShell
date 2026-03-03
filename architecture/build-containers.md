@@ -121,8 +121,8 @@ A k3s image with bundled Helm charts and Kubernetes manifests for single-contain
 
 Two Dockerfiles produce Python wheels for the CLI package distribution. These are not deployed as running containers.
 
-- **`Dockerfile.python-wheels`** -- Builds Linux amd64/arm64 wheels using Maturin with a two-pass Rust build (dependency prebuild + final wheel build), BuildKit cache mounts for cargo registry/git/target, sccache (backed by memcached when `SCCACHE_MEMCACHED_ENDPOINT` build arg is provided), and `cross-build.sh` for conditional cross-toolchain installation. The final build step patches workspace version inside the container layer from `NAVIGATOR_CARGO_VERSION` (computed before Docker build), preserving cacheable dependency layers and avoiding dirty working-tree edits. Output stage is `scratch` with only the `.whl` files.
-- **`Dockerfile.python-wheels-macos`** -- Builds macOS arm64 wheels using osxcross (cross-compiling from Linux) with the same two-pass dependency caching pattern and cargo cache mounts. Version injection uses the same in-container workspace-version patch from `NAVIGATOR_CARGO_VERSION`, avoiding host-side file edits that break Docker layer caching. Uses `crazymax/osxcross:latest` as the cross-toolchain source. The `OSXCROSS_IMAGE` build arg allows using a mirrored registry image instead of Docker Hub.
+- **`Dockerfile.python-wheels`** -- Builds Linux amd64/arm64 wheels using Maturin with a two-pass Rust build (dependency prebuild + final wheel build), BuildKit cache mounts for cargo registry/git/target, sccache (backed by memcached when `SCCACHE_MEMCACHED_ENDPOINT` build arg is provided), and `cross-build.sh` for conditional cross-toolchain installation. The final build step patches workspace version inside the container layer from `NEMOCLAW_CARGO_VERSION` (computed before Docker build), preserving cacheable dependency layers and avoiding dirty working-tree edits. Output stage is `scratch` with only the `.whl` files.
+- **`Dockerfile.python-wheels-macos`** -- Builds macOS arm64 wheels using osxcross (cross-compiling from Linux) with the same two-pass dependency caching pattern and cargo cache mounts. Version injection uses the same in-container workspace-version patch from `NEMOCLAW_CARGO_VERSION`, avoiding host-side file edits that break Docker layer caching. Uses `crazymax/osxcross:latest` as the cross-toolchain source. The `OSXCROSS_IMAGE` build arg allows using a mirrored registry image instead of Docker Hub.
 
 ### CI Runner Image (`navigator-ci`)
 
@@ -206,7 +206,7 @@ Modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/naviga
 `deploy/docker/cluster-healthcheck.sh` validates cluster readiness through a series of sequential checks:
 
 1. **Kubernetes API** -- `kubectl get --raw='/readyz'`.
-2. **Navigator StatefulSet** -- Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
+2. **NemoClaw StatefulSet** -- Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
 3. **TLS secrets** -- Verifies that `navigator-server-tls` and `navigator-client-tls` secrets exist in the `navigator` namespace (created by the bootstrap crate before the StatefulSet starts).
 
 ## Helm Chart
@@ -269,8 +269,8 @@ The chart deploys a **StatefulSet** (not a Deployment) with a `volumeClaimTempla
 The StatefulSet always mounts TLS secrets as volumes and sets environment variables for the server to use `rustls` with mTLS:
 
 - **Volumes**: `tls-cert` (from `navigator-server-tls` secret, mounted at `/etc/navigator-tls/server/`) and `tls-client-ca` (from `navigator-server-client-ca` secret, mounted at `/etc/navigator-tls/client-ca/`).
-- **Environment**: `NAVIGATOR_TLS_CERT`, `NAVIGATOR_TLS_KEY`, `NAVIGATOR_TLS_CLIENT_CA` pointing to the mounted files.
-- **Client TLS secret name**: `NAVIGATOR_CLIENT_TLS_SECRET_NAME` set to the `clientTlsSecretName` value, used by the server to inject TLS volume mounts into sandbox pod specs.
+- **Environment**: `NEMOCLAW_TLS_CERT`, `NEMOCLAW_TLS_KEY`, `NEMOCLAW_TLS_CLIENT_CA` pointing to the mounted files.
+- **Client TLS secret name**: `NEMOCLAW_CLIENT_TLS_SECRET_NAME` set to the `clientTlsSecretName` value, used by the server to inject TLS volume mounts into sandbox pod specs.
 - **gRPC endpoint**: `https://navigator.navigator.svc.cluster.local:8080` so sandbox pods connect over mTLS.
 
 TLS certificates are generated at cluster bootstrap time by the `navigator-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets before the Helm release is installed:
@@ -286,11 +286,11 @@ The fast deploy script (`cluster-deploy-fast.sh`) always sets `--set-string serv
 
 | Environment Variable | Source | Description |
 |---|---|---|
-| `NAVIGATOR_SANDBOX_NAMESPACE` | `server.sandboxNamespace` | Kubernetes namespace for sandbox pods |
-| `NAVIGATOR_SANDBOX_IMAGE` | `server.sandboxImage` | Container image for sandbox pods |
-| `NAVIGATOR_GRPC_ENDPOINT` | `server.grpcEndpoint` | gRPC callback endpoint (reachable from pods) |
-| `NAVIGATOR_SSH_GATEWAY_HOST` | `server.sshGatewayHost` | Public SSH gateway hostname (conditional) |
-| `NAVIGATOR_SSH_GATEWAY_PORT` | `server.sshGatewayPort` | Public SSH gateway port (conditional) |
+| `NEMOCLAW_SANDBOX_NAMESPACE` | `server.sandboxNamespace` | Kubernetes namespace for sandbox pods |
+| `NEMOCLAW_SANDBOX_IMAGE` | `server.sandboxImage` | Container image for sandbox pods |
+| `NEMOCLAW_GRPC_ENDPOINT` | `server.grpcEndpoint` | gRPC callback endpoint (reachable from pods) |
+| `NEMOCLAW_SSH_GATEWAY_HOST` | `server.sshGatewayHost` | Public SSH gateway hostname (conditional) |
+| `NEMOCLAW_SSH_GATEWAY_PORT` | `server.sshGatewayPort` | Public SSH gateway port (conditional) |
 
 ### RBAC
 
@@ -462,7 +462,7 @@ Artifactory:
 
 When the cluster container starts, k3s automatically deploys these HelmChart CRs from `/var/lib/rancher/k3s/server/manifests/`:
 
-1. **Navigator** (from `navigator-0.1.0.tgz` in the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. These values are rewritten by the entrypoint script based on environment variables from the bootstrap code.
+1. **NemoClaw** (from `navigator-0.1.0.tgz` in the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. These values are rewritten by the entrypoint script based on environment variables from the bootstrap code.
 
 ## Implementation References
 

@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Unified multi-arch build and push for all Navigator images.
+# Unified multi-arch build and push for all NemoClaw images.
 #
 # Usage:
 #   docker-publish-multiarch.sh --mode registry   # Push to DOCKER_REGISTRY

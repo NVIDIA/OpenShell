@@ -107,7 +107,7 @@ flowchart TD
 
 9. **Child process spawning** (`ProcessHandle::spawn()`):
    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
-   - Set environment variables: `NAVIGATOR_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
+   - Set environment variables: `NEMOCLAW_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
    - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
 10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
@@ -177,8 +177,8 @@ flowchart LR
         D --> E[SandboxPolicy]
     end
     subgraph "gRPC mode (production)"
-        F[NAVIGATOR_SANDBOX_ID] --> H[grpc_client::fetch_policy]
-        G[NAVIGATOR_ENDPOINT] --> H
+        F[NEMOCLAW_SANDBOX_ID] --> H[grpc_client::fetch_policy]
+        G[NEMOCLAW_ENDPOINT] --> H
         H --> I[ProtoSandboxPolicy]
         I --> J[OpaEngine::from_proto]
         I --> K[SandboxPolicy::try_from]
@@ -336,7 +336,7 @@ sequenceDiagram
     GW-->>PL: policy + version + hash
     PL->>PL: Store initial version
 
-    loop Every NAVIGATOR_POLICY_POLL_INTERVAL_SECS (default 30)
+    loop Every NEMOCLAW_POLICY_POLL_INTERVAL_SECS (default 30)
         PL->>GW: GetSandboxPolicy(sandbox_id)
         GW-->>PL: policy + version + hash
         alt version > current_version
@@ -712,11 +712,11 @@ pub struct InferenceContext {
 
 #### Design decision: standalone capability
 
-The sandbox is designed to operate both as part of a Navigator cluster and as a standalone component without any cluster infrastructure. This is intentional — it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full Navigator stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs — policy, inference routes — can be provided without any dependency on the control plane.
+The sandbox is designed to operate both as part of a NemoClaw cluster and as a standalone component without any cluster infrastructure. This is intentional — it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full NemoClaw stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs — policy, inference routes — can be provided without any dependency on the control plane.
 
 #### Route sources (priority order)
 
-1. **Route file (standalone mode)**: `--inference-routes` / `NAVIGATOR_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
+1. **Route file (standalone mode)**: `--inference-routes` / `NEMOCLAW_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
 
 2. **Cluster bundle (cluster mode)**: When `sandbox_id` and `navigator_endpoint` are available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetSandboxInferenceBundle` gRPC RPC on the `Inference` service. The gateway returns a `GetSandboxInferenceBundleResponse` containing pre-filtered `SandboxResolvedRoute` entries (routes whose `routing_hint` matches the sandbox's `allowed_routes` policy). These proto messages are converted to `ResolvedRoute` structs by `bundle_to_resolved_routes()`.
 
@@ -945,7 +945,7 @@ Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are c
 Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegate to `spawn_impl()`.
 
 **Environment setup** (both Linux and non-Linux):
-- `NAVIGATOR_SANDBOX=1` (always set)
+- `NEMOCLAW_SANDBOX=1` (always set)
 - Provider credentials (from `GetSandboxProviderEnvironment` RPC)
 - Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
@@ -1017,7 +1017,7 @@ The `SshHandler` implements `russh::server::Handler`:
 `spawn_pty_shell()`:
 1. `openpty()` to create a master/slave PTY pair
 2. Build `std::process::Command` (not tokio) with slave FDs for stdin/stdout/stderr
-3. Set environment: `NAVIGATOR_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM={negotiated}`, proxy URLs, TLS trust store paths, provider credentials
+3. Set environment: `NEMOCLAW_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM={negotiated}`, proxy URLs, TLS trust store paths, provider credentials
 4. Install pre-exec closure (via `unsafe_pty::install_pre_exec()`):
    - `setsid()` to create a new session
    - `TIOCSCTTY` ioctl to set the controlling terminal
@@ -1050,24 +1050,24 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 
 | Variable | CLI flag | Default | Purpose |
 |----------|----------|---------|---------|
-| `NAVIGATOR_SANDBOX_COMMAND` | (trailing args) | `/bin/bash` | Command to execute inside sandbox |
-| `NAVIGATOR_SANDBOX_ID` | `--sandbox-id` | | Sandbox ID for gRPC policy fetch |
-| `NAVIGATOR_ENDPOINT` | `--navigator-endpoint` | | Gateway gRPC endpoint |
-| `NAVIGATOR_POLICY_RULES` | `--policy-rules` | | Path to Rego policy file |
-| `NAVIGATOR_POLICY_DATA` | `--policy-data` | | Path to YAML data file |
-| `NAVIGATOR_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
-| `NAVIGATOR_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
-| `NAVIGATOR_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
-| `NAVIGATOR_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
-| `NAVIGATOR_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
-| `NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
-| `NAVIGATOR_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
+| `NEMOCLAW_SANDBOX_COMMAND` | (trailing args) | `/bin/bash` | Command to execute inside sandbox |
+| `NEMOCLAW_SANDBOX_ID` | `--sandbox-id` | | Sandbox ID for gRPC policy fetch |
+| `NEMOCLAW_ENDPOINT` | `--navigator-endpoint` | | Gateway gRPC endpoint |
+| `NEMOCLAW_POLICY_RULES` | `--policy-rules` | | Path to Rego policy file |
+| `NEMOCLAW_POLICY_DATA` | `--policy-data` | | Path to YAML data file |
+| `NEMOCLAW_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
+| `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
+| `NEMOCLAW_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
+| `NEMOCLAW_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
+| `NEMOCLAW_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
+| `NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
+| `NEMOCLAW_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
 
 ### Injected into child process
 
 | Variable | Purpose |
 |----------|---------|
-| `NAVIGATOR_SANDBOX` | Always `"1"` -- signals the process is sandboxed |
+| `NEMOCLAW_SANDBOX` | Always `"1"` -- signals the process is sandboxed |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | Proxy URL (uppercase, for curl/wget) |
 | `http_proxy` / `https_proxy` / `grpc_proxy` | Proxy URL (lowercase, for gRPC C-core) |
 | `NODE_EXTRA_CA_CERTS` | Path to sandbox CA cert PEM (Node.js, additive) |
@@ -1186,7 +1186,7 @@ pub struct LogPushLayer {
 ```
 
 Key behaviors:
-- **Level filtering**: Defaults to `INFO`. Configurable via the `NAVIGATOR_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
+- **Level filtering**: Defaults to `INFO`. Configurable via the `NEMOCLAW_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
 - **Best-effort delivery**: Uses `try_send()` on the mpsc channel. If the channel is full (1024 lines buffered), the event is dropped. Logging never blocks the sandbox supervisor.
 - **Structured fields**: Implements a `LogVisitor` that collects all tracing key-value fields (e.g., `dst_host`, `action`, `policy`) into a `HashMap<String, String>`. The `message` field is extracted separately; all other fields go into `SandboxLogLine.fields`.
 - **Source tagging**: Sets `source: "sandbox"` on every log line at construction time.
@@ -1201,7 +1201,7 @@ The log push layer is set up in `main()` before calling `run_sandbox()`, only in
 2. `LogPushLayer::new(sandbox_id, tx)` wraps the sender in a tracing layer.
 3. The layer is added to the `tracing_subscriber::registry()` alongside the stdout and file layers.
 
-This means the push layer captures all tracing events the sandbox supervisor generates, filtered by `NAVIGATOR_LOG_PUSH_LEVEL` (default INFO).
+This means the push layer captures all tracing events the sandbox supervisor generates, filtered by `NEMOCLAW_LOG_PUSH_LEVEL` (default INFO).
 
 ### Background push task
 
@@ -1337,7 +1337,7 @@ sequenceDiagram
     participant CL as CLI (nav sandbox logs)
 
     SB->>LP: tracing event (info!(...))
-    LP->>LP: Check level >= NAVIGATOR_LOG_PUSH_LEVEL
+    LP->>LP: Check level >= NEMOCLAW_LOG_PUSH_LEVEL
     LP->>CH: try_send(SandboxLogLine)
     Note over CH: Drops if full (best-effort)
     CH->>BG: recv()
@@ -1360,7 +1360,7 @@ sequenceDiagram
 | mpsc channel full (1024 lines buffered) | `try_send()` drops the event silently; logging never blocks |
 | gRPC stream breaks mid-session | Push loop detects send error, breaks, flushes remaining batch |
 | Push batch exceeds 100 lines | Server caps at 100 lines per batch; excess lines in the batch are ignored |
-| `NAVIGATOR_LOG_PUSH_LEVEL` unparseable | Falls back to INFO |
+| `NEMOCLAW_LOG_PUSH_LEVEL` unparseable | Falls back to INFO |
 
 ## Platform Support
 

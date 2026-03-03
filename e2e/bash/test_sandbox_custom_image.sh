@@ -7,13 +7,13 @@
 # with it.
 #
 # Verifies the full flow:
-#   1. nav sandbox image push --dockerfile <path>  (build + import into cluster)
-#   2. nav sandbox create --image <tag> -- <cmd>   (run sandbox with custom image)
+#   1. ncl sandbox image push --dockerfile <path>  (build + import into cluster)
+#   2. ncl sandbox create --image <tag> -- <cmd>   (run sandbox with custom image)
 #
 # Prerequisites:
-#   - A running navigator cluster (nav cluster admin deploy)
+#   - A running nemoclaw cluster (ncl cluster admin deploy)
 #   - Docker daemon running (for image build)
-#   - The `nav` binary on PATH (or set NAV_BIN)
+#   - The `ncl` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_sandbox_custom_image.sh
@@ -29,10 +29,10 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 if [[ -n "${NAV_BIN:-}" ]]; then
   NAV="${NAV_BIN}"
-elif [[ -x "${PROJECT_ROOT}/target/debug/navigator" ]]; then
-  NAV="${PROJECT_ROOT}/target/debug/navigator"
+elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
+  NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
-  NAV="nav"
+  NAV="ncl"
 fi
 
 IMAGE_TAG="e2e-custom-image:test-$(date +%s)"

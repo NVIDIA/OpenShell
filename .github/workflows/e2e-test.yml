@@ -28,11 +28,11 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
-      NAVIGATOR_REGISTRY: ghcr.io/nvidia/nv-agent-env
-      NAVIGATOR_REGISTRY_HOST: ghcr.io
-      NAVIGATOR_REGISTRY_NAMESPACE: nvidia/nv-agent-env
-      NAVIGATOR_REGISTRY_USERNAME: ${{ github.actor }}
-      NAVIGATOR_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
+      NEMOCLAW_REGISTRY: ghcr.io/nvidia/nv-agent-env
+      NEMOCLAW_REGISTRY_HOST: ghcr.io
+      NEMOCLAW_REGISTRY_NAMESPACE: nvidia/nv-agent-env
+      NEMOCLAW_REGISTRY_USERNAME: ${{ github.actor }}
+      NEMOCLAW_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
 
@@ -50,7 +50,7 @@ jobs:
           GATEWAY_HOST: host.docker.internal
           GATEWAY_PORT: "8080"
           SKIP_IMAGE_PUSH: "1"
-          NAVIGATOR_CLUSTER_IMAGE: ghcr.io/nvidia/nv-agent-env/cluster:${{ inputs.image-tag }}
+          NEMOCLAW_CLUSTER_IMAGE: ghcr.io/nvidia/nv-agent-env/cluster:${{ inputs.image-tag }}
         run: mise run --no-prepare --skip-deps cluster
 
       - name: Run E2E tests

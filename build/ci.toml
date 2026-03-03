@@ -48,9 +48,9 @@ docker run ${TTY_FLAG} \
   -v ${PWD}/tmp:/sandbox/tmp \
   -e HOME=/sandbox \
   -w /sandbox \
-  -e NAVIGATOR_POLICY_RULES=/var/navigator/policy.rego \
-  -e NAVIGATOR_POLICY_DATA=/var/navigator/data.yaml \
-  -e NAVIGATOR_INFERENCE_ROUTES=/var/navigator/inference-routes.yaml \
+  -e NEMOCLAW_POLICY_RULES=/var/navigator/policy.rego \
+  -e NEMOCLAW_POLICY_DATA=/var/navigator/data.yaml \
+  -e NEMOCLAW_INFERENCE_ROUTES=/var/navigator/inference-routes.yaml \
   -e NVIDIA_API_KEY="${NVIDIA_API_KEY:-}" \
   ${ENV_FLAGS} \
   navigator/sandbox:${IMAGE_TAG:-dev} -i -- ${CMD[@]}

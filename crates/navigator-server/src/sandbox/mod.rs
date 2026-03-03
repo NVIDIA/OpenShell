@@ -653,7 +653,7 @@ fn sandbox_template_to_k8s(
         container.insert("image".to_string(), serde_json::json!(image));
     }
 
-    // Build environment variables - start with Navigator-required vars
+    // Build environment variables - start with NemoClaw-required vars
     let env = build_env_list(
         None,
         &template.environment,
@@ -894,34 +894,30 @@ fn apply_required_env(
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
 ) {
-    upsert_env(env, "NAVIGATOR_SANDBOX_ID", sandbox_id);
-    upsert_env(env, "NAVIGATOR_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "NAVIGATOR_SANDBOX_COMMAND", "sleep infinity");
+    upsert_env(env, "NEMOCLAW_SANDBOX_ID", sandbox_id);
+    upsert_env(env, "NEMOCLAW_ENDPOINT", grpc_endpoint);
+    upsert_env(env, "NEMOCLAW_SANDBOX_COMMAND", "sleep infinity");
     if !ssh_listen_addr.is_empty() {
-        upsert_env(env, "NAVIGATOR_SSH_LISTEN_ADDR", ssh_listen_addr);
+        upsert_env(env, "NEMOCLAW_SSH_LISTEN_ADDR", ssh_listen_addr);
     }
     if !ssh_handshake_secret.is_empty() {
-        upsert_env(env, "NAVIGATOR_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
+        upsert_env(env, "NEMOCLAW_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
     }
     upsert_env(
         env,
-        "NAVIGATOR_SSH_HANDSHAKE_SKEW_SECS",
+        "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS",
         &ssh_handshake_skew_secs.to_string(),
     );
     // TLS cert paths for sandbox-to-server mTLS. The actual secret is mounted
     // as a volume; these env vars tell the sandbox gRPC client where to find
     // the certs.
-    upsert_env(env, "NAVIGATOR_TLS_CA", "/etc/navigator-tls/client/ca.crt");
+    upsert_env(env, "NEMOCLAW_TLS_CA", "/etc/navigator-tls/client/ca.crt");
     upsert_env(
         env,
-        "NAVIGATOR_TLS_CERT",
+        "NEMOCLAW_TLS_CERT",
         "/etc/navigator-tls/client/tls.crt",
     );
-    upsert_env(
-        env,
-        "NAVIGATOR_TLS_KEY",
-        "/etc/navigator-tls/client/tls.key",
-    );
+    upsert_env(env, "NEMOCLAW_TLS_KEY", "/etc/navigator-tls/client/tls.key");
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {

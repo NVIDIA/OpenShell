@@ -7,7 +7,7 @@ set -euo pipefail
 
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NAVIGATOR_REGISTRY:-127.0.0.1:5000/navigator}}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NEMOCLAW_REGISTRY:-127.0.0.1:5000/navigator}}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}
 DEPLOY_FAST_MODE=${DEPLOY_FAST_MODE:-auto}
@@ -225,7 +225,7 @@ if [[ "${FORCE_HELM_UPGRADE}" == "1" ]]; then
 fi
 
 # Always run helm upgrade when images are rebuilt so that the
-# NAVIGATOR_SANDBOX_IMAGE env var on the server pod is set correctly
+# NEMOCLAW_SANDBOX_IMAGE env var on the server pod is set correctly
 # and image pull policy is Always (not IfNotPresent from bootstrap).
 if [[ "${build_server}" == "1" || "${build_sandbox}" == "1" ]]; then
   needs_helm_upgrade=1

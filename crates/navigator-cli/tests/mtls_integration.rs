@@ -353,7 +353,7 @@ async fn cli_requires_client_cert_for_https() {
         .unwrap()
         .to_string_lossy()
         .to_string();
-    let _env = EnvVarGuard::set("NAVIGATOR_CLUSTER_NAME", &cluster_name);
+    let _env = EnvVarGuard::set("NEMOCLAW_CLUSTER_NAME", &cluster_name);
     let ca_path = dir.path().join("ca.crt");
     std::fs::write(&ca_path, ca_cert).unwrap();
 

@@ -1,8 +1,8 @@
-# Navigator 🗺️
+# NemoClaw 
 
-Navigator is the runtime environment for autonomous agents—the "Matrix" where they live, work, and verify.
+NemoClaw is the runtime environment for autonomous agents—the "Matrix" where they live, work, and verify.
 
-While coding tools like Claude help agents write logic, Navigator provides the infrastructure to run it, offering a programmable factory where agents can spin up physics simulations to master tasks, generate synthetic data to fix edge cases, and safely iterate through thousands of failures in isolated sandboxes.
+While coding tools like Claude help agents write logic, NemoClaw provides the infrastructure to run it, offering a programmable factory where agents can spin up physics simulations to master tasks, generate synthetic data to fix edge cases, and safely iterate through thousands of failures in isolated sandboxes.
 
 It transforms the data center from a static deployment target into a continuous verification engine, allowing agents to autonomously build and operate complex systems—from physical robotics to self-healing infrastructure—without needing a human to manage the infrastructure.
 
@@ -23,19 +23,19 @@ uv pip install nemoclaw \
   --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
-The `navigator` binary is installed into your Python environment. Use `uv run navigator` to invoke it, or activate your venv first with `source .venv/bin/activate`.
+The `nemoclaw` binary is installed into your Python environment. Use `uv run nemoclaw` to invoke it, or activate your venv first with `source .venv/bin/activate`.
 
 ### Create a sandbox
 
 To install a Openclaw cluster and start a sandbox
 
 ```bash
-navigator sandbox create -- claude  # or opencode or codex
+nemoclaw sandbox create -- claude  # or opencode or codex
 ```
 
 To run a sandbox on a remote machine, pass `--remote [remote-ssh-host]`.
 
-For more information see `navigator sandbox create --help`.
+For more information see `nemoclaw sandbox create --help`.
 
 The sandbox container includes the following tools by default:
 
@@ -50,18 +50,18 @@ For additional sandbox images see the [NVIDIA/NemoClaw-Community](https://github
 
 ### Deploy a cluster
 
-**Note:** `navigator sandbox create` automatically deploys a cluster if one isn't already running.
+**Note:** `nemoclaw sandbox create` automatically deploys a cluster if one isn't already running.
 
 To deploy a cluster explicitly:
 
 ```bash
-navigator cluster admin deploy
+nemoclaw cluster admin deploy
 ```
 
 For remote deployment:
 
 ```bash
-navigator cluster admin deploy --remote user@host
+nemoclaw cluster admin deploy --remote user@host
 ```
 
 ### Upgrading
@@ -69,14 +69,14 @@ navigator cluster admin deploy --remote user@host
 To upgrade, redeploy your cluster to pick up the latest server and sandbox images:
 
 ```bash
-navigator cluster admin deploy
+nemoclaw cluster admin deploy
 ```
 
 This will prompt you to recreate the cluster. Select "yes" to recreate the cluster.
 
 ## Developing
 
-See `CONTRIBUTING.md` for building from source and contributing to Navigator.
+See `CONTRIBUTING.md` for building from source and contributing to NemoClaw.
 
 ## Architecture
 

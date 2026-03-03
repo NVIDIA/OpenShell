@@ -16,14 +16,14 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
 
 /// Path to the file that stores the active cluster name.
 ///
-/// Location: `$XDG_CONFIG_HOME/navigator/active_cluster`
+/// Location: `$XDG_CONFIG_HOME/nemoclaw/active_cluster`
 pub fn active_cluster_path() -> Result<PathBuf> {
-    Ok(xdg_config_dir()?.join("navigator").join("active_cluster"))
+    Ok(xdg_config_dir()?.join("nemoclaw").join("active_cluster"))
 }
 
 /// Base directory for all cluster metadata files.
 ///
-/// Location: `$XDG_CONFIG_HOME/navigator/clusters/`
+/// Location: `$XDG_CONFIG_HOME/nemoclaw/clusters/`
 pub fn clusters_dir() -> Result<PathBuf> {
-    Ok(xdg_config_dir()?.join("navigator").join("clusters"))
+    Ok(xdg_config_dir()?.join("nemoclaw").join("clusters"))
 }

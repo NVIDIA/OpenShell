@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Navigator Server library.
+//! NemoClaw Server library.
 //!
-//! This crate provides the server implementation for Navigator, including:
+//! This crate provides the server implementation for NemoClaw, including:
 //! - gRPC service implementation
 //! - HTTP health endpoints
 //! - Protocol multiplexing (gRPC + HTTP on same port)
@@ -80,7 +80,7 @@ impl ServerState {
     }
 }
 
-/// Run the Navigator server.
+/// Run the NemoClaw server.
 ///
 /// This starts a multiplexed gRPC/HTTP server on the configured bind address.
 ///

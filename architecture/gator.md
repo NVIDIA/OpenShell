@@ -1,23 +1,23 @@
-# Gator: Navigator TUI
+# Gator: NemoClaw TUI
 
-Gator is a terminal user interface for Navigator, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, Gator gives you a real-time, keyboard-driven dashboard — everything updates automatically and you navigate with a few keystrokes.
+Gator is a terminal user interface for NemoClaw, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, Gator gives you a real-time, keyboard-driven dashboard — everything updates automatically and you navigate with a few keystrokes.
 
 ## Launching Gator
 
-Gator is a subcommand of the Navigator CLI, so it inherits all your existing configuration — cluster selection, TLS settings, and verbosity flags all work the same way.
+Gator is a subcommand of the NemoClaw CLI, so it inherits all your existing configuration — cluster selection, TLS settings, and verbosity flags all work the same way.
 
 ```bash
-navigator gator                   # launch against the active cluster
+nemoclaw gator                   # launch against the active cluster
 nav gator                         # dev alias (builds from source)
 nav gator --cluster prod          # target a specific cluster
-NAVIGATOR_CLUSTER=prod nav gator  # same thing, via environment variable
+NEMOCLAW_CLUSTER=prod nav gator  # same thing, via environment variable
 ```
 
 Cluster resolution follows the same priority as the rest of the CLI:
 
 1. `--cluster` flag (if provided)
-2. `NAVIGATOR_CLUSTER` environment variable
-3. Active cluster from `~/.config/navigator/active_cluster`
+2. `NEMOCLAW_CLUSTER` environment variable
+3. Active cluster from `~/.config/nemoclaw/active_cluster`
 
 No separate configuration files or authentication are needed.
 

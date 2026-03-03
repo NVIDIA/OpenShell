@@ -1,12 +1,12 @@
 # Cluster Bootstrap Architecture
 
-This document describes how Navigator bootstraps a single-node k3s cluster inside a Docker container, for both local and remote (SSH) targets.
+This document describes how NemoClaw bootstraps a single-node k3s cluster inside a Docker container, for both local and remote (SSH) targets.
 
 ## Goals and Scope
 
 - Provide a single bootstrap flow through `navigator-bootstrap` for local and remote cluster lifecycle.
 - Keep Docker as the only runtime dependency for provisioning and lifecycle operations.
-- Package the Navigator cluster as one container image, transferred to the target host via registry pull.
+- Package the NemoClaw cluster as one container image, transferred to the target host via registry pull.
 - Support idempotent `deploy` behavior (safe to re-run).
 - Persist cluster access artifacts (kubeconfig, metadata, mTLS certs) in the local XDG config directory.
 - Track the active cluster so most CLI commands resolve their target automatically.
@@ -39,20 +39,20 @@ Out of scope:
 
 ## CLI Commands
 
-All cluster lifecycle commands live under `nav cluster admin`:
+All cluster lifecycle commands live under `ncl cluster admin`:
 
 | Command | Description |
 |---|---|
-| `nav cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
-| `nav cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `nav cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
-| `nav cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
-| `nav cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
-| `nav cluster status` | Show gateway health via gRPC/HTTP |
-| `nav cluster use <name>` | Set the active cluster |
-| `nav cluster list` | List all clusters with metadata |
+| `ncl cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
+| `ncl cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
+| `ncl cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
+| `ncl cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
+| `ncl cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
+| `ncl cluster status` | Show gateway health via gRPC/HTTP |
+| `ncl cluster use <name>` | Set the active cluster |
+| `ncl cluster list` | List all clusters with metadata |
 
-The `--name` flag defaults to `"navigator"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--cluster` flag, then `NAVIGATOR_CLUSTER` env, then `~/.config/navigator/active_cluster` file.
+The `--name` flag defaults to `"nemoclaw"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--cluster` flag, then `NEMOCLAW_CLUSTER` env, then `~/.config/nemoclaw/active_cluster` file.
 
 ## Local Task Flows (`mise`)
 
@@ -60,11 +60,11 @@ Development task entrypoints split bootstrap behavior:
 
 | Task | Behavior |
 |---|---|
-| `mise run cluster` | Fast recreate path: destroys existing local cluster resources for `CLUSTER_NAME` (if present), removes conflicting local Navigator clusters that occupy host port `6443`, pushes prebuilt local component images to the local registry, and deploys using local-registry image refs (`127.0.0.1:5000/navigator/*`) |
+| `mise run cluster` | Fast recreate path: destroys existing local cluster resources for `CLUSTER_NAME` (if present), removes conflicting local NemoClaw clusters that occupy host port `6443`, pushes prebuilt local component images to the local registry, and deploys using local-registry image refs (`127.0.0.1:5000/navigator/*`) |
 | `mise run cluster:build` | Full build path: builds cluster/server/sandbox images, pushes components, then deploys (preferred in CI) |
 | `mise run cluster:deploy` | Iterative deploy path: detects changed files and rebuilds/pushes only impacted components |
 
-For `mise run cluster`, `.env` acts as local source-of-truth for `CLUSTER_NAME`, `GATEWAY_PORT`, and `NAVIGATOR_CLUSTER`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
+For `mise run cluster`, `.env` acts as local source-of-truth for `CLUSTER_NAME`, `GATEWAY_PORT`, and `NEMOCLAW_CLUSTER`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
 Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so `cluster` and `cluster:deploy` can push/pull local component images consistently.
 
 ## Bootstrap Sequence Diagram
@@ -77,7 +77,7 @@ sequenceDiagram
   participant L as Local Docker daemon
   participant R as Remote Docker daemon (SSH)
 
-  U->>C: nav cluster admin deploy --remote user@host
+  U->>C: ncl cluster admin deploy --remote user@host
   C->>B: deploy_cluster(DeployOptions)
 
   B->>B: create_ssh_docker_client (ssh://, 600s timeout)
@@ -110,7 +110,7 @@ flowchart LR
   subgraph WS[User workstation]
     NAV[navigator-cli]
     KUBECTL[kubectl]
-    KC[stored kubeconfig ~/.config/navigator/clusters/NAME/kubeconfig]
+    KC[stored kubeconfig ~/.config/nemoclaw/clusters/NAME/kubeconfig]
     MTLS[mTLS bundle ca.crt, tls.crt, tls.key]
     TUN[ssh -L 6443:127.0.0.1:6443 user@host]
   end
@@ -156,7 +156,7 @@ The `deploy_cluster_with_logs` variant accepts an `FnMut(String)` callback for p
 
 Image ref resolution in `default_cluster_image_ref()`:
 
-1. If `NAVIGATOR_CLUSTER_IMAGE` is set and non-empty, use it verbatim.
+1. If `NEMOCLAW_CLUSTER_IMAGE` is set and non-empty, use it verbatim.
 2. Otherwise, use the published distribution image base (`<distribution-registry>/navigator/cluster`) with its default tag behavior.
 
 - **Local deploy**: `ensure_image()` inspects the image on the local daemon and pulls from the configured registry if missing (using built-in distribution credentials when pulling from the default distribution host).
@@ -182,7 +182,7 @@ For the target daemon (local or remote):
      | Container Port | Host Port | Purpose |
      |---|---|---|
      | 6443/tcp | 6443 | Kubernetes API |
-     | 30051/tcp | configurable (default 8080) | Navigator service NodePort (mTLS) |
+     | 30051/tcp | configurable (default 8080) | NemoClaw service NodePort (mTLS) |
 
    - Container environment variables (see [Container Environment Variables](#container-environment-variables) below).
    - If the container exists with a different image ID (compared by inspecting the content-addressable ID), it is stopped, force-removed, and recreated. If the image matches, the existing container is reused.
@@ -194,9 +194,9 @@ After the container starts:
 
 1. **Poll kubeconfig**: `wait_for_kubeconfig()` runs `cat /etc/rancher/k3s/k3s.yaml` via `docker exec` up to 30 times, 2 seconds apart (60s total). Each attempt first checks that the container is still running. Validates the output contains `apiVersion:` and `clusters:`.
 2. **Rewrite kubeconfig**: Replace the server address with `https://127.0.0.1:6443`. Rename `default` entries (cluster, context, user) to the cluster name. Remote mode appends `-remote` suffix (e.g., `{name}-remote`) to avoid collisions with local contexts.
-3. **Store kubeconfig** at `~/.config/navigator/clusters/{name}/kubeconfig` (or `$XDG_CONFIG_HOME/navigator/clusters/{name}/kubeconfig`).
+3. **Store kubeconfig** at `~/.config/nemoclaw/clusters/{name}/kubeconfig` (or `$XDG_CONFIG_HOME/nemoclaw/clusters/{name}/kubeconfig`).
 4. **Clean stale nodes**: `clean_stale_nodes()` finds `NotReady` nodes via `kubectl get nodes` and deletes them. This is needed when a container is recreated but reuses the persistent volume -- k3s registers a new node (using the container ID as hostname) while old node entries persist in etcd. Non-fatal on error; returns the count of removed nodes.
-5. **Push local images** (optional, local deploy only): If `NAVIGATOR_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/navigator -n navigator` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/navigator-bootstrap/src/push.rs`.
+5. **Push local images** (optional, local deploy only): If `NEMOCLAW_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/navigator -n navigator` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/navigator-bootstrap/src/push.rs`.
 6. **Wait for cluster health**: `wait_for_cluster_ready()` polls the Docker HEALTHCHECK status up to 180 times, 2 seconds apart (6 min total). A background task streams container logs during this wait. Failure modes:
    - Container exits during polling: error includes recent log lines.
    - Container has no HEALTHCHECK instruction: fails immediately.
@@ -206,7 +206,7 @@ After the container starts:
 
 TLS is always required. `fetch_and_store_cli_mtls()` polls for Kubernetes secret `navigator-cli-client` in namespace `navigator` (90 attempts, 2 seconds apart, 3 min total). Each attempt checks the container is still running. The secret's base64-encoded `ca.crt`, `tls.crt`, and `tls.key` fields are decoded and stored.
 
-Storage location: `~/.config/navigator/clusters/{name}/mtls/`
+Storage location: `~/.config/nemoclaw/clusters/{name}/mtls/`
 
 Write is atomic: write to `.tmp` directory, validate all three files are non-empty, rename existing directory to `.bak`, rename `.tmp` to final path, then remove `.bak`.
 
@@ -228,11 +228,11 @@ Metadata fields:
 | `remote_host` | `Option<String>` | SSH destination (e.g., `user@host`) |
 | `resolved_host` | `Option<String>` | Resolved hostname/IP from `ssh -G` |
 
-Metadata location: `~/.config/navigator/clusters/{name}_metadata.json`
+Metadata location: `~/.config/nemoclaw/clusters/{name}_metadata.json`
 
 Note: metadata is stored at the `clusters/` level (not nested inside `{name}/` like kubeconfig and mTLS).
 
-After deploy, the CLI calls `save_active_cluster(name)`, writing the cluster name to `~/.config/navigator/active_cluster`. Subsequent commands that don't specify `--cluster` or `NAVIGATOR_CLUSTER` resolve to this active cluster.
+After deploy, the CLI calls `save_active_cluster(name)`, writing the cluster name to `~/.config/nemoclaw/active_cluster`. Subsequent commands that don't specify `--cluster` or `NEMOCLAW_CLUSTER` resolve to this active cluster.
 
 ## Container Image
 
@@ -250,7 +250,7 @@ Layers added:
 4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` -> `/opt/navigator/manifests/`
 
 Bundled manifests include:
-- `navigator-helmchart.yaml` (Navigator Helm chart auto-deploy)
+- `navigator-helmchart.yaml` (NemoClaw Helm chart auto-deploy)
 - `envoy-gateway-helmchart.yaml` (Envoy Gateway for Gateway API)
 - `agent-sandbox.yaml`
 
@@ -296,7 +296,7 @@ When environment variables are set, the entrypoint modifies the HelmChart manife
 `deploy/docker/cluster-healthcheck.sh` validates cluster readiness through a series of checks:
 
 1. **Kubernetes API**: `kubectl get --raw='/readyz'`
-2. **Navigator StatefulSet**: Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
+2. **NemoClaw StatefulSet**: Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
 3. **Gateway**: Checks that `gateway/navigator-gateway` in namespace `navigator` has the `Programmed` condition.
 4. **mTLS secret** (conditional): If `NAV_GATEWAY_TLS_ENABLED` is true (or inferred from the HelmChart manifest using the same two-path detection logic as the bootstrap code), checks that secret `navigator-cli-client` exists with non-empty `ca.crt`, `tls.crt`, and `tls.key` data.
 
@@ -329,7 +329,7 @@ ssh -L 6443:127.0.0.1:6443 -N user@host
 CLI helper:
 
 ```bash
-nav cluster admin tunnel --name <name>
+ncl cluster admin tunnel --name <name>
 ```
 
 The `--remote` flag is optional; the CLI resolves the SSH destination from stored cluster metadata. Pass `--print-command` to print the SSH command without executing it.
@@ -338,7 +338,7 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 
 - Local: `https://127.0.0.1:{port}` (or `https://{docker_host}:{port}` when `DOCKER_HOST` is a non-loopback TCP endpoint). Default port is 8080.
 - Remote: `https://<resolved-remote-host>:{port}`.
-- The host port (configurable via `--port`, default 8080) maps to container port 30051 (Navigator service NodePort).
+- The host port (configurable via `--port`, default 8080) maps to container port 30051 (NemoClaw service NodePort).
 
 ## Lifecycle Operations
 
@@ -379,11 +379,11 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 
 ## Auto-Bootstrap from `sandbox create`
 
-When `nav sandbox create` cannot connect to a cluster (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
+When `ncl sandbox create` cannot connect to a cluster (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
 
 1. `should_attempt_bootstrap()` in `crates/navigator-cli/src/bootstrap.rs` checks the error type. It returns `true` for connectivity errors and missing default TLS materials, but `false` for TLS handshake/auth errors.
 2. If running in a terminal, the user is prompted to confirm.
-3. `run_bootstrap()` deploys a cluster named `"navigator"`, sets it as active, and returns fresh `TlsOptions` pointing to the newly-written mTLS certs.
+3. `run_bootstrap()` deploys a cluster named `"nemoclaw"`, sets it as active, and returns fresh `TlsOptions` pointing to the newly-written mTLS certs.
 
 ## Container Environment Variables
 
@@ -392,10 +392,10 @@ Variables set on the container by `ensure_container()` in `docker.rs`:
 | Variable | Value | When Set |
 |---|---|---|
 | `REGISTRY_MODE` | `"external"` | Always |
-| `REGISTRY_HOST` | Distribution registry host (or `NAVIGATOR_REGISTRY_HOST` override) | Always |
+| `REGISTRY_HOST` | Distribution registry host (or `NEMOCLAW_REGISTRY_HOST` override) | Always |
 | `REGISTRY_INSECURE` | `"true"` or `"false"` | Always |
-| `IMAGE_REPO_BASE` | `{registry_host}/{namespace}` (or `IMAGE_REPO_BASE`/`NAVIGATOR_IMAGE_REPO_BASE` override) | Always |
-| `REGISTRY_ENDPOINT` | Custom endpoint URL | When `NAVIGATOR_REGISTRY_ENDPOINT` is set |
+| `IMAGE_REPO_BASE` | `{registry_host}/{namespace}` (or `IMAGE_REPO_BASE`/`NEMOCLAW_IMAGE_REPO_BASE` override) | Always |
+| `REGISTRY_ENDPOINT` | Custom endpoint URL | When `NEMOCLAW_REGISTRY_ENDPOINT` is set |
 | `REGISTRY_USERNAME` | Registry auth username | When credentials available |
 | `REGISTRY_PASSWORD` | Registry auth password | When credentials available |
 | `EXTRA_SANS` | Comma-separated extra TLS SANs | When extra SANs computed |
@@ -411,28 +411,28 @@ Environment variables that affect bootstrap behavior when set on the host:
 
 | Variable | Effect |
 |---|---|
-| `NAVIGATOR_CLUSTER_IMAGE` | Overrides entire image ref if set and non-empty |
-| `IMAGE_TAG` | Sets image tag (default: `"dev"`) when `NAVIGATOR_CLUSTER_IMAGE` is not set |
+| `NEMOCLAW_CLUSTER_IMAGE` | Overrides entire image ref if set and non-empty |
+| `IMAGE_TAG` | Sets image tag (default: `"dev"`) when `NEMOCLAW_CLUSTER_IMAGE` is not set |
 | `NAV_GATEWAY_TLS_ENABLED` | Overrides HelmChart manifest for TLS enabled check (`true`/`1`/`yes`/`false`/`0`/`no`) |
 | `XDG_CONFIG_HOME` | Base config directory (default: `$HOME/.config`) |
 | `KUBECONFIG` | Target kubeconfig path for merge (first colon-separated path; default: `$HOME/.kube/config`) |
 | `DOCKER_HOST` | When `tcp://` and non-loopback, the host is added as a TLS SAN and used as the gateway endpoint |
-| `NAVIGATOR_PUSH_IMAGES` | Comma-separated image refs to push into the cluster's containerd (local deploy only) |
-| `NAVIGATOR_REGISTRY_HOST` | Override the distribution registry host |
-| `NAVIGATOR_REGISTRY_NAMESPACE` | Override the registry namespace (default: `"navigator"`) |
-| `IMAGE_REPO_BASE` / `NAVIGATOR_IMAGE_REPO_BASE` | Override the image repository base path |
-| `NAVIGATOR_REGISTRY_INSECURE` | Use HTTP instead of HTTPS for registry mirror |
-| `NAVIGATOR_REGISTRY_ENDPOINT` | Custom registry mirror endpoint |
-| `NAVIGATOR_REGISTRY_USERNAME` | Override registry auth username |
-| `NAVIGATOR_REGISTRY_PASSWORD` | Override registry auth password |
-| `NAVIGATOR_CLUSTER` | Set the active cluster name for CLI commands |
+| `NEMOCLAW_PUSH_IMAGES` | Comma-separated image refs to push into the cluster's containerd (local deploy only) |
+| `NEMOCLAW_REGISTRY_HOST` | Override the distribution registry host |
+| `NEMOCLAW_REGISTRY_NAMESPACE` | Override the registry namespace (default: `"navigator"`) |
+| `IMAGE_REPO_BASE` / `NEMOCLAW_IMAGE_REPO_BASE` | Override the image repository base path |
+| `NEMOCLAW_REGISTRY_INSECURE` | Use HTTP instead of HTTPS for registry mirror |
+| `NEMOCLAW_REGISTRY_ENDPOINT` | Custom registry mirror endpoint |
+| `NEMOCLAW_REGISTRY_USERNAME` | Override registry auth username |
+| `NEMOCLAW_REGISTRY_PASSWORD` | Override registry auth password |
+| `NEMOCLAW_CLUSTER` | Set the active cluster name for CLI commands |
 
 ## File System Layout
 
-Artifacts stored under `$XDG_CONFIG_HOME/navigator/` (default `~/.config/navigator/`):
+Artifacts stored under `$XDG_CONFIG_HOME/nemoclaw/` (default `~/.config/nemoclaw/`):
 
 ```
-navigator/
+nemoclaw/
   active_cluster                           # plain text: active cluster name
   clusters/
     {name}_metadata.json                   # ClusterMetadata JSON
@@ -462,5 +462,5 @@ navigator/
 - `deploy/docker/Dockerfile.cluster` -- container image definition
 - `deploy/docker/cluster-entrypoint.sh` -- container entrypoint script
 - `deploy/docker/cluster-healthcheck.sh` -- Docker HEALTHCHECK script
-- `deploy/kube/manifests/navigator-helmchart.yaml` -- Navigator Helm chart manifest
+- `deploy/kube/manifests/navigator-helmchart.yaml` -- NemoClaw Helm chart manifest
 - `deploy/kube/manifests/envoy-gateway-helmchart.yaml` -- Envoy Gateway manifest
