@@ -16,7 +16,7 @@ It transforms the data center from a static deployment target into a continuous 
 ### Install
 
 ```bash
-uv pip install navigator --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
+uv pip install nemoclaw --upgrade --pre --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
 The `navigator` binary is installed into your Python environment. Use `uv run navigator` to invoke it, or activate your venv first (`source .venv/bin/activate`).
@@ -27,7 +27,11 @@ The `navigator` binary is installed into your Python environment. Use `uv run na
 uv run navigator sandbox create -- claude  # or opencode or codex
 ```
 
+If you want to run a sandbox on a remote machine, pass `--remote [remote-ssh-host]`. This will start a sandbox on the remote host.
+
 The sandbox container includes a minimal networking toolset by default: `ping`, `dig`, `nslookup`, `nc`, `traceroute`, and `netstat`.
+
+It also includes common coding harnesses such as: `opencode`, `claude`, and `codex`.
 
 ## Developing
 
