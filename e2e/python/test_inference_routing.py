@@ -125,7 +125,10 @@ def test_route_refresh_picks_up_route_created_after_sandbox_start(
             assert initial.exit_code == 0, f"stderr: {initial.stderr}"
             initial_output = initial.stdout.strip()
             assert initial_output.startswith("http_error_503"), initial_output
-            assert "no inference routes configured" in initial_output, initial_output
+            assert (
+                "inference endpoint detected without matching inference route"
+                in initial_output
+            ), initial_output
 
             inference_client.create(
                 name=route_name,

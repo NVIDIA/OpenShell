@@ -142,7 +142,7 @@ File mode does not spawn a refresh task -- routes are static for the sandbox lif
 Both route source modes degrade gracefully when routes are unavailable:
 
 - **Empty routes in file mode**: If `routes: []` in the file, `build_inference_context()` returns `None` and inference routing is disabled. This is confirmed by the `build_inference_context_empty_route_file_returns_none` test.
-- **Empty routes in cluster mode**: If the initial cluster bundle has zero routes, the sandbox still creates `InferenceContext` with an empty cache and starts background refresh. Intercepted inference requests return `503` (`{"error": "no inference routes configured"}`) until a later refresh provides routes.
+- **Empty routes in cluster mode**: If the initial cluster bundle has zero routes, the sandbox still creates `InferenceContext` with an empty cache and starts background refresh. Intercepted inference requests return `503` (`{"error": "inference endpoint detected without matching inference route"}`) until a later refresh provides routes.
 - **Cluster mode errors**: `PermissionDenied` or `NotFound` errors (detected via string matching on the gRPC error message) indicate no inference policy is configured for this sandbox. The sandbox logs this and proceeds without inference routing. Other gRPC errors also result in graceful degradation: inference routing is disabled, but the sandbox starts normally.
 - **File mode errors**: Parse failures or missing files in standalone mode are fatal -- `build_inference_context()` propagates the error and the sandbox refuses to start. Only an empty-but-valid routes list is gracefully disabled.
 
@@ -253,11 +253,11 @@ Built at sandbox startup in `crates/navigator-sandbox/src/lib.rs` by `build_infe
    - If `detect_inference_pattern()` matches:
      - Strip credential and framing/hop-by-hop headers (`Authorization`, `x-api-key`, `host`, `content-length`, and all hop-by-hop headers)
      - Acquire a read lock on the route cache
-     - If routes are empty, return `503` JSON: `{"error": "no inference routes configured"}`
+      - If routes are empty, return `503` JSON: `{"error": "inference endpoint detected without matching inference route"}`
      - Call `Router::proxy_with_candidates()` to select a route and forward the request locally
      - Return the backend's response to the client (response hop-by-hop and framing headers are stripped before formatting)
    - If no pattern matches:
-     - Return a `403` JSON error: `{"error": "only inference API calls are allowed on this connection"}`
+      - Return a `403` JSON error: `{"error": "connection not allowed by policy"}`
    - If the router call fails:
      - Map the `RouterError` to an HTTP status via `router_error_to_http()` and return a JSON error
 
@@ -634,8 +634,8 @@ The inference routing migration is a breaking protocol change. The `ProxyInferen
 | `InferenceContext` missing | Error: "InspectForInference requires inference context (router + routes)" |
 | TLS state not configured | Error: "InspectForInference requires TLS state for client termination" |
 | Request exceeds 10 MiB buffer | `413` Payload Too Large response to client |
-| Non-inference request on intercepted connection | `403` JSON error: `{"error": "only inference API calls are allowed on this connection"}` |
-| No routes in cache | `503` JSON error: `{"error": "no inference routes configured"}` |
+| Non-inference request on intercepted connection | `403` JSON error: `{"error": "connection not allowed by policy"}` |
+| No routes in cache | `503` JSON error: `{"error": "inference endpoint detected without matching inference route"}` |
 | Router returns `NoCompatibleRoute` | `400` JSON error |
 | Backend timeout or connection failure | `503` JSON error |
 | Backend protocol error or internal error | `502` JSON error |
