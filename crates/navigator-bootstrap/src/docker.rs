@@ -8,7 +8,8 @@ use bollard::Docker;
 use bollard::auth::DockerCredentials;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, NetworkCreateRequest, PortBinding, VolumeCreateRequest,
+    ContainerCreateBody, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
+    VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -89,7 +90,7 @@ pub fn normalize_arch(arch: &str) -> String {
 }
 
 /// Create an SSH Docker client from remote options.
-pub fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> {
+pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> {
     // Ensure destination has ssh:// prefix
     let ssh_url = if remote.destination.starts_with("ssh://") {
         remote.destination.clone()
@@ -97,14 +98,25 @@ pub fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> {
         format!("ssh://{}", remote.destination)
     };
 
-    Docker::connect_with_ssh(
+    let docker = Docker::connect_with_ssh(
         &ssh_url,
         600, // timeout in seconds (10 minutes for large image transfers)
         API_DEFAULT_VERSION,
         remote.ssh_key.clone(),
     )
     .into_diagnostic()
-    .wrap_err_with(|| format!("failed to connect to remote Docker daemon at {ssh_url}"))
+    .wrap_err_with(|| format!("failed to connect to remote Docker daemon at {ssh_url}"))?;
+
+    // Negotiate the API version with the remote daemon.  bollard defaults to
+    // a recent API version (1.52) which may be higher than what the remote
+    // Docker supports.  Version negotiation downgrades the client version to
+    // match the server, preventing errors like "Schema 2 manifest not
+    // supported by client" when pulling images on older Docker daemons.
+    docker
+        .negotiate_version()
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to negotiate Docker API version with remote daemon")
 }
 
 pub async fn ensure_network(docker: &Docker) -> Result<()> {
@@ -403,16 +415,33 @@ pub async fn ensure_container(
 
 pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {
     let container_name = container_name(name);
-    let response = docker
-        .start_container(&container_name, None::<StartContainerOptions>)
-        .await;
-    match response {
-        Ok(()) => Ok(()),
-        Err(err) if is_conflict(&err) => Ok(()),
-        Err(err) => Err(err)
-            .into_diagnostic()
-            .wrap_err("failed to start cluster container"),
+
+    // Retry with backoff when the start fails due to a port binding conflict.
+    // After a container is destroyed the OS may take a moment to release the
+    // TCP socket, so the new container's start can transiently fail with
+    // "port is already allocated".
+    let max_attempts: u64 = 5;
+    for attempt in 1..=max_attempts {
+        let response = docker
+            .start_container(&container_name, None::<StartContainerOptions>)
+            .await;
+        match response {
+            Ok(()) => return Ok(()),
+            Err(err) if is_conflict(&err) => return Ok(()),
+            Err(ref err) if attempt < max_attempts && is_port_conflict(err) => {
+                tracing::debug!(
+                    "Port conflict on start attempt {attempt}/{max_attempts}, retrying after backoff"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err("failed to start cluster container");
+            }
+        }
     }
+    unreachable!()
 }
 
 pub async fn stop_container(docker: &Docker, container_name: &str) -> Result<()> {
@@ -441,6 +470,20 @@ pub async fn destroy_cluster_resources(
         .await
         .ok()
         .and_then(|info| info.image);
+
+    // Explicitly disconnect the container from the cluster network before
+    // removing it.  This ensures Docker tears down the network endpoint
+    // synchronously so port bindings are released immediately and the
+    // subsequent network cleanup sees zero connected containers.
+    let _ = docker
+        .disconnect_network(
+            NETWORK_NAME,
+            NetworkDisconnectRequest {
+                container: container_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await;
 
     let _ = stop_container(docker, &container_name).await;
 
@@ -492,32 +535,48 @@ pub async fn destroy_cluster_resources(
 
     let _ = std::fs::remove_file(kubeconfig_path);
 
-    cleanup_network_if_unused(docker).await?;
+    // Force-remove the network during a full destroy.  First disconnect any
+    // stale endpoints that Docker may still report (race between container
+    // removal and network bookkeeping), then remove the network itself.
+    force_remove_network(docker).await?;
     Ok(())
 }
 
-pub async fn cleanup_network_if_unused(docker: &Docker) -> Result<()> {
-    let network = docker
+/// Forcefully remove the cluster network, disconnecting any remaining
+/// containers first.  This ensures that stale Docker network endpoints
+/// cannot prevent port bindings from being released.
+async fn force_remove_network(docker: &Docker) -> Result<()> {
+    let network = match docker
         .inspect_network(NETWORK_NAME, None::<InspectNetworkOptions>)
-        .await;
-    let network = match network {
+        .await
+    {
         Ok(info) => info,
         Err(err) if is_not_found(&err) => return Ok(()),
         Err(err) => return Err(err).into_diagnostic(),
     };
 
-    if let Some(containers) = network.containers
-        && !containers.is_empty()
-    {
-        return Ok(());
+    // Disconnect any containers still attached to the network.
+    if let Some(containers) = network.containers {
+        for (id, _) in containers {
+            let _ = docker
+                .disconnect_network(
+                    NETWORK_NAME,
+                    NetworkDisconnectRequest {
+                        container: id,
+                        force: Some(true),
+                    },
+                )
+                .await;
+        }
     }
 
-    docker
-        .remove_network(NETWORK_NAME)
-        .await
-        .into_diagnostic()
-        .wrap_err("failed to remove Docker network")?;
-    Ok(())
+    match docker.remove_network(NETWORK_NAME).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_not_found(&err) => Ok(()),
+        Err(err) => Err(err)
+            .into_diagnostic()
+            .wrap_err("failed to remove Docker network"),
+    }
 }
 
 fn is_not_found(err: &BollardError) -> bool {
@@ -636,6 +695,19 @@ fn is_conflict(err: &BollardError) -> bool {
             status_code: 409,
             ..
         }
+    )
+}
+
+/// Detect Docker "port is already allocated" errors that can occur transiently
+/// after a container using the same port was just destroyed.
+fn is_port_conflict(err: &BollardError) -> bool {
+    matches!(
+        err,
+        BollardError::DockerResponseServerError {
+            status_code: 500,
+            message,
+            ..
+        } if message.contains("port is already allocated")
     )
 }
 

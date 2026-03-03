@@ -490,6 +490,8 @@ enum SandboxCommands {
         keep: bool,
 
         /// SSH destination for remote bootstrap (e.g., user@hostname).
+        /// Only used when no cluster exists yet; ignored if a cluster is
+        /// already active.
         #[arg(long)]
         remote: Option<String>,
 
@@ -831,7 +833,7 @@ async fn main() -> Result<()> {
                 run::cluster_use(&name)?;
             }
             ClusterCommands::List => {
-                run::cluster_list()?;
+                run::cluster_list(&cli.cluster)?;
             }
             ClusterCommands::Admin { command } => match command {
                 ClusterAdminCommands::Deploy {
@@ -919,6 +921,15 @@ async fn main() -> Result<()> {
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_cluster(&cli.cluster) {
                         Ok(ctx) => {
+                            if remote.is_some() {
+                                eprintln!(
+                                    "{} --remote ignored: cluster '{}' is already active. \
+                                     To redeploy, use: nav cluster admin deploy",
+                                    "!".yellow(),
+                                    ctx.name,
+                                );
+                                return Ok(());
+                            }
                             let endpoint = &ctx.endpoint;
                             let tls = tls.with_cluster_name(&ctx.name);
                             run::sandbox_create(

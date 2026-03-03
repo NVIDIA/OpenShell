@@ -522,9 +522,9 @@ pub fn cluster_use(name: &str) -> Result<()> {
 }
 
 /// List all provisioned clusters.
-pub fn cluster_list() -> Result<()> {
+pub fn cluster_list(cluster_flag: &Option<String>) -> Result<()> {
     let clusters = list_clusters()?;
-    let active = load_active_cluster();
+    let active = cluster_flag.clone().or_else(load_active_cluster);
 
     if clusters.is_empty() {
         println!("No clusters found.");
@@ -755,7 +755,8 @@ pub async fn cluster_admin_deploy(
             let recreate = prompt_existing_cluster(name, &info)?;
             if recreate {
                 eprintln!("• Destroying existing cluster...");
-                let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref())?;
+                let handle =
+                    navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
                 handle.destroy().await?;
                 eprintln!("{} Cluster destroyed, starting fresh.", "✓".green().bold());
                 eprintln!();
@@ -821,7 +822,7 @@ pub async fn cluster_admin_stop(
     });
 
     eprintln!("• Stopping cluster {name}...");
-    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref())?;
+    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
     handle.stop().await?;
     eprintln!("{} Cluster {name} stopped.", "✓".green().bold());
     Ok(())
@@ -843,7 +844,7 @@ pub async fn cluster_admin_destroy(
     });
 
     eprintln!("• Destroying cluster {name}...");
-    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref())?;
+    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
     handle.destroy().await?;
 
     // Clean up metadata and active cluster reference

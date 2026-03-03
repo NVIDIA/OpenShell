@@ -188,7 +188,7 @@ pub async fn check_existing_deployment(
     remote: Option<&RemoteOptions>,
 ) -> Result<Option<ExistingClusterInfo>> {
     let docker = match remote {
-        Some(remote_opts) => create_ssh_docker_client(remote_opts)?,
+        Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
         None => Docker::connect_with_local_defaults().into_diagnostic()?,
     };
     check_existing_cluster(&docker, name).await
@@ -223,7 +223,7 @@ where
     // Create Docker client based on deployment mode
     let (target_docker, remote_opts) = match &options.remote {
         Some(remote_opts) => {
-            let remote = create_ssh_docker_client(remote_opts)?;
+            let remote = create_ssh_docker_client(remote_opts).await?;
             (remote, Some(remote_opts.clone()))
         }
         None => (
@@ -425,9 +425,9 @@ where
 ///
 /// For local clusters, pass `None` for remote options.
 /// For remote clusters, pass the same `RemoteOptions` used during deployment.
-pub fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<ClusterHandle> {
+pub async fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<ClusterHandle> {
     let docker = match remote {
-        Some(remote_opts) => create_ssh_docker_client(remote_opts)?,
+        Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
         None => Docker::connect_with_local_defaults().into_diagnostic()?,
     };
     let kubeconfig_path = stored_kubeconfig_path(name)?;
