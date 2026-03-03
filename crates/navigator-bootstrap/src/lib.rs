@@ -46,8 +46,8 @@ pub use crate::kubeconfig::{
 };
 pub use crate::metadata::{
     ClusterMetadata, clear_active_cluster, get_cluster_metadata, list_clusters,
-    load_active_cluster, load_cluster_metadata, remove_cluster_metadata, save_active_cluster,
-    store_cluster_metadata,
+    load_active_cluster, load_cluster_metadata, load_last_sandbox, remove_cluster_metadata,
+    save_active_cluster, save_last_sandbox, store_cluster_metadata,
 };
 
 /// Options for remote SSH deployment.

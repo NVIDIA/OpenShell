@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::paths::{active_cluster_path, clusters_dir, xdg_config_dir};
+use crate::paths::{active_cluster_path, clusters_dir, last_sandbox_path, xdg_config_dir};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -235,6 +235,30 @@ pub fn save_active_cluster(name: &str) -> Result<()> {
 /// Returns `None` if no active cluster has been set.
 pub fn load_active_cluster() -> Option<String> {
     let path = active_cluster_path().ok()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let name = contents.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
+/// Save the last-used sandbox name for a cluster to persistent storage.
+pub fn save_last_sandbox(cluster: &str, sandbox: &str) -> Result<()> {
+    let path = last_sandbox_path(cluster)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, sandbox)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write last sandbox to {}", path.display()))?;
+    Ok(())
+}
+
+/// Load the last-used sandbox name for a cluster from persistent storage.
+///
+/// Returns `None` if no last sandbox has been set.
+pub fn load_last_sandbox(cluster: &str) -> Option<String> {
+    let path = last_sandbox_path(cluster).ok()?;
     let contents = std::fs::read_to_string(&path).ok()?;
     let name = contents.trim().to_string();
     if name.is_empty() { None } else { Some(name) }

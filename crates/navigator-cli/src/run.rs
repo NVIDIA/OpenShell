@@ -18,7 +18,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
     DeployOptions, RemoteOptions, clear_active_cluster, default_local_kubeconfig_path,
     get_cluster_metadata, list_clusters, load_active_cluster, print_kubeconfig,
-    remove_cluster_metadata, save_active_cluster, update_local_kubeconfig,
+    remove_cluster_metadata, save_active_cluster, save_last_sandbox, update_local_kubeconfig,
 };
 use navigator_core::proto::navigator_client::NavigatorClient;
 use navigator_core::proto::{
@@ -185,7 +185,6 @@ fn print_sandbox_header(sandbox: &Sandbox, display: Option<&LogDisplay>) {
         String::new(),
         format!("{}", "Created sandbox:".cyan().bold()),
         String::new(),
-        format!("  {} {}", "Id:".dimmed(), sandbox.id),
         format!("  {} {}", "Name:".dimmed(), sandbox.name),
         format!("  {} {}", "Namespace:".dimmed(), sandbox.namespace),
     ];
@@ -1102,6 +1101,11 @@ pub async fn sandbox_create(
 
     let interactive = std::io::stdout().is_terminal();
     let sandbox_name = sandbox.name.clone();
+
+    // Record this sandbox as the last-used for the active cluster.
+    if let Some(cluster) = effective_tls.cluster_name() {
+        let _ = save_last_sandbox(cluster, &sandbox_name);
+    }
 
     // Set up display
     let mut display = if interactive {

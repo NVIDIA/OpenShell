@@ -27,3 +27,10 @@ pub fn active_cluster_path() -> Result<PathBuf> {
 pub fn clusters_dir() -> Result<PathBuf> {
     Ok(xdg_config_dir()?.join("nemoclaw").join("clusters"))
 }
+
+/// Path to the file that stores the last-used sandbox name for a cluster.
+///
+/// Location: `$XDG_CONFIG_HOME/navigator/clusters/<cluster>/last_sandbox`
+pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
+    Ok(clusters_dir()?.join(cluster).join("last_sandbox"))
+}

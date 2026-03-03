@@ -100,7 +100,7 @@ impl Navigator for NavigatorService {
 
         let id = uuid::Uuid::new_v4().to_string();
         let name = if request.name.is_empty() {
-            format!("sandbox-{id}")
+            petname::petname(2, "-").unwrap_or_else(generate_name)
         } else {
             request.name.clone()
         };
