@@ -94,7 +94,15 @@ cargo_cross_build() {
   fi
   local target_flag=""
   if is_cross; then target_flag="--target $(rust_target)"; fi
-  cargo build $target_flag "$@"
+  # Retry once after cleaning if the build fails. BuildKit cargo-target cache
+  # mounts can retain stale .rmeta files from prior builds with different
+  # dependency versions; cargo clean purges them so the retry succeeds.
+  # sccache still has the compiled objects, so the clean rebuild is fast.
+  if ! cargo build $target_flag "$@"; then
+    echo "cargo build failed; cleaning stale target cache and retrying..." >&2
+    cargo clean 2>/dev/null || true
+    cargo build $target_flag "$@"
+  fi
 }
 
 # Print the directory containing the compiled binary.
