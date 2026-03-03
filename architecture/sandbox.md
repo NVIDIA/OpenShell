@@ -270,7 +270,7 @@ Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.navi
 
 - `"allow"` -- endpoint + binary explicitly matched in a network policy
 - `"inspect_for_inference"` -- no policy match but `inference.allowed_routes` is non-empty
-- `"deny"` -- no matching policy and no inference routing configured
+- `"deny"` -- network connections not allowed by policy
 
 The Rego logic:
 1. If `network_policy_for_request` exists (endpoint + binary match), return `"allow"`
@@ -582,7 +582,7 @@ Startup steps:
 
 ### Request parsing
 
-The proxy reads up to 8192 bytes (`MAX_HEADER_BYTES`) looking for `\r\n\r\n`. It validates the method is `CONNECT` (returning 405 for anything else) and parses the `host:port` target.
+The proxy reads up to 8192 bytes (`MAX_HEADER_BYTES`) looking for `\r\n\r\n`. It validates the method is `CONNECT` (returning 403 for anything else with a structured log) and parses the `host:port` target.
 
 ### Control-plane bypass
 
@@ -632,7 +632,7 @@ The `action` field carries the matched policy name (for `Allow` and `InspectForI
 
 Every CONNECT request produces an `info!()` log line with all context: source/destination addresses, binary path, PID, ancestor chain, cmdline paths, action (`allow`, `inspect_for_inference`, or `deny`), engine, matched policy, and deny reason.
 
-For `InspectForInference` connections, the initial log records `action=inspect_for_inference`. If the subsequent inference interception fails (TLS handshake failure, client disconnect, non-inference request, payload too large, missing context, or I/O error), a second `CONNECT` log is emitted with `action=deny` and a `reason` describing the failure. Successfully routed connections produce no second log. This two-log pattern gives operators visibility into why an `inspect_for_inference` decision ultimately resulted in a denial.
+For `InspectForInference` connections, the initial log records `action=inspect_for_inference`. If the subsequent inference interception fails (TLS handshake failure, client disconnect, request not allowed by policy, payload too large, missing context, or I/O error), a second `CONNECT` log is emitted with `action=deny` and a `reason` describing the failure. Successfully routed connections produce no second log. This two-log pattern gives operators visibility into why an `inspect_for_inference` decision ultimately resulted in a denial.
 
 ### SSRF protection (internal IP rejection)
 
@@ -651,7 +651,7 @@ enum InferenceOutcome {
 }
 ```
 
-Every exit path in `handle_inference_interception` produces an explicit outcome. The `Denied` variant carries a human-readable reason describing the failure. At the call site in `handle_tcp_connection`, `Denied` outcomes (and `Err` results) trigger a structured CONNECT deny log with the same fields as the initial decision log (see [Unified logging](#unified-logging)). The `route_inference_request` helper returns `Result<bool>` where `true` means the request was routed and `false` means it was a non-inference request that was denied inline.
+Every exit path in `handle_inference_interception` produces an explicit outcome. The `Denied` variant carries a human-readable reason describing the failure. At the call site in `handle_tcp_connection`, `Denied` outcomes (and `Err` results) trigger a structured CONNECT deny log with the same fields as the initial decision log (see [Unified logging](#unified-logging)). The `route_inference_request` helper returns `Result<bool>` where `true` means the request was routed and `false` means the request was not allowed by policy and was denied inline.
 
 The interception steps:
 
@@ -677,10 +677,10 @@ The interception steps:
 6. **Response handling**:
    - On success: the router's response (status code, headers, body) is formatted as an HTTP/1.1 response and sent back to the client after stripping response framing/hop-by-hop headers (`transfer-encoding`, `content-length`, `connection`, etc.)
    - On router failure: the error is mapped to an HTTP status code via `router_error_to_http()` and returned as a JSON error body (see error table below)
-   - Empty route cache: returns `503` JSON error (`{"error": "no inference routes configured"}`)
-   - Non-inference requests: returns `403 Forbidden` with a JSON error body (`{"error": "only inference API calls are allowed on this connection"}`)
+   - Empty route cache: returns `503` JSON error (`{"error": "inference endpoint detected without matching inference route"}`)
+   - Non-inference requests: returns `403 Forbidden` with a JSON error body (`{"error": "connection not allowed by policy"}`)
 
-7. **Connection lifecycle**: The handler loops to process multiple HTTP requests on the same connection (HTTP keep-alive). The loop ends when the client closes the connection or an unrecoverable error occurs. Once at least one request has been successfully routed (`routed_any` flag), subsequent failures (client disconnect, I/O error, payload too large, non-inference request) are treated as clean termination (`InferenceOutcome::Routed`) rather than denials.
+7. **Connection lifecycle**: The handler loops to process multiple HTTP requests on the same connection (HTTP keep-alive). The loop ends when the client closes the connection or an unrecoverable error occurs. Once at least one request has been successfully routed (`routed_any` flag), subsequent failures (client disconnect, I/O error, payload too large, request not allowed by policy) are treated as clean termination (`InferenceOutcome::Routed`) rather than denials.
 
 ### Router error to HTTP mapping
 
@@ -1118,8 +1118,8 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Inference interception: no compatible route | 400 Bad Request with JSON error body |
 | Inference interception: backend timeout/unavailable | 503 Service Unavailable with JSON error body |
 | Inference interception: backend protocol error | 502 Bad Gateway with JSON error body |
-| Inference interception: non-inference request (no prior routing) | 403 Forbidden with JSON error body + structured CONNECT deny log |
-| Inference interception: non-inference request (after prior routing) | 403 Forbidden with JSON error body (no deny log, connection counts as routed) |
+| Inference interception: request not allowed by policy (no prior routing) | 403 Forbidden with JSON error body + structured CONNECT deny log |
+| Inference interception: request not allowed by policy (after prior routing) | 403 Forbidden with JSON error body (no deny log, connection counts as routed) |
 | Log push gRPC connection fails | Task prints to stderr and exits; logs not pushed for sandbox lifetime |
 | Log push mpsc channel full (1024 lines) | Event dropped silently; logging never blocks |
 | Log push gRPC stream breaks | Push loop exits, flushes remaining batch |

@@ -54,7 +54,7 @@ deny_reason := reason if {
 	reason := concat("; ", all_reasons)
 }
 
-deny_reason := "no matching policy and no inference routing configured" if {
+deny_reason := "network connections not allowed by policy" if {
 	input.network
 	input.exec
 	not network_policy_for_request

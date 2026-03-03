@@ -229,7 +229,13 @@ async fn handle_tcp_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        respond(&mut client, b"HTTP/1.1 405 Method Not Allowed\r\n\r\n").await?;
+        let target_host = extract_host_from_uri(target);
+        info!(
+            method = %method,
+            target_host = %target_host,
+            "Non-CONNECT proxy request denied"
+        );
+        respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
     }
 
@@ -748,7 +754,7 @@ async fn handle_inference_interception(
 
     let Some(ctx) = inference_ctx else {
         return Ok(InferenceOutcome::Denied {
-            reason: "missing inference context".to_string(),
+            reason: "connection not allowed by policy".to_string(),
         });
     };
 
@@ -805,7 +811,7 @@ async fn handle_inference_interception(
                     routed_any = true;
                 } else if !routed_any {
                     return Ok(InferenceOutcome::Denied {
-                        reason: "non-inference request".to_string(),
+                        reason: "connection not allowed by policy".to_string(),
                     });
                 }
 
@@ -861,7 +867,7 @@ async fn route_inference_request(
         let routes = ctx.routes.read().await;
 
         if routes.is_empty() {
-            let body = serde_json::json!({"error": "no inference routes configured"});
+            let body = serde_json::json!({"error": "inference endpoint detected without matching inference route"});
             let body_bytes = body.to_string();
             let response = format_http_response(
                 503,
@@ -891,7 +897,7 @@ async fn route_inference_request(
                 write_all(tls_client, &response).await?;
             }
             Err(e) => {
-                warn!(error = %e, "Local inference routing failed");
+                warn!(error = %e, "inference endpoint detected but upstream service failed");
                 let (status, msg) = router_error_to_http(&e);
                 let body = serde_json::json!({"error": msg});
                 let body_bytes = body.to_string();
@@ -909,10 +915,9 @@ async fn route_inference_request(
         info!(
             method = %request.method,
             path = %request.path,
-            "Non-inference request denied (inference-only mode)"
+            "connection not allowed by policy"
         );
-        let body =
-            serde_json::json!({"error": "only inference API calls are allowed on this connection"});
+        let body = serde_json::json!({"error": "connection not allowed by policy"});
         let body_bytes = body.to_string();
         let response = format_http_response(
             403,
@@ -1223,6 +1228,33 @@ fn query_allowed_ips(
             warn!(error = %e, "Failed to query allowed_ips from endpoint config");
             vec![]
         }
+    }
+}
+
+/// Extract the hostname from an absolute-form URI used in plain HTTP proxy requests.
+///
+/// For example, `"http://example.com/path"` yields `"example.com"` and
+/// `"http://example.com:8080/path"` yields `"example.com"`. Returns `"unknown"`
+/// if the URI cannot be parsed.
+fn extract_host_from_uri(uri: &str) -> String {
+    // Absolute-form URIs look like "http://host[:port]/path"
+    // Strip the scheme prefix, then extract the authority (host[:port]) before the first '/'.
+    let after_scheme = uri.find("://").map(|i| &uri[i + 3..]).unwrap_or(uri);
+    let authority = after_scheme.split('/').next().unwrap_or(after_scheme);
+    // Strip port if present (handle IPv6 bracket notation)
+    let host = if authority.starts_with('[') {
+        // IPv6: [::1]:port
+        authority
+            .find(']')
+            .map(|i| &authority[..=i])
+            .unwrap_or(authority)
+    } else {
+        authority.split(':').next().unwrap_or(authority)
+    };
+    if host.is_empty() {
+        "unknown".to_string()
+    } else {
+        host.to_string()
     }
 }
 
@@ -1697,5 +1729,53 @@ mod tests {
             err.contains("not in allowed_ips"),
             "expected 'not in allowed_ips' in error: {err}"
         );
+    }
+
+    // --- extract_host_from_uri tests ---
+
+    #[test]
+    fn test_extract_host_from_http_uri() {
+        assert_eq!(
+            extract_host_from_uri("http://example.com/path"),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_https_uri() {
+        assert_eq!(
+            extract_host_from_uri("https://api.openai.com/v1/chat/completions"),
+            "api.openai.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_uri_with_port() {
+        assert_eq!(
+            extract_host_from_uri("http://example.com:8080/path"),
+            "example.com"
+        );
+    }
+
+    #[test]
+    fn test_extract_host_from_uri_ipv6() {
+        assert_eq!(extract_host_from_uri("http://[::1]:8080/path"), "[::1]");
+    }
+
+    #[test]
+    fn test_extract_host_from_uri_no_path() {
+        assert_eq!(extract_host_from_uri("http://example.com"), "example.com");
+    }
+
+    #[test]
+    fn test_extract_host_from_uri_empty() {
+        assert_eq!(extract_host_from_uri(""), "unknown");
+    }
+
+    #[test]
+    fn test_extract_host_from_uri_malformed() {
+        // Gracefully handles garbage input
+        let result = extract_host_from_uri("not-a-uri");
+        assert!(!result.is_empty());
     }
 }
