@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Push sandbox tracing events to the Navigator server via gRPC.
 //!
 //! A [`tracing`] layer captures log events and sends them through an mpsc

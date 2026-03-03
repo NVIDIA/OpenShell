@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # HelmChart CR for auto-deploying Navigator via k3s Helm controller
 # This manifest is placed in /var/lib/rancher/k3s/server/manifests/ and
 # automatically installed when the k3s cluster starts.

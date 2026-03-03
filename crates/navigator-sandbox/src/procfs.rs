@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Linux `/proc` filesystem reading for process identity.
 //!
 //! Provides functions to resolve binary paths and compute file hashes

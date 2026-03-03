@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Push locally-built images into a k3s cluster's containerd runtime.
 //!
 //! This module implements the "push" path for local development: images are

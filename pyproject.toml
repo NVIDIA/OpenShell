@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 [build-system]
 requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
@@ -6,6 +9,7 @@ build-backend = "maturin"
 name = "nemoclaw"
 dynamic = ["version"]
 description = "NemoClaw is the runtime environment for autonomous agents"
+license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

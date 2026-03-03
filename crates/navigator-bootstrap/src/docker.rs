@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use crate::RemoteOptions;
 use crate::constants::{NETWORK_NAME, container_name, volume_name};
 use crate::image::{

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! SHA256 trust-on-first-use (TOFU) binary identity cache.
 //!
 //! On first network request from a binary, the proxy computes its SHA256 hash

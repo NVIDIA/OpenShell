@@ -1,4 +1,8 @@
 # syntax=docker/dockerfile:1.4
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 # CI runner image with all development tools pre-installed
 # Rebuild triggered automatically when mise.toml or this file changes
 

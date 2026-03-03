@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Protocol multiplexing for gRPC and HTTP on the same port.
 //!
 //! This module implements connection-level multiplexing that routes requests

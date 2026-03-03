@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! Capture navigator-server tracing logs for streaming over gRPC.
 
 use std::collections::{HashMap, VecDeque};

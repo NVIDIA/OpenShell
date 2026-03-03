@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::inference_client::InferenceClient;
 use navigator_core::proto::navigator_client::NavigatorClient;

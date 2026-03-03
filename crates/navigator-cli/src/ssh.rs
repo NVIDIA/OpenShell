@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 //! SSH connection and proxy utilities.
 
 use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
