@@ -34,15 +34,6 @@ jobs:
       - name: Install tools
         run: mise install
 
-      - name: Activate mise environment
-        run: |
-          # Register sccache globally so the mise shim can resolve it.
-          # Without this, the shim fails with "No version is set for shim".
-          mise use -g github:mozilla/sccache@0.14.0
-          # Resolve RUSTC_WRAPPER to the absolute sccache binary so cargo
-          # invokes it directly, bypassing the shim entirely.
-          echo "RUSTC_WRAPPER=$(mise which sccache)" >> "$GITHUB_ENV"
-
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
