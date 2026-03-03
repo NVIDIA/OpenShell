@@ -17,8 +17,12 @@ permissions:
 
 jobs:
   rust:
-    name: Rust
-    runs-on: build-amd64
+    name: Rust (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [build-amd64, build-arm64]
+    runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
@@ -32,7 +36,7 @@ jobs:
         with:
           # Separate caches for clippy (check-like) vs test (full build)
           # so they don't thrash each other's artifacts
-          shared-key: rust-checks
+          shared-key: rust-checks-${{ matrix.runner }}
           # Cache the sccache directory too
           cache-directories: .cache/sccache
 
@@ -50,8 +54,12 @@ jobs:
         run: sccache --show-stats
 
   python:
-    name: Python
-    runs-on: build-amd64
+    name: Python (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [build-amd64, build-arm64]
+    runs-on: ${{ matrix.runner }}
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
