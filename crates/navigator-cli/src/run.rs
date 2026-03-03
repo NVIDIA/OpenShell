@@ -522,9 +522,9 @@ pub fn cluster_use(name: &str) -> Result<()> {
 }
 
 /// List all provisioned clusters.
-pub fn cluster_list() -> Result<()> {
+pub fn cluster_list(cluster_flag: &Option<String>) -> Result<()> {
     let clusters = list_clusters()?;
-    let active = load_active_cluster();
+    let active = cluster_flag.clone().or_else(load_active_cluster);
 
     if clusters.is_empty() {
         println!("No clusters found.");

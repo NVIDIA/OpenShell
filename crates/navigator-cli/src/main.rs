@@ -831,7 +831,7 @@ async fn main() -> Result<()> {
                 run::cluster_use(&name)?;
             }
             ClusterCommands::List => {
-                run::cluster_list()?;
+                run::cluster_list(&cli.cluster)?;
             }
             ClusterCommands::Admin { command } => match command {
                 ClusterAdminCommands::Deploy {
