@@ -18,6 +18,39 @@
 #   IMAGE_REGISTRY     - Registry prefix for image name (e.g. ghcr.io/org/repo)
 set -euo pipefail
 
+sha256_16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+sha256_16_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+detect_rust_scope() {
+  local dockerfile="$1"
+  local rust_from
+  rust_from=$(grep -E '^FROM --platform=\$BUILDPLATFORM rust:[^ ]+' "$dockerfile" | head -n1 | sed -E 's/^FROM --platform=\$BUILDPLATFORM rust:([^ ]+).*/\1/' || true)
+  if [[ -n "${rust_from}" ]]; then
+    echo "rust-${rust_from}"
+    return
+  fi
+
+  if grep -q "rustup.rs" "$dockerfile"; then
+    echo "rustup-stable"
+    return
+  fi
+
+  echo "no-rust"
+}
+
 COMPONENT=${1:?"Usage: docker-build-component.sh <component> [variant] [extra-args...]"}
 shift
 
@@ -98,11 +131,17 @@ if [[ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]]; then
   SCCACHE_ARGS=(--build-arg "SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}")
 fi
 
+LOCK_HASH=$(sha256_16 Cargo.lock)
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
+CACHE_SCOPE_INPUT="v1|${COMPONENT}|${VARIANT:-base}|${LOCK_HASH}|${RUST_SCOPE}"
+CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
+
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
   ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
   -f "${DOCKERFILE}" \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
   --provenance=false \

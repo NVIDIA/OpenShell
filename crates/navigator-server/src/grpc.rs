@@ -1407,10 +1407,13 @@ fn is_valid_env_key(key: &str) -> bool {
 /// Maximum number of attempts when establishing the SSH transport to a sandbox.
 /// The sandbox SSH server may not be listening yet when the pod is marked Ready,
 /// so we retry transient connection failures with exponential backoff.
-const SSH_CONNECT_MAX_ATTEMPTS: u32 = 4;
+const SSH_CONNECT_MAX_ATTEMPTS: u32 = 6;
 
 /// Initial backoff duration between SSH connection retries (doubles each attempt).
-const SSH_CONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(200);
+const SSH_CONNECT_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Maximum backoff duration between SSH connection retries (caps exponential growth).
+const SSH_CONNECT_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Returns `true` if the gRPC status represents a transient SSH connection error
 /// that is worth retrying (e.g. the sandbox SSH server is not yet listening).
@@ -1453,7 +1456,8 @@ async fn stream_exec_over_ssh(
         let mut result = None;
         for attempt in 0..SSH_CONNECT_MAX_ATTEMPTS {
             if attempt > 0 {
-                let backoff = SSH_CONNECT_INITIAL_BACKOFF * 2u32.pow(attempt - 1);
+                let backoff = (SSH_CONNECT_INITIAL_BACKOFF * 2u32.pow(attempt - 1))
+                    .min(SSH_CONNECT_MAX_BACKOFF);
                 warn!(
                     sandbox_id = %sandbox_id,
                     attempt = attempt + 1,

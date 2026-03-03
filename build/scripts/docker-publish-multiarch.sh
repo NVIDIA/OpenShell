@@ -22,6 +22,39 @@
 #   AWS_REGION               - AWS region (default: us-west-2)
 set -euo pipefail
 
+sha256_16() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 "$1" | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+sha256_16_stdin() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum | awk '{print substr($1, 1, 16)}'
+  else
+    shasum -a 256 | awk '{print substr($1, 1, 16)}'
+  fi
+}
+
+detect_rust_scope() {
+  local dockerfile="$1"
+  local rust_from
+  rust_from=$(grep -E '^FROM --platform=\$BUILDPLATFORM rust:[^ ]+' "$dockerfile" | head -n1 | sed -E 's/^FROM --platform=\$BUILDPLATFORM rust:([^ ]+).*/\1/' || true)
+  if [[ -n "${rust_from}" ]]; then
+    echo "rust-${rust_from}"
+    return
+  fi
+
+  if grep -q "rustup.rs" "$dockerfile"; then
+    echo "rustup-stable"
+    return
+  fi
+
+  echo "no-rust"
+}
+
 # ---------------------------------------------------------------------------
 # Parse arguments
 # ---------------------------------------------------------------------------
@@ -115,6 +148,7 @@ resolve_dockerfile() {
 # so Rust compiles natively and only the final stage runs on the target arch.
 # ---------------------------------------------------------------------------
 echo "Building multi-arch component images..."
+LOCK_HASH=$(sha256_16 Cargo.lock)
 for component in sandbox server; do
   echo "Building ${IMAGE_PREFIX}${component} for ${PLATFORMS}..."
   BUILD_ARGS=""
@@ -125,6 +159,10 @@ for component in sandbox server; do
     BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
   fi
   DOCKERFILE=$(resolve_dockerfile "${component}")
+  RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
+  CACHE_SCOPE_INPUT="v1|${component}|base|${LOCK_HASH}|${RUST_SCOPE}"
+  CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
+  BUILD_ARGS="${BUILD_ARGS} --build-arg CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
   FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
   docker buildx build \
     --platform "${PLATFORMS}" \

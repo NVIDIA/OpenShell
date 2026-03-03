@@ -26,18 +26,17 @@ use tracing::{info, warn};
 
 const PREFACE_MAGIC: &str = "NSSH1";
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_ssh_server(
+/// Perform SSH server initialization: generate a host key, build the config,
+/// and bind the TCP listener. Extracted so that startup errors can be forwarded
+/// through the readiness channel rather than being silently logged.
+async fn ssh_server_init(
     listen_addr: SocketAddr,
-    policy: SandboxPolicy,
-    workdir: Option<String>,
-    handshake_secret: String,
-    handshake_skew_secs: u64,
-    netns_fd: Option<RawFd>,
-    proxy_url: Option<String>,
-    ca_file_paths: Option<(PathBuf, PathBuf)>,
-    provider_env: HashMap<String, String>,
-) -> Result<()> {
+    ca_file_paths: &Option<(PathBuf, PathBuf)>,
+) -> Result<(
+    TcpListener,
+    Arc<russh::server::Config>,
+    Option<Arc<(PathBuf, PathBuf)>>,
+)> {
     let mut rng = OsRng;
     let host_key = PrivateKey::random(&mut rng, Algorithm::Ed25519).into_diagnostic()?;
 
@@ -48,9 +47,40 @@ pub async fn run_ssh_server(
     config.keys.push(host_key);
 
     let config = Arc::new(config);
-    let ca_paths = ca_file_paths.map(Arc::new);
+    let ca_paths = ca_file_paths.as_ref().map(|p| Arc::new(p.clone()));
     let listener = TcpListener::bind(listen_addr).await.into_diagnostic()?;
     info!(addr = %listen_addr, "SSH server listening");
+
+    Ok((listener, config, ca_paths))
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn run_ssh_server(
+    listen_addr: SocketAddr,
+    ready_tx: tokio::sync::oneshot::Sender<Result<()>>,
+    policy: SandboxPolicy,
+    workdir: Option<String>,
+    handshake_secret: String,
+    handshake_skew_secs: u64,
+    netns_fd: Option<RawFd>,
+    proxy_url: Option<String>,
+    ca_file_paths: Option<(PathBuf, PathBuf)>,
+    provider_env: HashMap<String, String>,
+) -> Result<()> {
+    let (listener, config, ca_paths) = match ssh_server_init(listen_addr, &ca_file_paths).await {
+        Ok(v) => {
+            // Signal that the SSH server has bound the socket and is ready to
+            // accept connections. The parent task awaits this before spawning
+            // the entrypoint process, ensuring exec requests won't race
+            // against server startup.
+            let _ = ready_tx.send(Ok(()));
+            v
+        }
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return Ok(());
+        }
+    };
 
     loop {
         let (stream, peer) = listener.accept().await.into_diagnostic()?;

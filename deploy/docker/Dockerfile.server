@@ -6,6 +6,7 @@
 FROM --platform=$BUILDPLATFORM rust:1.88-slim AS builder
 ARG TARGETARCH
 ARG BUILDARCH
+ARG CARGO_TARGET_CACHE_SCOPE=default
 
 # Install build dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -47,7 +48,7 @@ COPY proto/ proto/
 # disk cache mount for local dev builds. The cargo-target mount gives cargo
 # a persistent target/ dir for true incremental rebuilds on source changes.
 RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-server-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=cargo-target-server-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p navigator-server 2>/dev/null || true
 
@@ -63,7 +64,7 @@ RUN touch crates/navigator-server/src/main.rs \
 
 # Build the actual application
 RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-server-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=cargo-target-server-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     cargo_cross_build --release -p navigator-server && \

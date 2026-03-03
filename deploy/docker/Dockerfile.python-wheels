@@ -25,6 +25,7 @@ FROM base AS builder
 ARG TARGETARCH
 ARG BUILDARCH
 ARG NAVIGATOR_CARGO_VERSION
+ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ARG SCCACHE_MEMCACHED_ENDPOINT
 
@@ -59,7 +60,7 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 # The cargo-target mount gives cargo a persistent target/ dir for incremental rebuilds.
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
-    --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p navigator-cli 2>/dev/null || true
 
@@ -83,7 +84,7 @@ RUN touch crates/navigator-cli/src/main.rs \
 
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
-    --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH},sharing=locked,target=/build/target \
+    --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-python-wheels-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     export_cross_env && \
