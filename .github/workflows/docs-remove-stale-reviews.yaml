@@ -1,0 +1,11 @@
+name: docs-remove-stale-reviews
+
+on:
+    schedule:
+        # 42 minutes after 0:00 UTC on Sundays
+        - cron: "42 0 * * 0"
+    workflow_dispatch:
+
+jobs:
+    remove:
+        uses: nvidia-merlin/.github/.github/workflows/docs-remove-stale-reviews-common.yaml@main
