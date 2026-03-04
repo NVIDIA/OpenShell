@@ -32,14 +32,11 @@ Project requirements:
 # One-time trust
 mise trust
 
-# Start/recreate local cluster
+# Bootstrap or incremental deploy
 mise run cluster
 
-# Iterative deploy after code changes
-mise run cluster:build
-
 # Launch a sandbox
-ncl sandbox create -- claude
+mise run sandbox
 ```
 
 ## `ncl` Shortcut
@@ -63,8 +60,8 @@ These are the primary `mise` tasks for day-to-day development:
 
 | Task | Purpose |
 |---|---|
-| `mise run cluster` | Fast local cluster recreate |
-| `mise run cluster:build` | Incremental deploy of changed components |
+| `mise run cluster` | Bootstrap or incremental deploy |
+| `mise run sandbox` | Create a sandbox on the running cluster |
 | `mise run cluster:sandbox` | Run sandbox container interactively |
 | `mise run fmt` | Format Rust and Python |
 | `mise run lint` | Repository lint checks |
@@ -73,7 +70,6 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run test:e2e` | Default end-to-end test lane |
 | `mise run ci` | Full local CI checks |
 | `mise run clean` | Clean build artifacts |
-| `mise run version` | Print git-derived version |
 
 ## Project Structure
 
@@ -86,11 +82,18 @@ These are the primary `mise` tasks for day-to-day development:
 | `crates/navigator-cli/` | CLI implementation |
 | `python/` | Python SDK/bindings |
 | `proto/` | Protocol buffer definitions |
-| `build/` | `mise` tasks and build scripts |
+| `tasks/` | `mise` tasks and build scripts |
 | `deploy/` | Dockerfiles, Helm chart, Kubernetes manifests |
 | `architecture/` | Architecture docs and plans |
 
-## Commit Messages
+## Pull Requests
+
+1. Create a feature branch from `main`
+2. Make your changes with tests
+3. Run `mise run ci` to verify
+4. Open a PR with a clear description
+
+### Commit Messages
 
 This project uses [Conventional Commits](https://www.conventionalcommits.org/). All commit messages must follow the format:
 
@@ -121,13 +124,6 @@ fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
 chore(deps): bump tokio to 1.40
 ```
-
-## Pull Requests
-
-1. Create a feature branch from `main`
-2. Make your changes with tests
-3. Run `mise run ci` to verify
-4. Open a PR with a clear description
 
 ### DCO
 

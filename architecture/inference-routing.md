@@ -20,7 +20,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 | `proto/inference.proto` | Protobuf definitions: `InferenceRoute`, `InferenceRouteSpec`, `GetSandboxInferenceBundle` RPC, CRUD RPCs |
 | `proto/sandbox.proto` | `InferencePolicy` message (field on `SandboxPolicy`) |
 | `crates/navigator-sandbox/src/main.rs` | Sandbox binary CLI: `--inference-routes` / `NEMOCLAW_INFERENCE_ROUTES` flag definition |
-| `build/ci.toml` | `[sandbox]` task: mounts `inference-routes.yaml`, sets env vars for dev sandbox |
+| `tasks/ci.toml` | `[sandbox]` task: mounts `inference-routes.yaml`, sets env vars for dev sandbox |
 | `inference-routes.yaml` | Default standalone routes for dev sandbox (NVIDIA API endpoint) |
 | `dev-sandbox-policy.rego` | `network_action` Rego rule -- tri-state decision logic |
 
@@ -563,7 +563,7 @@ The `create` and `update` commands perform protocol auto-detection when `--proto
 
 ## Dev Sandbox Workflow
 
-**File:** `build/cluster.toml` (task `["cluster:sandbox"]`), `inference-routes.yaml` (repo root)
+**File:** `tasks/cluster.toml` (task `["cluster:sandbox"]`), `inference-routes.yaml` (repo root)
 
 Running `mise run cluster:sandbox` starts a standalone sandbox container with inference routing pre-configured. The task mounts three files into the container:
 

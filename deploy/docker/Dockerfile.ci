@@ -60,9 +60,9 @@ RUN case "$TARGETARCH" in \
 # Install mise
 RUN curl https://mise.run | sh
 
-# Copy mise.toml and build task includes, then install all tools via mise
+# Copy mise.toml and task includes, then install all tools via mise
 COPY mise.toml /opt/mise/mise.toml
-COPY build/ /opt/mise/build/
+COPY tasks/ /opt/mise/tasks/
 WORKDIR /opt/mise
 ARG MISE_GITHUB_TOKEN
 RUN mise trust /opt/mise/mise.toml && \

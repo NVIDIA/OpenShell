@@ -41,7 +41,7 @@ sha256_16_stdin() {
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
 CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
 if [ -z "$CARGO_VERSION" ]; then
-  CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)
@@ -156,7 +156,7 @@ sha256_16_stdin() {
 CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
 OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
 if [ -z "$CARGO_VERSION" ]; then
-  CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)

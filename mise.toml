@@ -4,7 +4,7 @@
 # NemoClaw mise configuration
 # See https://mise.jdx.dev/ for documentation
 #
-# Tasks are defined in build/*.toml — run `mise tasks` to list them all.
+# Tasks are defined in tasks/*.toml — run `mise tasks` to list them all.
 
 redactions = ["*_TOKEN", "*_PASSWORD"]
 
@@ -43,7 +43,7 @@ DOCKER_BUILDKIT = "1"
 
 [vars]
 # Python paths to include in formatting/linting
-python_paths = "python/ build/scripts/*.py"
+python_paths = "python/ tasks/scripts/*.py"
 
 [task_config]
-includes = ["build/*.toml"]
+includes = ["tasks/*.toml"]

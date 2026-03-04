@@ -60,12 +60,11 @@ Development task entrypoints split bootstrap behavior:
 
 | Task | Behavior |
 |---|---|
-| `mise run cluster` | Fast recreate path: destroys existing local cluster resources for `CLUSTER_NAME` (if present), removes conflicting local NemoClaw clusters that occupy host port `6443`, pushes prebuilt local component images to the local registry, and deploys using local-registry image refs (`127.0.0.1:5000/navigator/*`) |
-| `mise run cluster:build` | Iterative deploy path: detects changed files and rebuilds/pushes only impacted components |
+| `mise run cluster` | Bootstrap or incremental deploy: creates cluster if needed (fast recreate), then detects changed files and rebuilds/pushes only impacted components |
 | `mise run cluster:build:full` | Full build path: builds cluster/server/sandbox images, pushes components, then deploys (preferred in CI) |
 
 For `mise run cluster`, `.env` acts as local source-of-truth for `CLUSTER_NAME`, `GATEWAY_PORT`, and `NEMOCLAW_CLUSTER`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
-Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so `cluster` and `cluster:build` can push/pull local component images consistently.
+Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so the cluster task can push/pull local component images consistently.
 
 ## Bootstrap Sequence Diagram
 

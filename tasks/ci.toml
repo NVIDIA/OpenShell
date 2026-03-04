@@ -26,12 +26,9 @@ depends = ["ci"]
 hide = true
 
 [sandbox]
-description = "Alias for cluster:sandbox"
-depends = ["docker:build:sandbox"]
+description = "Create a sandbox on the running cluster"
 raw = true
 usage = """
-flag "-e --env <env>" var=#true help="Environment variables to pass into the sandbox"
-arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
+arg "[command]" var=#true help="Command to run in the sandbox (default: interactive agent)"
 """
-run = "bash build/scripts/run-sandbox.sh"
-hide = true
+run = "ncl sandbox create -- ${usage_command:-claude}"

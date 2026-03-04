@@ -4,12 +4,8 @@
 # Cluster bootstrap and deploy tasks
 
 [cluster]
-description = "Fast local cluster recreate using prebuilt images"
-run = "build/scripts/cluster-bootstrap.sh fast"
-
-["cluster:build"]
-description = "Incremental deploy: rebuild changed components and skip unnecessary helm work"
-run = "build/scripts/cluster-deploy-fast.sh"
+description = "Bootstrap or incremental deploy (creates cluster if needed, rebuilds changed components)"
+run = "tasks/scripts/cluster.sh"
 
 ["cluster:build:full"]
 description = "Build and deploy local k3s cluster with NemoClaw"
@@ -17,7 +13,7 @@ depends = [
   "docker:build:server",
   "docker:build:sandbox",
 ]
-run = "build/scripts/cluster-bootstrap.sh build"
+run = "tasks/scripts/cluster-bootstrap.sh build"
 hide = true
 
 ["cluster:sandbox"]
@@ -28,29 +24,29 @@ usage = """
 flag "-e --env <env>" var=#true help="Environment variables to pass into the sandbox"
 arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
 """
-run = "bash build/scripts/run-sandbox.sh"
+run = "bash tasks/scripts/run-sandbox.sh"
 
 ["cluster:deploy"]
-description = "Alias for cluster:build (incremental deploy)"
-run = "build/scripts/cluster-deploy-fast.sh"
+description = "Alias for cluster (incremental deploy)"
+run = "tasks/scripts/cluster.sh"
 hide = true
 
 ["cluster:deploy:sandbox"]
 description = "Fast deploy sandbox-only changes"
-run = "build/scripts/cluster-deploy-fast.sh sandbox"
+run = "tasks/scripts/cluster-deploy-fast.sh sandbox"
 hide = true
 
 ["cluster:deploy:all"]
 description = "Pull-mode deploy using local registry pushes"
-run = "build/scripts/cluster-deploy-fast.sh all"
+run = "tasks/scripts/cluster-deploy-fast.sh all"
 hide = true
 
 ["cluster:push:server"]
 description = "Tag and push server image to pull registry"
-run = "build/scripts/cluster-push-component.sh server"
+run = "tasks/scripts/cluster-push-component.sh server"
 hide = true
 
 ["cluster:push:sandbox"]
 description = "Tag and push sandbox image to pull registry"
-run = "build/scripts/cluster-push-component.sh sandbox"
+run = "tasks/scripts/cluster-push-component.sh sandbox"
 hide = true
