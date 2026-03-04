@@ -69,18 +69,17 @@ These are the primary `mise` tasks for day-to-day development:
 
 ## Project Structure
 
-| Path                          | Purpose                                       |
-| ----------------------------- | --------------------------------------------- |
-| `crates/navigator-core/`      | Shared core library                           |
-| `crates/navigator-server/`    | Gateway/control plane server                  |
-| `crates/navigator-sandbox/`   | Sandbox runtime                               |
-| `crates/navigator-bootstrap/` | Cluster bootstrap logic                       |
-| `crates/navigator-cli/`       | CLI implementation                            |
-| `python/`                     | Python SDK/bindings                           |
-| `proto/`                      | Protocol buffer definitions                   |
-| `tasks/`                      | `mise` tasks and build scripts                |
-| `deploy/`                     | Dockerfiles, Helm chart, Kubernetes manifests |
-| `architecture/`               | Architecture docs and plans                   |
+```
+crates/                  # Rust crates
+python/                  # Python SDK and bindings
+proto/                   # Protocol buffer definitions
+tasks/                   # mise task definitions and build scripts
+deploy/
+  docker/                # Dockerfiles (sandbox, server, cluster, CI, wheels)
+  helm/navigator/        # Helm chart for the gateway
+  kube/manifests/        # Kubernetes manifests for k3s auto-deploy
+architecture/            # Architecture docs and plans
+```
 
 ## Pull Requests
 
