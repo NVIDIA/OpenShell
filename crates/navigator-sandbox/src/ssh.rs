@@ -1023,7 +1023,11 @@ mod tests {
             .expect("cat hung for 5s — stdin was not closed (channel_eof bug)")
             .expect("failed to wait for cat");
 
-        assert!(output.status.success(), "cat exited with {:?}", output.status);
+        assert!(
+            output.status.success(),
+            "cat exited with {:?}",
+            output.status
+        );
         assert_eq!(output.stdout, b"hello");
     }
 
@@ -1072,6 +1076,10 @@ mod tests {
             .trim()
             .parse()
             .expect("wc output was not a number");
-        assert_eq!(count, 100 * 1024, "expected all 100 KiB delivered before EOF");
+        assert_eq!(
+            count,
+            100 * 1024,
+            "expected all 100 KiB delivered before EOF"
+        );
     }
 }
