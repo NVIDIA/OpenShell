@@ -1,57 +1,37 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# CI, pre-commit, and sandbox runner tasks
+# CI and quality tasks
+
+[fmt]
+description = "Format Rust and Python code"
+depends = ["rust:format", "python:format"]
 
 [lint]
-description = "Run all linters and format checks"
-depends = ["license:check", "rust:format:check", "rust:lint", "python:lint"]
+description = "Run repository lint checks"
+depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint"]
+
+[ci]
+description = "Run full checks (lint, compile/type checks, and tests)"
+depends = ["lint", "check", "test"]
 
 [all]
-description = "Build, lint, and test everything"
-depends = ["lint", "test"]
+description = "Alias for ci"
+depends = ["ci"]
+hide = true
 
 ["pre-commit"]
-description = "Pre-commit checks (format, lint, and tests)"
-depends = ["lint", "test:rust", "test:python"]
+description = "Alias for ci"
+depends = ["ci"]
+hide = true
 
 [sandbox]
-description = "Run the sandbox container with an interactive shell"
+description = "Alias for cluster:sandbox"
 depends = ["docker:build:sandbox"]
 raw = true
 usage = """
 flag "-e --env <env>" var=#true help="Environment variables to pass into the sandbox"
 arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
 """
-run = """
-#!/usr/bin/env bash
-TTY_FLAG=""
-if [ -t 0 ]; then
-  TTY_FLAG="-it"
-fi
-CMD=(${usage_command:-/bin/bash})
-ENV_FLAGS=""
-for var in ${usage_env}; do
-  if [ -n "${!var+x}" ]; then
-    ENV_FLAGS="${ENV_FLAGS} -e ${var}=${!var}"
-  else
-    echo "Warning: ${var} is not set in your environment, skipping" >&2
-  fi
-done
-docker run ${TTY_FLAG} \
-  --cap-add=SYS_ADMIN \
-  --cap-add=NET_ADMIN \
-  --cap-add=SYS_PTRACE \
-  -v ${PWD}/dev-sandbox-policy.rego:/var/navigator/policy.rego:ro \
-  -v ${PWD}/dev-sandbox-policy.yaml:/var/navigator/data.yaml:ro \
-  -v ${PWD}/inference-routes.yaml:/var/navigator/inference-routes.yaml:ro \
-  -v ${PWD}/tmp:/sandbox/tmp \
-  -e HOME=/sandbox \
-  -w /sandbox \
-  -e NEMOCLAW_POLICY_RULES=/var/navigator/policy.rego \
-  -e NEMOCLAW_POLICY_DATA=/var/navigator/data.yaml \
-  -e NEMOCLAW_INFERENCE_ROUTES=/var/navigator/inference-routes.yaml \
-  -e NVIDIA_API_KEY="${NVIDIA_API_KEY:-}" \
-  ${ENV_FLAGS} \
-  navigator/sandbox:${IMAGE_TAG:-dev} -i -- ${CMD[@]}
-"""
+run = "bash build/scripts/run-sandbox.sh"
+hide = true

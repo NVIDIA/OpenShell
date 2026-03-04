@@ -38,7 +38,7 @@ build/
   cluster.toml                     # Cluster bootstrap and deploy tasks
   helm.toml                        # Helm lint task
   rust.toml                        # Rust build/lint/format tasks
-  ci.toml                          # Pre-commit, lint, sandbox runner tasks
+  ci.toml                          # Public quality tasks and CI entrypoint
   test.toml                        # Test tasks (Rust + Python)
   python.toml                      # Python build/lint/format tasks
   publish.toml                     # Release publishing tasks
@@ -317,19 +317,17 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 | Task | Description |
 |---|---|
 | `mise run cluster` | Fast local recreate: push prebuilt local component images and deploy via local registry |
-| `mise run cluster:deploy` | Fast deploy: rebuild changed components only |
-| `mise run cluster:deploy:all` | Full deploy: rebuild all components via local registry |
-| `mise run cluster:push:server` | Tag and push gateway image to local registry |
-| `mise run cluster:push:sandbox` | Tag and push sandbox image to local registry |
+| `mise run cluster:build` | Fast incremental deploy: rebuild changed components only |
+| `mise run cluster:build:full` | Full build + deploy path (advanced/CI) |
 
 ### Other Tasks
 
 | Task | Description |
 |---|---|
-| `mise run sandbox` | Run sandbox container interactively (builds image first) |
+| `mise run cluster:sandbox` | Run sandbox container interactively (builds image first) |
 | `mise run helm:lint` | Lint the Helm chart |
 
-### How `cluster:deploy` Works
+### How `cluster:build` Works
 
 `build/scripts/cluster-deploy-fast.sh` supports two modes:
 
@@ -346,7 +344,7 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 
 **Explicit target mode** (arguments: `server`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.
 
-Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster:deploy` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
+Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster:build` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
 
 After building, the script:
 
@@ -429,13 +427,13 @@ In CI pipelines:
 mise run cluster
 
 # Incremental rebuild of changed components only
-mise run cluster:deploy
+mise run cluster:build
 
-# Rebuild specific component(s)
-mise run cluster:deploy server sandbox
+# Full build + deploy path (advanced/CI)
+mise run cluster:build:full
 
 # Run sandbox container interactively (for testing sandbox code)
-mise run sandbox
+mise run cluster:sandbox
 ```
 
 ### Multi-Arch Publishing

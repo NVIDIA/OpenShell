@@ -563,9 +563,9 @@ The `create` and `update` commands perform protocol auto-detection when `--proto
 
 ## Dev Sandbox Workflow
 
-**File:** `build/ci.toml` (task `[sandbox]`), `inference-routes.yaml` (repo root)
+**File:** `build/cluster.toml` (task `["cluster:sandbox"]`), `inference-routes.yaml` (repo root)
 
-Running `mise run sandbox` starts a standalone sandbox container with inference routing pre-configured. The task mounts three files into the container:
+Running `mise run cluster:sandbox` starts a standalone sandbox container with inference routing pre-configured. The task mounts three files into the container:
 
 - `dev-sandbox-policy.rego` as `/var/navigator/policy.rego`
 - `dev-sandbox-policy.yaml` as `/var/navigator/data.yaml`
@@ -589,7 +589,7 @@ routes:
 The `-e` flag forwards arbitrary host environment variables into the container:
 
 ```bash
-mise run sandbox -e ANTHROPIC_API_KEY -- /bin/bash
+mise run cluster:sandbox -e ANTHROPIC_API_KEY -- /bin/bash
 ```
 
 This checks whether the named variable is set in the host environment and passes it through. Unset variables produce a warning and are skipped.

@@ -247,8 +247,8 @@ python_e2e_sandbox_test:
     - socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
     - sleep 1
     - mise run --no-prepare docker:build:cluster
-    - mise run --no-prepare cluster:build
-    - mise run --no-prepare test:e2e:sandbox
+    - mise run --no-prepare cluster:build:full
+    - mise run --no-prepare test:e2e
 
 # =============================================================================
 # Publish Jobs
