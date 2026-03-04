@@ -286,7 +286,7 @@ network_policies:
 
 # Inference routing policy (gRPC mode only)
 inference:
-  allowed_routing_hints: []
+  allowed_routes: []
 ```
 
 ---
@@ -472,11 +472,11 @@ Controls access to the platform's inference routing system (gRPC mode only, incl
 
 | Field                   | Type       | Default | Description                                                                                                                                                 |
 | ----------------------- | ---------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `allowed_routing_hints` | `string[]` | `[]`    | Which routing hints the sandbox may request. e.g., `["local"]` for private-only, `["local", "frontier"]` for full access. Empty means no inference allowed. |
+| `allowed_routes` | `string[]` | `[]`    | Which routing hints the sandbox may request. e.g., `["local"]` for private-only, `["local", "frontier"]` for full access. Empty means no inference allowed. |
 
 ```yaml
 inference:
-  allowed_routing_hints:
+  allowed_routes:
     - local
 ```
 
@@ -987,7 +987,7 @@ network_policies:
       - { path: /usr/bin/curl }
 
 inference:
-  allowed_routing_hints:
+  allowed_routes:
     - local
 ```
 
@@ -1016,7 +1016,7 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `NetworkEndpoint`   | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules`, `allowed_ips` | Same field names                            |
 | `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
-| `InferencePolicy`   | `allowed_routing_hints`                                             | `inference.allowed_routing_hints`           |
+| `InferencePolicy`   | `allowed_routes`                                                    | `inference.allowed_routes`                  |
 
 The conversion is performed in `crates/navigator-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
 

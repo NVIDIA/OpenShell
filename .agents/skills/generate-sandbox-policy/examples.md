@@ -825,10 +825,11 @@ filesystem_policy:
   read_only:
     - /usr
     - /lib
-    - /proc/self
+    - /proc
     - /dev/urandom
     - /app
     - /etc
+    - /var/log
   read_write:
     - /sandbox
     - /tmp
@@ -867,7 +868,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 
 inference:
-  allowed_routing_hints:
+  allowed_routes:
     - local
 ```
 
