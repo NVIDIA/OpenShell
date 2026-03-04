@@ -143,7 +143,10 @@ async fn handle_tunnel(
         Duration::from_secs(10),
         Duration::from_secs(15),
     ];
-    for (attempt, delay) in std::iter::once(&Duration::ZERO).chain(delays.iter()).enumerate() {
+    for (attempt, delay) in std::iter::once(&Duration::ZERO)
+        .chain(delays.iter())
+        .enumerate()
+    {
         if !delay.is_zero() {
             tokio::time::sleep(*delay).await;
         }

@@ -146,7 +146,9 @@ impl LogDisplay {
         // Print the final phase as a static line above the spinner, then
         // clear the spinner itself.  This leaves the phase label visible
         // in scrollback instead of erasing it with finish_and_clear().
-        let _ = self.mp.println(format!("  {}", format_phase_label(&self.phase)));
+        let _ = self
+            .mp
+            .println(format!("  {}", format_phase_label(&self.phase)));
         self.spinner.finish_and_clear();
     }
 
