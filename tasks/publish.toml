@@ -3,30 +3,6 @@
 
 # Publishing / release tasks
 
-["python:publish"]
-description = "Build and publish Python wheels"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-VERSION=$(uv run python tasks/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:all
-uv run python tasks/scripts/release.py python-publish --version "$VERSION"
-"""
-hide = true
-
-["python:publish:macos"]
-description = "Build and publish macOS arm64 Python wheel"
-run = """
-#!/usr/bin/env bash
-set -euo pipefail
-VERSION=$(uv run python tasks/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
-uv run python tasks/scripts/release.py python-publish --version "$VERSION" --wheel-glob "*macosx*arm64.whl"
-"""
-hide = true
-
 ["publish:main"]
 description = "Main branch publish job (images with :dev, :latest, and version tag)"
 run = """
