@@ -1037,11 +1037,10 @@ pub async fn sandbox_create(
 
     // When a custom image is specified, clear the default run_as_user/group
     // to prevent failures on images that lack the "sandbox" user/group.
-    if image.is_some()
-        && let Some(ref mut process) = policy.process
-    {
-        process.run_as_user = String::new();
-        process.run_as_group = String::new();
+    if image.is_some() {
+        if let Some(ref mut p) = policy {
+            navigator_policy::clear_process_identity(p);
+        }
     }
 
     let template = image.map(|img| SandboxTemplate {
@@ -1051,7 +1050,7 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            policy: Some(policy),
+            policy,
             providers: configured_providers,
             template,
             ..SandboxSpec::default()
@@ -1299,12 +1298,12 @@ pub async fn sandbox_create(
     }
 }
 
-/// Default sandbox policy YAML, baked in at compile time.
 /// Load sandbox policy YAML.
 ///
-/// Resolution order: `--policy` flag > `NEMOCLAW_SANDBOX_POLICY` env var > built-in default.
-/// Delegates to `navigator_policy::load_sandbox_policy`.
-fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
+/// Resolution order: `--policy` flag > `NEMOCLAW_SANDBOX_POLICY` env var.
+/// Returns `None` when no policy source is configured, allowing the server
+/// to apply its own default.
+fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     navigator_policy::load_sandbox_policy(cli_path)
 }
 
@@ -2606,7 +2605,8 @@ pub async fn sandbox_policy_set(
     timeout_secs: u64,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = load_sandbox_policy(Some(policy_path))?;
+    let policy = load_sandbox_policy(Some(policy_path))?
+        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
 

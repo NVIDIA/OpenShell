@@ -39,10 +39,10 @@ struct Args {
     #[arg(long, env = "NEMOCLAW_SANDBOX_ID")]
     sandbox_id: Option<String>,
 
-    /// Sandbox name (used for policy sync when the sandbox discovers policy
+    /// Sandbox (used for policy sync when the sandbox discovers policy
     /// from disk or falls back to the restrictive default).
-    #[arg(long, env = "NEMOCLAW_SANDBOX_NAME")]
-    sandbox_name: Option<String>,
+    #[arg(long, env = "NEMOCLAW_SANDBOX")]
+    sandbox: Option<String>,
 
     /// NemoClaw server gRPC endpoint for fetching policy.
     /// Required when using --sandbox-id.
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
         args.timeout,
         args.interactive,
         args.sandbox_id,
-        args.sandbox_name,
+        args.sandbox,
         args.navigator_endpoint,
         args.policy_rules,
         args.policy_data,

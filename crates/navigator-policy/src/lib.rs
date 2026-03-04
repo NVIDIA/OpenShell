@@ -3,8 +3,7 @@
 
 //! Shared sandbox policy parsing and defaults for NemoClaw.
 //!
-//! Provides bidirectional YAML↔proto conversion for sandbox policies, with a
-//! built-in default policy embedded from `dev-sandbox-policy.yaml`.
+//! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
 //! The serde types here are the **single canonical representation** of the YAML
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
@@ -18,10 +17,6 @@ use navigator_core::proto::{
     NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
-
-/// Built-in default sandbox policy YAML (embedded at compile time).
-const DEFAULT_SANDBOX_POLICY_YAML: &str =
-    include_str!("../../../deploy/docker/sandbox/dev-sandbox-policy.yaml");
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -353,12 +348,16 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
         .wrap_err("failed to serialize policy to YAML")
 }
 
-/// Load a sandbox policy with the standard resolution order:
+/// Load a sandbox policy from an explicit source.
 ///
+/// Resolution order:
 /// 1. `cli_path` argument (e.g. from a `--policy` flag)
 /// 2. `NEMOCLAW_SANDBOX_POLICY` environment variable
-/// 3. Built-in default (`dev-sandbox-policy.yaml`)
-pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
+///
+/// Returns `Ok(None)` when no policy source is configured, allowing the
+/// caller to omit the policy and let the server / sandbox apply its own
+/// default.
+pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     let contents = if let Some(p) = cli_path {
         let path = std::path::Path::new(p);
         std::fs::read_to_string(path)
@@ -370,16 +369,9 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
     } else {
-        DEFAULT_SANDBOX_POLICY_YAML.to_string()
+        return Ok(None);
     };
-    parse_sandbox_policy(&contents)
-}
-
-/// Return the built-in default sandbox policy.
-pub fn default_sandbox_policy() -> SandboxPolicy {
-    // The embedded YAML is known-good; unwrap is safe.
-    parse_sandbox_policy(DEFAULT_SANDBOX_POLICY_YAML)
-        .expect("built-in dev-sandbox-policy.yaml must be valid")
+    parse_sandbox_policy(&contents).map(Some)
 }
 
 /// Well-known path where a sandbox container image can ship a policy YAML file.
@@ -441,45 +433,11 @@ pub fn clear_process_identity(policy: &mut SandboxPolicy) {
 mod tests {
     use super::*;
 
-    /// Round-trip: parse the built-in default policy YAML → proto → YAML → proto
-    /// and verify the two proto representations are identical.
-    #[test]
-    fn round_trip_default_policy() {
-        let proto1 = parse_sandbox_policy(DEFAULT_SANDBOX_POLICY_YAML)
-            .expect("failed to parse default policy");
-
-        let yaml_str =
-            serialize_sandbox_policy(&proto1).expect("failed to serialize policy to YAML");
-
-        let proto2 = parse_sandbox_policy(&yaml_str).expect("failed to re-parse serialized policy");
-
-        assert_eq!(proto1.version, proto2.version);
-        assert_eq!(proto1.filesystem, proto2.filesystem);
-        assert_eq!(proto1.landlock, proto2.landlock);
-        assert_eq!(proto1.process, proto2.process);
-        assert_eq!(proto1.inference, proto2.inference);
-
-        // Compare network policies (proto HashMap ordering may differ, so
-        // compare key-by-key).
-        assert_eq!(
-            proto1.network_policies.len(),
-            proto2.network_policies.len(),
-            "network policy count mismatch"
-        );
-        for (key, rule1) in &proto1.network_policies {
-            let rule2 = proto2
-                .network_policies
-                .get(key)
-                .unwrap_or_else(|| panic!("missing network policy key: {key}"));
-            assert_eq!(rule1, rule2, "network policy mismatch for key: {key}");
-        }
-    }
-
     /// Verify that the serialized YAML uses `filesystem_policy` (not
     /// `filesystem`) so it can be fed back to `parse_sandbox_policy`.
     #[test]
     fn serialized_yaml_uses_filesystem_policy_key() {
-        let proto = default_sandbox_policy();
+        let proto = restrictive_default_policy();
         let yaml = serialize_sandbox_policy(&proto).expect("serialize failed");
         assert!(
             yaml.contains("filesystem_policy:"),
@@ -661,14 +619,6 @@ network_policies:
     fn parse_rejects_unknown_fields() {
         let yaml = "version: 1\nbogus_field: true\n";
         assert!(parse_sandbox_policy(yaml).is_err());
-    }
-
-    #[test]
-    fn default_sandbox_policy_is_valid() {
-        let policy = default_sandbox_policy();
-        assert_eq!(policy.version, 1);
-        // Dev default has network policies (unlike the restrictive default).
-        assert!(!policy.network_policies.is_empty());
     }
 
     #[test]

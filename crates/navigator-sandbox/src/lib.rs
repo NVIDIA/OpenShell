@@ -120,7 +120,7 @@ pub async fn run_sandbox(
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<String>,
-    sandbox_name: Option<String>,
+    sandbox: Option<String>,
     navigator_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
@@ -139,7 +139,7 @@ pub async fn run_sandbox(
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
     let (mut policy, opa_engine) = load_policy(
         sandbox_id.clone(),
-        sandbox_name,
+        sandbox,
         navigator_endpoint.clone(),
         policy_rules,
         policy_data,
@@ -687,7 +687,7 @@ fn spawn_route_refresh(
 /// 4. Otherwise, return an error
 async fn load_policy(
     sandbox_id: Option<String>,
-    sandbox_name: Option<String>,
+    sandbox: Option<String>,
     navigator_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
@@ -734,16 +734,16 @@ async fn load_policy(
                 // gateway so it becomes the authoritative baseline.
                 info!("Server returned no policy; attempting local discovery");
                 let discovered = discover_policy_from_disk_or_default();
-                let name = sandbox_name.as_deref().ok_or_else(|| {
+                let sandbox = sandbox.as_deref().ok_or_else(|| {
                     miette::miette!(
-                        "Cannot sync discovered policy: sandbox name not available.\n\
-                         Set NEMOCLAW_SANDBOX_NAME or --sandbox-name to enable policy sync."
+                        "Cannot sync discovered policy: sandbox not available.\n\
+                         Set NEMOCLAW_SANDBOX or --sandbox to enable policy sync."
                     )
                 })?;
 
                 // Sync and re-fetch over a single connection to avoid extra
                 // TLS handshakes.
-                grpc_client::discover_and_sync_policy(endpoint, id, name, &discovered).await?
+                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
             }
         };
 
