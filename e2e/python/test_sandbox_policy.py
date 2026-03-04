@@ -387,7 +387,7 @@ def test_l4_cross_policy_denied(
 def test_l4_non_connect_method_rejected(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """L4-6: Non-CONNECT HTTP method -> rejected with 405."""
+    """L4-6: Non-CONNECT HTTP method -> rejected with 403."""
 
     def send_get_to_proxy() -> str:
         import socket
@@ -416,7 +416,7 @@ def test_l4_non_connect_method_rejected(
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(send_get_to_proxy)
         assert result.exit_code == 0, result.stderr
-        assert "405" in result.stdout
+        assert "403" in result.stdout
 
 
 def test_l4_log_fields(

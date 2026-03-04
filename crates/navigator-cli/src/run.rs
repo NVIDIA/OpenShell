@@ -35,7 +35,6 @@ use navigator_providers::{
 };
 use owo_colors::OwoColorize;
 use reqwest::StatusCode as ReqwestStatusCode;
-use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -1368,174 +1367,6 @@ pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<(
     Ok(())
 }
 
-/// Serializable policy structure for YAML output.
-#[derive(Serialize)]
-struct PolicyYaml {
-    version: u32,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    inference: Option<InferenceYaml>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    filesystem: Option<FilesystemYaml>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    landlock: Option<LandlockYaml>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    process: Option<ProcessYaml>,
-    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    network_policies: std::collections::BTreeMap<String, NetworkPolicyRuleYaml>,
-}
-
-#[derive(Serialize)]
-struct InferenceYaml {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    allowed_routes: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct FilesystemYaml {
-    include_workdir: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    read_only: Vec<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    read_write: Vec<String>,
-}
-
-#[derive(Serialize)]
-struct LandlockYaml {
-    compatibility: String,
-}
-
-#[derive(Serialize)]
-struct ProcessYaml {
-    #[serde(skip_serializing_if = "String::is_empty")]
-    run_as_user: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    run_as_group: String,
-}
-
-#[derive(Serialize)]
-struct NetworkPolicyRuleYaml {
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    endpoints: Vec<NetworkEndpointYaml>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    binaries: Vec<NetworkBinaryYaml>,
-}
-
-#[derive(Serialize)]
-struct NetworkEndpointYaml {
-    host: String,
-    port: u32,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    protocol: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    tls: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    enforcement: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    access: String,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    rules: Vec<L7RuleYaml>,
-}
-
-#[derive(Serialize)]
-struct L7RuleYaml {
-    allow: L7AllowYaml,
-}
-
-#[derive(Serialize)]
-struct L7AllowYaml {
-    #[serde(skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    path: String,
-    #[serde(skip_serializing_if = "String::is_empty")]
-    command: String,
-}
-
-#[derive(Serialize)]
-struct NetworkBinaryYaml {
-    path: String,
-}
-
-/// Convert proto policy to serializable YAML structure.
-fn policy_to_yaml(policy: &SandboxPolicy) -> PolicyYaml {
-    let inference = policy.inference.as_ref().map(|inf| InferenceYaml {
-        allowed_routes: inf.allowed_routes.clone(),
-    });
-
-    let filesystem = policy.filesystem.as_ref().map(|fs| FilesystemYaml {
-        include_workdir: fs.include_workdir,
-        read_only: fs.read_only.clone(),
-        read_write: fs.read_write.clone(),
-    });
-
-    let landlock = policy.landlock.as_ref().map(|ll| LandlockYaml {
-        compatibility: ll.compatibility.clone(),
-    });
-
-    let process = policy.process.as_ref().and_then(|p| {
-        if p.run_as_user.is_empty() && p.run_as_group.is_empty() {
-            None
-        } else {
-            Some(ProcessYaml {
-                run_as_user: p.run_as_user.clone(),
-                run_as_group: p.run_as_group.clone(),
-            })
-        }
-    });
-
-    let network_policies = policy
-        .network_policies
-        .iter()
-        .map(|(key, rule)| {
-            let yaml_rule = NetworkPolicyRuleYaml {
-                endpoints: rule
-                    .endpoints
-                    .iter()
-                    .map(|e| NetworkEndpointYaml {
-                        host: e.host.clone(),
-                        port: e.port,
-                        protocol: e.protocol.clone(),
-                        tls: e.tls.clone(),
-                        enforcement: e.enforcement.clone(),
-                        access: e.access.clone(),
-                        rules: e
-                            .rules
-                            .iter()
-                            .map(|r| {
-                                let a = r.allow.clone().unwrap_or_default();
-                                L7RuleYaml {
-                                    allow: L7AllowYaml {
-                                        method: a.method,
-                                        path: a.path,
-                                        command: a.command,
-                                    },
-                                }
-                            })
-                            .collect(),
-                    })
-                    .collect(),
-                binaries: rule
-                    .binaries
-                    .iter()
-                    .map(|b| NetworkBinaryYaml {
-                        path: b.path.clone(),
-                    })
-                    .collect(),
-            };
-            (key.clone(), yaml_rule)
-        })
-        .collect();
-
-    PolicyYaml {
-        version: policy.version,
-        inference,
-        filesystem,
-        landlock,
-        process,
-        network_policies,
-    }
-}
-
 /// Print a single YAML line with dimmed keys and regular values.
 fn print_yaml_line(line: &str) {
     // Find leading whitespace
@@ -1581,8 +1412,7 @@ fn print_yaml_line(line: &str) {
 fn print_sandbox_policy(policy: &SandboxPolicy) {
     println!("{}", "Policy:".cyan().bold());
     println!();
-    let policy_yaml = policy_to_yaml(policy);
-    if let Ok(yaml_str) = serde_yaml::to_string(&policy_yaml) {
+    if let Ok(yaml_str) = navigator_policy::serialize_sandbox_policy(policy) {
         // Indent the YAML output and skip the initial "---" line
         for line in yaml_str.lines() {
             if line == "---" {
@@ -2899,11 +2729,9 @@ pub async fn sandbox_policy_get(
         }
 
         if full {
-            if let Some(policy) = rev.policy {
+            if let Some(ref policy) = rev.policy {
                 println!("---");
-                let yaml_repr = policy_to_yaml(&policy);
-                let yaml_str = serde_yaml::to_string(&yaml_repr)
-                    .into_diagnostic()
+                let yaml_str = navigator_policy::serialize_sandbox_policy(policy)
                     .wrap_err("failed to serialize policy to YAML")?;
                 print!("{yaml_str}");
             } else {
