@@ -63,7 +63,7 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run cluster` | Bootstrap or incremental deploy |
 | `mise run sandbox` | Create a sandbox on the running cluster |
 | `mise run test` | Default test suite |
-| `mise run test:e2e` | Default end-to-end test lane |
+| `mise run e2e` | Default end-to-end test lane |
 | `mise run ci` | Full local CI checks (lint, compile/type checks, tests) |
 | `mise run clean` | Clean build artifacts |
 

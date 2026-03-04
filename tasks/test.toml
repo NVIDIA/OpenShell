@@ -7,9 +7,14 @@
 description = "Run all tests (Rust + Python)"
 depends = ["test:rust", "test:python"]
 
-["test:e2e"]
+[e2e]
 description = "Run default end-to-end test lane"
 depends = ["test:e2e:sandbox"]
+
+["test:e2e"]
+description = "Alias for e2e"
+depends = ["e2e"]
+hide = true
 
 ["test:rust"]
 description = "Run Rust tests"
