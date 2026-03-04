@@ -6,8 +6,8 @@ graph TB
     %% USER'S MACHINE
     %% ============================================================
     subgraph UserMachine["User's Machine"]
-        CLI["NemoClaw CLI<br/>(ncl)"]
-        TUI["Gator TUI<br/>(ncl gator)"]
+        CLI["NemoClaw CLI<br/>(nemoclaw)"]
+        TUI["Gator TUI<br/>(nemoclaw gator)"]
         SDK["Python SDK<br/>(nemoclaw)"]
         LocalConfig["~/.config/nemoclaw/<br/>clusters, mTLS certs,<br/>active_cluster"]
     end

@@ -146,4 +146,4 @@ parsing CLI output.
 | Variable | Purpose |
 |---|---|
 | `NEMOCLAW_CLUSTER` | Override active cluster name for E2E tests |
-| `NAV_BIN` | Override `ncl` binary path in bash E2E tests |
+| `NAV_BIN` | Override `nemoclaw` binary path in bash E2E tests |

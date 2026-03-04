@@ -120,7 +120,7 @@ The target onboarding experience is two commands:
 
 ```bash
 pip install <package>
-ncl sandbox create --remote user@host -- claude
+nemoclaw sandbox create --remote user@host -- claude
 ```
 
 The first command installs the CLI. The second command bootstraps the cluster on the remote host (if needed) and launches a sandbox running the specified agent.
@@ -190,7 +190,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 - Agents need zero code changes -- standard OpenAI/Anthropic SDK calls work transparently.
 - The sandbox never sees the real API key for the backend -- credential isolation is maintained.
 - Policy controls which routes a sandbox can access via `inference.allowed_routes`.
-- Routes are managed as server-side resources via CLI (`ncl inference create/update/delete/list`).
+- Routes are managed as server-side resources via CLI (`nemoclaw inference create/update/delete/list`).
 
 **Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`) and have these fields: `routing_hint` (name for policy matching), `base_url` (backend endpoint), `protocols` (supported API protocols like `openai_chat_completions` or `anthropic_messages`), `api_key`, `model_id`, and `enabled` flag.
 
@@ -239,12 +239,12 @@ For more detail, see [Policy Language](security-policy.md).
 
 The CLI is the primary way users interact with the platform. It provides commands organized into four groups:
 
-- **Cluster management** (`ncl cluster`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
-- **Sandbox management** (`ncl sandbox`): Create sandboxes (with optional file sync and provider auto-discovery), list running sandboxes, connect to sandboxes via SSH, and delete sandboxes.
-- **Provider management** (`ncl provider`): Create, update, list, and delete external service credentials.
-- **Inference management** (`ncl inference`): Configure routing rules for AI model API endpoints.
+- **Cluster management** (`nemoclaw cluster`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
+- **Sandbox management** (`nemoclaw sandbox`): Create sandboxes (with optional file sync and provider auto-discovery), list running sandboxes, connect to sandboxes via SSH, and delete sandboxes.
+- **Provider management** (`nemoclaw provider`): Create, update, list, and delete external service credentials.
+- **Inference management** (`nemoclaw inference`): Configure routing rules for AI model API endpoints.
 
-The CLI resolves which cluster to operate on through a priority chain: explicit `--cluster` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `ncl cluster use`. It supports TLS client certificates for mutual authentication with the gateway.
+The CLI resolves which cluster to operate on through a priority chain: explicit `--cluster` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `nemoclaw cluster use`. It supports TLS client certificates for mutual authentication with the gateway.
 
 ## How Users Get Started
 
@@ -259,7 +259,7 @@ pip install <package>
 **Step 2: Create a sandbox.**
 
 ```bash
-ncl sandbox create -- claude
+nemoclaw sandbox create -- claude
 ```
 
 If no cluster exists, the CLI automatically bootstraps one. It provisions a local Kubernetes cluster inside a Docker container, waits for it to become healthy, discovers the user's AI provider credentials from local configuration files, uploads them to the gateway, and launches a sandbox running the specified agent -- all from a single command.
@@ -267,7 +267,7 @@ If no cluster exists, the CLI automatically bootstraps one. It provisions a loca
 For remote deployment (running the sandbox on a different machine):
 
 ```bash
-ncl sandbox create --remote user@hostname -- claude
+nemoclaw sandbox create --remote user@hostname -- claude
 ```
 
 This performs the same bootstrap flow on the remote host via SSH.
@@ -275,7 +275,7 @@ This performs the same bootstrap flow on the remote host via SSH.
 **Step 3: Connect to a running sandbox.**
 
 ```bash
-ncl sandbox connect <sandbox-name>
+nemoclaw sandbox connect <sandbox-name>
 ```
 
 This opens an interactive SSH session into the sandbox, with all provider credentials available as environment variables.

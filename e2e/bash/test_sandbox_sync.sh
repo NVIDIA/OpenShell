@@ -6,14 +6,14 @@
 # Integration test for bidirectional file sync with a sandbox.
 #
 # Verifies the full flow:
-#   1. ncl sandbox create --keep  (long-running sandbox for sync tests)
-#   2. ncl sandbox sync <name> --up <local> <sandbox-dest>  (push)
-#   3. ncl sandbox sync <name> --down <sandbox-path> <local-dest>  (pull)
+#   1. nemoclaw sandbox create --keep  (long-running sandbox for sync tests)
+#   2. nemoclaw sandbox sync <name> --up <local> <sandbox-dest>  (push)
+#   3. nemoclaw sandbox sync <name> --down <sandbox-path> <local-dest>  (pull)
 #   4. Single-file round-trip
 #
 # Prerequisites:
 #   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
-#   - The `ncl` binary on PATH (or set NAV_BIN)
+#   - The `nemoclaw` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_sandbox_sync.sh
@@ -32,7 +32,7 @@ if [[ -n "${NAV_BIN:-}" ]]; then
 elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
   NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
-  NAV="ncl"
+  NAV="nemoclaw"
 fi
 
 SANDBOX_NAME=""

@@ -6,7 +6,7 @@ your local machine through port forwarding.
 
 ## Prerequisites
 
-- A running NemoClaw cluster (`ncl cluster admin deploy`)
+- A running NemoClaw cluster (`nemoclaw cluster admin deploy`)
 - Docker daemon running
 
 ## What's in this example
@@ -21,7 +21,7 @@ your local machine through port forwarding.
 ### 1. Build and push the image
 
 ```bash
-ncl sandbox image push \
+nemoclaw sandbox image push \
     --dockerfile examples/bring-your-own-container/Dockerfile \
     --tag        byoc-demo:latest
 ```
@@ -29,7 +29,7 @@ ncl sandbox image push \
 ### 2. Create a sandbox with port forwarding
 
 ```bash
-ncl sandbox create --image byoc-demo:latest --forward 8080 -- python /sandbox/app.py
+nemoclaw sandbox create --image byoc-demo:latest --forward 8080 -- python /sandbox/app.py
 ```
 
 The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
@@ -94,5 +94,5 @@ bridges the tunnel to `127.0.0.1:<port>` inside the container.
 Delete the sandbox when you're done (this also stops port forwards):
 
 ```bash
-ncl sandbox delete <sandbox-name>
+nemoclaw sandbox delete <sandbox-name>
 ```

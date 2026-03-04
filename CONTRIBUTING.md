@@ -37,18 +37,18 @@ mise trust
 mise run sandbox
 ```
 
-## `ncl` Shortcut
+## `nemoclaw` Shortcut
 
-Inside this repository, `ncl` is a local shortcut script at `scripts/bin/ncl`. The script will
+Inside this repository, `nemoclaw` is a local shortcut script at `scripts/bin/nemoclaw`. The script will
 
 1. Builds `navigator-cli` if needed.
 2. Runs the local debug CLI binary (`target/debug/nemoclaw`).
 
-Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `ncl` directly from the repo.
+Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `nemoclaw` directly from the repo.
 
 ```bash
-ncl --help
-ncl sandbox create -- codex
+nemoclaw --help
+nemoclaw sandbox create -- codex
 ```
 
 ## Main Tasks
@@ -108,7 +108,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 **Examples:**
 
 ```
-feat(cli): add --verbose flag to ncl run
+feat(cli): add --verbose flag to nemoclaw run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
 chore(deps): bump tokio to 1.40

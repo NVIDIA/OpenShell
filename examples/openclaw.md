@@ -3,7 +3,7 @@
 ## Quick start
 
 ```sh
-ncl sandbox create --forward 18789 -- openclaw-start
+nemoclaw sandbox create --forward 18789 -- openclaw-start
 ```
 
 `openclaw-start` is a helper script pre-installed in the sandbox that runs the

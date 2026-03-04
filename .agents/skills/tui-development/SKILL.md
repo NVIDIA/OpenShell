@@ -9,9 +9,9 @@ Comprehensive reference for any agent working on the Gator TUI.
 
 ## 1. Overview
 
-Gator is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `ncl` CLI, but with a live, interactive dashboard.
+Gator is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `nemoclaw` CLI, but with a live, interactive dashboard.
 
-- **Launched via:** `ncl gator` or `mise run gator`
+- **Launched via:** `nemoclaw gator` or `mise run gator`
 - **Crate:** `crates/navigator-tui/`
 - **Key dependencies:**
   - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
@@ -225,14 +225,14 @@ The `confirm_delete` flag in `App` gates destructive key handling — while true
 
 ### CLI parity
 
-Gator actions should parallel `ncl` CLI commands so users have familiar mental models:
+Gator actions should parallel `nemoclaw` CLI commands so users have familiar mental models:
 
 | CLI Command | Gator Equivalent |
 | --- | --- |
-| `ncl sandbox list` | Sandbox table on Dashboard |
-| `ncl sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
-| `ncl sandbox logs <name>` | `[l]` on sandbox detail to open log viewer |
-| `ncl cluster health` | Status in title bar + cluster list |
+| `nemoclaw sandbox list` | Sandbox table on Dashboard |
+| `nemoclaw sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
+| `nemoclaw sandbox logs <name>` | `[l]` on sandbox detail to open log viewer |
+| `nemoclaw cluster health` | Status in title bar + cluster list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
