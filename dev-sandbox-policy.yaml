@@ -36,7 +36,7 @@ process:
 
 network_policies:
   claude_code:
-    name: claude_code
+    name: claude-code
     endpoints:
       - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
       - { host: statsig.anthropic.com, port: 443 }
@@ -46,15 +46,9 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/node }
-  gitlab:
-    name: gitlab
-    endpoints:
-      - { host: gitlab.com, port: 443 }
-      - { host: gitlab.mycorp.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/glab }
-  github:
-    name: github
+
+  github_ssh_over_https:
+    name: github-ssh-over-https
     endpoints:
       - host: github.com
         port: 443
@@ -71,66 +65,32 @@ network_policies:
           - allow:
               method: POST
               path: "/**/git-upload-pack"
-          # Data transfer for writes (alpha-claw only)
-          - allow:
-              method: POST
-              path: "/johntmyers/alpha-claw*/git-receive-pack"
+          # Data transfer for writes
+          # - allow:
+          #    method: POST
+          #    path: "/**/git-receive-pack"
     binaries:
       - { path: /usr/bin/git }
-  nvidia:
-    name: nvidia
+
+  nvidia_inference:
+    name: nvidia-inference
     endpoints:
       - { host: integrate.api.nvidia.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
       - { path: /bin/bash }
       - { path: /usr/local/bin/opencode }
-  nvidia_web:
-    name: nvidia_web
-    endpoints:
-      - { host: nvidia.com, port: 443 }
-      - { host: www.nvidia.com, port: 443 }
-    binaries:
-      - { path: /usr/bin/curl }
 
-  # --- GitHub repo-scoped policy (L7, TLS-terminated) ---
-  # Combined policy for api.github.com to avoid OPA complete-rule conflict.
-  #   - johntmyers/alpha-claw: full access (all methods including DELETE)
-  #   - johntmyers/bravo-claw: read-only + create/edit issues
-  github_repos:
-    name: github_repos
+  # --- GitHub REST API (read-only) ---
+  github_rest_api:
+    name: github-rest-api
     endpoints:
       - host: api.github.com
         port: 443
         protocol: rest
         tls: terminate
         enforcement: enforce
-        rules:
-          # Read-only access to all GitHub API paths
-          - allow:
-              method: GET
-              path: "/**"
-          - allow:
-              method: HEAD
-              path: "/**"
-          - allow:
-              method: OPTIONS
-              path: "/**"
-          # GraphQL API (used by gh CLI for most operations)
-          # - allow:
-          #    method: POST
-          #    path: "/graphql"
-          # alpha-claw: full write access
-          - allow:
-              method: "*"
-              path: "/repos/johntmyers/alpha-claw/**"
-          # bravo-claw: create + edit issues
-          - allow:
-              method: POST
-              path: "/repos/johntmyers/bravo-claw/issues"
-          - allow:
-              method: PATCH
-              path: "/repos/johntmyers/bravo-claw/issues/*"
+        access: read-only
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/gh }
@@ -148,19 +108,6 @@ network_policies:
       - { path: /usr/bin/wget }
       - { path: "/sandbox/.vscode-server/**" }
       - { path: "/sandbox/.vscode-remote-containers/**" }
-
-  # --- Private network access (allowed_ips demo) ---
-  # Allows any binary to reach services on the k3s cluster pod network
-  # (10.42.0.0/16). Without allowed_ips, the proxy's SSRF check blocks
-  # all connections to private RFC 1918 addresses.
-  cluster_pods:
-    name: cluster_pods
-    endpoints:
-      - port: 8080
-        allowed_ips:
-          - "10.42.0.0/16"
-    binaries:
-      - { path: "/**" }
 
 inference:
   allowed_routes:
