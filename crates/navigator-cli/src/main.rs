@@ -1339,6 +1339,7 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::fs;
 
     #[test]
     fn cli_debug_assert() {
@@ -1461,5 +1462,51 @@ mod tests {
                 "expected path completion '{expected}' for args {raw_args:?}, got: {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn sandbox_sync_up_uses_path_value_hint() {
+        let cmd = Cli::command();
+        let sandbox = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "sandbox")
+            .expect("missing sandbox subcommand");
+        let sync = sandbox
+            .get_subcommands()
+            .find(|c| c.get_name() == "sync")
+            .expect("missing sandbox sync subcommand");
+        let up = sync
+            .get_arguments()
+            .find(|arg| arg.get_id() == "up")
+            .expect("missing --up argument");
+
+        assert_eq!(up.get_value_hint(), ValueHint::AnyPath);
+    }
+
+    #[test]
+    fn sandbox_sync_up_completion_suggests_local_paths() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        fs::write(temp.path().join("sample.txt"), "x").expect("failed to create sample file");
+
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec![
+            "nemoclaw".into(),
+            "sandbox".into(),
+            "sync".into(),
+            "demo".into(),
+            "--up".into(),
+            "sa".into(),
+        ];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 5, Some(temp.path()))
+            .expect("completion engine failed");
+
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|name| name.contains("sample.txt")),
+            "expected path completion for --up, got: {names:?}"
+        );
     }
 }

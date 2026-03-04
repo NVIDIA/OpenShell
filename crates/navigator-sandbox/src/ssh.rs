@@ -418,6 +418,19 @@ impl russh::server::Handler for SshHandler {
         }
         Ok(())
     }
+
+    async fn channel_eof(
+        &mut self,
+        _channel: ChannelId,
+        _session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        // Drop the input sender so the stdin writer thread sees a
+        // disconnected channel and closes the child's stdin pipe.  This
+        // is essential for commands like `cat | tar xf -` which need
+        // stdin EOF to know the input stream is complete.
+        self.input_sender.take();
+        Ok(())
+    }
 }
 
 impl SshHandler {
@@ -670,17 +683,14 @@ fn spawn_pty_shell(
                 Ok(n) => {
                     let data = CryptoVec::from_slice(&buf[..n]);
                     let handle_clone = handle_clone.clone();
-                    drop(runtime_reader.spawn(async move {
-                        let _ = handle_clone.data(channel, data).await;
-                    }));
+                    let _ = runtime_reader
+                        .block_on(async move { handle_clone.data(channel, data).await });
                 }
             }
         }
         // Send EOF to indicate no more data will be sent on this channel.
         let eof_handle = handle_clone.clone();
-        drop(runtime_reader.spawn(async move {
-            let _ = eof_handle.eof(channel).await;
-        }));
+        let _ = runtime_reader.block_on(async move { eof_handle.eof(channel).await });
         // Notify the exit thread that all output has been forwarded.
         let _ = reader_done_tx.send(());
     });
@@ -828,9 +838,7 @@ fn spawn_pipe_exec(
                 Ok(n) => {
                     let data = CryptoVec::from_slice(&buf[..n]);
                     let h = stdout_handle.clone();
-                    drop(stdout_runtime.spawn(async move {
-                        let _ = h.data(channel, data).await;
-                    }));
+                    let _ = stdout_runtime.block_on(async move { h.data(channel, data).await });
                 }
             }
         }
@@ -849,9 +857,8 @@ fn spawn_pipe_exec(
                 Ok(n) => {
                     let data = CryptoVec::from_slice(&buf[..n]);
                     let h = stderr_handle.clone();
-                    drop(stderr_runtime.spawn(async move {
-                        let _ = h.extended_data(channel, 1, data).await;
-                    }));
+                    let _ = stderr_runtime
+                        .block_on(async move { h.extended_data(channel, 1, data).await });
                 }
             }
         }
