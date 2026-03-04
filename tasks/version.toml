@@ -6,6 +6,7 @@
 ["version"]
 description = "Print git-derived version"
 run = "uv run python tasks/scripts/release.py get-version"
+hide = true
 
 ["version:print"]
 description = "Print git-derived version"

@@ -22,6 +22,7 @@ echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 ```
 
 Project requirements:
+
 - Rust 1.88+
 - Python 3.12+
 - Docker (running)
@@ -41,9 +42,8 @@ mise run sandbox
 
 ## `ncl` Shortcut
 
-Inside this repository, `ncl` is a local shortcut script at `scripts/bin/ncl`.
+Inside this repository, `ncl` is a local shortcut script at `scripts/bin/ncl`. The script will
 
-It:
 1. Builds `navigator-cli` if needed.
 2. Runs the local debug CLI binary (`target/debug/nemoclaw`).
 
@@ -58,29 +58,29 @@ ncl sandbox create -- codex
 
 These are the primary `mise` tasks for day-to-day development:
 
-| Task | Purpose |
-|---|---|
-| `mise run cluster` | Bootstrap or incremental deploy |
-| `mise run sandbox` | Create a sandbox on the running cluster |
-| `mise run test` | Default test suite |
-| `mise run e2e` | Default end-to-end test lane |
-| `mise run ci` | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run clean` | Clean build artifacts |
+| Task               | Purpose                                                 |
+| ------------------ | ------------------------------------------------------- |
+| `mise run cluster` | Bootstrap or incremental deploy                         |
+| `mise run sandbox` | Create a sandbox on the running cluster                 |
+| `mise run test`    | Default test suite                                      |
+| `mise run e2e`     | Default end-to-end test lane                            |
+| `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
+| `mise run clean`   | Clean build artifacts                                   |
 
 ## Project Structure
 
-| Path | Purpose |
-|---|---|
-| `crates/navigator-core/` | Shared core library |
-| `crates/navigator-server/` | Gateway/control plane server |
-| `crates/navigator-sandbox/` | Sandbox runtime |
-| `crates/navigator-bootstrap/` | Cluster bootstrap logic |
-| `crates/navigator-cli/` | CLI implementation |
-| `python/` | Python SDK/bindings |
-| `proto/` | Protocol buffer definitions |
-| `tasks/` | `mise` tasks and build scripts |
-| `deploy/` | Dockerfiles, Helm chart, Kubernetes manifests |
-| `architecture/` | Architecture docs and plans |
+| Path                          | Purpose                                       |
+| ----------------------------- | --------------------------------------------- |
+| `crates/navigator-core/`      | Shared core library                           |
+| `crates/navigator-server/`    | Gateway/control plane server                  |
+| `crates/navigator-sandbox/`   | Sandbox runtime                               |
+| `crates/navigator-bootstrap/` | Cluster bootstrap logic                       |
+| `crates/navigator-cli/`       | CLI implementation                            |
+| `python/`                     | Python SDK/bindings                           |
+| `proto/`                      | Protocol buffer definitions                   |
+| `tasks/`                      | `mise` tasks and build scripts                |
+| `deploy/`                     | Dockerfiles, Helm chart, Kubernetes manifests |
+| `architecture/`               | Architecture docs and plans                   |
 
 ## Pull Requests
 
