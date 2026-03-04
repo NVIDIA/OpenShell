@@ -1,3 +1,4 @@
+# Test: verify DCO Assistant workflow fires correctly
 name: "DCO Assistant"
 on:
   issue_comment:
