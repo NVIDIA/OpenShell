@@ -3,7 +3,7 @@
 
 //! NemoClaw CLI - command-line interface for NemoClaw.
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
@@ -390,7 +390,7 @@ enum ClusterAdminCommands {
         remote: Option<String>,
 
         /// Path to SSH private key for remote deployment.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
 
         /// Host port to map to the gateway (default: 8080).
@@ -425,7 +425,7 @@ enum ClusterAdminCommands {
         remote: Option<String>,
 
         /// Path to SSH private key for remote cluster.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
     },
 
@@ -440,7 +440,7 @@ enum ClusterAdminCommands {
         remote: Option<String>,
 
         /// Path to SSH private key for remote cluster.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
     },
 
@@ -462,7 +462,7 @@ enum ClusterAdminCommands {
         remote: Option<String>,
 
         /// Path to SSH private key.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
 
         /// Only print the SSH command instead of running it.
@@ -499,7 +499,7 @@ enum SandboxCommands {
         remote: Option<String>,
 
         /// Path to SSH private key for remote bootstrap.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
 
         /// Provider names to attach to this sandbox.
@@ -508,7 +508,7 @@ enum SandboxCommands {
 
         /// Path to a custom sandbox policy YAML file.
         /// Overrides the built-in default and the `NEMOCLAW_SANDBOX_POLICY` env var.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
         /// Forward a local port to the sandbox after the command finishes.
@@ -574,7 +574,7 @@ enum SandboxCommands {
         name: String,
 
         /// Push local files up to the sandbox.
-        #[arg(long, conflicts_with = "down", value_name = "LOCAL_PATH")]
+        #[arg(long, conflicts_with = "down", value_name = "LOCAL_PATH", value_hint = ValueHint::AnyPath)]
         up: Option<String>,
 
         /// Pull sandbox files down to the local machine.
@@ -644,7 +644,7 @@ enum PolicyCommands {
         name: String,
 
         /// Path to the policy YAML file.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,
 
         /// Wait for the sandbox to load the policy.
@@ -716,7 +716,7 @@ enum SandboxImageCommands {
     /// Build and push a container image into the cluster.
     Push {
         /// Path to the Dockerfile.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::FilePath)]
         dockerfile: PathBuf,
 
         /// Image name and tag (default: navigator/sandbox-custom:<timestamp>).
@@ -724,7 +724,7 @@ enum SandboxImageCommands {
         tag: Option<String>,
 
         /// Build context directory (default: Dockerfile parent directory).
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::DirPath)]
         context: Option<PathBuf>,
 
         /// Build argument in KEY=VALUE format (can be specified multiple times).
@@ -1371,5 +1371,95 @@ mod tests {
             names.contains(&"completions".to_string()),
             "expected 'completions' in candidates, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn completions_policy_flag_falls_back_to_file_paths() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::write(temp.path().join("policy.yaml"), "version: 1\n")
+            .expect("failed to create policy file");
+
+        let mut cmd = Cli::command();
+        let args: Vec<OsString> = vec![
+            "nemoclaw".into(),
+            "sandbox".into(),
+            "create".into(),
+            "--policy".into(),
+            "pol".into(),
+        ];
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 4, Some(temp.path()))
+            .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+
+        assert!(
+            names.contains(&"policy.yaml".to_string()),
+            "expected file path completion for --policy, got: {names:?}"
+        );
+    }
+
+    #[test]
+    fn completions_other_path_flags_fall_back_to_path_candidates() {
+        let temp = tempfile::tempdir().expect("failed to create tempdir");
+        std::fs::write(temp.path().join("id_rsa"), "key").expect("failed to create key file");
+        std::fs::write(temp.path().join("Dockerfile"), "FROM scratch\n")
+            .expect("failed to create dockerfile");
+        std::fs::create_dir(temp.path().join("ctx")).expect("failed to create context directory");
+
+        let cases: Vec<(Vec<&str>, usize, &str)> = vec![
+            (
+                vec!["nemoclaw", "cluster", "admin", "deploy", "--ssh-key", "id"],
+                5,
+                "id_rsa",
+            ),
+            (
+                vec!["nemoclaw", "sandbox", "create", "--ssh-key", "id"],
+                4,
+                "id_rsa",
+            ),
+            (
+                vec!["nemoclaw", "sandbox", "sync", "demo", "--up", "Do"],
+                5,
+                "Dockerfile",
+            ),
+            (
+                vec!["nemoclaw", "sandbox", "image", "push", "--dockerfile", "Do"],
+                5,
+                "Dockerfile",
+            ),
+            (
+                vec![
+                    "nemoclaw",
+                    "sandbox",
+                    "image",
+                    "push",
+                    "--dockerfile",
+                    "Dockerfile",
+                    "--context",
+                    "c",
+                ],
+                7,
+                "ctx/",
+            ),
+        ];
+
+        for (raw_args, index, expected) in cases {
+            let mut cmd = Cli::command();
+            let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
+            let candidates =
+                clap_complete::engine::complete(&mut cmd, args, index, Some(temp.path()))
+                    .expect("completion engine failed");
+            let names: Vec<String> = candidates
+                .iter()
+                .map(|c| c.get_value().to_string_lossy().into_owned())
+                .collect();
+
+            assert!(
+                names.contains(&expected.to_string()),
+                "expected path completion '{expected}' for args {raw_args:?}, got: {names:?}"
+            );
+        }
     }
 }
