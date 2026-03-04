@@ -63,7 +63,7 @@
 - Helm chart deploys a StatefulSet (NOT Deployment), PVC 1Gi at /var/navigator
 - Cluster image does NOT bundle image tarballs -- components pulled at runtime from distribution registry
 - PKI job generates CA + server cert + client cert for mTLS (RSA 2048, 10yr, Helm pre-install hook)
-- Build tasks in `build/*.toml`; scripts in `build/scripts/`
+- Build tasks in `tasks/*.toml`; scripts in `tasks/scripts/`
 - `cluster-deploy-fast.sh` supports both auto mode (git diff) and explicit targets (server/sandbox/pki-job/chart/all)
 - `cluster-bootstrap.sh` ensures local Docker registry on port 5000, pushes all components, then deploys
 - Default values.yaml: repository is CloudFront-backed CDN, tag: "latest", pullPolicy: Always

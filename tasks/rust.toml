@@ -6,26 +6,37 @@
 [build]
 description = "Build all Rust crates"
 run = "cargo build --workspace"
+hide = true
 
 ["build:release"]
 description = "Build all Rust crates in release mode"
 run = "cargo build --workspace --release"
+hide = true
 
 [check]
+description = "Run fast compile and type checks"
+depends = ["rust:check", "python:typecheck"]
+hide = true
+
+["rust:check"]
 description = "Check all Rust crates for errors"
 run = "cargo check --workspace"
+hide = true
 
 ["rust:lint"]
 description = "Lint Rust code with Clippy"
 run = "cargo clippy --workspace --all-targets"
+hide = true
 
 ["rust:format"]
 description = "Format Rust code"
 run = "cargo fmt --all"
+hide = true
 
 ["rust:format:check"]
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
+hide = true
 
 [clean]
 description = "Clean build artifacts"

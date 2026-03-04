@@ -6,3 +6,4 @@
 ["helm:lint"]
 description = "Lint the nemoclaw helm chart"
 run = "helm lint deploy/helm/navigator"
+hide = true

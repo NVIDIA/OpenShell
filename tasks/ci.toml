@@ -1,0 +1,45 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# CI and quality tasks
+
+[fmt]
+description = "Format Rust and Python code"
+depends = ["rust:format", "python:format"]
+hide = true
+
+[lint]
+description = "Run repository lint checks"
+depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint"]
+hide = true
+
+[ci]
+description = "Run full checks (lint, compile/type checks, and tests)"
+depends = ["lint", "check", "test"]
+
+[all]
+description = "Alias for ci"
+depends = ["ci"]
+hide = true
+
+["pre-commit"]
+description = "Alias for ci"
+depends = ["ci"]
+hide = true
+
+[sandbox]
+description = "Create a sandbox on the running cluster"
+raw = true
+usage = """
+arg "[command]" var=#true help="Command to run in the sandbox (default: interactive agent)"
+"""
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
+CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
+  mise run cluster
+fi
+ncl sandbox create -- ${usage_command:-claude}
+"""

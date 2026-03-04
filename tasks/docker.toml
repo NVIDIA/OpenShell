@@ -10,32 +10,40 @@ depends = [
   "docker:build:server",
   "docker:build:cluster",
 ]
+hide = true
 
 ["docker:build:ci"]
 description = "Build the CI Docker image"
-run = "build/scripts/docker-build-component.sh ci"
+run = "tasks/scripts/docker-build-component.sh ci"
+hide = true
 
 ["docker:build:sandbox"]
 description = "Build the sandbox Docker image (base variant)"
-run = "build/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}"
+run = "tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}"
+hide = true
 
 ["docker:build:sandbox:nvidia"]
 description = "Build the NVIDIA GPU sandbox Docker image"
 depends = ["docker:build:sandbox"]
-run = "build/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=navigator/sandbox:${IMAGE_TAG:-dev}"
+run = "tasks/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=navigator/sandbox:${IMAGE_TAG:-dev}"
+hide = true
 
 ["docker:build:server"]
 description = "Build the server Docker image"
-run = "build/scripts/docker-build-component.sh server"
+run = "tasks/scripts/docker-build-component.sh server"
+hide = true
 
 ["docker:build:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
-run = "build/scripts/docker-build-cluster.sh"
+run = "tasks/scripts/docker-build-cluster.sh"
+hide = true
 
 ["docker:build:cluster:multiarch"]
 description = "Build multi-arch cluster image and push to a registry"
-run = "build/scripts/docker-publish-multiarch.sh --mode registry"
+run = "tasks/scripts/docker-publish-multiarch.sh --mode registry"
+hide = true
 
 ["docker:publish:cluster:multiarch"]
 description = "Build and publish multi-arch cluster image to ECR"
-run = "build/scripts/docker-publish-multiarch.sh --mode ecr"
+run = "tasks/scripts/docker-publish-multiarch.sh --mode ecr"
+hide = true

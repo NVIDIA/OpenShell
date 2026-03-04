@@ -120,14 +120,14 @@ jobs:
         id: version
         run: |
           set -euo pipefail
-          WHEEL_VERSION=$(uv run python build/scripts/release.py get-version --python)
+          WHEEL_VERSION=$(uv run python tasks/scripts/release.py get-version --python)
           echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Build Python wheels
         run: |
           set -euo pipefail
           WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
-          CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
           NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
           NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
           ls -la target/wheels/*.whl
@@ -216,4 +216,4 @@ jobs:
       run: |
         set -euo pipefail
         WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
-        uv run python build/scripts/release.py python-publish --version "$WHEEL_VERSION"
+        uv run python tasks/scripts/release.py python-publish --version "$WHEEL_VERSION"

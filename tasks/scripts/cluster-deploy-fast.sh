@@ -256,19 +256,19 @@ sandbox_pid=""
 
 if [[ "${build_server}" == "1" ]]; then
   if [[ "${build_sandbox}" == "1" ]]; then
-    build/scripts/docker-build-component.sh server &
+    tasks/scripts/docker-build-component.sh server &
     server_pid=$!
   else
-    build/scripts/docker-build-component.sh server
+    tasks/scripts/docker-build-component.sh server
   fi
 fi
 
 if [[ "${build_sandbox}" == "1" ]]; then
   if [[ -n "${server_pid}" ]]; then
-    build/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE} &
+    tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE} &
     sandbox_pid=$!
   else
-    build/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE}
+    tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE}
   fi
 fi
 

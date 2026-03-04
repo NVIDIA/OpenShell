@@ -1,43 +1,25 @@
+#!/usr/bin/env bash
+
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# CI, pre-commit, and sandbox runner tasks
+set -euo pipefail
 
-[lint]
-description = "Run all linters and format checks"
-depends = ["license:check", "rust:format:check", "rust:lint", "python:lint"]
-
-[all]
-description = "Build, lint, and test everything"
-depends = ["lint", "test"]
-
-["pre-commit"]
-description = "Pre-commit checks (format, lint, and tests)"
-depends = ["lint", "test:rust", "test:python"]
-
-[sandbox]
-description = "Run the sandbox container with an interactive shell"
-depends = ["docker:build:sandbox"]
-raw = true
-usage = """
-flag "-e --env <env>" var=#true help="Environment variables to pass into the sandbox"
-arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
-"""
-run = """
-#!/usr/bin/env bash
 TTY_FLAG=""
 if [ -t 0 ]; then
   TTY_FLAG="-it"
 fi
+
 CMD=(${usage_command:-/bin/bash})
 ENV_FLAGS=""
-for var in ${usage_env}; do
+for var in ${usage_env:-}; do
   if [ -n "${!var+x}" ]; then
     ENV_FLAGS="${ENV_FLAGS} -e ${var}=${!var}"
   else
     echo "Warning: ${var} is not set in your environment, skipping" >&2
   fi
 done
+
 docker run ${TTY_FLAG} \
   --cap-add=SYS_ADMIN \
   --cap-add=NET_ADMIN \
@@ -54,4 +36,3 @@ docker run ${TTY_FLAG} \
   -e NVIDIA_API_KEY="${NVIDIA_API_KEY:-}" \
   ${ENV_FLAGS} \
   navigator/sandbox:${IMAGE_TAG:-dev} -i -- ${CMD[@]}
-"""

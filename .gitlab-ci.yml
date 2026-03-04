@@ -43,7 +43,7 @@ cache:
   - key:
       files:
         - Cargo.lock
-        - build/rust.toml
+        - tasks/rust.toml
       prefix: "target-$CI_RUNNER_EXECUTABLE_ARCH"
     paths:
       - target/
@@ -58,9 +58,9 @@ cache:
         - Cargo.lock
         - crates/**/*
         - proto/**/*
-        - build/rust.toml
-        - build/test.toml
-        - build/ci.toml
+        - tasks/rust.toml
+        - tasks/test.toml
+        - tasks/ci.toml
         - mise.toml
         - .gitlab-ci.yml
     - when: never
@@ -73,9 +73,9 @@ cache:
         - python/**/*
         - scripts/**/*
         - proto/**/*
-        - build/python.toml
-        - build/test.toml
-        - build/ci.toml
+        - tasks/python.toml
+        - tasks/test.toml
+        - tasks/ci.toml
         - mise.toml
         - .gitlab-ci.yml
     - when: never
@@ -87,10 +87,10 @@ cache:
         - deploy/docker/**/*
         - deploy/helm/**/*
         - deploy/kube/**/*
-        - build/cluster.toml
-        - build/docker.toml
-        - build/test.toml
-        - build/scripts/**/*
+        - tasks/cluster.toml
+        - tasks/docker.toml
+        - tasks/test.toml
+        - tasks/scripts/**/*
         - crates/**/*
         - proto/**/*
         - mise.toml
@@ -119,7 +119,7 @@ build_ci_image:
     - changes:
         - deploy/docker/Dockerfile.ci
         - mise.toml
-        - build/**/*
+        - tasks/**/*
         - .gitlab-ci.yml
     - when: never
   script:
@@ -247,8 +247,8 @@ python_e2e_sandbox_test:
     - socat UNIX-LISTEN:/var/run/docker.sock,fork,reuseaddr TCP:docker:2375 &
     - sleep 1
     - mise run --no-prepare docker:build:cluster
-    - mise run --no-prepare cluster:build
-    - mise run --no-prepare test:e2e:sandbox
+    - mise run --no-prepare cluster:build:full
+    - mise run --no-prepare test:e2e
 
 # =============================================================================
 # Publish Jobs

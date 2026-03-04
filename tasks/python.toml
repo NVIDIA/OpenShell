@@ -7,11 +7,13 @@
 description = "Install Python package in development mode (builds CLI binary)"
 depends = ["python:proto"]
 run = "uv sync --group dev && uv pip install ."
+hide = true
 
 ["python:build"]
 description = "Build Python wheel with CLI binary (native)"
 depends = ["python:proto"]
 run = "uv run maturin build --release"
+hide = true
 
 ["python:build:multiarch"]
 description = "Build Python wheels for Linux amd64/arm64 with buildx"
@@ -39,7 +41,7 @@ sha256_16_stdin() {
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
 CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
 if [ -z "$CARGO_VERSION" ]; then
-  CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)
@@ -97,6 +99,7 @@ done
 
 ls -la target/wheels/*.whl
 """
+hide = true
 
 ["python:build:macos"]
 description = "Build Python wheel for macOS arm64"
@@ -125,6 +128,7 @@ fi
 
 ls -la target/wheels/*.whl
 """
+hide = true
 
 ["python:build:macos:docker"]
 description = "Build Python wheel for macOS arm64 from Docker"
@@ -152,7 +156,7 @@ sha256_16_stdin() {
 CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
 OSXCROSS_IMAGE_REF=${OSXCROSS_IMAGE:-crazymax/osxcross:latest}
 if [ -z "$CARGO_VERSION" ]; then
-  CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)
@@ -173,25 +177,35 @@ docker build \
 
 ls -la target/wheels/*macosx*arm64.whl
 """
+hide = true
 
 ["python:build:all"]
 description = "Build Python wheels for Linux and macOS"
 depends = ["python:build", "python:build:multiarch", "python:build:macos"]
+hide = true
 
 ["python:lint"]
 description = "Lint Python code with ruff"
 depends = ["python:proto"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run ruff check {{vars.python_paths}}"
+hide = true
 
 ["python:format"]
 description = "Format Python code with ruff"
 run = "uv run ruff format {{vars.python_paths}}"
+hide = true
+
+["python:format:check"]
+description = "Check Python formatting with ruff"
+run = "uv run ruff format --check {{vars.python_paths}}"
+hide = true
 
 ["python:typecheck"]
 description = "Type check Python code with ty"
 depends = ["python:proto"]
 run = "uv run ty check {{vars.python_paths}}"
+hide = true
 
 ["python:proto"]
 description = "Generate Python protobuf stubs from .proto files"
@@ -245,3 +259,4 @@ for path, rules in line_rewrites.items():
     file_path.write_text(text)
 PY
 """
+hide = true

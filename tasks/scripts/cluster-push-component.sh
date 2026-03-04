@@ -49,7 +49,7 @@ if [ -z "${resolved_source_image}" ]; then
   done
   echo "build it first with either:" >&2
   echo "  mise run docker:build:${component}" >&2
-  echo "  mise run cluster:build" >&2
+  echo "  mise run cluster" >&2
   exit 1
 fi
 

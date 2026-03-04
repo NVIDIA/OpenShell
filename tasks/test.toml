@@ -7,33 +7,48 @@
 description = "Run all tests (Rust + Python)"
 depends = ["test:rust", "test:python"]
 
+[e2e]
+description = "Run default end-to-end test lane"
+depends = ["test:e2e:sandbox"]
+
+["test:e2e"]
+description = "Alias for e2e"
+depends = ["e2e"]
+hide = true
+
 ["test:rust"]
 description = "Run Rust tests"
 run = "cargo test --workspace"
+hide = true
 
 ["test:python"]
 description = "Run Python tests"
 depends = ["python:proto"]
 env = { UV_NO_SYNC = "1" }
 run = "uv run pytest python/"
+hide = true
 
 ["test:e2e:sandbox"]
 description = "Run sandbox end-to-end tests"
-depends = ["python:proto", "cluster:deploy"]
+depends = ["python:proto", "cluster"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "uv run pytest -o python_files='test_*.py' e2e/python"
+hide = true
 
 ["test:e2e:port-forward"]
 description = "Run port-forward integration test"
-depends = ["cluster:deploy"]
+depends = ["cluster"]
 run = "bash e2e/bash/test_port_forward.sh"
+hide = true
 
 ["test:e2e:custom-image"]
 description = "Run custom image build and sandbox e2e test"
-depends = ["cluster:deploy"]
+depends = ["cluster"]
 run = "bash e2e/bash/test_sandbox_custom_image.sh"
+hide = true
 
 ["test:e2e:sync"]
 description = "Run sandbox file sync e2e test"
-depends = ["cluster:deploy"]
+depends = ["cluster"]
 run = "bash e2e/bash/test_sandbox_sync.sh"
+hide = true

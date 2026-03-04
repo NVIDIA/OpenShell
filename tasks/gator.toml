@@ -5,8 +5,10 @@
 
 [gator]
 description = "Launch the Gator TUI"
-run = "ncl gator"
+run = "nemoclaw gator"
+hide = true
 
 ["gator:dev"]
 description = "Launch the Gator TUI with hot-reload on file changes"
-run = "cargo watch -s 'ncl gator'"
+run = "cargo watch -s 'nemoclaw gator'"
+hide = true

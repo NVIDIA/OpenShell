@@ -209,7 +209,7 @@ VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
 if [ "${MODE}" = "fast" ]; then
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
-    ncl cluster admin destroy --name "${CLUSTER_NAME}"
+    nemoclaw cluster admin destroy --name "${CLUSTER_NAME}"
   fi
 fi
 
@@ -217,11 +217,26 @@ if [ "${SKIP_IMAGE_PUSH:-}" = "1" ]; then
   echo "Skipping image push (SKIP_IMAGE_PUSH=1; images already in registry)."
 elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
   for component in server sandbox; do
-    build/scripts/cluster-push-component.sh "${component}"
+    tasks/scripts/cluster-push-component.sh "${component}"
   done
 fi
 
-DEPLOY_CMD=(ncl cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
+# Build the cluster image so it contains the latest Helm chart, manifests,
+# and entrypoint from the working tree.  This ensures the k3s container
+# always starts with the correct chart version.
+if [ "${SKIP_CLUSTER_IMAGE_BUILD:-}" != "1" ]; then
+  tasks/scripts/docker-build-cluster.sh
+fi
+
+# In fast/build modes, use the locally-built cluster image rather than the
+# remote distribution registry image.  The local image is built by
+# `docker-build-cluster.sh` and contains the bundled Helm chart and
+# manifests from the current working tree.
+if [ -z "${NEMOCLAW_CLUSTER_IMAGE:-}" ]; then
+  export NEMOCLAW_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
+fi
+
+DEPLOY_CMD=(nemoclaw cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
 
 if [ -n "${GATEWAY_HOST:-}" ]; then
   DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")
@@ -248,6 +263,13 @@ else
 fi
 
 "${DEPLOY_CMD[@]}"
+
+# Clear the fast-deploy state file so the next incremental deploy
+# recalculates from scratch.  This prevents stale fingerprints from a
+# prior session from masking changes that the bootstrap has already baked
+# into the freshly pushed images.
+DEPLOY_FAST_STATE_FILE=${DEPLOY_FAST_STATE_FILE:-.cache/cluster-deploy-fast.state}
+rm -f "${DEPLOY_FAST_STATE_FILE}"
 
 echo ""
 echo "Cluster '${CLUSTER_NAME}' is ready."

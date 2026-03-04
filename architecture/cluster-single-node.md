@@ -39,18 +39,18 @@ Out of scope:
 
 ## CLI Commands
 
-All cluster lifecycle commands live under `ncl cluster admin`:
+All cluster lifecycle commands live under `nemoclaw cluster admin`:
 
 | Command | Description |
 |---|---|
-| `ncl cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
-| `ncl cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `ncl cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
-| `ncl cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
-| `ncl cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
-| `ncl cluster status` | Show gateway health via gRPC/HTTP |
-| `ncl cluster use <name>` | Set the active cluster |
-| `ncl cluster list` | List all clusters with metadata |
+| `nemoclaw cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
+| `nemoclaw cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
+| `nemoclaw cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
+| `nemoclaw cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
+| `nemoclaw cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
+| `nemoclaw cluster status` | Show gateway health via gRPC/HTTP |
+| `nemoclaw cluster use <name>` | Set the active cluster |
+| `nemoclaw cluster list` | List all clusters with metadata |
 
 The `--name` flag defaults to `"nemoclaw"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--cluster` flag, then `NEMOCLAW_CLUSTER` env, then `~/.config/nemoclaw/active_cluster` file.
 
@@ -60,12 +60,11 @@ Development task entrypoints split bootstrap behavior:
 
 | Task | Behavior |
 |---|---|
-| `mise run cluster` | Fast recreate path: destroys existing local cluster resources for `CLUSTER_NAME` (if present), removes conflicting local NemoClaw clusters that occupy host port `6443`, pushes prebuilt local component images to the local registry, and deploys using local-registry image refs (`127.0.0.1:5000/navigator/*`) |
-| `mise run cluster:build` | Full build path: builds cluster/server/sandbox images, pushes components, then deploys (preferred in CI) |
-| `mise run cluster:deploy` | Iterative deploy path: detects changed files and rebuilds/pushes only impacted components |
+| `mise run cluster` | Bootstrap or incremental deploy: creates cluster if needed (fast recreate), then detects changed files and rebuilds/pushes only impacted components |
+| `mise run cluster:build:full` | Full build path: builds cluster/server/sandbox images, pushes components, then deploys (preferred in CI) |
 
 For `mise run cluster`, `.env` acts as local source-of-truth for `CLUSTER_NAME`, `GATEWAY_PORT`, and `NEMOCLAW_CLUSTER`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
-Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so `cluster` and `cluster:deploy` can push/pull local component images consistently.
+Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so the cluster task can push/pull local component images consistently.
 
 ## Bootstrap Sequence Diagram
 
@@ -77,7 +76,7 @@ sequenceDiagram
   participant L as Local Docker daemon
   participant R as Remote Docker daemon (SSH)
 
-  U->>C: ncl cluster admin deploy --remote user@host
+  U->>C: nemoclaw cluster admin deploy --remote user@host
   C->>B: deploy_cluster(DeployOptions)
 
   B->>B: create_ssh_docker_client (ssh://, 600s timeout)
@@ -329,7 +328,7 @@ ssh -L 6443:127.0.0.1:6443 -N user@host
 CLI helper:
 
 ```bash
-ncl cluster admin tunnel --name <name>
+nemoclaw cluster admin tunnel --name <name>
 ```
 
 The `--remote` flag is optional; the CLI resolves the SSH destination from stored cluster metadata. Pass `--print-command` to print the SSH command without executing it.
@@ -379,7 +378,7 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 
 ## Auto-Bootstrap from `sandbox create`
 
-When `ncl sandbox create` cannot connect to a cluster (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
+When `nemoclaw sandbox create` cannot connect to a cluster (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
 
 1. `should_attempt_bootstrap()` in `crates/navigator-cli/src/bootstrap.rs` checks the error type. It returns `true` for connectivity errors and missing default TLS materials, but `false` for TLS handshake/auth errors.
 2. If running in a terminal, the user is prompted to confirm.
