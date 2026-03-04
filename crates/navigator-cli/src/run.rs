@@ -969,7 +969,7 @@ pub fn cluster_admin_tunnel(
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create_with_bootstrap(
     name: Option<&str>,
-    image: Option<&str>,
+    from: Option<&str>,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
@@ -988,10 +988,13 @@ pub async fn sandbox_create_with_bootstrap(
         ));
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+    // The bootstrap flow always creates a cluster named "nemoclaw".
+    let cluster_name = "nemoclaw";
     sandbox_create(
         &server,
         name,
-        image,
+        from,
+        cluster_name,
         sync,
         keep,
         remote,
@@ -1011,7 +1014,8 @@ pub async fn sandbox_create_with_bootstrap(
 pub async fn sandbox_create(
     server: &str,
     name: Option<&str>,
-    image: Option<&str>,
+    from: Option<&str>,
+    cluster_name: &str,
     sync: bool,
     keep: bool,
     remote: Option<&str>,
@@ -1042,6 +1046,25 @@ pub async fn sandbox_create(
         }
     };
 
+    // Resolve the --from flag into a container image reference, building from
+    // a Dockerfile first if necessary.
+    let image: Option<String> = match from {
+        Some(val) => {
+            let resolved = resolve_from(val)?;
+            match resolved {
+                ResolvedSource::Image(img) => Some(img),
+                ResolvedSource::Dockerfile {
+                    dockerfile,
+                    context,
+                } => {
+                    let tag = build_from_dockerfile(&dockerfile, &context, cluster_name).await?;
+                    Some(tag)
+                }
+            }
+        }
+        None => None,
+    };
+
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers =
         ensure_required_providers(&mut client, providers, &inferred_types).await?;
@@ -1057,7 +1080,7 @@ pub async fn sandbox_create(
     }
 
     let template = image.map(|img| SandboxTemplate {
-        image: img.to_string(),
+        image: img,
         ..SandboxTemplate::default()
     });
 
@@ -1314,6 +1337,139 @@ pub async fn sandbox_create(
             "sandbox provisioning stream ended before reaching terminal phase"
         )),
     }
+}
+
+/// The default community sandbox registry prefix.
+///
+/// Bare sandbox names (e.g., `openclaw`) are expanded to
+/// `{prefix}/{name}:latest` using this value.  Override with the
+/// `NEMOCLAW_COMMUNITY_REGISTRY` environment variable.
+const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/nemoclaw-community/sandboxes";
+
+/// Resolved source for the `--from` flag on `sandbox create`.
+enum ResolvedSource {
+    /// A ready-to-use container image reference.
+    Image(String),
+    /// A Dockerfile that must be built and pushed before creating the sandbox.
+    Dockerfile {
+        dockerfile: PathBuf,
+        context: PathBuf,
+    },
+}
+
+/// Classify the `--from` value into an image reference or a Dockerfile that
+/// needs building.
+///
+/// Resolution order:
+/// 1. Existing file whose name contains "Dockerfile" → build from file.
+/// 2. Existing directory that contains a `Dockerfile` → build from directory.
+/// 3. Value contains `/`, `:`, or `.` → treat as a full image reference.
+/// 4. Otherwise → community sandbox name, expanded via the registry prefix.
+fn resolve_from(value: &str) -> Result<ResolvedSource> {
+    let path = Path::new(value);
+
+    // 1. Existing file that looks like a Dockerfile.
+    if path.is_file() {
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy())
+            .unwrap_or_default();
+        let lower = name.to_lowercase();
+        if lower.contains("dockerfile") || lower.ends_with(".dockerfile") {
+            let dockerfile = path
+                .canonicalize()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+            let context = dockerfile
+                .parent()
+                .ok_or_else(|| miette::miette!("Dockerfile has no parent directory"))?
+                .to_path_buf();
+            return Ok(ResolvedSource::Dockerfile {
+                dockerfile,
+                context,
+            });
+        }
+    }
+
+    // 2. Existing directory containing a Dockerfile.
+    if path.is_dir() {
+        let candidate = path.join("Dockerfile");
+        if candidate.is_file() {
+            let context = path
+                .canonicalize()
+                .into_diagnostic()
+                .wrap_err_with(|| format!("failed to resolve path: {}", path.display()))?;
+            let dockerfile = context.join("Dockerfile");
+            return Ok(ResolvedSource::Dockerfile {
+                dockerfile,
+                context,
+            });
+        }
+        return Err(miette::miette!(
+            "No Dockerfile found in directory: {}",
+            path.display()
+        ));
+    }
+
+    // 3. Looks like a full image reference (contains / : or .).
+    if value.contains('/') || value.contains(':') || value.contains('.') {
+        return Ok(ResolvedSource::Image(value.to_string()));
+    }
+
+    // 4. Community sandbox name.
+    let prefix = std::env::var("NEMOCLAW_COMMUNITY_REGISTRY")
+        .unwrap_or_else(|_| DEFAULT_COMMUNITY_REGISTRY.to_string());
+    let prefix = prefix.trim_end_matches('/');
+    Ok(ResolvedSource::Image(format!("{prefix}/{value}:latest")))
+}
+
+/// Build a Dockerfile and push the resulting image into the cluster.
+///
+/// Returns the image tag that was built so the caller can use it for sandbox
+/// creation.
+async fn build_from_dockerfile(
+    dockerfile: &Path,
+    context: &Path,
+    cluster_name: &str,
+) -> Result<String> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let tag = format!("navigator/sandbox-from:{timestamp}");
+
+    eprintln!(
+        "Building image {} from {}",
+        tag.cyan(),
+        dockerfile.display()
+    );
+    eprintln!("  {} {}", "Context:".dimmed(), context.display());
+    eprintln!("  {} {}", "Cluster:".dimmed(), cluster_name);
+    eprintln!();
+
+    let mut on_log = |msg: String| {
+        eprintln!("  {msg}");
+    };
+
+    navigator_bootstrap::build::build_and_push_image(
+        dockerfile,
+        &tag,
+        context,
+        cluster_name,
+        &HashMap::new(),
+        &mut on_log,
+    )
+    .await?;
+
+    eprintln!();
+    eprintln!(
+        "{} Image {} is available in the cluster.",
+        "✓".green().bold(),
+        tag.cyan(),
+    );
+    eprintln!();
+
+    Ok(tag)
 }
 
 /// Load sandbox policy YAML.
@@ -1674,7 +1830,7 @@ pub async fn sandbox_image_push(
     eprintln!();
     eprintln!(
         "Use it with: {}",
-        format!("ncl sandbox create --image {tag}").dimmed()
+        format!("ncl sandbox create --from {tag}").dimmed()
     );
 
     Ok(())

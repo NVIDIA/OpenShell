@@ -29,7 +29,7 @@ nemoclaw sandbox image push \
 ### 2. Create a sandbox with port forwarding
 
 ```bash
-nemoclaw sandbox create --image byoc-demo:latest --forward 8080 -- python /sandbox/app.py
+ncl sandbox create --from byoc-demo:latest --forward 8080 -- python /sandbox/app.py
 ```
 
 The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
@@ -72,7 +72,7 @@ TODO(#70): Remove the sandbox user note once custom images are secure by default
 
 NemoClaw handles all the wiring automatically.  You build a standard
 Linux container image — no NemoClaw-specific dependencies or
-configuration required.  When you create a sandbox with `--image`,
+configuration required.  When you create a sandbox with `--from`,
 NemoClaw ensures that sandboxing (network policy, filesystem isolation,
 SSH access) works the same as with the default image.
 

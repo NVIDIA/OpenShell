@@ -7,8 +7,8 @@
 # with it.
 #
 # Verifies the full flow:
-#   1. nemoclaw sandbox image push --dockerfile <path>  (build + import into cluster)
-#   2. nemoclaw sandbox create --image <tag> -- <cmd>   (run sandbox with custom image)
+#   1. ncl sandbox image push --dockerfile <path>  (build + import into cluster)
+#   2. ncl sandbox create --from <tag> -- <cmd>    (run sandbox with custom image)
 #
 # Prerequisites:
 #   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
@@ -120,7 +120,7 @@ info "Creating sandbox with custom image: ${IMAGE_TAG}"
 
 CREATE_LOG=$(mktemp)
 if ! "${NAV}" sandbox create \
-    --image "${IMAGE_TAG}" \
+    --from "${IMAGE_TAG}" \
     -- cat /opt/marker.txt \
     > "${CREATE_LOG}" 2>&1; then
   error "Sandbox create failed"

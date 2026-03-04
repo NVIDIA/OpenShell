@@ -479,10 +479,18 @@ enum SandboxCommands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Container image for the sandbox workload.
-        /// The sandbox supervisor is side-loaded via an init container.
+        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// to a Dockerfile or directory containing one, or a full container
+        /// image reference (e.g., `myregistry.com/img:tag`).
+        ///
+        /// Community names are resolved to
+        /// `ghcr.io/nvidia/nemoclaw-community/sandboxes/<name>:latest`
+        /// (override the prefix with `NEMOCLAW_COMMUNITY_REGISTRY`).
+        ///
+        /// When given a Dockerfile or directory, the image is built and pushed
+        /// into the cluster automatically before creating the sandbox.
         #[arg(long)]
-        image: Option<String>,
+        from: Option<String>,
 
         /// Sync local files into the sandbox before running.
         #[arg(long)]
@@ -921,7 +929,7 @@ async fn main() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
-                    image,
+                    from,
                     sync,
                     keep,
                     remote,
@@ -960,7 +968,8 @@ async fn main() -> Result<()> {
                             run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
-                                image.as_deref(),
+                                from.as_deref(),
+                                &ctx.name,
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -978,7 +987,7 @@ async fn main() -> Result<()> {
                             // No cluster configured — go straight to bootstrap.
                             run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
-                                image.as_deref(),
+                                from.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
