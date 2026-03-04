@@ -25,6 +25,7 @@ flag "-e --env <env>" var=#true help="Environment variables to pass into the san
 arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
 """
 run = "bash tasks/scripts/run-sandbox.sh"
+hide = true
 
 ["cluster:deploy"]
 description = "Alias for cluster (incremental deploy)"
