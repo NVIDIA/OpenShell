@@ -734,16 +734,16 @@ async fn load_policy(
                 // gateway so it becomes the authoritative baseline.
                 info!("Server returned no policy; attempting local discovery");
                 let discovered = discover_policy_from_disk_or_default();
-                sync_discovered_policy(endpoint, sandbox_name.as_deref(), &discovered).await?;
+                let name = sandbox_name.as_deref().ok_or_else(|| {
+                    miette::miette!(
+                        "Cannot sync discovered policy: sandbox name not available.\n\
+                         Set NEMOCLAW_SANDBOX_NAME or --sandbox-name to enable policy sync."
+                    )
+                })?;
 
-                // Re-fetch from gateway so we get the canonical version/hash.
-                grpc_client::fetch_policy(endpoint, id)
-                    .await?
-                    .ok_or_else(|| {
-                        miette::miette!(
-                            "Server still returned no policy after sync — this is a bug"
-                        )
-                    })?
+                // Sync and re-fetch over a single connection to avoid extra
+                // TLS handshakes.
+                grpc_client::discover_and_sync_policy(endpoint, id, name, &discovered).await?
             }
         };
 
@@ -814,21 +814,6 @@ fn discover_policy_from_path(path: &std::path::Path) -> navigator_core::proto::S
             restrictive_default_policy()
         }
     }
-}
-
-/// Sync a locally-discovered policy to the gateway server.
-async fn sync_discovered_policy(
-    endpoint: &str,
-    sandbox_name: Option<&str>,
-    policy: &navigator_core::proto::SandboxPolicy,
-) -> Result<()> {
-    let name = sandbox_name.ok_or_else(|| {
-        miette::miette!(
-            "Cannot sync discovered policy: sandbox name not available.\n\
-             Set NEMOCLAW_SANDBOX_NAME or --sandbox-name to enable policy sync."
-        )
-    })?;
-    grpc_client::sync_policy(endpoint, name, policy).await
 }
 
 /// Prepare filesystem for the sandboxed process.

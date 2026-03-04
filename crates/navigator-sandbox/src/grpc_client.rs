@@ -85,6 +85,14 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
 
     debug!("Connected, fetching sandbox policy");
 
+    fetch_policy_with_client(&mut client, sandbox_id).await
+}
+
+/// Fetch sandbox policy using an existing client connection.
+async fn fetch_policy_with_client(
+    client: &mut NavigatorClient<Channel>,
+    sandbox_id: &str,
+) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
         .get_sandbox_policy(GetSandboxPolicyRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -104,23 +112,12 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<Pro
     })?))
 }
 
-/// Sync a locally-discovered policy to the NemoClaw server.
-///
-/// Used when the sandbox discovers a policy from disk or falls back to the
-/// restrictive default. The server will store this as the baseline policy.
-pub async fn sync_policy(
-    endpoint: &str,
+/// Sync a locally-discovered policy using an existing client connection.
+async fn sync_policy_with_client(
+    client: &mut NavigatorClient<Channel>,
     sandbox_name: &str,
     policy: &ProtoSandboxPolicy,
 ) -> Result<()> {
-    debug!(
-        endpoint = %endpoint,
-        sandbox_name = %sandbox_name,
-        "Syncing locally-discovered policy to server"
-    );
-
-    let mut client = connect(endpoint).await?;
-
     client
         .update_sandbox_policy(UpdateSandboxPolicyRequest {
             name: sandbox_name.to_string(),
@@ -131,6 +128,36 @@ pub async fn sync_policy(
         .wrap_err("failed to sync policy to server")?;
 
     Ok(())
+}
+
+/// Discover and sync policy using a single gRPC connection.
+///
+/// Performs the full discovery flow (fetch → sync → re-fetch) over one TLS
+/// channel instead of establishing three separate connections.
+pub async fn discover_and_sync_policy(
+    endpoint: &str,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    discovered_policy: &ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy> {
+    debug!(
+        endpoint = %endpoint,
+        sandbox_id = %sandbox_id,
+        sandbox_name = %sandbox_name,
+        "Syncing discovered policy and re-fetching canonical version"
+    );
+
+    let mut client = connect(endpoint).await?;
+
+    // Sync the discovered policy to the gateway.
+    sync_policy_with_client(&mut client, sandbox_name, discovered_policy).await?;
+
+    // Re-fetch from the gateway to get the canonical version/hash.
+    fetch_policy_with_client(&mut client, sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            miette::miette!("Server still returned no policy after sync — this is a bug")
+        })
 }
 
 /// Fetch provider environment variables for a sandbox from NemoClaw server via gRPC.
