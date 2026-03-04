@@ -3,8 +3,7 @@
 
 # Example: a minimal Python REST API that runs inside a NemoClaw sandbox.
 # The image exposes port 8080 with a /hello endpoint.  Use port forwarding
-# (--forward 8080 on the CLI, or the Ports field in Gator) to reach it from
-# your local machine.
+# (--forward 8080 on the CLI) to reach it from your local machine.
 
 FROM python:3.12-slim
 
@@ -22,6 +21,6 @@ COPY app.py .
 
 EXPOSE 8080
 
-# The image's own entrypoint starts the REST API.  When creating a sandbox
-# leave the Command field empty (or omit -- on the CLI) so this runs.
+# NOTE: The sandbox supervisor replaces CMD at runtime.  Pass the start
+# command explicitly:  nemoclaw sandbox create ... -- python /sandbox/app.py
 CMD ["python", "app.py"]
