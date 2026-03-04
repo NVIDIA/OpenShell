@@ -33,10 +33,7 @@ Project requirements:
 # One-time trust
 mise trust
 
-# Bootstrap or incremental deploy
-mise run cluster
-
-# Launch a sandbox
+# Launch a sandbox (deploys a cluster if one isn't running)
 mise run sandbox
 ```
 

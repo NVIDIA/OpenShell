@@ -29,6 +29,7 @@ hide = true
 
 [sandbox]
 description = "Create a sandbox on the running cluster"
+depends = ["cluster"]
 raw = true
 usage = """
 arg "[command]" var=#true help="Command to run in the sandbox (default: interactive agent)"
