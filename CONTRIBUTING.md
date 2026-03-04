@@ -70,8 +70,18 @@ These are the primary `mise` tasks for day-to-day development:
 ## Project Structure
 
 ```
-crates/                  # Rust crates
-python/                  # Python SDK and bindings
+crates/
+  navigator-cli/         # CLI implementation
+  navigator-server/      # Gateway / control-plane server
+  navigator-sandbox/     # Sandbox runtime
+  navigator-bootstrap/   # Cluster bootstrap logic
+  navigator-core/        # Shared core library
+  navigator-policy/      # Policy engine
+  navigator-providers/   # Agent provider integrations
+  navigator-router/      # Inference routing
+  navigator-tui/         # Terminal UI (Gator)
+python/
+  navigator/             # Python SDK and sandbox helpers
 proto/                   # Protocol buffer definitions
 tasks/                   # mise task definitions and build scripts
 deploy/
