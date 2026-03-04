@@ -68,7 +68,7 @@ These are the primary `mise` tasks for day-to-day development:
 
 | Path | Purpose |
 |---|---|
-| `crates/` | Rust crates (CLI, server, sandbox, bootstrap, core, policy, providers, router, TUI) |
+| `crates/` | Rust crates |
 | `python/` | Python SDK and bindings |
 | `proto/` | Protocol buffer definitions |
 | `tasks/` | `mise` task definitions and build scripts |
