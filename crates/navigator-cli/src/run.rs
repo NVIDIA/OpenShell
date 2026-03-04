@@ -45,11 +45,11 @@ use tonic::{Code, transport::Channel};
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::print_ssh_config;
-pub use crate::ssh::{list_forwards, stop_forward, stop_forwards_for_sandbox};
 pub use crate::ssh::{
     sandbox_connect, sandbox_exec, sandbox_forward, sandbox_ssh_proxy, sandbox_ssh_proxy_by_name,
     sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
+pub use navigator_core::forward::{list_forwards, stop_forward, stop_forwards_for_sandbox};
 
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {

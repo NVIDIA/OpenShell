@@ -34,8 +34,9 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     #[allow(clippy::cast_possible_truncation)]
     let provider_rows = form.providers.len().clamp(1, 8) as u16;
-    let content_height = 3 + 3 + 3 + 1 + 1 + provider_rows + 1 + 1 + 1 + 1 + 1;
-    let modal_height = (content_height + 3).min(area.height.saturating_sub(2));
+    // chrome = borders (2) + vertical padding (2) = 4 rows
+    let content_height = 3 + 3 + 3 + 1 + 1 + provider_rows + 1 + 1 + 1 + 1 + 1 + 1 + 1;
+    let modal_height = (content_height + 4).min(area.height.saturating_sub(2));
     let popup_area = centered_rect(modal_width, modal_height, area);
 
     frame.render_widget(Clear, popup_area);
@@ -50,17 +51,19 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(block, popup_area);
 
     let constraints = [
-        Constraint::Length(3),             // Name
-        Constraint::Length(3),             // Image
-        Constraint::Length(3),             // Command
-        Constraint::Length(1),             // Spacer
-        Constraint::Length(1),             // Providers label
-        Constraint::Length(provider_rows), // Provider list
-        Constraint::Length(1),             // Spacer
-        Constraint::Length(1),             // Submit button
-        Constraint::Length(1),             // Status message
-        Constraint::Length(1),             // Spacer
-        Constraint::Length(1),             // Nav hint
+        Constraint::Length(3),             // [0]  Name
+        Constraint::Length(3),             // [1]  Image
+        Constraint::Length(3),             // [2]  Command
+        Constraint::Length(1),             // [3]  Spacer
+        Constraint::Length(1),             // [4]  Providers label
+        Constraint::Length(provider_rows), // [5]  Provider list
+        Constraint::Length(1),             // [6]  Spacer
+        Constraint::Length(1),             // [7]  Ports (single line: label + input)
+        Constraint::Length(1),             // [8]  Spacer
+        Constraint::Length(1),             // [9]  Submit button
+        Constraint::Length(1),             // [10] Status message
+        Constraint::Length(1),             // [11] Spacer
+        Constraint::Length(1),             // [12] Nav hint
         Constraint::Min(0),
     ];
 
@@ -94,7 +97,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame,
         "Command",
         &form.command,
-        "entrypoint to run in the sandbox",
+        "optional — runs /bin/bash if empty",
         form.focused_field == CreateFormField::Command,
         chunks[2],
     );
@@ -158,6 +161,34 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(Paragraph::new(lines), chunks[5]);
     }
 
+    // --- Ports (single-line: label + inline input) ---
+    let ports_focused = form.focused_field == CreateFormField::Ports;
+    let ports_label_style = if ports_focused {
+        styles::ACCENT_BOLD
+    } else {
+        styles::TEXT
+    };
+    let ports_display = if form.ports.is_empty() && !ports_focused {
+        Span::styled(" -", styles::MUTED)
+    } else if ports_focused {
+        Span::styled(format!(" {}█", form.ports), styles::ACCENT)
+    } else {
+        Span::styled(format!(" {}", form.ports), styles::TEXT)
+    };
+    let ports_hint = if ports_focused {
+        Span::styled("", styles::MUTED)
+    } else {
+        Span::styled("  (comma-separated, e.g. 8080,3000)", styles::MUTED)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("Ports:", ports_label_style),
+            ports_display,
+            ports_hint,
+        ])),
+        chunks[7],
+    );
+
     // --- Submit ---
     let submit_focused = form.focused_field == CreateFormField::Submit;
     let submit_style = if submit_focused {
@@ -172,7 +203,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(submit_label, submit_style))),
-        chunks[7],
+        chunks[9],
     );
 
     // --- Status ---
@@ -186,7 +217,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
-            chunks[8],
+            chunks[10],
         );
     }
 
@@ -201,7 +232,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled("[Esc]", styles::KEY_HINT),
         Span::styled(" Cancel", styles::MUTED),
     ]);
-    frame.render_widget(Paragraph::new(hint), chunks[10]);
+    frame.render_widget(Paragraph::new(hint), chunks[12]);
 }
 
 // ---------------------------------------------------------------------------

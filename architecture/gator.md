@@ -68,6 +68,8 @@ The Sandboxes view shows a table of all sandboxes in the cluster:
 | STATUS | Current phase, color-coded (see below) |
 | AGE | Time since creation (e.g., `45s`, `12m`, `3h 20m`, `2d 5h`) |
 | IMAGE | Container image the sandbox is running |
+| PROVIDERS | Provider names attached to the sandbox |
+| NOTES | General-purpose metadata (e.g., `fwd:8080,3000` for forwarded ports) |
 
 Status colors tell you the sandbox state at a glance:
 
@@ -124,11 +126,23 @@ Gator uses a dark terminal theme based on the NVIDIA brand palette:
 
 The title bar uses white text on an Everglade background to visually anchor the top of the screen.
 
+## Port Forwarding
+
+Gator supports creating sandboxes with port forwarding directly from the create modal. When creating a sandbox, you can specify ports to forward in the **Ports** field (comma-separated, e.g., `8080,3000`). After the sandbox reaches `Ready` state, Gator automatically spawns background SSH tunnels (`ssh -N -f -L <port>:127.0.0.1:<port>`) for each specified port.
+
+Forwarded ports are displayed in the **NOTES** column of the sandbox table as `fwd:8080,3000` and in the **Forwards** row of the sandbox detail view.
+
+Port forwarding lifecycle:
+- **On create**: Gator polls for sandbox readiness (up to 30 attempts at 2-second intervals), then spawns SSH tunnels.
+- **On delete**: Any active forwards for the sandbox are automatically stopped before deletion.
+- **PID tracking**: Forward PIDs are stored in `~/.config/nemoclaw/forwards/<name>-<port>.pid`, shared with the CLI.
+
+The forwarding implementation lives in `navigator-core::forward`, shared between the CLI and TUI.
+
 ## What is Not Yet Available
 
 Gator is in its initial phase. The following features are planned but not yet implemented:
 
-- **Sandbox operations** — creating, connecting to (SSH), deleting, and viewing logs for sandboxes.
 - **Inference and provider views** — browsing inference routes and provider configurations.
 - **Help overlay** — the `?` key is shown in the nav bar but does not open a help screen yet.
 - **Command bar autocomplete** — the command bar accepts text but does not offer suggestions.
@@ -140,4 +154,4 @@ See the [Gator design plan](plans/gator-tui.md) for the full roadmap, including 
 
 The TUI lives in `crates/navigator-tui/`, a separate workspace crate. The CLI crate (`crates/navigator-cli/`) depends on it and launches it via the `Gator` command variant in the `Commands` enum. This keeps TUI-specific dependencies (ratatui, crossterm) out of the CLI when not in use.
 
-The `navigator-tui` crate depends on `navigator-core` for protobuf types and the gRPC client — it communicates with the gateway over the same gRPC channel the CLI uses.
+The `navigator-tui` crate depends on `navigator-core` for protobuf types, the gRPC client, and shared utilities (e.g., `navigator_core::forward` for port forwarding PID management) — it communicates with the gateway over the same gRPC channel the CLI uses.

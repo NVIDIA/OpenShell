@@ -65,7 +65,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         Span::styled(providers_str, styles::TEXT),
     ]);
 
-    let mut lines = vec![Line::from(""), row1, row2, row3];
+    // Row 4: Forwarded Ports
+    let forwards_str = app
+        .sandbox_notes
+        .get(idx)
+        .filter(|s| !s.is_empty())
+        .map_or_else(|| "none".to_string(), Clone::clone);
+    let row4 = Line::from(vec![
+        Span::styled("  Forwards: ", styles::MUTED),
+        Span::styled(forwards_str, styles::TEXT),
+    ]);
+
+    let mut lines = vec![Line::from(""), row1, row2, row3, row4];
 
     // Delete confirmation in title area (same pattern as provider delete).
     if app.confirm_delete {

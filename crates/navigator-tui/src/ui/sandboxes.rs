@@ -16,6 +16,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Cell::from(Span::styled("CREATED", styles::MUTED)),
         Cell::from(Span::styled("AGE", styles::MUTED)),
         Cell::from(Span::styled("IMAGE", styles::MUTED)),
+        Cell::from(Span::styled("NOTES", styles::MUTED)),
     ])
     .bottom_margin(1);
 
@@ -26,6 +27,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             let created = app.sandbox_created.get(i).map_or("", String::as_str);
             let age = app.sandbox_ages.get(i).map_or("", String::as_str);
             let image = app.sandbox_images.get(i).map_or("", String::as_str);
+            let notes = app.sandbox_notes.get(i).map_or("", String::as_str);
 
             let phase_style = match phase {
                 "Ready" => styles::STATUS_OK,
@@ -53,16 +55,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                 Cell::from(Span::styled(created, styles::MUTED)),
                 Cell::from(Span::styled(age, styles::MUTED)),
                 Cell::from(Span::styled(image, styles::MUTED)),
+                Cell::from(Span::styled(notes, styles::MUTED)),
             ])
         })
         .collect();
 
     let widths = [
-        Constraint::Percentage(22),
-        Constraint::Percentage(12),
-        Constraint::Percentage(18),
+        Constraint::Percentage(20),
         Constraint::Percentage(10),
-        Constraint::Percentage(38),
+        Constraint::Percentage(15),
+        Constraint::Percentage(8),
+        Constraint::Percentage(27),
+        Constraint::Percentage(20),
     ];
 
     let border_style = if focused {

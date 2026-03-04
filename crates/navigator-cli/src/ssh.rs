@@ -5,13 +5,16 @@
 
 use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use navigator_core::forward::{
+    find_ssh_forward_pid, resolve_ssh_gateway, shell_escape, write_forward_pid,
+};
 use navigator_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
 use owo_colors::OwoColorize;
 use rustls::pki_types::ServerName;
 use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -85,40 +88,6 @@ async fn ssh_session_config(
         gateway_url,
         token: session.token,
     })
-}
-
-/// If the server-provided gateway host is a loopback address, use the host
-/// and port from the cluster endpoint instead so the CLI connects to the right
-/// machine. The server returns its internal bind address (e.g. 0.0.0.0:8080)
-/// which may not be reachable from outside — the cluster URL has the actual
-/// Docker-mapped or tunnel port.
-fn resolve_ssh_gateway(gateway_host: &str, gateway_port: u16, cluster_url: &str) -> (String, u16) {
-    let is_loopback = gateway_host == "127.0.0.1"
-        || gateway_host == "0.0.0.0"
-        || gateway_host == "localhost"
-        || gateway_host == "::1";
-
-    if !is_loopback {
-        return (gateway_host.to_string(), gateway_port);
-    }
-
-    // Extract host and port from the cluster URL. The cluster URL represents
-    // the externally reachable endpoint (e.g. Docker port-mapped address).
-    if let Ok(url) = url::Url::parse(cluster_url)
-        && let Some(host) = url.host_str()
-    {
-        let cluster_port = url.port().unwrap_or(gateway_port);
-        let cluster_is_loopback =
-            host == "127.0.0.1" || host == "0.0.0.0" || host == "localhost" || host == "::1";
-        if !cluster_is_loopback {
-            // Remote cluster: use the remote host but keep the cluster URL port.
-            return (host.to_string(), cluster_port);
-        }
-        // Local cluster: both loopback — use cluster URL's port (Docker-mapped).
-        return (gateway_host.to_string(), cluster_port);
-    }
-
-    (gateway_host.to_string(), gateway_port)
 }
 
 fn ssh_base_command(proxy_command: &str) -> Command {
@@ -227,208 +196,6 @@ pub async fn sandbox_forward(
     }
 
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Forward PID file management
-// ---------------------------------------------------------------------------
-
-/// Base directory for forward PID files.
-fn forward_pid_dir() -> Result<PathBuf> {
-    let base = if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(path)
-    } else {
-        let home = std::env::var("HOME")
-            .into_diagnostic()
-            .wrap_err("HOME is not set")?;
-        PathBuf::from(home).join(".config")
-    };
-    Ok(base.join("nemoclaw").join("forwards"))
-}
-
-/// PID file path for a specific sandbox + port forward.
-fn forward_pid_path(name: &str, port: u16) -> Result<PathBuf> {
-    Ok(forward_pid_dir()?.join(format!("{name}-{port}.pid")))
-}
-
-/// Write a PID file for a background forward.
-fn write_forward_pid(name: &str, port: u16, pid: u32, sandbox_id: &str) -> Result<()> {
-    let dir = forward_pid_dir()?;
-    std::fs::create_dir_all(&dir)
-        .into_diagnostic()
-        .wrap_err("failed to create forwards directory")?;
-    let path = forward_pid_path(name, port)?;
-    std::fs::write(&path, format!("{pid}\t{sandbox_id}"))
-        .into_diagnostic()
-        .wrap_err("failed to write forward PID file")?;
-    Ok(())
-}
-
-/// Find the PID of a backgrounded SSH forward by searching for the matching
-/// SSH process.  Falls back to `pgrep` since SSH `-f` forks a new process
-/// whose PID we cannot capture directly.
-fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
-    // Match the ProxyCommand argument which contains the sandbox ID, plus
-    // the -L port forwarding spec. The ProxyCommand (with --sandbox-id)
-    // appears before -L in the SSH command line.
-    let pattern = format!("ssh.*sandbox-id.*{sandbox_id}.*-L.*{port}:127.0.0.1:{port}");
-    let output = Command::new("pgrep")
-        .arg("-f")
-        .arg(&pattern)
-        .output()
-        .ok()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    // pgrep may return multiple PIDs (e.g., parent + child). Take the last
-    // one, which is typically the backgrounded SSH process.
-    stdout
-        .lines()
-        .rev()
-        .find_map(|l| l.trim().parse::<u32>().ok())
-}
-
-/// Read the PID from a forward PID file.  Returns `None` if the file does not
-/// exist or cannot be parsed.
-struct ForwardPidRecord {
-    pid: u32,
-    sandbox_id: Option<String>,
-}
-
-fn read_forward_pid(name: &str, port: u16) -> Option<ForwardPidRecord> {
-    let path = forward_pid_path(name, port).ok()?;
-    let contents = std::fs::read_to_string(path).ok()?;
-    let mut parts = contents.split_whitespace();
-    let pid = parts.next()?.parse().ok()?;
-    let sandbox_id = parts.next().map(str::to_string);
-    Some(ForwardPidRecord { pid, sandbox_id })
-}
-
-/// Check whether a process is alive.
-fn pid_is_alive(pid: u32) -> bool {
-    // `kill -0 <pid>` checks if we can signal the process without actually
-    // sending a signal.
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
-}
-
-fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> bool {
-    let output = match Command::new("ps")
-        .arg("-ww")
-        .arg("-o")
-        .arg("command=")
-        .arg("-p")
-        .arg(pid.to_string())
-        .output()
-    {
-        Ok(output) if output.status.success() => output,
-        _ => return false,
-    };
-
-    let cmd = String::from_utf8_lossy(&output.stdout);
-    let forward_spec = format!("{port}:127.0.0.1:{port}");
-    if !cmd.contains("ssh") || !cmd.contains("ssh-proxy") || !cmd.contains(&forward_spec) {
-        return false;
-    }
-
-    sandbox_id.is_none_or(|id| cmd.contains(id))
-}
-
-/// Stop a background port forward.
-pub fn stop_forward(name: &str, port: u16) -> Result<bool> {
-    let pid_path = forward_pid_path(name, port)?;
-    let Some(record) = read_forward_pid(name, port) else {
-        return Ok(false);
-    };
-    let pid = record.pid;
-
-    if pid_is_alive(pid) {
-        if !pid_matches_forward(pid, port, record.sandbox_id.as_deref()) {
-            let _ = std::fs::remove_file(&pid_path);
-            return Ok(false);
-        }
-        let _ = Command::new("kill")
-            .arg(pid.to_string())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        // Give the process a moment to exit.
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
-
-    let _ = std::fs::remove_file(&pid_path);
-    Ok(true)
-}
-
-/// Stop all forwards for a given sandbox name.
-pub fn stop_forwards_for_sandbox(name: &str) -> Result<Vec<u16>> {
-    let Ok(dir) = forward_pid_dir() else {
-        return Ok(Vec::new());
-    };
-    let prefix = format!("{name}-");
-    let mut stopped = Vec::new();
-
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy();
-        if let Some(rest) = file_name.strip_prefix(&prefix)
-            && let Some(port_str) = rest.strip_suffix(".pid")
-            && let Ok(port) = port_str.parse::<u16>()
-            && stop_forward(name, port)?
-        {
-            stopped.push(port);
-        }
-    }
-
-    Ok(stopped)
-}
-
-/// Information about a tracked forward.
-pub struct ForwardInfo {
-    pub sandbox: String,
-    pub port: u16,
-    pub pid: u32,
-    pub alive: bool,
-}
-
-/// List all tracked forwards.
-pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
-    let Ok(dir) = forward_pid_dir() else {
-        return Ok(Vec::new());
-    };
-
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Ok(Vec::new());
-    };
-
-    let mut forwards = Vec::new();
-    for entry in entries.flatten() {
-        let file_name = entry.file_name();
-        let file_name = file_name.to_string_lossy().to_string();
-        if let Some(stem) = file_name.strip_suffix(".pid")
-            // Parse "<sandbox>-<port>" — the port is the last segment after '-'.
-            && let Some(dash_pos) = stem.rfind('-')
-            && let Ok(port) = stem[dash_pos + 1..].parse::<u16>()
-            && let Some(record) = read_forward_pid(&stem[..dash_pos], port)
-        {
-            forwards.push(ForwardInfo {
-                sandbox: stem[..dash_pos].to_string(),
-                port,
-                pid: record.pid,
-                alive: pid_is_alive(record.pid),
-            });
-        }
-    }
-
-    forwards.sort_by(|a, b| a.sandbox.cmp(&b.sandbox).then(a.port.cmp(&b.port)));
-    Ok(forwards)
 }
 
 /// Execute a command in a sandbox via SSH.
@@ -705,22 +472,6 @@ pub async fn sandbox_sync_down(
     Ok(())
 }
 
-fn shell_escape(value: &str) -> String {
-    if value.is_empty() {
-        return "''".to_string();
-    }
-
-    let safe = value
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
-    if safe {
-        return value.to_string();
-    }
-
-    let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
-}
-
 /// Run the SSH proxy, connecting stdin/stdout to the gateway.
 pub async fn sandbox_ssh_proxy(
     gateway_url: &str,
@@ -888,50 +639,3 @@ async fn read_connect_status(stream: &mut dyn ProxyStream) -> Result<u16> {
 trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_ssh_gateway_keeps_non_loopback() {
-        let (host, port) = resolve_ssh_gateway("10.0.0.5", 8080, "https://spark.local");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 8080);
-    }
-
-    #[test]
-    fn resolve_ssh_gateway_overrides_loopback_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://spark.local");
-        assert_eq!(host, "spark.local");
-        assert_eq!(port, 8080);
-    }
-
-    #[test]
-    fn resolve_ssh_gateway_overrides_zeros_with_cluster_host() {
-        let (host, port) = resolve_ssh_gateway("0.0.0.0", 8080, "https://10.0.0.5:443");
-        assert_eq!(host, "10.0.0.5");
-        assert_eq!(port, 8080);
-    }
-
-    #[test]
-    fn resolve_ssh_gateway_overrides_localhost() {
-        let (host, port) = resolve_ssh_gateway("localhost", 8080, "https://remote-host:443");
-        assert_eq!(host, "remote-host");
-        assert_eq!(port, 8080);
-    }
-
-    #[test]
-    fn resolve_ssh_gateway_no_override_when_cluster_is_also_loopback() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "https://127.0.0.1:443");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
-    }
-
-    #[test]
-    fn resolve_ssh_gateway_handles_invalid_cluster_url() {
-        let (host, port) = resolve_ssh_gateway("127.0.0.1", 8080, "not-a-url");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(port, 8080);
-    }
-}
