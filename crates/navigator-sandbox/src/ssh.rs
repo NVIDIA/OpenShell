@@ -975,3 +975,103 @@ mod unsafe_pty {
 fn to_u16(value: u32) -> u16 {
     u16::try_from(value.min(u32::from(u16::MAX))).unwrap_or(u16::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Verify that dropping the input sender (the operation `channel_eof`
+    /// performs) causes the stdin writer loop to exit and close the child's
+    /// stdin pipe.  Without this, commands like `cat | tar xf -` used by
+    /// `sync --up` hang forever waiting for EOF on stdin.
+    #[test]
+    fn dropping_input_sender_closes_child_stdin() {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+
+        let mut child = Command::new("cat")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn cat");
+
+        let child_stdin = child.stdin.take().expect("stdin must be piped");
+
+        // Replicate the stdin writer loop from spawn_pipe_exec.
+        std::thread::spawn(move || {
+            let mut stdin = child_stdin;
+            while let Ok(bytes) = receiver.recv() {
+                if stdin.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = stdin.flush();
+            }
+        });
+
+        sender.send(b"hello".to_vec()).unwrap();
+
+        // Simulate what channel_eof does: drop the sender.
+        drop(sender);
+
+        // cat should see EOF on stdin and exit.  Use a timeout so the test
+        // fails fast instead of hanging if the mechanism is broken.
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(child.wait_with_output());
+        });
+        let output = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("cat hung for 5s — stdin was not closed (channel_eof bug)")
+            .expect("failed to wait for cat");
+
+        assert!(output.status.success(), "cat exited with {:?}", output.status);
+        assert_eq!(output.stdout, b"hello");
+    }
+
+    /// Verify that the stdin writer delivers all buffered data before exiting
+    /// when the sender is dropped.  This ensures channel_eof doesn't cause
+    /// data loss — only signals "no more data after this".
+    #[test]
+    fn stdin_writer_delivers_buffered_data_before_eof() {
+        let (sender, receiver) = mpsc::channel::<Vec<u8>>();
+
+        let mut child = Command::new("wc")
+            .arg("-c")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .expect("failed to spawn wc");
+
+        let child_stdin = child.stdin.take().expect("stdin must be piped");
+
+        std::thread::spawn(move || {
+            let mut stdin = child_stdin;
+            while let Ok(bytes) = receiver.recv() {
+                if stdin.write_all(&bytes).is_err() {
+                    break;
+                }
+                let _ = stdin.flush();
+            }
+        });
+
+        // Send multiple chunks, then drop the sender.
+        for _ in 0..100 {
+            sender.send(vec![0u8; 1024]).unwrap();
+        }
+        drop(sender);
+
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(child.wait_with_output());
+        });
+        let output = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("wc hung for 5s — stdin was not closed")
+            .expect("failed to wait for wc");
+
+        let count: usize = String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse()
+            .expect("wc output was not a number");
+        assert_eq!(count, 100 * 1024, "expected all 100 KiB delivered before EOF");
+    }
+}

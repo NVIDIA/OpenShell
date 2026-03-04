@@ -210,7 +210,58 @@ fi
 info "subdir/nested.txt verified"
 
 ###############################################################################
-# Step 4 — Sync up a single file and round-trip it.
+# Step 4 — Large-file round-trip to exercise multi-chunk SSH transport.
+#
+# The tar archive is streamed through the SSH channel in 4096-byte chunks.
+# Historically, a fire-and-forget tokio::spawn per chunk caused out-of-order
+# delivery that corrupted the tar stream.  A ~512 KiB file spans many chunks
+# and makes such ordering bugs much more likely to surface.
+###############################################################################
+
+info "Generating large test file (~512 KiB)"
+
+LARGE_DIR="${TMPDIR_ROOT}/large_upload"
+mkdir -p "${LARGE_DIR}"
+
+# Deterministic pseudo-random content so we can verify with a checksum.
+dd if=/dev/urandom bs=1024 count=512 2>/dev/null > "${LARGE_DIR}/large.bin"
+EXPECTED_HASH=$(shasum -a 256 "${LARGE_DIR}/large.bin" | awk '{print $1}')
+
+info "Syncing large file up to sandbox"
+if ! "${NAV}" sandbox sync "${SANDBOX_NAME}" --up "${LARGE_DIR}" /sandbox/large_test \
+    > /dev/null 2>&1; then
+  error "sync --up large file failed"
+  exit 1
+fi
+
+info "Syncing large file back down"
+LARGE_DOWN="${TMPDIR_ROOT}/large_download"
+mkdir -p "${LARGE_DOWN}"
+
+if ! "${NAV}" sandbox sync "${SANDBOX_NAME}" --down /sandbox/large_test "${LARGE_DOWN}" \
+    > /dev/null 2>&1; then
+  error "sync --down large file failed"
+  exit 1
+fi
+
+ACTUAL_HASH=$(shasum -a 256 "${LARGE_DOWN}/large.bin" | awk '{print $1}')
+if [[ "${EXPECTED_HASH}" != "${ACTUAL_HASH}" ]]; then
+  error "large.bin checksum mismatch after round-trip"
+  error "  expected: ${EXPECTED_HASH}"
+  error "  actual:   ${ACTUAL_HASH}"
+  exit 1
+fi
+
+ACTUAL_SIZE=$(wc -c < "${LARGE_DOWN}/large.bin" | tr -d ' ')
+if [[ "${ACTUAL_SIZE}" -ne 524288 ]]; then
+  error "large.bin size mismatch: expected 524288, got ${ACTUAL_SIZE}"
+  exit 1
+fi
+
+info "Large file round-trip verified (SHA-256 match, ${ACTUAL_SIZE} bytes)"
+
+###############################################################################
+# Step 5 — Sync up a single file and round-trip it.
 ###############################################################################
 
 info "Testing single-file sync"
