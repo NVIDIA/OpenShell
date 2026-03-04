@@ -11,8 +11,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
     GetSandboxInferenceBundleRequest, GetSandboxInferenceBundleResponse, GetSandboxPolicyRequest,
     GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, inference_client::InferenceClient,
-    navigator_client::NavigatorClient,
+    SandboxPolicy as ProtoSandboxPolicy, UpdateSandboxPolicyRequest,
+    inference_client::InferenceClient, navigator_client::NavigatorClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -74,7 +74,11 @@ async fn connect(endpoint: &str) -> Result<NavigatorClient<Channel>> {
 }
 
 /// Fetch sandbox policy from NemoClaw server via gRPC.
-pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<ProtoSandboxPolicy> {
+///
+/// Returns `Ok(Some(policy))` when the server has a policy configured,
+/// or `Ok(None)` when the sandbox was created without a policy (the sandbox
+/// should discover one from disk or use the restrictive default).
+pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to NemoClaw server");
 
     let mut client = connect(endpoint).await?;
@@ -88,10 +92,45 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<ProtoSandb
         .await
         .into_diagnostic()?;
 
-    response
-        .into_inner()
-        .policy
-        .ok_or_else(|| miette::miette!("Server returned empty policy"))
+    let inner = response.into_inner();
+
+    // version 0 with no policy means the sandbox was created without one.
+    if inner.version == 0 && inner.policy.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(inner.policy.ok_or_else(|| {
+        miette::miette!("Server returned non-zero version but empty policy")
+    })?))
+}
+
+/// Sync a locally-discovered policy to the NemoClaw server.
+///
+/// Used when the sandbox discovers a policy from disk or falls back to the
+/// restrictive default. The server will store this as the baseline policy.
+pub async fn sync_policy(
+    endpoint: &str,
+    sandbox_name: &str,
+    policy: &ProtoSandboxPolicy,
+) -> Result<()> {
+    debug!(
+        endpoint = %endpoint,
+        sandbox_name = %sandbox_name,
+        "Syncing locally-discovered policy to server"
+    );
+
+    let mut client = connect(endpoint).await?;
+
+    client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: sandbox_name.to_string(),
+            policy: Some(policy.clone()),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to sync policy to server")?;
+
+    Ok(())
 }
 
 /// Fetch provider environment variables for a sandbox from NemoClaw server via gRPC.
