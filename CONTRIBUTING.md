@@ -63,12 +63,9 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run cluster` | Bootstrap or incremental deploy |
 | `mise run sandbox` | Create a sandbox on the running cluster |
 | `mise run cluster:sandbox` | Run sandbox container interactively |
-| `mise run fmt` | Format Rust and Python |
-| `mise run lint` | Repository lint checks |
-| `mise run check` | Fast compile and type checks |
 | `mise run test` | Default test suite |
 | `mise run test:e2e` | Default end-to-end test lane |
-| `mise run ci` | Full local CI checks |
+| `mise run ci` | Full local CI checks (lint, compile/type checks, tests) |
 | `mise run clean` | Clean build artifacts |
 
 ## Project Structure

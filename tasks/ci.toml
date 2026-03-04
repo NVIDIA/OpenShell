@@ -6,10 +6,12 @@
 [fmt]
 description = "Format Rust and Python code"
 depends = ["rust:format", "python:format"]
+hide = true
 
 [lint]
 description = "Run repository lint checks"
 depends = ["license:check", "rust:format:check", "rust:lint", "python:format:check", "python:lint", "helm:lint"]
+hide = true
 
 [ci]
 description = "Run full checks (lint, compile/type checks, and tests)"

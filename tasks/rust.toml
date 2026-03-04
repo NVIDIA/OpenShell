@@ -16,6 +16,7 @@ hide = true
 [check]
 description = "Run fast compile and type checks"
 depends = ["rust:check", "python:typecheck"]
+hide = true
 
 ["rust:check"]
 description = "Check all Rust crates for errors"
