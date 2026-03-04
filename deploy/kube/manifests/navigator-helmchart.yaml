@@ -22,6 +22,7 @@ spec:
   targetNamespace: navigator
   createNamespace: true
   valuesContent: |-
+    chartChecksum: __CHART_CHECKSUM__
     image:
       repository: d1i0nduu2f6qxk.cloudfront.net/navigator/server
       tag: latest

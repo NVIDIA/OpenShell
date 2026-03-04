@@ -235,6 +235,17 @@ pub async fn sandbox_exec(
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
 
+    // For interactive TTY sessions, replace this process with SSH via exec()
+    // to avoid signal handling issues (e.g. Ctrl+C killing the parent ncl
+    // process and orphaning the SSH child).
+    if tty && std::io::stdin().is_terminal() {
+        #[cfg(unix)]
+        {
+            let err = ssh.exec();
+            return Err(miette::miette!("failed to exec ssh: {err}"));
+        }
+    }
+
     let status = tokio::task::spawn_blocking(move || ssh.status())
         .await
         .into_diagnostic()?

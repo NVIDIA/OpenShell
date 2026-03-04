@@ -127,6 +127,35 @@ else
     echo "Warning: REGISTRY_HOST not set; skipping registry config"
 fi
 
+# Copy bundled Helm chart tarballs to the k3s static charts directory.
+# These are stored in /opt/navigator/charts/ because the volume mount
+# on /var/lib/rancher/k3s overwrites any files baked into that path.
+# Without this, a persistent volume from a previous deploy would keep
+# serving stale chart tarballs.
+K3S_CHARTS="/var/lib/rancher/k3s/server/static/charts"
+BUNDLED_CHARTS="/opt/navigator/charts"
+CHART_CHECKSUM=""
+
+if [ -d "$BUNDLED_CHARTS" ]; then
+    echo "Copying bundled charts to k3s..."
+    for chart in "$BUNDLED_CHARTS"/*.tgz; do
+        [ ! -f "$chart" ] && continue
+        cp "$chart" "$K3S_CHARTS/"
+    done
+    # Compute a checksum of the navigator chart so we can inject it into the
+    # HelmChart manifest below. When the chart content changes between image
+    # versions the checksum changes, which modifies the HelmChart CR spec and
+    # forces the k3s Helm controller to re-install.
+    NAV_CHART="$BUNDLED_CHARTS/navigator-0.1.0.tgz"
+    if [ -f "$NAV_CHART" ]; then
+        if command -v sha256sum >/dev/null 2>&1; then
+            CHART_CHECKSUM=$(sha256sum "$NAV_CHART" | cut -d ' ' -f 1)
+        elif command -v shasum >/dev/null 2>&1; then
+            CHART_CHECKSUM=$(shasum -a 256 "$NAV_CHART" | cut -d ' ' -f 1)
+        fi
+    fi
+fi
+
 # Copy bundled manifests to k3s manifests directory.
 # These are stored in /opt/navigator/manifests/ because the volume mount
 # on /var/lib/rancher/k3s overwrites any files baked into that path.
@@ -237,6 +266,17 @@ if [ -f "$HELMCHART" ]; then
         # Clear the placeholder so the default (8080) is used
         sed -i "s|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g" "$HELMCHART"
     fi
+fi
+
+# Inject chart checksum into the HelmChart manifest so that a changed chart
+# tarball causes the HelmChart CR spec to differ, forcing the k3s Helm
+# controller to upgrade the release.
+if [ -n "$CHART_CHECKSUM" ] && [ -f "$HELMCHART" ]; then
+    echo "Injecting chart checksum: ${CHART_CHECKSUM}"
+    sed -i "s|__CHART_CHECKSUM__|${CHART_CHECKSUM}|g" "$HELMCHART"
+else
+    # Remove the placeholder line entirely so invalid YAML isn't left behind
+    sed -i '/__CHART_CHECKSUM__/d' "$HELMCHART"
 fi
 
 # Execute k3s with explicit resolv-conf.

@@ -1,22 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Rust build, check, lint, and format tasks
-
-[build]
-description = "Build all Rust crates"
-run = "cargo build --workspace"
-hide = true
-
-["build:release"]
-description = "Build all Rust crates in release mode"
-run = "cargo build --workspace --release"
-hide = true
-
-[check]
-description = "Run fast compile and type checks"
-depends = ["rust:check", "python:typecheck"]
-hide = true
+# Rust check, lint, and format tasks
 
 ["rust:check"]
 description = "Check all Rust crates for errors"
@@ -37,7 +22,3 @@ hide = true
 description = "Check Rust formatting"
 run = "cargo fmt --all -- --check"
 hide = true
-
-[clean]
-description = "Clean build artifacts"
-run = "cargo clean"

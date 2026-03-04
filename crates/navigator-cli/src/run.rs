@@ -143,12 +143,12 @@ impl LogDisplay {
     fn finish_phase(&mut self, phase: &str) {
         self.phase = phase.to_string();
         self.latest_log.clear();
-        self.spinner
-            .finish_with_message(format_phase_label(&self.phase));
-    }
-
-    fn shutdown(&self) {
-        self.spinner.disable_steady_tick();
+        // Print the final phase as a static line above the spinner, then
+        // clear the spinner itself.  This leaves the phase label visible
+        // in scrollback instead of erasing it with finish_and_clear().
+        let _ = self
+            .mp
+            .println(format!("  {}", format_phase_label(&self.phase)));
         self.spinner.finish_and_clear();
     }
 
@@ -1085,6 +1085,11 @@ pub async fn sandbox_create(
         println!("  {}", format_phase_label(phase_name(sandbox.phase)));
     }
 
+    // Don't use stop_on_terminal on the server — the Kubernetes CRD may
+    // briefly report a stale Ready status before the controller reconciles
+    // a newly created sandbox.  Instead we handle termination client-side:
+    // we wait until we have observed at least one non-Ready phase followed
+    // by Ready (a genuine Provisioning → Ready transition).
     let mut stream = client
         .watch_sandbox(WatchSandboxRequest {
             id: sandbox.id.clone(),
@@ -1093,10 +1098,8 @@ pub async fn sandbox_create(
             follow_events: true,
             log_tail_lines: 200,
             event_tail: 0,
-            stop_on_terminal: true,
+            stop_on_terminal: false,
             log_since_ms: 0,
-            // Only show gateway logs during provisioning — sandbox logs would
-            // keep the stream alive indefinitely and prevent stop_on_terminal.
             log_sources: vec!["gateway".to_string()],
             log_min_level: String::new(),
         })
@@ -1106,6 +1109,8 @@ pub async fn sandbox_create(
 
     let mut last_phase = sandbox.phase;
     let mut last_error_reason = String::new();
+    // Track whether we have seen a non-Ready phase during the watch.
+    let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
     let start_time = Instant::now();
     let provision_timeout = Duration::from_secs(120);
 
@@ -1125,10 +1130,16 @@ pub async fn sandbox_create(
         let evt = item.into_diagnostic()?;
         match evt.payload {
             Some(navigator_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
+                let phase = SandboxPhase::try_from(s.phase).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase;
+
+                if phase != SandboxPhase::Ready {
+                    saw_non_ready = true;
+                }
+
                 // Capture error reason from conditions only when phase is Error
                 // to avoid showing stale transient error reasons
-                if SandboxPhase::try_from(s.phase) == Ok(SandboxPhase::Error)
+                if phase == SandboxPhase::Error
                     && let Some(status) = &s.status
                 {
                     for condition in &status.conditions {
@@ -1144,6 +1155,12 @@ pub async fn sandbox_create(
                     d.set_phase(phase_name(s.phase));
                 } else {
                     println!("  {}", format_phase_label(phase_name(s.phase)));
+                }
+
+                // Only accept Ready as terminal after we've observed a
+                // non-Ready phase, proving the controller has reconciled.
+                if saw_non_ready && phase == SandboxPhase::Ready {
+                    break;
                 }
             }
             Some(navigator_core::proto::sandbox_stream_event::Payload::Log(line)) => {
@@ -1180,7 +1197,6 @@ pub async fn sandbox_create(
     // Finish up - check final phase
     if let Some(d) = display.as_mut() {
         d.finish_phase(phase_name(last_phase));
-        d.shutdown();
     }
     drop(display);
     let _ = std::io::stdout().flush();
@@ -1229,9 +1245,11 @@ pub async fn sandbox_create(
             }
 
             if command.is_empty() {
+                eprintln!("Connecting...");
                 return sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await;
             }
 
+            eprintln!("Connecting...");
             let exec_result = sandbox_exec(
                 &effective_server,
                 &sandbox_name,

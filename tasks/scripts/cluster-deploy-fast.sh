@@ -166,6 +166,26 @@ compute_fingerprint() {
   local path
   local digest
 
+  # Include the committed state of relevant source paths via git tree
+  # hashes.  This ensures that committed changes (e.g. after `git pull`
+  # or amend) are detected even when there are no uncommitted edits.
+  local committed_trees=""
+  case "${component}" in
+    server)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-router/ crates/navigator-server/ deploy/docker/Dockerfile.server 2>/dev/null || true)
+      ;;
+    sandbox)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-sandbox/ deploy/docker/sandbox/ deploy/docker/openclaw-start.sh python/ pyproject.toml uv.lock dev-sandbox-policy.rego 2>/dev/null || true)
+      ;;
+    helm)
+      committed_trees=$(git ls-tree HEAD deploy/helm/navigator/ 2>/dev/null || true)
+      ;;
+  esac
+  if [[ -n "${committed_trees}" ]]; then
+    payload+="${committed_trees}"$'\n'
+  fi
+
+  # Layer uncommitted changes on top so dirty files trigger a rebuild too.
   for path in "${changed_files[@]}"; do
     case "${component}" in
       server)

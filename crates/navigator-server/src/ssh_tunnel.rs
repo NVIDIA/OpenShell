@@ -11,6 +11,7 @@ use hyper_util::rt::TokioIo;
 use navigator_core::proto::{Sandbox, SandboxPhase, SshSession};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tracing::{info, warn};
@@ -127,10 +128,53 @@ async fn handle_tunnel(
     secret: &str,
     sandbox_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let mut upstream = match target {
-        ConnectTarget::Ip(addr) => TcpStream::connect(addr).await?,
-        ConnectTarget::Host(host, port) => TcpStream::connect((host.as_str(), port)).await?,
-    };
+    // The sandbox pod may not be network-reachable immediately after the CRD
+    // reports Ready (DNS propagation, pod IP assignment, SSH server startup).
+    // Retry the TCP connection with exponential backoff.
+    let mut upstream = None;
+    let mut last_err = None;
+    let delays = [
+        Duration::from_millis(100),
+        Duration::from_millis(250),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
+        Duration::from_secs(5),
+        Duration::from_secs(10),
+        Duration::from_secs(15),
+    ];
+    for (attempt, delay) in std::iter::once(&Duration::ZERO)
+        .chain(delays.iter())
+        .enumerate()
+    {
+        if !delay.is_zero() {
+            tokio::time::sleep(*delay).await;
+        }
+        let result = match &target {
+            ConnectTarget::Ip(addr) => TcpStream::connect(addr).await,
+            ConnectTarget::Host(host, port) => TcpStream::connect((host.as_str(), *port)).await,
+        };
+        match result {
+            Ok(stream) => {
+                if attempt > 0 {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        attempts = attempt + 1,
+                        "SSH tunnel connected after retry"
+                    );
+                }
+                upstream = Some(stream);
+                break;
+            }
+            Err(err) => {
+                last_err = Some(err);
+            }
+        }
+    }
+    let mut upstream = upstream.ok_or_else(|| {
+        let err = last_err.unwrap();
+        format!("failed to connect to sandbox after retries: {err}")
+    })?;
     upstream.set_nodelay(true)?;
     let preface = build_preface(token, secret)?;
     upstream.write_all(preface.as_bytes()).await?;
