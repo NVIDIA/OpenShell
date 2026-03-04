@@ -73,11 +73,24 @@ def inference_client(sandbox_client: SandboxClient) -> InferenceRouteClient:
 
 
 @pytest.fixture(scope="session")
+def _worker_suffix(worker_id: str) -> str:
+    """Return a suffix for worker-unique resource names.
+
+    Uses the built-in ``worker_id`` fixture from pytest-xdist which returns
+    ``"gw0"``, ``"gw1"``, etc. for workers, or ``"master"`` for non-xdist runs.
+    """
+    if worker_id == "master":
+        return ""
+    return f"-{worker_id}"
+
+
+@pytest.fixture(scope="session")
 def mock_inference_route(
     inference_client: InferenceRouteClient,
+    _worker_suffix: str,
 ) -> Iterator[str]:
-    name = "e2e-mock-local"
-    routing_hint = "e2e_mock_local"
+    name = f"e2e-mock-local{_worker_suffix}"
+    routing_hint = f"e2e_mock_local{_worker_suffix}"
     # Clean up any leftover route from a previous run.
     try:
         inference_client.delete(name)
@@ -93,7 +106,7 @@ def mock_inference_route(
         model_id="mock/test-model",
         enabled=True,
     )
-    yield name
+    yield routing_hint
     try:
         inference_client.delete(name)
     except grpc.RpcError:
@@ -103,9 +116,10 @@ def mock_inference_route(
 @pytest.fixture(scope="session")
 def mock_anthropic_route(
     inference_client: InferenceRouteClient,
+    _worker_suffix: str,
 ) -> Iterator[str]:
-    name = "e2e-mock-anthropic"
-    routing_hint = "e2e_mock_anthropic"
+    name = f"e2e-mock-anthropic{_worker_suffix}"
+    routing_hint = f"e2e_mock_anthropic{_worker_suffix}"
     try:
         inference_client.delete(name)
     except grpc.RpcError:
@@ -120,7 +134,7 @@ def mock_anthropic_route(
         model_id="mock/claude-test",
         enabled=True,
     )
-    yield name
+    yield routing_hint
     try:
         inference_client.delete(name)
     except grpc.RpcError:
@@ -130,10 +144,11 @@ def mock_anthropic_route(
 @pytest.fixture(scope="session")
 def mock_disallowed_route(
     inference_client: InferenceRouteClient,
+    _worker_suffix: str,
 ) -> Iterator[str]:
     """Route that exists but is NOT in any sandbox's allowed_routes."""
-    name = "e2e-mock-disallowed"
-    routing_hint = "e2e_mock_disallowed"
+    name = f"e2e-mock-disallowed{_worker_suffix}"
+    routing_hint = f"e2e_mock_disallowed{_worker_suffix}"
     try:
         inference_client.delete(name)
     except grpc.RpcError:
@@ -148,7 +163,7 @@ def mock_disallowed_route(
         model_id="mock/disallowed-model",
         enabled=True,
     )
-    yield name
+    yield routing_hint
     try:
         inference_client.delete(name)
     except grpc.RpcError:
