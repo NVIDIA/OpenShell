@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Empty sandbox policy — no network access.
+# Use this as a starting point for iterative policy development.
+# Network policies and inference routes can be added at runtime
+# via `ncl sandbox policy set`.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# No network policies — all outbound connections will be denied.
+# Add policies here or push updates at runtime with:
+#   ncl sandbox policy set <name> --policy <file>
+network_policies: {}

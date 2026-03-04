@@ -829,7 +829,10 @@ mod tests {
             "Expected allow, got deny: {}",
             decision.reason
         );
-        assert_eq!(decision.matched_policy.as_deref(), Some("github"));
+        assert_eq!(
+            decision.matched_policy.as_deref(),
+            Some("github_ssh_over_https")
+        );
     }
 
     #[test]
@@ -961,7 +964,10 @@ network_policies: {}
             "Expected allow via ancestor match, got deny: {}",
             decision.reason
         );
-        assert_eq!(decision.matched_policy.as_deref(), Some("github"));
+        assert_eq!(
+            decision.matched_policy.as_deref(),
+            Some("github_ssh_over_https")
+        );
     }
 
     #[test]
@@ -1778,7 +1784,7 @@ process:
         assert_eq!(
             action,
             NetworkAction::Allow {
-                matched_policy: Some("github".to_string())
+                matched_policy: Some("github_ssh_over_https".to_string())
             },
         );
     }
