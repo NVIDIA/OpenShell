@@ -1,6 +1,6 @@
 # Sandbox Custom Containers
 
-Users can run `ncl sandbox create --image <any-linux-image>` to launch a sandbox with an arbitrary container image while keeping the `navigator-sandbox` process supervisor in control.
+Users can run `nemoclaw sandbox create --image <any-linux-image>` to launch a sandbox with an arbitrary container image while keeping the `navigator-sandbox` process supervisor in control.
 
 ## How It Works
 
@@ -40,7 +40,7 @@ These transforms apply to both generated templates and user-provided `pod_templa
 ### Creating a sandbox with a custom image
 
 ```bash
-ncl sandbox create --image myimage:latest -- echo "hello from custom container"
+nemoclaw sandbox create --image myimage:latest -- echo "hello from custom container"
 ```
 
 When `--image` is set the CLI clears the default `run_as_user`/`run_as_group` policy (which expects a `sandbox` user) so that arbitrary images that lack that user can start without error.
@@ -48,11 +48,11 @@ When `--image` is set the CLI clears the default `run_as_user`/`run_as_group` po
 ### Pushing custom images into the cluster
 
 ```bash
-ncl sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
-ncl sandbox create --image my-sandbox:latest
+nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+nemoclaw sandbox create --image my-sandbox:latest
 ```
 
-`ncl sandbox image push` accepts:
+`nemoclaw sandbox image push` accepts:
 
 | Flag | Description |
 |------|-------------|

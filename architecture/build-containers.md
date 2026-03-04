@@ -33,12 +33,12 @@ deploy/
     manifests/                     # Kubernetes manifests for k3s auto-deploy
       navigator-helmchart.yaml
       agent-sandbox.yaml           # Agent Sandbox CRD controller RBAC
-build/
+tasks/
   docker.toml                      # Docker image build tasks
   cluster.toml                     # Cluster bootstrap and deploy tasks
   helm.toml                        # Helm lint task
   rust.toml                        # Rust build/lint/format tasks
-  ci.toml                          # Pre-commit, lint, sandbox runner tasks
+  ci.toml                          # Public quality tasks and CI entrypoint
   test.toml                        # Test tasks (Rust + Python)
   python.toml                      # Python build/lint/format tasks
   publish.toml                     # Release publishing tasks
@@ -140,7 +140,7 @@ A pre-built Ubuntu 24.04 image for CI pipeline jobs, defined in `deploy/docker/D
 | sccache | Rust compilation cache (amd64 only; skipped on arm64) |
 | socat | Docker socket forwarding in sandbox e2e tests |
 
-The build context must include `build/` because the Dockerfile copies mise task includes from that directory (`mise.toml` + `build/*.toml`).
+The build context must include `tasks/` because the Dockerfile copies mise task includes from that directory (`mise.toml` + `tasks/*.toml`).
 
 ## Cross-Compilation Support
 
@@ -298,7 +298,7 @@ The chart creates a Role and RoleBinding granting the gateway's ServiceAccount p
 
 ## Build Tasks (mise)
 
-All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
+All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 
 ### Docker Image Tasks
 
@@ -316,22 +316,19 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 
 | Task | Description |
 |---|---|
-| `mise run cluster` | Fast local recreate: push prebuilt local component images and deploy via local registry |
-| `mise run cluster:deploy` | Fast deploy: rebuild changed components only |
-| `mise run cluster:deploy:all` | Full deploy: rebuild all components via local registry |
-| `mise run cluster:push:server` | Tag and push gateway image to local registry |
-| `mise run cluster:push:sandbox` | Tag and push sandbox image to local registry |
+| `mise run cluster` | Bootstrap or incremental deploy: creates cluster if needed, rebuilds changed components |
+| `mise run cluster:build:full` | Full build + deploy path (advanced/CI) |
 
 ### Other Tasks
 
 | Task | Description |
 |---|---|
-| `mise run sandbox` | Run sandbox container interactively (builds image first) |
+| `mise run cluster:sandbox` | Run sandbox container interactively (builds image first) |
 | `mise run helm:lint` | Lint the Helm chart |
 
-### How `cluster:deploy` Works
+### How `cluster` Works (Incremental Deploy)
 
-`build/scripts/cluster-deploy-fast.sh` supports two modes:
+`tasks/scripts/cluster-deploy-fast.sh` supports two modes:
 
 **Auto mode** (no arguments): Detects changed files from Git (unstaged, staged, and untracked), fingerprints the relevant local changes for each component, and rebuilds only components whose fingerprint changed since the last successful deploy.
 
@@ -346,7 +343,7 @@ All builds use mise tasks defined in `build/*.toml` (included from `mise.toml`).
 
 **Explicit target mode** (arguments: `server`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.
 
-Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster:deploy` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
+Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
 
 After building, the script:
 
@@ -356,9 +353,9 @@ After building, the script:
 4. Restarts the gateway StatefulSet (or Deployment, if present) and waits for rollout completion.
 5. On success, updates the local deploy fingerprint state file for the next incremental deploy.
 
-### How `mise run cluster` Works
+### How `mise run cluster` Bootstrap Works
 
-`build/scripts/cluster-bootstrap.sh` performs a full cluster bootstrap for local development:
+`tasks/scripts/cluster-bootstrap.sh` performs a full cluster bootstrap for local development:
 
 1. Resolves the local registry address (defaults to `127.0.0.1:5000/navigator`). In CI, uses `$CI_REGISTRY_IMAGE`.
 2. Ensures a local Docker registry container (`navigator-local-registry`) is running on port 5000 (creates one if needed).
@@ -383,8 +380,8 @@ After building, the script:
 
 Container builds use Docker BuildKit with local cache directories:
 
-- `build/scripts/docker-build-component.sh` stores per-component caches in `.cache/buildkit/<component>`.
-- `build/scripts/docker-build-cluster.sh` stores the cluster image cache in `.cache/buildkit/cluster`.
+- `tasks/scripts/docker-build-component.sh` stores per-component caches in `.cache/buildkit/<component>`.
+- `tasks/scripts/docker-build-cluster.sh` stores the cluster image cache in `.cache/buildkit/cluster`.
 - `mise run python:build:multiarch` stores per-platform wheel caches in `.cache/buildkit/python-wheels/<platform>` for local builds when using a `docker-container` buildx driver.
 - Rust-heavy Dockerfiles use BuildKit cache mounts for cargo registry, cargo target, and sccache local disk directories. Cargo target cache mounts are keyed by image name, `TARGETARCH`, and a computed scope hash derived from `Cargo.lock` plus a Rust toolchain hint, with `sharing=locked` to prevent concurrent cache corruption in parallel CI builds. This reduces reuse of stale `target/` artifacts across dependency or toolchain changes while preserving incremental rebuilds within a compatible scope. sccache uses memcached in CI (`SCCACHE_MEMCACHED_ENDPOINT`) and falls back to the local disk cache mount for local dev builds, providing a second layer of caching at the compilation unit level.
 - When the active buildx driver is `docker` (not `docker-container`), local cache import/export flags are skipped automatically because the docker driver cannot export local caches. In CI, cache export is also skipped.
@@ -402,7 +399,7 @@ In CI pipelines:
 
 ## Multi-Arch Publishing
 
-`build/scripts/docker-publish-multiarch.sh` builds and pushes all images for multiple architectures.
+`tasks/scripts/docker-publish-multiarch.sh` builds and pushes all images for multiple architectures.
 
 **Two modes:**
 
@@ -425,17 +422,14 @@ In CI pipelines:
 ### Local Development
 
 ```bash
-# Full build + deploy (builds all images, starts local registry, bootstraps cluster)
+# Bootstrap or incremental deploy (creates cluster if needed, rebuilds changed components)
 mise run cluster
 
-# Incremental rebuild of changed components only
-mise run cluster:deploy
-
-# Rebuild specific component(s)
-mise run cluster:deploy server sandbox
+# Full build + deploy path (advanced/CI)
+mise run cluster:build:full
 
 # Run sandbox container interactively (for testing sandbox code)
-mise run sandbox
+mise run cluster:sandbox
 ```
 
 ### Multi-Arch Publishing
@@ -477,11 +471,11 @@ When the cluster container starts, k3s automatically deploys these HelmChart CRs
 - `deploy/docker/cluster-healthcheck.sh` -- Cluster health check script
 - `deploy/helm/navigator/` -- Helm chart directory
 - `deploy/kube/manifests/` -- Auto-deployed Kubernetes manifests
-- `build/docker.toml` -- Docker build task definitions
-- `build/cluster.toml` -- Cluster lifecycle task definitions
-- `build/scripts/docker-build-component.sh` -- Generic component image builder
-- `build/scripts/docker-build-cluster.sh` -- Cluster image builder
-- `build/scripts/docker-publish-multiarch.sh` -- Multi-arch publish script
-- `build/scripts/cluster-bootstrap.sh` -- Full local cluster bootstrap
-- `build/scripts/cluster-deploy-fast.sh` -- Incremental deploy script
-- `build/scripts/cluster-push-component.sh` -- Single component push to registry
+- `tasks/docker.toml` -- Docker build task definitions
+- `tasks/cluster.toml` -- Cluster lifecycle task definitions
+- `tasks/scripts/docker-build-component.sh` -- Generic component image builder
+- `tasks/scripts/docker-build-cluster.sh` -- Cluster image builder
+- `tasks/scripts/docker-publish-multiarch.sh` -- Multi-arch publish script
+- `tasks/scripts/cluster-bootstrap.sh` -- Full local cluster bootstrap
+- `tasks/scripts/cluster-deploy-fast.sh` -- Incremental deploy script
+- `tasks/scripts/cluster-push-component.sh` -- Single component push to registry

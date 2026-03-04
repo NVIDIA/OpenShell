@@ -6,7 +6,9 @@
 ["license:check"]
 description = "Check that all source files have SPDX license headers"
 run = "uv run python scripts/update_license_headers.py --check"
+hide = true
 
 ["license:update"]
 description = "Add or update SPDX license headers on all source files"
 run = "uv run python scripts/update_license_headers.py"
+hide = true

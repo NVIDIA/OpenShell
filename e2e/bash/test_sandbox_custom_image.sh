@@ -7,13 +7,13 @@
 # with it.
 #
 # Verifies the full flow:
-#   1. ncl sandbox image push --dockerfile <path>  (build + import into cluster)
-#   2. ncl sandbox create --image <tag> -- <cmd>   (run sandbox with custom image)
+#   1. nemoclaw sandbox image push --dockerfile <path>  (build + import into cluster)
+#   2. nemoclaw sandbox create --image <tag> -- <cmd>   (run sandbox with custom image)
 #
 # Prerequisites:
-#   - A running nemoclaw cluster (ncl cluster admin deploy)
+#   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
 #   - Docker daemon running (for image build)
-#   - The `ncl` binary on PATH (or set NAV_BIN)
+#   - The `nemoclaw` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_sandbox_custom_image.sh
@@ -32,7 +32,7 @@ if [[ -n "${NAV_BIN:-}" ]]; then
 elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
   NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
-  NAV="ncl"
+  NAV="nemoclaw"
 fi
 
 IMAGE_TAG="e2e-custom-image:test-$(date +%s)"

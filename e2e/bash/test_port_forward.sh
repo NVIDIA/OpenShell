@@ -6,8 +6,8 @@
 # Integration test for port forwarding through a sandbox.
 #
 # Prerequisites:
-#   - A running nemoclaw cluster (ncl cluster admin deploy)
-#   - The `ncl` binary on PATH (or set NAV_BIN)
+#   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
+#   - The `nemoclaw` binary on PATH (or set NAV_BIN)
 #
 # Usage:
 #   ./e2e/bash/test_port_forward.sh
@@ -27,7 +27,7 @@ if [[ -n "${NAV_BIN:-}" ]]; then
 elif [[ -x "${PROJECT_ROOT}/target/debug/nemoclaw" ]]; then
   NAV="${PROJECT_ROOT}/target/debug/nemoclaw"
 else
-  NAV="ncl"
+  NAV="nemoclaw"
 fi
 
 FORWARD_PORT="${FORWARD_PORT:-19876}"

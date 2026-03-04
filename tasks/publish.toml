@@ -8,47 +8,51 @@ description = "Build and publish Python wheels"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION=$(uv run python build/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+VERSION=$(uv run python tasks/scripts/release.py get-version --python)
+CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:all
-uv run python build/scripts/release.py python-publish --version "$VERSION"
+uv run python tasks/scripts/release.py python-publish --version "$VERSION"
 """
+hide = true
 
 ["python:publish:macos"]
 description = "Build and publish macOS arm64 Python wheel"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION=$(uv run python build/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+VERSION=$(uv run python tasks/scripts/release.py get-version --python)
+CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
-uv run python build/scripts/release.py python-publish --version "$VERSION" --wheel-glob "*macosx*arm64.whl"
+uv run python tasks/scripts/release.py python-publish --version "$VERSION" --wheel-glob "*macosx*arm64.whl"
 """
+hide = true
 
 ["publish:main"]
 description = "Main branch publish job (images with :dev, :latest, and version tag)"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
-VERSION_PYTHON=$(uv run python build/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+VERSION_DOCKER=$(uv run python tasks/scripts/release.py get-version --docker)
+VERSION_PYTHON=$(uv run python tasks/scripts/release.py get-version --python)
+CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 IMAGE_TAG=dev TAG_LATEST=true EXTRA_DOCKER_TAGS="$VERSION_DOCKER" mise run docker:publish:cluster:multiarch
 NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
 NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
-uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON"
+uv run python tasks/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """
+hide = true
 
 ["publish:tag"]
 description = "Tag release publish: versioned Docker to ECR and Python to GitHub Packages"
 run = """
 #!/usr/bin/env bash
 set -euo pipefail
-VERSION_DOCKER=$(uv run python build/scripts/release.py get-version --docker)
-VERSION_PYTHON=$(uv run python build/scripts/release.py get-version --python)
-CARGO_VERSION=$(uv run python build/scripts/release.py get-version --cargo)
+VERSION_DOCKER=$(uv run python tasks/scripts/release.py get-version --docker)
+VERSION_PYTHON=$(uv run python tasks/scripts/release.py get-version --python)
+CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 IMAGE_TAG="$VERSION_DOCKER" TAG_LATEST=false mise run docker:publish:cluster:multiarch
 NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
 NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
-uv run python build/scripts/release.py python-publish --version "$VERSION_PYTHON"
+uv run python tasks/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """
+hide = true

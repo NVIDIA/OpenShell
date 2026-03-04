@@ -152,7 +152,7 @@ The `sandbox exec` path is identical to interactive connect except:
 
 ### Port Forwarding (`sandbox forward start`)
 
-`ncl sandbox forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
+`nemoclaw sandbox forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
 on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 
 #### CLI
@@ -162,13 +162,13 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 - By default stays attached in foreground until interrupted (Ctrl+C).
 - With `-d`/`--background`, SSH forks after auth and the CLI exits. The PID is
   tracked in `~/.config/nemoclaw/forwards/<name>-<port>.pid` along with sandbox id metadata.
-- `ncl sandbox forward stop <port> <name>` validates PID ownership and then kills a background forward.
-- `ncl sandbox forward list` shows all tracked forwards.
-- `ncl sandbox forward stop` and `ncl sandbox forward list` are local operations and do not require
+- `nemoclaw sandbox forward stop <port> <name>` validates PID ownership and then kills a background forward.
+- `nemoclaw sandbox forward list` shows all tracked forwards.
+- `nemoclaw sandbox forward stop` and `nemoclaw sandbox forward list` are local operations and do not require
   resolving an active cluster.
-- `ncl sandbox create --forward <port>` starts a background forward before connect/exec, including
+- `nemoclaw sandbox create --forward <port>` starts a background forward before connect/exec, including
   when no trailing command is provided.
-- `ncl sandbox delete` auto-stops any active forwards for the deleted sandbox.
+- `nemoclaw sandbox delete` auto-stops any active forwards for the deleted sandbox.
 
 #### TUI (Gator)
 
@@ -287,16 +287,16 @@ When `--sync` is passed to `sandbox create`, the CLI pushes local git-tracked fi
 3. `sandbox_sync_up_files()` creates an SSH session config, spawns `ssh <proxy> sandbox "tar xf - -C /sandbox"`, and streams a tar archive of the file list to the SSH child's stdin using the `tar` crate
 4. Files land in `/sandbox` inside the container
 
-#### `ncl sandbox sync` command
+#### `nemoclaw sandbox sync` command
 
 The standalone `sandbox sync` subcommand supports bidirectional file transfer:
 
 ```bash
 # Push local files up to sandbox
-ncl sandbox sync <name> --up <local-path> [<sandbox-path>]
+nemoclaw sandbox sync <name> --up <local-path> [<sandbox-path>]
 
 # Pull sandbox files down to local
-ncl sandbox sync <name> --down <sandbox-path> [<local-path>]
+nemoclaw sandbox sync <name> --down <sandbox-path> [<local-path>]
 ```
 
 - **Push (`--up`)**: `sandbox_sync_up()` streams a tar archive of the local path to `ssh ... tar xf - -C <dest>` on the sandbox side. Default destination: `/sandbox`.

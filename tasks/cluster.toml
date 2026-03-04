@@ -1,0 +1,53 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Cluster bootstrap and deploy tasks
+
+[cluster]
+description = "Bootstrap or incremental deploy (creates cluster if needed, rebuilds changed components)"
+run = "tasks/scripts/cluster.sh"
+
+["cluster:build:full"]
+description = "Build and deploy local k3s cluster with NemoClaw"
+depends = [
+  "docker:build:server",
+  "docker:build:sandbox",
+]
+run = "tasks/scripts/cluster-bootstrap.sh build"
+hide = true
+
+["cluster:sandbox"]
+description = "Run the sandbox container with an interactive shell"
+depends = ["docker:build:sandbox"]
+raw = true
+usage = """
+flag "-e --env <env>" var=#true help="Environment variables to pass into the sandbox"
+arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
+"""
+run = "bash tasks/scripts/run-sandbox.sh"
+hide = true
+
+["cluster:deploy"]
+description = "Alias for cluster (incremental deploy)"
+run = "tasks/scripts/cluster.sh"
+hide = true
+
+["cluster:deploy:sandbox"]
+description = "Fast deploy sandbox-only changes"
+run = "tasks/scripts/cluster-deploy-fast.sh sandbox"
+hide = true
+
+["cluster:deploy:all"]
+description = "Pull-mode deploy using local registry pushes"
+run = "tasks/scripts/cluster-deploy-fast.sh all"
+hide = true
+
+["cluster:push:server"]
+description = "Tag and push server image to pull registry"
+run = "tasks/scripts/cluster-push-component.sh server"
+hide = true
+
+["cluster:push:sandbox"]
+description = "Tag and push sandbox image to pull registry"
+run = "tasks/scripts/cluster-push-component.sh sandbox"
+hide = true

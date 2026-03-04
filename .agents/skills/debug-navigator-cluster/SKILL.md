@@ -1,17 +1,17 @@
 ---
 name: debug-navigator-cluster
-description: Debug why a nemoclaw cluster failed to start or is unhealthy. Use when the user has a failed `ncl cluster admin deploy`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed.
+description: Debug why a nemoclaw cluster failed to start or is unhealthy. Use when the user has a failed `nemoclaw cluster admin deploy`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed.
 ---
 
 # Debug NemoClaw Cluster
 
-Diagnose why a nemoclaw cluster failed to start after `ncl cluster admin deploy`.
+Diagnose why a nemoclaw cluster failed to start after `nemoclaw cluster admin deploy`.
 
 ## Overview
 
-`ncl cluster admin deploy` creates a Docker container running k3s with the NemoClaw server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
+`nemoclaw cluster admin deploy` creates a Docker container running k3s with the NemoClaw server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
 
-1. **Pre-deploy check**: `ncl cluster admin deploy` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
+1. **Pre-deploy check**: `nemoclaw cluster admin deploy` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
 3. Create Docker network (`navigator-cluster`) and volume (`navigator-cluster-{name}`)
 4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
@@ -31,7 +31,7 @@ For local deploys, metadata endpoint selection now depends on Docker connectivit
 - default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
 - TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
 
-The host port is configurable via `--port` on `ncl cluster admin deploy` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
+The host port is configurable via `--port` on `nemoclaw cluster admin deploy` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
 
 The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validation succeeds.
 
@@ -40,7 +40,7 @@ The default cluster name is `nemoclaw`. The container is `navigator-cluster-{nam
 ## Prerequisites
 
 - Docker must be running (locally or on the remote host)
-- The `ncl` CLI must be available
+- The `nemoclaw` CLI must be available
 - For remote clusters: SSH access to the remote host
 
 ## Workflow
@@ -331,7 +331,7 @@ docker -H ssh://<host> logs navigator-cluster-<name>
 **Setting up kubectl access** (requires tunnel):
 
 ```bash
-ncl cluster admin tunnel --name <name> --remote <host>
+nemoclaw cluster admin tunnel --name <name> --remote <host>
 # Then in another terminal:
 export KUBECONFIG=~/.config/nemoclaw/clusters/<name>/kubeconfig
 kubectl get pods -A
