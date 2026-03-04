@@ -10,7 +10,7 @@ use landlock::{
 };
 use miette::{IntoDiagnostic, Result};
 use std::path::PathBuf;
-use tracing::{debug, warn};
+use tracing::debug;
 
 pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     let read_only = policy.filesystem.read_only.clone();
@@ -71,7 +71,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
             policy.landlock.compatibility,
             LandlockCompatibility::BestEffort
         ) {
-            warn!(error = %err, "Landlock unavailable, continuing without filesystem sandbox");
+            debug!(error = %err, "Landlock unavailable, continuing without filesystem sandbox");
             return Ok(());
         }
         return Err(err);
