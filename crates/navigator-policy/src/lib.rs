@@ -10,7 +10,7 @@
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
 //! these types, ensuring round-trip fidelity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
@@ -20,7 +20,8 @@ use navigator_core::proto::{
 use serde::{Deserialize, Serialize};
 
 /// Built-in default sandbox policy YAML (embedded at compile time).
-const DEFAULT_SANDBOX_POLICY_YAML: &str = include_str!("../../../dev-sandbox-policy.yaml");
+const DEFAULT_SANDBOX_POLICY_YAML: &str =
+    include_str!("../../../deploy/docker/sandbox/dev-sandbox-policy.yaml");
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)

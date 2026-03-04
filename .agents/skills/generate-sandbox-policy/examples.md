@@ -729,11 +729,11 @@ An exact IP is treated as `/32` — only that specific address is permitted.
 
 ### Example F1: Add a New Policy to an Existing File
 
-**User**: "Add read-only access to api.github.com for curl to my dev-sandbox-policy.yaml"
+**User**: "Add read-only access to api.github.com for curl to my deploy/docker/sandbox/dev-sandbox-policy.yaml"
 
 **Agent workflow**:
 
-1. Read `dev-sandbox-policy.yaml`
+1. Read `deploy/docker/sandbox/dev-sandbox-policy.yaml`
 2. Check that no existing policy already covers `api.github.com:443` — if one does, warn about overlap
 3. Check that the key `github_readonly` doesn't already exist
 4. Insert the new policy under `network_policies`:
@@ -760,11 +760,11 @@ The agent uses `StrReplace` to insert after the last existing policy in the `net
 
 ### Example F2: Modify an Existing Policy (Add an Endpoint)
 
-**User**: "Add sentry.io to the claude_code policy in dev-sandbox-policy.yaml"
+**User**: "Add sentry.io to the claude_code policy in deploy/docker/sandbox/dev-sandbox-policy.yaml"
 
 **Agent workflow**:
 
-1. Read `dev-sandbox-policy.yaml`
+1. Read `deploy/docker/sandbox/dev-sandbox-policy.yaml`
 2. Find the `claude_code` policy
 3. Check that `sentry.io:443` isn't already listed in its endpoints
 4. Add the new endpoint to the existing `endpoints` list:
@@ -878,11 +878,11 @@ The agent notes that `filesystem_policy`, `landlock`, `process`, and `inference`
 
 ### Example F5: Handle a Key Conflict
 
-**User**: "Add an nvidia policy to dev-sandbox-policy.yaml"
+**User**: "Add an nvidia policy to deploy/docker/sandbox/dev-sandbox-policy.yaml"
 
 **Agent workflow**:
 
-1. Read `dev-sandbox-policy.yaml`
+1. Read `deploy/docker/sandbox/dev-sandbox-policy.yaml`
 2. Find that a policy key `nvidia` already exists
 3. **Ask the user**: "A policy named `nvidia` already exists. Do you want to replace it, add endpoints to it, or use a different name (e.g., `nvidia_inference_v2`)?"
 4. Proceed based on the user's answer

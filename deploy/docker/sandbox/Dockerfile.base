@@ -49,8 +49,8 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 
 # Copy proto files needed for build
 COPY proto/ proto/
-COPY dev-sandbox-policy.rego ./
-COPY dev-sandbox-policy.yaml ./
+COPY crates/navigator-policy/dev-sandbox-policy.rego ./crates/navigator-policy/
+COPY deploy/docker/sandbox/dev-sandbox-policy.yaml ./deploy/docker/sandbox/
 
 # Build dependencies only (cached unless Cargo.toml/lock changes).
 # sccache uses memcached in CI or the local disk cache mount for local dev.
@@ -171,6 +171,10 @@ ENV PATH="/app/.venv/bin:$PATH"
 # with a SKILL.md file (and any supporting files). It will be installed into
 # both ~/.claude/skills/ and ~/.agents/skills/ for agent discovery.
 COPY deploy/docker/sandbox/skills/ /sandbox/.openclaw/skills/
+
+# Bake the default sandbox policy into the image so that sandboxes without an
+# explicit policy from the gateway can discover it on disk.
+COPY deploy/docker/sandbox/dev-sandbox-policy.yaml /etc/navigator/policy.yaml
 
 RUN mkdir -p /var/navigator /sandbox /var/log && \
     touch /var/log/navigator.log && \
