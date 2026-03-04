@@ -44,7 +44,7 @@ docs = [
     "sphinx-design",
     "sphinx-autobuild",
     "sphinxcontrib-mermaid",
-    "nvidia-sphinx-theme>=0.0.8",
+    "nvidia-sphinx-theme",
 ]
 
 [tool.uv]
