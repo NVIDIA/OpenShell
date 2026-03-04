@@ -1,17 +1,50 @@
-name: DCO
-
+name: "DCO Assistant"
 on:
-  pull_request:
-    branches: [main]
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, closed, synchronize]
+
+permissions:
+  actions: write
+  checks: none
+  contents: write
+  deployments: none
+  id-token: none
+  issues: none
+  discussions: none
+  packages: none
+  pages: none
+  pull-requests: write
+  repository-projects: none
+  security-events: none
+  statuses: write
 
 jobs:
-  dco:
-    name: DCO Check
+  DCOAssistant:
+    if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: "DCO Assistant"
+        if: |
+          (github.event.comment.body == 'recheck' ||
+           github.event.comment.body == 'I have read the Contributor Agreement including DCO and I hereby sign the Contributor Agreement and DCO') ||
+          github.event_name == 'pull_request_target'
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          fetch-depth: 0
-
-      - name: Check DCO sign-off
-        uses: gsactions/dco-check@v1.1.1
+          path-to-signatures: "dco-signatures.json"
+          path-to-document: "https://github.com/NVIDIA/NemoClaw/blob/main/DCO"
+          branch: "signatures"
+          allowlist: dependabot
+          create-file-commit-message: "chore: create file to store dco signatures"
+          signed-commit-message: "chore: $contributorName has signed the dco in #$pullRequestNo"
+          custom-notsigned-prcomment: >-
+            Thank you for your submission! We ask that $you sign our
+            [Developer Certificate of Origin](https://github.com/NVIDIA/NemoClaw/blob/main/DCO)
+            before we can accept your contribution. You can sign the DCO by
+            adding a comment below using this text:
+          custom-pr-sign-comment: "I have read the DCO document and I hereby sign the DCO."
+          lock-pullrequest-aftermerge: false
+          use-dco-flag: true
