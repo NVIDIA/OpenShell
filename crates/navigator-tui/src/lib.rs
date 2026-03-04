@@ -780,8 +780,9 @@ async fn handle_shell_connect(
 
 /// Suspend the TUI, execute a command on a sandbox via SSH, then resume.
 ///
-/// Similar to `handle_shell_connect` but runs a specific command with `-T`
-/// (no PTY) instead of an interactive shell.
+/// Mirrors `handle_shell_connect` but passes the user's command to SSH
+/// instead of opening an interactive shell.  The TUI is suspended while
+/// the command runs; press Ctrl-C to stop and return to the TUI.
 async fn handle_exec_command(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -789,7 +790,7 @@ async fn handle_exec_command(
     sandbox_name: &str,
     command: &str,
 ) {
-    // Step 1: Create SSH session.
+    // Step 1: Resolve sandbox → SSH session (same as handle_shell_connect).
     let sandbox_id = {
         let req = navigator_core::proto::GetSandboxRequest {
             name: sandbox_name.to_string(),
@@ -802,8 +803,12 @@ async fn handle_exec_command(
                     return;
                 }
             },
-            _ => {
-                app.status_text = "exec: failed to resolve sandbox".to_string();
+            Ok(Err(e)) => {
+                app.status_text = format!("exec: failed to get sandbox: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "exec: get sandbox timed out".to_string();
                 return;
             }
         }
@@ -816,14 +821,18 @@ async fn handle_exec_command(
         match tokio::time::timeout(Duration::from_secs(5), app.client.create_ssh_session(req)).await
         {
             Ok(Ok(resp)) => resp.into_inner(),
-            _ => {
-                app.status_text = "exec: SSH session failed".to_string();
+            Ok(Err(e)) => {
+                app.status_text = format!("exec: SSH session failed: {}", e.message());
+                return;
+            }
+            Err(_) => {
+                app.status_text = "exec: SSH session timed out".to_string();
                 return;
             }
         }
     };
 
-    // Step 2: Resolve gateway and build ProxyCommand.
+    // Step 2: Resolve gateway and build ProxyCommand (same as handle_shell_connect).
     #[allow(clippy::cast_possible_truncation)]
     let gateway_port_u16 = session.gateway_port as u16;
     let (gateway_host, gateway_port) =
@@ -846,8 +855,14 @@ async fn handle_exec_command(
         session.sandbox_id, session.token,
     );
 
-    // Step 3: Build SSH exec command.
-    let escaped_command = shell_escape(command);
+    // Step 3: Build SSH command — same flags as handle_shell_connect but with
+    // the user's command appended.  Each word is escaped individually so the
+    // remote shell parses it correctly.
+    let command_str = command
+        .split_whitespace()
+        .map(|word| shell_escape(word))
+        .collect::<Vec<_>>()
+        .join(" ");
     let mut ssh = std::process::Command::new("ssh");
     ssh.arg("-o")
         .arg(format!("ProxyCommand={proxy_command}"))
@@ -865,7 +880,7 @@ async fn handle_exec_command(
         .arg("-o")
         .arg("SetEnv=TERM=xterm-256color")
         .arg("sandbox")
-        .arg(escaped_command)
+        .arg(command_str)
         .stdin(std::process::Stdio::inherit())
         .stdout(std::process::Stdio::inherit())
         .stderr(std::process::Stdio::inherit());
@@ -882,7 +897,7 @@ async fn handle_exec_command(
     );
     let _ = disable_raw_mode();
 
-    // Step 5: Run.
+    // Step 5: Run command — blocks until user Ctrl-C's or command exits.
     let status = tokio::task::spawn_blocking(move || ssh.status()).await;
     match &status {
         Ok(Ok(s)) if !s.success() => {
@@ -1121,6 +1136,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     app.pending_forward_ports = ports.clone();
 
     let endpoint = app.endpoint.clone();
+    let cluster_name = app.cluster_name.clone();
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
 
     tokio::spawn(async move {
@@ -1201,8 +1217,15 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 
             // Start port forwards if requested.
             if !ports.is_empty() {
-                start_port_forwards(&mut client, &endpoint, &sandbox_name, &sandbox_id, &ports)
-                    .await;
+                start_port_forwards(
+                    &mut client,
+                    &endpoint,
+                    &cluster_name,
+                    &sandbox_name,
+                    &sandbox_id,
+                    &ports,
+                )
+                .await;
             }
         }
 
@@ -1217,6 +1240,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 async fn start_port_forwards(
     client: &mut NavigatorClient<Channel>,
     endpoint: &str,
+    cluster_name: &str,
     sandbox_name: &str,
     sandbox_id: &str,
     ports: &[u16],
@@ -1258,8 +1282,9 @@ async fn start_port_forwards(
         }
     };
     let exe_str = shell_escape(&exe.to_string_lossy());
+    let cluster = shell_escape(cluster_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --cluster {cluster}",
         session.sandbox_id, session.token,
     );
 
@@ -1277,6 +1302,8 @@ async fn start_port_forwards(
             .arg("GlobalKnownHostsFile=/dev/null")
             .arg("-o")
             .arg("LogLevel=ERROR")
+            .arg("-o")
+            .arg("ConnectTimeout=15")
             .arg("-N")
             .arg("-f")
             .arg("-L")
@@ -1289,16 +1316,49 @@ async fn start_port_forwards(
         let port_val = *port;
         let sid = session.sandbox_id.clone();
         let name = sandbox_name.to_string();
-        let status = tokio::task::spawn_blocking(move || command.status()).await;
 
-        match status {
-            Ok(Ok(s)) if s.success() => {
+        // Use spawn (not status) so we don't block if SSH hangs during auth.
+        // SSH with -f forks to background after auth, but if auth stalls the
+        // parent process blocks indefinitely.  We use spawn + wait_with_timeout
+        // to avoid freezing the create flow.
+        let result = tokio::task::spawn_blocking(move || {
+            match command.spawn() {
+                Ok(mut child) => {
+                    // Wait up to 20 seconds for SSH to authenticate and fork.
+                    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+                    loop {
+                        match child.try_wait() {
+                            Ok(Some(status)) => return Ok(status.success()),
+                            Ok(None) => {
+                                if std::time::Instant::now() >= deadline {
+                                    let _ = child.kill();
+                                    return Err("timed out".to_string());
+                                }
+                                std::thread::sleep(Duration::from_millis(200));
+                            }
+                            Err(e) => return Err(e.to_string()),
+                        }
+                    }
+                }
+                Err(e) => Err(e.to_string()),
+            }
+        })
+        .await;
+
+        match result {
+            Ok(Ok(true)) => {
                 if let Some(pid) = navigator_core::forward::find_ssh_forward_pid(&sid, port_val) {
                     let _ = navigator_core::forward::write_forward_pid(&name, port_val, pid, &sid);
                 }
             }
-            _ => {
-                tracing::warn!("failed to start forward for port {port_val}");
+            Ok(Ok(false)) => {
+                tracing::warn!("SSH forward exited with error for port {port_val}");
+            }
+            Ok(Err(e)) => {
+                tracing::warn!("forward failed for port {port_val}: {e}");
+            }
+            Err(e) => {
+                tracing::warn!("forward task panicked for port {port_val}: {e}");
             }
         }
     }
