@@ -29,6 +29,7 @@ WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/navigator-cli/Cargo.toml crates/navigator-cli/Cargo.toml
 COPY crates/navigator-core/Cargo.toml crates/navigator-core/Cargo.toml
+COPY crates/navigator-policy/Cargo.toml crates/navigator-policy/Cargo.toml
 COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
 COPY crates/navigator-router/Cargo.toml crates/navigator-router/Cargo.toml
 COPY crates/navigator-sandbox/Cargo.toml crates/navigator-sandbox/Cargo.toml
@@ -36,11 +37,12 @@ COPY crates/navigator-server/Cargo.toml crates/navigator-server/Cargo.toml
 COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
 
 # Create dummy source files to build dependencies
-RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-providers/src crates/navigator-router/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
+RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-policy/src crates/navigator-providers/src crates/navigator-router/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
     echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
     echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
     echo "fn main() {}" > crates/navigator-server/src/main.rs && \
     touch crates/navigator-core/src/lib.rs && \
+    touch crates/navigator-policy/src/lib.rs && \
     touch crates/navigator-providers/src/lib.rs && \
     touch crates/navigator-router/src/lib.rs && \
     touch crates/navigator-bootstrap/src/lib.rs
@@ -48,6 +50,7 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 # Copy proto files needed for build
 COPY proto/ proto/
 COPY dev-sandbox-policy.rego ./
+COPY dev-sandbox-policy.yaml ./
 
 # Build dependencies only (cached unless Cargo.toml/lock changes).
 # sccache uses memcached in CI or the local disk cache mount for local dev.

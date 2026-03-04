@@ -24,8 +24,8 @@ log_duration() {
   echo "${label} took $((end - start))s"
 }
 
-if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
-  echo "Error: Cluster container '${CONTAINER_NAME}' is not running."
+if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
+  echo "Error: Cluster container '${CONTAINER_NAME}' is not running or not healthy."
   echo "Start the cluster first with: mise run cluster"
   exit 1
 fi
@@ -139,7 +139,7 @@ matches_sandbox() {
     crates/navigator-core/*|crates/navigator-providers/*)
       return 0
       ;;
-    crates/navigator-sandbox/*|deploy/docker/sandbox/*|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego)
+    crates/navigator-policy/*|crates/navigator-sandbox/*|deploy/docker/sandbox/*|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock|dev-sandbox-policy.rego|dev-sandbox-policy.yaml)
       return 0
       ;;
     *)
@@ -273,6 +273,7 @@ done
 
 server_pid=""
 sandbox_pid=""
+build_failed=0
 
 if [[ "${build_server}" == "1" ]]; then
   if [[ "${build_sandbox}" == "1" ]]; then
@@ -292,11 +293,28 @@ if [[ "${build_sandbox}" == "1" ]]; then
   fi
 fi
 
-if [[ -n "${server_pid}" ]]; then
+# Wait for parallel builds and fail fast: if either build fails, kill the
+# other one immediately instead of letting it run to completion.
+if [[ -n "${server_pid}" && -n "${sandbox_pid}" ]]; then
+  # Both running in parallel — wait for either to finish first.
+  if ! wait -n "${server_pid}" "${sandbox_pid}" 2>/dev/null; then
+    build_failed=1
+  fi
+  # Whichever finished, wait for the other (or kill it on failure).
+  if [[ "${build_failed}" == "1" ]]; then
+    echo "Error: a parallel image build failed. Killing remaining build..." >&2
+    kill "${server_pid}" "${sandbox_pid}" 2>/dev/null || true
+    wait "${server_pid}" "${sandbox_pid}" 2>/dev/null || true
+    exit 1
+  fi
+  # First build succeeded; wait for the second.
+  if ! wait -n "${server_pid}" "${sandbox_pid}" 2>/dev/null; then
+    echo "Error: a parallel image build failed." >&2
+    exit 1
+  fi
+elif [[ -n "${server_pid}" ]]; then
   wait "${server_pid}"
-fi
-
-if [[ -n "${sandbox_pid}" ]]; then
+elif [[ -n "${sandbox_pid}" ]]; then
   wait "${sandbox_pid}"
 fi
 
