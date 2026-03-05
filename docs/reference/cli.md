@@ -49,7 +49,7 @@ nemoclaw
 │   ├── update <name>
 │   ├── delete <name>
 │   └── list
-├── gator
+├── term
 └── completions <shell>
 ```
 
@@ -148,7 +148,7 @@ Manage inference routes that intercept and reroute LLM API calls from userland c
 
 ## NemoClaw Terminal
 
-`nemoclaw gator` launches the NemoClaw Terminal, a dashboard that shows sandbox
+`nemoclaw term` launches the NemoClaw Terminal, a dashboard that shows sandbox
 status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
 press `f` to follow live output, `s` to filter by source, and `q` to quit.
 

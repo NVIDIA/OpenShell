@@ -9,7 +9,7 @@ Troubleshoot problems with building and running custom container images in sandb
 
 ## Custom Image Fails to Start
 
-**Symptom:** Sandbox with `--image` goes to `Error` state.
+**Symptom:** Sandbox with `--from <image>` goes to `Error` state.
 
 **Check:**
 1. Is the image pushed to the cluster? `nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-image`.

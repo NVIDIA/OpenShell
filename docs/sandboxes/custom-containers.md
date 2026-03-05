@@ -9,7 +9,7 @@ You can run any Linux container image as a sandbox while keeping the NemoClaw su
 
 ## How It Works
 
-When you specify `--image`, the server activates supervisor bootstrap mode. The `navigator-sandbox` supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container, then mounted read-only into your custom container. This means you do not need to build the supervisor into your image.
+When you specify `--from` with a container image reference, the server activates supervisor bootstrap mode. The `navigator-sandbox` supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container, then mounted read-only into your custom container. This means you do not need to build the supervisor into your image.
 
 ```{mermaid}
 flowchart TB
@@ -49,17 +49,17 @@ The image is built locally via Docker and imported directly into the cluster's c
 ## Creating a Sandbox with a Custom Image
 
 ```console
-$ nemoclaw sandbox create --image my-app:latest --keep --name my-app
+$ nemoclaw sandbox create --from my-app:latest --keep --name my-app
 ```
 
-When `--image` is set, the CLI clears the default `run_as_user`/`run_as_group` policy, since custom images may not have the default `sandbox` user.
+When `--from` specifies a container image, the CLI clears the default `run_as_user`/`run_as_group` policy, since custom images may not have the default `sandbox` user.
 
 ### With Port Forwarding
 
 If your container runs a service:
 
 ```console
-$ nemoclaw sandbox create --image my-app:latest --forward 8080 --keep -- ./start-server.sh
+$ nemoclaw sandbox create --from my-app:latest --forward 8080 --keep -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs, so the service is reachable at `localhost:8080` immediately.
@@ -71,7 +71,7 @@ To iterate on your container:
 ```console
 $ nemoclaw sandbox delete my-app
 $ nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-app:v2
-$ nemoclaw sandbox create --image my-app:v2 --keep --name my-app
+$ nemoclaw sandbox create --from my-app:v2 --keep --name my-app
 ```
 
 ## Limitations

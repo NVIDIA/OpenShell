@@ -18,7 +18,7 @@
 | [OPA / Rego](https://www.openpolicyagent.org/) | Policy language for sandbox network access control. NemoClaw uses the `regorus` pure-Rust evaluator. |
 | [Landlock](https://landlock.io/) | Linux security module for filesystem access control. |
 | [seccomp](https://www.kernel.org/doc/html/latest/userspace-api/seccomp_filter.html) | Linux kernel system call filtering. |
-| [ratatui](https://ratatui.rs/) | Rust TUI framework powering the Gator terminal dashboard. |
+| [ratatui](https://ratatui.rs/) | Rust TUI framework powering the NemoClaw Terminal dashboard. |
 | [russh](https://github.com/warp-tech/russh) | Rust SSH library used for the sandbox embedded SSH server. |
 | [Helm](https://helm.sh/) | Kubernetes package manager used for deploying NemoClaw components. |
 
@@ -33,7 +33,7 @@
 | **Gateway** | The central control plane service that manages sandboxes, providers, and routes. |
 | **Inference Route** | A mapping from a routing hint to a backend AI model endpoint. |
 | **BYOC** | Bring Your Own Container — running custom images as sandboxes. |
-| **Gator** | The NemoClaw terminal user interface (TUI). |
+| **NemoClaw Terminal** | The NemoClaw terminal user interface (TUI), launched with `nemoclaw term`. |
 | **L7 Inspection** | HTTP-level traffic inspection inside TLS tunnels. |
 | **TOFU** | Trust-On-First-Use — the binary integrity verification model used by the proxy. |
 | **mTLS** | Mutual TLS — both client and server present certificates. Used for all gateway communication. |

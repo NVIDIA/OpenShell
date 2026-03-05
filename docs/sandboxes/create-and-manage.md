@@ -139,7 +139,7 @@ $ nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn --since 
 
 :::{tip}
 For a real-time dashboard that combines sandbox status and logs in one view,
-run `nemoclaw gator`. See {doc}`terminal` for details on reading log entries and
+run `nemoclaw term`. See {doc}`terminal` for details on reading log entries and
 diagnosing blocked connections.
 :::
 

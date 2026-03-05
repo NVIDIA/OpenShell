@@ -8,7 +8,7 @@
 NemoClaw Terminal is a terminal dashboard that displays sandbox status and live activity in a single view. Use it to monitor agent behavior, diagnose blocked connections, and observe inference interception in real time.
 
 ```console
-$ nemoclaw gator
+$ nemoclaw term
 ```
 
 ## Sandbox Status

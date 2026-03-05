@@ -141,7 +141,7 @@ Bootstrap, manage, and deploy NemoClaw clusters locally or on remote hosts via S
 :link: observability/index
 :link-type: doc
 
-Stream sandbox logs, audit agent activity, and monitor policy enforcement with the Gator TUI and CLI.
+Stream sandbox logs, audit agent activity, and monitor policy enforcement with the NemoClaw Terminal and CLI.
 +++
 {bdg-secondary}`How To`
 :::

@@ -44,7 +44,7 @@ $ nemoclaw sandbox forward stop 8080 my-sandbox
 You can start a port forward when creating a sandbox:
 
 ```console
-$ nemoclaw sandbox create --image my-app:latest --forward 8080 --keep -- ./start-server.sh
+$ nemoclaw sandbox create --from my-app:latest --forward 8080 --keep -- ./start-server.sh
 ```
 
 The `--forward` flag implies `--keep` (the sandbox stays alive after the command exits) and starts the forward before the command runs.
@@ -55,6 +55,6 @@ Port forwarding uses OpenSSH's `-L` flag (`-L <port>:127.0.0.1:<port>`) through 
 
 Background forwards are tracked via PID files in `~/.config/nemoclaw/forwards/`. Deleting a sandbox automatically stops any active forwards for that sandbox.
 
-## Gator TUI
+## NemoClaw Terminal
 
-The Gator TUI also supports port forwarding. When creating a sandbox in Gator, specify ports in the **Ports** field (comma-separated, e.g., `8080,3000`). Forwarded ports appear in the sandbox table's **NOTES** column.
+The NemoClaw Terminal also supports port forwarding. When creating a sandbox in the terminal, specify ports in the **Ports** field (comma-separated, e.g., `8080,3000`). Forwarded ports appear in the sandbox table's **NOTES** column.

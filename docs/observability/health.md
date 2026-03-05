@@ -5,7 +5,7 @@
 
 # Cluster and Sandbox Health
 
-NemoClaw provides two ways to monitor health: the CLI for quick checks and the Gator TUI for a live dashboard.
+NemoClaw provides two ways to monitor health: the CLI for quick checks and the NemoClaw Terminal for a live dashboard.
 
 ## CLI
 
@@ -26,25 +26,25 @@ $ nemoclaw sandbox get <name>
 
 `sandbox list` shows all sandboxes with their current phase. `sandbox get` returns detailed information for a single sandbox, including status, image, attached providers, and policy revision.
 
-## Gator TUI
+## NemoClaw Terminal
 
-Gator is a terminal user interface for NemoClaw, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, Gator gives you a real-time, keyboard-driven dashboard.
+The NemoClaw Terminal is a terminal user interface inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, it gives you a real-time, keyboard-driven dashboard.
 
-### Launching Gator
+### Launching the Terminal
 
 ```console
-$ nemoclaw gator
-$ nemoclaw gator --cluster prod
-$ NEMOCLAW_CLUSTER=prod nemoclaw gator
+$ nemoclaw term
+$ nemoclaw term --cluster prod
+$ NEMOCLAW_CLUSTER=prod nemoclaw term
 ```
 
-Gator inherits all CLI configuration --- cluster selection, TLS settings, and verbosity flags work the same way. No separate configuration is needed.
+The terminal inherits all CLI configuration --- cluster selection, TLS settings, and verbosity flags work the same way. No separate configuration is needed.
 
 ### Screen Layout
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  gator ─ my-cluster ─ Dashboard  ● Healthy                     │  ← title bar
+│  NemoClaw ─ my-cluster ─ Dashboard  ● Healthy                   │  ← title bar
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  (view content — Dashboard or Sandboxes)                        │  ← main area
@@ -56,7 +56,7 @@ Gator inherits all CLI configuration --- cluster selection, TLS settings, and ve
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- **Title bar** --- Gator logo, cluster name, current view, and live health status.
+- **Title bar** --- NemoClaw logo, cluster name, current view, and live health status.
 - **Main area** --- the active view.
 - **Navigation bar** --- available views with shortcut keys.
 - **Command bar** --- appears when you press `:` (vim-style).
@@ -100,7 +100,7 @@ Navigate with `j`/`k` or arrow keys.
 | `j` / `↓` | Move selection down. |
 | `k` / `↑` | Move selection up. |
 | `:` | Enter command mode. |
-| `q` | Quit Gator. |
+| `q` | Quit the terminal. |
 | `Ctrl+C` | Force quit. |
 
 #### Command Mode
@@ -109,7 +109,7 @@ Press `:` to open the command bar. Type a command and press `Enter`.
 
 | Command | Action |
 |---------|--------|
-| `quit` / `q` | Quit Gator. |
+| `quit` / `q` | Quit the terminal. |
 | `dashboard` / `1` | Switch to Dashboard. |
 | `sandboxes` / `2` | Switch to Sandboxes. |
 
@@ -117,15 +117,15 @@ Press `Esc` to cancel.
 
 ### Port Forwarding
 
-When creating a sandbox in Gator, specify ports in the **Ports** field (comma-separated, e.g., `8080,3000`). After the sandbox reaches `Ready` state, Gator automatically spawns background SSH tunnels. Forwarded ports appear in the **NOTES** column and in the sandbox detail view.
+When creating a sandbox in the terminal, specify ports in the **Ports** field (comma-separated, e.g., `8080,3000`). After the sandbox reaches `Ready` state, the terminal automatically spawns background SSH tunnels. Forwarded ports appear in the **NOTES** column and in the sandbox detail view.
 
 ### Data Refresh
 
-Gator polls the cluster every 2 seconds. Both cluster health and the sandbox list update automatically --- no manual refresh needed.
+The terminal polls the cluster every 2 seconds. Both cluster health and the sandbox list update automatically --- no manual refresh needed.
 
 ### Theme
 
-Gator uses a dark terminal theme based on the NVIDIA brand palette:
+The NemoClaw Terminal uses a dark terminal theme based on the NVIDIA brand palette:
 
 - **Background**: Terminal black.
 - **Text**: White for primary, dimmed for secondary.

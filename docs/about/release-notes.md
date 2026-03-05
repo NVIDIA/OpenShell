@@ -25,7 +25,7 @@ The following table summarizes the key features included in this release.
 | Inference routing | Transparent interception and rerouting of OpenAI/Anthropic API calls to policy-controlled backends for inference privacy. |
 | Cluster bootstrap | Single-container k3s deployment with Docker as the only dependency. Supports local and remote (SSH) targets. |
 | CLI (`nemoclaw` / `ncl`) | Full command-line interface for cluster, sandbox, provider, and inference route management. |
-| Gator TUI | Terminal dashboard for real-time cluster monitoring and sandbox management. |
+| NemoClaw Terminal | Terminal dashboard for real-time cluster monitoring and sandbox management. |
 | BYOC | Run custom container images as sandboxes with supervisor bootstrap. |
 | SSH tunneling | Secure access to sandboxes through the gateway with session tokens and mTLS. |
 | File sync | Push and pull files to/from sandboxes via tar-over-SSH. |
