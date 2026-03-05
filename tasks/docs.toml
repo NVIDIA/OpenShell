@@ -6,9 +6,13 @@
 ["docs"]
 description = "Build HTML documentation"
 run = """
-uv run sphinx-build -b html docs _build/docs
+if ! uv run sphinx-build -b html docs _build/docs; then
+  echo ""
+  echo "Build failed. If this is a dependency issue, try: mise run docs:deps"
+  exit 1
+fi
 echo ""
-echo "Documentation built successfully. Open in browser:"
+echo "Documentation built successfully."
 echo "file://$(pwd)/_build/docs/index.html"
 """
 
