@@ -54,7 +54,7 @@ The agent code calls `api.openai.com` with your API key, sending proprietary
 data to a third-party inference provider you did not approve.
 
 **With NemoClaw:**
-The inference router intercepts outbound API calls and reroutes them to a
+The privacy router intercepts outbound API calls and reroutes them to a
 backend you control --- a local model, an NVIDIA endpoint, or your own
 deployment. The agent's code does not need to change; the rerouting is
 transparent. Your data never reaches an unauthorized provider.

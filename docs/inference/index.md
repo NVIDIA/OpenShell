@@ -38,7 +38,7 @@ sequenceDiagram
     participant Code as Userland Code
     participant Proxy as Sandbox Proxy
     participant OPA as Policy Engine
-    participant Router as Inference Router
+    participant Router as Privacy Router
     participant Backend as Your Backend
 
     Code->>Proxy: CONNECT api.openai.com:443

@@ -146,14 +146,21 @@ Manage inference routes that intercept and reroute LLM API calls from userland c
 | `--protocol` | API protocol: `openai` or `anthropic`. Defaults to `openai`. |
 | `--disabled` | Create the route in a disabled state. |
 
-## Gator
+## NemoClaw Terminal
 
-`nemoclaw gator` launches a terminal dashboard that shows sandbox status, live
-logs, and policy decisions in a single view. Navigate with `j`/`k`, press `f`
-to follow live output, `s` to filter by source, and `q` to quit.
+`nemoclaw gator` launches the NemoClaw Terminal, a dashboard that shows sandbox
+status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
+press `f` to follow live output, `s` to filter by source, and `q` to quit.
 
-See {doc}`/sandboxes/gator` for the full guide — including how to read log
+See {doc}`/sandboxes/terminal` for the full guide — including how to read log
 entries, diagnose blocked connections, and interpret inference interception.
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `NEMOCLAW_CLUSTER` | Name of the cluster to operate on. Overrides the active cluster set by `nemoclaw cluster use`. |
+| `NEMOCLAW_SANDBOX_POLICY` | Default path to a policy YAML file. When set, `nemoclaw sandbox create` uses this policy if no `--policy` flag is provided. |
 
 ## Shell Completions
 

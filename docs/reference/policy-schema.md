@@ -196,7 +196,7 @@ network_policies:
 
 **Category:** Dynamic
 
-Controls which inference routing backends userland code may access. The `allowed_routes` list names route types that the inference router will accept. Traffic matching an inference API pattern that targets a route type not in this list is denied.
+Controls which inference routing backends userland code may access. The `allowed_routes` list names route types that the privacy router will accept. Traffic matching an inference API pattern that targets a route type not in this list is denied.
 
 | Field | Type | Required | Description |
 |---|---|---|---|

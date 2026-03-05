@@ -58,7 +58,7 @@ Open a second terminal and check the logs:
 $ nemoclaw sandbox logs opencode-sandbox --tail
 ```
 
-Or launch the Gator dashboard for a live view:
+Or launch the NemoClaw Terminal for a live view:
 
 ```console
 $ nemoclaw gator
@@ -213,7 +213,7 @@ The latest revision should show status `loaded`.
 
 ## Step 7: Set Up Inference Routing
 
-So far, you have allowed the opencode *agent* to reach `integrate.api.nvidia.com` directly via network policy. But what about code that opencode writes and runs inside the sandbox? If that code calls an LLM API, it goes through the inference router --- a separate mechanism.
+So far, you have allowed the opencode *agent* to reach `integrate.api.nvidia.com` directly via network policy. But what about code that opencode writes and runs inside the sandbox? If that code calls an LLM API, it goes through the privacy router --- a separate mechanism.
 
 Create an inference route so userland code can access NVIDIA models:
 

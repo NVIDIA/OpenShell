@@ -8,19 +8,19 @@
 Your agent is running inside a sandbox. You need to know: Is it working? Is
 something being blocked? Why did that API call fail?
 
-Gator is the answer. It's a terminal dashboard that shows sandbox status and
-live activity in a single view.
+NemoClaw Terminal is the answer. It's a terminal dashboard that shows sandbox
+status and live activity in a single view.
 
 ```console
 $ nemoclaw gator
 ```
 
-<!-- TODO: Add screenshot of the full Gator dashboard layout -->
-:::{figure} /_static/gator-overview.png
-:alt: Gator dashboard showing sandbox status and live logs
+<!-- TODO: Add screenshot of the full NemoClaw Terminal dashboard layout -->
+:::{figure} /_static/terminal-overview.png
+:alt: NemoClaw Terminal dashboard showing sandbox status and live logs
 :class: no-scaled-link
 
-*The Gator dashboard. Top: sandbox status. Bottom: live log stream.*
+*The NemoClaw Terminal dashboard. Top: sandbox status. Bottom: live log stream.*
 :::
 
 ## Is My Sandbox Running?
@@ -34,8 +34,8 @@ The status pane at the top shows everything about your sandbox at a glance:
 - **Port forwards** if any are active
 
 <!-- TODO: Add screenshot of the status pane -->
-:::{figure} /_static/gator-status-pane.png
-:alt: Gator status pane showing sandbox name, phase, providers, and age
+:::{figure} /_static/terminal-status-pane.png
+:alt: NemoClaw Terminal status pane showing sandbox name, phase, providers, and age
 :class: no-scaled-link
 
 *Sandbox status: name, phase, image, providers, and active port forwards.*
@@ -84,9 +84,9 @@ isn't in your network policy. You have two options:
    {doc}`/safety-and-privacy/policies` for the iteration workflow.
 2. Leave it blocked if the connection shouldn't be allowed.
 
-<!-- TODO: Add screenshot showing deny lines in Gator logs -->
-:::{figure} /_static/gator-deny-logs.png
-:alt: Gator log pane showing action=deny entries highlighted
+<!-- TODO: Add screenshot showing deny lines in NemoClaw Terminal logs -->
+:::{figure} /_static/terminal-deny-logs.png
+:alt: NemoClaw Terminal log pane showing action=deny entries highlighted
 :class: no-scaled-link
 
 *Deny entries show the blocked host, port, and the binary that attempted the connection.*
@@ -108,7 +108,7 @@ This means:
 - **But inference routing is configured** (`allowed_routes` is non-empty), so
   the proxy intercepted the call instead of denying it outright.
 - The proxy TLS-terminated the connection, detected an inference API pattern,
-  and routed it through the inference router.
+  and routed it through the privacy router.
 
 :::{note}
 If you expected these calls to go **directly** to the destination (because
@@ -123,7 +123,8 @@ how binary matching works.
 
 ## Finding What You Need
 
-Gator provides filtering and navigation to help you focus on what matters:
+The terminal dashboard provides filtering and navigation to help you focus on
+what matters:
 
 - Press **`s`** to filter logs by source — show only `sandbox` logs (policy
   decisions) or only `gateway` logs (lifecycle events).
@@ -142,7 +143,7 @@ Gator provides filtering and navigation to help you focus on what matters:
 | `f` | Toggle follow mode (auto-scroll to new entries). |
 | `s` | Open source filter (sandbox, gateway, or all). |
 | `Esc` | Return to the main view / close detail view. |
-| `q` | Quit Gator. |
+| `q` | Quit. |
 
 ## What to Do Next
 

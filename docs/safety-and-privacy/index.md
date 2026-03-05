@@ -20,7 +20,7 @@ graph TB
             fs["Filesystem — Landlock LSM"]
             net["Network — Proxy + Policy Engine"]
             proc["Process — seccomp + Unprivileged User"]
-            inf["Inference — Router"]
+            inf["Inference — Privacy Router"]
 
             subgraph sandbox["Sandbox"]
                 agent(["AI Agent"])

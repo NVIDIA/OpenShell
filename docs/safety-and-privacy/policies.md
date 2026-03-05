@@ -131,14 +131,14 @@ $ nemoclaw sandbox logs <name> --tail --source sandbox
 
 Each deny entry shows the blocked host, port, calling binary, and reason. This tells you exactly what the agent tried to reach and why it was blocked.
 
-Alternatively, run `nemoclaw gator` for a live dashboard that shows status and
-logs in a single view. See {doc}`/sandboxes/gator` for how to read log entries
-and diagnose what's being blocked.
+Alternatively, run `nemoclaw gator` for the NemoClaw Terminal, a live dashboard
+that shows status and logs in a single view. See {doc}`/sandboxes/terminal` for
+how to read log entries and diagnose what's being blocked.
 
 :::{tip}
-Gator is especially useful during policy iteration — you can watch deny entries
-appear in real time as the agent hits blocked endpoints, then push an updated
-policy without leaving the terminal.
+The NemoClaw Terminal is especially useful during policy iteration — you can
+watch deny entries appear in real time as the agent hits blocked endpoints, then
+push an updated policy without leaving the terminal.
 :::
 
 ### Step 3: Pull the current policy

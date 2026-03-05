@@ -117,7 +117,7 @@ tutorials/opencode-nvidia
 :hidden:
 
 sandboxes/create-and-manage
-sandboxes/gator
+sandboxes/terminal
 sandboxes/community-sandboxes
 sandboxes/providers
 sandboxes/custom-containers
@@ -147,7 +147,6 @@ inference/configure-routes
 
 reference/cli
 reference/policy-schema
-reference/environment-variables
 reference/architecture
 ```
 

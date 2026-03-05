@@ -102,7 +102,7 @@ $ export ANTHROPIC_API_KEY=sk-ant-...
 $ nemoclaw provider create --name my-claude --type claude --from-existing
 ```
 
-See the [Environment Variables](environment-variables.md) reference for the full list of variables each provider type expects.
+See {doc}`../sandboxes/providers` for the full list of variables each provider type expects.
 
 ### Provider not found
 
@@ -165,7 +165,7 @@ Both the endpoint and binary must match for the connection to be allowed.
 
 ### Agent calls intercepted instead of going direct
 
-**Symptom:** The agent's own API calls are being intercepted by the inference router instead of flowing directly to the API. The agent may receive responses from a different model or fail with authentication errors.
+**Symptom:** The agent's own API calls are being intercepted by the privacy router instead of flowing directly to the API. The agent may receive responses from a different model or fail with authentication errors.
 
 **Cause:** The binary path in your policy does not match the actual process executable making the connection. The proxy resolves the calling binary via `/proc/<pid>/exe`. If the resolved path does not match any binary in your `network_policies` entry, the connection falls through to inference interception.
 
@@ -185,7 +185,7 @@ Look for the `binary_path` field in intercepted connection entries. Update your 
 
 ### Inference routing not working
 
-**Symptom:** Userland code makes an inference API call but gets a 403 or the call is denied. The inference router does not intercept the request.
+**Symptom:** Userland code makes an inference API call but gets a 403 or the call is denied. The privacy router does not intercept the request.
 
 **Causes:**
 - The `allowed_routes` in the sandbox policy does not include the route's `routing_hint`.
@@ -204,9 +204,9 @@ Verify that the route's `routing_hint` appears in your sandbox policy's `inferen
 $ nemoclaw sandbox logs <name>
 ```
 
-## Gator Issues
+## NemoClaw Terminal Issues
 
-### Gator shows no logs
+### Terminal shows no logs
 
 **Symptom:** `nemoclaw gator` launches but displays no log entries.
 
@@ -218,4 +218,4 @@ $ nemoclaw sandbox logs <name>
 $ nemoclaw sandbox get <name>
 ```
 
-If the sandbox is in `Provisioning`, wait for it to reach `Ready`. If no sandboxes exist, create one first. Gator displays logs from all active sandboxes in the cluster.
+If the sandbox is in `Provisioning`, wait for it to reach `Ready`. If no sandboxes exist, create one first. The NemoClaw Terminal displays logs from all active sandboxes in the cluster.

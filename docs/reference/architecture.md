@@ -5,21 +5,16 @@
 
 # Architecture
 
-System architecture and component internals for the NemoClaw runtime. This page is for advanced users who need to understand what runs where, how components interact, and how to deploy to remote hosts.
-
-## System Overview
-
-NemoClaw runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker container. All components run within this container. Sandboxes are Kubernetes pods managed by the NemoClaw control plane.
-
-The system has five core components:
+NemoClaw runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker
+container. Sandboxes are Kubernetes pods managed by the NemoClaw control plane.
+The system has four core components.
 
 | Component | Role |
 |---|---|
-| **Gateway** | gRPC control plane. Manages sandbox lifecycle, stores provider credentials, distributes policies, and terminates SSH tunnels. |
-| **Sandbox Supervisor** | Per-sandbox process that sets up isolation (Landlock, seccomp, network namespace), runs the proxy and SSH server, and fetches credentials from the gateway at startup. |
-| **HTTP CONNECT Proxy** | Per-sandbox proxy in the sandbox's network namespace. Evaluates OPA policy for every outbound connection. Supports L4 passthrough and L7 inspection with TLS termination. |
-| **OPA Engine** | Embedded [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/) policy evaluator. The proxy queries it on each connection to determine allow, deny, or inspect-for-inference. |
-| **Inference Router** | Intercepts outbound LLM API calls that do not match any network policy, strips credentials, and reroutes them to operator-configured backends. |
+| **Gateway** | Control-plane API that coordinates sandbox lifecycle and state, acts as the auth boundary, and brokers requests across the platform. |
+| **Sandbox** | Isolated runtime that includes container supervision and general L7 egress routing. |
+| **Policy Engine** | Policy definition and enforcement layer for filesystem, network, and process constraints. Defense in depth enforces policies from the application layer down to infrastructure and kernel layers. |
+| **Privacy Router** | Privacy-aware LLM routing layer that keeps sensitive context on sandbox compute and routes based on cost/privacy policy. |
 
 ## Component Diagram
 
@@ -27,28 +22,29 @@ The system has five core components:
 graph TB
     subgraph docker["Docker Container"]
         subgraph k3s["k3s Cluster"]
-            gw["Gateway<br/>(gRPC + DB)"]
+            gw["Gateway"]
+            pr["Privacy Router"]
 
-            subgraph pod1["Sandbox Pod"]
+            subgraph pod1["Sandbox"]
                 sup1["Supervisor"]
-                proxy1["Proxy + OPA"]
-                ssh1["SSH Server"]
-                agent1["Agent Process"]
+                proxy1["L7 Proxy"]
+                pe1["Policy Engine"]
+                agent1["Agent"]
 
                 sup1 --> proxy1
-                sup1 --> ssh1
                 sup1 --> agent1
+                proxy1 --> pe1
             end
 
-            subgraph pod2["Sandbox Pod"]
+            subgraph pod2["Sandbox"]
                 sup2["Supervisor"]
-                proxy2["Proxy + OPA"]
-                ssh2["SSH Server"]
-                agent2["Agent Process"]
+                proxy2["L7 Proxy"]
+                pe2["Policy Engine"]
+                agent2["Agent"]
 
                 sup2 --> proxy2
-                sup2 --> ssh2
                 sup2 --> agent2
+                proxy2 --> pe2
             end
 
             gw -- "credentials,<br/>policies" --> sup1
@@ -57,83 +53,105 @@ graph TB
     end
 
     cli["nemoclaw CLI"] -- "gRPC" --> gw
-    user["User"] -- "SSH" --> ssh1
-    user -- "SSH" --> ssh2
     agent1 -- "all outbound<br/>traffic" --> proxy1
     agent2 -- "all outbound<br/>traffic" --> proxy2
-    proxy1 -- "allowed / routed<br/>traffic" --> internet["External Services"]
-    proxy2 -- "allowed / routed<br/>traffic" --> internet
+    proxy1 -- "policy-approved<br/>traffic" --> internet["External Services"]
+    proxy2 -- "policy-approved<br/>traffic" --> internet
+    proxy1 -- "inference traffic" --> pr
+    proxy2 -- "inference traffic" --> pr
+    pr -- "routed requests" --> backend["LLM Backend"]
 ```
 
 ## Gateway
 
-The gateway is the central control plane. It exposes a gRPC API consumed by the CLI and handles:
+The gateway is the central control-plane API. It coordinates sandbox lifecycle
+and state, acts as the auth boundary, and brokers all requests across the
+platform. It exposes a gRPC API consumed by the CLI and handles:
 
-| Responsibility | Detail |
-|---|---|
-| Sandbox lifecycle | Creates, monitors, and deletes sandbox pods in the k3s cluster. |
-| Provider storage | Stores encrypted provider credentials in its embedded database. |
-| Policy distribution | Delivers policy YAML to sandbox supervisors at startup and on hot-reload. |
-| SSH termination | Terminates SSH tunnels from the CLI and routes them to the correct sandbox pod. |
+- Sandbox lifecycle --- creates, monitors, and deletes sandbox pods.
+- Provider storage --- stores encrypted provider credentials.
+- Policy distribution --- delivers policy YAML to sandboxes at startup and on
+  hot-reload.
+- SSH termination --- terminates SSH tunnels from the CLI and routes them to
+  the correct sandbox.
 
-The CLI never talks to sandbox pods directly. All commands go through the gateway.
+The CLI never talks to sandbox pods directly. All commands go through the
+gateway.
 
-## Sandbox Supervisor
+## Sandbox
 
-Each sandbox pod runs a supervisor process as its init process. The supervisor is responsible for establishing all isolation boundaries before starting the agent.
+Each sandbox is an isolated runtime that includes container supervision and
+general L7 egress routing. It runs as a Kubernetes pod containing a supervisor
+process, an L7 proxy, and the agent.
 
-Startup sequence:
+### Supervisor
+
+The supervisor is the sandbox's init process. It establishes all isolation
+boundaries before starting the agent:
 
 1. **Fetch credentials** from the gateway for all attached providers.
-2. **Set up the network namespace.** The sandbox gets its own network stack with no default route to the outside world. All outbound traffic is redirected through the proxy via iptables rules.
-3. **Apply Landlock** filesystem restrictions based on the policy's `filesystem_policy`.
+2. **Set up the network namespace.** The sandbox gets its own network stack
+   with no default route. All outbound traffic is redirected through the proxy.
+3. **Apply Landlock** filesystem restrictions based on the policy.
 4. **Apply seccomp** filters to restrict available system calls.
-5. **Start the proxy** in the sandbox's network namespace.
+5. **Start the L7 proxy** in the sandbox's network namespace.
 6. **Start the SSH server** for interactive access.
-7. **Start the agent** as a child process running as the configured user and group, with credentials injected as environment variables.
+7. **Start the agent** as a child process with credentials injected as
+   environment variables.
 
-The supervisor continues running for the lifetime of the sandbox. It monitors the agent process, handles policy hot-reloads from the gateway, and manages the proxy and SSH server.
+### L7 Proxy
 
-## Proxy
+Every outbound TCP connection from any process in the sandbox is routed through
+the proxy. For each connection, the proxy:
 
-The proxy runs inside each sandbox's network namespace. Every outbound TCP connection from any process in the sandbox is routed through the proxy via iptables redirection.
+1. **Resolves the calling binary** via `/proc/<pid>/exe`, ancestor process
+   walking, and `/proc/<pid>/cmdline`.
+2. **Queries the policy engine** with the destination host, port, and resolved
+   binary path.
+3. **Acts on the decision** --- allow the connection directly, hand it to the
+   privacy router for inference routing, or deny it. See
+   [How the Proxy Evaluates Connections](../safety-and-privacy/network-access-rules.md#how-the-proxy-evaluates-connections)
+   for the full decision model.
 
-For each connection, the proxy:
+For endpoints configured with `protocol: rest` and `tls: terminate`, the proxy
+performs full L7 inspection: it decrypts TLS, reads the HTTP method and path,
+evaluates access rules, then re-encrypts and forwards the request.
 
-1. **Resolves the calling binary** by reading `/proc/<pid>/exe` for the socket owner, walking ancestor processes, and checking `/proc/<pid>/cmdline` for interpreted languages.
-2. **Queries the OPA engine** with the destination host, port, and resolved binary path.
-3. **Acts on the policy decision:**
+## Policy Engine
 
-| Decision | Action |
-|---|---|
-| **Allow** | Forward the connection directly to the destination. |
-| **InspectForInference** | TLS-terminate the connection, inspect the HTTP request, and hand it to the inference router if it matches a known API pattern. Deny if it does not match. |
-| **Deny** | Block the connection. Return HTTP 403 or reset the TCP connection. |
+The policy engine is the definition and enforcement layer for filesystem,
+network, and process constraints. Defense in depth enforces policies from the
+application layer down to infrastructure and kernel layers.
 
-For endpoints configured with `protocol: rest` and `tls: terminate`, the proxy performs full L7 inspection: it decrypts TLS, reads the HTTP method and path, evaluates `access` or `rules`, then re-encrypts and forwards the request.
+The engine evaluates policies compiled from the sandbox's policy YAML. It is
+queried synchronously by the proxy on every outbound connection. Policy updates
+delivered via hot-reload are compiled and loaded without restarting the proxy.
 
-## OPA Engine
+## Privacy Router
 
-The OPA engine is embedded in the proxy process. It evaluates [Rego](https://www.openpolicyagent.org/docs/latest/policy-language/) policies compiled from the sandbox's policy YAML. The engine is queried synchronously on every outbound connection.
+The privacy router is a privacy-aware LLM routing layer that keeps sensitive
+context on sandbox compute and routes based on cost/privacy policy.
 
-Policy updates delivered via hot-reload are compiled into Rego and loaded into the engine without restarting the proxy.
-
-## Inference Router
-
-The inference router handles connections that the OPA engine marks as `InspectForInference`. It:
+When the policy engine determines that a connection should be inspected for
+inference, the privacy router:
 
 1. Reads the intercepted HTTP request.
-2. Checks whether the method and path match a recognized inference API pattern (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`).
-3. Selects a route whose `routing_hint` appears in the sandbox policy's `allowed_routes`.
+2. Checks whether the method and path match a recognized inference API pattern
+   (`/v1/chat/completions`, `/v1/completions`, `/v1/messages`).
+3. Selects a route whose `routing_hint` appears in the sandbox policy's
+   `allowed_routes`.
 4. Strips the original authorization header.
 5. Injects the route's API key and model ID.
 6. Forwards the request to the route's backend URL.
 
-The router refreshes its route list periodically from the gateway, so routes created with `nemoclaw inference create` become available without restarting sandboxes.
+The router refreshes its route list periodically from the gateway, so routes
+created with `nemoclaw inference create` become available without restarting
+sandboxes.
 
 ## Remote Deployment
 
-NemoClaw can deploy the cluster to a remote host via SSH. This is useful for shared team environments or running sandboxes on machines with more resources.
+NemoClaw can deploy the cluster to a remote host via SSH. This is useful for
+shared team environments or running sandboxes on machines with more resources.
 
 ### Deploy
 
@@ -141,18 +159,24 @@ NemoClaw can deploy the cluster to a remote host via SSH. This is useful for sha
 $ nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
-The CLI connects to the remote machine over SSH, installs k3s, deploys the NemoClaw control plane, and registers the cluster locally. The remote machine needs Docker installed.
+The CLI connects to the remote machine over SSH, installs k3s, deploys the
+NemoClaw control plane, and registers the cluster locally. The remote machine
+needs Docker installed.
 
 ### Tunnel
 
-After deploying to a remote host, set up a tunnel for kubectl access:
+After deploying to a remote host, set up a tunnel for CLI access:
 
 ```console
 $ nemoclaw cluster admin tunnel
 ```
 
-This establishes an SSH tunnel from your local machine to the remote cluster's API server. All subsequent CLI commands route through this tunnel transparently.
+This establishes an SSH tunnel from your local machine to the remote cluster's
+API server. All subsequent CLI commands route through this tunnel transparently.
 
 ### Remote Architecture
 
-The architecture is identical to a local deployment. The only difference is that the Docker container runs on the remote host instead of your workstation. The CLI communicates with the gateway over the SSH tunnel. Sandbox SSH connections are also tunneled through the gateway.
+The architecture is identical to a local deployment. The only difference is
+that the Docker container runs on the remote host instead of your workstation.
+The CLI communicates with the gateway over the SSH tunnel. Sandbox SSH
+connections are also tunneled through the gateway.

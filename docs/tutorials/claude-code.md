@@ -72,13 +72,13 @@ List all sandboxes:
 $ nemoclaw sandbox list
 ```
 
-For a live dashboard view, launch Gator:
+For a live dashboard view, launch the NemoClaw Terminal:
 
 ```console
 $ nemoclaw gator
 ```
 
-Gator shows sandbox status, active network connections, and policy decisions in real time.
+The terminal dashboard shows sandbox status, active network connections, and policy decisions in real time.
 
 ## Step 5: Connect from VS Code
 
