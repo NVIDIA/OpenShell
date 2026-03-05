@@ -950,9 +950,14 @@ Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegat
 Resolves user/group names from policy, then:
 1. `initgroups()` to set supplementary groups (Linux only, not macOS)
 2. `setgid()` to target group
-3. `setuid()` to target user
+3. Verify `getegid()` matches the target GID
+4. `setuid()` to target user
+5. Verify `geteuid()` matches the target UID
+6. Verify `setuid(0)` fails (confirms root cannot be re-acquired)
 
 The ordering is significant: `initgroups`/`setgid` must happen before `setuid` because switching user may drop the privileges needed for group manipulation. Similarly, privilege dropping must happen before Landlock because Landlock may block access to `/etc/passwd` and `/etc/group`.
+
+Steps 3, 5, and 6 are defense-in-depth post-condition checks (CWE-250 / CERT POS37-C). All three syscalls (`geteuid`, `getegid`, `setuid`) are async-signal-safe, so they are safe to call in the `pre_exec` context. The checks add negligible overhead while guarding against hypothetical kernel-level defects that could cause `setuid`/`setgid` to return success without actually changing the effective IDs.
 
 ### `ProcessStatus`
 
