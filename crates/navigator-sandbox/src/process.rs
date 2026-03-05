@@ -408,8 +408,39 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
 
     nix::unistd::setgid(group.gid).into_diagnostic()?;
 
+    // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
+    let effective_gid = nix::unistd::getegid();
+    if effective_gid != group.gid {
+        return Err(miette::miette!(
+            "Privilege drop verification failed: expected effective GID {}, got {}",
+            group.gid,
+            effective_gid
+        ));
+    }
+
     if user_name.is_some() {
         nix::unistd::setuid(user.uid).into_diagnostic()?;
+
+        // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
+        let effective_uid = nix::unistd::geteuid();
+        if effective_uid != user.uid {
+            return Err(miette::miette!(
+                "Privilege drop verification failed: expected effective UID {}, got {}",
+                user.uid,
+                effective_uid
+            ));
+        }
+
+        // Verify root cannot be re-acquired (CERT POS37-C hardening).
+        // If we dropped from root, setuid(0) must fail; success means privileges
+        // were not fully relinquished.
+        if nix::unistd::setuid(nix::unistd::Uid::from_raw(0)).is_ok() && user.uid.as_raw() != 0 {
+            return Err(miette::miette!(
+                "Privilege drop verification failed: process can still re-acquire root (UID 0) \
+                 after switching to UID {}",
+                user.uid
+            ));
+        }
     }
 
     Ok(())
@@ -462,5 +493,94 @@ impl From<std::process::ExitStatus> for ProcessStatus {
                 signal: None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::{
+        FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
+    };
+
+    /// Helper to create a minimal `SandboxPolicy` with the given process policy.
+    fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process,
+        }
+    }
+
+    #[test]
+    fn drop_privileges_noop_when_no_user_or_group() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+        assert!(drop_privileges(&policy).is_ok());
+    }
+
+    #[test]
+    fn drop_privileges_noop_when_empty_strings() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(String::new()),
+            run_as_group: Some(String::new()),
+        });
+        assert!(drop_privileges(&policy).is_ok());
+    }
+
+    #[test]
+    fn drop_privileges_succeeds_for_current_user() {
+        // Resolve the current user's name so we can ask drop_privileges to
+        // "switch" to the user we're already running as.  This exercises the
+        // full verification path (getegid/geteuid checks) without needing root.
+        let current_user = User::from_uid(nix::unistd::geteuid())
+            .expect("getpwuid")
+            .expect("current user entry");
+        let current_group = Group::from_gid(nix::unistd::getegid())
+            .expect("getgrgid")
+            .expect("current group entry");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: Some(current_group.name),
+        });
+
+        assert!(drop_privileges(&policy).is_ok());
+    }
+
+    #[test]
+    fn drop_privileges_fails_for_nonexistent_user() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some("__nonexistent_test_user_42__".to_string()),
+            run_as_group: None,
+        });
+
+        let result = drop_privileges(&policy);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' in error: {msg}"
+        );
+    }
+
+    #[test]
+    fn drop_privileges_fails_for_nonexistent_group() {
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: Some("__nonexistent_test_group_42__".to_string()),
+        });
+
+        let result = drop_privileges(&policy);
+        assert!(result.is_err());
+        let msg = format!("{}", result.unwrap_err());
+        assert!(
+            msg.contains("not found"),
+            "expected 'not found' in error: {msg}"
+        );
     }
 }

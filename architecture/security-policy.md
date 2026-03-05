@@ -364,9 +364,12 @@ Controls privilege dropping for the sandboxed process. **Static field** -- immut
 
 1. `initgroups()` -- set supplementary groups for the target user
 2. `setgid()` -- switch to the target group
-3. `setuid()` -- switch to the target user
+3. Verify `getegid()` matches the target GID (defense-in-depth, CWE-250 / CERT POS37-C)
+4. `setuid()` -- switch to the target user
+5. Verify `geteuid()` matches the target UID
+6. Verify `setuid(0)` fails -- confirms root cannot be re-acquired
 
-This happens before Landlock and seccomp are applied because `initgroups` needs access to `/etc/group` and `/etc/passwd`, which Landlock may subsequently block. See `crates/navigator-sandbox/src/process.rs` -- `drop_privileges()`.
+This happens before Landlock and seccomp are applied because `initgroups` needs access to `/etc/group` and `/etc/passwd`, which Landlock may subsequently block. The post-condition checks (steps 3, 5, 6) are async-signal-safe and add negligible overhead while guarding against hypothetical kernel-level defects. See `crates/navigator-sandbox/src/process.rs` -- `drop_privileges()`.
 
 ```yaml
 process:
