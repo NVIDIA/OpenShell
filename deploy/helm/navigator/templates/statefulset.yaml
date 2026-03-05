@@ -58,6 +58,8 @@ spec:
             - name: NEMOCLAW_SSH_GATEWAY_PORT
               value: {{ .Values.server.sshGatewayPort | quote }}
             {{- end }}
+            - name: NEMOCLAW_SSH_HANDSHAKE_SECRET
+              value: {{ required "server.sshHandshakeSecret is required" .Values.server.sshHandshakeSecret | quote }}
             - name: NEMOCLAW_TLS_CERT
               value: /etc/navigator-tls/server/tls.crt
             - name: NEMOCLAW_TLS_KEY

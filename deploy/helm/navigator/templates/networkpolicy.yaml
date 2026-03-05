@@ -1,0 +1,32 @@
+{{- if .Values.networkPolicy.enabled }}
+# NetworkPolicy restricting SSH ingress on sandbox pods to the gateway pod.
+# Sandbox pods are dynamically created by the server and labelled with
+# navigator.ai/managed-by=navigator. This policy ensures only the gateway
+# (navigator server) pod can reach the sandbox SSH port (2222), blocking
+# lateral movement from other in-cluster workloads.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "navigator.fullname" . }}-sandbox-ssh
+  namespace: {{ .Values.server.sandboxNamespace }}
+  labels:
+    {{- include "navigator.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      navigator.ai/managed-by: navigator
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: {{ include "navigator.name" . }}
+              app.kubernetes.io/instance: {{ .Release.Name }}
+      ports:
+        - protocol: TCP
+          port: 2222
+{{- end }}

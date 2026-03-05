@@ -915,9 +915,7 @@ fn apply_required_env(
     if !ssh_listen_addr.is_empty() {
         upsert_env(env, "NEMOCLAW_SSH_LISTEN_ADDR", ssh_listen_addr);
     }
-    if !ssh_handshake_secret.is_empty() {
-        upsert_env(env, "NEMOCLAW_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
-    }
+    upsert_env(env, "NEMOCLAW_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
     upsert_env(
         env,
         "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS",
@@ -1218,5 +1216,30 @@ mod tests {
         });
 
         assert_eq!(derive_phase(&status, false), SandboxPhase::Ready);
+    }
+
+    #[test]
+    fn apply_required_env_always_injects_ssh_handshake_secret() {
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "0.0.0.0:2222",
+            "my-secret-value",
+            300,
+        );
+
+        let secret_entry = env
+            .iter()
+            .find(|e| {
+                e.get("name").and_then(|v| v.as_str()) == Some("NEMOCLAW_SSH_HANDSHAKE_SECRET")
+            })
+            .expect("NEMOCLAW_SSH_HANDSHAKE_SECRET must be present in env");
+        assert_eq!(
+            secret_entry.get("value").and_then(|v| v.as_str()),
+            Some("my-secret-value")
+        );
     }
 }

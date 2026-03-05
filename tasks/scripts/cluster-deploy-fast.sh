@@ -379,6 +379,13 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   # terminates mTLS (there is no server.tls.enabled toggle). Without this,
   # a prior Helm override or chart default change could silently regress
   # sandbox callbacks to plaintext.
+  # Retrieve the existing handshake secret from the running release, or generate
+  # a new one if this is the first deploy with the mandatory secret.
+  EXISTING_SECRET=$(helm get values navigator -n navigator -o json 2>/dev/null \
+    | grep -o '"sshHandshakeSecret":"[^"]*"' \
+    | cut -d'"' -f4) || true
+  SSH_HANDSHAKE_SECRET="${EXISTING_SECRET:-$(openssl rand -hex 32)}"
+
   helm upgrade navigator deploy/helm/navigator \
     --namespace navigator \
     --set image.repository=${IMAGE_REPO_BASE}/server \
@@ -389,6 +396,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.certSecretName=navigator-server-tls \
     --set server.tls.clientCaSecretName=navigator-server-client-ca \
     --set server.tls.clientTlsSecretName=navigator-client-tls \
+    --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
     "${helm_wait_args[@]}"
   helm_end=$(date +%s)
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"
