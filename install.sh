@@ -8,13 +8,13 @@
 #   curl -fsSL https://raw.githubusercontent.com/NVIDIA/NemoClaw/main/install.sh | sh
 #
 # Environment variables:
-#   NEMOCLAW_VERSION    - Release tag to install (default: "snapshot")
+#   NEMOCLAW_VERSION    - Release tag to install (default: "devel")
 #   NEMOCLAW_INSTALL_DIR - Directory to install into (default: /usr/local/bin)
 #
 set -eu
 
 REPO="NVIDIA/NemoClaw"
-VERSION="${NEMOCLAW_VERSION:-snapshot}"
+VERSION="${NEMOCLAW_VERSION:-devel}"
 INSTALL_DIR="${NEMOCLAW_INSTALL_DIR:-/usr/local/bin}"
 
 info() {
