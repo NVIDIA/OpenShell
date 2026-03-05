@@ -9,7 +9,7 @@ This walkthrough takes you from a fresh install to an interactive sandbox sessio
 
 ## Step 1: Bootstrap a Cluster
 
-If you don't have a cluster running yet:
+NemoClaw runs sandboxes on a lightweight Kubernetes cluster. If you don't have a cluster running yet, deploy one with a single command.
 
 ```console
 $ nemoclaw cluster admin deploy
@@ -24,6 +24,8 @@ $ nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 ### Verify the Cluster
+
+Check that the cluster is running and healthy before you continue.
 
 ```console
 $ nemoclaw cluster status
@@ -59,6 +61,8 @@ This creates a sandbox with defaults, auto-discovers and uploads your Claude cre
 
 ### With More Options
 
+You can name the sandbox, attach multiple providers, and sync your local project files in a single command.
+
 ```console
 $ nemoclaw sandbox create \
   --name my-sandbox \
@@ -90,7 +94,7 @@ The sandbox enforces its safety and privacy policy:
 
 ## Step 5: Connect from Another Terminal
 
-If you exited the sandbox or want a second session:
+You can reconnect to a running sandbox at any time. This is useful if you closed your terminal or need a second session.
 
 ```console
 $ nemoclaw sandbox connect my-sandbox
@@ -106,11 +110,15 @@ Then connect via VS Code's Remote-SSH extension to the host `my-sandbox`.
 
 ## Step 6: Clean Up
 
+Delete the sandbox when you are finished to free cluster resources.
+
 ```console
 $ nemoclaw sandbox delete my-sandbox
 ```
 
 ## Next Steps
+
+Now that you have a working sandbox, explore these areas to go further.
 
 - [Sandboxes](../sandboxes/index.md) — full sandbox lifecycle management.
 - [Providers](../sandboxes/providers.md) — managing credentials.

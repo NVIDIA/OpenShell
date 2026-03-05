@@ -5,12 +5,18 @@
 
 # Installation
 
+Install the NemoClaw CLI to create and manage sandboxes from your terminal.
+
 ## Prerequisites
+
+Confirm that the following dependencies are available on your machine before you install the CLI.
 
 - **Docker** — must be installed and running. This is the only runtime dependency.
 - **Python 3.12+** — required for `pip install`.
 
 ## Install the CLI
+
+Install the latest release from PyPI.
 
 ```console
 $ pip install nemoclaw
@@ -19,6 +25,8 @@ $ pip install nemoclaw
 This installs the `nemoclaw` command (also available as `ncl`).
 
 ### Verify the Installation
+
+Run the help command to confirm that the CLI is on your path and working.
 
 ```console
 $ nemoclaw --help

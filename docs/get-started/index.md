@@ -1,50 +1,100 @@
+---
+title:
+  page: "About Getting Started with NemoClaw"
+  nav: "About Getting Started"
+  card: "About Getting Started"
+description: "Install the CLI, bootstrap a cluster, and launch your first sandbox in minutes."
+topics:
+- Get Started
+tags:
+- Installation
+- Quickstart
+- Sandbox
+- CLI
+content:
+  type: get_started
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - ai_engineer
+  - devops
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# About Getting Started
+# About Getting Started with NemoClaw
 
-NemoClaw is designed for minimal setup with safety and privacy built in from the start. Docker is the only prerequisite.
+NemoClaw is designed for minimal setup with safety and privacy built in from the start. Docker is the only prerequisite. Three commands take you from zero to a running, policy-enforced sandbox.
 
-## Quickstart
+::::{grid} 1 1 2 2
+:gutter: 3
 
-**Step 1: Install the CLI.**
+:::{grid-item-card} Installation
+:link: installation
+:link-type: doc
 
-```console
-$ pip install nemoclaw
-```
+Prerequisites, install methods, shell completions, and verification steps for the NemoClaw CLI.
++++
+{bdg-secondary}`Get Started`
+:::
 
-See [Installation](installation.md) for detailed prerequisites and alternative install methods.
+:::{grid-item-card} Your First Sandbox
+:link: first-sandbox
+:link-type: doc
 
-**Step 2: Create a sandbox.**
+Step-by-step walkthrough from cluster bootstrap to an interactive sandbox session with policy enforcement.
++++
+{bdg-secondary}`Tutorial`
+:::
 
-```console
-$ nemoclaw sandbox create -- claude
-```
+::::
 
-If no cluster exists, the CLI automatically bootstraps one. It provisions a local Kubernetes cluster inside a Docker container, discovers your AI provider credentials from local configuration files, uploads them to the gateway, and launches a sandbox — all from a single command.
-
-**Step 3: Connect to a running sandbox.**
-
-```console
-$ nemoclaw sandbox connect <sandbox-name>
-```
-
-This opens an interactive SSH session into the sandbox, with all provider credentials available as environment variables.
-
-## What Happens Under the Hood
-
-When you run `nemoclaw sandbox create -- claude`, the CLI:
-
-1. Checks for a running cluster. If none exists, it bootstraps one automatically (a k3s cluster inside a Docker container).
-2. Scans your local machine for Claude credentials (`ANTHROPIC_API_KEY`, `~/.claude.json`, etc.) and uploads them to the gateway as a provider.
-3. Creates a sandbox pod with the default policy and attaches the discovered provider.
-4. Waits for the sandbox to reach `Ready` state.
-5. Opens an interactive SSH session into the sandbox.
+---
 
 ## Next Steps
 
-- [Installation](installation.md) — detailed prerequisites and install methods.
-- [Your First Sandbox](first-sandbox.md) — a step-by-step walkthrough.
-- [Sandboxes](../sandboxes/index.md) — full sandbox management guide.
+After you have a sandbox running, explore the following areas.
+
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} Sandboxes
+:link: ../sandboxes/index
+:link-type: doc
+
+Create, connect to, and manage sandboxes. Configure providers, sync files, forward ports, and bring your own containers.
++++
+{bdg-secondary}`How To`
+:::
+
+:::{grid-item-card} Safety and Privacy
+:link: ../security/index
+:link-type: doc
+
+Understand how NemoClaw keeps your data safe and private — and write policies that control filesystem, network, and inference access.
++++
+{bdg-secondary}`Concept`
+:::
+
+:::{grid-item-card} Inference Routing
+:link: ../inference/index
+:link-type: doc
+
+Route AI API calls to local or self-hosted backends without modifying agent code.
++++
+{bdg-secondary}`How To`
+:::
+
+:::{grid-item-card} Reference
+:link: ../reference/index
+:link-type: doc
+
+CLI command reference, policy schema, environment variables, and system architecture diagrams.
++++
+{bdg-secondary}`Reference`
+:::
+
+::::
