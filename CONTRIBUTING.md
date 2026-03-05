@@ -2,67 +2,116 @@
 
 ## Prerequisites
 
-Install [mise](https://mise.jdx.dev/). This is used to set up the development environment.
+Install [mise](https://mise.jdx.dev/). This is used to setup the development environment.
 
 ```bash
 # Install mise (macOS/Linux)
 curl https://mise.run | sh
 ```
 
-After installing `mise`, activate it with `mise activate` or [add it to your shell](https://mise.jdx.dev/getting-started.html).
 
-Shell setup examples:
+After installing `mise` be sure to activate the environment by running `mise activate` or [add it to your shell](https://mise.jdx.dev/getting-started.html).
+
+Shell installation examples:
+
+Fish:
 
 ```bash
-# Fish
 echo '~/.local/bin/mise activate fish | source' >> ~/.config/fish/config.fish
+```
 
-# Zsh
+Zsh (Mac OS Default):
+
+```bash
 echo 'eval "$(~/.local/bin/mise activate zsh)"' >> ~/.zshrc
 ```
 
-Project requirements:
+Project uses Rust 1.88+ and Python 3.12+. Docker must be running for cluster and sandbox workflows.
 
-- Rust 1.88+
-- Python 3.12+
-- Docker (running)
+## Developer Certificate of Origin (DCO)
 
-## Getting Started
+All contributions to this project must include a `Signed-off-by` line in the commit message, certifying that you wrote or have the right to submit the code under the project's open-source license. This is the [Developer Certificate of Origin (DCO)](https://developercertificate.org/).
+
+Add the sign-off automatically with `git commit -s`:
 
 ```bash
-# One-time trust
+git commit -s -m "feat(sandbox): add new capability"
+```
+
+This appends a line like:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+A DCO check runs on every pull request and will fail if any commit is missing the sign-off.
+
+## License Headers
+
+All source files must include an SPDX copyright header. Use the license header script to add or check headers:
+
+```bash
+# Add/update headers on all source files
+mise run license:update
+
+# Check that all files have headers (runs in CI and pre-commit)
+mise run license:check
+```
+
+## Getting started
+
+```bash
+# Trust the project config (one-time)
 mise trust
 
-# Launch a sandbox (deploys a cluster if one isn't running)
-mise run sandbox
+# Fast local cluster recreate (reuses prebuilt images)
+mise run cluster
+
+# Build images and deploy (recommended for CI/first setup)
+mise run cluster:build
+
+# Create a sandbox with Claude (or opencode / codex)
+nemoclaw sandbox create -- claude
 ```
 
-## `nemoclaw` Shortcut
+Note: `nemoclaw` builds the CLI from source on first run, which takes several minutes while Rust compiles. Subsequent runs are fast.
 
-Inside this repository, `nemoclaw` is a local shortcut script at `scripts/bin/nemoclaw`. The script will
-
-1. Builds `navigator-cli` if needed.
-2. Runs the local debug CLI binary (`target/debug/nemoclaw`).
-
-Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `nemoclaw` directly from the repo.
+### Other useful commands
 
 ```bash
-nemoclaw --help
-nemoclaw sandbox create -- codex
+nemoclaw --help                   # CLI help
+mise build                        # Debug build (without running)
+mise test                         # Run all project tests
+mise run sandbox                  # Run sandbox container interactively
 ```
 
-## Main Tasks
+## Shell Completions
 
-These are the primary `mise` tasks for day-to-day development:
+The CLI supports dynamic shell completions. Run `nemoclaw completions --help` for full per-shell setup instructions.
 
-| Task               | Purpose                                                 |
-| ------------------ | ------------------------------------------------------- |
-| `mise run cluster` | Bootstrap or incremental deploy                         |
-| `mise run sandbox` | Create a sandbox on the running cluster                 |
-| `mise run test`    | Default test suite                                      |
-| `mise run e2e`     | Default end-to-end test lane                            |
-| `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
-| `mise run clean`   | Clean build artifacts                                   |
+## Sandbox SSH access
+
+To connect to a running sandbox with SSH, use:
+
+```bash
+nemoclaw sandbox connect <sandbox-id>
+```
+
+To forward a local port into a sandbox (e.g., port 18789):
+
+```bash
+nemoclaw sandbox forward start 18789 <sandbox-name>
+```
+
+This opens a local SSH tunnel so connections to `127.0.0.1:18789` on the host
+are forwarded to `127.0.0.1:18789` inside the sandbox. The command stays
+attached until interrupted (Ctrl+C). Add `-d` to run in the background.
+
+Relevant environment variables:
+
+- `NEMOCLAW_SSH_GATEWAY_HOST`, `NEMOCLAW_SSH_GATEWAY_PORT`, `NEMOCLAW_SSH_CONNECT_PATH`
+- `NEMOCLAW_SANDBOX_SSH_PORT`, `NEMOCLAW_SSH_HANDSHAKE_SECRET`, `NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS`
+- `NEMOCLAW_SSH_LISTEN_ADDR` (set inside sandbox pods)
 
 ## Project Structure
 
@@ -137,59 +186,44 @@ mise run sandbox         # Run sandbox container with interactive shell
 
 ### Custom Container Images
 
-Use `--from` to run a sandbox with any Linux container image, a community sandbox, or a
-local Dockerfile:
+Use `--image` to run a sandbox with any Linux container image:
 
 ```bash
-# Use a community sandbox image
-ncl sandbox create --from openclaw
-
 # Run an interactive shell in an Ubuntu sandbox
-ncl sandbox create --from ubuntu:24.04
+nemoclaw sandbox create --image ubuntu:24.04
 
 # Run a command in a custom image
-ncl sandbox create --from python:3.12-slim -- python3 -c "print('hello')"
+nemoclaw sandbox create --image python:3.12-slim -- python3 -c "print('hello')"
 
 # Sync local files and run in a custom image
-ncl sandbox create --from node:22 --sync -- npm test
-
-# Build from a local Dockerfile in one step
-ncl sandbox create --from ./Dockerfile
-
-# Build from a directory containing a Dockerfile
-ncl sandbox create --from ./my-sandbox/
+nemoclaw sandbox create --image node:22 --sync -- npm test
 ```
-
-The `--from` flag accepts community sandbox names (e.g., `openclaw`), paths to Dockerfiles
-or directories, and full container image references. See `architecture/sandbox-custom-containers.md`
-for the full resolution heuristic.
 
 The supervisor binary is side-loaded from the standard sandbox image via a Kubernetes init
 container. The default `run_as_user`/`run_as_group` policy is cleared for custom images to
 avoid failures on images that lack the `sandbox` user. See `architecture/sandbox.md` for
 details on the bootstrap flow and constraints.
 
-#### Building and Pushing Custom Images (Manual Two-Step)
+#### Building and Pushing Custom Images
 
-Use `ncl sandbox image push` to build a Dockerfile and push the resulting image into the
-cluster's containerd runtime separately (the `--from` flag does this automatically for
-Dockerfile paths):
+Use `nemoclaw sandbox image push` to build a Dockerfile and push the resulting image into the
+cluster's containerd runtime so it can be used with `--image`:
 
 ```bash
 # Build and push from a Dockerfile
-ncl sandbox image push --dockerfile ./Dockerfile
+nemoclaw sandbox image push --dockerfile ./Dockerfile
 
 # Specify a custom tag
-ncl sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
 
 # Specify a build context directory
-ncl sandbox image push --dockerfile ./build/Dockerfile --context ./build
+nemoclaw sandbox image push --dockerfile ./build/Dockerfile --context ./build
 
 # Pass build arguments
-ncl sandbox image push --dockerfile ./Dockerfile --build-arg PYTHON_VERSION=3.12
+nemoclaw sandbox image push --dockerfile ./Dockerfile --build-arg PYTHON_VERSION=3.12
 
 # Use the pushed image
-ncl sandbox create --from my-sandbox:latest
+nemoclaw sandbox create --image my-sandbox:latest
 ```
 
 The command builds the image using the local Docker daemon and pushes it into the cluster
@@ -266,20 +300,20 @@ export IMAGE_REPO_BASE=ghcr.io/${GITHUB_REPOSITORY}
 
 The cluster exposes ports 80/443 for gateway traffic and 6443 for the Kubernetes API.
 
-Once the cluster is deployed. You can interact with the cluster using standard `ncl` CLI commands.
+Once the cluster is deployed. You can interact with the cluster using standard `nemoclaw` CLI commands.
 
 ### Gateway mTLS for CLI
 
 When the cluster is configured to terminate TLS at the Gateway with client authentication, the
 CLI needs the generated client certificate bundle. The chart creates a `navigator-cli-client`
-Secret containing `ca.crt`, `tls.crt`, and `tls.key`. During `ncl cluster admin deploy`, the
+Secret containing `ca.crt`, `tls.crt`, and `tls.key`. During `nemoclaw cluster admin deploy`, the
 CLI bundle is automatically copied into `~/.config/nemoclaw/clusters/<name>/mtls`, where
 `<name>` comes from `NEMOCLAW_CLUSTER_NAME` or the host in `NEMOCLAW_CLUSTER` (localhost
 defaults to `nemoclaw`).
 
 ### Debugging Cluster Issues
 
-If a cluster fails to start or is unhealthy after `ncl cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.agent/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
+If a cluster fails to start or is unhealthy after `nemoclaw cluster admin deploy`, use the `debug-navigator-cluster` skill (located at `.agent/skills/debug-navigator-cluster/SKILL.md`) to diagnose the issue. This skill provides step-by-step instructions for troubleshooting cluster bootstrap failures, health check errors, and other infrastructure problems.
 
 ### Docker Build Tasks
 
@@ -434,12 +468,11 @@ docs: update installation instructions
 chore(deps): bump tokio to 1.40
 ```
 
-### DCO
+## Pull Requests
 
-All contributions must include a `Signed-off-by` line in each commit message. This certifies you have the right to submit the work under the project license. See the [Developer Certificate of Origin](https://developercertificate.org/).
-
-```bash
-git commit -s -m "feat(sandbox): add new capability"
-```
+1. Create a feature branch from `main`
+2. Make your changes with tests
+3. Run `mise run all` to verify
+4. Open a PR with a clear description
 
 Use the `create-github-pr` skill to help with opening your pull request.

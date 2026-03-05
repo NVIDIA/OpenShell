@@ -7,8 +7,8 @@
 # with it.
 #
 # Verifies the full flow:
-#   1. ncl sandbox image push --dockerfile <path>  (build + import into cluster)
-#   2. ncl sandbox create --from <tag> -- <cmd>    (run sandbox with custom image)
+#   1. nemoclaw sandbox image push --dockerfile <path>  (build + import into cluster)
+#   2. nemoclaw sandbox create --from <tag> -- <cmd>    (run sandbox with custom image)
 #
 # Prerequisites:
 #   - A running nemoclaw cluster (nemoclaw cluster admin deploy)

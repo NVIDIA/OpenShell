@@ -1,6 +1,6 @@
 # Sandbox Custom Containers
 
-Users can run `ncl sandbox create --from <source>` to launch a sandbox with a custom container image while keeping the `navigator-sandbox` process supervisor in control.
+Users can run `nemoclaw sandbox create --from <source>` to launch a sandbox with a custom container image while keeping the `navigator-sandbox` process supervisor in control.
 
 ## The `--from` Flag
 
@@ -32,7 +32,7 @@ When `--from` points to a Dockerfile or directory, the CLI:
 2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
 3. Creates the sandbox with the resulting image tag.
 
-This is equivalent to running `ncl sandbox image push` followed by `ncl sandbox create --from <tag>` in a single step.
+This is equivalent to running `nemoclaw sandbox image push` followed by `nemoclaw sandbox create --from <tag>` in a single step.
 
 ## How It Works
 
@@ -72,13 +72,13 @@ These transforms apply to both generated templates and user-provided `pod_templa
 ### Creating a sandbox from a community image
 
 ```bash
-ncl sandbox create --from openclaw
+nemoclaw sandbox create --from openclaw
 ```
 
 ### Creating a sandbox with a custom image
 
 ```bash
-ncl sandbox create --from myimage:latest -- echo "hello from custom container"
+nemoclaw sandbox create --from myimage:latest -- echo "hello from custom container"
 ```
 
 When `--from` is set the CLI clears the default `run_as_user`/`run_as_group` policy (which expects a `sandbox` user) so that arbitrary images that lack that user can start without error.
@@ -86,15 +86,15 @@ When `--from` is set the CLI clears the default `run_as_user`/`run_as_group` pol
 ### Building from a Dockerfile in one step
 
 ```bash
-ncl sandbox create --from ./Dockerfile -- echo "built and running"
-ncl sandbox create --from ./my-sandbox/  # directory with Dockerfile
+nemoclaw sandbox create --from ./Dockerfile -- echo "built and running"
+nemoclaw sandbox create --from ./my-sandbox/  # directory with Dockerfile
 ```
 
 ### Pushing custom images into the cluster (manual two-step)
 
 ```bash
-ncl sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
-ncl sandbox create --from my-sandbox:latest
+nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+nemoclaw sandbox create --from my-sandbox:latest
 ```
 
 `nemoclaw sandbox image push` accepts:

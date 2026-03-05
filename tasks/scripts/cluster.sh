@@ -16,4 +16,10 @@ if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
   exec tasks/scripts/cluster-bootstrap.sh fast
 fi
 
+# Container is running but not healthy — tear it down and re-bootstrap.
+if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
+  echo "Cluster container '${CONTAINER_NAME}' is running but not healthy. Recreating..."
+  exec tasks/scripts/cluster-bootstrap.sh fast
+fi
+
 exec tasks/scripts/cluster-deploy-fast.sh "$@"

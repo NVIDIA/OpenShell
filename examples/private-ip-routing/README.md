@@ -63,7 +63,7 @@ Create a sandbox and curl the private API through the proxy. Replace the IP
 with whatever `kubectl get pod` showed above:
 
 ```bash
-nav sandbox create -- bash -c \
+nemoclaw sandbox create -- bash -c \
   'curl -s --proxytunnel -x http://10.200.0.1:3128 http://10.42.0.128:8080/'
 ```
 

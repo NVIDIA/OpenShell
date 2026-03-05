@@ -44,16 +44,16 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         .ok_or_else(|| {
             miette::miette!(
                 "No active cluster.\n\
-                 Set one with: ncl cluster use <name>\n\
-                 Or deploy a new cluster: ncl cluster admin deploy"
+                 Set one with: nemoclaw cluster use <name>\n\
+                 Or deploy a new cluster: nemoclaw cluster admin deploy"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown cluster '{name}'.\n\
-             Deploy it first: ncl cluster admin deploy --name {name}\n\
-             Or list available clusters: ncl cluster list"
+             Deploy it first: nemoclaw cluster admin deploy --name {name}\n\
+             Or list available clusters: nemoclaw cluster list"
         )
     })?;
 
@@ -137,10 +137,10 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `ncl ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `ncl ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -957,7 +957,7 @@ async fn main() -> Result<()> {
                             if remote.is_some() {
                                 eprintln!(
                                     "{} --remote ignored: cluster '{}' is already active. \
-                                     To redeploy, use: ncl cluster admin deploy",
+                                     To redeploy, use: nemoclaw cluster admin deploy",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -1340,8 +1340,8 @@ async fn main() -> Result<()> {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
                                 "Unknown cluster '{c}'.\n\
-                                  Deploy it first: ncl cluster admin deploy --name {c}\n\
-                                  Or list available clusters: ncl cluster list"
+                                  Deploy it first: nemoclaw cluster admin deploy --name {c}\n\
+                                  Or list available clusters: nemoclaw cluster list"
                             )
                         })?;
                         meta.gateway_endpoint
