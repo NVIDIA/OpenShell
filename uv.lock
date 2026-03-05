@@ -553,7 +553,7 @@ dev = [
 ]
 docs = [
     { name = "myst-parser", specifier = "<=5" },
-    { name = "nvidia-sphinx-theme", specifier = ">=0.0.8" },
+    { name = "nvidia-sphinx-theme" },
     { name = "sphinx", specifier = "<=7.5" },
     { name = "sphinx-autobuild" },
     { name = "sphinx-copybutton", specifier = "<=0.6" },

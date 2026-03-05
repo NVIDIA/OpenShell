@@ -6,12 +6,8 @@ on:
         types: [opened, synchronize]
         paths:
             - "docs/**"
-            - "**/*.md"
-            - "**/*.rst"
     push:
         branches: [main]
-        tags:
-            - docs-v*
     workflow_dispatch:
 
 defaults:
@@ -19,8 +15,7 @@ defaults:
         shell: bash
 
 env:
-    PYTHON_VERSION: "3.12"
-    UV_VERSION: "0.10.2"
+    MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 concurrency:
     group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -28,22 +23,19 @@ concurrency:
 
 jobs:
     build-docs:
-        runs-on: ubuntu-latest
+        runs-on: build-amd64
+        container:
+            image: ghcr.io/nvidia/nv-agent-env/ci:latest
+            credentials:
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
         steps:
             - name: Checkout
               uses: actions/checkout@v4
-            - name: Set up Python ${{ env.PYTHON_VERSION }}
-              uses: actions/setup-python@v5
-              with:
-                  python-version: ${{ env.PYTHON_VERSION }}
-            - name: Install uv
-              uses: astral-sh/setup-uv@v6
-              with:
-                  version: ${{ env.UV_VERSION }}
-            - name: Install dependencies
-              run: uv sync --group docs
+            - name: Install tools
+              run: mise install
             - name: Build documentation
-              run: make docs-strict
+              run: mise run docs:build:strict
             - name: Delete unnecessary files
               run: |
                   find _build -name .doctrees -prune -exec rm -rf {} \;
@@ -70,9 +62,14 @@ jobs:
                   path: pr/
 
     store-html:
-        if: github.event_name == 'push' && github.repository_owner == 'NVIDIA-NeMo'
+        if: github.event_name == 'push' && github.repository_owner == 'NVIDIA'
         needs: [build-docs]
-        runs-on: ubuntu-latest
+        runs-on: build-amd64
+        container:
+            image: ghcr.io/nvidia/nv-agent-env/ci:latest
+            credentials:
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
         steps:
             - uses: actions/checkout@v4
               with:
@@ -118,7 +115,7 @@ jobs:
                   echo '  <head>'                                                                               >> index.html
                   echo '    <title>Redirect to documentation</title>'                                           >> index.html
                   echo '    <meta charset="utf-8">'                                                             >> index.html
-                  echo '    <meta http=equiv="refresh" content="3; URL='${html_url}${def_branch}'/index.html">' >> index.html
+                  echo '    <meta http-equiv="refresh" content="3; URL='${html_url}${def_branch}'/index.html">' >> index.html
                   echo '    <link rel="canonical" href="'${html_url}${def_branch}'/index.html">'                >> index.html
                   echo '    <script language="javascript">'                                                     >> index.html
                   echo '      function redirect() {'                                                            >> index.html
