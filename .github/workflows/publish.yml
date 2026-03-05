@@ -259,6 +259,15 @@ jobs:
           rustup target add x86_64-unknown-linux-musl
           rustup target add aarch64-unknown-linux-musl
 
+      - name: Scope workspace to CLI crates
+        run: |
+          set -euo pipefail
+          # Remove workspace members that are not needed for navigator-cli.
+          # This avoids Cargo feature-unification pulling in aws-lc-sys (via
+          # russh in navigator-sandbox / navigator-server), which fails to
+          # cross-compile for musl targets.
+          sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
+
       - name: Patch workspace version
         if: steps.version.outputs.cargo_version != ''
         run: |

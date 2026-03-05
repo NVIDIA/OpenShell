@@ -16,12 +16,12 @@ ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 
-FROM rust:1.88-slim AS builder
+FROM python:3.12-slim AS builder
 
 ARG NEMOCLAW_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
-ENV PATH="/root/.cargo/bin:/osxcross/bin:${PATH}"
+ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
 ENV LD_LIBRARY_PATH="/osxcross/lib"
 
 COPY --from=osxcross /osxcross /osxcross
@@ -34,6 +34,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
 
 # aws-lc-sys probes with --target=arm64-apple-macosx and clang then looks for
 # arm64-apple-macosx-ld.  Provide a linker alias to osxcross ld64.
@@ -59,30 +61,26 @@ COPY crates/navigator-cli/Cargo.toml      crates/navigator-cli/Cargo.toml
 COPY crates/navigator-core/Cargo.toml     crates/navigator-core/Cargo.toml
 COPY crates/navigator-policy/Cargo.toml   crates/navigator-policy/Cargo.toml
 COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
-COPY crates/navigator-router/Cargo.toml   crates/navigator-router/Cargo.toml
-COPY crates/navigator-sandbox/Cargo.toml  crates/navigator-sandbox/Cargo.toml
-COPY crates/navigator-server/Cargo.toml   crates/navigator-server/Cargo.toml
 COPY crates/navigator-tui/Cargo.toml      crates/navigator-tui/Cargo.toml
 COPY crates/navigator-core/build.rs       crates/navigator-core/build.rs
 COPY proto/ proto/
+
+# Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
+# by russh in navigator-sandbox/navigator-server) which is difficult to
+# cross-compile and unnecessary for the CLI binary.
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
 
 RUN mkdir -p crates/navigator-cli/src \
              crates/navigator-core/src \
              crates/navigator-bootstrap/src \
              crates/navigator-policy/src \
              crates/navigator-providers/src \
-             crates/navigator-router/src \
-             crates/navigator-sandbox/src \
-             crates/navigator-server/src \
              crates/navigator-tui/src && \
     echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
-    echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
-    echo "fn main() {}" > crates/navigator-server/src/main.rs && \
     touch crates/navigator-core/src/lib.rs && \
     touch crates/navigator-bootstrap/src/lib.rs && \
     touch crates/navigator-policy/src/lib.rs && \
     touch crates/navigator-providers/src/lib.rs && \
-    touch crates/navigator-router/src/lib.rs && \
     touch crates/navigator-tui/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
@@ -102,9 +100,6 @@ RUN touch crates/navigator-cli/src/main.rs \
     crates/navigator-core/src/lib.rs \
     crates/navigator-policy/src/lib.rs \
     crates/navigator-providers/src/lib.rs \
-    crates/navigator-router/src/lib.rs \
-    crates/navigator-sandbox/src/main.rs \
-    crates/navigator-server/src/main.rs \
     crates/navigator-tui/src/lib.rs \
     crates/navigator-core/build.rs \
     proto/*.proto

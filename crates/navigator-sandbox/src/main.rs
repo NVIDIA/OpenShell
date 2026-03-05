@@ -110,7 +110,7 @@ async fn main() -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
 
     // Install rustls crypto provider before any TLS connections (including log push).
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Set up optional log push layer (gRPC mode only).
     let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
