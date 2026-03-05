@@ -272,7 +272,7 @@ jobs:
           rm -rf /var/lib/apt/lists/*
 
       - name: Add Rust musl target
-        run: rustup target add ${{ matrix.target }}
+        run: mise x -- rustup target add ${{ matrix.target }}
 
       - name: Scope workspace to CLI crates
         run: |
@@ -289,7 +289,7 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
-        run: cargo build --release --target ${{ matrix.target }} -p navigator-cli
+        run: mise x -- cargo build --release --target ${{ matrix.target }} -p navigator-cli
 
       - name: sccache stats
         if: always()
