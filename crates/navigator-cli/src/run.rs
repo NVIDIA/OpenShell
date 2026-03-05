@@ -978,6 +978,7 @@ pub async fn sandbox_create_with_bootstrap(
     policy: Option<&str>,
     forward: Option<u16>,
     command: &[String],
+    tty_override: Option<bool>,
 ) -> Result<()> {
     if !crate::bootstrap::confirm_bootstrap()? {
         return Err(miette::miette!(
@@ -988,7 +989,18 @@ pub async fn sandbox_create_with_bootstrap(
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
     sandbox_create(
-        &server, name, image, sync, keep, remote, ssh_key, providers, policy, forward, command,
+        &server,
+        name,
+        image,
+        sync,
+        keep,
+        remote,
+        ssh_key,
+        providers,
+        policy,
+        forward,
+        command,
+        tty_override,
         &tls,
     )
     .await
@@ -1008,6 +1020,7 @@ pub async fn sandbox_create(
     policy: Option<&str>,
     forward: Option<u16>,
     command: &[String],
+    tty_override: Option<bool>,
     tls: &TlsOptions,
 ) -> Result<()> {
     // Try connecting to the cluster. If it fails due to an unreachable cluster,
@@ -1249,11 +1262,16 @@ pub async fn sandbox_create(
             }
 
             eprintln!("Connecting...");
+            // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
+            // auto-detect from the local terminal.
+            let tty = tty_override.unwrap_or_else(|| {
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+            });
             let exec_result = sandbox_exec(
                 &effective_server,
                 &sandbox_name,
                 command,
-                interactive,
+                tty,
                 &effective_tls,
             )
             .await;

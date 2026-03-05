@@ -143,11 +143,17 @@ async fn handle_tunnel(
         Duration::from_secs(10),
         Duration::from_secs(15),
     ];
+    let target_desc = match &target {
+        ConnectTarget::Ip(addr) => format!("{addr}"),
+        ConnectTarget::Host(host, port) => format!("{host}:{port}"),
+    };
+    info!(sandbox_id = %sandbox_id, target = %target_desc, "SSH tunnel: connecting to sandbox");
     for (attempt, delay) in std::iter::once(&Duration::ZERO)
         .chain(delays.iter())
         .enumerate()
     {
         if !delay.is_zero() {
+            info!(sandbox_id = %sandbox_id, attempt = attempt + 1, delay_ms = delay.as_millis() as u64, "SSH tunnel: retrying TCP connect");
             tokio::time::sleep(*delay).await;
         }
         let result = match &target {
@@ -156,17 +162,16 @@ async fn handle_tunnel(
         };
         match result {
             Ok(stream) => {
-                if attempt > 0 {
-                    info!(
-                        sandbox_id = %sandbox_id,
-                        attempts = attempt + 1,
-                        "SSH tunnel connected after retry"
-                    );
-                }
+                info!(
+                    sandbox_id = %sandbox_id,
+                    attempts = attempt + 1,
+                    "SSH tunnel: TCP connected to sandbox"
+                );
                 upstream = Some(stream);
                 break;
             }
             Err(err) => {
+                info!(sandbox_id = %sandbox_id, attempt = attempt + 1, error = %err, "SSH tunnel: TCP connect failed");
                 last_err = Some(err);
             }
         }
@@ -176,11 +181,14 @@ async fn handle_tunnel(
         format!("failed to connect to sandbox after retries: {err}")
     })?;
     upstream.set_nodelay(true)?;
+    info!(sandbox_id = %sandbox_id, "SSH tunnel: sending NSSH1 handshake preface");
     let preface = build_preface(token, secret)?;
     upstream.write_all(preface.as_bytes()).await?;
 
+    info!(sandbox_id = %sandbox_id, "SSH tunnel: waiting for handshake response");
     let mut response = String::new();
     read_line(&mut upstream, &mut response).await?;
+    info!(sandbox_id = %sandbox_id, response = %response.trim(), "SSH tunnel: handshake response received");
     if response.trim() != "OK" {
         return Err("sandbox handshake rejected".into());
     }

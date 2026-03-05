@@ -49,7 +49,7 @@ RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator
 
 # Copy proto files needed for build
 COPY proto/ proto/
-COPY crates/navigator-policy/dev-sandbox-policy.rego ./crates/navigator-policy/
+COPY crates/navigator-sandbox/data/sandbox-policy.rego ./crates/navigator-sandbox/data/
 COPY deploy/docker/sandbox/dev-sandbox-policy.yaml ./deploy/docker/sandbox/
 
 # Build dependencies only (cached unless Cargo.toml/lock changes).

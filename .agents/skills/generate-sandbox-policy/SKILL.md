@@ -546,5 +546,5 @@ private_services:
 
 - Full policy schema: [architecture/security-policy.md](../../../architecture/security-policy.md)
 - Example policy file: [dev-sandbox-policy.yaml](../../../deploy/docker/sandbox/dev-sandbox-policy.yaml)
-- Rego evaluation rules: [dev-sandbox-policy.rego](../../../crates/navigator-policy/dev-sandbox-policy.rego)
+- Rego evaluation rules: [sandbox-policy.rego](../../../crates/navigator-sandbox/data/sandbox-policy.rego)
 - For translation examples from real API docs, see [examples.md](examples.md)

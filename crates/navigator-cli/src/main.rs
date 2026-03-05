@@ -516,6 +516,17 @@ enum SandboxCommands {
         #[arg(long)]
         forward: Option<u16>,
 
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
+
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -918,8 +929,19 @@ async fn main() -> Result<()> {
                     providers,
                     policy,
                     forward,
+                    tty,
+                    no_tty,
                     command,
                 } => {
+                    // Resolve --tty / --no-tty into an Option<bool> override.
+                    let tty_override = if no_tty {
+                        Some(false)
+                    } else if tty {
+                        Some(true)
+                    } else {
+                        None // auto-detect
+                    };
+
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_cluster(&cli.cluster) {
@@ -947,6 +969,7 @@ async fn main() -> Result<()> {
                                 policy.as_deref(),
                                 forward,
                                 &command,
+                                tty_override,
                                 &tls,
                             )
                             .await?;
@@ -964,6 +987,7 @@ async fn main() -> Result<()> {
                                 policy.as_deref(),
                                 forward,
                                 &command,
+                                tty_override,
                             )
                             .await?;
                         }

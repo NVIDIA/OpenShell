@@ -84,11 +84,20 @@ mapfile -t changed_files < <(
 detect_end=$(date +%s)
 log_duration "Change detection" "${detect_start}" "${detect_end}"
 
+# Track the cluster container ID so we can detect when the cluster was
+# recreated (e.g. via bootstrap).  A new container means the k3s state is
+# fresh and all images must be rebuilt and pushed regardless of source
+# fingerprints.
+current_container_id=$(docker inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null || true)
+
 if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   while IFS='=' read -r key value; do
     case "${key}" in
       cluster_name)
         previous_cluster_name=${value}
+        ;;
+      container_id)
+        previous_container_id=${value}
         ;;
       server)
         previous_server_fingerprint=${value}
@@ -103,6 +112,15 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   done < "${DEPLOY_FAST_STATE_FILE}"
 
   if [[ "${previous_cluster_name:-}" != "${CLUSTER_NAME}" ]]; then
+    previous_server_fingerprint=""
+    previous_sandbox_fingerprint=""
+    previous_helm_fingerprint=""
+  fi
+
+  # Invalidate all previous fingerprints when the cluster container has
+  # changed (recreated or replaced).  The new k3s instance has no pushed
+  # images so everything must be rebuilt.
+  if [[ -n "${current_container_id}" && "${current_container_id}" != "${previous_container_id:-}" ]]; then
     previous_server_fingerprint=""
     previous_sandbox_fingerprint=""
     previous_helm_fingerprint=""
@@ -262,14 +280,9 @@ fi
 
 build_start=$(date +%s)
 
-# Capture image IDs before rebuild so we can detect what changed.
-declare -A image_id_before=()
-for component in server sandbox; do
-  var="build_${component//-/_}"
-  if [[ "${!var}" == "1" ]]; then
-    image_id_before[${component}]=$(docker images -q "navigator/${component}:${IMAGE_TAG}" 2>/dev/null || true)
-  fi
-done
+# Track which components are being rebuilt so we can evict their images
+# from the k3s containerd cache after pushing.
+declare -a built_components=()
 
 server_pid=""
 sandbox_pid=""
@@ -322,20 +335,15 @@ build_end=$(date +%s)
 log_duration "Image builds" "${build_start}" "${build_end}"
 
 declare -a pushed_images=()
-declare -a changed_images=()
 
 for component in server sandbox; do
   var="build_${component//-/_}"
   if [[ "${!var}" == "1" ]]; then
-    docker tag "navigator/${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}"
+    # Tag may fail with AlreadyExists when the image digest hasn't changed;
+    # this is harmless — the registry already has the correct image.
+    docker tag "navigator/${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" 2>/dev/null || true
     pushed_images+=("${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}")
-
-    # Detect whether the image actually changed by comparing Docker image IDs.
-    id_after=$(docker images -q "navigator/${component}:${IMAGE_TAG}" 2>/dev/null || true)
-    id_before=${image_id_before[${component}]:-}
-    if [[ -z "${id_before}" || "${id_before}" != "${id_after}" ]]; then
-      changed_images+=("${component}")
-    fi
+    built_components+=("${component}")
   fi
 done
 
@@ -349,13 +357,12 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   log_duration "Image push" "${push_start}" "${push_end}"
 fi
 
-# Evict stale images from k3s's containerd store so new pods pull the
-# updated image from the registry.  Without this, k3s uses its cached copy
-# (imagePullPolicy defaults to IfNotPresent for non-:latest tags) and pods
-# run stale code.
-if [[ "${#changed_images[@]}" -gt 0 ]]; then
-  echo "Evicting stale images from k3s: ${changed_images[*]}"
-  for component in "${changed_images[@]}"; do
+# Always evict rebuilt images from k3s's containerd store so new pods pull
+# the updated image from the registry.  Without this, k3s may use a cached
+# copy even when the registry has a newer version with the same tag.
+if [[ "${#built_components[@]}" -gt 0 ]]; then
+  echo "Evicting stale images from k3s: ${built_components[*]}"
+  for component in "${built_components[@]}"; do
     docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" >/dev/null 2>&1 || true
   done
 fi
@@ -409,6 +416,7 @@ if [[ "${explicit_target}" == "0" ]]; then
   mkdir -p "$(dirname "${DEPLOY_FAST_STATE_FILE}")"
   cat > "${DEPLOY_FAST_STATE_FILE}" <<EOF
 cluster_name=${CLUSTER_NAME}
+container_id=${current_container_id}
 server=${current_server_fingerprint}
 sandbox=${current_sandbox_fingerprint}
 helm=${current_helm_fingerprint}

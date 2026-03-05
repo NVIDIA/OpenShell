@@ -909,7 +909,7 @@ fn apply_required_env(
     ssh_handshake_skew_secs: u64,
 ) {
     upsert_env(env, "NEMOCLAW_SANDBOX_ID", sandbox_id);
-    upsert_env(env, "NEMOCLAW_SANDBOX_NAME", sandbox_name);
+    upsert_env(env, "NEMOCLAW_SANDBOX", sandbox_name);
     upsert_env(env, "NEMOCLAW_ENDPOINT", grpc_endpoint);
     upsert_env(env, "NEMOCLAW_SANDBOX_COMMAND", "sleep infinity");
     if !ssh_listen_addr.is_empty() {

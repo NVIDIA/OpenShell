@@ -98,7 +98,7 @@ fi
 
 if [[ "${need_create}" == "1" ]]; then
   echo "Creating sandbox '${SANDBOX_NAME}'..."
-  nemoclaw sandbox create --name "${SANDBOX_NAME}" "${PROVIDER_ARGS[@]}" -- "${CMD[@]}"
+  nemoclaw sandbox create --name "${SANDBOX_NAME}" "${PROVIDER_ARGS[@]}" --tty -- "${CMD[@]}"
 else
   echo "Connecting to existing sandbox '${SANDBOX_NAME}'..."
   nemoclaw sandbox connect "${SANDBOX_NAME}"
