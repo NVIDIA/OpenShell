@@ -3,14 +3,18 @@
 
 # Documentation build, serve, and check tasks
 
+["docs"]
+description = "Build HTML documentation"
+run = """
+uv run sphinx-build -b html docs _build/docs
+echo ""
+echo "Documentation built successfully. Open in browser:"
+echo "file://$(pwd)/_build/docs/index.html"
+"""
+
 ["docs:deps"]
 description = "Install documentation dependencies"
 run = "uv sync --group docs"
-
-["docs:build"]
-description = "Build HTML documentation"
-depends = ["docs:deps"]
-run = "uv run sphinx-build -b html docs _build/docs"
 
 ["docs:build:strict"]
 description = "Build HTML documentation with warnings as errors"

@@ -2,7 +2,7 @@ name: docs-preview-pr
 
 on:
     workflow_run:
-        workflows: [docs-build]
+        workflows: [Docs]
         types: [completed]
         branches-ignore: [main]
 
