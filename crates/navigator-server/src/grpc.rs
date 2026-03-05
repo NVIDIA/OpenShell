@@ -98,6 +98,11 @@ impl Navigator for NavigatorService {
             template.image = self.state.sandbox_client.default_image().to_string();
         }
 
+        // Validate policy safety before persisting.
+        if let Some(ref policy) = spec.policy {
+            validate_policy_safety(policy)?;
+        }
+
         let id = uuid::Uuid::new_v4().to_string();
         let name = if request.name.is_empty() {
             petname::petname(2, "-").unwrap_or_else(generate_name)
@@ -858,6 +863,9 @@ impl Navigator for NavigatorService {
 
             // Validate network mode hasn't changed (Block ↔ Proxy).
             validate_network_mode_unchanged(baseline_policy, &new_policy)?;
+
+            // Validate policy safety (no root, no path traversal, etc.).
+            validate_policy_safety(&new_policy)?;
         } else {
             // No baseline policy exists (sandbox created without one). The
             // sandbox is syncing a locally-discovered or restrictive-default
@@ -1225,6 +1233,21 @@ fn level_matches(log_level: &str, min_level: &str) -> bool {
 // ---------------------------------------------------------------------------
 // Policy helper functions
 // ---------------------------------------------------------------------------
+
+/// Validate that a policy does not contain unsafe content.
+///
+/// Delegates to [`navigator_policy::validate_sandbox_policy`] and converts
+/// violations into a gRPC `INVALID_ARGUMENT` status.
+fn validate_policy_safety(policy: &ProtoSandboxPolicy) -> Result<(), Status> {
+    if let Err(violations) = navigator_policy::validate_sandbox_policy(policy) {
+        let messages: Vec<String> = violations.iter().map(ToString::to_string).collect();
+        return Err(Status::invalid_argument(format!(
+            "policy contains unsafe content: {}",
+            messages.join("; ")
+        )));
+    }
+    Ok(())
+}
 
 /// Validate that static policy fields (filesystem, landlock, process) haven't changed
 /// from the baseline (version 1) policy.
@@ -2320,7 +2343,75 @@ mod tests {
         assert!(result.is_none());
     }
 
-    // ---- Policy validation tests ----
+    // ---- Policy safety validation tests ----
+
+    #[test]
+    fn validate_policy_safety_rejects_root_user() {
+        use navigator_core::proto::{
+            FilesystemPolicy, ProcessPolicy, SandboxPolicy as ProtoSandboxPolicy,
+        };
+
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr".into()],
+                read_write: vec!["/tmp".into()],
+            }),
+            process: Some(ProcessPolicy {
+                run_as_user: "root".into(),
+                run_as_group: "sandbox".into(),
+            }),
+            ..Default::default()
+        };
+        let err = super::validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("root"));
+    }
+
+    #[test]
+    fn validate_policy_safety_rejects_path_traversal() {
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr/../etc/shadow".into()],
+                read_write: vec!["/tmp".into()],
+            }),
+            ..Default::default()
+        };
+        let err = super::validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("traversal"));
+    }
+
+    #[test]
+    fn validate_policy_safety_rejects_overly_broad_path() {
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr".into()],
+                read_write: vec!["/".into()],
+            }),
+            ..Default::default()
+        };
+        let err = super::validate_policy_safety(&policy).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("broad"));
+    }
+
+    #[test]
+    fn validate_policy_safety_accepts_valid_policy() {
+        let policy = navigator_policy::restrictive_default_policy();
+        assert!(super::validate_policy_safety(&policy).is_ok());
+    }
+
+    // ---- Static field validation tests ----
 
     #[test]
     fn validate_static_fields_allows_unchanged() {

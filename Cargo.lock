@@ -2852,6 +2852,7 @@ dependencies = [
  "kube-runtime",
  "miette",
  "navigator-core",
+ "navigator-policy",
  "petname",
  "pin-project-lite",
  "prost",
