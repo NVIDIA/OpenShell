@@ -10,6 +10,8 @@
 //! these types, ensuring round-trip fidelity.
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
+use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
@@ -359,12 +361,12 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 /// default.
 pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     let contents = if let Some(p) = cli_path {
-        let path = std::path::Path::new(p);
+        let path = Path::new(p);
         std::fs::read_to_string(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
     } else if let Ok(policy_path) = std::env::var("NEMOCLAW_SANDBOX_POLICY") {
-        let path = std::path::Path::new(&policy_path);
+        let path = Path::new(&policy_path);
         std::fs::read_to_string(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
@@ -423,6 +425,195 @@ pub fn clear_process_identity(policy: &mut SandboxPolicy) {
         process.run_as_user = String::new();
         process.run_as_group = String::new();
     }
+}
+
+// ---------------------------------------------------------------------------
+// Policy safety validation
+// ---------------------------------------------------------------------------
+
+/// Maximum number of filesystem paths (`read_only` + `read_write` combined).
+const MAX_FILESYSTEM_PATHS: usize = 256;
+
+/// Maximum length of any single filesystem path string.
+const MAX_PATH_LENGTH: usize = 4096;
+
+/// A safety violation found in a sandbox policy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PolicyViolation {
+    /// `run_as_user` or `run_as_group` is "root" or "0".
+    RootProcessIdentity { field: &'static str, value: String },
+    /// A filesystem path contains `..` components.
+    PathTraversal { path: String },
+    /// A filesystem path is not absolute (does not start with `/`).
+    RelativePath { path: String },
+    /// A read-write filesystem path is overly broad (e.g. `/`).
+    OverlyBroadPath { path: String },
+    /// A filesystem path exceeds the maximum allowed length.
+    FieldTooLong { path: String, length: usize },
+    /// Too many filesystem paths in the policy.
+    TooManyPaths { count: usize },
+}
+
+impl fmt::Display for PolicyViolation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::RootProcessIdentity { field, value } => {
+                write!(f, "{field} cannot be '{value}' (root is not allowed)")
+            }
+            Self::PathTraversal { path } => {
+                write!(f, "path contains '..' traversal component: {path}")
+            }
+            Self::RelativePath { path } => {
+                write!(f, "path must be absolute (start with '/'): {path}")
+            }
+            Self::OverlyBroadPath { path } => {
+                write!(f, "read-write path is overly broad: {path}")
+            }
+            Self::FieldTooLong { path, length } => {
+                write!(
+                    f,
+                    "path exceeds maximum length ({length} > {MAX_PATH_LENGTH}): {path}"
+                )
+            }
+            Self::TooManyPaths { count } => {
+                write!(
+                    f,
+                    "too many filesystem paths ({count} > {MAX_FILESYSTEM_PATHS})"
+                )
+            }
+        }
+    }
+}
+
+/// Validate that a sandbox policy does not contain unsafe content.
+///
+/// Returns `Ok(())` if the policy is safe, or `Err(violations)` listing all
+/// safety violations found. Callers decide how to handle violations (hard
+/// error vs. logged warning).
+///
+/// Checks performed:
+/// - `run_as_user` / `run_as_group` must not be "root" or "0"
+/// - Filesystem paths must be absolute (start with `/`)
+/// - Filesystem paths must not contain `..` components
+/// - Read-write paths must not be overly broad (just `/`)
+/// - Individual path lengths must not exceed [`MAX_PATH_LENGTH`]
+/// - Total path count must not exceed [`MAX_FILESYSTEM_PATHS`]
+pub fn validate_sandbox_policy(
+    policy: &SandboxPolicy,
+) -> std::result::Result<(), Vec<PolicyViolation>> {
+    let mut violations = Vec::new();
+
+    // Check process identity
+    if let Some(ref process) = policy.process {
+        if is_root_identity(&process.run_as_user) {
+            violations.push(PolicyViolation::RootProcessIdentity {
+                field: "run_as_user",
+                value: process.run_as_user.clone(),
+            });
+        }
+        if is_root_identity(&process.run_as_group) {
+            violations.push(PolicyViolation::RootProcessIdentity {
+                field: "run_as_group",
+                value: process.run_as_group.clone(),
+            });
+        }
+    }
+
+    // Check filesystem paths
+    if let Some(ref fs) = policy.filesystem {
+        let total_paths = fs.read_only.len() + fs.read_write.len();
+        if total_paths > MAX_FILESYSTEM_PATHS {
+            violations.push(PolicyViolation::TooManyPaths { count: total_paths });
+        }
+
+        for path_str in fs.read_only.iter().chain(fs.read_write.iter()) {
+            if path_str.len() > MAX_PATH_LENGTH {
+                violations.push(PolicyViolation::FieldTooLong {
+                    path: truncate_for_display(path_str),
+                    length: path_str.len(),
+                });
+                continue;
+            }
+
+            let path = Path::new(path_str);
+
+            if !path.has_root() {
+                violations.push(PolicyViolation::RelativePath {
+                    path: path_str.clone(),
+                });
+            }
+
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                violations.push(PolicyViolation::PathTraversal {
+                    path: path_str.clone(),
+                });
+            }
+        }
+
+        // Only reject "/" as read-write (overly broad)
+        for path_str in &fs.read_write {
+            let normalized = path_str.trim_end_matches('/');
+            if normalized.is_empty() {
+                // Path is "/" or "///" etc.
+                violations.push(PolicyViolation::OverlyBroadPath {
+                    path: path_str.clone(),
+                });
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        Ok(())
+    } else {
+        Err(violations)
+    }
+}
+
+/// Check if a user/group identity string refers to root.
+fn is_root_identity(value: &str) -> bool {
+    if value.is_empty() {
+        return false;
+    }
+    let trimmed = value.trim();
+    trimmed == "root" || trimmed == "0"
+}
+
+/// Truncate a string for safe inclusion in error messages.
+fn truncate_for_display(s: &str) -> String {
+    if s.len() <= 80 {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..77])
+    }
+}
+
+/// Normalize a filesystem path by collapsing redundant separators
+/// and removing trailing slashes, without requiring the path to exist on disk.
+///
+/// This is a lexical normalization only — it does NOT resolve symlinks or
+/// check the filesystem.
+pub fn normalize_path(path: &str) -> String {
+    use std::path::Component;
+
+    let p = Path::new(path);
+    let mut normalized = std::path::PathBuf::new();
+    for component in p.components() {
+        match component {
+            Component::Prefix(prefix) => normalized.push(prefix.as_os_str()),
+            #[allow(clippy::path_buf_push_overwrite)]
+            Component::RootDir => normalized.push("/"),
+            Component::CurDir => {} // skip "."
+            Component::ParentDir => {
+                // Keep ".." — validation will catch it separately
+                normalized.push("..");
+            }
+            Component::Normal(c) => normalized.push(c),
+        }
+    }
+    normalized.to_string_lossy().to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -634,5 +825,170 @@ network_policies:
     #[test]
     fn container_policy_path_is_expected() {
         assert_eq!(CONTAINER_POLICY_PATH, "/etc/navigator/policy.yaml");
+    }
+
+    // ---- Policy validation tests ----
+
+    #[test]
+    fn validate_rejects_root_run_as_user() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "root".into(),
+            run_as_group: "sandbox".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(violations.iter().any(|v| matches!(
+            v,
+            PolicyViolation::RootProcessIdentity {
+                field: "run_as_user",
+                ..
+            }
+        )));
+    }
+
+    #[test]
+    fn validate_rejects_uid_zero() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "0".into(),
+            run_as_group: "0".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_path_traversal() {
+        let mut policy = restrictive_default_policy();
+        policy.filesystem = Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec!["/usr/../etc/shadow".into()],
+            read_write: vec!["/tmp".into()],
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::PathTraversal { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_relative_paths() {
+        let mut policy = restrictive_default_policy();
+        policy.filesystem = Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec!["usr/lib".into()],
+            read_write: vec!["/tmp".into()],
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::RelativePath { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_overly_broad_read_write_path() {
+        let mut policy = restrictive_default_policy();
+        policy.filesystem = Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec!["/usr".into()],
+            read_write: vec!["/".into()],
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_valid_policy() {
+        let policy = restrictive_default_policy();
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_empty_process() {
+        let policy = SandboxPolicy {
+            version: 1,
+            process: None,
+            filesystem: None,
+            landlock: None,
+            network_policies: HashMap::new(),
+            inference: None,
+        };
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_accepts_empty_run_as_user() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: String::new(),
+        });
+        assert!(validate_sandbox_policy(&policy).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_too_many_paths() {
+        let mut policy = restrictive_default_policy();
+        let many_paths: Vec<String> = (0..300).map(|i| format!("/path/{i}")).collect();
+        policy.filesystem = Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: many_paths,
+            read_write: vec!["/tmp".into()],
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TooManyPaths { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_rejects_path_too_long() {
+        let mut policy = restrictive_default_policy();
+        let long_path = format!("/{}", "a".repeat(5000));
+        policy.filesystem = Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec![long_path],
+            read_write: vec!["/tmp".into()],
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. }))
+        );
+    }
+
+    #[test]
+    fn normalize_path_collapses_separators() {
+        assert_eq!(normalize_path("/usr//lib"), "/usr/lib");
+        assert_eq!(normalize_path("/usr/./lib"), "/usr/lib");
+        assert_eq!(normalize_path("/tmp/"), "/tmp");
+    }
+
+    #[test]
+    fn normalize_path_preserves_parent_dir() {
+        // normalize_path preserves ".." — validation catches it separately
+        assert_eq!(normalize_path("/usr/../etc"), "/usr/../etc");
+    }
+
+    #[test]
+    fn policy_violation_display() {
+        let v = PolicyViolation::RootProcessIdentity {
+            field: "run_as_user",
+            value: "root".into(),
+        };
+        let s = format!("{v}");
+        assert!(s.contains("root"));
+        assert!(s.contains("run_as_user"));
     }
 }

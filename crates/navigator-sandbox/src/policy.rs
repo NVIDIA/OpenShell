@@ -132,8 +132,16 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
 impl From<ProtoFilesystemPolicy> for FilesystemPolicy {
     fn from(proto: ProtoFilesystemPolicy) -> Self {
         Self {
-            read_only: proto.read_only.into_iter().map(PathBuf::from).collect(),
-            read_write: proto.read_write.into_iter().map(PathBuf::from).collect(),
+            read_only: proto
+                .read_only
+                .into_iter()
+                .map(|p| PathBuf::from(navigator_policy::normalize_path(&p)))
+                .collect(),
+            read_write: proto
+                .read_write
+                .into_iter()
+                .map(|p| PathBuf::from(navigator_policy::normalize_path(&p)))
+                .collect(),
             include_workdir: proto.include_workdir,
         }
     }

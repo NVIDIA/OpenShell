@@ -784,7 +784,9 @@ fn discover_policy_from_disk_or_default() -> navigator_core::proto::SandboxPolic
 /// Try to read a sandbox policy YAML from `path`, falling back to the
 /// hardcoded restrictive default if the file is missing or invalid.
 fn discover_policy_from_path(path: &std::path::Path) -> navigator_core::proto::SandboxPolicy {
-    use navigator_policy::{parse_sandbox_policy, restrictive_default_policy};
+    use navigator_policy::{
+        parse_sandbox_policy, restrictive_default_policy, validate_sandbox_policy,
+    };
 
     match std::fs::read_to_string(path) {
         Ok(yaml) => {
@@ -793,7 +795,20 @@ fn discover_policy_from_path(path: &std::path::Path) -> navigator_core::proto::S
                 "Loaded sandbox policy from container disk"
             );
             match parse_sandbox_policy(&yaml) {
-                Ok(policy) => policy,
+                Ok(policy) => {
+                    // Validate the disk-loaded policy for safety.
+                    if let Err(violations) = validate_sandbox_policy(&policy) {
+                        let messages: Vec<String> =
+                            violations.iter().map(ToString::to_string).collect();
+                        warn!(
+                            path = %path.display(),
+                            violations = %messages.join("; "),
+                            "Disk policy contains unsafe content, using restrictive default"
+                        );
+                        return restrictive_default_policy();
+                    }
+                    policy
+                }
                 Err(e) => {
                     warn!(
                         path = %path.display(),
@@ -1199,6 +1214,34 @@ network_policies:
         // Falls back to restrictive default.
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_some());
+    }
+
+    #[test]
+    fn discover_policy_from_unsafe_yaml_falls_back_to_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+process:
+  run_as_user: root
+  run_as_group: root
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+  read_write:
+    - /tmp
+"#,
+        )
+        .unwrap();
+
+        let policy = discover_policy_from_path(&path);
+        // Falls back to restrictive default because of root user.
+        let proc = policy.process.unwrap();
+        assert_eq!(proc.run_as_user, "sandbox");
+        assert_eq!(proc.run_as_group, "sandbox");
     }
 
     #[test]
