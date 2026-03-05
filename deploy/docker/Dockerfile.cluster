@@ -18,6 +18,9 @@
 ARG K3S_VERSION=v1.29.8-k3s1
 FROM rancher/k3s:${K3S_VERSION}
 
+# Install openssl (used by entrypoint to generate SSH handshake secret)
+RUN apk add --no-cache openssl
+
 # Create directories for manifests, charts, and configuration
 RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /var/lib/rancher/k3s/server/static/charts \
