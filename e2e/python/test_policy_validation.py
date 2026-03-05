@@ -122,11 +122,17 @@ def test_create_sandbox_rejects_overly_broad_paths(
     assert "broad" in exc_info.value.details().lower()
 
 
-def test_update_policy_rejects_unsafe_content(
+def test_update_policy_rejects_immutable_fields(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """UpdateSandboxPolicy rejects policy with unsafe content (root user)."""
+    """UpdateSandboxPolicy rejects changes to immutable policy fields.
+
+    Both process and filesystem policies are applied at sandbox startup and
+    cannot be changed on a live sandbox. This test verifies that the server
+    rejects such updates, which also prevents unsafe content from being
+    introduced via policy updates to these fields.
+    """
     safe_policy = _safe_policy()
     spec = datamodel_pb2.SandboxSpec(policy=safe_policy)
 
@@ -134,15 +140,16 @@ def test_update_policy_rejects_unsafe_content(
         sandbox_name = sb.sandbox.name
         stub = sandbox_client._stub
 
-        # Try to update with a policy containing root user
+        # Try to update with a modified filesystem policy (immutable field)
         unsafe_policy = sandbox_pb2.SandboxPolicy(
             version=1,
-            filesystem=_SAFE_FILESYSTEM,
-            landlock=_SAFE_LANDLOCK,
-            process=sandbox_pb2.ProcessPolicy(
-                run_as_user="root",
-                run_as_group="root",
+            filesystem=sandbox_pb2.FilesystemPolicy(
+                include_workdir=True,
+                read_only=["/usr/../etc/shadow"],
+                read_write=["/tmp"],
             ),
+            landlock=_SAFE_LANDLOCK,
+            process=_SAFE_PROCESS,
         )
 
         with pytest.raises(grpc.RpcError) as exc_info:
@@ -154,4 +161,4 @@ def test_update_policy_rejects_unsafe_content(
             )
 
         assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
-        assert "root" in exc_info.value.details().lower()
+        assert "cannot be changed" in exc_info.value.details().lower()
