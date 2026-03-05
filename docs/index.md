@@ -1,7 +1,7 @@
 ---
 title:
   page: "NVIDIA NemoClaw Developer Guide"
-  nav: "NVIDIA NemoClaw"
+  nav: "Get Started"
   card: "NVIDIA NemoClaw"
 description: "NemoClaw is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
 topics:
@@ -24,10 +24,66 @@ content:
 
 # NVIDIA NemoClaw Developer Guide
 
+{bdg-link-secondary}`GitHub <https://github.com/NVIDIA/NemoClaw>`
+{bdg-link-primary}`PyPI <https://pypi.org/project/nemoclaw/>`
+
 NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments 
 that protect your data, credentials, and infrastructure — agents run with exactly the permissions they need and 
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and 
 uncontrolled network activity.
+
+# Install and Create a Sandbox
+
+NemoClaw is designed for minimal setup with safety and privacy built in from the start. Two commands take you from zero to a running, policy-enforced sandbox.
+
+## Prerequisites
+
+The following are the prerequisites for the NemoClaw CLI.
+
+- Docker must be running.
+- Python 3.12+ is required.
+
+## Install the CLI
+
+```console
+$ pip install nemoclaw
+```
+
+## Create a Sandbox
+
+::::{tab-set}
+
+:::{tab-item} Claude Code
+```console
+$ nemoclaw sandbox create -- claude
+```
+
+```text
+✓ Runtime ready
+✓ Discovered Claude credentials (ANTHROPIC_API_KEY)
+✓ Created sandbox: keen-fox
+✓ Policy loaded (4 protection layers active)
+
+Connecting to keen-fox...
+```
+
+Claude Code works out of the box with the default policy.
+:::
+
+:::{tab-item} Community Sandbox
+```console
+$ nemoclaw sandbox create --from openclaw
+```
+
+The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog --- a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
+:::
+
+::::
+
+The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
+
+For opencode or Codex, see the [Tutorials](tutorials/index.md) for agent-specific setup.
+
 
 ---
 
@@ -184,22 +240,22 @@ Links to the GitHub repository, related projects, and additional learning materi
 
 ::::
 
+
 ```{toctree}
-:caption: About
+:hidden:
+
+Get Started <self>
+get-started/tutorials/index
+```
+
+```{toctree}
+:caption: Concepts
 :hidden:
 
 Overview <about/index>
 about/how-it-works
 about/support-matrix
 about/release-notes
-```
-
-```{toctree}
-:caption: Get Started
-:hidden:
-
-get-started/installation
-get-started/tutorials/index
 ```
 
 ```{toctree}
@@ -257,6 +313,7 @@ observability/health
 :hidden:
 
 reference/index
+about/support-matrix
 reference/cli
 reference/policy-schema
 reference/environment-variables
