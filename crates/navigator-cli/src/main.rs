@@ -959,7 +959,7 @@ async fn main() -> Result<()> {
                             }
                             let endpoint = &ctx.endpoint;
                             let tls = tls.with_cluster_name(&ctx.name);
-                            run::sandbox_create(
+                            Box::pin(run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
                                 from.as_deref(),
@@ -974,12 +974,12 @@ async fn main() -> Result<()> {
                                 &command,
                                 tty_override,
                                 &tls,
-                            )
+                            ))
                             .await?;
                         }
                         Err(_) => {
                             // No cluster configured — go straight to bootstrap.
-                            run::sandbox_create_with_bootstrap(
+                            Box::pin(run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
                                 from.as_deref(),
                                 sync,
@@ -991,7 +991,7 @@ async fn main() -> Result<()> {
                                 forward,
                                 &command,
                                 tty_override,
-                            )
+                            ))
                             .await?;
                         }
                     }
@@ -1360,6 +1360,31 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
+
+    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
+    // A static mutex serialises them so concurrent threads don't clobber
+    // each other's environment.
+    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
+    /// then restore the original value.
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = XDG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
 
     #[test]
     fn cli_debug_assert() {

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
 use navigator_bootstrap::{load_last_sandbox, save_last_sandbox};
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;

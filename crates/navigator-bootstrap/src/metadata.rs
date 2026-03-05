@@ -497,16 +497,11 @@ mod tests {
 
     // ── last-sandbox persistence ──────────────────────────────────────
 
-    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
-    // A static mutex serialises them so concurrent threads don't clobber
-    // each other's environment.
-    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
-    /// then restore the original value.
+    /// Helper: hold the shared XDG test lock, set `XDG_CONFIG_HOME` to a
+    /// tempdir, run `f`, then restore the original value.
     #[allow(unsafe_code)]
     fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
-        let _guard = XDG_LOCK
+        let _guard = crate::XDG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let orig = std::env::var("XDG_CONFIG_HOME").ok();

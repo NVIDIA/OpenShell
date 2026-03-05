@@ -30,7 +30,7 @@ pub fn clusters_dir() -> Result<PathBuf> {
 
 /// Path to the file that stores the last-used sandbox name for a cluster.
 ///
-/// Location: `$XDG_CONFIG_HOME/navigator/clusters/<cluster>/last_sandbox`
+/// Location: `$XDG_CONFIG_HOME/nemoclaw/clusters/<cluster>/last_sandbox`
 pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
     Ok(clusters_dir()?.join(cluster).join("last_sandbox"))
 }
@@ -39,12 +39,10 @@ pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
 mod tests {
     use super::*;
 
-    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     #[allow(unsafe_code)]
     fn last_sandbox_path_layout() {
-        let _guard = XDG_LOCK
+        let _guard = crate::XDG_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
@@ -54,7 +52,7 @@ mod tests {
         }
         let path = last_sandbox_path("my-cluster").unwrap();
         assert!(
-            path.ends_with("navigator/clusters/my-cluster/last_sandbox"),
+            path.ends_with("nemoclaw/clusters/my-cluster/last_sandbox"),
             "unexpected path: {path:?}"
         );
         unsafe {

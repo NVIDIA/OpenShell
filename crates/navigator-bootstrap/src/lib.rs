@@ -14,6 +14,12 @@ mod pki;
 pub(crate) mod push;
 mod runtime;
 
+/// Shared lock for tests that mutate the process-global `XDG_CONFIG_HOME`
+/// env var. All such tests in any module must hold this lock to avoid
+/// concurrent clobbering.
+#[cfg(test)]
+pub(crate) static XDG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 use bollard::Docker;
 use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
