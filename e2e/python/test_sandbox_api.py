@@ -36,7 +36,7 @@ def test_sandbox_api_crud_and_exec(
         )
         assert all(p.isalpha() and p.islower() for p in parts)
 
-        fetched = sandbox_client.get(sb.id)
+        fetched = sandbox_client.get(sb.sandbox.name)
         assert fetched.id == sb.id
 
         ids = set(sandbox_client.list_ids(limit=100))
