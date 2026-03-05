@@ -137,20 +137,11 @@ Bootstrap, manage, and deploy NemoClaw clusters locally or on remote hosts via S
 {bdg-secondary}`How To`
 :::
 
-:::{grid-item-card} Gator TUI
-:link: gator/index
-:link-type: doc
-
-Use the keyboard-driven terminal dashboard for real-time cluster monitoring and sandbox management.
-+++
-{bdg-secondary}`How To`
-:::
-
 :::{grid-item-card} Observability
 :link: observability/index
 :link-type: doc
 
-Stream sandbox logs, audit agent activity, and monitor policy enforcement in real time.
+Stream sandbox logs, audit agent activity, and monitor policy enforcement with the Gator TUI and CLI.
 +++
 {bdg-secondary}`How To`
 :::
@@ -253,17 +244,12 @@ clusters/remote-deploy
 ```
 
 ```{toctree}
-:caption: Gator TUI
-:hidden:
-
-gator/index
-```
-
-```{toctree}
 :caption: Observability
 :hidden:
 
 observability/index
+observability/logs
+observability/health
 ```
 
 ```{toctree}

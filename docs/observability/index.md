@@ -5,81 +5,27 @@
 
 # About Observability
 
-NemoClaw provides log streaming and monitoring for sandboxes and the gateway.
+NemoClaw provides log streaming and monitoring for sandboxes and the gateway. You can stream logs from the CLI, monitor denied actions to iterate on policies, and use the Gator TUI for a real-time dashboard.
 
-## Sandbox Logs
+::::{grid} 1 1 2 2
+:gutter: 3
 
-View recent logs from a sandbox:
+:::{grid-item-card} Sandbox Logs
+:link: logs
+:link-type: doc
 
-```console
-$ nemoclaw sandbox logs my-sandbox
-```
+Stream, filter, and monitor sandbox and gateway logs from the CLI.
++++
+{bdg-secondary}`How To`
+:::
 
-### Live Streaming
+:::{grid-item-card} Cluster and Sandbox Health
+:link: health
+:link-type: doc
 
-Stream logs in real time:
+Check cluster and sandbox health from the CLI or the Gator TUI dashboard.
++++
+{bdg-secondary}`How To`
+:::
 
-```console
-$ nemoclaw sandbox logs my-sandbox --tail
-```
-
-### Filtering
-
-Filter by source, level, and time range:
-
-```console
-$ nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn
-$ nemoclaw sandbox logs my-sandbox --since 5m
-$ nemoclaw sandbox logs my-sandbox --source gateway --level error
-```
-
-| Flag | Description |
-|------|-------------|
-| `--tail` | Stream live logs (does not exit). |
-| `--source` | Filter by source: `gateway`, `sandbox`, or `all` (repeatable). |
-| `--level` | Minimum log level: `error`, `warn`, `info`, `debug`, `trace`. |
-| `--since` | Show logs from this duration ago (e.g., `5m`, `1h`, `30s`). |
-| `-n <N>` | Number of log lines to fetch (default: 200). |
-
-### Log Sources
-
-| Source | Content |
-|--------|---------|
-| `gateway` | Gateway-side events: sandbox lifecycle, gRPC calls, pod management. |
-| `sandbox` | Sandbox-side events: proxy decisions, policy evaluation, connection allows/denies. |
-
-## Monitoring Denied Actions
-
-When iterating on sandbox policies, the most useful view is sandbox-level deny events:
-
-```console
-$ nemoclaw sandbox logs my-sandbox --tail --source sandbox
-```
-
-Deny log entries include:
-
-- **Destination host and port** — what the agent tried to reach.
-- **Binary path** — which program attempted the connection.
-- **Deny reason** — why the connection was blocked (no matching policy, binary mismatch, etc.).
-
-This information drives the [policy iteration loop](../safety-and-privacy/policies.md#the-policy-iteration-loop).
-
-## Log Architecture
-
-Sandbox logs are pushed from the sandbox process to the gateway using a background batching layer. The sandbox collects log entries from its tracing subscriber and streams them to the gateway via gRPC in batches. The gateway stores log entries and makes them available via the CLI's `logs` command.
-
-This push-based model means logs are available even if you are not actively streaming — you can always retrieve recent logs after the fact.
-
-## Cluster Health
-
-### CLI
-
-```console
-$ nemoclaw cluster status
-```
-
-Shows gateway connectivity and version.
-
-### Gator TUI
-
-The [Gator TUI](../gator/index.md) dashboard polls cluster health every 2 seconds, displaying real-time status: Healthy, Degraded, or Unhealthy.
+::::
