@@ -14,16 +14,6 @@ A **spike** is an exploratory investigation. The user has a vague idea — a fea
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
 
-## Agent Comment Marker
-
-All comments posted by this skill **must** begin with the following marker line:
-
-```
-> **🔬 spike-agent**
-```
-
-This marker distinguishes spike investigation comments from other skills (e.g., `🏗️ build-from-issue-agent`, `🔒 security-review-agent`) and from human comments.
-
 ## Workflow Overview
 
 ```
@@ -39,9 +29,7 @@ User describes a problem
   │
   ├─ Step 4: Create a GitHub issue with structured findings
   │
-  ├─ Step 5: Post investigation detail comment with spike-agent marker
-  │
-  └─ Step 6: Report to user with issue URL and next steps
+  └─ Step 5: Report to user with issue URL and next steps
 ```
 
 ## Step 1: Gather the Problem Statement
@@ -115,10 +103,7 @@ Include in the prompt to the reviewer:
 
 ### What to do with the results
 
-The reviewer will return a detailed analysis. You'll use this to populate both the issue body (Step 4) and the investigation detail comment (Step 5). Split the content as follows:
-
-- **Issue body**: concise, stakeholder-readable summary
-- **Spike comment**: full technical details with code references, for implementers
+The reviewer will return a detailed analysis. You'll use this to populate the issue body (Step 4). The issue should contain both the stakeholder-readable summary and the full technical investigation — everything in one place.
 
 ## Step 3: Determine Labels
 
@@ -137,7 +122,7 @@ Based on the investigation results, select appropriate labels:
 
 ## Step 4: Create the GitHub Issue
 
-Create the issue with a structured body. The title should follow conventional commit format.
+Create the issue with a structured body containing both the stakeholder-readable summary and the full technical investigation. The title should follow conventional commit format.
 
 ```bash
 gh issue create \
@@ -150,7 +135,7 @@ gh issue create \
 
 ## Technical Context
 
-<What the investigation found about the current architecture in the affected area. Keep it concise — the deep dive is in the spike comment below. 3-5 sentences covering how things work today and why a change is needed.>
+<What the investigation found about the current architecture in the affected area. How things work today and why a change is needed.>
 
 ## Affected Components
 
@@ -158,49 +143,6 @@ gh issue create \
 |-----------|-----------|------|
 | <component> | `<file1>`, `<file2>` | <what this component does in the context of this change> |
 | ... | ... | ... |
-
-## Proposed Approach
-
-<High-level strategy — NOT a full implementation plan. That's `build-from-issue`'s job. Describe the direction, not the steps. 3-6 sentences.>
-
-## Scope Assessment
-
-- **Complexity:** <Low / Medium / High>
-- **Confidence:** <High — clear path / Medium — some unknowns / Low — needs discussion>
-- **Estimated files to change:** <count>
-- **Issue type:** `<feat|fix|refactor|chore|perf|docs>`
-
-## Risks & Open Questions
-
-- <risk or unknown that needs human judgment>
-- <design decision that could go either way>
-- ...
-
-## Test Considerations
-
-- <what testing strategy makes sense for this change>
-- <which test levels are needed: unit, integration, e2e>
-- <any test infrastructure that may need to be added>
-
----
-*Created by spike investigation. Use `build-from-issue` to plan and implement.*
-EOF
-)"
-```
-
-**Display the issue URL** so it's easily clickable:
-
-```
-Created issue [#<number>](https://github.com/OWNER/REPO/issues/<number>)
-```
-
-## Step 5: Post Investigation Detail Comment
-
-Post a comment on the newly created issue containing the full technical investigation. This comment is more detailed than the issue body — it's reference material for whoever implements the issue (likely `build-from-issue`).
-
-```bash
-gh issue comment <id> --body "$(cat <<'EOF'
-> **🔬 spike-agent**
 
 ## Technical Investigation
 
@@ -232,50 +174,72 @@ gh issue comment <id> --body "$(cat <<'EOF'
 
 <Existing patterns in the codebase that the implementation should be consistent with. Reference specific examples.>
 
-### Test Coverage Notes
+## Proposed Approach
 
-<What tests exist for the affected area today. What test patterns should be followed. Any test infrastructure gaps.>
+<High-level strategy — NOT a full implementation plan. That's `build-from-issue`'s job. Describe the direction, not the steps. 3-6 sentences.>
+
+## Scope Assessment
+
+- **Complexity:** <Low / Medium / High>
+- **Confidence:** <High — clear path / Medium — some unknowns / Low — needs discussion>
+- **Estimated files to change:** <count>
+- **Issue type:** `<feat|fix|refactor|chore|perf|docs>`
+
+## Risks & Open Questions
+
+- <risk or unknown that needs human judgment>
+- <design decision that could go either way>
+- ...
+
+## Test Considerations
+
+- <what testing strategy makes sense for this change>
+- <which test levels are needed: unit, integration, e2e>
+- <any test infrastructure that may need to be added>
+- <what tests exist for the affected area today, what patterns should be followed, any test infrastructure gaps>
 
 ---
-*This investigation provides context for implementation. Next step: review the issue, refine if needed, then use `build-from-issue` to create a plan and implement.*
+*Created by spike investigation. Use `build-from-issue` to plan and implement.*
 EOF
 )"
 ```
 
-### Why the split?
+**Do NOT post a follow-up comment on the issue.** All findings must be contained in the issue body itself.
 
-- **Issue body** = concise, stakeholder-readable. Product managers, tech leads, and other engineers can scan it.
-- **Spike comment** = deep technical context. When `build-from-issue` runs, its `principal-engineer-reviewer` reads issue comments — this gives it a head start so it doesn't have to redo the investigation.
+**Display the issue URL** so it's easily clickable:
 
-## Step 6: Report to User
+```
+Created issue [#<number>](https://github.com/OWNER/REPO/issues/<number>)
+```
 
-After creating the issue and posting the investigation comment, report:
+## Step 5: Report to User
+
+After creating the issue, report:
 
 1. The issue URL (as a clickable markdown link)
 2. A 2-3 sentence summary of what was found
 3. Key risks or decisions that need human attention
 4. Next steps:
 
-> Review the issue and the spike investigation comment. Refine the proposed approach if needed, then use `build-from-issue` on the issue to create an implementation plan and build it.
+> Review the issue. Refine the proposed approach if needed, then use `build-from-issue` on the issue to create an implementation plan and build it.
 
 ## Design Principles
 
-1. **The issue body is for stakeholders; the spike comment is for implementers.** Keep the issue body concise and the comment detailed.
+1. **Everything goes in the issue body.** Do NOT post follow-up comments. The issue body should contain both the stakeholder-readable summary and the full technical investigation, all in one place.
 
 2. **Do NOT create an implementation plan.** The spike identifies the problem space and proposes a direction. The implementation plan is `build-from-issue`'s responsibility, created after human review of the spike.
 
 3. **One round of clarification max.** Don't turn this into an interrogation. If the user provides enough to identify the area of the codebase, start investigating.
 
-4. **The spike comment should save `build-from-issue` work.** When `build-from-issue` runs, it reads issue comments as input context. The spike comment should contain enough detail that its `principal-engineer-reviewer` can build on the investigation rather than starting from scratch.
+4. **The issue should save `build-from-issue` work.** When `build-from-issue` runs, it reads the issue body as input context. The technical investigation section should contain enough detail that its `principal-engineer-reviewer` can build on the investigation rather than starting from scratch.
 
-5. **Cross-reference `build-from-issue`.** Mention it as the natural next step in the issue body footer and the spike comment footer.
+5. **Cross-reference `build-from-issue`.** Mention it as the natural next step in the issue body footer.
 
 ## Useful Commands Reference
 
 | Command | Description |
 | --- | --- |
 | `gh issue create --title "..." --body "..." --label "..."` | Create a new issue |
-| `gh issue comment <id> --body "..."` | Post a comment on an issue |
 | `gh label list --limit 100` | List available labels in the repo |
 | `gh issue edit <id> --add-label "..."` | Add labels to an issue |
 | `gh issue view <id> --json number,title,body,state,labels` | Fetch issue metadata |
@@ -296,9 +260,8 @@ User says: "Allow sandbox egress to private IP space via networking policy"
    - Identifies exact insertion points: policy field addition, SSRF check bypass path, OPA rule extension
    - Assesses: Medium complexity, High confidence, ~6 files
 3. Fetch labels — select `feat`, `sandbox`, `proxy`, `policy`, `review-ready`
-4. Create issue: `feat: allow sandbox egress to private IP space via networking policy`
-5. Post spike comment with full investigation: code references, architecture context, alternative approaches (allowlist vs. blanket bypass vs. per-policy toggle)
-6. Report: "Created issue #59. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. Review the issue and use `build-from-issue` when ready."
+4. Create issue: `feat: allow sandbox egress to private IP space via networking policy` — body includes both the summary and full investigation (code references, architecture context, alternative approaches)
+5. Report: "Created issue #59. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. Review the issue and use `build-from-issue` when ready."
 
 ### Bug investigation spike
 
@@ -313,9 +276,8 @@ User says: "The proxy retry logic seems too aggressive — I'm seeing cascading 
    - Identifies that retries happen without backoff jitter, causing thundering herd
    - Assesses: Low complexity, High confidence, ~2 files
 3. Fetch labels — select `fix`, `proxy`, `review-ready`
-4. Create issue: `fix: proxy retry logic causes cascading failures under load`
-5. Post spike comment with retry code references, current behavior trace, and comparison to standard backoff patterns
-6. Report: "Created issue #74. The proxy retries without jitter or circuit breaking, which amplifies failures under load. Straightforward fix. Review and use `build-from-issue` when ready."
+4. Create issue: `fix: proxy retry logic causes cascading failures under load` — body includes both the summary and full investigation (retry code references, current behavior trace, comparison to standard backoff patterns)
+5. Report: "Created issue #74. The proxy retries without jitter or circuit breaking, which amplifies failures under load. Straightforward fix. Review and use `build-from-issue` when ready."
 
 ### Performance/refactoring spike
 
@@ -330,6 +292,5 @@ User says: "Policy evaluation is getting slow — can we cache compiled OPA poli
    - Identifies that policies are recompiled on every evaluation
    - Assesses: Medium complexity, Medium confidence (cache invalidation is a design decision), ~4 files
 3. Fetch labels — select `perf`, `policy`, `review-ready`
-4. Create issue: `perf: cache compiled OPA policies to reduce evaluation latency`
-5. Post spike comment with compilation hot path, current per-request overhead, cache invalidation strategies considered (TTL vs. content-hash vs. explicit reload), and trade-offs
-6. Report: "Created issue #81. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy — flagged as an open question. Review and use `build-from-issue` when ready."
+4. Create issue: `perf: cache compiled OPA policies to reduce evaluation latency` — body includes both the summary and full investigation (compilation hot path, per-request overhead, cache invalidation strategies with trade-offs)
+5. Report: "Created issue #81. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy — flagged as an open question. Review and use `build-from-issue` when ready."
