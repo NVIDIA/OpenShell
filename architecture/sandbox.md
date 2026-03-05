@@ -99,7 +99,6 @@ flowchart TD
 7. **Proxy startup** (proxy mode only):
    - Validate that OPA engine and identity cache are present
    - Determine bind address: on Linux, use the netns veth host IP (netns creation is required and startup already aborted if it failed); on non-Linux, use `policy.network.proxy.http_addr`
-   - Parse the gateway endpoint URL into the control-plane allowlist
    - Build `InferenceContext` via `build_inference_context()` which resolves routes from one of two sources (see [Inference routing context](#inference-routing-context) below)
    - `ProxyHandle::start_with_bind_addr()` binds a `TcpListener` and spawns an accept loop, passing the inference context to each connection handler
 
@@ -521,20 +520,15 @@ sequenceDiagram
 
     S->>P: CONNECT api.example.com:443 HTTP/1.1
     P->>P: Parse CONNECT target (host, port)
-    P->>P: Check control-plane allowlist
-    alt Control-plane endpoint
-        P->>P: Allow without OPA or SSRF check
-        P->>U: TCP connect (hostname-based)
-    else Normal endpoint
-        P->>P: Resolve TCP peer identity via /proc
-        P->>P: TOFU verify binary SHA256
-        P->>P: Walk ancestor chain, verify each
-        P->>P: Collect cmdline paths
-        P->>O: evaluate_network_action(input)
-        O-->>P: NetworkAction (Allow / InspectForInference / Deny)
-        P->>P: Log CONNECT decision (unified log line)
-        alt Deny
-            P-->>S: HTTP/1.1 403 Forbidden
+    P->>P: Resolve TCP peer identity via /proc
+    P->>P: TOFU verify binary SHA256
+    P->>P: Walk ancestor chain, verify each
+    P->>P: Collect cmdline paths
+    P->>O: evaluate_network_action(input)
+    O-->>P: NetworkAction (Allow / InspectForInference / Deny)
+    P->>P: Log CONNECT decision (unified log line)
+    alt Deny
+        P-->>S: HTTP/1.1 403 Forbidden
         else InspectForInference
             P-->>S: HTTP/1.1 200 Connection Established
             P->>P: TLS-terminate client (SandboxCa)
@@ -584,10 +578,6 @@ Startup steps:
 
 The proxy reads up to 8192 bytes (`MAX_HEADER_BYTES`) looking for `\r\n\r\n`. It validates the method is `CONNECT` (returning 403 for anything else with a structured log) and parses the `host:port` target.
 
-### Control-plane bypass
-
-Connections to the gateway's own endpoint (parsed from `--navigator-endpoint`) are always allowed without OPA evaluation and without the SSRF internal-IP check. This ensures the sandboxed process can reach the gateway for management operations (policy fetch, provider environment, inference route bundle refresh), even when the gateway resolves to a private IP (e.g., a Kubernetes service IP). Control-plane connections use hostname-based `TcpStream::connect()` rather than pre-resolved addresses. The decision engine is recorded as `"control_plane"`.
-
 ### OPA evaluation with identity binding (`evaluate_opa_tcp()`)
 
 This is the core security evaluation path, Linux-only (requires `/proc`).
@@ -622,7 +612,6 @@ struct ConnectDecision {
     binary_pid: Option<u32>,
     ancestors: Vec<PathBuf>,
     cmdline_paths: Vec<PathBuf>,
-    engine: &'static str,          // "opa" or "control_plane"
 }
 ```
 
@@ -636,7 +625,7 @@ For `InspectForInference` connections, the initial log records `action=inspect_f
 
 ### SSRF protection (internal IP rejection)
 
-After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. Control-plane endpoints are exempt from this check. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
+After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
 
 ### Inference interception (`InspectForInference` path)
 

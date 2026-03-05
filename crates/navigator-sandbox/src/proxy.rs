@@ -30,8 +30,6 @@ struct ConnectDecision {
     ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
     cmdline_paths: Vec<PathBuf>,
-    /// Which engine made the decision ("opa" or "`control_plane`").
-    engine: &'static str,
 }
 
 /// Outcome of an inference interception attempt.
@@ -76,30 +74,6 @@ impl InferenceContext {
     }
 }
 
-/// An endpoint that the proxy always allows without OPA evaluation.
-/// Used for infrastructure endpoints like the navigator control plane.
-#[derive(Debug, Clone)]
-pub struct AllowedEndpoint {
-    pub host: String,
-    pub port: u16,
-}
-
-/// Parse a URL like `http://host:port` into an `AllowedEndpoint`.
-///
-/// Strips the scheme and extracts host + port. Returns `None` if the
-/// URL can't be parsed.
-pub fn parse_endpoint_url(url: &str) -> Option<AllowedEndpoint> {
-    let without_scheme = url
-        .strip_prefix("http://")
-        .or_else(|| url.strip_prefix("https://"))?;
-    let (host, port_str) = without_scheme.rsplit_once(':')?;
-    let port: u16 = port_str.parse().ok()?;
-    Some(AllowedEndpoint {
-        host: host.to_ascii_lowercase(),
-        port,
-    })
-}
-
 #[derive(Debug)]
 pub struct ProxyHandle {
     #[allow(dead_code)]
@@ -111,9 +85,7 @@ impl ProxyHandle {
     /// Start the proxy with OPA engine for policy evaluation.
     ///
     /// The proxy uses OPA for network decisions with process-identity binding
-    /// via `/proc/net/tcp`. Connections to `control_plane_endpoints` are always
-    /// allowed without OPA evaluation — these are infrastructure endpoints
-    /// (like the navigator server) that the sandbox needs to function.
+    /// via `/proc/net/tcp`. All connections are evaluated through OPA policy.
     #[allow(clippy::too_many_arguments)]
     pub async fn start_with_bind_addr(
         policy: &ProxyPolicy,
@@ -121,7 +93,6 @@ impl ProxyHandle {
         opa_engine: Arc<OpaEngine>,
         identity_cache: Arc<BinaryIdentityCache>,
         entrypoint_pid: Arc<AtomicU32>,
-        control_plane_endpoints: Vec<AllowedEndpoint>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
     ) -> Result<Self> {
@@ -143,7 +114,6 @@ impl ProxyHandle {
         let local_addr = listener.local_addr().into_diagnostic()?;
         info!(addr = %local_addr, "Proxy listening (tcp)");
 
-        let cp_endpoints = Arc::new(control_plane_endpoints);
         let join = tokio::spawn(async move {
             loop {
                 match listener.accept().await {
@@ -151,12 +121,11 @@ impl ProxyHandle {
                         let opa = opa_engine.clone();
                         let cache = identity_cache.clone();
                         let spid = entrypoint_pid.clone();
-                        let cp = cp_endpoints.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
                         tokio::spawn(async move {
                             if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, cp, tls, inf).await
+                                handle_tcp_connection(stream, opa, cache, spid, tls, inf).await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -193,7 +162,6 @@ async fn handle_tcp_connection(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
-    control_plane_endpoints: Arc<Vec<AllowedEndpoint>>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
 ) -> Result<()> {
@@ -245,34 +213,15 @@ async fn handle_tcp_connection(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    // Allow control plane endpoints (e.g. navigator server) without OPA evaluation.
-    // These are infrastructure endpoints the sandbox needs to function.
-    let is_control_plane = control_plane_endpoints
-        .iter()
-        .any(|ep| ep.host == host_lc && ep.port == port);
-
-    let decision = if is_control_plane {
-        ConnectDecision {
-            action: NetworkAction::Allow {
-                matched_policy: Some("control_plane".into()),
-            },
-            binary: None,
-            binary_pid: None,
-            ancestors: vec![],
-            cmdline_paths: vec![],
-            engine: "control_plane",
-        }
-    } else {
-        // Evaluate OPA policy with process-identity binding
-        evaluate_opa_tcp(
-            peer_addr,
-            &opa_engine,
-            &identity_cache,
-            &entrypoint_pid,
-            &host_lc,
-            port,
-        )
-    };
+    // Evaluate OPA policy with process-identity binding
+    let decision = evaluate_opa_tcp(
+        peer_addr,
+        &opa_engine,
+        &identity_cache,
+        &entrypoint_pid,
+        &host_lc,
+        port,
+    );
 
     // Extract action string and matched policy for logging
     let (action_str, matched_policy, deny_reason) = match &decision.action {
@@ -326,7 +275,7 @@ async fn handle_tcp_connection(
         ancestors = %ancestors_str,
         cmdline = %cmdline_str,
         action = %action_str,
-        engine = %decision.engine,
+        engine = "opa",
         policy = %policy_str,
         reason = %deny_reason,
         "CONNECT",
@@ -369,7 +318,7 @@ async fn handle_tcp_connection(
                 ancestors = %ancestors_str,
                 cmdline = %cmdline_str,
                 action = "deny",
-                engine = %decision.engine,
+                engine = "opa",
                 policy = %policy_str,
                 reason = %reason,
                 "CONNECT",
@@ -384,20 +333,10 @@ async fn handle_tcp_connection(
     // Query allowed_ips from the matched endpoint config (if any).
     // When present, the SSRF check validates resolved IPs against this
     // allowlist instead of blanket-blocking all private IPs.
-    let raw_allowed_ips = if !is_control_plane {
-        query_allowed_ips(&opa_engine, &decision, &host_lc, port)
-    } else {
-        vec![]
-    };
+    let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
-    // Control plane endpoints are exempt — they legitimately resolve to private
-    // IPs in cluster deployments and are already checked before OPA evaluation.
-    let mut upstream = if is_control_plane {
-        TcpStream::connect((host.as_str(), port))
-            .await
-            .into_diagnostic()?
-    } else if !raw_allowed_ips.is_empty() {
+    let mut upstream = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
         match parse_allowed_ips(&raw_allowed_ips) {
@@ -449,9 +388,7 @@ async fn handle_tcp_connection(
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
     // Check if endpoint has L7 config for protocol-aware inspection
-    if !is_control_plane
-        && let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port)
-    {
+    if let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port) {
         // Clone engine for per-tunnel L7 evaluation (cheap: shares compiled policy via Arc)
         let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
             warn!(error = %e, "Failed to clone OPA engine for L7, falling back to L4-only");
@@ -611,7 +548,6 @@ fn evaluate_opa_tcp(
             binary_pid,
             ancestors,
             cmdline_paths,
-            engine: "opa",
         }
     };
 
@@ -695,7 +631,6 @@ fn evaluate_opa_tcp(
             binary_pid: Some(binary_pid),
             ancestors,
             cmdline_paths,
-            engine: "opa",
         },
         Err(e) => deny(
             format!("policy evaluation error: {e}"),
@@ -725,7 +660,6 @@ fn evaluate_opa_tcp(
         binary_pid: None,
         ancestors: vec![],
         cmdline_paths: vec![],
-        engine: "opa",
     }
 }
 
