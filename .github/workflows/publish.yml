@@ -212,11 +212,20 @@ jobs:
   #       uv run python tasks/scripts/release.py python-publish --version "$WHEEL_VERSION"
 
   # ---------------------------------------------------------------------------
-  # Build CLI binaries (Linux musl — static)
+  # Build CLI binaries (Linux musl — static, native on each arch)
   # ---------------------------------------------------------------------------
   build-cli-linux:
-    name: Build CLI (Linux)
-    runs-on: build-amd64
+    name: Build CLI (Linux ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
@@ -238,6 +247,16 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: cli-musl-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
       - name: Compute version
         id: version
         run: |
@@ -245,27 +264,22 @@ jobs:
           CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
           echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Install musl toolchains
+      - name: Install musl toolchain
         run: |
           set -euo pipefail
           apt-get update
-          apt-get install -y --no-install-recommends \
-            musl-tools cmake \
-            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          apt-get install -y --no-install-recommends musl-tools
           rm -rf /var/lib/apt/lists/*
 
-      - name: Add Rust musl targets
-        run: |
-          rustup target add x86_64-unknown-linux-musl
-          rustup target add aarch64-unknown-linux-musl
+      - name: Add Rust musl target
+        run: rustup target add ${{ matrix.target }}
 
       - name: Scope workspace to CLI crates
         run: |
           set -euo pipefail
           # Remove workspace members that are not needed for navigator-cli.
           # This avoids Cargo feature-unification pulling in aws-lc-sys (via
-          # russh in navigator-sandbox / navigator-server), which fails to
-          # cross-compile for musl targets.
+          # russh in navigator-sandbox / navigator-server).
           sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
 
       - name: Patch workspace version
@@ -274,35 +288,25 @@ jobs:
           set -euo pipefail
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
 
-      - name: Build x86_64-unknown-linux-musl
-        run: cargo build --release --target x86_64-unknown-linux-musl -p navigator-cli
+      - name: Build ${{ matrix.target }}
+        run: cargo build --release --target ${{ matrix.target }} -p navigator-cli
 
-      - name: Build aarch64-unknown-linux-musl
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
-          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
-          CXX_aarch64_unknown_linux_musl: aarch64-linux-gnu-g++
-        run: cargo build --release --target aarch64-unknown-linux-musl -p navigator-cli
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
 
-      - name: Package binaries
+      - name: Package binary
         run: |
           set -euo pipefail
           mkdir -p artifacts
-
-          # x86_64
-          tar -czf artifacts/nemoclaw-x86_64-unknown-linux-musl.tar.gz \
-            -C target/x86_64-unknown-linux-musl/release nemoclaw
-
-          # aarch64
-          tar -czf artifacts/nemoclaw-aarch64-unknown-linux-musl.tar.gz \
-            -C target/aarch64-unknown-linux-musl/release nemoclaw
-
+          tar -czf artifacts/nemoclaw-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release nemoclaw
           ls -lh artifacts/
 
-      - name: Upload artifacts
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: cli-linux
+          name: cli-linux-${{ matrix.arch }}
           path: artifacts/*.tar.gz
           retention-days: 5
 
@@ -385,17 +389,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Linux CLI artifacts
+      - name: Download all CLI artifacts
         uses: actions/download-artifact@v4
         with:
-          name: cli-linux
+          pattern: cli-*
           path: release/
-
-      - name: Download macOS CLI artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: cli-macos
-          path: release/
+          merge-multiple: true
 
       - name: Generate checksums
         run: |
