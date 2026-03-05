@@ -39,6 +39,11 @@ struct Args {
     #[arg(long, env = "NEMOCLAW_SANDBOX_ID")]
     sandbox_id: Option<String>,
 
+    /// Sandbox (used for policy sync when the sandbox discovers policy
+    /// from disk or falls back to the restrictive default).
+    #[arg(long, env = "NEMOCLAW_SANDBOX")]
+    sandbox: Option<String>,
+
     /// NemoClaw server gRPC endpoint for fetching policy.
     /// Required when using --sandbox-id.
     #[arg(long, env = "NEMOCLAW_ENDPOINT")]
@@ -105,7 +110,7 @@ async fn main() -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&args.log_level));
 
     // Install rustls crypto provider before any TLS connections (including log push).
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let _ = rustls::crypto::ring::default_provider().install_default();
 
     // Set up optional log push layer (gRPC mode only).
     let log_push_state = if let (Some(sandbox_id), Some(endpoint)) =
@@ -172,6 +177,7 @@ async fn main() -> Result<()> {
         args.timeout,
         args.interactive,
         args.sandbox_id,
+        args.sandbox,
         args.navigator_endpoint,
         args.policy_rules,
         args.policy_data,

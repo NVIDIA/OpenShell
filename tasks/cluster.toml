@@ -16,17 +16,6 @@ depends = [
 run = "tasks/scripts/cluster-bootstrap.sh build"
 hide = true
 
-["cluster:sandbox"]
-description = "Run the sandbox container with an interactive shell"
-depends = ["docker:build:sandbox"]
-raw = true
-usage = """
-flag "-e --env <env>" var=#true help="Environment variables to pass into the sandbox"
-arg "[command]" var=#true help="Command to run in the sandbox (default: /bin/bash)"
-"""
-run = "bash tasks/scripts/run-sandbox.sh"
-hide = true
-
 ["cluster:deploy"]
 description = "Alias for cluster (incremental deploy)"
 run = "tasks/scripts/cluster.sh"

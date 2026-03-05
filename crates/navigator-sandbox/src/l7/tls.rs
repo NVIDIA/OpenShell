@@ -310,7 +310,7 @@ mod tests {
 
     #[test]
     fn upstream_config_alpn() {
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let config = build_upstream_client_config();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
     }

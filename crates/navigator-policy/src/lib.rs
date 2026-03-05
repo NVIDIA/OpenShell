@@ -3,14 +3,13 @@
 
 //! Shared sandbox policy parsing and defaults for NemoClaw.
 //!
-//! Provides bidirectional YAML↔proto conversion for sandbox policies, with a
-//! built-in default policy embedded from `dev-sandbox-policy.yaml`.
+//! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
 //! The serde types here are the **single canonical representation** of the YAML
 //! policy schema. Both parsing (YAML→proto) and serialization (proto→YAML) use
 //! these types, ensuring round-trip fidelity.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
@@ -18,9 +17,6 @@ use navigator_core::proto::{
     NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
-
-/// Built-in default sandbox policy YAML (embedded at compile time).
-const DEFAULT_SANDBOX_POLICY_YAML: &str = include_str!("../../../dev-sandbox-policy.yaml");
 
 // ---------------------------------------------------------------------------
 // YAML serde types (canonical — used for both parsing and serialization)
@@ -352,12 +348,16 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
         .wrap_err("failed to serialize policy to YAML")
 }
 
-/// Load a sandbox policy with the standard resolution order:
+/// Load a sandbox policy from an explicit source.
 ///
+/// Resolution order:
 /// 1. `cli_path` argument (e.g. from a `--policy` flag)
 /// 2. `NEMOCLAW_SANDBOX_POLICY` environment variable
-/// 3. Built-in default (`dev-sandbox-policy.yaml`)
-pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
+///
+/// Returns `Ok(None)` when no policy source is configured, allowing the
+/// caller to omit the policy and let the server / sandbox apply its own
+/// default.
+pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     let contents = if let Some(p) = cli_path {
         let path = std::path::Path::new(p);
         std::fs::read_to_string(path)
@@ -369,16 +369,49 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
     } else {
-        DEFAULT_SANDBOX_POLICY_YAML.to_string()
+        return Ok(None);
     };
-    parse_sandbox_policy(&contents)
+    parse_sandbox_policy(&contents).map(Some)
 }
 
-/// Return the built-in default sandbox policy.
-pub fn default_sandbox_policy() -> SandboxPolicy {
-    // The embedded YAML is known-good; unwrap is safe.
-    parse_sandbox_policy(DEFAULT_SANDBOX_POLICY_YAML)
-        .expect("built-in dev-sandbox-policy.yaml must be valid")
+/// Well-known path where a sandbox container image can ship a policy YAML file.
+///
+/// When the gateway provides no policy at sandbox creation time, the sandbox
+/// supervisor probes this path before falling back to the restrictive default.
+pub const CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
+
+/// Return a restrictive default policy suitable for sandboxes that have no
+/// explicit policy configured.
+///
+/// This policy grants filesystem access to standard system paths, runs as the
+/// `sandbox` user, enables Landlock in best-effort mode, and **blocks all
+/// network access** (no network policies, no inference routing).
+pub fn restrictive_default_policy() -> SandboxPolicy {
+    SandboxPolicy {
+        version: 1,
+        filesystem: Some(FilesystemPolicy {
+            include_workdir: true,
+            read_only: vec![
+                "/usr".into(),
+                "/lib".into(),
+                "/proc".into(),
+                "/dev/urandom".into(),
+                "/app".into(),
+                "/etc".into(),
+                "/var/log".into(),
+            ],
+            read_write: vec!["/sandbox".into(), "/tmp".into(), "/dev/null".into()],
+        }),
+        landlock: Some(LandlockPolicy {
+            compatibility: "best_effort".into(),
+        }),
+        process: Some(ProcessPolicy {
+            run_as_user: "sandbox".into(),
+            run_as_group: "sandbox".into(),
+        }),
+        network_policies: HashMap::new(),
+        inference: None,
+    }
 }
 
 /// Clear `run_as_user` / `run_as_group` from the policy's process section.
@@ -400,45 +433,11 @@ pub fn clear_process_identity(policy: &mut SandboxPolicy) {
 mod tests {
     use super::*;
 
-    /// Round-trip: parse the built-in default policy YAML → proto → YAML → proto
-    /// and verify the two proto representations are identical.
-    #[test]
-    fn round_trip_default_policy() {
-        let proto1 = parse_sandbox_policy(DEFAULT_SANDBOX_POLICY_YAML)
-            .expect("failed to parse default policy");
-
-        let yaml_str =
-            serialize_sandbox_policy(&proto1).expect("failed to serialize policy to YAML");
-
-        let proto2 = parse_sandbox_policy(&yaml_str).expect("failed to re-parse serialized policy");
-
-        assert_eq!(proto1.version, proto2.version);
-        assert_eq!(proto1.filesystem, proto2.filesystem);
-        assert_eq!(proto1.landlock, proto2.landlock);
-        assert_eq!(proto1.process, proto2.process);
-        assert_eq!(proto1.inference, proto2.inference);
-
-        // Compare network policies (proto HashMap ordering may differ, so
-        // compare key-by-key).
-        assert_eq!(
-            proto1.network_policies.len(),
-            proto2.network_policies.len(),
-            "network policy count mismatch"
-        );
-        for (key, rule1) in &proto1.network_policies {
-            let rule2 = proto2
-                .network_policies
-                .get(key)
-                .unwrap_or_else(|| panic!("missing network policy key: {key}"));
-            assert_eq!(rule1, rule2, "network policy mismatch for key: {key}");
-        }
-    }
-
     /// Verify that the serialized YAML uses `filesystem_policy` (not
     /// `filesystem`) so it can be fed back to `parse_sandbox_policy`.
     #[test]
     fn serialized_yaml_uses_filesystem_policy_key() {
-        let proto = default_sandbox_policy();
+        let proto = restrictive_default_policy();
         let yaml = serialize_sandbox_policy(&proto).expect("serialize failed");
         assert!(
             yaml.contains("filesystem_policy:"),
@@ -526,5 +525,114 @@ inference:
         assert_eq!(patterns1[0].path_glob, patterns2[0].path_glob);
         assert_eq!(patterns1[0].protocol, patterns2[0].protocol);
         assert_eq!(patterns1[0].kind, patterns2[0].kind);
+    }
+
+    #[test]
+    fn restrictive_default_has_no_network_policies() {
+        let policy = restrictive_default_policy();
+        assert!(
+            policy.network_policies.is_empty(),
+            "restrictive default must block all network"
+        );
+    }
+
+    #[test]
+    fn restrictive_default_has_no_inference() {
+        let policy = restrictive_default_policy();
+        assert!(policy.inference.is_none());
+    }
+
+    #[test]
+    fn restrictive_default_has_filesystem_policy() {
+        let policy = restrictive_default_policy();
+        let fs = policy.filesystem.expect("must have filesystem policy");
+        assert!(fs.include_workdir);
+        assert!(
+            fs.read_only.iter().any(|p| p == "/usr"),
+            "read_only should contain /usr"
+        );
+        assert!(
+            fs.read_write.iter().any(|p| p == "/sandbox"),
+            "read_write should contain /sandbox"
+        );
+        assert!(
+            fs.read_write.iter().any(|p| p == "/tmp"),
+            "read_write should contain /tmp"
+        );
+    }
+
+    #[test]
+    fn restrictive_default_has_process_identity() {
+        let policy = restrictive_default_policy();
+        let proc = policy.process.expect("must have process policy");
+        assert_eq!(proc.run_as_user, "sandbox");
+        assert_eq!(proc.run_as_group, "sandbox");
+    }
+
+    #[test]
+    fn restrictive_default_has_landlock() {
+        let policy = restrictive_default_policy();
+        let ll = policy.landlock.expect("must have landlock policy");
+        assert_eq!(ll.compatibility, "best_effort");
+    }
+
+    #[test]
+    fn restrictive_default_version_is_one() {
+        let policy = restrictive_default_policy();
+        assert_eq!(policy.version, 1);
+    }
+
+    #[test]
+    fn parse_minimal_policy_yaml() {
+        let yaml = "version: 1\n";
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        assert_eq!(policy.version, 1);
+        assert!(policy.network_policies.is_empty());
+        assert!(policy.filesystem.is_none());
+        assert!(policy.inference.is_none());
+    }
+
+    #[test]
+    fn parse_policy_with_network_rules() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test_policy
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        assert_eq!(policy.network_policies.len(), 1);
+        let rule = &policy.network_policies["test"];
+        assert_eq!(rule.name, "test_policy");
+        assert_eq!(rule.endpoints.len(), 1);
+        assert_eq!(rule.endpoints[0].host, "example.com");
+        assert_eq!(rule.endpoints[0].port, 443);
+        assert_eq!(rule.binaries.len(), 1);
+        assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
+    }
+
+    #[test]
+    fn parse_rejects_unknown_fields() {
+        let yaml = "version: 1\nbogus_field: true\n";
+        assert!(parse_sandbox_policy(yaml).is_err());
+    }
+
+    #[test]
+    fn clear_process_identity_clears_fields() {
+        let mut policy = restrictive_default_policy();
+        assert_eq!(policy.process.as_ref().unwrap().run_as_user, "sandbox");
+        clear_process_identity(&mut policy);
+        let proc = policy.process.unwrap();
+        assert!(proc.run_as_user.is_empty());
+        assert!(proc.run_as_group.is_empty());
+    }
+
+    #[test]
+    fn container_policy_path_is_expected() {
+        assert_eq!(CONTAINER_POLICY_PATH, "/etc/navigator/policy.yaml");
     }
 }

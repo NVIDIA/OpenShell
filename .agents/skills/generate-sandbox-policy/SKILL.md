@@ -170,7 +170,7 @@ Key sections to reference:
 Also read the example policy for real-world patterns:
 
 ```
-Read dev-sandbox-policy.yaml
+Read deploy/docker/sandbox/dev-sandbox-policy.yaml
 ```
 
 ## Step 4: Choose Policy Shape
@@ -355,8 +355,8 @@ The policy needs to go somewhere. Determine which mode applies:
 
 | Signal | Mode |
 |--------|------|
-| User names an existing policy file (e.g., "add to dev-sandbox-policy.yaml") | **Update existing file** |
-| User says "update my policy", "add this to my policy file" | **Update existing file** — look for `dev-sandbox-policy.yaml` or ask which file |
+| User names an existing policy file (e.g., "add to deploy/docker/sandbox/dev-sandbox-policy.yaml") | **Update existing file** |
+| User says "update my policy", "add this to my policy file" | **Update existing file** — look for `deploy/docker/sandbox/dev-sandbox-policy.yaml` or ask which file |
 | User asks to modify an existing policy rule by name | **Update existing file** — edit the named policy in place |
 | User says "create a new policy file" or names a file that doesn't exist | **Create new file** |
 | No file context given | **Present only** — show the YAML and ask if the user wants it written to a file |
@@ -418,7 +418,7 @@ inference:
 
 The `filesystem_policy`, `landlock`, `process`, and `inference` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. The generated `network_policies` block is the primary output.
 
-If the user provides a file path, write to it. Otherwise, suggest `dev-sandbox-policy.yaml` for local development or ask where to place it.
+If the user provides a file path, write to it. Otherwise, suggest `deploy/docker/sandbox/dev-sandbox-policy.yaml` for local development or ask where to place it.
 
 ### Mode C: Present Only (no file write)
 
@@ -427,7 +427,7 @@ Show the generated policy YAML with:
 1. **Summary** — what the policy allows and denies, in plain language
 2. **The YAML** — the complete `network_policies` block, ready to paste
 3. **Integration guidance**:
-   - For local dev: add to `dev-sandbox-policy.yaml` under `network_policies`
+   - For local dev: add to `deploy/docker/sandbox/dev-sandbox-policy.yaml` under `network_policies`
    - For production: configure via the gateway
 4. **Caveats** — any assumptions made, anything the user should verify
 
@@ -545,6 +545,6 @@ private_services:
 ## Additional Resources
 
 - Full policy schema: [architecture/security-policy.md](../../../architecture/security-policy.md)
-- Example policy file: [dev-sandbox-policy.yaml](../../../dev-sandbox-policy.yaml)
-- Rego evaluation rules: [dev-sandbox-policy.rego](../../../dev-sandbox-policy.rego)
+- Example policy file: [dev-sandbox-policy.yaml](../../../deploy/docker/sandbox/dev-sandbox-policy.yaml)
+- Rego evaluation rules: [sandbox-policy.rego](../../../crates/navigator-sandbox/data/sandbox-policy.rego)
 - For translation examples from real API docs, see [examples.md](examples.md)

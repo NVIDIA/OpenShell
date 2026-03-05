@@ -198,7 +198,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 
 | Component | Location | Role |
 |---|---|---|
-| OPA `network_action` rule | `dev-sandbox-policy.rego` | Returns `inspect_for_inference` when no explicit policy match and inference routes exist |
+| OPA `network_action` rule | `crates/navigator-sandbox/data/sandbox-policy.rego` | Returns `inspect_for_inference` when no explicit policy match and inference routes exist |
 | Proxy interception | `crates/navigator-sandbox/src/proxy.rs` | TLS-terminates intercepted connections, parses HTTP, calls gateway |
 | Inference pattern detection | `crates/navigator-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
 | gRPC forwarding | `crates/navigator-sandbox/src/grpc_client.rs` | Sends `ProxyInferenceRequest` to the gateway |

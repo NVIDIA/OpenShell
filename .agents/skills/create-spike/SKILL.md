@@ -289,7 +289,7 @@ User says: "Allow sandbox egress to private IP space via networking policy"
 1. Problem is clear — no clarification needed
 2. Fire `principal-engineer-reviewer` to investigate:
    - Finds `is_internal_ip()` SSRF check in `proxy.rs` that blocks RFC 1918 addresses
-   - Reads OPA policy evaluation pipeline in `opa.rs` and `dev-sandbox-policy.rego`
+   - Reads OPA policy evaluation pipeline in `opa.rs` and `crates/navigator-sandbox/data/sandbox-policy.rego`
    - Reads proto definitions in `sandbox.proto` for `NetworkEndpoint`
    - Maps the 4-layer defense model: netns, seccomp, OPA, SSRF check
    - Reads `architecture/security-policy.md` and `architecture/sandbox.md`

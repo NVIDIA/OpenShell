@@ -1,8 +1,8 @@
 # NemoClaw CLI Reference
 
-Quick-reference for the `nemoclaw` (aliased as `ncl`) command-line interface. For workflow guidance, see [SKILL.md](SKILL.md).
+Quick-reference for the `nemoclaw` command-line interface. For workflow guidance, see [SKILL.md](SKILL.md).
 
-> **Self-teaching**: If a command or flag is not listed here, use `ncl <command> --help` to discover it. The CLI has comprehensive built-in help at every level.
+> **Self-teaching**: If a command or flag is not listed here, use `nemoclaw <command> --help` to discover it. The CLI has comprehensive built-in help at every level.
 
 ## Global Options
 
@@ -23,7 +23,7 @@ Quick-reference for the `nemoclaw` (aliased as `ncl`) command-line interface. Fo
 ## Complete Command Tree
 
 ```
-nemoclaw (ncl)
+nemoclaw
 ├── cluster
 │   ├── status
 │   ├── use <name>
@@ -73,19 +73,19 @@ nemoclaw (ncl)
 
 ## Cluster Commands
 
-### `ncl cluster status`
+### `nemoclaw cluster status`
 
 Show server connectivity and version.
 
-### `ncl cluster use <name>`
+### `nemoclaw cluster use <name>`
 
 Set the active cluster. Writes to `~/.config/nemoclaw/active_cluster`.
 
-### `ncl cluster list`
+### `nemoclaw cluster list`
 
 List all provisioned clusters. Active cluster marked with `*`.
 
-### `ncl cluster admin deploy`
+### `nemoclaw cluster admin deploy`
 
 Provision or start a cluster (local or remote).
 
@@ -100,7 +100,7 @@ Provision or start a cluster (local or remote).
 | `--update-kube-config` | false | Write kubeconfig into `~/.kube/config` |
 | `--get-kubeconfig` | false | Print kubeconfig to stdout |
 
-### `ncl cluster admin stop`
+### `nemoclaw cluster admin stop`
 
 Stop a cluster (preserves state for later restart).
 
@@ -110,11 +110,11 @@ Stop a cluster (preserves state for later restart).
 | `--remote <USER@HOST>` | SSH destination |
 | `--ssh-key <PATH>` | SSH private key |
 
-### `ncl cluster admin destroy`
+### `nemoclaw cluster admin destroy`
 
 Destroy a cluster and all its state. Same flags as `stop`.
 
-### `ncl cluster admin info`
+### `nemoclaw cluster admin info`
 
 Show deployment details: endpoint, kubeconfig path, kube port, remote host.
 
@@ -122,7 +122,7 @@ Show deployment details: endpoint, kubeconfig path, kube port, remote host.
 |------|-------------|
 | `--name <NAME>` | Cluster name (defaults to active) |
 
-### `ncl cluster admin tunnel`
+### `nemoclaw cluster admin tunnel`
 
 Print or start an SSH tunnel for kubectl access to a remote cluster.
 
@@ -137,14 +137,14 @@ Print or start an SSH tunnel for kubectl access to a remote cluster.
 
 ## Sandbox Commands
 
-### `ncl sandbox create [OPTIONS] [-- COMMAND...]`
+### `nemoclaw sandbox create [OPTIONS] [-- COMMAND...]`
 
 Create a sandbox, wait for readiness, then connect or execute the trailing command. Auto-bootstraps a cluster if none exists.
 
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
-| `--image <IMAGE>` | Custom container image (BYOC) |
+| `--from <SOURCE>` | Sandbox source: community name, Dockerfile path, directory, or image reference (BYOC) |
 | `--sync` | Sync local git-tracked files into sandbox at `/sandbox` |
 | `--keep` | Keep sandbox alive after non-interactive commands finish |
 | `--provider <NAME>` | Provider to attach (repeatable) |
@@ -152,13 +152,15 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 | `--forward <PORT>` | Forward local port to sandbox (implies `--keep`) |
 | `--remote <USER@HOST>` | SSH destination for auto-bootstrap |
 | `--ssh-key <PATH>` | SSH private key for auto-bootstrap |
+| `--tty` | Force pseudo-terminal allocation |
+| `--no-tty` | Disable pseudo-terminal allocation |
 | `[-- COMMAND...]` | Command to execute (defaults to interactive shell) |
 
-### `ncl sandbox get <name>`
+### `nemoclaw sandbox get <name>`
 
 Show sandbox details (id, name, namespace, phase, policy).
 
-### `ncl sandbox list`
+### `nemoclaw sandbox list`
 
 List sandboxes in a table.
 
@@ -169,15 +171,15 @@ List sandboxes in a table.
 | `--ids` | false | Print only sandbox IDs |
 | `--names` | false | Print only sandbox names |
 
-### `ncl sandbox delete <NAME>...`
+### `nemoclaw sandbox delete <NAME>...`
 
 Delete one or more sandboxes by name. Stops any background port forwards.
 
-### `ncl sandbox connect <name>`
+### `nemoclaw sandbox connect <name>`
 
 Open an interactive SSH shell to a sandbox.
 
-### `ncl sandbox sync <name> {--up <path> | --down <path>} [dest]`
+### `nemoclaw sandbox sync <name> {--up <path> | --down <path>} [dest]`
 
 Sync files to/from a sandbox using tar-over-SSH.
 
@@ -187,7 +189,7 @@ Sync files to/from a sandbox using tar-over-SSH.
 | `--down <SANDBOX_PATH>` | Pull sandbox files to local |
 | `[DEST]` | Destination path (default: `/sandbox` for up, `.` for down) |
 
-### `ncl sandbox logs <name>`
+### `nemoclaw sandbox logs <name>`
 
 View sandbox logs. Supports one-shot and streaming.
 
@@ -199,7 +201,7 @@ View sandbox logs. Supports one-shot and streaming.
 | `--source <SOURCE>` | `all` | Filter: `gateway`, `sandbox`, or `all` (repeatable) |
 | `--level <LEVEL>` | none | Minimum level: `error`, `warn`, `info`, `debug`, `trace` |
 
-### `ncl sandbox ssh-config <name>`
+### `nemoclaw sandbox ssh-config <name>`
 
 Print an SSH config `Host` block for a sandbox. Useful for VS Code Remote-SSH.
 
@@ -207,7 +209,7 @@ Print an SSH config `Host` block for a sandbox. Useful for VS Code Remote-SSH.
 
 ## Port Forwarding Commands
 
-### `ncl sandbox forward start <port> <name>`
+### `nemoclaw sandbox forward start <port> <name>`
 
 Start forwarding a local port to a sandbox.
 
@@ -217,34 +219,19 @@ Start forwarding a local port to a sandbox.
 | `<name>` | Sandbox name |
 | `-d`, `--background` | Run in background |
 
-### `ncl sandbox forward stop <port> <name>`
+### `nemoclaw sandbox forward stop <port> <name>`
 
 Stop a background port forward.
 
-### `ncl sandbox forward list`
+### `nemoclaw sandbox forward list`
 
 List all active port forwards (sandbox, port, PID, status).
 
 ---
 
-## Custom Image Commands (BYOC)
-
-### `ncl sandbox image push`
-
-Build a container image and push it into the cluster's internal registry.
-
-| Flag | Description |
-|------|-------------|
-| `--dockerfile <PATH>` | Path to Dockerfile (required) |
-| `--tag <NAME:TAG>` | Image name and tag (default: `navigator/sandbox-custom:<timestamp>`) |
-| `--context <PATH>` | Build context directory (default: Dockerfile parent) |
-| `--build-arg KEY=VALUE` | Build argument (repeatable) |
-
----
-
 ## Policy Commands
 
-### `ncl sandbox policy set <name> --policy <PATH>`
+### `nemoclaw sandbox policy set <name> --policy <PATH>`
 
 Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `inference`) can be changed at runtime.
 
@@ -256,7 +243,7 @@ Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `i
 
 Exit codes with `--wait`: 0 = loaded, 1 = failed, 124 = timeout.
 
-### `ncl sandbox policy get <name>`
+### `nemoclaw sandbox policy get <name>`
 
 Show current active policy for a sandbox.
 
@@ -265,7 +252,7 @@ Show current active policy for a sandbox.
 | `--rev <VERSION>` | 0 (latest) | Show a specific revision |
 | `--full` | false | Print the full policy as YAML (round-trips with `--policy` input) |
 
-### `ncl sandbox policy list <name>`
+### `nemoclaw sandbox policy list <name>`
 
 List policy revision history (version, hash, status, created, error).
 
@@ -279,7 +266,7 @@ List policy revision history (version, hash, status, created, error).
 
 Supported provider types: `claude`, `opencode`, `codex`, `generic`, `nvidia`, `gitlab`, `github`, `outlook`.
 
-### `ncl provider create --name <NAME> --type <TYPE>`
+### `nemoclaw provider create --name <NAME> --type <TYPE>`
 
 Create a provider configuration.
 
@@ -291,11 +278,11 @@ Create a provider configuration.
 | `--credential KEY[=VALUE]` | Credential pair. Bare `KEY` reads from env var. Repeatable. |
 | `--config KEY=VALUE` | Config key/value pair. Repeatable. |
 
-### `ncl provider get <name>`
+### `nemoclaw provider get <name>`
 
 Show provider details (id, name, type, credential keys, config keys).
 
-### `ncl provider list`
+### `nemoclaw provider list`
 
 List providers in a table.
 
@@ -305,11 +292,11 @@ List providers in a table.
 | `--offset <N>` | 0 | Pagination offset |
 | `--names` | false | Print only names |
 
-### `ncl provider update <name> --type <TYPE>`
+### `nemoclaw provider update <name> --type <TYPE>`
 
 Update an existing provider. Same flags as `create`.
 
-### `ncl provider delete <NAME>...`
+### `nemoclaw provider delete <NAME>...`
 
 Delete one or more providers by name.
 
@@ -317,7 +304,7 @@ Delete one or more providers by name.
 
 ## Inference Commands
 
-### `ncl inference create`
+### `nemoclaw inference create`
 
 Create an inference route. Auto-detects supported protocols if `--protocol` is omitted.
 
@@ -331,15 +318,15 @@ Create an inference route. Auto-detects supported protocols if `--protocol` is o
 | `--model-id <ID>` | -- | Model identifier (required) |
 | `--disabled` | false | Create in disabled state |
 
-### `ncl inference update <name>`
+### `nemoclaw inference update <name>`
 
 Update an existing inference route. Same flags as `create`.
 
-### `ncl inference delete <NAME>...`
+### `nemoclaw inference delete <NAME>...`
 
 Delete inference routes by name.
 
-### `ncl inference list`
+### `nemoclaw inference list`
 
 List inference routes.
 
@@ -352,14 +339,14 @@ List inference routes.
 
 ## Other Commands
 
-### `ncl gator`
+### `nemoclaw gator`
 
 Launch the Gator interactive TUI.
 
-### `ncl completions <shell>`
+### `nemoclaw completions <shell>`
 
 Generate shell completion scripts. Supported shells: `bash`, `fish`, `zsh`, `powershell`.
 
-### `ncl ssh-proxy`
+### `nemoclaw ssh-proxy`
 
 SSH proxy used as a `ProxyCommand`. Not typically invoked directly.

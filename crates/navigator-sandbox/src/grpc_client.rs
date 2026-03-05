@@ -11,8 +11,8 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
     GetSandboxInferenceBundleRequest, GetSandboxInferenceBundleResponse, GetSandboxPolicyRequest,
     GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, inference_client::InferenceClient,
-    navigator_client::NavigatorClient,
+    SandboxPolicy as ProtoSandboxPolicy, UpdateSandboxPolicyRequest,
+    inference_client::InferenceClient, navigator_client::NavigatorClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -74,13 +74,25 @@ async fn connect(endpoint: &str) -> Result<NavigatorClient<Channel>> {
 }
 
 /// Fetch sandbox policy from NemoClaw server via gRPC.
-pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<ProtoSandboxPolicy> {
+///
+/// Returns `Ok(Some(policy))` when the server has a policy configured,
+/// or `Ok(None)` when the sandbox was created without a policy (the sandbox
+/// should discover one from disk or use the restrictive default).
+pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
     debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to NemoClaw server");
 
     let mut client = connect(endpoint).await?;
 
     debug!("Connected, fetching sandbox policy");
 
+    fetch_policy_with_client(&mut client, sandbox_id).await
+}
+
+/// Fetch sandbox policy using an existing client connection.
+async fn fetch_policy_with_client(
+    client: &mut NavigatorClient<Channel>,
+    sandbox_id: &str,
+) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
         .get_sandbox_policy(GetSandboxPolicyRequest {
             sandbox_id: sandbox_id.to_string(),
@@ -88,10 +100,64 @@ pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<ProtoSandb
         .await
         .into_diagnostic()?;
 
-    response
-        .into_inner()
-        .policy
-        .ok_or_else(|| miette::miette!("Server returned empty policy"))
+    let inner = response.into_inner();
+
+    // version 0 with no policy means the sandbox was created without one.
+    if inner.version == 0 && inner.policy.is_none() {
+        return Ok(None);
+    }
+
+    Ok(Some(inner.policy.ok_or_else(|| {
+        miette::miette!("Server returned non-zero version but empty policy")
+    })?))
+}
+
+/// Sync a locally-discovered policy using an existing client connection.
+async fn sync_policy_with_client(
+    client: &mut NavigatorClient<Channel>,
+    sandbox: &str,
+    policy: &ProtoSandboxPolicy,
+) -> Result<()> {
+    client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: sandbox.to_string(),
+            policy: Some(policy.clone()),
+        })
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to sync policy to server")?;
+
+    Ok(())
+}
+
+/// Discover and sync policy using a single gRPC connection.
+///
+/// Performs the full discovery flow (fetch → sync → re-fetch) over one TLS
+/// channel instead of establishing three separate connections.
+pub async fn discover_and_sync_policy(
+    endpoint: &str,
+    sandbox_id: &str,
+    sandbox: &str,
+    discovered_policy: &ProtoSandboxPolicy,
+) -> Result<ProtoSandboxPolicy> {
+    debug!(
+        endpoint = %endpoint,
+        sandbox_id = %sandbox_id,
+        sandbox = %sandbox,
+        "Syncing discovered policy and re-fetching canonical version"
+    );
+
+    let mut client = connect(endpoint).await?;
+
+    // Sync the discovered policy to the gateway.
+    sync_policy_with_client(&mut client, sandbox, discovered_policy).await?;
+
+    // Re-fetch from the gateway to get the canonical version/hash.
+    fetch_policy_with_client(&mut client, sandbox_id)
+        .await?
+        .ok_or_else(|| {
+            miette::miette!("Server still returned no policy after sync — this is a bug")
+        })
 }
 
 /// Fetch provider environment variables for a sandbox from NemoClaw server via gRPC.

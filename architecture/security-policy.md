@@ -17,7 +17,7 @@ Provide a Rego rules file and a YAML data file via CLI flags or environment vari
 
 ```bash
 navigator-sandbox \
-  --policy-rules dev-sandbox-policy.rego \
+  --policy-rules sandbox-policy.rego \
   --policy-data dev-sandbox-policy.yaml \
   -- /bin/bash
 ```
@@ -45,7 +45,7 @@ navigator-sandbox \
 | `--sandbox-id`         | `NEMOCLAW_SANDBOX_ID` | Sandbox ID for policy lookup |
 | `--nemoclaw-endpoint` | `NEMOCLAW_ENDPOINT`   | Gateway gRPC endpoint        |
 
-The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`dev-sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
+The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
 
 ### Policy Loading Sequence
 
@@ -421,7 +421,7 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | ------ | -------- | -------- | ------------------------------------------------------------------ |
 | `path` | `string` | Yes      | Filesystem path of the binary. Supports glob patterns (`*`, `**`). |
 
-**Binary identity matching** is evaluated in the Rego rules (`dev-sandbox-policy.rego`) using four strategies, tried in order:
+**Binary identity matching** is evaluated in the Rego rules (`sandbox-policy.rego`) using four strategies, tried in order:
 
 1. **Direct path match** -- `exec.path == binary.path`
 2. **Ancestor match** -- any entry in `exec.ancestors` matches `binary.path`
@@ -450,7 +450,7 @@ rules:
 | `path`    | `string` | URL path glob pattern: `**` matches everything, otherwise `glob.match` with `/` delimiter.                                   |
 | `command` | `string` | SQL command: `SELECT`, `INSERT`, `UPDATE`, `DELETE`, or `*` (any). Case-insensitive matching. For `protocol: sql` endpoints. |
 
-Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. See `dev-sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`.
+Method and command fields use `*` as wildcard for "any". Path patterns use `**` for "match everything" and standard glob patterns with `/` as a delimiter otherwise. See `sandbox-policy.rego` -- `method_matches()`, `path_matches()`, `command_matches()`.
 
 #### Access Presets
 
@@ -524,7 +524,7 @@ flowchart LR
 
 This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
-**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.navigator.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `dev-sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/navigator-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.navigator.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/navigator-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
 
 **Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
@@ -1055,7 +1055,7 @@ The OPA engine evaluates two categories of rules:
 | `allow_request`       | `input.network.*`, `input.exec.*`, `input.request.method`, `input.request.path` | `true` if the request matches any rule in the matched endpoint |
 | `request_deny_reason` | Same input                                                                      | Human-readable deny message                                    |
 
-See `dev-sandbox-policy.rego` for the full Rego implementation.
+See `sandbox-policy.rego` for the full Rego implementation.
 
 ---
 

@@ -76,7 +76,6 @@ RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},shari
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
 COPY pyproject.toml README.md ./
-COPY dev-sandbox-policy.yaml ./
 COPY python/ python/
 
 # Touch source files to ensure they're rebuilt (not the cached dummy).

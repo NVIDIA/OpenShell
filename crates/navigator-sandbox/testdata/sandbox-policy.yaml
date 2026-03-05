@@ -1,0 +1,69 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Minimal sandbox policy fixture for OPA engine tests.
+# Covers the network policies, filesystem, process, and inference config
+# exercised by opa.rs unit tests.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  claude_code:
+    name: claude_code
+    endpoints:
+      - { host: api.anthropic.com, port: 443 }
+      - { host: statsig.anthropic.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/node }
+
+  github_ssh_over_https:
+    name: github-ssh-over-https
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/**/info/refs*"
+          - allow:
+              method: POST
+              path: "/**/git-upload-pack"
+    binaries:
+      - { path: /usr/bin/git }
+
+  gitlab:
+    name: gitlab
+    endpoints:
+      - { host: gitlab.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/glab }
+
+inference:
+  allowed_routes:
+    - local

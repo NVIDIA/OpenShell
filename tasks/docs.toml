@@ -1,0 +1,35 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Documentation build, serve, and check tasks
+
+["docs"]
+description = "Build HTML documentation"
+run = """
+if ! uv run sphinx-build -b html docs _build/docs; then
+  echo ""
+  echo "Build failed. If this is a dependency issue, try: mise run docs:deps"
+  exit 1
+fi
+echo ""
+echo "Documentation built successfully."
+echo "file://$(pwd)/_build/docs/index.html"
+"""
+
+["docs:deps"]
+description = "Install documentation dependencies"
+run = "uv sync --group docs"
+
+["docs:build:strict"]
+description = "Build HTML documentation with warnings as errors"
+depends = ["docs:deps"]
+run = "uv run sphinx-build -b html -W --keep-going docs _build/docs"
+
+["docs:serve"]
+description = "Serve documentation with live reload on port 8000"
+depends = ["docs:deps"]
+run = "uv run sphinx-autobuild docs _build/docs --port 8000 --open-browser"
+
+["docs:clean"]
+description = "Remove built documentation"
+run = "rm -rf _build/docs"

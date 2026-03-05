@@ -37,12 +37,12 @@ mise trust
 mise run sandbox
 ```
 
-## `nemoclaw` Shortcut
+## Building the `nemoclaw` CLI
 
 Inside this repository, `nemoclaw` is a local shortcut script at `scripts/bin/nemoclaw`. The script will
 
-1. Builds `navigator-cli` if needed.
-2. Runs the local debug CLI binary (`target/debug/nemoclaw`).
+1. Build `navigator-cli` if needed.
+2. Run the local debug CLI binary under `target/debug/nemoclaw`.
 
 Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `nemoclaw` directly from the repo.
 
@@ -62,18 +62,19 @@ These are the primary `mise` tasks for day-to-day development:
 | `mise run test`    | Default test suite                                      |
 | `mise run e2e`     | Default end-to-end test lane                            |
 | `mise run ci`      | Full local CI checks (lint, compile/type checks, tests) |
+| `mise run docs`    | Build and serve documentation locally                   |
 | `mise run clean`   | Clean build artifacts                                   |
 
 ## Project Structure
 
-| Path | Purpose |
-|---|---|
-| `crates/` | Rust crates |
-| `python/` | Python SDK and bindings |
-| `proto/` | Protocol buffer definitions |
-| `tasks/` | `mise` task definitions and build scripts |
-| `deploy/` | Dockerfiles, Helm chart, Kubernetes manifests |
-| `architecture/` | Architecture docs and plans |
+| Path            | Purpose                                       |
+| --------------- | --------------------------------------------- |
+| `crates/`       | Rust crates                                   |
+| `python/`       | Python SDK and bindings                       |
+| `proto/`        | Protocol buffer definitions                   |
+| `tasks/`        | `mise` task definitions and build scripts     |
+| `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
+| `architecture/` | Architecture docs and plans                   |
 
 ## Pull Requests
 

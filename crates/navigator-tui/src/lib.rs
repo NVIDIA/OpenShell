@@ -634,7 +634,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
 /// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
 ///
-/// This replicates the `ncl sandbox connect` flow but uses `Command::status()`
+/// This replicates the `nemoclaw sandbox connect` flow but uses `Command::status()`
 /// instead of `exec()` so the TUI process survives.
 async fn handle_shell_connect(
     app: &mut App,
@@ -1150,17 +1150,23 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             None
         };
 
-        let mut policy = navigator_policy::default_sandbox_policy();
-        if has_custom_image {
-            navigator_policy::clear_process_identity(&mut policy);
-        }
+        let policy = if has_custom_image {
+            // Custom images may lack the default "sandbox" user/group, so
+            // use a restrictive default with cleared process identity.
+            let mut p = navigator_policy::restrictive_default_policy();
+            navigator_policy::clear_process_identity(&mut p);
+            Some(p)
+        } else {
+            // Let the server apply the sandbox's own default policy.
+            None
+        };
 
         let req = navigator_core::proto::CreateSandboxRequest {
             name,
             spec: Some(navigator_core::proto::SandboxSpec {
                 providers: selected_providers,
                 template,
-                policy: Some(policy),
+                policy,
                 ..Default::default()
             }),
         };

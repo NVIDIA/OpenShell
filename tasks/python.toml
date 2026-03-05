@@ -207,6 +207,30 @@ depends = ["python:proto"]
 run = "uv run ty check {{vars.python_paths}}"
 hide = true
 
+["python:publish"]
+description = "Build and publish Python wheels"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=$(uv run python tasks/scripts/release.py get-version --python)
+CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:all
+uv run python tasks/scripts/release.py python-publish --version "$VERSION"
+"""
+hide = true
+
+["python:publish:macos"]
+description = "Build and publish macOS arm64 Python wheel"
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+VERSION=$(uv run python tasks/scripts/release.py get-version --python)
+CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+uv run python tasks/scripts/release.py python-publish --version "$VERSION" --wheel-glob "*macosx*arm64.whl"
+"""
+hide = true
+
 ["python:proto"]
 description = "Generate Python protobuf stubs from .proto files"
 env = { UV_NO_SYNC = "1" }

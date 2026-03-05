@@ -120,6 +120,7 @@ pub async fn run_sandbox(
     timeout_secs: u64,
     interactive: bool,
     sandbox_id: Option<String>,
+    sandbox: Option<String>,
     navigator_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
@@ -138,6 +139,7 @@ pub async fn run_sandbox(
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
     let (mut policy, opa_engine) = load_policy(
         sandbox_id.clone(),
+        sandbox,
         navigator_endpoint.clone(),
         policy_rules,
         policy_data,
@@ -681,9 +683,11 @@ fn spawn_route_refresh(
 /// Priority:
 /// 1. If `policy_rules` and `policy_data` are provided, load OPA engine from local files
 /// 2. If `sandbox_id` and `navigator_endpoint` are provided, fetch via gRPC
-/// 3. Otherwise, return an error
+/// 3. If the server returns no policy, discover from disk or use restrictive default
+/// 4. Otherwise, return an error
 async fn load_policy(
     sandbox_id: Option<String>,
+    sandbox: Option<String>,
     navigator_endpoint: Option<String>,
     policy_rules: Option<String>,
     policy_data: Option<String>,
@@ -722,6 +726,27 @@ async fn load_policy(
         );
         let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
 
+        let proto_policy = match proto_policy {
+            Some(p) => p,
+            None => {
+                // No policy configured on the server. Discover from disk or
+                // fall back to the restrictive default, then sync to the
+                // gateway so it becomes the authoritative baseline.
+                info!("Server returned no policy; attempting local discovery");
+                let discovered = discover_policy_from_disk_or_default();
+                let sandbox = sandbox.as_deref().ok_or_else(|| {
+                    miette::miette!(
+                        "Cannot sync discovered policy: sandbox not available.\n\
+                         Set NEMOCLAW_SANDBOX or --sandbox to enable policy sync."
+                    )
+                })?;
+
+                // Sync and re-fetch over a single connection to avoid extra
+                // TLS handshakes.
+                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
+            }
+        };
+
         // Build OPA engine from baked-in rules + typed proto data.
         // The engine is needed when network policies exist OR inference routing
         // is configured (inference routing uses OPA to decide inspect_for_inference).
@@ -748,6 +773,47 @@ async fn load_policy(
          - --policy-rules and --policy-data (or NEMOCLAW_POLICY_RULES and NEMOCLAW_POLICY_DATA env vars)\n\
          - --sandbox-id and --navigator-endpoint (or NEMOCLAW_SANDBOX_ID and NEMOCLAW_ENDPOINT env vars)"
     ))
+}
+
+/// Try to discover a sandbox policy from the well-known disk path, falling
+/// back to the hardcoded restrictive default if no file is found.
+fn discover_policy_from_disk_or_default() -> navigator_core::proto::SandboxPolicy {
+    discover_policy_from_path(std::path::Path::new(
+        navigator_policy::CONTAINER_POLICY_PATH,
+    ))
+}
+
+/// Try to read a sandbox policy YAML from `path`, falling back to the
+/// hardcoded restrictive default if the file is missing or invalid.
+fn discover_policy_from_path(path: &std::path::Path) -> navigator_core::proto::SandboxPolicy {
+    use navigator_policy::{parse_sandbox_policy, restrictive_default_policy};
+
+    match std::fs::read_to_string(path) {
+        Ok(yaml) => {
+            info!(
+                path = %path.display(),
+                "Loaded sandbox policy from container disk"
+            );
+            match parse_sandbox_policy(&yaml) {
+                Ok(policy) => policy,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "Failed to parse disk policy, using restrictive default"
+                    );
+                    restrictive_default_policy()
+                }
+            }
+        }
+        Err(_) => {
+            info!(
+                path = %path.display(),
+                "No policy file on disk, using restrictive default"
+            );
+            restrictive_default_policy()
+        }
+    }
 }
 
 /// Prepare filesystem for the sandboxed process.
@@ -1077,5 +1143,72 @@ routes:
         assert!(disable_inference_on_empty_routes(
             InferenceRouteSource::None
         ));
+    }
+
+    // ---- Policy disk discovery tests ----
+
+    #[test]
+    fn discover_policy_from_nonexistent_path_returns_restrictive_default() {
+        let path = std::path::Path::new("/nonexistent/policy.yaml");
+        let policy = discover_policy_from_path(path);
+        // Restrictive default has no network policies.
+        assert!(policy.network_policies.is_empty());
+        assert!(policy.inference.is_none());
+        // But does have filesystem and process policies.
+        assert!(policy.filesystem.is_some());
+        assert!(policy.process.is_some());
+    }
+
+    #[test]
+    fn discover_policy_from_valid_yaml_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(
+            &path,
+            r#"
+version: 1
+filesystem_policy:
+  include_workdir: false
+  read_only:
+    - /usr
+  read_write:
+    - /tmp
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - { host: example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#,
+        )
+        .unwrap();
+
+        let policy = discover_policy_from_path(&path);
+        assert_eq!(policy.network_policies.len(), 1);
+        assert!(policy.network_policies.contains_key("test"));
+        let fs = policy.filesystem.unwrap();
+        assert!(!fs.include_workdir);
+    }
+
+    #[test]
+    fn discover_policy_from_invalid_yaml_returns_restrictive_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("policy.yaml");
+        std::fs::write(&path, "this is not valid yaml: [[[").unwrap();
+
+        let policy = discover_policy_from_path(&path);
+        // Falls back to restrictive default.
+        assert!(policy.network_policies.is_empty());
+        assert!(policy.filesystem.is_some());
+    }
+
+    #[test]
+    fn discover_policy_restrictive_default_blocks_network() {
+        // Verify that the restrictive default results in NetworkMode::Block
+        // when converted to the sandbox-local SandboxPolicy type.
+        let proto = navigator_policy::restrictive_default_policy();
+        let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
+        assert!(matches!(local_policy.network.mode, NetworkMode::Block));
     }
 }

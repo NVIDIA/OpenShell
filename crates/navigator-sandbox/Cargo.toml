@@ -16,6 +16,7 @@ path = "src/main.rs"
 
 [dependencies]
 navigator-core = { path = "../navigator-core" }
+navigator-policy = { path = "../navigator-policy" }
 navigator-router = { path = "../navigator-router" }
 
 # Async runtime

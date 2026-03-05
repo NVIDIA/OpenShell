@@ -18,11 +18,12 @@
 ARG K3S_VERSION=v1.29.8-k3s1
 FROM rancher/k3s:${K3S_VERSION}
 
-# Create directories for manifests and configuration
+# Create directories for manifests, charts, and configuration
 RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /var/lib/rancher/k3s/server/static/charts \
              /etc/rancher/k3s \
-             /opt/navigator/manifests
+             /opt/navigator/manifests \
+             /opt/navigator/charts
 
 # Copy entrypoint script that configures DNS for Docker environments
 # This script detects the host gateway IP and configures CoreDNS to use it
@@ -36,8 +37,10 @@ RUN chmod +x /usr/local/bin/cluster-healthcheck.sh
 # Registry credentials for pulling component images at runtime are generated
 # by the entrypoint script at /etc/rancher/k3s/registries.yaml.
 
-# Copy packaged helm chart to static directory for serving via k3s API
-COPY deploy/docker/.build/charts/*.tgz /var/lib/rancher/k3s/server/static/charts/
+# Copy packaged helm charts to a staging directory that won't be
+# overwritten by the /var/lib/rancher/k3s volume mount. The entrypoint
+# script copies them into the k3s static charts directory at container start.
+COPY deploy/docker/.build/charts/*.tgz /opt/navigator/charts/
 
 # Copy Kubernetes manifests to a persistent location that won't be overwritten by the volume mount.
 # The bootstrap code will copy these to /var/lib/rancher/k3s/server/manifests/ after cluster start.

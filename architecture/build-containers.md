@@ -338,7 +338,7 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 | `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway + sandbox rebuild |
 | `crates/navigator-router/*` | Gateway rebuild |
 | `crates/navigator-server/*`, `deploy/docker/Dockerfile.server` | Gateway rebuild |
-| `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `deploy/docker/openclaw-start.sh`, `python/*`, `pyproject.toml`, `uv.lock`, `dev-sandbox-policy.rego` | Sandbox rebuild |
+| `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `deploy/docker/openclaw-start.sh`, `python/*`, `pyproject.toml`, `uv.lock`, `crates/navigator-sandbox/data/sandbox-policy.rego` | Sandbox rebuild |
 | `deploy/helm/navigator/*` | Helm upgrade |
 
 **Explicit target mode** (arguments: `server`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.

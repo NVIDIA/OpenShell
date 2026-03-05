@@ -16,7 +16,7 @@ use std::sync::Mutex;
 /// Baked-in rego rules for OPA policy evaluation.
 /// These rules define the network access decision logic and static config
 /// passthroughs. They reference `data.sandbox.*` for policy data.
-const BAKED_POLICY_RULES: &str = include_str!("../../../dev-sandbox-policy.rego");
+const BAKED_POLICY_RULES: &str = include_str!("../data/sandbox-policy.rego");
 
 /// Result of evaluating a network access request against OPA policy.
 pub struct PolicyDecision {
@@ -671,8 +671,8 @@ mod tests {
         ProcessPolicy as ProtoProc, SandboxPolicy as ProtoSandboxPolicy,
     };
 
-    const TEST_POLICY: &str = include_str!("../../../dev-sandbox-policy.rego");
-    const TEST_DATA_YAML: &str = include_str!("../../../dev-sandbox-policy.yaml");
+    const TEST_POLICY: &str = include_str!("../data/sandbox-policy.rego");
+    const TEST_DATA_YAML: &str = include_str!("../testdata/sandbox-policy.yaml");
 
     fn test_engine() -> OpaEngine {
         OpaEngine::from_strings(TEST_POLICY, TEST_DATA_YAML).expect("Failed to load test policy")

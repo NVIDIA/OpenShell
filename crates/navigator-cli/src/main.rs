@@ -9,9 +9,10 @@ use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::Write;
-use std::path::PathBuf;
 
-use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
+use navigator_bootstrap::{
+    load_active_cluster, load_cluster_metadata, load_last_sandbox, save_last_sandbox,
+};
 use navigator_cli::completers;
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;
@@ -44,16 +45,16 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         .ok_or_else(|| {
             miette::miette!(
                 "No active cluster.\n\
-                 Set one with: ncl cluster use <name>\n\
-                 Or deploy a new cluster: ncl cluster admin deploy"
+                 Set one with: nemoclaw cluster use <name>\n\
+                 Or deploy a new cluster: nemoclaw cluster admin deploy"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown cluster '{name}'.\n\
-             Deploy it first: ncl cluster admin deploy --name {name}\n\
-             Or list available clusters: ncl cluster list"
+             Deploy it first: nemoclaw cluster admin deploy --name {name}\n\
+             Or list available clusters: nemoclaw cluster list"
         )
     })?;
 
@@ -76,6 +77,25 @@ fn resolve_cluster_name(cluster_flag: &Option<String>) -> Option<String> {
                 .filter(|v| !v.trim().is_empty())
         })
         .or_else(load_active_cluster)
+}
+
+/// Resolve a sandbox name, falling back to the last-used sandbox for the cluster.
+///
+/// When `name` is `None`, looks up the last sandbox recorded for the active
+/// cluster. Prints a hint when falling back so the user knows which sandbox
+/// was chosen.
+fn resolve_sandbox_name(name: Option<String>, cluster: &str) -> Result<String> {
+    if let Some(n) = name {
+        return Ok(n);
+    }
+    let last = load_last_sandbox(cluster).ok_or_else(|| {
+        miette::miette!(
+            "No sandbox name provided and no last-used sandbox.\n\
+             Specify a sandbox name or connect to one first: nav sandbox connect <name>"
+        )
+    })?;
+    eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold(),);
+    Ok(last)
 }
 
 /// NemoClaw CLI - agent execution and management.
@@ -137,10 +157,10 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `ncl ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `ncl ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -479,10 +499,18 @@ enum SandboxCommands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Container image for the sandbox workload.
-        /// The sandbox supervisor is side-loaded via an init container.
+        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// to a Dockerfile or directory containing one, or a full container
+        /// image reference (e.g., `myregistry.com/img:tag`).
+        ///
+        /// Community names are resolved to
+        /// `ghcr.io/nvidia/nemoclaw-community/sandboxes/<name>:latest`
+        /// (override the prefix with `NEMOCLAW_COMMUNITY_REGISTRY`).
+        ///
+        /// When given a Dockerfile or directory, the image is built and pushed
+        /// into the cluster automatically before creating the sandbox.
         #[arg(long)]
-        image: Option<String>,
+        from: Option<String>,
 
         /// Sync local files into the sandbox before running.
         #[arg(long)]
@@ -516,6 +544,17 @@ enum SandboxCommands {
         #[arg(long)]
         forward: Option<u16>,
 
+        /// Allocate a pseudo-terminal for the remote command.
+        /// Defaults to auto-detection (on when stdin and stdout are terminals).
+        /// Use --tty to force a PTY even when auto-detection fails, or
+        /// --no-tty to disable.
+        #[arg(long, overrides_with = "no_tty")]
+        tty: bool,
+
+        /// Disable pseudo-terminal allocation.
+        #[arg(long, overrides_with = "tty")]
+        no_tty: bool,
+
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
@@ -523,9 +562,9 @@ enum SandboxCommands {
 
     /// Fetch a sandbox by name.
     Get {
-        /// Sandbox name.
+        /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: String,
+        name: Option<String>,
     },
 
     /// List sandboxes.
@@ -555,10 +594,12 @@ enum SandboxCommands {
     },
 
     /// Connect to a sandbox.
+    ///
+    /// When no name is given, reconnects to the last-used sandbox.
     Connect {
-        /// Sandbox name.
+        /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: String,
+        name: Option<String>,
     },
 
     /// Manage port forwarding to a sandbox.
@@ -569,9 +610,9 @@ enum SandboxCommands {
 
     /// Sync files to or from a sandbox.
     Sync {
-        /// Sandbox name.
+        /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: String,
+        name: Option<String>,
 
         /// Push local files up to the sandbox.
         #[arg(long, conflicts_with = "down", value_name = "LOCAL_PATH", value_hint = ValueHint::AnyPath)]
@@ -587,12 +628,6 @@ enum SandboxCommands {
         dest: Option<String>,
     },
 
-    /// Manage sandbox images.
-    Image {
-        #[command(subcommand)]
-        command: SandboxImageCommands,
-    },
-
     /// Manage sandbox policy.
     Policy {
         #[command(subcommand)]
@@ -601,8 +636,8 @@ enum SandboxCommands {
 
     /// View sandbox logs.
     Logs {
-        /// Sandbox name.
-        name: String,
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
 
         /// Number of log lines to return.
         #[arg(short, default_value_t = 200)]
@@ -631,8 +666,8 @@ enum SandboxCommands {
     /// Outputs a Host block suitable for appending to ~/.ssh/config,
     /// enabling tools like `VSCode` Remote-SSH to connect to the sandbox.
     SshConfig {
-        /// Sandbox name.
-        name: String,
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
     },
 }
 
@@ -640,8 +675,8 @@ enum SandboxCommands {
 enum PolicyCommands {
     /// Update policy on a live sandbox.
     Set {
-        /// Sandbox name.
-        name: String,
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
 
         /// Path to the policy YAML file.
         #[arg(long, value_hint = ValueHint::FilePath)]
@@ -658,8 +693,8 @@ enum PolicyCommands {
 
     /// Show current active policy for a sandbox.
     Get {
-        /// Sandbox name.
-        name: String,
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
 
         /// Show a specific policy revision (default: latest).
         #[arg(long = "rev", default_value_t = 0)]
@@ -672,8 +707,8 @@ enum PolicyCommands {
 
     /// List policy history for a sandbox.
     List {
-        /// Sandbox name.
-        name: String,
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
 
         /// Maximum number of revisions to return.
         #[arg(long, default_value_t = 20)]
@@ -688,9 +723,9 @@ enum ForwardCommands {
         /// Port to forward (used as both local and remote port).
         port: u16,
 
-        /// Sandbox name.
+        /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: String,
+        name: Option<String>,
 
         /// Run the forward in the background and exit immediately.
         #[arg(short = 'd', long)]
@@ -702,35 +737,13 @@ enum ForwardCommands {
         /// Port that was forwarded.
         port: u16,
 
-        /// Sandbox name.
+        /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: String,
+        name: Option<String>,
     },
 
     /// List active port forwards.
     List,
-}
-
-#[derive(Subcommand, Debug)]
-enum SandboxImageCommands {
-    /// Build and push a container image into the cluster.
-    Push {
-        /// Path to the Dockerfile.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        dockerfile: PathBuf,
-
-        /// Image name and tag (default: navigator/sandbox-custom:<timestamp>).
-        #[arg(long)]
-        tag: Option<String>,
-
-        /// Build context directory (default: Dockerfile parent directory).
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        context: Option<PathBuf>,
-
-        /// Build argument in KEY=VALUE format (can be specified multiple times).
-        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
-        build_args: Vec<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -800,7 +813,7 @@ enum InferenceCommands {
 async fn main() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
     // establish TLS connections to the gateway.
-    rustls::crypto::aws_lc_rs::default_provider()
+    rustls::crypto::ring::default_provider()
         .install_default()
         .map_err(|e| miette::miette!("failed to install rustls crypto provider: {e:?}"))?;
 
@@ -910,7 +923,7 @@ async fn main() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
-                    image,
+                    from,
                     sync,
                     keep,
                     remote,
@@ -918,8 +931,19 @@ async fn main() -> Result<()> {
                     providers,
                     policy,
                     forward,
+                    tty,
+                    no_tty,
                     command,
                 } => {
+                    // Resolve --tty / --no-tty into an Option<bool> override.
+                    let tty_override = if no_tty {
+                        Some(false)
+                    } else if tty {
+                        Some(true)
+                    } else {
+                        None // auto-detect
+                    };
+
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_cluster(&cli.cluster) {
@@ -927,7 +951,7 @@ async fn main() -> Result<()> {
                             if remote.is_some() {
                                 eprintln!(
                                     "{} --remote ignored: cluster '{}' is already active. \
-                                     To redeploy, use: ncl cluster admin deploy",
+                                     To redeploy, use: nemoclaw cluster admin deploy",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -935,10 +959,11 @@ async fn main() -> Result<()> {
                             }
                             let endpoint = &ctx.endpoint;
                             let tls = tls.with_cluster_name(&ctx.name);
-                            run::sandbox_create(
+                            Box::pin(run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
-                                image.as_deref(),
+                                from.as_deref(),
+                                &ctx.name,
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -947,15 +972,16 @@ async fn main() -> Result<()> {
                                 policy.as_deref(),
                                 forward,
                                 &command,
+                                tty_override,
                                 &tls,
-                            )
+                            ))
                             .await?;
                         }
                         Err(_) => {
                             // No cluster configured — go straight to bootstrap.
-                            run::sandbox_create_with_bootstrap(
+                            Box::pin(run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
-                                image.as_deref(),
+                                from.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -964,7 +990,8 @@ async fn main() -> Result<()> {
                                 policy.as_deref(),
                                 forward,
                                 &command,
-                            )
+                                tty_override,
+                            ))
                             .await?;
                         }
                     }
@@ -972,6 +999,8 @@ async fn main() -> Result<()> {
                 SandboxCommands::Forward {
                     command: ForwardCommands::Stop { port, name },
                 } => {
+                    let cluster_name = resolve_cluster_name(&cli.cluster).unwrap_or_default();
+                    let name = resolve_sandbox_name(name, &cluster_name)?;
                     if run::stop_forward(&name, port)? {
                         eprintln!(
                             "{} Stopped forward of port {port} for sandbox {name}",
@@ -1021,31 +1050,12 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                SandboxCommands::Image { command } => match command {
-                    SandboxImageCommands::Push {
-                        dockerfile,
-                        tag,
-                        context,
-                        build_args,
-                    } => {
-                        let cluster_name = resolve_cluster_name(&cli.cluster)
-                            .unwrap_or_else(|| "nemoclaw".to_string());
-                        run::sandbox_image_push(
-                            &dockerfile,
-                            tag.as_deref(),
-                            context.as_deref(),
-                            &cluster_name,
-                            &build_args,
-                        )
-                        .await?;
-                    }
-                },
                 other => {
                     let ctx = resolve_cluster(&cli.cluster)?;
                     let endpoint = &ctx.endpoint;
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
-                        SandboxCommands::Create { .. } | SandboxCommands::Image { .. } => {
+                        SandboxCommands::Create { .. } => {
                             unreachable!()
                         }
                         SandboxCommands::Sync {
@@ -1054,6 +1064,7 @@ async fn main() -> Result<()> {
                             down,
                             dest,
                         } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::sandbox_sync_command(
                                 endpoint,
                                 &name,
@@ -1065,6 +1076,7 @@ async fn main() -> Result<()> {
                             .await?;
                         }
                         SandboxCommands::Get { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::sandbox_get(endpoint, &name, &tls).await?;
                         }
                         SandboxCommands::List {
@@ -1079,6 +1091,8 @@ async fn main() -> Result<()> {
                             run::sandbox_delete(endpoint, &names, &tls).await?;
                         }
                         SandboxCommands::Connect { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
+                            let _ = save_last_sandbox(&ctx.name, &name);
                             run::sandbox_connect(endpoint, &name, &tls).await?;
                         }
                         SandboxCommands::Forward { command: fwd } => match fwd {
@@ -1087,6 +1101,7 @@ async fn main() -> Result<()> {
                                 name,
                                 background,
                             } => {
+                                let name = resolve_sandbox_name(name, &ctx.name)?;
                                 run::sandbox_forward(endpoint, &name, port, background, &tls)
                                     .await?;
                                 if background {
@@ -1111,15 +1126,18 @@ async fn main() -> Result<()> {
                                 wait,
                                 timeout,
                             } => {
+                                let name = resolve_sandbox_name(name, &ctx.name)?;
                                 run::sandbox_policy_set(
                                     endpoint, &name, &policy, wait, timeout, &tls,
                                 )
                                 .await?;
                             }
                             PolicyCommands::Get { name, rev, full } => {
+                                let name = resolve_sandbox_name(name, &ctx.name)?;
                                 run::sandbox_policy_get(endpoint, &name, rev, full, &tls).await?;
                             }
                             PolicyCommands::List { name, limit } => {
+                                let name = resolve_sandbox_name(name, &ctx.name)?;
                                 run::sandbox_policy_list(endpoint, &name, limit, &tls).await?;
                             }
                         },
@@ -1131,6 +1149,7 @@ async fn main() -> Result<()> {
                             source,
                             level,
                         } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::sandbox_logs(
                                 endpoint,
                                 &name,
@@ -1144,6 +1163,7 @@ async fn main() -> Result<()> {
                             .await?;
                         }
                         SandboxCommands::SshConfig { name } => {
+                            let name = resolve_sandbox_name(name, &ctx.name)?;
                             run::print_ssh_config(&ctx.name, &name);
                         }
                     }
@@ -1307,8 +1327,8 @@ async fn main() -> Result<()> {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
                                 "Unknown cluster '{c}'.\n\
-                                  Deploy it first: ncl cluster admin deploy --name {c}\n\
-                                  Or list available clusters: ncl cluster list"
+                                  Deploy it first: nemoclaw cluster admin deploy --name {c}\n\
+                                  Or list available clusters: nemoclaw cluster list"
                             )
                         })?;
                         meta.gateway_endpoint
@@ -1340,6 +1360,31 @@ mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::fs;
+
+    // Tests below mutate the process-global XDG_CONFIG_HOME env var.
+    // A static mutex serialises them so concurrent threads don't clobber
+    // each other's environment.
+    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Helper: hold `XDG_LOCK`, set `XDG_CONFIG_HOME` to a tempdir, run `f`,
+    /// then restore the original value.
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = XDG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
 
     #[test]
     fn cli_debug_assert() {
@@ -1425,25 +1470,6 @@ mod tests {
                 5,
                 "Dockerfile",
             ),
-            (
-                vec!["nemoclaw", "sandbox", "image", "push", "--dockerfile", "Do"],
-                5,
-                "Dockerfile",
-            ),
-            (
-                vec![
-                    "nemoclaw",
-                    "sandbox",
-                    "image",
-                    "push",
-                    "--dockerfile",
-                    "Dockerfile",
-                    "--context",
-                    "c",
-                ],
-                7,
-                "ctx/",
-            ),
         ];
 
         for (raw_args, index, expected) in cases {
@@ -1508,5 +1534,36 @@ mod tests {
             names.iter().any(|name| name.contains("sample.txt")),
             "expected path completion for --up, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn resolve_sandbox_name_returns_explicit_name() {
+        // When a name is provided, it should be returned regardless of any
+        // stored last-sandbox state.
+        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-cluster");
+        assert_eq!(result.unwrap(), "explicit");
+    }
+
+    #[test]
+    fn resolve_sandbox_name_falls_back_to_last_used() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("test-cluster", "remembered-sb").unwrap();
+            let result = resolve_sandbox_name(None, "test-cluster");
+            assert_eq!(result.unwrap(), "remembered-sb");
+        });
+    }
+
+    #[test]
+    fn resolve_sandbox_name_errors_without_fallback() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            let err = resolve_sandbox_name(None, "unknown-cluster").unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nav sandbox connect"),
+                "expected helpful hint in error, got: {msg}"
+            );
+        });
     }
 }
