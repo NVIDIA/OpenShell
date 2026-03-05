@@ -36,7 +36,7 @@ Every sandbox is governed by a policy that defines what the agent can do, ensuri
 - **Inference routing** — which AI model backends are available, keeping inference traffic private.
 - **Process privileges** — the user and group the agent runs as, limiting blast radius.
 
-See [Safety & Privacy](../security/index.md) for details.
+See [Safety & Privacy](../safety-and-privacy/index.md) for details.
 
 ## Quick Reference
 
@@ -54,8 +54,9 @@ See [Safety & Privacy](../security/index.md) for details.
 
 ## In This Section
 
-- [Create and Manage](create-and-manage.md) — sandbox CRUD, connecting, and log viewing.
-- [Providers](providers.md) — managing external credentials privately.
-- [Custom Containers](custom-containers.md) — bring your own container images.
-- [File Sync](file-sync.md) — pushing and pulling files to/from sandboxes.
-- [Port Forwarding](port-forwarding.md) — forwarding local ports into sandboxes.
+- [Create and Manage](create-and-manage.md): About creating, listing, inspecting, and connecting to sandboxes.
+- [Providers](providers.md): About managing external credentials privately.
+- [Custom Containers](custom-containers.md): About bringing your own container images.
+- [Community Sandboxes](community-sandboxes.md): About using pre-built sandboxes from the NemoClaw Community catalog.
+- [Port Forwarding](port-forwarding.md): About forwarding local ports into sandboxes.
+- [Terminal](terminal.md): About using NemoClaw Terminal to monitor sandbox activity and diagnose blocked connections.

@@ -1,56 +1,78 @@
+---
+title:
+  page: "About Getting Started with NemoClaw"
+  nav: "About Getting Started"
+  card: "About Getting Started"
+description: "Install the CLI, bootstrap a cluster, and launch your first sandbox in minutes."
+topics:
+- Get Started
+tags:
+- Installation
+- Quickstart
+- Sandbox
+- CLI
+content:
+  type: get_started
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - ai_engineer
+  - devops
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Installation
+# Install and Create a Sandbox
 
-Install the NemoClaw CLI to create and manage sandboxes from your terminal.
+NemoClaw is designed for minimal setup with safety and privacy built in from the start. Two commands take you from zero to a running, policy-enforced sandbox.
 
 ## Prerequisites
 
-Confirm that the following dependencies are available on your machine before you install the CLI.
+The following are the prerequisites for the NemoClaw CLI.
 
-- **Docker** — must be installed and running. This is the only runtime dependency.
-- **Python 3.12+** — required for `pip install`.
+- Docker must be running.
+- Python 3.12+ is required.
 
 ## Install the CLI
-
-Install the latest release from PyPI.
 
 ```console
 $ pip install nemoclaw
 ```
 
-This installs the `nemoclaw` command (also available as `ncl`).
+## Create a Sandbox
 
-### Verify the Installation
+::::{tab-set}
 
-Run the help command to confirm that the CLI is on your path and working.
-
+:::{tab-item} Claude Code
 ```console
-$ nemoclaw --help
+$ nemoclaw sandbox create -- claude
 ```
 
-You should see the top-level help with command groups: `cluster`, `sandbox`, `provider`, `inference`, and `gator`.
+```text
+✓ Runtime ready
+✓ Discovered Claude credentials (ANTHROPIC_API_KEY)
+✓ Created sandbox: keen-fox
+✓ Policy loaded (4 protection layers active)
 
-## Shell Completions
-
-Generate shell completions for tab-completion support:
-
-```console
-$ nemoclaw completions bash >> ~/.bashrc
-$ nemoclaw completions zsh >> ~/.zshrc
-$ nemoclaw completions fish >> ~/.config/fish/completions/nemoclaw.fish
+Connecting to keen-fox...
 ```
 
-## For Contributors
+Claude Code works out of the box with the default policy.
+:::
 
-If you are developing NemoClaw itself, see the [Contributing Guide](https://github.com/NVIDIA/NemoClaw/blob/main/CONTRIBUTING.md) for building from source using `mise`.
-
-The contributor workflow uses a local shortcut script at `scripts/bin/nemoclaw` that automatically builds the CLI from source. With `mise` active, you can run `nemoclaw` directly from the repository.
-
+:::{tab-item} Community Sandbox
 ```console
-$ mise trust
-$ mise run sandbox
+$ nemoclaw sandbox create --from openclaw
 ```
+
+The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog --- a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
+:::
+
+::::
+
+The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
+
+For opencode or Codex, see the [Tutorials](tutorials/index.md) for agent-specific setup.

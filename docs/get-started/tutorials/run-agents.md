@@ -190,11 +190,11 @@ $ nemoclaw sandbox policy get my-agent --full > current-policy.yaml
 $ nemoclaw sandbox policy set my-agent --policy current-policy.yaml --wait
 ```
 
-Refer to [Policies](../../security/policies.md) for the full policy iteration workflow.
+Refer to [Policies](../../safety-and-privacy/policies.md) for the full policy iteration workflow.
 
 ## Next Steps
 
 - [Sandboxes](../../sandboxes/index.md) — full sandbox lifecycle management.
 - [Inference Routing](../../inference/index.md) — route AI API calls to local or self-hosted backends.
-- [Safety & Privacy](../../security/index.md) — understanding and customizing sandbox policies.
-- [Network Access Control](../../security/network-access.md) — per-binary, per-endpoint network rules.
+- [Safety & Privacy](../../safety-and-privacy/index.md) — understanding and customizing sandbox policies.
+- [Network Access Control](../../safety-and-privacy/network-access-rules.md) — per-binary, per-endpoint network rules.

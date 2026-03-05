@@ -62,7 +62,7 @@ Deny log entries include:
 - **Binary path** — which program attempted the connection.
 - **Deny reason** — why the connection was blocked (no matching policy, binary mismatch, etc.).
 
-This information drives the [policy iteration loop](../security/policies.md#the-policy-iteration-loop).
+This information drives the [policy iteration loop](../safety-and-privacy/policies.md#the-policy-iteration-loop).
 
 ## Log Architecture
 

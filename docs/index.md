@@ -24,7 +24,12 @@ content:
 
 # NVIDIA NemoClaw Developer Guide
 
-NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — agents run with exactly the permissions they need and nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
+NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments 
+that protect your data, credentials, and infrastructure — agents run with exactly the permissions they need and 
+nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and 
+uncontrolled network activity.
+
+---
 
 ## About NemoClaw
 
@@ -79,7 +84,7 @@ Install the CLI, bootstrap a cluster, and create your first sandbox.
 :gutter: 3
 
 :::{grid-item-card} About Getting Started
-:link: get-started/index
+:link: get-started/installation
 :link-type: doc
 
 Install the CLI, bootstrap a cluster, and launch your first sandbox in minutes.
@@ -106,7 +111,7 @@ Configure safety policies, route inference traffic, manage clusters, and monitor
 :gutter: 3
 
 :::{grid-item-card} Safety and Privacy
-:link: security/index
+:link: safety-and-privacy/index
 :link-type: doc
 
 Understand how NemoClaw keeps your data safe and private — and write policies that control filesystem, network, and inference access.
@@ -169,7 +174,7 @@ CLI command reference, policy schema, environment variables, and system architec
 :::
 
 :::{grid-item-card} Troubleshooting
-:link: troubleshooting/index
+:link: troubleshooting/cluster-issues
 :link-type: doc
 
 Diagnose common issues with clusters, sandboxes, and networking.
@@ -202,7 +207,6 @@ about/release-notes
 :caption: Get Started
 :hidden:
 
-get-started/index
 get-started/installation
 get-started/tutorials/index
 ```
@@ -215,17 +219,19 @@ sandboxes/index
 sandboxes/create-and-manage
 sandboxes/providers
 sandboxes/custom-containers
-sandboxes/file-sync
+sandboxes/community-sandboxes
 sandboxes/port-forwarding
+sandboxes/terminal
 ```
 
 ```{toctree}
 :caption: Safety and Privacy
 :hidden:
 
-security/index
-security/policies
-security/network-access
+safety-and-privacy/index
+safety-and-privacy/security-model
+safety-and-privacy/policies
+safety-and-privacy/network-access-rules
 ```
 
 ```{toctree}
@@ -233,6 +239,9 @@ security/network-access
 :hidden:
 
 inference/index
+inference/create-routes
+inference/manage-routes
+inference/connect-sandboxes
 ```
 
 ```{toctree}
@@ -272,7 +281,12 @@ reference/architecture
 :caption: Troubleshooting
 :hidden:
 
-troubleshooting/index
+troubleshooting/cluster-issues
+troubleshooting/sandbox-issues
+troubleshooting/provider-issues
+troubleshooting/custom-container-issues
+troubleshooting/port-forwarding-issues
+troubleshooting/getting-more-information
 ```
 
 ```{toctree}

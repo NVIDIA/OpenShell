@@ -146,7 +146,7 @@ Edit `current-policy.yaml` to add a `network_policies` entry, then push it.
 $ nemoclaw sandbox policy set my-claude --policy current-policy.yaml --wait
 ```
 
-Refer to [Policies](../../security/policies.md) for the full policy iteration workflow.
+Refer to [Policies](../../safety-and-privacy/policies.md) for the full policy iteration workflow.
 
 ## Step 6: Reconnect or Open a Second Session
 
@@ -232,4 +232,4 @@ $ nemoclaw sandbox delete my-claude
 - [Sandboxes](../../sandboxes/index.md) — full sandbox lifecycle management.
 - [Providers](../../sandboxes/providers.md) — managing credentials and auto-discovery.
 - [Inference Routing](../../inference/index.md) — route AI API calls to local or self-hosted backends.
-- [Safety & Privacy](../../security/index.md) — understanding and customizing sandbox policies.
+- [Safety & Privacy](../../safety-and-privacy/index.md) — understanding and customizing sandbox policies.

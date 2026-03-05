@@ -41,52 +41,11 @@ sequenceDiagram
     Proxy-->>Agent: HTTP 200 OK (re-encrypted)
 ```
 
-## Creating Inference Routes
+## Working with Inference Routes
 
-Create a route that maps a routing hint to a backend:
-
-```console
-$ nemoclaw inference create \
-  --routing-hint local \
-  --base-url https://my-llm.example.com \
-  --model-id my-model-v1 \
-  --api-key sk-abc123
-```
-
-If `--protocol` is omitted, the CLI auto-detects by probing the endpoint.
-
-| Flag | Description |
-|------|-------------|
-| `--routing-hint` (required) | Name used in sandbox policy to reference this route. |
-| `--base-url` (required) | Backend inference endpoint URL. |
-| `--model-id` (required) | Model identifier sent to the backend. |
-| `--api-key` | API key for the backend endpoint. |
-| `--protocol` | Supported protocol(s): `openai_chat_completions`, `openai_completions`, `anthropic_messages` (repeatable, auto-detected if omitted). |
-| `--disabled` | Create the route in disabled state. |
-
-## Managing Routes
-
-```console
-$ nemoclaw inference list
-$ nemoclaw inference update my-route --routing-hint local --base-url https://new-url.example.com
-$ nemoclaw inference delete my-route
-```
-
-## Connecting Sandboxes to Inference Routes
-
-Add the routing hint to the sandbox policy's `inference.allowed_routes`:
-
-```yaml
-inference:
-  allowed_routes:
-    - local
-```
-
-Then create the sandbox with that policy:
-
-```console
-$ nemoclaw sandbox create --policy ./policy-with-inference.yaml -- claude
-```
+- {doc}`create-routes` --- register a new inference backend with `nemoclaw inference create`.
+- {doc}`manage-routes` --- list, update, and delete inference routes.
+- {doc}`connect-sandboxes` --- connect a sandbox to inference routes via policy.
 
 ## Key Design Properties
 

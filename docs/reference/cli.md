@@ -5,175 +5,187 @@
 
 # CLI Reference
 
-The `nemoclaw` CLI (also available as `ncl`) is the primary interface for managing sandboxes, providers, inference routes, and clusters.
-
-:::{tip}
-The CLI has comprehensive built-in help. Use `nemoclaw <command> --help` at any level to discover commands and flags.
-:::
-
-## Global Options
-
-| Flag | Description |
-|------|-------------|
-| `-v`, `--verbose` | Increase verbosity (`-v` = info, `-vv` = debug, `-vvv` = trace). |
-| `-c`, `--cluster <NAME>` | Cluster to operate on (also via `NEMOCLAW_CLUSTER` env var). |
+Complete command reference for the `nemoclaw` CLI. Every subcommand, flag, and option is documented here.
 
 ## Command Tree
 
-```
-nemoclaw (ncl)
+```text
+nemoclaw
 ├── cluster
-│   ├── status                          # Check gateway connectivity
-│   ├── use <name>                      # Set active cluster
-│   ├── list                            # List all clusters
+│   ├── status
+│   ├── use <name>
+│   ├── list
 │   └── admin
-│       ├── deploy [opts]               # Provision or restart cluster
-│       ├── stop [opts]                 # Stop cluster (preserve state)
-│       ├── destroy [opts]              # Destroy cluster permanently
-│       ├── info [--name]               # Show deployment details
-│       └── tunnel [opts]               # SSH tunnel for kubectl access
+│       ├── deploy
+│       ├── stop
+│       ├── destroy
+│       ├── info
+│       └── tunnel
 ├── sandbox
-│   ├── create [opts] [-- CMD...]       # Create sandbox and connect
-│   ├── get <name>                      # Show sandbox details
-│   ├── list [opts]                     # List sandboxes
-│   ├── delete <name>...                # Delete sandboxes
-│   ├── connect <name>                  # SSH into sandbox
-│   ├── sync <name> {--up|--down}       # Sync files
-│   ├── logs <name> [opts]              # View/stream logs
-│   ├── ssh-config <name>               # Print SSH config block
+│   ├── create
+│   ├── get <name>
+│   ├── list
+│   ├── delete <name...>
+│   ├── connect <name>
+│   ├── sync <name>
+│   ├── logs <name>
+│   ├── ssh-config <name>
 │   ├── forward
-│   │   ├── start <port> <name> [-d]    # Start port forward
-│   │   ├── stop <port> <name>          # Stop port forward
-│   │   └── list                        # List active forwards
-│   ├── image
-│   │   └── push [opts]                 # Build and push custom image
+│   │   ├── start <port> <name>
+│   │   ├── stop <port> <name>
+│   │   └── list
 │   └── policy
-│       ├── set <name> --policy <path>  # Update live policy
-│       ├── get <name> [--full]         # Show current policy
-│       └── list <name>                 # Policy revision history
+│       ├── set <name>
+│       ├── get <name>
+│       └── list <name>
 ├── provider
-│   ├── create --name --type [opts]     # Create provider
-│   ├── get <name>                      # Show provider details
-│   ├── list [opts]                     # List providers
-│   ├── update <name> --type [opts]     # Update provider
-│   └── delete <name>...                # Delete providers
+│   ├── create
+│   ├── get <name>
+│   ├── list
+│   ├── update <name>
+│   └── delete <name>
 ├── inference
-│   ├── create [opts]                   # Create inference route
-│   ├── update <name> [opts]            # Update inference route
-│   ├── delete <name>...                # Delete inference routes
-│   └── list [opts]                     # List inference routes
-├── gator                               # Launch TUI
-└── completions <shell>                 # Generate shell completions
+│   ├── create
+│   ├── update <name>
+│   ├── delete <name>
+│   └── list
+├── gator
+└── completions <shell>
 ```
 
 ## Cluster Commands
 
-### `nemoclaw cluster admin deploy`
+Manage the NemoClaw runtime cluster.
 
-Provision or start a cluster (local or remote).
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | `nemoclaw` | Cluster name. |
-| `--remote <USER@HOST>` | — | SSH destination for remote deployment. |
-| `--ssh-key <PATH>` | — | SSH private key for remote deployment. |
-| `--port <PORT>` | 8080 | Host port mapped to gateway. |
-| `--kube-port [PORT]` | — | Expose K8s control plane on host port. |
-
-### `nemoclaw cluster admin stop`
-
-Stop a cluster container (preserves state for later restart).
-
-### `nemoclaw cluster admin destroy`
-
-Destroy a cluster and all its state permanently.
-
-### `nemoclaw cluster admin info`
-
-Show deployment details: endpoint, kubeconfig path, kube port, remote host.
-
-### `nemoclaw cluster admin tunnel`
-
-Start or print an SSH tunnel for kubectl access to a remote cluster.
+| Command | Description |
+|---|---|
+| `nemoclaw cluster status` | Show the health and status of the active cluster. |
+| `nemoclaw cluster use <name>` | Set the active cluster. All subsequent commands target this cluster. |
+| `nemoclaw cluster list` | List all registered clusters. |
+| `nemoclaw cluster admin deploy` | Deploy a new cluster. Add `--remote user@host` for remote deployment. |
+| `nemoclaw cluster admin stop` | Stop the active cluster, preserving state. |
+| `nemoclaw cluster admin destroy` | Permanently remove the cluster and all its data. |
+| `nemoclaw cluster admin info` | Show detailed information about the cluster. |
+| `nemoclaw cluster admin tunnel` | Set up a kubectl tunnel to a remote cluster. |
 
 ## Sandbox Commands
 
-### `nemoclaw sandbox create [OPTIONS] [-- COMMAND...]`
+Create and manage isolated agent execution environments.
 
-Create a sandbox, wait for readiness, then connect or execute the trailing command.
+| Command | Description |
+|---|---|
+| `nemoclaw sandbox create` | Create a new sandbox. See flag reference below. |
+| `nemoclaw sandbox get <name>` | Show detailed information about a sandbox. |
+| `nemoclaw sandbox list` | List all sandboxes in the active cluster. |
+| `nemoclaw sandbox delete <name...>` | Delete one or more sandboxes by name. |
+| `nemoclaw sandbox connect <name>` | Open an interactive SSH session into a running sandbox. |
+| `nemoclaw sandbox sync <name>` | Sync files between host and sandbox. Use `--up` or `--down`. |
+| `nemoclaw sandbox logs <name>` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. |
+| `nemoclaw sandbox ssh-config <name>` | Print SSH config for a sandbox. Append to `~/.ssh/config` for VS Code Remote-SSH. |
+| `nemoclaw sandbox forward start <port> <name>` | Forward a sandbox port to the host. Add `-d` for background mode. |
+| `nemoclaw sandbox forward stop <port> <name>` | Stop an active port forward. |
+| `nemoclaw sandbox forward list` | List all active port forwards. |
+| `nemoclaw sandbox policy set <name>` | Apply or update a policy on a running sandbox. Pass `--policy <file>`. |
+| `nemoclaw sandbox policy get <name>` | Show the active policy for a sandbox. Add `--full` for the complete policy with metadata. |
+| `nemoclaw sandbox policy list <name>` | List all policy versions applied to a sandbox, with status. |
 
-| Flag | Description |
-|------|-------------|
-| `--name <NAME>` | Sandbox name (auto-generated if omitted). |
-| `--image <IMAGE>` | Custom container image (BYOC). |
-| `--sync` | Sync local git-tracked files to `/sandbox`. |
-| `--keep` | Keep sandbox alive after command exits. |
-| `--provider <NAME>` | Provider to attach (repeatable). |
-| `--policy <PATH>` | Path to custom policy YAML. |
-| `--forward <PORT>` | Forward local port to sandbox (implies `--keep`). |
-| `--remote <USER@HOST>` | SSH destination for auto-bootstrap. |
-
-### `nemoclaw sandbox logs <name>`
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-n <N>` | 200 | Number of log lines. |
-| `--tail` | — | Stream live logs. |
-| `--since <DURATION>` | — | Logs from this duration ago (e.g., `5m`, `1h`). |
-| `--source <SOURCE>` | `all` | Filter: `gateway`, `sandbox`, or `all`. |
-| `--level <LEVEL>` | — | Minimum level: `error`, `warn`, `info`, `debug`, `trace`. |
-
-### `nemoclaw sandbox sync <name> {--up|--down} <path> [dest]`
-
-Sync files to/from a sandbox.
-
-### `nemoclaw sandbox forward start <port> <name>`
-
-Start forwarding a local port to a sandbox. `-d` runs in background.
-
-## Policy Commands
-
-### `nemoclaw sandbox policy set <name> --policy <path>`
-
-Update the policy on a live sandbox. Only dynamic fields can change at runtime.
+### `sandbox create` Flags
 
 | Flag | Description |
-|------|-------------|
-| `--wait` | Wait for sandbox to confirm policy is loaded. |
-| `--timeout <SECS>` | Timeout for `--wait` (default: 60). |
-
-### `nemoclaw sandbox policy get <name>`
-
-| Flag | Description |
-|------|-------------|
-| `--rev <VERSION>` | Show a specific revision (default: latest). |
-| `--full` | Print full policy as YAML (round-trips with `--policy`). |
-
-### `nemoclaw sandbox policy list <name>`
-
-Show policy revision history.
+|---|---|
+| `--name` | Assign a human-readable name to the sandbox. Auto-generated if omitted. |
+| `--provider` | Attach a credential provider. Repeatable for multiple providers. |
+| `--policy` | Path to a policy YAML file to apply at creation time. |
+| `--sync` | Sync local files into the sandbox before running. |
+| `--keep` | Keep the sandbox alive after the trailing command exits. |
+| `--forward` | Forward a local port into the sandbox at startup. |
+| `--from` | Build from a community sandbox name, local Dockerfile directory, or container image reference. |
+| `-- <command>` | The command to run inside the sandbox. Everything after `--` is passed as the agent command. |
 
 ## Provider Commands
 
-### `nemoclaw provider create --name <NAME> --type <TYPE>`
+Manage credential providers that inject secrets into sandboxes.
+
+| Command | Description |
+|---|---|
+| `nemoclaw provider create` | Create a new credential provider. See flag reference below. |
+| `nemoclaw provider get <name>` | Show details of a provider. |
+| `nemoclaw provider list` | List all providers in the active cluster. |
+| `nemoclaw provider update <name>` | Update a provider's credentials or configuration. |
+| `nemoclaw provider delete <name>` | Delete a provider. |
+
+### `provider create` Flags
 
 | Flag | Description |
-|------|-------------|
-| `--from-existing` | Discover credentials from local machine. |
-| `--credential KEY[=VALUE]` | Credential pair (repeatable). Bare `KEY` reads from env var. |
-| `--config KEY=VALUE` | Config key/value pair (repeatable). |
-
-Supported types: `claude`, `opencode`, `codex`, `generic`, `nvidia`, `gitlab`, `github`, `outlook`.
+|---|---|
+| `--name` | Name for the provider. |
+| `--type` | Provider type: `claude`, `codex`, `opencode`, `github`, `gitlab`, `nvidia`, `generic`, `outlook`. |
+| `--from-existing` | Discover credentials from your current shell environment variables. |
+| `--credential` | Set a credential explicitly. Format: `KEY=VALUE` or bare `KEY` to read from env. Repeatable. |
+| `--config` | Set a configuration value. Format: `KEY=VALUE`. Repeatable. |
 
 ## Inference Commands
 
-### `nemoclaw inference create`
+Manage inference routes that intercept and reroute LLM API calls from userland code.
+
+| Command | Description |
+|---|---|
+| `nemoclaw inference create` | Create a new inference route. See flag reference below. |
+| `nemoclaw inference update <name>` | Update an existing route's configuration. |
+| `nemoclaw inference delete <name>` | Delete an inference route. |
+| `nemoclaw inference list` | List all inference routes in the active cluster. |
+
+### `inference create` Flags
 
 | Flag | Description |
-|------|-------------|
-| `--routing-hint <HINT>` (required) | Routing hint for policy matching. |
-| `--base-url <URL>` (required) | Backend endpoint URL. |
-| `--model-id <ID>` (required) | Model identifier. |
-| `--api-key <KEY>` | API key for the endpoint. |
-| `--protocol <PROTO>` | Protocol (auto-detected if omitted, repeatable). |
-| `--disabled` | Create in disabled state. |
+|---|---|
+| `--routing-hint` | Short label that identifies this route (e.g., `local`, `nvidia`, `staging`). Referenced by `allowed_routes` in sandbox policies. |
+| `--base-url` | Base URL of the inference backend (e.g., `https://vllm.internal:8000`). |
+| `--model-id` | Model identifier to send to the backend (e.g., `meta/llama-3.1-8b`). |
+| `--api-key` | API key for authenticating with the backend. |
+| `--protocol` | API protocol: `openai` or `anthropic`. Defaults to `openai`. |
+| `--disabled` | Create the route in a disabled state. |
+
+## NemoClaw Terminal
+
+`nemoclaw gator` launches the NemoClaw Terminal, a dashboard that shows sandbox
+status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
+press `f` to follow live output, `s` to filter by source, and `q` to quit.
+
+See {doc}`/sandboxes/terminal` for the full guide — including how to read log
+entries, diagnose blocked connections, and interpret inference interception.
+
+## Environment Variables
+
+| Variable | Description |
+|---|---|
+| `NEMOCLAW_CLUSTER` | Name of the cluster to operate on. Overrides the active cluster set by `nemoclaw cluster use`. |
+| `NEMOCLAW_SANDBOX_POLICY` | Default path to a policy YAML file. When set, `nemoclaw sandbox create` uses this policy if no `--policy` flag is provided. |
+
+## Shell Completions
+
+Generate shell completion scripts for tab completion:
+
+```console
+$ nemoclaw completions bash
+$ nemoclaw completions zsh
+$ nemoclaw completions fish
+```
+
+Pipe the output to your shell's config file:
+
+```console
+$ nemoclaw completions zsh >> ~/.zshrc
+$ source ~/.zshrc
+```
+
+## Self-Teaching
+
+Every command and subcommand includes built-in help. Use `--help` at any level to see available subcommands, flags, and usage examples:
+
+```console
+$ nemoclaw --help
+$ nemoclaw sandbox --help
+$ nemoclaw sandbox create --help
+$ nemoclaw cluster admin --help
+```

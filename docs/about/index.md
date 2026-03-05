@@ -75,7 +75,7 @@ AI API calls (OpenAI, Anthropic) are transparently intercepted by the proxy and 
 
 :::{dropdown} Declarative Policies
 
-YAML policies define what each sandbox can access — filesystems, network endpoints, inference routes, and credential bindings. Policies can be updated on running sandboxes without restart: push a new policy revision and the OPA engine reloads atomically within 30 seconds. Refer to [Policies](../security/policies.md) for the schema and examples.
+YAML policies define what each sandbox can access — filesystems, network endpoints, inference routes, and credential bindings. Policies can be updated on running sandboxes without restart: push a new policy revision and the OPA engine reloads atomically within 30 seconds. Refer to [Policies](../safety-and-privacy/policies.md) for the schema and examples.
 :::
 
 :::{dropdown} Zero-Config Deployment
@@ -87,7 +87,7 @@ nemoclaw cluster admin deploy
 nemoclaw sandbox create -- claude
 ```
 
-No Kubernetes expertise is required. Refer to [Get Started](../get-started/index.md) for full installation steps.
+No Kubernetes expertise is required. Refer to [Get Started](../get-started/installation.md) for full installation steps.
 :::
 
 ## Use Cases
@@ -106,4 +106,4 @@ No Kubernetes expertise is required. Refer to [Get Started](../get-started/index
 - [How It Works](how-it-works.md): Explore the architecture, major subsystems, and the end-to-end flow from cluster bootstrap to running sandbox.
 - [Support Matrix](support-matrix.md): Find platform requirements, supported providers, agent tools, and compatibility details.
 - [Release Notes](release-notes.md): Track what changed in each version.
-- [Get Started](../get-started/index.md): Install the CLI, bootstrap a cluster, and launch your first sandbox.
+- [Get Started](../get-started/installation.md): Install the CLI and launch your first sandbox.

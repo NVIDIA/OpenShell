@@ -5,185 +5,208 @@
 
 # Policy Schema Reference
 
-This is the complete YAML schema for NemoClaw sandbox policies. For a guide on using policies, see [Policies](../security/policies.md).
+Complete field reference for the sandbox policy YAML. Each field is documented with its type, whether it is required, and whether it is static (locked at sandbox creation) or dynamic (hot-reloadable on a running sandbox).
 
-## Full Schema
+## Top-Level Structure
 
 ```yaml
-filesystem_policy:
-  read_only:                    # List of paths — read-only access (Landlock)
-    - /usr
-    - /etc
-    - /lib
-  read_write:                   # List of paths — read-write access (auto-created, chowned)
-    - /sandbox
-    - /tmp
-
-landlock:
-  compatibility: best_effort    # best_effort | hard_requirement
-
-process:
-  run_as_user: sandbox          # Username or UID
-  run_as_group: sandbox         # Group name or GID
-
-network_policies:               # Map of named network policy entries
-  <policy-name>:
-    endpoints:
-      - host: <hostname>        # Destination hostname
-        port: <port>            # Destination port (integer)
-        l7:                     # Optional — L7 inspection config
-          tls_mode: terminate   # terminate
-          enforcement_mode: enforce  # enforce | audit
-          access: <preset>      # read-only | read-write | full (expands to rules)
-          rules:                # Explicit HTTP rules (mutually exclusive with access)
-            - method: <METHOD>  # HTTP method (GET, POST, PUT, DELETE, etc.)
-              path_pattern: <pattern>  # URL path pattern (glob)
-    binaries:
-      - path_patterns:          # List of glob patterns for binary paths
-          - "**/git"
-          - "/usr/bin/curl"
-
-inference:
-  allowed_routes:               # List of routing hint names
-    - local
-    - cloud
+version: 1
+filesystem_policy: { ... }
+landlock: { ... }
+process: { ... }
+network_policies: { ... }
+inference: { ... }
 ```
 
-## Field Reference
+| Field | Type | Required | Category | Description |
+|---|---|---|---|---|
+| `version` | integer | Yes | -- | Policy schema version. Must be `1`. |
+| `filesystem_policy` | object | No | Static | Controls which directories the agent can read and write. |
+| `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
+| `process` | object | No | Static | Sets the user and group the agent process runs as. |
+| `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
+| `inference` | object | No | Dynamic | Controls which inference routing backends are available. |
 
-### `filesystem_policy`
+Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw sandbox policy set` and take effect without restarting.
 
-Controls directory-level access enforced by the Linux Landlock LSM.
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `read_only` | `list[string]` | No | Paths the agent can read but not write. |
-| `read_write` | `list[string]` | No | Paths the agent can read and write. Directories are created and ownership is set to the `run_as_user` automatically. |
-
-**Note:** The working directory (`--workdir`, default `/sandbox`) is automatically added to `read_write` unless `include_workdir` is set to `false`.
-
-### `landlock`
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `compatibility` | `string` | `best_effort` | `best_effort` — use the best available Landlock ABI version. `hard_requirement` — fail startup if the required ABI is not available. |
-
-### `process`
+## `version`
 
 | Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `run_as_user` | `string` | No | Username or UID the child process runs as. |
-| `run_as_group` | `string` | No | Group name or GID the child process runs as. |
+|---|---|---|---|
+| `version` | integer | Yes | Schema version number. Currently must be `1`. |
 
-### `network_policies`
+## `filesystem_policy`
 
-A map where each key is a policy name and each value defines endpoints and allowed binaries.
+**Category:** Static
 
-#### Endpoint Fields
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `host` | `string` | Yes | Destination hostname to match. |
-| `port` | `integer` | Yes | Destination port to match. |
-| `l7` | `object` | No | L7 inspection configuration (see below). |
-
-#### L7 Fields
+Controls filesystem access inside the sandbox. Paths not listed in either `read_only` or `read_write` are inaccessible.
 
 | Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `tls_mode` | `string` | Yes | Must be `terminate` — the proxy terminates TLS and inspects plaintext HTTP. |
-| `enforcement_mode` | `string` | No | `enforce` (default) — block non-matching requests. `audit` — log violations but allow traffic. |
-| `access` | `string` | No | Preset: `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
-| `rules` | `list[object]` | No | Explicit HTTP rules. Mutually exclusive with `access`. |
+|---|---|---|---|
+| `include_workdir` | bool | No | When `true`, automatically adds the agent's working directory to `read_write`. |
+| `read_only` | list of strings | No | Paths the agent can read but not modify. Typically system directories like `/usr`, `/lib`, `/etc`. |
+| `read_write` | list of strings | No | Paths the agent can read and write. Typically `/sandbox` (working directory) and `/tmp`. |
 
-#### L7 Rule Fields
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `method` | `string` | Yes | HTTP method (`GET`, `POST`, `PUT`, `DELETE`, `PATCH`, `HEAD`, `OPTIONS`). |
-| `path_pattern` | `string` | Yes | URL path pattern (glob matching). |
-
-#### Access Presets
-
-| Preset | Expands To |
-|--------|-----------|
-| `read-only` | `GET`, `HEAD`, `OPTIONS` |
-| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`, `DELETE` |
-| `full` | All HTTP methods |
-
-#### Binary Fields
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `path_patterns` | `list[string]` | Yes | Glob patterns matched against the full path of the requesting executable. |
-
-### `inference`
-
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `allowed_routes` | `list[string]` | No | List of routing hint names. Routes are created via `nemoclaw inference create`. |
-
-## Static vs. Dynamic Fields
-
-| Category | Fields | Updatable at Runtime? |
-|----------|--------|----------------------|
-| **Static** | `filesystem_policy`, `landlock`, `process` | No — immutable after creation. |
-| **Dynamic** | `network_policies`, `inference` | Yes — updated via `nemoclaw sandbox policy set`. |
-
-## Example: Development Policy
+Example:
 
 ```yaml
 filesystem_policy:
+  include_workdir: true
   read_only:
     - /usr
-    - /etc
     - /lib
-    - /lib64
-    - /bin
-    - /sbin
+    - /proc
+    - /dev/urandom
+    - /etc
   read_write:
     - /sandbox
     - /tmp
-    - /home/sandbox
+    - /dev/null
+```
 
+## `landlock`
+
+**Category:** Static
+
+Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforcement at the kernel level. Landlock provides mandatory filesystem access control below what UNIX permissions allow.
+
+| Field | Type | Required | Values | Description |
+|---|---|---|---|---|
+| `compatibility` | string | No | `best_effort`, `hard_requirement` | How NemoClaw handles kernel ABI differences. `best_effort` uses the highest Landlock ABI the host kernel supports. `hard_requirement` fails if the required ABI is unavailable. |
+
+Example:
+
+```yaml
 landlock:
   compatibility: best_effort
+```
 
+## `process`
+
+**Category:** Static
+
+Sets the OS-level identity for the agent process inside the sandbox.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `run_as_user` | string | No | The user name or UID the agent process runs as. Default: `sandbox`. |
+| `run_as_group` | string | No | The group name or GID the agent process runs as. Default: `sandbox`. |
+
+Example:
+
+```yaml
 process:
   run_as_user: sandbox
   run_as_group: sandbox
+```
 
+## `network_policies`
+
+**Category:** Dynamic
+
+A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier; the `name` field inside the entry is the display name used in logs.
+
+### Network Policy Entry
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
+| `endpoints` | list of endpoint objects | Yes | Hosts and ports this entry permits. |
+| `binaries` | list of binary objects | Yes | Executables allowed to connect to these endpoints. |
+
+### Endpoint Object
+
+Each endpoint defines a reachable destination and optional inspection rules.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
+| `port` | integer | Yes | TCP port number. |
+| `protocol` | string | No | Set to `rest` to enable L7 (HTTP) inspection. Omit for L4-only (TCP passthrough). |
+| `tls` | string | No | TLS handling mode. `terminate` decrypts TLS at the proxy for inspection. `passthrough` forwards encrypted traffic without inspection. Only relevant when `protocol` is `rest`. |
+| `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
+| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. See table below. Mutually exclusive with `rules`. |
+| `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
+
+#### Access Levels
+
+| Value | Allowed HTTP Methods |
+|---|---|
+| `full` | All methods and paths. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS`. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. |
+
+#### Rule Object
+
+Used when `access` is not set. Each rule explicitly allows a method and path combination.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `allow.method` | string | Yes | HTTP method to allow (e.g., `GET`, `POST`). |
+| `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+
+Example with rules:
+
+```yaml
+rules:
+  - allow:
+      method: GET
+      path: /**/info/refs*
+  - allow:
+      method: POST
+      path: /**/git-upload-pack
+```
+
+### Binary Object
+
+Identifies an executable that is permitted to use the associated endpoints.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
+
+### Full Example
+
+```yaml
 network_policies:
-  github:
+  github_rest_api:
+    name: github-rest-api
     endpoints:
-      - host: github.com
-        port: 443
       - host: api.github.com
         port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
     binaries:
-      - path_patterns: ["**/git"]
-      - path_patterns: ["**/ssh"]
-      - path_patterns: ["**/curl"]
-
-  anthropic:
+      - path: /usr/local/bin/claude
+      - path: /usr/bin/node
+      - path: /usr/bin/gh
+  npm_registry:
+    name: npm-registry
     endpoints:
-      - host: api.anthropic.com
+      - host: registry.npmjs.org
         port: 443
     binaries:
-      - path_patterns: ["**/claude"]
-      - path_patterns: ["**/node"]
+      - path: /usr/bin/npm
+      - path: /usr/bin/node
+```
 
-  pypi:
-    endpoints:
-      - host: pypi.org
-        port: 443
-      - host: files.pythonhosted.org
-        port: 443
-    binaries:
-      - path_patterns: ["**/pip"]
-      - path_patterns: ["**/python*"]
+## `inference`
 
+**Category:** Dynamic
+
+Controls which inference routing backends userland code may access. The `allowed_routes` list names route types that the privacy router will accept. Traffic matching an inference API pattern that targets a route type not in this list is denied.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `allowed_routes` | list of strings | No | Routing hint labels (e.g., `local`, `nvidia`, `staging`) that this sandbox may use. Must match the `routing_hint` of inference routes created with `nemoclaw inference create`. |
+
+Example:
+
+```yaml
 inference:
   allowed_routes:
     - local
+    - nvidia
 ```

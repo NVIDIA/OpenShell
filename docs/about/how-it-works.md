@@ -60,7 +60,7 @@ Each sandbox runs inside a container as two processes: a privileged **supervisor
 - **Network namespace isolation** — the agent is placed in a separate network where the only reachable destination is the proxy, preventing data exfiltration.
 - **Process privilege separation** — the agent runs as an unprivileged user, protecting against privilege escalation.
 
-All restrictions are driven by a YAML **policy** evaluated by an embedded OPA/Rego engine. See [Safety & Privacy](../security/index.md).
+All restrictions are driven by a YAML **policy** evaluated by an embedded OPA/Rego engine. See [Safety & Privacy](../safety-and-privacy/index.md).
 
 ### Network Proxy
 

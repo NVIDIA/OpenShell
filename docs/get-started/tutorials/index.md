@@ -1,6 +1,8 @@
 # Tutorials
 
-This section contains tutorials that help you get started with NemoClaw.
+Each tutorial walks through an end-to-end workflow from bootstrapping a cluster to running an agent inside a policy-enforced sandbox. Pick the tutorial that matches your agent and follow along.
+
+All tutorials assume you have [installed the CLI](../installation.md) and have Docker running.
 
 ::::{grid} 1 1 2 2
 :gutter: 3
@@ -23,6 +25,15 @@ Run Anthropic Claude as a coding agent with credential management, inference rou
 {bdg-secondary}`Tutorial`
 :::
 
+:::{grid-item-card} Run Opencode with NVIDIA Inference
+:link: run-opencode
+:link-type: doc
+
+Set up opencode with NVIDIA inference routing, custom policies, and the full policy iteration loop.
++++
+{bdg-secondary}`Tutorial`
+:::
+
 ::::
 
 ```{toctree}
@@ -31,5 +42,6 @@ Run Anthropic Claude as a coding agent with credential management, inference rou
 
 Run OpenClaw Safely <run-openclaw>
 Run Claude Safely <run-claude>
+Run Opencode with NVIDIA Inference <run-opencode>
 Run Any Agent Safely <run-agents>
 ```

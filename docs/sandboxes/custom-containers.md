@@ -3,13 +3,13 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Custom Containers (BYOC)
+# Custom Containers
 
-You can run any Linux container image as a sandbox while keeping the NemoClaw supervisor in control of security enforcement. This is called Bring Your Own Container (BYOC).
+You can run any Linux container image as a sandbox while keeping the NemoClaw supervisor in control of security enforcement.
 
 ## How It Works
 
-When you specify `--image`, the server activates **supervisor bootstrap mode**. The `navigator-sandbox` supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container, then mounted read-only into your custom container. This means you do not need to build the supervisor into your image.
+When you specify `--image`, the server activates supervisor bootstrap mode. The `navigator-sandbox` supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container, then mounted read-only into your custom container. This means you do not need to build the supervisor into your image.
 
 ```{mermaid}
 flowchart TB

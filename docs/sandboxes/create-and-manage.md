@@ -5,114 +5,213 @@
 
 # Create and Manage Sandboxes
 
-## Creating a Sandbox
+This page walks you through the full sandbox lifecycle: creating, inspecting, connecting to, monitoring, and deleting sandboxes.
 
-The simplest form creates a sandbox with defaults and drops you into an interactive shell:
+## Sandbox Lifecycle
+
+Every sandbox moves through a defined set of phases:
+
+| Phase | Description |
+|---|---|
+| **Provisioning** | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
+| **Ready** | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| **Error** | Something went wrong during provisioning or execution. Check logs with `nemoclaw sandbox logs` for details. |
+| **Deleting** | The sandbox is being torn down. Resources are released and credentials are purged. |
+
+## The NemoClaw Runtime
+
+Sandboxes run inside a lightweight runtime cluster that NemoClaw manages for
+you. The cluster runs as a [k3s](https://k3s.io/) Kubernetes distribution
+inside a Docker container on your machine.
+
+**You do not need to set this up manually.** The first time you run a command
+that needs a cluster (such as `nemoclaw sandbox create`), the CLI provisions
+one automatically. This is the "Runtime ready" line you see in the output.
+Subsequent commands reuse the existing cluster.
+
+For teams or when you need more resources, you can deploy the cluster to a
+remote host instead of your local machine:
 
 ```console
-$ nemoclaw sandbox create
+$ nemoclaw cluster admin deploy --remote user@host
 ```
 
-### With an Agent Tool
+See [Remote Deployment](../reference/architecture.md) for
+details. If you have multiple clusters (local and remote), switch between them
+with `nemoclaw cluster use <name>`. See the
+[CLI Reference](../reference/cli.md#cluster-commands) for the full command set.
 
-When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
+## Prerequisites
+
+- NemoClaw CLI installed (`pip install nemoclaw`)
+- Docker running on your machine
+
+## Create a Sandbox
+
+The simplest way to create a sandbox is to specify a trailing command:
 
 ```console
 $ nemoclaw sandbox create -- claude
-$ nemoclaw sandbox create -- codex
 ```
 
-### With Options
+The CLI bootstraps the runtime (if this is your first run), discovers your
+credentials, applies the default policy, and drops you into the sandbox.
+
+You can customize creation with flags like `--name`, `--provider`, `--policy`,
+`--sync`, `--keep`, `--forward`, and `--from`. See the
+[CLI Reference](../reference/cli.md) for the full flag list.
+
+A fully specified creation command might look like:
 
 ```console
 $ nemoclaw sandbox create \
-  --name my-sandbox \
-  --provider my-github \
-  --provider my-claude \
-  --policy ./my-policy.yaml \
-  --sync \
-  -- claude
+    --name dev \
+    --provider my-claude \
+    --policy policy.yaml \
+    --sync \
+    --keep \
+    -- claude
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--name <NAME>` | Sandbox name (auto-generated if omitted). |
-| `--provider <NAME>` | Provider to attach (repeatable). |
-| `--policy <PATH>` | Custom policy YAML. Uses the built-in default if omitted. |
-| `--sync` | Push local git-tracked files to `/sandbox` in the container. |
-| `--keep` | Keep sandbox alive after the command exits. |
-| `--forward <PORT>` | Forward a local port to the sandbox (implies `--keep`). |
-| `--image <IMAGE>` | Custom container image (see [Custom Containers](custom-containers.md)). |
+:::{tip}
+Use `--keep` to keep the sandbox running after the trailing command exits.
+This is especially useful when you are iterating on a policy or want to
+reconnect later from another terminal or VS Code.
+:::
 
-### Auto-Bootstrap
+## List and Inspect Sandboxes
 
-If no cluster is running, `sandbox create` offers to bootstrap one automatically. This is equivalent to running `nemoclaw cluster admin deploy` first.
-
-## Listing Sandboxes
+List all sandboxes:
 
 ```console
 $ nemoclaw sandbox list
 ```
 
-| Flag | Description |
-|------|-------------|
-| `--limit <N>` | Maximum number of sandboxes to return (default: 100). |
-| `--offset <N>` | Pagination offset. |
-| `--names` | Print only sandbox names. |
-
-## Inspecting a Sandbox
+Get detailed information about a specific sandbox:
 
 ```console
 $ nemoclaw sandbox get my-sandbox
 ```
 
-Shows sandbox details including ID, name, namespace, phase, and policy.
+## Connect to a Sandbox
 
-## Connecting to a Sandbox
+### Interactive SSH
+
+Open an SSH session into a running sandbox:
 
 ```console
 $ nemoclaw sandbox connect my-sandbox
 ```
 
-Opens an interactive SSH session. All provider credentials are available as environment variables inside the sandbox.
-
 ### VS Code Remote-SSH
+
+Export the sandbox SSH configuration and append it to your SSH config:
 
 ```console
 $ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
-Then use VS Code's Remote-SSH extension to connect to the host `my-sandbox`.
+Then open VS Code, install the **Remote - SSH** extension if you have not
+already, and connect to the host named `my-sandbox`.
 
-## Viewing Logs
+## View Logs
+
+Stream sandbox logs:
 
 ```console
 $ nemoclaw sandbox logs my-sandbox
 ```
 
-| Flag | Description |
-|------|-------------|
-| `-n <N>` | Number of log lines (default: 200). |
-| `--tail` | Stream live logs. |
-| `--since <DURATION>` | Show logs from this duration ago (e.g., `5m`, `1h`). |
-| `--source <SOURCE>` | Filter by source: `gateway`, `sandbox`, or `all` (repeatable). |
-| `--level <LEVEL>` | Minimum level: `error`, `warn`, `info`, `debug`, `trace`. |
+Use flags to filter and follow output:
 
-### Monitoring for Denied Actions
+| Flag | Purpose | Example |
+|---|---|---|
+| `--tail` | Stream logs in real time | `nemoclaw sandbox logs my-sandbox --tail` |
+| `--source` | Filter by log source | `--source sandbox` |
+| `--level` | Filter by severity | `--level warn` |
+| `--since` | Show logs from a time window | `--since 5m` |
 
-When iterating on a sandbox policy, watch for denied network requests:
+Combine flags to narrow in on what you need:
 
 ```console
-$ nemoclaw sandbox logs my-sandbox --tail --source sandbox
+$ nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn --since 5m
 ```
 
-Denied actions include the destination host/port, the binary that attempted the connection, and the reason for denial.
+:::{tip}
+For a real-time dashboard that combines sandbox status and logs in one view,
+run `nemoclaw gator`. See {doc}`terminal` for details on reading log entries and
+diagnosing blocked connections.
+:::
 
-## Deleting Sandboxes
+## Sync Files
+
+Push files from your host into the sandbox:
+
+```console
+$ nemoclaw sandbox sync my-sandbox --up ./src /sandbox/src
+```
+
+Pull files from the sandbox to your host:
+
+```console
+$ nemoclaw sandbox sync my-sandbox --down /sandbox/output ./local
+```
+
+:::{note}
+You can also sync files at creation time with the `--sync` flag on
+`nemoclaw sandbox create`.
+:::
+
+## Port Forwarding
+
+Forward a port from the sandbox to your host machine. This runs in the
+foreground by default:
+
+```console
+$ nemoclaw sandbox forward start 8080 my-sandbox
+```
+
+Add `-d` to run the forward in the background:
+
+```console
+$ nemoclaw sandbox forward start 8080 my-sandbox -d
+```
+
+List active port forwards:
+
+```console
+$ nemoclaw sandbox forward list
+```
+
+Stop a port forward:
+
+```console
+$ nemoclaw sandbox forward stop 8080 my-sandbox
+```
+
+:::{note}
+You can set up port forwarding at creation time with the `--forward` flag on
+`nemoclaw sandbox create`, which is convenient when you know upfront that
+your workload exposes a service.
+:::
+
+## Delete Sandboxes
+
+Delete a sandbox by name:
 
 ```console
 $ nemoclaw sandbox delete my-sandbox
-$ nemoclaw sandbox delete sandbox-1 sandbox-2 sandbox-3
 ```
 
-Deleting a sandbox also stops any active port forwards.
+You can delete multiple sandboxes in a single command:
+
+```console
+$ nemoclaw sandbox delete sandbox-a sandbox-b sandbox-c
+```
+
+## Next Steps
+
+- {doc}`community-sandboxes` --- use pre-built sandboxes from the community catalog
+- {doc}`providers` --- create and attach credential providers
+- {doc}`custom-containers` --- build and run your own container image
+- {doc}`../safety-and-privacy/policies` --- control what the agent can access
