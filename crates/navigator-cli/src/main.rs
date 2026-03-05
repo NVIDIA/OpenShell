@@ -9,7 +9,6 @@ use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::Write;
-use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
 use navigator_cli::completers;
@@ -44,16 +43,16 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         .ok_or_else(|| {
             miette::miette!(
                 "No active cluster.\n\
-                 Set one with: ncl cluster use <name>\n\
-                 Or deploy a new cluster: ncl cluster admin deploy"
+                 Set one with: nemoclaw cluster use <name>\n\
+                 Or deploy a new cluster: nemoclaw cluster admin deploy"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown cluster '{name}'.\n\
-             Deploy it first: ncl cluster admin deploy --name {name}\n\
-             Or list available clusters: ncl cluster list"
+             Deploy it first: nemoclaw cluster admin deploy --name {name}\n\
+             Or list available clusters: nemoclaw cluster list"
         )
     })?;
 
@@ -137,10 +136,10 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `ncl ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `ncl ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -479,10 +478,18 @@ enum SandboxCommands {
         #[arg(long)]
         name: Option<String>,
 
-        /// Container image for the sandbox workload.
-        /// The sandbox supervisor is side-loaded via an init container.
+        /// Sandbox source: a community sandbox name (e.g., `openclaw`), a path
+        /// to a Dockerfile or directory containing one, or a full container
+        /// image reference (e.g., `myregistry.com/img:tag`).
+        ///
+        /// Community names are resolved to
+        /// `ghcr.io/nvidia/nemoclaw-community/sandboxes/<name>:latest`
+        /// (override the prefix with `NEMOCLAW_COMMUNITY_REGISTRY`).
+        ///
+        /// When given a Dockerfile or directory, the image is built and pushed
+        /// into the cluster automatically before creating the sandbox.
         #[arg(long)]
-        image: Option<String>,
+        from: Option<String>,
 
         /// Sync local files into the sandbox before running.
         #[arg(long)]
@@ -596,12 +603,6 @@ enum SandboxCommands {
         /// Defaults to /sandbox for --up or . for --down.
         #[arg(value_name = "DEST")]
         dest: Option<String>,
-    },
-
-    /// Manage sandbox images.
-    Image {
-        #[command(subcommand)]
-        command: SandboxImageCommands,
     },
 
     /// Manage sandbox policy.
@@ -720,28 +721,6 @@ enum ForwardCommands {
 
     /// List active port forwards.
     List,
-}
-
-#[derive(Subcommand, Debug)]
-enum SandboxImageCommands {
-    /// Build and push a container image into the cluster.
-    Push {
-        /// Path to the Dockerfile.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        dockerfile: PathBuf,
-
-        /// Image name and tag (default: navigator/sandbox-custom:<timestamp>).
-        #[arg(long)]
-        tag: Option<String>,
-
-        /// Build context directory (default: Dockerfile parent directory).
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        context: Option<PathBuf>,
-
-        /// Build argument in KEY=VALUE format (can be specified multiple times).
-        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
-        build_args: Vec<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -921,7 +900,7 @@ async fn main() -> Result<()> {
             match command {
                 SandboxCommands::Create {
                     name,
-                    image,
+                    from,
                     sync,
                     keep,
                     remote,
@@ -949,7 +928,7 @@ async fn main() -> Result<()> {
                             if remote.is_some() {
                                 eprintln!(
                                     "{} --remote ignored: cluster '{}' is already active. \
-                                     To redeploy, use: ncl cluster admin deploy",
+                                     To redeploy, use: nemoclaw cluster admin deploy",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -960,7 +939,8 @@ async fn main() -> Result<()> {
                             run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
-                                image.as_deref(),
+                                from.as_deref(),
+                                &ctx.name,
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -978,7 +958,7 @@ async fn main() -> Result<()> {
                             // No cluster configured — go straight to bootstrap.
                             run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
-                                image.as_deref(),
+                                from.as_deref(),
                                 sync,
                                 keep,
                                 remote.as_deref(),
@@ -1045,31 +1025,12 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                SandboxCommands::Image { command } => match command {
-                    SandboxImageCommands::Push {
-                        dockerfile,
-                        tag,
-                        context,
-                        build_args,
-                    } => {
-                        let cluster_name = resolve_cluster_name(&cli.cluster)
-                            .unwrap_or_else(|| "nemoclaw".to_string());
-                        run::sandbox_image_push(
-                            &dockerfile,
-                            tag.as_deref(),
-                            context.as_deref(),
-                            &cluster_name,
-                            &build_args,
-                        )
-                        .await?;
-                    }
-                },
                 other => {
                     let ctx = resolve_cluster(&cli.cluster)?;
                     let endpoint = &ctx.endpoint;
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
-                        SandboxCommands::Create { .. } | SandboxCommands::Image { .. } => {
+                        SandboxCommands::Create { .. } => {
                             unreachable!()
                         }
                         SandboxCommands::Sync {
@@ -1331,8 +1292,8 @@ async fn main() -> Result<()> {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
                                 "Unknown cluster '{c}'.\n\
-                                  Deploy it first: ncl cluster admin deploy --name {c}\n\
-                                  Or list available clusters: ncl cluster list"
+                                  Deploy it first: nemoclaw cluster admin deploy --name {c}\n\
+                                  Or list available clusters: nemoclaw cluster list"
                             )
                         })?;
                         meta.gateway_endpoint
@@ -1448,25 +1409,6 @@ mod tests {
                 vec!["nemoclaw", "sandbox", "sync", "demo", "--up", "Do"],
                 5,
                 "Dockerfile",
-            ),
-            (
-                vec!["nemoclaw", "sandbox", "image", "push", "--dockerfile", "Do"],
-                5,
-                "Dockerfile",
-            ),
-            (
-                vec![
-                    "nemoclaw",
-                    "sandbox",
-                    "image",
-                    "push",
-                    "--dockerfile",
-                    "Dockerfile",
-                    "--context",
-                    "c",
-                ],
-                7,
-                "ctx/",
             ),
         ];
 

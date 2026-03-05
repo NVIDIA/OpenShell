@@ -18,19 +18,17 @@ your local machine through port forwarding.
 
 ## Quick start
 
-### 1. Build and push the image
+### 1. Create a sandbox from the Dockerfile with port forwarding
 
 ```bash
-nemoclaw sandbox image push \
-    --dockerfile examples/bring-your-own-container/Dockerfile \
-    --tag        byoc-demo:latest
+nemoclaw sandbox create \
+    --from examples/bring-your-own-container/Dockerfile \
+    --forward 8080 \
+    -- python /sandbox/app.py
 ```
 
-### 2. Create a sandbox with port forwarding
-
-```bash
-nemoclaw sandbox create --image byoc-demo:latest --forward 8080 -- python /sandbox/app.py
-```
+The `--from` flag accepts a Dockerfile path. The CLI builds the image,
+pushes it into the cluster, and creates the sandbox in one step.
 
 The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
 machine reaches the REST API inside the sandbox.
@@ -40,7 +38,7 @@ NemoClaw replaces it with the sandbox supervisor (which manages SSH access,
 network policy, etc.).  You must pass your application's start command
 after `--` so it is executed via SSH once the sandbox is ready.
 
-### 3. Hit the API
+### 2. Hit the API
 
 ```bash
 curl http://localhost:8080/hello
@@ -72,22 +70,13 @@ TODO(#70): Remove the sandbox user note once custom images are secure by default
 
 NemoClaw handles all the wiring automatically.  You build a standard
 Linux container image — no NemoClaw-specific dependencies or
-configuration required.  When you create a sandbox with `--image`,
+configuration required.  When you create a sandbox with `--from`,
 NemoClaw ensures that sandboxing (network policy, filesystem isolation,
 SSH access) works the same as with the default image.
 
 Port forwarding is entirely client-side: the CLI spawns a background
 `ssh -L` tunnel through the gateway.  The sandbox's embedded SSH daemon
 bridges the tunnel to `127.0.0.1:<port>` inside the container.
-
-## Push flags
-
-| Flag           | Description                                              |
-| -------------- | -------------------------------------------------------- |
-| `--dockerfile` | Path to the Dockerfile (required)                        |
-| `--tag`        | Image name and tag (default: auto-generated)             |
-| `--context`    | Docker build context directory for COPY/ADD (default: Dockerfile parent dir) |
-| `--build-arg`  | Repeatable `KEY=VALUE` Docker build arguments            |
 
 ## Cleanup
 

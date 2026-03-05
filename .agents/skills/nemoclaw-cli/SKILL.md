@@ -1,31 +1,31 @@
 ---
 name: nemoclaw-cli
-description: Guide agents through using the NemoClaw CLI (nemoclaw/ncl) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - nemoclaw, ncl, sandbox create, sandbox connect, sandbox logs, provider create, policy set, policy get, image push, port forward, BYOC, bring your own container, use nemoclaw, run nemoclaw, CLI usage, manage sandbox, manage provider.
+description: Guide agents through using the NemoClaw CLI (nemoclaw) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - nemoclaw, sandbox create, sandbox connect, sandbox logs, provider create, policy set, policy get, image push, port forward, BYOC, bring your own container, use nemoclaw, run nemoclaw, CLI usage, manage sandbox, manage provider.
 ---
 
 # NemoClaw CLI
 
-Guide agents through using the `nemoclaw` CLI (`ncl`) for sandbox and platform management -- from basic operations to advanced multi-step workflows.
+Guide agents through using the `nemoclaw` CLI for sandbox and platform management -- from basic operations to advanced multi-step workflows.
 
 ## Overview
 
-The NemoClaw CLI (`nemoclaw`, commonly aliased as `ncl`) is the primary interface for managing sandboxes, providers, policies, inference routes, and clusters. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The NemoClaw CLI (`nemoclaw`) is the primary interface for managing sandboxes, providers, policies, inference routes, and clusters. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
 **Self-teaching**: The CLI has comprehensive built-in help. When you encounter a command or option not covered in this skill, walk the help tree:
 
 ```bash
-ncl --help                    # Top-level commands
-ncl <group> --help            # Subcommands in a group
-ncl <group> <cmd> --help      # Flags for a specific command
+nemoclaw --help                    # Top-level commands
+nemoclaw <group> --help            # Subcommands in a group
+nemoclaw <group> <cmd> --help      # Flags for a specific command
 ```
 
 This is your primary fallback. Use it freely -- the CLI's help output is authoritative and always up-to-date.
 
 ## Prerequisites
 
-- `ncl` or `nemoclaw` is on the PATH (install via `cargo install --path crates/navigator-cli` or use the `ncl` wrapper script)
+- `nemoclaw` is on the PATH (install via `cargo install --path crates/navigator-cli`)
 - Docker is running (required for cluster operations and BYOC)
 - For remote clusters: SSH access to the target host
 
@@ -42,7 +42,7 @@ Use this workflow when no cluster exists yet and the user wants to get a sandbox
 ### Step 1: Bootstrap a cluster
 
 ```bash
-ncl cluster admin deploy
+nemoclaw cluster admin deploy
 ```
 
 This provisions a local k3s cluster in Docker. The CLI will prompt interactively if a cluster already exists. The cluster is automatically set as the active cluster.
@@ -50,13 +50,13 @@ This provisions a local k3s cluster in Docker. The CLI will prompt interactively
 For remote deployment:
 
 ```bash
-ncl cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa
+nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 ### Step 2: Verify the cluster
 
 ```bash
-ncl cluster status
+nemoclaw cluster status
 ```
 
 Confirm the cluster is reachable and shows a version.
@@ -66,7 +66,7 @@ Confirm the cluster is reachable and shows a version.
 The simplest way to get a sandbox running:
 
 ```bash
-ncl sandbox create
+nemoclaw sandbox create
 ```
 
 This creates a sandbox with defaults and drops you into an interactive shell. The CLI auto-bootstraps a cluster if none exists.
@@ -74,8 +74,8 @@ This creates a sandbox with defaults and drops you into an interactive shell. Th
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
 
 ```bash
-ncl sandbox create -- claude        # Auto-creates claude provider
-ncl sandbox create -- codex         # Auto-creates codex provider
+nemoclaw sandbox create -- claude        # Auto-creates claude provider
+nemoclaw sandbox create -- codex         # Auto-creates codex provider
 ```
 
 The agent will be prompted interactively if credentials are missing.
@@ -85,7 +85,7 @@ The agent will be prompted interactively if credentials are missing.
 Exit the sandbox shell (`exit` or Ctrl-D), then:
 
 ```bash
-ncl sandbox delete <name>
+nemoclaw sandbox delete <name>
 ```
 
 ---
@@ -99,7 +99,7 @@ Supported types: `claude`, `opencode`, `codex`, `generic`, `nvidia`, `gitlab`, `
 ### Create a provider from local credentials
 
 ```bash
-ncl provider create --name my-github --type github --from-existing
+nemoclaw provider create --name my-github --type github --from-existing
 ```
 
 The `--from-existing` flag discovers credentials from local state (e.g., `gh auth` tokens, Claude config files).
@@ -107,7 +107,7 @@ The `--from-existing` flag discovers credentials from local state (e.g., `gh aut
 ### Create a provider with explicit credentials
 
 ```bash
-ncl provider create --name my-api --type generic \
+nemoclaw provider create --name my-api --type generic \
   --credential API_KEY=sk-abc123 \
   --config base_url=https://api.example.com
 ```
@@ -115,16 +115,16 @@ ncl provider create --name my-api --type generic \
 Bare `KEY` (without `=VALUE`) reads the value from the environment variable of that name:
 
 ```bash
-ncl provider create --name my-api --type generic --credential API_KEY
+nemoclaw provider create --name my-api --type generic --credential API_KEY
 ```
 
 ### List, inspect, update, delete
 
 ```bash
-ncl provider list
-ncl provider get my-github
-ncl provider update my-github --type github --from-existing
-ncl provider delete my-github
+nemoclaw provider list
+nemoclaw provider get my-github
+nemoclaw provider update my-github --type github --from-existing
+nemoclaw provider delete my-github
 ```
 
 ---
@@ -134,7 +134,7 @@ ncl provider delete my-github
 ### Create with options
 
 ```bash
-ncl sandbox create \
+nemoclaw sandbox create \
   --name my-sandbox \
   --provider my-github \
   --provider my-claude \
@@ -153,53 +153,53 @@ Key flags:
 ### List and inspect sandboxes
 
 ```bash
-ncl sandbox list
-ncl sandbox get my-sandbox
+nemoclaw sandbox list
+nemoclaw sandbox get my-sandbox
 ```
 
 ### Connect to a running sandbox
 
 ```bash
-ncl sandbox connect my-sandbox
+nemoclaw sandbox connect my-sandbox
 ```
 
 Opens an interactive SSH shell. To configure VS Code Remote-SSH:
 
 ```bash
-ncl sandbox ssh-config my-sandbox >> ~/.ssh/config
+nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
 ### Sync files
 
 ```bash
 # Push local files to sandbox
-ncl sandbox sync my-sandbox --up ./src /sandbox/src
+nemoclaw sandbox sync my-sandbox --up ./src /sandbox/src
 
 # Pull files from sandbox
-ncl sandbox sync my-sandbox --down /sandbox/output ./local-output
+nemoclaw sandbox sync my-sandbox --down /sandbox/output ./local-output
 ```
 
 ### View logs
 
 ```bash
 # Recent logs
-ncl sandbox logs my-sandbox
+nemoclaw sandbox logs my-sandbox
 
 # Stream live logs
-ncl sandbox logs my-sandbox --tail
+nemoclaw sandbox logs my-sandbox --tail
 
 # Filter by source and level
-ncl sandbox logs my-sandbox --tail --source sandbox --level warn
+nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn
 
 # Logs from the last 5 minutes
-ncl sandbox logs my-sandbox --since 5m
+nemoclaw sandbox logs my-sandbox --since 5m
 ```
 
 ### Delete sandboxes
 
 ```bash
-ncl sandbox delete my-sandbox
-ncl sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
+nemoclaw sandbox delete my-sandbox
+nemoclaw sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 ```
 
 ---
@@ -236,7 +236,7 @@ Create sandbox with initial policy
 ### Step 1: Create sandbox with initial policy
 
 ```bash
-ncl sandbox create --name dev --policy ./initial-policy.yaml --keep -- claude
+nemoclaw sandbox create --name dev --policy ./initial-policy.yaml --keep -- claude
 ```
 
 Use `--keep` so the sandbox stays alive for iteration. The user can work in the sandbox via a separate shell.
@@ -246,7 +246,7 @@ Use `--keep` so the sandbox stays alive for iteration. The user can work in the 
 In a separate terminal or as the agent:
 
 ```bash
-ncl sandbox logs dev --tail --source sandbox
+nemoclaw sandbox logs dev --tail --source sandbox
 ```
 
 Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
@@ -257,7 +257,7 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 ### Step 3: Pull the current policy
 
 ```bash
-ncl sandbox policy get dev --full > current-policy.yaml
+nemoclaw sandbox policy get dev --full > current-policy.yaml
 ```
 
 The `--full` flag outputs valid YAML that can be directly re-submitted. This is the round-trip format.
@@ -277,7 +277,7 @@ Only `network_policies` and `inference` sections can be modified at runtime. If 
 ### Step 5: Push the updated policy
 
 ```bash
-ncl sandbox policy set dev --policy current-policy.yaml --wait
+nemoclaw sandbox policy set dev --policy current-policy.yaml --wait
 ```
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
@@ -288,7 +288,7 @@ The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls 
 ### Step 6: Verify the update
 
 ```bash
-ncl sandbox policy list dev
+nemoclaw sandbox policy list dev
 ```
 
 Check that the latest revision shows status `loaded`. If `failed`, check the error column for details.
@@ -302,13 +302,13 @@ Return to Step 2. Continue monitoring logs and refining the policy until all req
 View all revisions to understand how the policy evolved:
 
 ```bash
-ncl sandbox policy list dev --limit 50
+nemoclaw sandbox policy list dev --limit 50
 ```
 
 Fetch a specific historical revision:
 
 ```bash
-ncl sandbox policy get dev --rev 3 --full
+nemoclaw sandbox policy get dev --rev 3 --full
 ```
 
 ---
@@ -317,72 +317,55 @@ ncl sandbox policy get dev --rev 3 --full
 
 Build a custom container image and run it as a sandbox.
 
-### Step 1: Build and push the image
+### Step 1: Create a sandbox from a Dockerfile
 
 ```bash
-ncl sandbox image push \
-  --dockerfile ./Dockerfile \
-  --tag my-app:latest \
-  --context .
+nemoclaw sandbox create --from ./Dockerfile --keep --name my-app
 ```
 
-The image is built locally via Docker and imported directly into the cluster's containerd runtime. No external registry needed.
+The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference (e.g. `myregistry.com/img:tag`), or a community sandbox name (e.g. `openclaw`).
 
-Build arguments are supported:
+When given a Dockerfile or directory, the image is built locally via Docker and imported directly into the cluster's containerd runtime. No external registry needed.
 
-```bash
-ncl sandbox image push \
-  --dockerfile ./Dockerfile \
-  --tag my-app:v2 \
-  --build-arg PYTHON_VERSION=3.12
-```
-
-### Step 2: Create a sandbox with the custom image
-
-```bash
-ncl sandbox create --image my-app:latest --keep --name my-app
-```
-
-When `--image` is specified, the CLI:
+When `--from` is specified, the CLI:
 - Clears default `run_as_user`/`run_as_group` (custom images may not have the `sandbox` user)
 - Uses a supervisor bootstrap pattern (init container copies the sandbox supervisor into a shared volume)
 
-### Step 3: Forward ports (if the container runs a service)
+### Step 2: Forward ports (if the container runs a service)
 
 ```bash
 # Foreground (blocks)
-ncl sandbox forward start 8080 my-app
+nemoclaw sandbox forward start 8080 my-app
 
 # Background (returns immediately)
-ncl sandbox forward start 8080 my-app -d
+nemoclaw sandbox forward start 8080 my-app -d
 ```
 
 The service is now reachable at `localhost:8080`.
 
-### Step 4: Manage port forwards
+### Step 3: Manage port forwards
 
 ```bash
 # List active forwards
-ncl sandbox forward list
+nemoclaw sandbox forward list
 
 # Stop a forward
-ncl sandbox forward stop 8080 my-app
+nemoclaw sandbox forward stop 8080 my-app
 ```
 
-### Step 5: Iterate
+### Step 4: Iterate
 
 To update the container:
 
 ```bash
-ncl sandbox delete my-app
-ncl sandbox image push --dockerfile ./Dockerfile --tag my-app:v2
-ncl sandbox create --image my-app:v2 --keep --name my-app --forward 8080
+nemoclaw sandbox delete my-app
+nemoclaw sandbox create --from ./Dockerfile --keep --name my-app --forward 8080
 ```
 
 ### Shortcut: Create with port forward in one command
 
 ```bash
-ncl sandbox create --image my-app:latest --forward 8080 --keep -- ./start-server.sh
+nemoclaw sandbox create --from ./Dockerfile --forward 8080 --keep -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs, so the service is reachable immediately.
@@ -401,7 +384,7 @@ This workflow supports a human working in a sandbox while an agent monitors acti
 ### Step 1: Create sandbox with providers and keep alive
 
 ```bash
-ncl sandbox create \
+nemoclaw sandbox create \
   --name work-session \
   --provider github \
   --provider claude \
@@ -414,13 +397,13 @@ ncl sandbox create \
 Tell the user to run:
 
 ```bash
-ncl sandbox connect work-session
+nemoclaw sandbox connect work-session
 ```
 
 Or for VS Code:
 
 ```bash
-ncl sandbox ssh-config work-session >> ~/.ssh/config
+nemoclaw sandbox ssh-config work-session >> ~/.ssh/config
 # Then connect via VS Code Remote-SSH to the host "work-session"
 ```
 
@@ -429,7 +412,7 @@ ncl sandbox ssh-config work-session >> ~/.ssh/config
 While the user works, monitor the sandbox logs:
 
 ```bash
-ncl sandbox logs work-session --tail --source sandbox --level warn
+nemoclaw sandbox logs work-session --tail --source sandbox --level warn
 ```
 
 Watch for `deny` actions that indicate the user's work is being blocked by policy.
@@ -438,17 +421,17 @@ Watch for `deny` actions that indicate the user's work is being blocked by polic
 
 When denied actions are observed:
 
-1. Pull current policy: `ncl sandbox policy get work-session --full > policy.yaml`
+1. Pull current policy: `nemoclaw sandbox policy get work-session --full > policy.yaml`
 2. Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
-3. Push the update: `ncl sandbox policy set work-session --policy policy.yaml --wait`
-4. Verify: `ncl sandbox policy list work-session`
+3. Push the update: `nemoclaw sandbox policy set work-session --policy policy.yaml --wait`
+4. Verify: `nemoclaw sandbox policy list work-session`
 
 The user does not need to disconnect -- policy updates are hot-reloaded within ~30 seconds (or immediately when using `--wait`, which polls for confirmation).
 
 ### Step 5: Clean up when done
 
 ```bash
-ncl sandbox delete work-session
+nemoclaw sandbox delete work-session
 ```
 
 ---
@@ -460,7 +443,7 @@ Configure inference routes so sandboxes can access LLM endpoints.
 ### Create an inference route
 
 ```bash
-ncl inference create \
+nemoclaw inference create \
   --routing-hint local \
   --base-url https://my-llm.example.com \
   --model-id my-model-v1 \
@@ -472,9 +455,9 @@ If `--protocol` is omitted, the CLI auto-detects by probing the endpoint.
 ### List and manage routes
 
 ```bash
-ncl inference list
-ncl inference update my-route --routing-hint local --base-url https://new-url.example.com --model-id my-model-v2
-ncl inference delete my-route
+nemoclaw inference list
+nemoclaw inference update my-route --routing-hint local --base-url https://new-url.example.com --model-id my-model-v2
+nemoclaw inference delete my-route
 ```
 
 ### Connect sandbox to inference
@@ -491,7 +474,7 @@ inference:
 Then create the sandbox with the policy:
 
 ```bash
-ncl sandbox create --policy ./policy-with-inference.yaml -- claude
+nemoclaw sandbox create --policy ./policy-with-inference.yaml -- claude
 ```
 
 ---
@@ -501,31 +484,31 @@ ncl sandbox create --policy ./policy-with-inference.yaml -- claude
 ### List and switch clusters
 
 ```bash
-ncl cluster list              # See all clusters
-ncl cluster use my-cluster    # Switch active cluster
-ncl cluster status            # Verify connectivity
+nemoclaw cluster list              # See all clusters
+nemoclaw cluster use my-cluster    # Switch active cluster
+nemoclaw cluster status            # Verify connectivity
 ```
 
 ### Lifecycle
 
 ```bash
-ncl cluster admin deploy                          # Start local cluster
-ncl cluster admin stop                            # Stop (preserves state)
-ncl cluster admin deploy                          # Restart (reuses state)
-ncl cluster admin destroy                         # Destroy permanently
+nemoclaw cluster admin deploy                          # Start local cluster
+nemoclaw cluster admin stop                            # Stop (preserves state)
+nemoclaw cluster admin deploy                          # Restart (reuses state)
+nemoclaw cluster admin destroy                         # Destroy permanently
 ```
 
 ### Remote clusters
 
 ```bash
 # Deploy to remote host
-ncl cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
+nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
 
 # Set up kubectl access
-ncl cluster admin tunnel --name remote-cluster
+nemoclaw cluster admin tunnel --name remote-cluster
 
 # Get cluster info
-ncl cluster admin info --name remote-cluster
+nemoclaw cluster admin info --name remote-cluster
 ```
 
 ---
@@ -534,19 +517,19 @@ ncl cluster admin info --name remote-cluster
 
 When you encounter a command or option not covered in this skill:
 
-1. **Start broad**: `ncl --help` to see all command groups.
-2. **Narrow down**: `ncl <group> --help` to see subcommands (e.g., `ncl sandbox --help`).
-3. **Get specific**: `ncl <group> <cmd> --help` for flags and usage (e.g., `ncl sandbox create --help`).
+1. **Start broad**: `nemoclaw --help` to see all command groups.
+2. **Narrow down**: `nemoclaw <group> --help` to see subcommands (e.g., `nemoclaw sandbox --help`).
+3. **Get specific**: `nemoclaw <group> <cmd> --help` for flags and usage (e.g., `nemoclaw sandbox create --help`).
 
 The CLI help is always authoritative. If the help output contradicts this skill, follow the help output -- the CLI may have been updated since this skill was written.
 
 ### Example: discovering an unfamiliar command
 
 ```bash
-$ ncl sandbox --help
+$ nemoclaw sandbox --help
 # Shows: create, get, list, delete, connect, sync, logs, ssh-config, forward, image, policy
 
-$ ncl sandbox sync --help
+$ nemoclaw sandbox sync --help
 # Shows: --up, --down flags, positional arguments, usage examples
 ```
 
@@ -556,24 +539,24 @@ $ ncl sandbox sync --help
 
 | Task | Command |
 |------|---------|
-| Deploy local cluster | `ncl cluster admin deploy` |
-| Check cluster health | `ncl cluster status` |
-| Create sandbox (interactive) | `ncl sandbox create` |
-| Create sandbox with tool | `ncl sandbox create -- claude` |
-| Create with custom policy | `ncl sandbox create --policy ./p.yaml --keep` |
-| Connect to sandbox | `ncl sandbox connect <name>` |
-| Stream live logs | `ncl sandbox logs <name> --tail` |
-| Pull current policy | `ncl sandbox policy get <name> --full > p.yaml` |
-| Push updated policy | `ncl sandbox policy set <name> --policy p.yaml --wait` |
-| Policy revision history | `ncl sandbox policy list <name>` |
-| Build & push custom image | `ncl sandbox image push --dockerfile ./Dockerfile` |
-| Forward a port | `ncl sandbox forward start <port> <name> -d` |
-| Create provider | `ncl provider create --name N --type T --from-existing` |
-| List providers | `ncl provider list` |
-| Create inference route | `ncl inference create --routing-hint H --base-url U --model-id M` |
-| Delete sandbox | `ncl sandbox delete <name>` |
-| Destroy cluster | `ncl cluster admin destroy` |
-| Self-teach any command | `ncl <group> <cmd> --help` |
+| Deploy local cluster | `nemoclaw cluster admin deploy` |
+| Check cluster health | `nemoclaw cluster status` |
+| Create sandbox (interactive) | `nemoclaw sandbox create` |
+| Create sandbox with tool | `nemoclaw sandbox create -- claude` |
+| Create with custom policy | `nemoclaw sandbox create --policy ./p.yaml --keep` |
+| Connect to sandbox | `nemoclaw sandbox connect <name>` |
+| Stream live logs | `nemoclaw sandbox logs <name> --tail` |
+| Pull current policy | `nemoclaw sandbox policy get <name> --full > p.yaml` |
+| Push updated policy | `nemoclaw sandbox policy set <name> --policy p.yaml --wait` |
+| Policy revision history | `nemoclaw sandbox policy list <name>` |
+| Create sandbox from Dockerfile | `nemoclaw sandbox create --from ./Dockerfile --keep` |
+| Forward a port | `nemoclaw sandbox forward start <port> <name> -d` |
+| Create provider | `nemoclaw provider create --name N --type T --from-existing` |
+| List providers | `nemoclaw provider list` |
+| Create inference route | `nemoclaw inference create --routing-hint H --base-url U --model-id M` |
+| Delete sandbox | `nemoclaw sandbox delete <name>` |
+| Destroy cluster | `nemoclaw cluster admin destroy` |
+| Self-teach any command | `nemoclaw <group> <cmd> --help` |
 
 ## Companion Skills
 
@@ -581,4 +564,4 @@ $ ncl sandbox sync --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
 | `debug-navigator-cluster` | Diagnosing cluster startup or health failures |
-| `tui-development` | Developing features for the Gator TUI (`ncl gator`) |
+| `tui-development` | Developing features for the Gator TUI (`nemoclaw gator`) |

@@ -236,7 +236,7 @@ pub async fn sandbox_exec(
         .stderr(std::process::Stdio::inherit());
 
     // For interactive TTY sessions, replace this process with SSH via exec()
-    // to avoid signal handling issues (e.g. Ctrl+C killing the parent ncl
+    // to avoid signal handling issues (e.g. Ctrl+C killing the parent nemoclaw
     // process and orphaning the SSH child).
     if tty && std::io::stdin().is_terminal() {
         #[cfg(unix)]

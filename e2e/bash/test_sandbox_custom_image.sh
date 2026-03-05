@@ -7,8 +7,7 @@
 # with it.
 #
 # Verifies the full flow:
-#   1. nemoclaw sandbox image push --dockerfile <path>  (build + import into cluster)
-#   2. nemoclaw sandbox create --image <tag> -- <cmd>   (run sandbox with custom image)
+#   nemoclaw sandbox create --from <Dockerfile> -- <cmd>
 #
 # Prerequisites:
 #   - A running nemoclaw cluster (nemoclaw cluster admin deploy)
@@ -35,7 +34,6 @@ else
   NAV="nemoclaw"
 fi
 
-IMAGE_TAG="e2e-custom-image:test-$(date +%s)"
 SANDBOX_NAME=""
 TMPDIR_ROOT=""
 
@@ -95,32 +93,14 @@ CMD ["sleep", "infinity"]
 DOCKERFILE_CONTENT
 
 ###############################################################################
-# Step 2 — Build and push the image into the cluster
+# Step 2 — Create a sandbox from the Dockerfile and verify it works
 ###############################################################################
 
-info "Building and pushing custom image: ${IMAGE_TAG}"
-
-PUSH_LOG=$(mktemp)
-if ! "${NAV}" sandbox image push \
-    --dockerfile "${DOCKERFILE}" \
-    --tag "${IMAGE_TAG}" \
-    > "${PUSH_LOG}" 2>&1; then
-  error "Image push failed"
-  cat "${PUSH_LOG}" >&2
-  exit 1
-fi
-
-info "Image pushed successfully"
-
-###############################################################################
-# Step 3 — Create a sandbox with the custom image and verify it works
-###############################################################################
-
-info "Creating sandbox with custom image: ${IMAGE_TAG}"
+info "Creating sandbox from Dockerfile"
 
 CREATE_LOG=$(mktemp)
 if ! "${NAV}" sandbox create \
-    --image "${IMAGE_TAG}" \
+    --from "${DOCKERFILE}" \
     -- cat /opt/marker.txt \
     > "${CREATE_LOG}" 2>&1; then
   error "Sandbox create failed"
