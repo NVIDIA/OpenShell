@@ -204,31 +204,25 @@ container. The default `run_as_user`/`run_as_group` policy is cleared for custom
 avoid failures on images that lack the `sandbox` user. See `architecture/sandbox.md` for
 details on the bootstrap flow and constraints.
 
-#### Building and Pushing Custom Images
+#### Building from a Dockerfile
 
-Use `nemoclaw sandbox image push` to build a Dockerfile and push the resulting image into the
-cluster's containerd runtime so it can be used with `--image`:
+Pass a Dockerfile path (or a directory containing one) to `--from` and the CLI will
+build the image, push it into the cluster, and create the sandbox in a single step:
 
 ```bash
-# Build and push from a Dockerfile
-nemoclaw sandbox image push --dockerfile ./Dockerfile
+# Build from a Dockerfile
+nemoclaw sandbox create --from ./Dockerfile
 
-# Specify a custom tag
-nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
+# Build from a directory containing a Dockerfile
+nemoclaw sandbox create --from ./my-sandbox/
 
-# Specify a build context directory
-nemoclaw sandbox image push --dockerfile ./build/Dockerfile --context ./build
-
-# Pass build arguments
-nemoclaw sandbox image push --dockerfile ./Dockerfile --build-arg PYTHON_VERSION=3.12
-
-# Use the pushed image
-nemoclaw sandbox create --image my-sandbox:latest
+# Use a pre-built image
+nemoclaw sandbox create --from my-sandbox:latest
 ```
 
-The command builds the image using the local Docker daemon and pushes it into the cluster
-via the same `docker save` / `ctr images import` pipeline used for component images. A
-`.dockerignore` file in the build context directory is respected.
+The image is built using the local Docker daemon and pushed into the cluster via the same
+`docker save` / `ctr images import` pipeline used for component images. A `.dockerignore`
+file in the build context directory is respected.
 
 ### Git Hooks (Pre-commit)
 

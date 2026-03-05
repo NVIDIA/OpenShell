@@ -21,7 +21,7 @@ use crate::push::push_local_images;
 
 /// Build a container image from a Dockerfile and push it into the cluster.
 ///
-/// This is the primary entry point for `nav sandbox image push`. It:
+/// This is used by `nemoclaw sandbox create --from <Dockerfile>`. It:
 /// 1. Creates a tar archive of the build context directory.
 /// 2. Sends it to the local Docker daemon via `build_image()`.
 /// 3. Pushes the resulting image into the cluster's containerd via the

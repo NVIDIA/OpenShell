@@ -32,8 +32,6 @@ When `--from` points to a Dockerfile or directory, the CLI:
 2. Pushes it into the cluster's containerd runtime using `docker save` / `ctr import`.
 3. Creates the sandbox with the resulting image tag.
 
-This is equivalent to running `nemoclaw sandbox image push` followed by `nemoclaw sandbox create --from <tag>` in a single step.
-
 ## How It Works
 
 When the resolved image differs from the server's default sandbox image, the server activates **supervisor bootstrap mode**. The supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container:
@@ -89,24 +87,6 @@ When `--from` is set the CLI clears the default `run_as_user`/`run_as_group` pol
 nemoclaw sandbox create --from ./Dockerfile -- echo "built and running"
 nemoclaw sandbox create --from ./my-sandbox/  # directory with Dockerfile
 ```
-
-### Pushing custom images into the cluster (manual two-step)
-
-```bash
-nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-sandbox:latest
-nemoclaw sandbox create --from my-sandbox:latest
-```
-
-`nemoclaw sandbox image push` accepts:
-
-| Flag | Description |
-|------|-------------|
-| `--dockerfile` (required) | Path to the Dockerfile |
-| `--tag` | Image name and tag (default: `navigator/sandbox-custom:<unix_timestamp>`) |
-| `--context` | Build context directory (default: Dockerfile parent directory) |
-| `--build-arg` | Repeatable `KEY=VALUE` Docker build arguments |
-
-The command builds the image locally via the Docker daemon (respecting `.dockerignore`), then imports it into the cluster's containerd runtime using a `docker save` / `ctr -n k8s.io images import` pipeline — the same mechanism used for component images during bootstrap.
 
 ## Supervisor Behavior in Custom Images
 

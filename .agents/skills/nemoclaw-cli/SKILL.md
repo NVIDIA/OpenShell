@@ -317,37 +317,21 @@ nemoclaw sandbox policy get dev --rev 3 --full
 
 Build a custom container image and run it as a sandbox.
 
-### Step 1: Build and push the image
+### Step 1: Create a sandbox from a Dockerfile
 
 ```bash
-nemoclaw sandbox image push \
-  --dockerfile ./Dockerfile \
-  --tag my-app:latest \
-  --context .
+nemoclaw sandbox create --from ./Dockerfile --keep --name my-app
 ```
 
-The image is built locally via Docker and imported directly into the cluster's containerd runtime. No external registry needed.
+The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference (e.g. `myregistry.com/img:tag`), or a community sandbox name (e.g. `openclaw`).
 
-Build arguments are supported:
-
-```bash
-nemoclaw sandbox image push \
-  --dockerfile ./Dockerfile \
-  --tag my-app:v2 \
-  --build-arg PYTHON_VERSION=3.12
-```
-
-### Step 2: Create a sandbox with the custom image
-
-```bash
-nemoclaw sandbox create --from my-app:latest --keep --name my-app
-```
+When given a Dockerfile or directory, the image is built locally via Docker and imported directly into the cluster's containerd runtime. No external registry needed.
 
 When `--from` is specified, the CLI:
 - Clears default `run_as_user`/`run_as_group` (custom images may not have the `sandbox` user)
 - Uses a supervisor bootstrap pattern (init container copies the sandbox supervisor into a shared volume)
 
-### Step 3: Forward ports (if the container runs a service)
+### Step 2: Forward ports (if the container runs a service)
 
 ```bash
 # Foreground (blocks)
@@ -359,7 +343,7 @@ nemoclaw sandbox forward start 8080 my-app -d
 
 The service is now reachable at `localhost:8080`.
 
-### Step 4: Manage port forwards
+### Step 3: Manage port forwards
 
 ```bash
 # List active forwards
@@ -369,20 +353,19 @@ nemoclaw sandbox forward list
 nemoclaw sandbox forward stop 8080 my-app
 ```
 
-### Step 5: Iterate
+### Step 4: Iterate
 
 To update the container:
 
 ```bash
 nemoclaw sandbox delete my-app
-nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-app:v2
-nemoclaw sandbox create --from my-app:v2 --keep --name my-app --forward 8080
+nemoclaw sandbox create --from ./Dockerfile --keep --name my-app --forward 8080
 ```
 
 ### Shortcut: Create with port forward in one command
 
 ```bash
-nemoclaw sandbox create --from my-app:latest --forward 8080 --keep -- ./start-server.sh
+nemoclaw sandbox create --from ./Dockerfile --forward 8080 --keep -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs, so the service is reachable immediately.
@@ -566,7 +549,7 @@ $ nemoclaw sandbox sync --help
 | Pull current policy | `nemoclaw sandbox policy get <name> --full > p.yaml` |
 | Push updated policy | `nemoclaw sandbox policy set <name> --policy p.yaml --wait` |
 | Policy revision history | `nemoclaw sandbox policy list <name>` |
-| Build & push custom image | `nemoclaw sandbox image push --dockerfile ./Dockerfile` |
+| Create sandbox from Dockerfile | `nemoclaw sandbox create --from ./Dockerfile --keep` |
 | Forward a port | `nemoclaw sandbox forward start <port> <name> -d` |
 | Create provider | `nemoclaw provider create --name N --type T --from-existing` |
 | List providers | `nemoclaw provider list` |

@@ -229,21 +229,6 @@ List all active port forwards (sandbox, port, PID, status).
 
 ---
 
-## Custom Image Commands (BYOC)
-
-### `nemoclaw sandbox image push`
-
-Build a container image and push it into the cluster's internal registry.
-
-| Flag | Description |
-|------|-------------|
-| `--dockerfile <PATH>` | Path to Dockerfile (required) |
-| `--tag <NAME:TAG>` | Image name and tag (default: `navigator/sandbox-custom:<timestamp>`) |
-| `--context <PATH>` | Build context directory (default: Dockerfile parent) |
-| `--build-arg KEY=VALUE` | Build argument (repeatable) |
-
----
-
 ## Policy Commands
 
 ### `nemoclaw sandbox policy set <name> --policy <PATH>`

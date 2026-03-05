@@ -9,7 +9,6 @@ use clap_complete::env::CompleteEnv;
 use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::Write;
-use std::path::PathBuf;
 
 use navigator_bootstrap::{load_active_cluster, load_cluster_metadata};
 use navigator_cli::completers;
@@ -606,12 +605,6 @@ enum SandboxCommands {
         dest: Option<String>,
     },
 
-    /// Manage sandbox images.
-    Image {
-        #[command(subcommand)]
-        command: SandboxImageCommands,
-    },
-
     /// Manage sandbox policy.
     Policy {
         #[command(subcommand)]
@@ -728,28 +721,6 @@ enum ForwardCommands {
 
     /// List active port forwards.
     List,
-}
-
-#[derive(Subcommand, Debug)]
-enum SandboxImageCommands {
-    /// Build and push a container image into the cluster.
-    Push {
-        /// Path to the Dockerfile.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        dockerfile: PathBuf,
-
-        /// Image name and tag (default: navigator/sandbox-custom:<timestamp>).
-        #[arg(long)]
-        tag: Option<String>,
-
-        /// Build context directory (default: Dockerfile parent directory).
-        #[arg(long, value_hint = ValueHint::DirPath)]
-        context: Option<PathBuf>,
-
-        /// Build argument in KEY=VALUE format (can be specified multiple times).
-        #[arg(long = "build-arg", value_name = "KEY=VALUE")]
-        build_args: Vec<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1054,31 +1025,12 @@ async fn main() -> Result<()> {
                         }
                     }
                 }
-                SandboxCommands::Image { command } => match command {
-                    SandboxImageCommands::Push {
-                        dockerfile,
-                        tag,
-                        context,
-                        build_args,
-                    } => {
-                        let cluster_name = resolve_cluster_name(&cli.cluster)
-                            .unwrap_or_else(|| "nemoclaw".to_string());
-                        run::sandbox_image_push(
-                            &dockerfile,
-                            tag.as_deref(),
-                            context.as_deref(),
-                            &cluster_name,
-                            &build_args,
-                        )
-                        .await?;
-                    }
-                },
                 other => {
                     let ctx = resolve_cluster(&cli.cluster)?;
                     let endpoint = &ctx.endpoint;
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
-                        SandboxCommands::Create { .. } | SandboxCommands::Image { .. } => {
+                        SandboxCommands::Create { .. } => {
                             unreachable!()
                         }
                         SandboxCommands::Sync {
@@ -1457,25 +1409,6 @@ mod tests {
                 vec!["nemoclaw", "sandbox", "sync", "demo", "--up", "Do"],
                 5,
                 "Dockerfile",
-            ),
-            (
-                vec!["nemoclaw", "sandbox", "image", "push", "--dockerfile", "Do"],
-                5,
-                "Dockerfile",
-            ),
-            (
-                vec![
-                    "nemoclaw",
-                    "sandbox",
-                    "image",
-                    "push",
-                    "--dockerfile",
-                    "Dockerfile",
-                    "--context",
-                    "c",
-                ],
-                7,
-                "ctx/",
             ),
         ];
 
