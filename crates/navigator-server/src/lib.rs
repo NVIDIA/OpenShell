@@ -128,6 +128,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         state.sandbox_client.clone(),
         state.sandbox_index.clone(),
         state.sandbox_watch_bus.clone(),
+        state.tracing_log_bus.clone(),
     );
     spawn_kube_event_tailer(state.clone());
 

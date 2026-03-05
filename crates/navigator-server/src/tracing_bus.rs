@@ -75,6 +75,16 @@ impl TracingLogBus {
         self.sender_for(sandbox_id).subscribe()
     }
 
+    /// Remove all bus entries for the given sandbox id.
+    ///
+    /// This drops the broadcast sender (closing any active receivers with
+    /// `RecvError::Closed`) and frees the tail buffer.
+    pub fn remove(&self, sandbox_id: &str) {
+        let mut inner = self.inner.lock().expect("tracing bus lock poisoned");
+        inner.per_id.remove(sandbox_id);
+        inner.tails.remove(sandbox_id);
+    }
+
     pub fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
         let inner = self.inner.lock().expect("tracing bus lock poisoned");
         inner
@@ -186,6 +196,129 @@ fn current_time_ms() -> Option<i64> {
     i64::try_from(now.as_millis()).ok()
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_log_event(sandbox_id: &str, message: &str) -> SandboxLogLine {
+        SandboxLogLine {
+            sandbox_id: sandbox_id.to_string(),
+            timestamp_ms: 1000,
+            level: "INFO".to_string(),
+            target: "test".to_string(),
+            message: message.to_string(),
+            source: "gateway".to_string(),
+            fields: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn tracing_log_bus_remove_cleans_up_all_maps() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-1";
+
+        // Create entries via subscribe and publish
+        let _rx = bus.subscribe(sandbox_id);
+        bus.publish_external(make_log_event(sandbox_id, "hello"));
+
+        // Verify entries exist
+        assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
+
+        // Remove
+        bus.remove(sandbox_id);
+
+        // Verify entries are gone
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+    }
+
+    #[test]
+    fn tracing_log_bus_subscribe_after_remove_creates_fresh_channel() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-2";
+
+        // Create and remove
+        bus.publish_external(make_log_event(sandbox_id, "old message"));
+        bus.remove(sandbox_id);
+
+        // Subscribe again — should get a fresh channel with no history
+        let mut rx = bus.subscribe(sandbox_id);
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+
+        // New publish should reach the new subscriber
+        bus.publish_external(make_log_event(sandbox_id, "new message"));
+        let evt = rx.try_recv().expect("should receive new event");
+        assert!(evt.payload.is_some());
+    }
+
+    #[test]
+    fn tracing_log_bus_remove_closes_active_receivers() {
+        let bus = TracingLogBus::new();
+        let sandbox_id = "sb-3";
+
+        let mut rx = bus.subscribe(sandbox_id);
+
+        // Remove drops the sender
+        bus.remove(sandbox_id);
+
+        // Existing receiver should get Closed error
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Closed) => {} // expected
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tracing_log_bus_remove_nonexistent_is_noop() {
+        let bus = TracingLogBus::new();
+        // Should not panic
+        bus.remove("nonexistent");
+    }
+
+    #[test]
+    fn platform_event_bus_remove_cleans_up() {
+        let bus = PlatformEventBus::new();
+        let sandbox_id = "sb-4";
+
+        let mut rx = bus.subscribe(sandbox_id);
+
+        // Publish an event
+        let evt = SandboxStreamEvent { payload: None };
+        bus.publish(sandbox_id, evt);
+        assert!(rx.try_recv().is_ok());
+
+        // Remove
+        bus.remove(sandbox_id);
+
+        // Receiver should be closed
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Closed) => {} // expected
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn platform_event_bus_subscribe_after_remove_creates_fresh_channel() {
+        let bus = PlatformEventBus::new();
+        let sandbox_id = "sb-5";
+
+        let _old_rx = bus.subscribe(sandbox_id);
+        bus.remove(sandbox_id);
+
+        // New subscription should work
+        let mut new_rx = bus.subscribe(sandbox_id);
+        let evt = SandboxStreamEvent { payload: None };
+        bus.publish(sandbox_id, evt);
+        assert!(new_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn platform_event_bus_remove_nonexistent_is_noop() {
+        let bus = PlatformEventBus::new();
+        // Should not panic
+        bus.remove("nonexistent");
+    }
+}
+
 /// Separate bus for platform event stream events.
 ///
 /// This keeps platform events isolated from tracing capture.
@@ -219,5 +352,13 @@ impl PlatformEventBus {
     pub(crate) fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent) {
         let tx = self.sender_for(sandbox_id);
         let _ = tx.send(event);
+    }
+
+    /// Remove the bus entry for the given sandbox id.
+    ///
+    /// This drops the broadcast sender, closing any active receivers.
+    pub(crate) fn remove(&self, sandbox_id: &str) {
+        let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
+        inner.remove(sandbox_id);
     }
 }

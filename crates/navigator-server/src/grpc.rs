@@ -205,7 +205,23 @@ impl Navigator for NavigatorService {
 
         // Spawn producer task.
         tokio::spawn(async move {
-            // Subscribe to all buses BEFORE reading the initial snapshot to avoid
+            // Validate that the sandbox exists BEFORE subscribing to any buses.
+            // This prevents creating bus entries for non-existent sandbox IDs.
+            match state.store.get_message::<Sandbox>(&sandbox_id).await {
+                Ok(Some(_)) => {} // sandbox exists, proceed
+                Ok(None) => {
+                    let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
+                    return;
+                }
+                Err(e) => {
+                    let _ = tx
+                        .send(Err(Status::internal(format!("fetch sandbox failed: {e}"))))
+                        .await;
+                    return;
+                }
+            }
+
+            // Subscribe to all buses BEFORE reading the snapshot to avoid
             // missing notifications that fire between the snapshot read and subscribe.
             let mut status_rx = if follow_status {
                 Some(state.sandbox_watch_bus.subscribe(&sandbox_id))
@@ -228,7 +244,8 @@ impl Navigator for NavigatorService {
                 None
             };
 
-            // Always start with a snapshot if present.
+            // Re-read the snapshot now that we have subscriptions active
+            // (avoids missing notifications between validate and subscribe).
             match state.store.get_message::<Sandbox>(&sandbox_id).await {
                 Ok(Some(sandbox)) => {
                     state.sandbox_index.update_from_sandbox(&sandbox);
@@ -253,6 +270,7 @@ impl Navigator for NavigatorService {
                     }
                 }
                 Ok(None) => {
+                    // Sandbox was deleted between validate and subscribe — end stream.
                     let _ = tx.send(Err(Status::not_found("sandbox not found"))).await;
                     return;
                 }
@@ -480,6 +498,11 @@ impl Navigator for NavigatorService {
         if !deleted && let Err(e) = self.state.store.delete(Sandbox::object_type(), &id).await {
             warn!(sandbox_id = %id, error = %e, "Failed to clean up store after delete");
         }
+
+        // Clean up bus entries to prevent unbounded memory growth.
+        self.state.tracing_log_bus.remove(&id);
+        self.state.tracing_log_bus.platform_event_bus.remove(&id);
+        self.state.sandbox_watch_bus.remove(&id);
 
         info!(
             sandbox_id = %id,
@@ -1147,6 +1170,7 @@ impl Navigator for NavigatorService {
         request: Request<tonic::Streaming<PushSandboxLogsRequest>>,
     ) -> Result<Response<PushSandboxLogsResponse>, Status> {
         let mut stream = request.into_inner();
+        let mut validated = false;
 
         while let Some(batch) = stream
             .message()
@@ -1155,6 +1179,20 @@ impl Navigator for NavigatorService {
         {
             if batch.sandbox_id.is_empty() {
                 continue;
+            }
+
+            // Validate sandbox existence once at stream open (first batch).
+            // Subsequent batches trust the validated sandbox_id. If the sandbox
+            // is deleted mid-stream, bus remove() drops the sender and publish
+            // silently discards via `let _ = tx.send(...)`.
+            if !validated {
+                self.state
+                    .store
+                    .get_message::<Sandbox>(&batch.sandbox_id)
+                    .await
+                    .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                    .ok_or_else(|| Status::not_found("sandbox not found"))?;
+                validated = true;
             }
 
             // Cap lines per batch to prevent abuse.

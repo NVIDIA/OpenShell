@@ -217,6 +217,7 @@ pub fn spawn_sandbox_watcher(
     client: SandboxClient,
     index: crate::sandbox_index::SandboxIndex,
     watch_bus: crate::sandbox_watch::SandboxWatchBus,
+    tracing_log_bus: crate::tracing_bus::TracingLogBus,
 ) {
     let namespace = client.namespace().to_string();
     info!(namespace = %namespace, "Starting sandbox watcher");
@@ -240,7 +241,9 @@ pub fn spawn_sandbox_watcher(
                     Event::Deleted(obj) => {
                         let obj_name = obj.metadata.name.clone().unwrap_or_default();
                         debug!(sandbox_name = %obj_name, "Received Deleted event from Kubernetes");
-                        if let Err(err) = handle_deleted(&store, &index, &watch_bus, obj).await {
+                        if let Err(err) =
+                            handle_deleted(&store, &index, &watch_bus, &tracing_log_bus, obj).await
+                        {
                             warn!(sandbox_name = %obj_name, error = %err, "Failed to delete sandbox record");
                         }
                     }
@@ -363,6 +366,7 @@ async fn handle_deleted(
     store: &Store,
     index: &crate::sandbox_index::SandboxIndex,
     watch_bus: &crate::sandbox_watch::SandboxWatchBus,
+    tracing_log_bus: &crate::tracing_bus::TracingLogBus,
     obj: DynamicObject,
 ) -> Result<(), String> {
     let id = sandbox_id_from_object(&obj)?;
@@ -373,6 +377,12 @@ async fn handle_deleted(
     debug!(sandbox_id = %id, deleted, "Deleted sandbox record");
     index.remove_sandbox(&id);
     watch_bus.notify(&id);
+
+    // Clean up bus entries to prevent unbounded memory growth.
+    tracing_log_bus.remove(&id);
+    tracing_log_bus.platform_event_bus.remove(&id);
+    watch_bus.remove(&id);
+
     Ok(())
 }
 

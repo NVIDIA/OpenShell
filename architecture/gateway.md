@@ -340,6 +340,10 @@ All buses use `tokio::sync::broadcast` channels keyed by sandbox ID. Buffer size
 
 Broadcast lag is translated to `Status::resource_exhausted` via `broadcast_to_status()`.
 
+**Cleanup:** Each bus exposes a `remove(sandbox_id)` method that drops the broadcast sender (closing active receivers with `RecvError::Closed`) and frees internal map entries. Cleanup is wired into both the `handle_deleted` reconciler (Kubernetes watcher) and the `delete_sandbox` gRPC handler to prevent unbounded memory growth from accumulated entries for deleted sandboxes.
+
+**Validation:** `WatchSandbox` validates that the sandbox exists before subscribing to any bus, preventing entries from being created for non-existent IDs. `PushSandboxLogs` validates sandbox existence once on the first batch of the stream.
+
 ## Remote Exec via SSH
 
 The `ExecSandbox` RPC (`crates/navigator-server/src/grpc.rs`) executes a command inside a sandbox pod over SSH and streams stdout/stderr/exit back to the client.
