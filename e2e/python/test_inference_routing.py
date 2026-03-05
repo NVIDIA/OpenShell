@@ -177,7 +177,9 @@ def test_inference_call_routed_to_backend(
     4. Forward locally via sandbox router to the policy-allowed backend
     5. Return the mock response from the configured route
     """
-    spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy())
+    spec = datamodel_pb2.SandboxSpec(
+        policy=_inference_routing_policy(mock_inference_route)
+    )
 
     def call_chat_completions() -> str:
         import json
@@ -226,7 +228,9 @@ def test_non_inference_request_denied(
     undeclared endpoint should be denied with 403 when inference routing
     is configured — only recognized inference API patterns are routed.
     """
-    spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy())
+    spec = datamodel_pb2.SandboxSpec(
+        policy=_inference_routing_policy(mock_inference_route)
+    )
 
     def make_non_inference_request() -> str:
         import ssl
@@ -265,7 +269,7 @@ def test_inference_anthropic_messages_protocol(
     policy = sandbox_pb2.SandboxPolicy(
         version=1,
         inference=sandbox_pb2.InferencePolicy(
-            allowed_routes=["e2e_mock_anthropic"],
+            allowed_routes=[mock_anthropic_route],
         ),
         filesystem=_BASE_FILESYSTEM,
         landlock=_BASE_LANDLOCK,
@@ -323,8 +327,10 @@ def test_inference_route_filtering_by_allowed_routes(
     allowed route should succeed, while inference requests that can't
     match any allowed route get an error from the sandbox router.
     """
-    # Policy only allows e2e_mock_local, NOT e2e_mock_disallowed
-    spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy())
+    # Policy only allows the mock_inference_route, NOT mock_disallowed_route
+    spec = datamodel_pb2.SandboxSpec(
+        policy=_inference_routing_policy(mock_inference_route)
+    )
 
     def call_allowed_route() -> str:
         import json

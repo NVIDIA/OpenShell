@@ -31,6 +31,7 @@ dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
     "pytest-cov>=4.0",
+    "pytest-xdist>=3.0",
     "ruff>=0.4",
     "ty>=0.0.1a6",
     "maturin>=1.5,<2.0",

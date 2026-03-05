@@ -29,10 +29,10 @@ run = "uv run pytest python/"
 hide = true
 
 ["test:e2e:sandbox"]
-description = "Run sandbox end-to-end tests"
+description = "Run sandbox end-to-end tests (E2E_PARALLEL=N or 'auto'; default 5)"
 depends = ["python:proto", "cluster"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
-run = "uv run pytest -o python_files='test_*.py' e2e/python"
+run = "uv run pytest -o python_files='test_*.py' -n ${E2E_PARALLEL:-5} e2e/python"
 hide = true
 
 ["test:e2e:port-forward"]
