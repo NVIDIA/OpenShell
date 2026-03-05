@@ -123,6 +123,94 @@ cargo_cross_build() {
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Musl (static) build helpers
+# ---------------------------------------------------------------------------
+
+# Map Docker arch name to musl Rust target triple.
+rust_target_musl() {
+  case "$TARGETARCH" in
+    arm64) echo "aarch64-unknown-linux-musl" ;;
+    amd64) echo "x86_64-unknown-linux-musl" ;;
+    *)     echo "unsupported TARGETARCH for musl: $TARGETARCH" >&2; return 1 ;;
+  esac
+}
+
+# Install musl toolchain packages.  Native builds only need musl-tools;
+# cross builds also need the GNU cross-compiler (used as linker for the
+# foreign arch — Rust handles the musl libc linking).
+install_musl_toolchain() {
+  apt-get update
+  apt-get install -y --no-install-recommends musl-tools cmake
+  if is_cross; then
+    case "$TARGETARCH" in
+      arm64)
+        dpkg --add-architecture arm64
+        apt-get install -y --no-install-recommends \
+          gcc-aarch64-linux-gnu g++-aarch64-linux-gnu ;;
+      amd64)
+        dpkg --add-architecture amd64
+        apt-get install -y --no-install-recommends \
+          gcc-x86-64-linux-gnu g++-x86-64-linux-gnu ;;
+    esac
+  fi
+  rm -rf /var/lib/apt/lists/*
+}
+
+# Add the musl Rust compilation target.
+add_musl_target() {
+  rustup target add "$(rust_target_musl)"
+}
+
+# Export CC / CXX / linker env vars for a musl target.
+export_musl_cross_env() {
+  # For native musl builds, musl-gcc is provided by musl-tools and
+  # handles everything — no extra env vars needed.
+  is_cross || return 0
+  case "$TARGETARCH" in
+    arm64)
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-gnu-gcc
+      export CC_aarch64_unknown_linux_musl=aarch64-linux-gnu-gcc
+      export CXX_aarch64_unknown_linux_musl=aarch64-linux-gnu-g++ ;;
+    amd64)
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-gnu-gcc
+      export CC_x86_64_unknown_linux_musl=x86_64-linux-gnu-gcc
+      export CXX_x86_64_unknown_linux_musl=x86_64-linux-gnu-g++ ;;
+  esac
+}
+
+# Run cargo build targeting musl with the correct --target and env vars.
+# All extra arguments are forwarded to cargo.
+cargo_musl_build() {
+  export_musl_cross_env
+  if [ -z "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
+    unset SCCACHE_MEMCACHED_ENDPOINT 2>/dev/null || true
+  fi
+  export SCCACHE_DIR="${SCCACHE_DIR:-/tmp/sccache}"
+  if command -v sccache >/dev/null 2>&1; then
+    export RUSTC_WRAPPER=sccache
+  fi
+  local target
+  target="$(rust_target_musl)"
+  local profile="debug"
+  for arg in "$@"; do
+    case "$arg" in --release) profile="release" ;; esac
+  done
+  local out_dir="/build/target/${target}/${profile}"
+  mkdir -p "${out_dir}/deps"
+  if ! cargo build --target "$target" "$@"; then
+    echo "cargo musl build failed; cleaning and retrying without sccache..." >&2
+    rm -rf /build/target/*
+    mkdir -p "${out_dir}/deps"
+    unset RUSTC_WRAPPER 2>/dev/null || true
+    cargo build --target "$target" "$@"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Output helpers
+# ---------------------------------------------------------------------------
+
 # Print the directory containing the compiled binary.
 # Usage: cp "$(cross_output_dir release)/my-binary" /out/
 cross_output_dir() {
@@ -132,4 +220,11 @@ cross_output_dir() {
   else
     echo "/build/target/$profile"
   fi
+}
+
+# Print the musl build output directory.
+# Usage: cp "$(musl_output_dir release)/my-binary" /out/
+musl_output_dir() {
+  local profile="${1:-release}"
+  echo "/build/target/$(rust_target_musl)/$profile"
 }

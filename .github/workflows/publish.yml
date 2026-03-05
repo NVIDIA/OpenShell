@@ -2,11 +2,11 @@ name: Publish
 
 on:
   push:
-    branches: [main]
+    branches: [main, feat/cli-release-binaries]
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 defaults:
@@ -15,100 +15,222 @@ defaults:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Build container images to GHCR (same as E2E pipeline)
+  # NOTE: Container and Python wheel jobs commented out for testing CLI release.
+  # Uncomment before merging to main.
   # ---------------------------------------------------------------------------
-  build-server:
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: server
 
-  build-sandbox:
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-
-  build-cluster:
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: cluster
+  # build-server:
+  #   uses: ./.github/workflows/docker-build.yml
+  #   with:
+  #     component: server
+  #
+  # build-sandbox:
+  #   uses: ./.github/workflows/docker-build.yml
+  #   with:
+  #     component: sandbox
+  #
+  # build-cluster:
+  #   uses: ./.github/workflows/docker-build.yml
+  #   with:
+  #     component: cluster
+  #
+  # publish-containers:
+  #   name: Publish Containers
+  #   needs: [build-server, build-sandbox, build-cluster]
+  #   runs-on: build-amd64
+  #   timeout-minutes: 120
+  #   container:
+  #     image: ghcr.io/nvidia/nv-agent-env/ci:latest
+  #     credentials:
+  #       username: ${{ github.actor }}
+  #       password: ${{ secrets.GITHUB_TOKEN }}
+  #     options: --privileged
+  #     volumes:
+  #       - /var/run/docker.sock:/var/run/docker.sock
+  #   env:
+  #     MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #     SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+  #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #     AWS_DEFAULT_REGION: us-west-2
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #
+  #     - name: Log in to GHCR
+  #       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+  #
+  #     - name: Log in to ECR
+  #       run: aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
+  #
+  #     - name: Set up Docker Buildx
+  #       uses: ./.github/actions/setup-buildx
+  #
+  #     - name: Build and push multi-arch images to ECR
+  #       env:
+  #         DOCKER_BUILDER: navigator
+  #         IMAGE_TAG: dev
+  #         TAG_LATEST: "true"
+  #       run: mise run --no-prepare docker:publish:cluster:multiarch
+  #
+  # build-python-wheels:
+  #   name: Stage Python Wheels
+  #   needs: [build-server, build-sandbox, build-cluster]
+  #   runs-on: build-amd64
+  #   timeout-minutes: 120
+  #   outputs:
+  #     wheel_version: ${{ steps.version.outputs.wheel_version }}
+  #     s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
+  #   container:
+  #     image: ghcr.io/nvidia/nv-agent-env/ci:latest
+  #     credentials:
+  #       username: ${{ github.actor }}
+  #       password: ${{ secrets.GITHUB_TOKEN }}
+  #     options: --privileged
+  #     volumes:
+  #       - /var/run/docker.sock:/var/run/docker.sock
+  #   env:
+  #     MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #     SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+  #     NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
+  #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #     AWS_DEFAULT_REGION: us-west-2
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #       with:
+  #         fetch-depth: 0
+  #
+  #     - name: Log in to GHCR
+  #       run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+  #
+  #     - name: Set up Docker Buildx
+  #       uses: ./.github/actions/setup-buildx
+  #
+  #     - name: Mark workspace safe for git
+  #       run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+  #
+  #     - name: Fetch tags
+  #       run: git fetch --tags --force
+  #
+  #     - name: Compute Python version
+  #       id: version
+  #       run: |
+  #         set -euo pipefail
+  #         WHEEL_VERSION=$(uv run python tasks/scripts/release.py get-version --python)
+  #         echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
+  #
+  #     - name: Build Python wheels
+  #       run: |
+  #         set -euo pipefail
+  #         WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
+  #         CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+  #         NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
+  #         NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+  #         ls -la target/wheels/*.whl
+  #
+  #     - name: Upload wheels to S3
+  #       id: upload
+  #       run: |
+  #         set -euo pipefail
+  #         WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
+  #         S3_PREFIX="nemoclaw/${WHEEL_VERSION}"
+  #         aws s3 cp target/wheels/ "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" --recursive --exclude "*" --include "*.whl"
+  #         aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
+  #         echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
+  #
+  # publish-python:
+  #   name: Publish Python
+  #   needs: [build-python-wheels]
+  #   runs-on: [self-hosted, nv]
+  #   timeout-minutes: 10
+  #   env:
+  #     MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  #     NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
+  #     NAV_PYPI_REPOSITORY_URL: https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local
+  #     NAV_PYPI_USERNAME: ${{ secrets.NAV_PYPI_USERNAME }}
+  #     NAV_PYPI_PASSWORD: ${{ secrets.NAV_PYPI_PASSWORD }}
+  #     AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  #     AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  #     AWS_DEFAULT_REGION: us-west-2
+  #   steps:
+  #   - uses: actions/checkout@v4
+  #     with:
+  #       fetch-depth: 0
+  #
+  #   - uses: actions/setup-python@v5
+  #     with:
+  #       python-version: "3.12"
+  #
+  #   - name: Install publish dependencies
+  #     run: |
+  #       set -euo pipefail
+  #       python -m pip install --upgrade pip uv
+  #
+  #       if ! command -v aws >/dev/null 2>&1; then
+  #         ARCH="$(uname -m)"
+  #         case "$ARCH" in
+  #           x86_64|amd64) AWSCLI_ARCH="x86_64" ;;
+  #           aarch64|arm64) AWSCLI_ARCH="aarch64" ;;
+  #           *)
+  #             echo "Unsupported architecture for AWS CLI installer: $ARCH" >&2
+  #             exit 1
+  #             ;;
+  #         esac
+  #
+  #         rm -rf aws awscliv2.zip
+  #         curl --fail --silent --show-error --location \
+  #           "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
+  #           --output awscliv2.zip
+  #         unzip -q awscliv2.zip
+  #         ./aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
+  #         echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+  #         export PATH="$HOME/.local/bin:$PATH"
+  #       fi
+  #
+  #       aws --version
+  #       uv --version
+  #
+  #   - name: List and download versioned wheels from S3
+  #     run: |
+  #       set -euo pipefail
+  #       WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
+  #       S3_PREFIX="${{ needs.build-python-wheels.outputs.s3_prefix }}"
+  #       OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "length(Contents)" --output text)
+  #       if [ "$OBJECT_COUNT" = "None" ] || [ "$OBJECT_COUNT" = "0" ]; then
+  #         echo "No wheel artifacts found for ${WHEEL_VERSION} at s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" >&2
+  #         exit 1
+  #       fi
+  #       aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "Contents[].Key" --output text
+  #       mkdir -p target/wheels
+  #       aws s3 cp "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" target/wheels/ --recursive --exclude "*" --include "*.whl"
+  #       ls -la target/wheels/*.whl
+  #
+  #   - name: Publish wheels to Artifactory
+  #     run: |
+  #       set -euo pipefail
+  #       WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
+  #       uv run python tasks/scripts/release.py python-publish --version "$WHEEL_VERSION"
 
   # ---------------------------------------------------------------------------
-  # Publish multi-arch container images to ECR
+  # Build CLI binaries (Linux musl — static)
   # ---------------------------------------------------------------------------
-  publish-containers:
-    name: Publish Containers
-    needs: [build-server, build-sandbox, build-cluster]
+  build-cli-linux:
+    name: Build CLI (Linux)
     runs-on: build-amd64
-    timeout-minutes: 120
+    timeout-minutes: 60
     container:
       image: ghcr.io/nvidia/nv-agent-env/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-west-2
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Log in to ECR
-        run: aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
-
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
-
-      - name: Build and push multi-arch images to ECR
-        env:
-          DOCKER_BUILDER: navigator
-          IMAGE_TAG: dev
-          TAG_LATEST: "true"
-        run: mise run --no-prepare docker:publish:cluster:multiarch
-
-  # ---------------------------------------------------------------------------
-  # Build Python wheels and stage them in S3
-  # ---------------------------------------------------------------------------
-  build-python-wheels:
-    name: Stage Python Wheels
-    needs: [build-server, build-sandbox, build-cluster]
-    runs-on: build-amd64
-    timeout-minutes: 120
-    outputs:
-      wheel_version: ${{ steps.version.outputs.wheel_version }}
-      s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
-    container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
-      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-west-2
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
@@ -116,104 +238,208 @@ jobs:
       - name: Fetch tags
         run: git fetch --tags --force
 
-      - name: Compute Python version
+      - name: Compute version
         id: version
         run: |
           set -euo pipefail
-          WHEEL_VERSION=$(uv run python tasks/scripts/release.py get-version --python)
-          echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
-
-      - name: Build Python wheels
-        run: |
-          set -euo pipefail
-          WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
           CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-          NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-          NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
-          ls -la target/wheels/*.whl
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
 
-      - name: Upload wheels to S3
-        id: upload
+      - name: Install musl toolchains
         run: |
           set -euo pipefail
-          WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
-          S3_PREFIX="nemoclaw/${WHEEL_VERSION}"
-          aws s3 cp target/wheels/ "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" --recursive --exclude "*" --include "*.whl"
-          aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
-          echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            musl-tools cmake \
+            gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Add Rust musl targets
+        run: |
+          rustup target add x86_64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+
+      - name: Patch workspace version
+        if: steps.version.outputs.cargo_version != ''
+        run: |
+          set -euo pipefail
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
+
+      - name: Build x86_64-unknown-linux-musl
+        run: cargo build --release --target x86_64-unknown-linux-musl -p navigator-cli
+
+      - name: Build aarch64-unknown-linux-musl
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_musl: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_musl: aarch64-linux-gnu-g++
+        run: cargo build --release --target aarch64-unknown-linux-musl -p navigator-cli
+
+      - name: Package binaries
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+
+          # x86_64
+          tar -czf artifacts/nemoclaw-x86_64-unknown-linux-musl.tar.gz \
+            -C target/x86_64-unknown-linux-musl/release nemoclaw
+
+          # aarch64
+          tar -czf artifacts/nemoclaw-aarch64-unknown-linux-musl.tar.gz \
+            -C target/aarch64-unknown-linux-musl/release nemoclaw
+
+          ls -lh artifacts/
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux
+          path: artifacts/*.tar.gz
+          retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # Publish Python wheels to Artifactory from S3 staging
+  # Build CLI binary (macOS aarch64 via osxcross)
   # ---------------------------------------------------------------------------
-  publish-python:
-    name: Publish Python
-    needs: [build-python-wheels]
-    runs-on: [self-hosted, nv]
-    timeout-minutes: 10
+  build-cli-macos:
+    name: Build CLI (macOS)
+    runs-on: build-amd64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
-      NAV_PYPI_REPOSITORY_URL: https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local
-      NAV_PYPI_USERNAME: ${{ secrets.NAV_PYPI_USERNAME }}
-      NAV_PYPI_PASSWORD: ${{ secrets.NAV_PYPI_PASSWORD }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-west-2
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
     steps:
-    - uses: actions/checkout@v4
-      with:
-        fetch-depth: 0
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.12"
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-    - name: Install publish dependencies
-      run: |
-        set -euo pipefail
-        python -m pip install --upgrade pip uv
-        
-        if ! command -v aws >/dev/null 2>&1; then
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64|amd64) AWSCLI_ARCH="x86_64" ;;
-            aarch64|arm64) AWSCLI_ARCH="aarch64" ;;
-            *)
-              echo "Unsupported architecture for AWS CLI installer: $ARCH" >&2
-              exit 1
-              ;;
-          esac
-        
-          rm -rf aws awscliv2.zip
-          curl --fail --silent --show-error --location \
-            "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
-            --output awscliv2.zip
-          unzip -q awscliv2.zip
-          ./aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-        fi
-        
-        aws --version
-        uv --version
+      - name: Fetch tags
+        run: git fetch --tags --force
 
-    - name: List and download versioned wheels from S3
-      run: |
-        set -euo pipefail
-        WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
-        S3_PREFIX="${{ needs.build-python-wheels.outputs.s3_prefix }}"
-        OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "length(Contents)" --output text)
-        if [ "$OBJECT_COUNT" = "None" ] || [ "$OBJECT_COUNT" = "0" ]; then
-          echo "No wheel artifacts found for ${WHEEL_VERSION} at s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" >&2
-          exit 1
-        fi
-        aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "Contents[].Key" --output text
-        mkdir -p target/wheels
-        aws s3 cp "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" target/wheels/ --recursive --exclude "*" --include "*.whl"
-        ls -la target/wheels/*.whl
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-    - name: Publish wheels to Artifactory
-      run: |
-        set -euo pipefail
-        WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
-        uv run python tasks/scripts/release.py python-publish --version "$WHEEL_VERSION"
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS binary via Docker
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.cli-macos \
+            --build-arg NEMOCLAW_CARGO_VERSION="${{ steps.version.outputs.cargo_version }}" \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/nemoclaw-aarch64-apple-darwin.tar.gz \
+            -C out nemoclaw
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-macos
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Create / update the "tip" GitHub Release with CLI binaries
+  # ---------------------------------------------------------------------------
+  release-tip:
+    name: Release Tip
+    needs: [build-cli-linux, build-cli-macos]
+    runs-on: build-amd64
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Linux CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-linux
+          path: release/
+
+      - name: Download macOS CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-macos
+          path: release/
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum *.tar.gz > nemoclaw-checksums-sha256.txt
+          cat nemoclaw-checksums-sha256.txt
+
+      - name: Move tip tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa tip -m "Latest Continuous Release" "${GITHUB_SHA}"
+          git push --force origin tip
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: 'NemoClaw Tip ("Nightly")'
+          prerelease: true
+          tag_name: tip
+          target_commitish: ${{ github.sha }}
+          body: |
+            This tip release is automatically built on every commit to main that passes CI.
+
+            > **Warning**: This is a nightly build, not a tagged release.
+            > We recommend using tagged releases for production use.
+
+            ### Assets
+            | File | Description |
+            |------|-------------|
+            | `nemoclaw-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static binary) |
+            | `nemoclaw-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 (static binary) |
+            | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
+            | `nemoclaw-checksums-sha256.txt` | SHA256 checksums for all archives |
+
+            ### Quick install
+
+            ```bash
+            # Linux x86_64
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-x86_64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+
+            # Linux aarch64
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+
+            # macOS (Apple Silicon)
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+            ```
+          files: |
+            release/nemoclaw-x86_64-unknown-linux-musl.tar.gz
+            release/nemoclaw-aarch64-unknown-linux-musl.tar.gz
+            release/nemoclaw-aarch64-apple-darwin.tar.gz
+            release/nemoclaw-checksums-sha256.txt
