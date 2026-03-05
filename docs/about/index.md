@@ -19,7 +19,7 @@ content:
 
 # NVIDIA NemoClaw Overview
 
-NemoClaw is a safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure while giving agents the system access they need to be useful. Each sandbox enforces declarative YAML policies through Linux kernel-level isolation, a policy-enforcing network proxy, and a credential management pipeline — agents run with exactly the permissions you grant and nothing more.
+NVIDIA NemoClaw is a safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure while giving agents the system access they need to be useful. Each sandbox enforces declarative YAML policies through Linux kernel-level isolation, a policy-enforcing network proxy, and a credential management pipeline — agents run with exactly the permissions you grant and nothing more.
 
 You do not modify agent code to use NemoClaw. Instead, the CLI bootstraps a local Kubernetes cluster packaged in a single Docker container, creates sandboxes with the safety policies you define, and connects you to the running agent through an SSH tunnel.
 

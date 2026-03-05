@@ -87,8 +87,8 @@ Install the CLI, bootstrap a cluster, and launch your first sandbox in minutes.
 {bdg-secondary}`Get Started`
 :::
 
-:::{grid-item-card} Sandboxes
-:link: sandboxes/index
+:::{grid-item-card} Tutorials
+:link: get-started/tutorials/index
 :link-type: doc
 
 Create, connect to, and manage sandboxes. Configure providers, sync files, forward ports, and bring your own containers.
@@ -192,7 +192,7 @@ Links to the GitHub repository, related projects, and additional learning materi
 :caption: About
 :hidden:
 
-about/index
+Overview <about/index>
 about/how-it-works
 about/support-matrix
 about/release-notes
@@ -204,7 +204,7 @@ about/release-notes
 
 get-started/index
 get-started/installation
-get-started/first-sandbox
+get-started/tutorials/index
 ```
 
 ```{toctree}

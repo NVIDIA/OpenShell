@@ -41,8 +41,8 @@ Prerequisites, install methods, shell completions, and verification steps for th
 {bdg-secondary}`Get Started`
 :::
 
-:::{grid-item-card} Your First Sandbox
-:link: first-sandbox
+:::{grid-item-card} Tutorials
+:link: tutorials/index
 :link-type: doc
 
 Step-by-step walkthrough from cluster bootstrap to an interactive sandbox session with policy enforcement.

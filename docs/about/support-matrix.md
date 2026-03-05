@@ -5,7 +5,11 @@
 
 # Support Matrix
 
+This page lists the platforms, kernel features, providers, protocols, and tools that NVIDIA NemoClaw supports.
+
 ## Platform Requirements
+
+The following software and runtime dependencies are required to install and run NemoClaw.
 
 | Requirement | Supported |
 |-------------|-----------|
@@ -32,6 +36,8 @@ When `landlock.compatibility` is set to `best_effort` (the default), the sandbox
 
 ## Supported Provider Types
 
+Providers supply credentials to sandboxes. NemoClaw can auto-discover credentials from environment variables and config files on your local machine.
+
 | Provider | Type Slug | Auto-Discovery |
 |----------|-----------|----------------|
 | Anthropic Claude | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY`, `~/.claude.json` |
@@ -44,6 +50,8 @@ When `landlock.compatibility` is set to `best_effort` (the default), the sandbox
 | Outlook | `outlook` | Manual only |
 
 ## Supported Inference Protocols
+
+Inference routing intercepts AI API calls and reroutes them to policy-controlled backends. The following protocols are recognized for interception.
 
 | Protocol | API Pattern | Method | Path |
 |----------|-------------|--------|------|
@@ -63,6 +71,8 @@ The following tools are recognized by `nemoclaw sandbox create -- <tool>` for au
 
 ## Network Policy Features
 
+The network proxy enforces policies at layers 4 and 7. The following table summarizes the available policy capabilities.
+
 | Feature | Support |
 |---------|---------|
 | L4 allow/deny (host + port) | Supported |
@@ -76,6 +86,8 @@ The following tools are recognized by `nemoclaw sandbox create -- <tool>` for au
 
 ## Container Image Compatibility (BYOC)
 
+Bring Your Own Container lets you run custom images as sandboxes. Image compatibility depends on the libraries and tools available in the image.
+
 | Image Type | Supported | Notes |
 |------------|-----------|-------|
 | Standard Linux images | Yes | Must have glibc and `/proc`. |
@@ -84,6 +96,8 @@ The following tools are recognized by `nemoclaw sandbox create -- <tool>` for au
 | Images without `iproute2` | Partial | Works in Block mode; fails in Proxy mode. |
 
 ## Database Backends
+
+The gateway server stores cluster state in a database. SQLite is the default and requires no configuration.
 
 | Backend | Support |
 |---------|---------|
