@@ -727,12 +727,6 @@ See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
 ---
 
-## Control Plane Bypass
-
-When `--nemoclaw-endpoint` is set, the proxy automatically allows connections to the gateway endpoint without OPA evaluation. This ensures the sandbox can always reach the gateway for inference routing and provider environment updates. The endpoint is parsed from the URL and added to a `control_plane_endpoints` allowlist. Control plane endpoints are also exempt from the SSRF internal-IP check (see below) because they legitimately resolve to private IPs in cluster deployments. See `crates/navigator-sandbox/src/proxy.rs` -- `is_control_plane` check.
-
----
-
 ## SSRF Protection (Internal IP Rejection)
 
 As a defense-in-depth measure, the proxy resolves DNS before connecting to upstream hosts and rejects any connection where the resolved IP address falls within an internal range. This prevents Server-Side Request Forgery (SSRF) attacks where a misconfigured or overly permissive OPA policy could allow connections to infrastructure endpoints such as cloud metadata services (`169.254.169.254`), localhost, or RFC 1918 private addresses.
@@ -779,9 +773,7 @@ Functions in `crates/navigator-sandbox/src/proxy.rs` implement the SSRF checks:
 
 ```mermaid
 flowchart TD
-    A[CONNECT request received] --> B{Control plane endpoint?}
-    B -- Yes --> C["Allow: skip OPA + SSRF check"]
-    B -- No --> D[OPA policy evaluation]
+    A[CONNECT request received] --> D[OPA policy evaluation]
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
     E -- Yes --> G{allowed_ips on endpoint?}
@@ -855,10 +847,6 @@ network_policies:
 ```
 
 Any hostname on port 8080 is allowed, provided DNS resolves to an IP within `10.0.5.0/24` or `10.0.6.0/24`. This allows access to multiple internal services without listing each hostname.
-
-### Control Plane Exemption
-
-Control plane endpoints bypass the SSRF check entirely and connect using hostname-based `TcpStream::connect()`. This is necessary because the gateway legitimately resolves to a private IP (e.g., a Kubernetes service IP or `10.200.0.1` on the veth pair). Control plane endpoints are already authenticated before OPA evaluation, so the SSRF bypass does not weaken the security model.
 
 ### DNS Resolution Failure
 

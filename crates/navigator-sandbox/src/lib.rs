@@ -262,14 +262,6 @@ pub async fn run_sandbox(
         #[cfg(not(target_os = "linux"))]
         let bind_addr: Option<SocketAddr> = None;
 
-        // Build the control plane allowlist: the navigator endpoint is always
-        // allowed so sandbox processes can reach the server for inference.
-        let control_plane_endpoints = navigator_endpoint_for_proxy
-            .as_deref()
-            .and_then(proxy::parse_endpoint_url)
-            .into_iter()
-            .collect::<Vec<_>>();
-
         // Build inference context for local routing of intercepted inference calls.
         let inference_ctx = build_inference_context(
             sandbox_id.as_deref(),
@@ -285,7 +277,6 @@ pub async fn run_sandbox(
                 engine,
                 cache,
                 entrypoint_pid.clone(),
-                control_plane_endpoints,
                 tls_state,
                 inference_ctx,
             )
