@@ -22,7 +22,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 | `crates/navigator-sandbox/src/main.rs` | Sandbox binary CLI: `--inference-routes` / `NEMOCLAW_INFERENCE_ROUTES` flag definition |
 | `tasks/ci.toml` | `[sandbox]` task: mounts `inference-routes.yaml`, sets env vars for dev sandbox |
 | `inference-routes.yaml` | Default standalone routes for dev sandbox (NVIDIA API endpoint) |
-| `dev-sandbox-policy.rego` | `network_action` Rego rule -- tri-state decision logic |
+| `crates/navigator-sandbox/data/sandbox-policy.rego` | `network_action` Rego rule -- tri-state decision logic |
 
 ## Architecture Overview
 
@@ -174,7 +174,7 @@ The `evaluate_network_action()` method evaluates `data.navigator.sandbox.network
 
 ### Rego rules
 
-**File:** `dev-sandbox-policy.rego`
+**File:** `crates/navigator-sandbox/data/sandbox-policy.rego`
 
 ```rego
 default network_action := "deny"
@@ -567,8 +567,8 @@ The `create` and `update` commands perform protocol auto-detection when `--proto
 
 Running `mise run cluster:sandbox` starts a standalone sandbox container with inference routing pre-configured. The task mounts three files into the container:
 
-- `dev-sandbox-policy.rego` as `/var/navigator/policy.rego`
-- `dev-sandbox-policy.yaml` as `/var/navigator/data.yaml`
+- `crates/navigator-sandbox/data/sandbox-policy.rego` as `/var/navigator/policy.rego`
+- `deploy/docker/sandbox/dev-sandbox-policy.yaml` as `/var/navigator/data.yaml`
 - `inference-routes.yaml` as `/var/navigator/inference-routes.yaml`
 
 The container receives `NEMOCLAW_INFERENCE_ROUTES=/var/navigator/inference-routes.yaml` to enable standalone inference routing. `NVIDIA_API_KEY` is always forwarded from the host environment (empty string if unset).

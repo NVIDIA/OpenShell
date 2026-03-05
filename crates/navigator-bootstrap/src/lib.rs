@@ -462,7 +462,7 @@ fn default_cluster_image_ref() -> String {
     image::pull_registry_image()
 }
 
-/// Create the three TLS K8s secrets required by the NemoClaw server and sandbox pods.
+/// Create the three TLS K8s secrets required by the `NemoClaw` server and sandbox pods.
 ///
 /// Secrets are created via `kubectl` exec'd inside the cluster container:
 /// - `navigator-server-tls` (kubernetes.io/tls): server cert + key

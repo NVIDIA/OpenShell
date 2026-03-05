@@ -77,10 +77,6 @@ impl Navigator for NavigatorService {
         let spec = request
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
-        if spec.policy.is_none() {
-            return Err(Status::invalid_argument("spec.policy is required"));
-        }
-
         // Validate provider names exist (fail fast). Credentials are fetched at
         // runtime by the sandbox supervisor via GetSandboxProviderEnvironment.
         for name in &spec.providers {
@@ -595,14 +591,27 @@ impl Navigator for NavigatorService {
             }));
         }
 
-        // Lazy backfill: no policy history exists yet, create version 1 from spec.policy.
+        // Lazy backfill: no policy history exists yet.
         let spec = sandbox
             .spec
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-        let policy = spec
-            .policy
-            .ok_or_else(|| Status::failed_precondition("sandbox has no policy configured"))?;
 
+        // If spec.policy is None, the sandbox was created without a policy.
+        // Return an empty response so the sandbox can discover policy from disk
+        // or fall back to its restrictive default.
+        let Some(policy) = spec.policy else {
+            debug!(
+                sandbox_id = %sandbox_id,
+                "GetSandboxPolicy: no policy configured, returning empty response"
+            );
+            return Ok(Response::new(GetSandboxPolicyResponse {
+                policy: None,
+                version: 0,
+                policy_hash: String::new(),
+            }));
+        };
+
+        // Create version 1 from spec.policy.
         let payload = policy.encode_to_vec();
         let hash = deterministic_policy_hash(&policy);
         let policy_id = uuid::Uuid::new_v4().to_string();
@@ -842,16 +851,32 @@ impl Navigator for NavigatorService {
             .spec
             .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-        let baseline_policy = spec
-            .policy
-            .as_ref()
-            .ok_or_else(|| Status::failed_precondition("sandbox has no policy configured"))?;
 
-        // Validate static fields haven't changed.
-        validate_static_fields_unchanged(baseline_policy, &new_policy)?;
+        if let Some(baseline_policy) = spec.policy.as_ref() {
+            // Validate static fields haven't changed.
+            validate_static_fields_unchanged(baseline_policy, &new_policy)?;
 
-        // Validate network mode hasn't changed (Block ↔ Proxy).
-        validate_network_mode_unchanged(baseline_policy, &new_policy)?;
+            // Validate network mode hasn't changed (Block ↔ Proxy).
+            validate_network_mode_unchanged(baseline_policy, &new_policy)?;
+        } else {
+            // No baseline policy exists (sandbox created without one). The
+            // sandbox is syncing a locally-discovered or restrictive-default
+            // policy. Backfill spec.policy so future updates can validate
+            // against it.
+            let mut sandbox = sandbox;
+            if let Some(ref mut spec) = sandbox.spec {
+                spec.policy = Some(new_policy.clone());
+            }
+            self.state
+                .store
+                .put_message(&sandbox)
+                .await
+                .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
+            info!(
+                sandbox_id = %sandbox_id,
+                "UpdateSandboxPolicy: backfilled spec.policy from sandbox-discovered policy"
+            );
+        }
 
         // Determine next version number.
         let latest = self
@@ -2293,5 +2318,168 @@ mod tests {
         let store = Store::connect("sqlite::memory:").await.unwrap();
         let result = store.get_message::<Sandbox>("nonexistent").await.unwrap();
         assert!(result.is_none());
+    }
+
+    // ---- Policy validation tests ----
+
+    #[test]
+    fn validate_static_fields_allows_unchanged() {
+        use super::{validate_network_mode_unchanged, validate_static_fields_unchanged};
+        use navigator_core::proto::{
+            FilesystemPolicy, LandlockPolicy, ProcessPolicy, SandboxPolicy as ProtoSandboxPolicy,
+        };
+
+        let policy = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr".into()],
+                read_write: vec!["/tmp".into()],
+            }),
+            landlock: Some(LandlockPolicy {
+                compatibility: "best_effort".into(),
+            }),
+            process: Some(ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "sandbox".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(validate_static_fields_unchanged(&policy, &policy).is_ok());
+        assert!(validate_network_mode_unchanged(&policy, &policy).is_ok());
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_filesystem_change() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_only: vec!["/usr".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let changed = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_only: vec!["/usr".into(), "/lib".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = validate_static_fields_unchanged(&baseline, &changed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("filesystem"));
+    }
+
+    #[test]
+    fn validate_network_mode_rejects_block_to_proxy() {
+        use super::validate_network_mode_unchanged;
+        use navigator_core::proto::{NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy};
+
+        let baseline = ProtoSandboxPolicy::default(); // no network policies = Block
+        let mut changed = ProtoSandboxPolicy::default();
+        changed.network_policies.insert(
+            "test".into(),
+            NetworkPolicyRule {
+                name: "test".into(),
+                ..Default::default()
+            },
+        );
+        assert!(validate_network_mode_unchanged(&baseline, &changed).is_err());
+    }
+
+    // ---- Sandbox creation without policy ----
+
+    #[tokio::test]
+    async fn sandbox_without_policy_stores_successfully() {
+        use navigator_core::proto::{Sandbox, SandboxPhase, SandboxSpec};
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        let sandbox = Sandbox {
+            id: "sb-no-policy".to_string(),
+            name: "no-policy-sandbox".to_string(),
+            namespace: "default".to_string(),
+            spec: Some(SandboxSpec {
+                policy: None, // no policy
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        let loaded = store
+            .get_message::<Sandbox>("sb-no-policy")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(loaded.spec.unwrap().policy.is_none());
+    }
+
+    #[tokio::test]
+    async fn sandbox_policy_backfill_on_update_when_no_baseline() {
+        use navigator_core::proto::{
+            FilesystemPolicy, LandlockPolicy, ProcessPolicy, Sandbox, SandboxPhase,
+            SandboxPolicy as ProtoSandboxPolicy, SandboxSpec,
+        };
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+
+        // Create sandbox without policy.
+        let sandbox = Sandbox {
+            id: "sb-backfill".to_string(),
+            name: "backfill-sandbox".to_string(),
+            namespace: "default".to_string(),
+            spec: Some(SandboxSpec {
+                policy: None,
+                ..Default::default()
+            }),
+            phase: SandboxPhase::Provisioning as i32,
+            ..Default::default()
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        // Simulate what update_sandbox_policy does when spec.policy is None:
+        // backfill spec.policy with the new policy.
+        let new_policy = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                read_only: vec!["/usr".into()],
+                read_write: vec!["/tmp".into()],
+            }),
+            landlock: Some(LandlockPolicy {
+                compatibility: "best_effort".into(),
+            }),
+            process: Some(ProcessPolicy {
+                run_as_user: "sandbox".into(),
+                run_as_group: "sandbox".into(),
+            }),
+            ..Default::default()
+        };
+
+        let mut sandbox = store
+            .get_message::<Sandbox>("sb-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        if let Some(ref mut spec) = sandbox.spec {
+            spec.policy = Some(new_policy.clone());
+        }
+        store.put_message(&sandbox).await.unwrap();
+
+        // Verify backfill succeeded.
+        let loaded = store
+            .get_message::<Sandbox>("sb-backfill")
+            .await
+            .unwrap()
+            .unwrap();
+        let policy = loaded.spec.unwrap().policy.unwrap();
+        assert_eq!(policy.version, 1);
+        assert!(policy.filesystem.is_some());
+        assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
     }
 }

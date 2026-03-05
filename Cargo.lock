@@ -2777,6 +2777,7 @@ dependencies = [
  "libc",
  "miette",
  "navigator-core",
+ "navigator-policy",
  "navigator-router",
  "nix",
  "rand_core 0.6.4",

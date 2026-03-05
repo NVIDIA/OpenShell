@@ -23,7 +23,7 @@
 - Naming convention: "gateway" in prose for the control plane component; code identifiers like `navigator-server` stay unchanged
 
 ## Key Patterns
-- OPA baked-in rules: `include_str!("../../../dev-sandbox-policy.rego")` in opa.rs
+- OPA baked-in rules: `include_str!("../data/sandbox-policy.rego")` in opa.rs
 - Policy loading: gRPC mode (NAVIGATOR_SANDBOX_ID + NAVIGATOR_ENDPOINT) or file mode (--policy-rules + --policy-data)
 - Provider env injection: both entrypoint process (tokio Command) and SSH shell (std Command)
 - Cluster bootstrap: `sandbox_create_with_bootstrap()` auto-deploys when no cluster exists (main.rs ~line 632)

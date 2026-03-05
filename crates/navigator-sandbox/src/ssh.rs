@@ -132,9 +132,12 @@ async fn handle_connection(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
 ) -> Result<()> {
+    info!(peer = %peer, "SSH connection: reading handshake preface");
     let mut line = String::new();
     read_line(&mut stream, &mut line).await?;
+    info!(peer = %peer, preface_len = line.len(), "SSH connection: preface received, verifying");
     if !verify_preface(&line, secret, handshake_skew_secs)? {
+        warn!(peer = %peer, "SSH connection: handshake verification failed");
         let _ = stream.write_all(b"ERR\n").await;
         return Ok(());
     }

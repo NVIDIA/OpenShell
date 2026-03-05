@@ -978,6 +978,7 @@ pub async fn sandbox_create_with_bootstrap(
     policy: Option<&str>,
     forward: Option<u16>,
     command: &[String],
+    tty_override: Option<bool>,
 ) -> Result<()> {
     if !crate::bootstrap::confirm_bootstrap()? {
         return Err(miette::miette!(
@@ -988,7 +989,18 @@ pub async fn sandbox_create_with_bootstrap(
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
     sandbox_create(
-        &server, name, image, sync, keep, remote, ssh_key, providers, policy, forward, command,
+        &server,
+        name,
+        image,
+        sync,
+        keep,
+        remote,
+        ssh_key,
+        providers,
+        policy,
+        forward,
+        command,
+        tty_override,
         &tls,
     )
     .await
@@ -1008,6 +1020,7 @@ pub async fn sandbox_create(
     policy: Option<&str>,
     forward: Option<u16>,
     command: &[String],
+    tty_override: Option<bool>,
     tls: &TlsOptions,
 ) -> Result<()> {
     // Try connecting to the cluster. If it fails due to an unreachable cluster,
@@ -1037,11 +1050,10 @@ pub async fn sandbox_create(
 
     // When a custom image is specified, clear the default run_as_user/group
     // to prevent failures on images that lack the "sandbox" user/group.
-    if image.is_some()
-        && let Some(ref mut process) = policy.process
-    {
-        process.run_as_user = String::new();
-        process.run_as_group = String::new();
+    if image.is_some() {
+        if let Some(ref mut p) = policy {
+            navigator_policy::clear_process_identity(p);
+        }
     }
 
     let template = image.map(|img| SandboxTemplate {
@@ -1051,7 +1063,7 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
-            policy: Some(policy),
+            policy,
             providers: configured_providers,
             template,
             ..SandboxSpec::default()
@@ -1250,11 +1262,16 @@ pub async fn sandbox_create(
             }
 
             eprintln!("Connecting...");
+            // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
+            // auto-detect from the local terminal.
+            let tty = tty_override.unwrap_or_else(|| {
+                std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+            });
             let exec_result = sandbox_exec(
                 &effective_server,
                 &sandbox_name,
                 command,
-                interactive,
+                tty,
                 &effective_tls,
             )
             .await;
@@ -1299,12 +1316,12 @@ pub async fn sandbox_create(
     }
 }
 
-/// Default sandbox policy YAML, baked in at compile time.
 /// Load sandbox policy YAML.
 ///
-/// Resolution order: `--policy` flag > `NEMOCLAW_SANDBOX_POLICY` env var > built-in default.
-/// Delegates to `navigator_policy::load_sandbox_policy`.
-fn load_sandbox_policy(cli_path: Option<&str>) -> Result<SandboxPolicy> {
+/// Resolution order: `--policy` flag > `NEMOCLAW_SANDBOX_POLICY` env var.
+/// Returns `None` when no policy source is configured, allowing the server
+/// to apply its own default.
+fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
     navigator_policy::load_sandbox_policy(cli_path)
 }
 
@@ -2606,7 +2623,8 @@ pub async fn sandbox_policy_set(
     timeout_secs: u64,
     tls: &TlsOptions,
 ) -> Result<()> {
-    let policy = load_sandbox_policy(Some(policy_path))?;
+    let policy = load_sandbox_policy(Some(policy_path))?
+        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
 
     let mut client = grpc_client(server, tls).await?;
 

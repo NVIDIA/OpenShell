@@ -120,13 +120,13 @@ pub fn rewrite_kubeconfig(contents: &str, cluster_name: &str, kube_port: Option<
     let mut replaced = Vec::new();
     for line in contents.lines() {
         let trimmed = line.trim_start();
-        if let Some(kp) = kube_port {
-            if trimmed.starts_with("server:") {
-                let indent_len = line.len() - trimmed.len();
-                let indent = &line[..indent_len];
-                replaced.push(format!("{indent}server: https://127.0.0.1:{kp}"));
-                continue;
-            }
+        if let Some(kp) = kube_port
+            && trimmed.starts_with("server:")
+        {
+            let indent_len = line.len() - trimmed.len();
+            let indent = &line[..indent_len];
+            replaced.push(format!("{indent}server: https://127.0.0.1:{kp}"));
+            continue;
         }
         // Rename default cluster/context/user to the cluster name
         // Handle both "name: default" and "- name: default" (YAML list item)

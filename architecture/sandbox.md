@@ -191,7 +191,7 @@ The OPA engine lives in `crates/navigator-sandbox/src/opa.rs` and uses the `rego
 
 ### Baked-in rules
 
-The Rego rules are compiled into the binary via `include_str!("../../../dev-sandbox-policy.rego")`. The package is `navigator.sandbox`. Key rules:
+The Rego rules are compiled into the binary via `include_str!("../data/sandbox-policy.rego")`. The package is `navigator.sandbox`. Key rules:
 
 | Rule | Type | Purpose |
 |------|------|---------|
