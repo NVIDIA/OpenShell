@@ -83,6 +83,7 @@ nemoclaw --help                   # CLI help
 mise build                        # Debug build (without running)
 mise test                         # Run all project tests
 mise run sandbox                  # Run sandbox container interactively
+mise run docs                     # Build HTML documentation
 ```
 
 ## Shell Completions
