@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 defaults:
@@ -14,9 +14,6 @@ defaults:
     shell: bash
 
 jobs:
-  # ---------------------------------------------------------------------------
-  # Build container images to GHCR (same as E2E pipeline)
-  # ---------------------------------------------------------------------------
   build-server:
     uses: ./.github/workflows/docker-build.yml
     with:
@@ -32,9 +29,6 @@ jobs:
     with:
       component: cluster
 
-  # ---------------------------------------------------------------------------
-  # Publish multi-arch container images to ECR
-  # ---------------------------------------------------------------------------
   publish-containers:
     name: Publish Containers
     needs: [build-server, build-sandbox, build-cluster]
@@ -73,9 +67,6 @@ jobs:
           TAG_LATEST: "true"
         run: mise run --no-prepare docker:publish:cluster:multiarch
 
-  # ---------------------------------------------------------------------------
-  # Build Python wheels and stage them in S3
-  # ---------------------------------------------------------------------------
   build-python-wheels:
     name: Stage Python Wheels
     needs: [build-server, build-sandbox, build-cluster]
@@ -142,9 +133,6 @@ jobs:
           aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
           echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
 
-  # ---------------------------------------------------------------------------
-  # Publish Python wheels to Artifactory from S3 staging
-  # ---------------------------------------------------------------------------
   publish-python:
     name: Publish Python
     needs: [build-python-wheels]
@@ -172,7 +160,7 @@ jobs:
       run: |
         set -euo pipefail
         python -m pip install --upgrade pip uv
-        
+
         if ! command -v aws >/dev/null 2>&1; then
           ARCH="$(uname -m)"
           case "$ARCH" in
@@ -183,7 +171,7 @@ jobs:
               exit 1
               ;;
           esac
-        
+
           rm -rf aws awscliv2.zip
           curl --fail --silent --show-error --location \
             "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
@@ -193,7 +181,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           export PATH="$HOME/.local/bin:$PATH"
         fi
-        
+
         aws --version
         uv --version
 
@@ -217,3 +205,256 @@ jobs:
         set -euo pipefail
         WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
         uv run python tasks/scripts/release.py python-publish --version "$WHEEL_VERSION"
+
+  # ---------------------------------------------------------------------------
+  # Build CLI binaries (Linux musl — static, native on each arch)
+  # ---------------------------------------------------------------------------
+  build-cli-linux:
+    name: Build CLI (Linux ${{ matrix.arch }})
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Install tools
+        run: mise install
+
+      - name: Cache Rust target and registry
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+        with:
+          shared-key: cli-musl-${{ matrix.arch }}
+          cache-directories: .cache/sccache
+          cache-targets: "true"
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Install musl toolchain
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends musl-tools
+          rm -rf /var/lib/apt/lists/*
+
+      - name: Add Rust musl target
+        run: mise x -- rustup target add ${{ matrix.target }}
+
+      - name: Scope workspace to CLI crates
+        run: |
+          set -euo pipefail
+          # Remove workspace members that are not needed for navigator-cli.
+          # This avoids Cargo feature-unification pulling in aws-lc-sys (via
+          # russh in navigator-sandbox / navigator-server).
+          sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
+
+      - name: Patch workspace version
+        if: steps.version.outputs.cargo_version != ''
+        run: |
+          set -euo pipefail
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
+
+      - name: Build ${{ matrix.target }}
+        run: mise x -- cargo build --release --target ${{ matrix.target }} -p navigator-cli
+
+      - name: sccache stats
+        if: always()
+        run: mise x -- sccache --show-stats
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/nemoclaw-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release nemoclaw
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-linux-${{ matrix.arch }}
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Build CLI binary (macOS aarch64 via osxcross)
+  # ---------------------------------------------------------------------------
+  build-cli-macos:
+    name: Build CLI (macOS)
+    runs-on: build-amd64
+    timeout-minutes: 60
+    container:
+      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Set up Docker Buildx
+        uses: ./.github/actions/setup-buildx
+
+      - name: Compute version
+        id: version
+        run: |
+          set -euo pipefail
+          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Build macOS binary via Docker
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file deploy/docker/Dockerfile.cli-macos \
+            --build-arg NEMOCLAW_CARGO_VERSION="${{ steps.version.outputs.cargo_version }}" \
+            --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
+            --target binary \
+            --output type=local,dest=out/ \
+            .
+
+      - name: Package binary
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          tar -czf artifacts/nemoclaw-aarch64-apple-darwin.tar.gz \
+            -C out nemoclaw
+          ls -lh artifacts/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cli-macos
+          path: artifacts/*.tar.gz
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # Create / update the snapshot GitHub Release with CLI binaries
+  # ---------------------------------------------------------------------------
+  release-snapshot:
+    name: Release Snapshot
+    needs: [build-cli-linux, build-cli-macos]
+    runs-on: build-amd64
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all CLI artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: cli-*
+          path: release/
+          merge-multiple: true
+
+      - name: Stage install script
+        run: cp install.sh release/install.sh
+
+      - name: Generate checksums
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum *.tar.gz > nemoclaw-checksums-sha256.txt
+          cat nemoclaw-checksums-sha256.txt
+
+      - name: Move snapshot tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa snapshot -m "Latest Snapshot" "${GITHUB_SHA}"
+          git push --force origin snapshot
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: NemoClaw Latest Snapshot
+          prerelease: true
+          tag_name: snapshot
+          target_commitish: ${{ github.sha }}
+          body: |
+            This snapshot is automatically built on every commit to main that passes CI.
+
+            > **Warning**: This is a snapshot build, not a tagged release.
+            > We recommend using tagged releases for production use.
+
+            ### Quick install
+
+            ```bash
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/install.sh | sh
+            ```
+
+            ### Assets
+
+            | File | Platform | Install |
+            |------|----------|---------|
+            | `nemoclaw-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/nemoclaw-x86_64-unknown-linux-musl.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
+            | `nemoclaw-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/nemoclaw-aarch64-unknown-linux-musl.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
+            | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/nemoclaw-aarch64-apple-darwin.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
+            | `install.sh` | All platforms | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/install.sh \| sh` |
+            | `nemoclaw-checksums-sha256.txt` | — | SHA256 checksums for all archives |
+
+            ### Manual install
+
+            ```bash
+            # Linux x86_64
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/nemoclaw-x86_64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+
+            # Linux aarch64
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/nemoclaw-aarch64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+
+            # macOS (Apple Silicon)
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/snapshot/nemoclaw-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+            ```
+          files: |
+            release/nemoclaw-x86_64-unknown-linux-musl.tar.gz
+            release/nemoclaw-aarch64-unknown-linux-musl.tar.gz
+            release/nemoclaw-aarch64-apple-darwin.tar.gz
+            release/nemoclaw-checksums-sha256.txt
+            release/install.sh

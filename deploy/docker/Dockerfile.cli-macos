@@ -1,0 +1,117 @@
+# syntax=docker/dockerfile:1.6
+
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Cross-compile the nemoclaw CLI binary for macOS aarch64 (Apple Silicon)
+# using the osxcross toolchain.  Produces a standalone binary — no Python
+# wheel wrapping.
+#
+# Usage:
+#   docker buildx build -f deploy/docker/Dockerfile.cli-macos \
+#     --build-arg NEMOCLAW_CARGO_VERSION=0.6.0 \
+#     --output type=local,dest=out/ .
+
+ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
+
+FROM ${OSXCROSS_IMAGE} AS osxcross
+
+FROM python:3.12-slim AS builder
+
+ARG NEMOCLAW_CARGO_VERSION
+ARG CARGO_TARGET_CACHE_SCOPE=default
+
+ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
+ENV LD_LIBRARY_PATH="/osxcross/lib"
+
+COPY --from=osxcross /osxcross /osxcross
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    ca-certificates \
+    clang \
+    cmake \
+    curl \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain 1.88.0
+
+# aws-lc-sys probes with --target=arm64-apple-macosx and clang then looks for
+# arm64-apple-macosx-ld.  Provide a linker alias to osxcross ld64.
+RUN ln -sf /osxcross/bin/arm64-apple-darwin25.1-ld /usr/local/bin/arm64-apple-macosx-ld
+
+RUN rustup target add aarch64-apple-darwin
+
+WORKDIR /build
+
+ENV CC_aarch64_apple_darwin=oa64-clang
+ENV CXX_aarch64_apple_darwin=oa64-clang++
+ENV AR_aarch64_apple_darwin=aarch64-apple-darwin25.1-ar
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_LINKER=oa64-clang
+ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
+
+# ---------------------------------------------------------------------------
+# Stage 1: dependency caching — copy only manifests, create dummy sources,
+# build dependencies.  This layer is cached unless Cargo.toml/lock changes.
+# ---------------------------------------------------------------------------
+COPY Cargo.toml Cargo.lock ./
+COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
+COPY crates/navigator-cli/Cargo.toml      crates/navigator-cli/Cargo.toml
+COPY crates/navigator-core/Cargo.toml     crates/navigator-core/Cargo.toml
+COPY crates/navigator-policy/Cargo.toml   crates/navigator-policy/Cargo.toml
+COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
+COPY crates/navigator-tui/Cargo.toml      crates/navigator-tui/Cargo.toml
+COPY crates/navigator-core/build.rs       crates/navigator-core/build.rs
+COPY proto/ proto/
+
+# Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
+# by russh in navigator-sandbox/navigator-server) which is difficult to
+# cross-compile and unnecessary for the CLI binary.
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
+
+RUN mkdir -p crates/navigator-cli/src \
+             crates/navigator-core/src \
+             crates/navigator-bootstrap/src \
+             crates/navigator-policy/src \
+             crates/navigator-providers/src \
+             crates/navigator-tui/src && \
+    echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
+    touch crates/navigator-core/src/lib.rs && \
+    touch crates/navigator-bootstrap/src/lib.rs && \
+    touch crates/navigator-policy/src/lib.rs && \
+    touch crates/navigator-providers/src/lib.rs && \
+    touch crates/navigator-tui/src/lib.rs
+
+RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    cargo build --release --target aarch64-apple-darwin -p navigator-cli 2>/dev/null || true
+
+# ---------------------------------------------------------------------------
+# Stage 2: real build
+# ---------------------------------------------------------------------------
+COPY crates/ crates/
+
+# Touch source files to ensure they're rebuilt (not the cached dummy).
+RUN touch crates/navigator-cli/src/main.rs \
+    crates/navigator-cli/src/lib.rs \
+    crates/navigator-bootstrap/src/lib.rs \
+    crates/navigator-core/src/lib.rs \
+    crates/navigator-policy/src/lib.rs \
+    crates/navigator-providers/src/lib.rs \
+    crates/navigator-tui/src/lib.rs \
+    crates/navigator-core/build.rs \
+    proto/*.proto
+
+RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
+    --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
+    --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    if [ -n "${NEMOCLAW_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NEMOCLAW_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
+    cargo build --release --target aarch64-apple-darwin -p navigator-cli && \
+    cp target/aarch64-apple-darwin/release/nemoclaw /nemoclaw
+
+FROM scratch AS binary
+COPY --from=builder /nemoclaw /nemoclaw
