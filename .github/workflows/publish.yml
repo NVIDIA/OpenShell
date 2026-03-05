@@ -441,6 +441,22 @@ jobs:
             | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-apple-darwin.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
             | `install.sh` | All platforms | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/install.sh \| sh` |
             | `nemoclaw-checksums-sha256.txt` | — | SHA256 checksums for all archives |
+
+            ### Manual install
+
+            ```bash
+            # Linux x86_64
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-x86_64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+
+            # Linux aarch64
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+
+            # macOS (Apple Silicon)
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv nemoclaw /usr/local/bin/
+            ```
           files: |
             release/nemoclaw-x86_64-unknown-linux-musl.tar.gz
             release/nemoclaw-aarch64-unknown-linux-musl.tar.gz
