@@ -177,6 +177,9 @@ credentials/
 
 kubeconfig
 
+# Documentation build output
+_build/
+
 # Docker build artifacts (image tarballs, packaged helm charts)
 deploy/docker/.build/
 

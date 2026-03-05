@@ -37,6 +37,15 @@ dev = [
     "setuptools-scm>=8",
     "grpcio-tools>=1.60",
 ]
+docs = [
+    "sphinx<=7.5",
+    "myst-parser<=5",
+    "sphinx-copybutton<=0.6",
+    "sphinx-design",
+    "sphinx-autobuild",
+    "sphinxcontrib-mermaid",
+    "nvidia-sphinx-theme",
+]
 
 [tool.uv]
 # Don't try to install the root package with uv sync - use uv pip install . instead

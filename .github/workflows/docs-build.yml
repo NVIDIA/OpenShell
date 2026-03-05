@@ -1,0 +1,150 @@
+name: Docs
+
+on:
+    pull_request:
+        branches: [main]
+        types: [opened, synchronize]
+        paths:
+            - "docs/**"
+    push:
+        branches: [main]
+    workflow_dispatch:
+
+defaults:
+    run:
+        shell: bash
+
+env:
+    MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    build:
+        runs-on: build-arm64
+        container:
+            image: ghcr.io/nvidia/nv-agent-env/ci:latest
+            credentials:
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v4
+
+            - name: Install tools
+              run: mise install
+
+            - name: Build documentation
+              run: mise run docs:build:strict
+
+            - name: Delete unnecessary files
+              run: |
+                  find _build -name .doctrees -prune -exec rm -rf {} \;
+                  find _build -name .buildinfo -exec rm {} \;
+
+            - name: Upload HTML
+              uses: actions/upload-artifact@v4
+              with:
+                  name: html-build-artifact
+                  path: _build/docs
+                  if-no-files-found: error
+                  retention-days: 1
+            - name: Store PR information
+              if: github.event_name == 'pull_request'
+              run: |
+                  mkdir ./pr
+                  echo ${{ github.event.number }}              > ./pr/pr.txt
+                  echo ${{ github.event.pull_request.merged }} > ./pr/merged.txt
+                  echo ${{ github.event.action }}              > ./pr/action.txt
+
+            - name: Upload PR information
+              if: github.event_name == 'pull_request'
+              uses: actions/upload-artifact@v4
+              with:
+                  name: pr
+                  path: pr/
+
+    publish:
+        if: github.event_name == 'push' && github.repository_owner == 'NVIDIA'
+        needs: [build]
+        runs-on: build-arm64
+        container:
+            image: ghcr.io/nvidia/nv-agent-env/ci:latest
+            credentials:
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
+        steps:
+            - uses: actions/checkout@v4
+              with:
+                  ref: "gh-pages"
+
+            - name: Initialize Git configuration
+              run: |
+                  git config user.name docs-build
+                  git config user.email do-not-send@github.com
+
+            - name: Download artifacts
+              uses: actions/download-artifact@v4
+              with:
+                  name: html-build-artifact
+                  path: ${{ github.ref_name }}
+
+            - name: Copy HTML directories
+              run: |
+                  ls -asl
+                  for i in `ls -d *`
+                  do
+                    echo "Git adding ${i}"
+                    git add "${i}"
+                  done
+            - name: Check or create dot-no-jekyll file
+
+              run: |
+                  if [ -f ".nojekyll" ]; then
+                    echo "The dot-no-jekyll file already exists."
+                    exit 0
+                  fi
+                  touch .nojekyll
+                  git add .nojekyll
+
+            - name: Check or create redirect page
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  resp=$(grep 'http-equiv="refresh"' index.html 2>/dev/null) || true
+                  if [ -n "${resp}" ]; then
+                    echo "The redirect file already exists."
+                    exit 0
+                  fi
+                  def_branch=$(gh api "repos/${GITHUB_REPOSITORY}" --jq ".default_branch")
+                  html_url=$(gh api "repos/${GITHUB_REPOSITORY}/pages" --jq ".html_url")
+                  echo '<!DOCTYPE html>'                                                                         > index.html
+                  echo '<html>'                                                                                 >> index.html
+                  echo '  <head>'                                                                               >> index.html
+                  echo '    <title>Redirect to documentation</title>'                                           >> index.html
+                  echo '    <meta charset="utf-8">'                                                             >> index.html
+                  echo '    <meta http-equiv="refresh" content="3; URL='${html_url}${def_branch}'/index.html">' >> index.html
+                  echo '    <link rel="canonical" href="'${html_url}${def_branch}'/index.html">'                >> index.html
+                  echo '    <script language="javascript">'                                                     >> index.html
+                  echo '      function redirect() {'                                                            >> index.html
+                  echo '        window.location.assign("'${html_url}${def_branch}'/index.html")'                >> index.html
+                  echo '      }'                                                                                >> index.html
+                  echo '    </script>'                                                                          >> index.html
+                  echo '  </head>'                                                                              >> index.html
+                  echo '  <body onload="redirect()">'                                                           >> index.html
+                  echo '    <p>Please follow the link to the <a href="'${html_url}${def_branch}'/index.html">'  >> index.html
+                  echo      ${def_branch}'</a> branch documentation.</p>'                                       >> index.html
+                  echo '  </body>'                                                                              >> index.html
+                  echo '</html>'                                                                                >> index.html
+                  git add index.html
+
+            - name: Commit changes to the GitHub Pages branch
+              run: |
+                  git status
+                  if git commit -m 'Pushing changes to GitHub Pages.'; then
+                    git push -f
+                  else
+                   echo "Nothing changed."
+                  fi
