@@ -396,6 +396,9 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Stage install script
+        run: cp install.sh release/install.sh
+
       - name: Generate checksums
         run: |
           set -euo pipefail
@@ -430,8 +433,15 @@ jobs:
             | `nemoclaw-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 (static binary) |
             | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
             | `nemoclaw-checksums-sha256.txt` | SHA256 checksums for all archives |
+            | `install.sh` | Installer script (detects OS/arch automatically) |
 
             ### Quick install
+
+            ```bash
+            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/install.sh | sh
+            ```
+
+            Or install a specific platform manually:
 
             ```bash
             # Linux x86_64
@@ -451,3 +461,4 @@ jobs:
             release/nemoclaw-aarch64-unknown-linux-musl.tar.gz
             release/nemoclaw-aarch64-apple-darwin.tar.gz
             release/nemoclaw-checksums-sha256.txt
+            release/install.sh
