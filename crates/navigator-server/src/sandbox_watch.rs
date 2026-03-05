@@ -57,6 +57,15 @@ impl SandboxWatchBus {
     pub fn subscribe(&self, sandbox_id: &str) -> broadcast::Receiver<()> {
         self.sender_for(sandbox_id).subscribe()
     }
+
+    /// Remove the bus entry for the given sandbox id.
+    ///
+    /// This drops the broadcast sender, closing any active receivers with
+    /// `RecvError::Closed`.
+    pub fn remove(&self, sandbox_id: &str) {
+        let mut inner = self.inner.lock().expect("sandbox watch bus lock poisoned");
+        inner.remove(sandbox_id);
+    }
 }
 
 /// Spawn a background Kubernetes Event tailer.
@@ -158,6 +167,53 @@ fn map_kube_event_to_platform(
             )),
         },
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sandbox_watch_bus_remove_cleans_up() {
+        let bus = SandboxWatchBus::new();
+        let sandbox_id = "sb-1";
+
+        let mut rx = bus.subscribe(sandbox_id);
+
+        // Notify and receive
+        bus.notify(sandbox_id);
+        assert!(rx.try_recv().is_ok());
+
+        // Remove
+        bus.remove(sandbox_id);
+
+        // Receiver should be closed
+        match rx.try_recv() {
+            Err(broadcast::error::TryRecvError::Closed) => {} // expected
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sandbox_watch_bus_subscribe_after_remove_creates_fresh_channel() {
+        let bus = SandboxWatchBus::new();
+        let sandbox_id = "sb-2";
+
+        let _old_rx = bus.subscribe(sandbox_id);
+        bus.remove(sandbox_id);
+
+        // New subscription should work
+        let mut new_rx = bus.subscribe(sandbox_id);
+        bus.notify(sandbox_id);
+        assert!(new_rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn sandbox_watch_bus_remove_nonexistent_is_noop() {
+        let bus = SandboxWatchBus::new();
+        // Should not panic
+        bus.remove("nonexistent");
+    }
 }
 
 /// Helper to translate broadcast lag into a gRPC status.
