@@ -404,7 +404,14 @@ pub async fn run_sandbox(
         let addr: SocketAddr = listen_addr.parse().into_diagnostic()?;
         let policy_clone = policy.clone();
         let workdir_clone = workdir.clone();
-        let secret = ssh_handshake_secret.unwrap_or_default();
+        let secret = ssh_handshake_secret
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                miette::miette!(
+                    "NEMOCLAW_SSH_HANDSHAKE_SECRET is required when SSH is enabled.\n\
+                     Set --ssh-handshake-secret or the NEMOCLAW_SSH_HANDSHAKE_SECRET env var."
+                )
+            })?;
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();

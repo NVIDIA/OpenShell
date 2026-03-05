@@ -92,6 +92,11 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     if database_url.is_empty() {
         return Err(Error::config("database_url is required"));
     }
+    if config.ssh_handshake_secret.is_empty() {
+        return Err(Error::config(
+            "ssh_handshake_secret is required. Set --ssh-handshake-secret or NEMOCLAW_SSH_HANDSHAKE_SECRET",
+        ));
+    }
 
     let store = Store::connect(database_url).await?;
     let sandbox_client = SandboxClient::new(

@@ -249,6 +249,11 @@ if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then
     sed -i "s|pullPolicy: Always|pullPolicy: ${IMAGE_PULL_POLICY}|" "$HELMCHART"
 fi
 
+# Generate a random SSH handshake secret for the NSSH1 HMAC handshake between
+# the gateway and sandbox SSH servers. This is required — the server will refuse
+# to start without it.
+SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET:-$(openssl rand -hex 32)}"
+
 # Inject SSH gateway host/port into the HelmChart manifest so the navigator
 # server returns the correct address to CLI clients for SSH proxy CONNECT.
 if [ -f "$HELMCHART" ]; then
@@ -266,6 +271,8 @@ if [ -f "$HELMCHART" ]; then
         # Clear the placeholder so the default (8080) is used
         sed -i "s|sshGatewayPort: __SSH_GATEWAY_PORT__|sshGatewayPort: 0|g" "$HELMCHART"
     fi
+    echo "Setting SSH handshake secret"
+    sed -i "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART"
 fi
 
 # Inject chart checksum into the HelmChart manifest so that a changed chart

@@ -31,6 +31,7 @@ spec:
       sandboxImage: d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
+      sshHandshakeSecret: __SSH_HANDSHAKE_SECRET__
       grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
       tls:
         certSecretName: navigator-server-tls

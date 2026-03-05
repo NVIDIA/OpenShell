@@ -21,13 +21,18 @@ use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::{Arc, mpsc};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex, mpsc};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 const PREFACE_MAGIC: &str = "NSSH1";
+
+/// A time-bounded set of nonces used to detect replayed NSSH1 handshakes.
+/// Each entry records the `Instant` it was inserted; a background reaper task
+/// periodically evicts entries older than the handshake skew window.
+type NonceCache = Arc<Mutex<HashMap<String, Instant>>>;
 
 /// Perform SSH server initialization: generate a host key, build the config,
 /// and bind the TCP listener. Extracted so that startup errors can be forwarded
@@ -85,6 +90,23 @@ pub async fn run_ssh_server(
         }
     };
 
+    // Nonce cache for replay detection. Entries are evicted by a background
+    // reaper once they exceed the handshake skew window.
+    let nonce_cache: NonceCache = Arc::new(Mutex::new(HashMap::new()));
+
+    // Background task that periodically purges expired nonces.
+    let reaper_cache = nonce_cache.clone();
+    let ttl = Duration::from_secs(handshake_skew_secs);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(60));
+        loop {
+            interval.tick().await;
+            if let Ok(mut cache) = reaper_cache.lock() {
+                cache.retain(|_, inserted| inserted.elapsed() < ttl);
+            }
+        }
+    });
+
     loop {
         let (stream, peer) = listener.accept().await.into_diagnostic()?;
         stream.set_nodelay(true).into_diagnostic()?;
@@ -95,6 +117,7 @@ pub async fn run_ssh_server(
         let proxy_url = proxy_url.clone();
         let ca_paths = ca_paths.clone();
         let provider_env = provider_env.clone();
+        let nonce_cache = nonce_cache.clone();
 
         tokio::spawn(async move {
             if let Err(err) = handle_connection(
@@ -109,6 +132,7 @@ pub async fn run_ssh_server(
                 proxy_url,
                 ca_paths,
                 provider_env,
+                &nonce_cache,
             )
             .await
             {
@@ -131,12 +155,13 @@ async fn handle_connection(
     proxy_url: Option<String>,
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: HashMap<String, String>,
+    nonce_cache: &NonceCache,
 ) -> Result<()> {
     info!(peer = %peer, "SSH connection: reading handshake preface");
     let mut line = String::new();
     read_line(&mut stream, &mut line).await?;
     info!(peer = %peer, preface_len = line.len(), "SSH connection: preface received, verifying");
-    if !verify_preface(&line, secret, handshake_skew_secs)? {
+    if !verify_preface(&line, secret, handshake_skew_secs, nonce_cache)? {
         warn!(peer = %peer, "SSH connection: handshake verification failed");
         let _ = stream.write_all(b"ERR\n").await;
         return Ok(());
@@ -178,7 +203,12 @@ async fn read_line(stream: &mut tokio::net::TcpStream, buf: &mut String) -> Resu
     Ok(())
 }
 
-fn verify_preface(line: &str, secret: &str, handshake_skew_secs: u64) -> Result<bool> {
+fn verify_preface(
+    line: &str,
+    secret: &str,
+    handshake_skew_secs: u64,
+    nonce_cache: &NonceCache,
+) -> Result<bool> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() != 5 || parts[0] != PREFACE_MAGIC {
         return Ok(false);
@@ -202,7 +232,22 @@ fn verify_preface(line: &str, secret: &str, handshake_skew_secs: u64) -> Result<
 
     let payload = format!("{token}|{timestamp}|{nonce}");
     let expected = hmac_sha256(secret.as_bytes(), payload.as_bytes());
-    Ok(signature == expected)
+    if signature != expected {
+        return Ok(false);
+    }
+
+    // Reject replayed nonces. The cache is bounded by the reaper task which
+    // evicts entries older than `handshake_skew_secs`.
+    let mut cache = nonce_cache
+        .lock()
+        .map_err(|_| miette::miette!("nonce cache lock poisoned"))?;
+    if cache.contains_key(nonce) {
+        warn!(nonce = nonce, "NSSH1 nonce replay detected");
+        return Ok(false);
+    }
+    cache.insert(nonce.to_string(), Instant::now());
+
+    Ok(true)
 }
 
 fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
@@ -1084,5 +1129,104 @@ mod tests {
             100 * 1024,
             "expected all 100 KiB delivered before EOF"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // verify_preface tests
+    // -----------------------------------------------------------------------
+
+    /// Build a valid NSSH1 preface line with the given parameters.
+    fn build_preface(token: &str, secret: &str, nonce: &str, timestamp: i64) -> String {
+        let payload = format!("{token}|{timestamp}|{nonce}");
+        let signature = hmac_sha256(secret.as_bytes(), payload.as_bytes());
+        format!("{PREFACE_MAGIC} {token} {timestamp} {nonce} {signature}")
+    }
+
+    fn fresh_nonce_cache() -> NonceCache {
+        Arc::new(Mutex::new(HashMap::new()))
+    }
+
+    fn current_timestamp() -> i64 {
+        i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn verify_preface_accepts_valid_preface() {
+        let secret = "test-secret-key";
+        let nonce = "unique-nonce-1";
+        let ts = current_timestamp();
+        let line = build_preface("tok1", secret, nonce, ts);
+        let cache = fresh_nonce_cache();
+
+        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_rejects_replayed_nonce() {
+        let secret = "test-secret-key";
+        let nonce = "replay-nonce";
+        let ts = current_timestamp();
+        let line = build_preface("tok1", secret, nonce, ts);
+        let cache = fresh_nonce_cache();
+
+        // First attempt should succeed.
+        assert!(verify_preface(&line, secret, 300, &cache).unwrap());
+        // Second attempt with the same nonce should be rejected.
+        assert!(!verify_preface(&line, secret, 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_rejects_expired_timestamp() {
+        let secret = "test-secret-key";
+        let nonce = "expired-nonce";
+        // Timestamp 600 seconds in the past, with a 300-second skew window.
+        let ts = current_timestamp() - 600;
+        let line = build_preface("tok1", secret, nonce, ts);
+        let cache = fresh_nonce_cache();
+
+        assert!(!verify_preface(&line, secret, 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_rejects_invalid_hmac() {
+        let secret = "test-secret-key";
+        let nonce = "hmac-nonce";
+        let ts = current_timestamp();
+        // Build with the correct secret, then verify with the wrong one.
+        let line = build_preface("tok1", secret, nonce, ts);
+        let cache = fresh_nonce_cache();
+
+        assert!(!verify_preface(&line, "wrong-secret", 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_rejects_malformed_input() {
+        let cache = fresh_nonce_cache();
+
+        // Too few parts.
+        assert!(!verify_preface("NSSH1 tok1 123", "s", 300, &cache).unwrap());
+        // Wrong magic.
+        assert!(!verify_preface("NSSH2 tok1 123 nonce sig", "s", 300, &cache).unwrap());
+        // Empty string.
+        assert!(!verify_preface("", "s", 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn verify_preface_distinct_nonces_both_accepted() {
+        let secret = "test-secret-key";
+        let ts = current_timestamp();
+        let cache = fresh_nonce_cache();
+
+        let line1 = build_preface("tok1", secret, "nonce-a", ts);
+        let line2 = build_preface("tok1", secret, "nonce-b", ts);
+
+        assert!(verify_preface(&line1, secret, 300, &cache).unwrap());
+        assert!(verify_preface(&line2, secret, 300, &cache).unwrap());
     }
 }
