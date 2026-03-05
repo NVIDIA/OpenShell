@@ -564,4 +564,4 @@ $ nemoclaw sandbox sync --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
 | `debug-navigator-cluster` | Diagnosing cluster startup or health failures |
-| `tui-development` | Developing features for the Gator TUI (`nemoclaw gator`) |
+| `tui-development` | Developing features for the NemoClaw TUI (`nemoclaw term`) |

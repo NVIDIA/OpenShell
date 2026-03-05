@@ -142,8 +142,8 @@ enum Commands {
         command: ProviderCommands,
     },
 
-    /// Launch the Gator interactive TUI.
-    Gator,
+    /// Launch the NemoClaw interactive TUI.
+    Term,
 
     /// Generate shell completions.
     #[command(after_long_help = COMPLETIONS_HELP)]
@@ -1285,7 +1285,7 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Gator) => {
+        Some(Commands::Term) => {
             let ctx = resolve_cluster(&cli.cluster)?;
             let tls = tls.with_cluster_name(&ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;

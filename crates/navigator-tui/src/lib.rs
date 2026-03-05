@@ -25,7 +25,7 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use app::{App, ClusterEntry, Focus, LogLine, Screen};
 use event::{Event, EventHandler};
 
-/// Launch the Gator TUI.
+/// Launch the NemoClaw TUI.
 ///
 /// `channel` must be a connected gRPC channel to the NemoClaw gateway.
 pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result<()> {

@@ -170,12 +170,12 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
   when no trailing command is provided.
 - `nemoclaw sandbox delete` auto-stops any active forwards for the deleted sandbox.
 
-#### TUI (Gator)
+#### TUI
 
 The TUI (`crates/navigator-tui/`) supports port forwarding through the create sandbox modal. Users
 specify comma-separated ports in the **Ports** field. After sandbox creation:
 
-1. Gator polls for `Ready` state (up to 30 attempts at 2-second intervals).
+1. The TUI polls for `Ready` state (up to 30 attempts at 2-second intervals).
 2. Creates an SSH session via `CreateSshSession` gRPC.
 3. Spawns background SSH tunnels (`ssh -N -f -L <port>:127.0.0.1:<port>`) for each port.
 4. Sends a `ForwardResult` event back to the main loop with the outcome.
@@ -183,7 +183,7 @@ specify comma-separated ports in the **Ports** field. After sandbox creation:
 Active forwards are displayed in the sandbox table's NOTES column (e.g., `fwd:8080,3000`) and in
 the sandbox detail view's Forwards row.
 
-When deleting a sandbox, Gator calls `stop_forwards_for_sandbox()` before sending the delete
+When deleting a sandbox, the TUI calls `stop_forwards_for_sandbox()` before sending the delete
 request. PID tracking uses the same `~/.config/nemoclaw/forwards/` directory as the CLI.
 
 #### Shared forward module

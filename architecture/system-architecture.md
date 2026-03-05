@@ -7,7 +7,7 @@ graph TB
     %% ============================================================
     subgraph UserMachine["User's Machine"]
         CLI["NemoClaw CLI<br/>(nemoclaw)"]
-        TUI["Gator TUI<br/>(nemoclaw gator)"]
+        TUI["NemoClaw TUI<br/>(nemoclaw term)"]
         SDK["Python SDK<br/>(nemoclaw)"]
         LocalConfig["~/.config/nemoclaw/<br/>clusters, mTLS certs,<br/>active_cluster"]
     end
@@ -177,7 +177,7 @@ graph TB
 
 | Color | Category | Examples |
 |-------|----------|---------|
-| Blue | User-side components | NemoClaw CLI, Gator TUI, Python SDK |
+| Blue | User-side components | NemoClaw CLI, NemoClaw TUI, Python SDK |
 | Orange | Gateway / Control plane | navigator-server, watch bus, log bus |
 | Green | Sandbox supervisor | SSH server, HTTP CONNECT proxy, OPA engine, inference router |
 | Purple | Agent process & isolation | AI agent, Landlock, Seccomp, network namespace |
