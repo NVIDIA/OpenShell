@@ -82,8 +82,9 @@ jobs:
 
             - name: Initialize Git configuration
               run: |
-                  git config user.name docs-build
-                  git config user.email do-not-send@github.com
+                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
+                  git config --global user.name "github-actions[bot]"
+                  git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
             - name: Download artifacts
               uses: actions/download-artifact@v4
