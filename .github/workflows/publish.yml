@@ -416,24 +416,15 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: 'NemoClaw Tip ("Nightly")'
+          name: NemoClaw Latest Snapshot
           prerelease: true
           tag_name: tip
           target_commitish: ${{ github.sha }}
           body: |
-            This tip release is automatically built on every commit to main that passes CI.
+            This snapshot is automatically built on every commit to main that passes CI.
 
-            > **Warning**: This is a nightly build, not a tagged release.
+            > **Warning**: This is a snapshot build, not a tagged release.
             > We recommend using tagged releases for production use.
-
-            ### Assets
-            | File | Description |
-            |------|-------------|
-            | `nemoclaw-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 (static binary) |
-            | `nemoclaw-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 (static binary) |
-            | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-            | `nemoclaw-checksums-sha256.txt` | SHA256 checksums for all archives |
-            | `install.sh` | Installer script (detects OS/arch automatically) |
 
             ### Quick install
 
@@ -441,21 +432,15 @@ jobs:
             curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/install.sh | sh
             ```
 
-            Or install a specific platform manually:
+            ### Assets
 
-            ```bash
-            # Linux x86_64
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-x86_64-unknown-linux-musl.tar.gz | tar xz
-            sudo mv nemoclaw /usr/local/bin/
-
-            # Linux aarch64
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-unknown-linux-musl.tar.gz | tar xz
-            sudo mv nemoclaw /usr/local/bin/
-
-            # macOS (Apple Silicon)
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-apple-darwin.tar.gz | tar xz
-            sudo mv nemoclaw /usr/local/bin/
-            ```
+            | File | Platform | Install |
+            |------|----------|---------|
+            | `nemoclaw-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-x86_64-unknown-linux-musl.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
+            | `nemoclaw-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-unknown-linux-musl.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
+            | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/nemoclaw-aarch64-apple-darwin.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
+            | `install.sh` | All platforms | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/tip/install.sh \| sh` |
+            | `nemoclaw-checksums-sha256.txt` | — | SHA256 checksums for all archives |
           files: |
             release/nemoclaw-x86_64-unknown-linux-musl.tar.gz
             release/nemoclaw-aarch64-unknown-linux-musl.tar.gz
