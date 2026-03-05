@@ -5,39 +5,47 @@
 
 # Environment Variables
 
-## CLI Variables
+Environment variables that configure the NemoClaw CLI and control credential injection into sandboxes.
 
-| Variable | Description |
-|----------|-------------|
-| `NEMOCLAW_CLUSTER` | Override the active cluster name (same as `--cluster` flag). |
-| `NEMOCLAW_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided). |
+## CLI Configuration
 
-## Sandbox Variables
+These variables affect CLI behavior across all commands.
 
-These variables are set inside sandbox processes automatically:
+| Variable | Description | Used By |
+|---|---|---|
+| `NEMOCLAW_CLUSTER` | Name of the cluster to operate on. Overrides the active cluster set by `nemoclaw cluster use`. | All commands that interact with a cluster. |
+| `NEMOCLAW_SANDBOX_POLICY` | Default path to a policy YAML file. When set, `nemoclaw sandbox create` uses this policy if no `--policy` flag is provided. | `nemoclaw sandbox create` |
 
-| Variable | Description |
-|----------|-------------|
-| `NEMOCLAW_SANDBOX` | Set to `1` inside all sandbox processes. |
-| `HTTP_PROXY` | Proxy URL for HTTP traffic (set in proxy mode). |
-| `HTTPS_PROXY` | Proxy URL for HTTPS traffic (set in proxy mode). |
-| `ALL_PROXY` | Proxy URL for all traffic (set in proxy mode). |
-| `SSL_CERT_FILE` | Path to the combined CA bundle (system CAs + sandbox ephemeral CA). |
-| `NODE_EXTRA_CA_CERTS` | Same CA bundle path, for Node.js applications. |
-| `REQUESTS_CA_BUNDLE` | Same CA bundle path, for Python requests library. |
+Set these in your shell profile to avoid repeating flags:
 
-Provider credentials are also injected as environment variables. The specific variables depend on which providers are attached (e.g., `ANTHROPIC_API_KEY` for Claude, `GITHUB_TOKEN` for GitHub).
+```console
+$ export NEMOCLAW_CLUSTER=my-remote-cluster
+$ export NEMOCLAW_SANDBOX_POLICY=~/policies/default.yaml
+```
 
-## Sandbox Supervisor Variables
+## Provider Credential Variables
 
-These are used by the sandbox supervisor process and are not typically set by users:
+When you create a provider with `--from-existing`, the CLI reads credentials from your shell environment. See {doc}`../sandboxes/providers` for the full list of provider types and the environment variables each one discovers.
 
-| Variable | Description |
-|----------|-------------|
-| `NEMOCLAW_SANDBOX_ID` | Sandbox ID (set by gateway in pod spec). |
-| `NEMOCLAW_ENDPOINT` | Gateway gRPC endpoint (set by gateway in pod spec). |
-| `NEMOCLAW_POLICY_RULES` | Path to `.rego` file (file mode only). |
-| `NEMOCLAW_POLICY_DATA` | Path to YAML policy data file (file mode only). |
-| `NEMOCLAW_INFERENCE_ROUTES` | Path to YAML inference routes file (standalone mode). |
-| `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` | Override policy poll interval (default: 30 seconds). |
-| `NEMOCLAW_SANDBOX_COMMAND` | Default command when none specified (set to `sleep infinity` by server). |
+### How Discovery Works
+
+The CLI checks each variable in the order listed. If any variable in the set is defined in your shell, its value is captured and stored in the provider. Variables that are unset or empty are skipped.
+
+To verify that a variable is set before creating a provider:
+
+```console
+$ echo $ANTHROPIC_API_KEY
+```
+
+If the output is empty, export the variable first:
+
+```console
+$ export ANTHROPIC_API_KEY=sk-ant-...
+$ nemoclaw provider create --name my-claude --type claude --from-existing
+```
+
+### What Gets Injected
+
+When a sandbox starts with a provider attached, the supervisor fetches credentials from the gateway and injects them as environment variables into the agent process. For example, a `claude` provider injects both `ANTHROPIC_API_KEY` and `CLAUDE_API_KEY` into the sandbox. See {doc}`../sandboxes/providers` for the full list of variable names per provider type.
+
+These variables are also available in SSH sessions opened with `nemoclaw sandbox connect`.
