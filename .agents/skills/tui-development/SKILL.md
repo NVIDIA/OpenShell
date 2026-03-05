@@ -1,17 +1,17 @@
 ---
 name: tui-development
-description: Guide for developing the "Gator" TUI — a ratatui-based terminal UI for the NemoClaw platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - gator, TUI, terminal UI, ratatui, navigator-tui, tui development, gator feature, gator bug.
+description: Guide for developing the NemoClaw TUI — a ratatui-based terminal UI for the NemoClaw platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, navigator-tui, tui development, tui feature, tui bug.
 ---
 
-# Gator TUI Development Guide
+# NemoClaw TUI Development Guide
 
-Comprehensive reference for any agent working on the Gator TUI.
+Comprehensive reference for any agent working on the NemoClaw TUI.
 
 ## 1. Overview
 
-Gator is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `nemoclaw` CLI, but with a live, interactive dashboard.
+The NemoClaw TUI is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `nemoclaw` CLI, but with a live, interactive dashboard.
 
-- **Launched via:** `nemoclaw gator` or `mise run gator`
+- **Launched via:** `nemoclaw term` or `mise run term`
 - **Crate:** `crates/navigator-tui/`
 - **Key dependencies:**
   - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
@@ -39,7 +39,7 @@ Cluster (discovered via navigator_bootstrap::list_clusters())
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- Gator │ Current Cluster: <name> (<status>) │ <screen/context>
+ NemoClaw │ Current Cluster: <name> (<status>) │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -104,8 +104,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` Gator │ Current Cluster: nemoclaw (Healthy) │ Dashboard`
-- Sandbox detail: ` Gator │ Current Cluster: nemoclaw (Healthy) │ Sandbox: my-sandbox`
+- Dashboard: ` NemoClaw │ Current Cluster: nemoclaw (Healthy) │ Dashboard`
+- Sandbox detail: ` NemoClaw │ Current Cluster: nemoclaw (Healthy) │ Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -193,7 +193,7 @@ All colors and styles are defined in `crates/navigator-tui/src/theme.rs`.
 | `MUTED` | White + DIM modifier | Secondary info, separators (`│`), unfocused items |
 | `HEADING` | White + BOLD | Panel titles, sandbox/cluster names when active |
 | `ACCENT` | NVIDIA_GREEN foreground | Selected row marker (`▌`), sandbox source labels |
-| `ACCENT_BOLD` | NVIDIA_GREEN + BOLD | "Gator" brand text, command prompt `:` |
+| `ACCENT_BOLD` | NVIDIA_GREEN + BOLD | "NemoClaw" brand text, command prompt `:` |
 | `SELECTED` | BOLD modifier only | Selected row text emphasis |
 | `BORDER` | EVERGLADE foreground | Unfocused panel borders |
 | `BORDER_FOCUSED` | NVIDIA_GREEN foreground | Focused panel borders |
@@ -225,9 +225,9 @@ The `confirm_delete` flag in `App` gates destructive key handling — while true
 
 ### CLI parity
 
-Gator actions should parallel `nemoclaw` CLI commands so users have familiar mental models:
+TUI actions should parallel `nemoclaw` CLI commands so users have familiar mental models:
 
-| CLI Command | Gator Equivalent |
+| CLI Command | TUI Equivalent |
 | --- | --- |
 | `nemoclaw sandbox list` | Sandbox table on Dashboard |
 | `nemoclaw sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
@@ -405,11 +405,11 @@ The connect timeout for cluster switching is 10 seconds with HTTP/2 keepalive at
 # Build the crate
 cargo build -p navigator-tui
 
-# Run gator against the active cluster
-mise run gator
+# Run the TUI against the active cluster
+mise run term
 
 # Run with cargo-watch for hot-reload during development
-mise run gator:dev
+mise run term:dev
 
 # Format
 cargo fmt -p navigator-tui

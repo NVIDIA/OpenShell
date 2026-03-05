@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-tui"
-description = "Gator – NemoClaw interactive TUI"
+description = "NemoClaw interactive TUI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

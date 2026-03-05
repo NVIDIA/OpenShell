@@ -64,7 +64,7 @@ nemoclaw
 │   ├── update <name> [opts]
 │   ├── delete <name>...
 │   └── list [opts]
-├── gator
+├── term
 ├── completions <shell>
 └── ssh-proxy [opts]
 ```
@@ -339,9 +339,9 @@ List inference routes.
 
 ## Other Commands
 
-### `nemoclaw gator`
+### `nemoclaw term`
 
-Launch the Gator interactive TUI.
+Launch the NemoClaw interactive TUI.
 
 ### `nemoclaw completions <shell>`
 

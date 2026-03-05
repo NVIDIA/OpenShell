@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# TUI tasks
+
+[term]
+description = "Launch the NemoClaw TUI"
+run = "nemoclaw term"
+hide = true
+
+["term:dev"]
+description = "Launch the NemoClaw TUI with hot-reload on file changes"
+run = "cargo watch -s 'nemoclaw term'"
+hide = true
