@@ -32,7 +32,7 @@ jobs:
     runs-on: build-amd64
     timeout-minutes: ${{ inputs.timeout-minutes }}
     container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      image: ghcr.io/nvidia/nemoclaw/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -41,7 +41,7 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       IMAGE_TAG: ${{ github.sha }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/nv-agent-env
+      IMAGE_REGISTRY: ghcr.io/nvidia/nemoclaw
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4

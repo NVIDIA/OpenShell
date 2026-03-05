@@ -18,7 +18,7 @@ jobs:
     runs-on: build-amd64
     timeout-minutes: 30
     container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      image: ghcr.io/nvidia/nemoclaw/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -28,9 +28,9 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       IMAGE_TAG: ${{ inputs.image-tag }}
-      NEMOCLAW_REGISTRY: ghcr.io/nvidia/nv-agent-env
+      NEMOCLAW_REGISTRY: ghcr.io/nvidia/nemoclaw
       NEMOCLAW_REGISTRY_HOST: ghcr.io
-      NEMOCLAW_REGISTRY_NAMESPACE: nvidia/nv-agent-env
+      NEMOCLAW_REGISTRY_NAMESPACE: nvidia/nemoclaw
       NEMOCLAW_REGISTRY_USERNAME: ${{ github.actor }}
       NEMOCLAW_REGISTRY_PASSWORD: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -40,7 +40,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Pull cluster image
-        run: docker pull ghcr.io/nvidia/nv-agent-env/cluster:${{ inputs.image-tag }}
+        run: docker pull ghcr.io/nvidia/nemoclaw/cluster:${{ inputs.image-tag }}
 
       - name: Install Python dependencies and generate protobuf stubs
         run: uv sync --frozen && mise run --no-prepare python:proto
@@ -50,7 +50,7 @@ jobs:
           GATEWAY_HOST: host.docker.internal
           GATEWAY_PORT: "8080"
           SKIP_IMAGE_PUSH: "1"
-          NEMOCLAW_CLUSTER_IMAGE: ghcr.io/nvidia/nv-agent-env/cluster:${{ inputs.image-tag }}
+          NEMOCLAW_CLUSTER_IMAGE: ghcr.io/nvidia/nemoclaw/cluster:${{ inputs.image-tag }}
         run: mise run --no-prepare --skip-deps cluster
 
       - name: Run E2E tests
