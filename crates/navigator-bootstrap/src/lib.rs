@@ -14,6 +14,12 @@ mod pki;
 pub(crate) mod push;
 mod runtime;
 
+/// Shared lock for tests that mutate the process-global `XDG_CONFIG_HOME`
+/// env var. All such tests in any module must hold this lock to avoid
+/// concurrent clobbering.
+#[cfg(test)]
+pub(crate) static XDG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
 use bollard::Docker;
 use miette::{IntoDiagnostic, Result};
 use std::path::{Path, PathBuf};
@@ -46,8 +52,8 @@ pub use crate::kubeconfig::{
 };
 pub use crate::metadata::{
     ClusterMetadata, clear_active_cluster, get_cluster_metadata, list_clusters,
-    load_active_cluster, load_cluster_metadata, remove_cluster_metadata, save_active_cluster,
-    store_cluster_metadata,
+    load_active_cluster, load_cluster_metadata, load_last_sandbox, remove_cluster_metadata,
+    save_active_cluster, save_last_sandbox, store_cluster_metadata,
 };
 
 /// Options for remote SSH deployment.

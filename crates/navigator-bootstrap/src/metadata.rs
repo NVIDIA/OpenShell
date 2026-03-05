@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::paths::{active_cluster_path, clusters_dir, xdg_config_dir};
+use crate::paths::{active_cluster_path, clusters_dir, last_sandbox_path, xdg_config_dir};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -240,6 +240,30 @@ pub fn load_active_cluster() -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Save the last-used sandbox name for a cluster to persistent storage.
+pub fn save_last_sandbox(cluster: &str, sandbox: &str) -> Result<()> {
+    let path = last_sandbox_path(cluster)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
+    }
+    std::fs::write(&path, sandbox)
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to write last sandbox to {}", path.display()))?;
+    Ok(())
+}
+
+/// Load the last-used sandbox name for a cluster from persistent storage.
+///
+/// Returns `None` if no last sandbox has been set.
+pub fn load_last_sandbox(cluster: &str) -> Option<String> {
+    let path = last_sandbox_path(cluster).ok()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    let name = contents.trim().to_string();
+    if name.is_empty() { None } else { Some(name) }
+}
+
 /// List all clusters that have stored metadata.
 ///
 /// Scans `$XDG_CONFIG_HOME/navigator/clusters/` for `*_metadata.json` files
@@ -469,5 +493,107 @@ mod tests {
         // When gateway_host is None, behaviour matches create_cluster_metadata.
         let meta = create_cluster_metadata_with_host("test", None, 8080, None, None);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
+    }
+
+    // ── last-sandbox persistence ──────────────────────────────────────
+
+    /// Helper: hold the shared XDG test lock, set `XDG_CONFIG_HOME` to a
+    /// tempdir, run `f`, then restore the original value.
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = crate::XDG_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn save_and_load_last_sandbox_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("mycluster", "dev-box").unwrap();
+            assert_eq!(load_last_sandbox("mycluster"), Some("dev-box".to_string()));
+        });
+    }
+
+    #[test]
+    fn load_last_sandbox_returns_none_when_not_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            assert_eq!(load_last_sandbox("no-such-cluster"), None);
+        });
+    }
+
+    #[test]
+    fn save_last_sandbox_overwrites_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("c1", "first").unwrap();
+            save_last_sandbox("c1", "second").unwrap();
+            assert_eq!(load_last_sandbox("c1"), Some("second".to_string()));
+        });
+    }
+
+    #[test]
+    fn save_last_sandbox_creates_parent_dirs() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            // The cluster subdir doesn't exist yet — save should create it.
+            save_last_sandbox("brand-new-cluster", "sb1").unwrap();
+            assert_eq!(
+                load_last_sandbox("brand-new-cluster"),
+                Some("sb1".to_string())
+            );
+        });
+    }
+
+    #[test]
+    fn load_last_sandbox_ignores_whitespace() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            // Write the file manually with surrounding whitespace.
+            let path = last_sandbox_path("ws-cluster").unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "  my-sb \n").unwrap();
+            assert_eq!(load_last_sandbox("ws-cluster"), Some("my-sb".to_string()));
+        });
+    }
+
+    #[test]
+    fn load_last_sandbox_returns_none_for_empty_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            let path = last_sandbox_path("empty-cluster").unwrap();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "   \n").unwrap();
+            assert_eq!(load_last_sandbox("empty-cluster"), None);
+        });
+    }
+
+    #[test]
+    fn last_sandbox_is_per_cluster() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("cluster-a", "sandbox-a").unwrap();
+            save_last_sandbox("cluster-b", "sandbox-b").unwrap();
+            assert_eq!(
+                load_last_sandbox("cluster-a"),
+                Some("sandbox-a".to_string())
+            );
+            assert_eq!(
+                load_last_sandbox("cluster-b"),
+                Some("sandbox-b".to_string())
+            );
+        });
     }
 }

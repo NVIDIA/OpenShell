@@ -28,9 +28,15 @@ def test_sandbox_api_crud_and_exec(
 
     with sandbox(delete_on_exit=True) as sb:
         assert sb.id
-        assert sb.sandbox.name.startswith("sandbox-")
+        # Server auto-generates a petname (e.g. "feasible-retriever")
+        assert sb.sandbox.name
+        parts = sb.sandbox.name.split("-")
+        assert len(parts) == 2, (
+            f"expected petname with 2 parts, got {sb.sandbox.name!r}"
+        )
+        assert all(p.isalpha() and p.islower() for p in parts)
 
-        fetched = sandbox_client.get(sb.id)
+        fetched = sandbox_client.get(sb.sandbox.name)
         assert fetched.id == sb.id
 
         ids = set(sandbox_client.list_ids(limit=100))

@@ -69,6 +69,7 @@ sha2 = "0.10"
 hex = "0.4"
 russh = "0.57"
 rand = "0.9"
+petname = "2"
 
 [dev-dependencies]
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }

@@ -113,7 +113,7 @@ class SandboxSession:
         )
 
     def delete(self) -> bool:
-        return self._client.delete(self.sandbox.id)
+        return self._client.delete(self.sandbox.name)
 
 
 class SandboxClient:
@@ -205,15 +205,15 @@ class SandboxClient:
     ) -> SandboxSession:
         return SandboxSession(self, self.create(spec=spec))
 
-    def get(self, sandbox_id: str) -> SandboxRef:
+    def get(self, sandbox_name: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            navigator_pb2.GetSandboxRequest(name=_canonical_sandbox_name(sandbox_id)),
+            navigator_pb2.GetSandboxRequest(name=sandbox_name),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
 
-    def get_session(self, sandbox_id: str) -> SandboxSession:
-        return SandboxSession(self, self.get(sandbox_id))
+    def get_session(self, sandbox_name: str) -> SandboxSession:
+        return SandboxSession(self, self.get(sandbox_name))
 
     def list(self, *, limit: int = 100, offset: int = 0) -> builtins.list[SandboxRef]:
         response = self._stub.ListSandboxes(
@@ -225,20 +225,18 @@ class SandboxClient:
     def list_ids(self, *, limit: int = 100, offset: int = 0) -> builtins.list[str]:
         return [item.id for item in self.list(limit=limit, offset=offset)]
 
-    def delete(self, sandbox_id: str) -> bool:
+    def delete(self, sandbox_name: str) -> bool:
         response = self._stub.DeleteSandbox(
-            navigator_pb2.DeleteSandboxRequest(
-                name=_canonical_sandbox_name(sandbox_id)
-            ),
+            navigator_pb2.DeleteSandboxRequest(name=sandbox_name),
             timeout=self._timeout,
         )
         return bool(response.deleted)
 
-    def wait_deleted(self, sandbox_id: str, *, timeout_seconds: float = 60.0) -> None:
+    def wait_deleted(self, sandbox_name: str, *, timeout_seconds: float = 60.0) -> None:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
             try:
-                self.get(sandbox_id)
+                self.get(sandbox_name)
             except grpc.RpcError as exc:
                 if (
                     isinstance(exc, grpc.Call)
@@ -247,20 +245,20 @@ class SandboxClient:
                     return
                 raise
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_id} was not deleted within timeout")
+        raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_id: str, *, timeout_seconds: float = 120.0
+        self, sandbox_name: str, *, timeout_seconds: float = 120.0
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
-            sandbox = self.get(sandbox_id)
+            sandbox = self.get(sandbox_name)
             if sandbox.phase == datamodel_pb2.SANDBOX_PHASE_READY:
                 return sandbox
             if sandbox.phase == datamodel_pb2.SANDBOX_PHASE_ERROR:
-                raise SandboxError(f"sandbox {sandbox_id} entered error phase")
+                raise SandboxError(f"sandbox {sandbox_name} entered error phase")
             time.sleep(1)
-        raise SandboxError(f"sandbox {sandbox_id} was not ready within timeout")
+        raise SandboxError(f"sandbox {sandbox_name} was not ready within timeout")
 
     def exec_stream(
         self,
@@ -486,7 +484,7 @@ class Sandbox:
             self._session = client.get_session(self._sandbox_input)
 
         ready = client.wait_ready(
-            self._session.id,
+            self._session.sandbox.name,
             timeout_seconds=self._ready_timeout_seconds,
         )
         self._session = SandboxSession(client, ready)
@@ -503,7 +501,7 @@ class Sandbox:
                 try:
                     deleted = self._session.delete()
                     if deleted:
-                        self._client.wait_deleted(self._session.id)
+                        self._client.wait_deleted(self._session.sandbox.name)
                 except grpc.RpcError as exc:
                     if (
                         not isinstance(exc, grpc.Call)
@@ -614,12 +612,6 @@ def _default_policy() -> sandbox_pb2.SandboxPolicy:
 
 def _default_spec() -> datamodel_pb2.SandboxSpec:
     return datamodel_pb2.SandboxSpec(policy=_default_policy())
-
-
-def _canonical_sandbox_name(sandbox_id_or_name: str) -> str:
-    if sandbox_id_or_name.startswith("sandbox-"):
-        return sandbox_id_or_name
-    return f"sandbox-{sandbox_id_or_name}"
 
 
 def _xdg_config_home() -> pathlib.Path:
