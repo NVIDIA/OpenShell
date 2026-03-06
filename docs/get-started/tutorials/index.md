@@ -25,7 +25,7 @@ Run Anthropic Claude as a coding agent with credential management, inference rou
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Run Opencode with NVIDIA Inference
+:::{grid-item-card} Run OpenCode with NVIDIA Inference
 :link: run-opencode
 :link-type: doc
 

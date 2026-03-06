@@ -3,9 +3,9 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Run opencode with NVIDIA Inference
+# Run OpenCode with NVIDIA Inference
 
-This tutorial walks through a realistic setup where you run [opencode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing --- the full policy iteration loop.
+This tutorial walks through a realistic setup where you run [OpenCode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing --- the full policy iteration loop.
 
 **What you will learn:**
 
@@ -41,17 +41,17 @@ $ nemoclaw provider list
 
 ## Step 2: Create the Sandbox
 
-Create a sandbox with the NVIDIA provider attached and opencode as the startup command:
+Create a sandbox with the NVIDIA provider attached and OpenCode as the startup command:
 
 ```console
 $ nemoclaw sandbox create --name opencode-sandbox --provider nvidia --keep -- opencode
 ```
 
-The `--keep` flag keeps the sandbox alive after you exit, which you will need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts opencode.
+The `--keep` flag keeps the sandbox alive after you exit, which you will need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts OpenCode.
 
 ## Step 3: Hit a Problem
 
-Try using opencode inside the sandbox. You will likely find that calls to NVIDIA inference endpoints fail or behave unexpectedly. The default policy is designed around Claude Code, not opencode.
+Try using OpenCode inside the sandbox. You will likely find that calls to NVIDIA inference endpoints fail or behave unexpectedly. The default policy is designed around Claude Code, not OpenCode.
 
 Open a second terminal and check the logs:
 

@@ -24,8 +24,9 @@ content:
 
 # NVIDIA NemoClaw
 
-{bdg-link-secondary}`GitHub <https://github.com/NVIDIA/NemoClaw>`
-{bdg-link-primary}`PyPI <https://pypi.org/project/nemoclaw/>`
+[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/NemoClaw)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/NemoClaw/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
 
 NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments 
 that protect your data, credentials, and infrastructure — agents run with exactly the permissions they need and 
