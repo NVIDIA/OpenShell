@@ -7,13 +7,15 @@
 
 This tutorial walks through a realistic setup where you run [OpenCode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop.
 
-**What you will learn:**
+## What you will learn
 
-- Creating a provider manually with `--from-existing`
-- Writing a custom policy to replace the defaults
-- Reading sandbox logs to diagnose denied actions
+You will learn the following from this tutorial:
+
+- How to create a provider manually using the `--from-existing` flag
+- How to write a custom policy to replace the default policy
+- How to read sandbox logs to diagnose denied actions
 - The difference between agent traffic and userland inference
-- Setting up inference routes for code running inside the sandbox
+- How to set up inference routes for code running inside the sandbox
 
 ## Prerequisites
 

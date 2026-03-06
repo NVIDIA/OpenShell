@@ -7,10 +7,12 @@
 
 This tutorial shows you how to launch a community sandbox using the `--from` flag. Community sandboxes are pre-built configurations published to the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) repository. They bundle a container image, a tailored policy, and optional skills into a single package you can run with one command.
 
-What you will learn:
+## What you will learn
+
+You will learn the following from this tutorial:
 
 - What community sandboxes are and how they differ from default sandboxes
-- How the `--from` flag pulls and builds a complete sandbox configuration
+- How to use the `--from` flag to pull and build a complete sandbox configuration
 - How to inspect the bundled policy that ships with a community sandbox
 
 ## Prerequisites

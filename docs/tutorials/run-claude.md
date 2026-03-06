@@ -7,12 +7,14 @@
 
 This tutorial walks you through the simplest path to running Claude Code inside a NemoClaw sandbox. By the end, you will have an isolated environment with Claude Code running, your credentials securely injected, and a default policy controlling what the agent can access.
 
-What you will learn:
+## What you will learn
 
-- Creating a sandbox with a single command
+You will learn the following from this tutorial:
+
+- How to create a sandbox with a single command
 - How NemoClaw auto-discovers provider credentials
 - What the default policy allows and denies
-- Connecting to a sandbox and working inside it
+- How to connect to a sandbox and work inside it
 
 ## Step 1: Create a Sandbox
 
