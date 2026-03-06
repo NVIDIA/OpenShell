@@ -5,86 +5,85 @@
 
 # Providers
 
-AI agents typically need credentials to access external services — an API key for the AI model provider, a token for GitHub or GitLab, and so on. NemoClaw manages these credentials as first-class entities called **providers**.
+AI agents typically need credentials to access external services — an API key for the AI model provider, a token for GitHub or GitLab, and so on. NemoClaw manages these credentials as first-class entities called *providers*.
 
-## How Providers Work
+Create and manage providers that supply credentials to sandboxes.
 
-1. **You configure a provider once** — either by letting the CLI discover credentials from your local machine, or by providing them explicitly.
-2. **Credentials are stored on the gateway** — separate from sandbox definitions. They never appear in Kubernetes pod specifications.
-3. **Sandboxes receive credentials at runtime** — when a sandbox starts, the supervisor fetches credentials from the gateway and injects them as environment variables into every process it spawns.
+## Create a Provider
 
-This means you configure credentials once, and every sandbox that needs them receives them automatically.
+### From Local Credentials
 
-## Supported Provider Types
-
-| Type | Discovered Environment Variables | Discovered Config Paths |
-|------|----------------------------------|------------------------|
-| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | `~/.claude.json`, `~/.claude/credentials.json`, `~/.config/claude/config.json` |
-| `codex` | `OPENAI_API_KEY` | `~/.config/codex/config.json`, `~/.codex/config.json` |
-| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | `~/.config/opencode/config.json` |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | `~/.config/gh/hosts.yml` |
-| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | `~/.config/glab-cli/config.yml` |
-| `nvidia` | `NVIDIA_API_KEY` | — |
-| `generic` | — | — |
-| `outlook` | — | — |
-
-## Creating Providers
-
-### From Local Credentials (Auto-Discovery)
-
-The easiest way to create a provider — the CLI scans your machine for existing credentials:
+The fastest way to create a provider is to let the CLI discover credentials from
+your shell environment:
 
 ```console
 $ nemoclaw provider create --name my-claude --type claude --from-existing
 ```
 
+This reads `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` from your current environment
+and stores them in the provider.
+
 ### With Explicit Credentials
 
+Supply a credential value directly:
+
 ```console
-$ nemoclaw provider create --name my-api --type generic \
-  --credential API_KEY=sk-abc123 \
-  --config base_url=https://api.example.com
+$ nemoclaw provider create --name my-api --type generic --credential API_KEY=sk-abc123
 ```
 
-A bare key (without `=VALUE`) reads the value from the environment variable of that name:
+### Bare Key Form
+
+Pass a key name without a value to read the value from the environment variable
+of that name:
 
 ```console
 $ nemoclaw provider create --name my-api --type generic --credential API_KEY
 ```
 
-## Managing Providers
+This looks up the current value of `$API_KEY` in your shell and stores it.
+
+## Manage Providers
+
+List all providers:
 
 ```console
 $ nemoclaw provider list
+```
+
+Inspect a provider:
+
+```console
 $ nemoclaw provider get my-claude
+```
+
+Update a provider's credentials:
+
+```console
 $ nemoclaw provider update my-claude --type claude --from-existing
+```
+
+Delete a provider:
+
+```console
 $ nemoclaw provider delete my-claude
 ```
 
-## Attaching Providers to Sandboxes
+## Attach Providers to Sandboxes
 
-Specify providers at sandbox creation time:
+Pass one or more `--provider` flags when creating a sandbox:
 
 ```console
 $ nemoclaw sandbox create --provider my-claude --provider my-github -- claude
 ```
 
-Each attached provider's credentials are injected as environment variables into the sandbox. If multiple providers define the same environment variable, the first provider's value wins.
+Each `--provider` flag attaches one provider. The sandbox receives all
+credentials from every attached provider at runtime.
 
 :::{warning}
 Providers cannot be added to a running sandbox. If you need to attach an
 additional provider, delete the sandbox and recreate it with all required
 providers specified.
 :::
-
-## Privacy & Safety
-
-NemoClaw manages credentials with a privacy-first design:
-
-- **Credentials stay private** — stored separately from sandbox definitions, never in Kubernetes pod specs or container configurations.
-- **Runtime-only injection** — credentials are fetched at runtime by the sandbox supervisor, minimizing exposure surface.
-- **No credential leakage** — the CLI never displays credential values in its output.
-- **Strict key validation** — only credential keys that are valid environment variable names (`^[A-Za-z_][A-Za-z0-9_]*$`) are injected; invalid keys are silently skipped.
 
 ### Auto-Discovery Shortcut
 
@@ -130,26 +129,12 @@ means credentials are not visible in container inspection, image layers, or
 environment dumps of the container spec.
 :::
 
-## Supported Types
+## Supported Provider Types
 
-| Type | Environment Variables Injected | Typical Use |
-|---|---|---|
-| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
-| `codex` | `OPENAI_API_KEY` | OpenAI Codex |
-| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI |
-| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
-| `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
-| `generic` | User-defined | Any service with custom credentials |
-| `outlook` | *(none --- no auto-discovery)* | Microsoft Outlook integration |
-
-:::{tip}
-Use the `generic` type for any service not listed above. You define the
-environment variable names and values yourself with `--credential`.
-:::
+For a list of supported provider types, refer to the [Support Matrix](../about/support-matrix.md#supported-provider-types).
 
 ## Next Steps
 
 - {doc}`create-and-manage` --- full sandbox lifecycle management
 - {doc}`custom-containers` --- use providers with custom container images
-- {doc}`/safety-and-privacy/security-model` --- why credential isolation matters
+- {doc}`../safety-and-privacy/security-model` --- why credential isolation matters

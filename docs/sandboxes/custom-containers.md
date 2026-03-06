@@ -5,77 +5,74 @@
 
 # Custom Containers
 
-You can run any Linux container image as a sandbox while keeping the NemoClaw supervisor in control of security enforcement.
+Build a custom container image and run it as a NemoClaw sandbox.
 
-## How It Works
+## Prerequisites
 
-When you specify `--from` with a container image reference, the server activates supervisor bootstrap mode. The `navigator-sandbox` supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container, then mounted read-only into your custom container. This means you do not need to build the supervisor into your image.
+- NemoClaw CLI installed (`pip install nemoclaw`)
+- Docker running on your machine
+- A Dockerfile for your workload
 
-```{mermaid}
-flowchart TB
-    subgraph pod["Pod"]
-        subgraph init["Init Container · copy-supervisor"]
-            init_desc["Image: default sandbox image\nCopies navigator-sandbox binary\ninto shared volume"]
-        end
+## Step 1: Create a Sandbox from Your Dockerfile
 
-        init -- "shared volume" --> agent
-
-        subgraph agent["Agent Container"]
-            agent_desc["Image: your custom image\nRuns navigator-sandbox as entrypoint\nFull sandbox policy enforcement"]
-        end
-    end
-```
-
-## Building and Pushing Images
-
-Build a custom container image and import it into the cluster:
+Point `--from` at the directory containing your Dockerfile:
 
 ```console
-$ nemoclaw sandbox image push \
-  --dockerfile ./Dockerfile \
-  --tag my-app:latest \
-  --context .
+$ nemoclaw sandbox create --from ./my-app --keep --name my-app
 ```
 
-The image is built locally via Docker and imported directly into the cluster's containerd runtime. No external registry is needed.
+The CLI builds the image locally via Docker, pushes it into the cluster, and
+creates the sandbox --- all in one step. No external container registry is
+needed.
 
-| Flag | Description |
-|------|-------------|
-| `--dockerfile` (required) | Path to the Dockerfile. |
-| `--tag` | Image name and tag (default: auto-generated timestamp). |
-| `--context` | Build context directory (default: Dockerfile parent). |
-| `--build-arg KEY=VALUE` | Docker build argument (repeatable). |
-
-## Creating a Sandbox with a Custom Image
+You can also pass a full container image reference if the image is already
+built:
 
 ```console
-$ nemoclaw sandbox create --from my-app:latest --keep --name my-app
+$ nemoclaw sandbox create --from my-registry.example.com/my-image:latest --keep --name my-app
 ```
 
-When `--from` specifies a container image, the CLI clears the default `run_as_user`/`run_as_group` policy, since custom images may not have the default `sandbox` user.
+## Step 2: Forward Ports
 
-### With Port Forwarding
-
-If your container runs a service:
+If your container runs a service, forward the port to your host:
 
 ```console
-$ nemoclaw sandbox create --from my-app:latest --forward 8080 --keep -- ./start-server.sh
+$ nemoclaw sandbox forward start 8080 my-app -d
 ```
 
-The `--forward` flag starts a background port forward before the command runs, so the service is reachable at `localhost:8080` immediately.
+The `-d` flag runs the forward in the background so you can continue using
+your terminal.
 
-## Updating a Custom Image
+## Step 3: Iterate
 
-To iterate on your container:
+When you change your Dockerfile, delete the sandbox and recreate:
 
 ```console
-$ nemoclaw sandbox delete my-app
-$ nemoclaw sandbox image push --dockerfile ./Dockerfile --tag my-app:v2
-$ nemoclaw sandbox create --from my-app:v2 --keep --name my-app
+$ nemoclaw sandbox delete my-app && \
+    nemoclaw sandbox create --from ./my-app --keep --name my-app
 ```
 
-## Limitations
+## Shortcut: Create with Forwarding and a Startup Command
 
-- **Distroless / `FROM scratch` images are not supported.** The supervisor needs glibc, `/proc`, and a shell.
-- **Missing `iproute2` blocks proxy mode.** Network namespace isolation requires `iproute2` and the `CAP_NET_ADMIN`/`CAP_SYS_ADMIN` capabilities.
-- The init container assumes the supervisor binary is at a fixed path in the default sandbox image.
+You can combine port forwarding and a startup command in a single step:
+
+```console
+$ nemoclaw sandbox create --from ./my-app --forward 8080 --keep -- ./start-server.sh
+```
+
+This creates the sandbox, sets up port forwarding on port 8080, and runs
+`./start-server.sh` as the sandbox command.
+
+:::{warning}
+Distroless and `FROM scratch` images are not supported. The NemoClaw
+supervisor requires glibc, `/proc`, and a shell to operate. Images missing
+`iproute2` or required Linux capabilities will fail to start in proxy mode.
+Ensure your base image includes these dependencies.
+:::
+
+## Next Steps
+
+- {doc}`create-and-manage` --- full sandbox lifecycle commands
+- {doc}`providers` --- attach credentials to your custom container
+- {doc}`/safety-and-privacy/policies` --- write a policy tailored to your workload
+- {doc}`/safety-and-privacy/security-model` --- understand the isolation layers applied to custom images

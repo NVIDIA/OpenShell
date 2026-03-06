@@ -38,16 +38,21 @@ When `landlock.compatibility` is set to `best_effort` (the default), the sandbox
 
 Providers supply credentials to sandboxes. NemoClaw can auto-discover credentials from environment variables and config files on your local machine.
 
-| Provider | Type Slug | Auto-Discovery |
-|----------|-----------|----------------|
-| Anthropic Claude | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY`, `~/.claude.json` |
-| OpenAI Codex | `codex` | `OPENAI_API_KEY`, `~/.config/codex/config.json` |
-| OpenCode | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` |
-| GitHub | `github` | `GITHUB_TOKEN`, `GH_TOKEN`, `~/.config/gh/hosts.yml` |
-| GitLab | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `~/.config/glab-cli/config.yml` |
-| NVIDIA | `nvidia` | `NVIDIA_API_KEY` |
-| Generic | `generic` | Manual only (`--credential KEY=VALUE`) |
-| Outlook | `outlook` | Manual only |
+| Type | Environment Variables Injected | Typical Use |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
+| `codex` | `OPENAI_API_KEY` | OpenAI Codex |
+| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI |
+| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
+| `generic` | User-defined | Any service with custom credentials |
+| `outlook` | *(none --- no auto-discovery)* | Microsoft Outlook integration |
+
+:::{tip}
+Use the `generic` type for any service not listed above. You define the
+environment variable names and values yourself with `--credential`.
+:::
 
 ## Supported Inference Protocols
 
