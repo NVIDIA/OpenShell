@@ -5,6 +5,8 @@
 
 # NVIDIA NemoClaw Developer Guide
 
+tests
+
 NemoClaw is the runtime environment for autonomous agents. It provides secure sandboxed execution, cluster management, and infrastructure for running AI agent workloads.
 
 ```{toctree}
