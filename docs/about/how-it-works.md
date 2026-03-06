@@ -87,7 +87,7 @@ AI inference API calls are transparently intercepted and rerouted to policy-cont
 
 ### Cluster Infrastructure
 
-The entire platform packages into a single Docker container running k3s. Docker is the only dependency. See [Clusters](../clusters/index.md).
+The entire platform packages into a single Docker container running k3s. Docker is the only dependency.
 
 ## End-to-End Flow
 
