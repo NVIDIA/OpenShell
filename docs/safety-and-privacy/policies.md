@@ -75,7 +75,7 @@ NemoClaw ships a built-in default policy designed for Claude Code. It covers Cla
 | Agent | Default policy coverage | What you need to do |
 |---|---|---|
 | Claude Code | Full | Nothing: works out of the box |
-| opencode | Partial | Add `opencode.ai` endpoint and opencode binary paths. |
+| OpenCode | Partial | Add `opencode.ai` endpoint and OpenCode binary paths. |
 | Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
 
 :::{important}
@@ -231,10 +231,10 @@ Refer to the [Policy Schema Reference](../reference/policy-schema.md) for the co
 
 ## Safety Properties
 
-Last-known-good.
+**Last-known-good.**
 If a new policy revision fails validation, the previous successfully loaded policy stays active. A bad push does not break a running sandbox. The agent continues operating under the last good policy.
 
-Idempotent.
+**Idempotent.**
 Submitting the same policy content again does not create a new revision. The CLI detects that the content has not changed and returns without modifying the revision history.
 
 ## Next Steps

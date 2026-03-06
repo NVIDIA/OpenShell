@@ -5,7 +5,7 @@
 
 # Run OpenCode with NVIDIA Inference
 
-This tutorial walks through a realistic setup where you run [opencode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop.
+This tutorial walks through a realistic setup where you run [OpenCode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop.
 
 **What you will learn:**
 
@@ -40,17 +40,17 @@ $ nemoclaw provider list
 
 ## Step 2: Create the Sandbox
 
-Create a sandbox with the NVIDIA provider attached and opencode as the startup command:
+Create a sandbox with the NVIDIA provider attached and OpenCode as the startup command:
 
 ```console
 $ nemoclaw sandbox create --name opencode-sandbox --provider nvidia --keep -- opencode
 ```
 
-The `--keep` flag keeps the sandbox alive after you exit, which you will need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts opencode.
+The `--keep` flag keeps the sandbox alive after you exit, which you will need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts OpenCode.
 
 ## Step 3: Hit a Problem
 
-Try using opencode inside the sandbox. You will likely find that calls to NVIDIA inference endpoints fail or behave unexpectedly. The default policy is designed around Claude Code, not opencode.
+Try using OpenCode inside the sandbox. You will likely find that calls to NVIDIA inference endpoints fail or behave unexpectedly. The default policy is designed around Claude Code, not OpenCode.
 
 Open a second terminal and check the logs:
 
@@ -76,14 +76,14 @@ These log entries tell you exactly what the policy blocks and why.
 
 ## Step 4: Understand Why
 
-The default policy has a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries, typically `/usr/local/bin/claude` and `/usr/bin/node`. If opencode makes HTTP calls through a different binary (its own binary, `curl`, or a shell subprocess), those connections do not match any policy rule and get denied.
+The default policy has a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries, typically `/usr/local/bin/claude` and `/usr/bin/node`. If OpenCode makes HTTP calls through a different binary (its own binary, `curl`, or a shell subprocess), those connections do not match any policy rule and get denied.
 
 There are two separate problems:
 
-1. OpenCode's own traffic. opencode contacts `opencode.ai` for its API and `integrate.api.nvidia.com` for inference. Neither of these endpoints has a matching policy entry for the binaries opencode uses.
+1. OpenCode's own traffic. OpenCode contacts `opencode.ai` for its API and `integrate.api.nvidia.com` for inference. Neither of these endpoints has a matching policy entry for the binaries OpenCode uses.
 2. No opencode.ai endpoint. The default policy has no entry for `opencode.ai` at all. Even if the binary matched, the destination is not listed.
 
-This is the expected behavior. NemoClaw denies by default. You need to write a policy that explicitly allows what opencode needs.
+This is the expected behavior. NemoClaw denies by default. You need to write a policy that explicitly allows what OpenCode needs.
 
 ## Step 5: Write a Custom Policy
 
