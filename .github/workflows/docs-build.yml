@@ -67,7 +67,7 @@ jobs:
                   path: pr/
 
     publish:
-        if: false # disabled until GitHub Pages is configured
+        if: github.event_name == 'push' && github.repository_owner == 'NVIDIA'
         needs: [build]
         runs-on: build-arm64
         container:
