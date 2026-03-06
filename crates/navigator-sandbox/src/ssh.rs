@@ -645,6 +645,12 @@ fn spawn_pty_shell(
         pty.term.as_str()
     };
 
+    // Inherit PATH from the container (set via Dockerfile ENV) so that
+    // sandbox sessions see the same tool layout without hardcoding paths.
+    // Tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.) are
+    // set in /sandbox/.bashrc by the Dockerfile and sourced via login shell.
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+
     cmd.env_clear()
         .stdin(stdin)
         .stdout(stdout)
@@ -653,7 +659,7 @@ fn spawn_pty_shell(
         .env("HOME", "/sandbox")
         .env("USER", "sandbox")
         .env("SHELL", "/bin/bash")
-        .env("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", &path)
         .env("TERM", term);
 
     // Set proxy environment variables so cooperative tools (curl, wget, etc.)
@@ -797,10 +803,15 @@ fn spawn_pipe_exec(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            c.arg("-c").arg(command);
+            // Use login shell (-l) so that .profile/.bashrc are sourced and
+            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
+            // are available without hardcoding them here.
+            c.arg("-lc").arg(command);
             c
         },
     );
+
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     cmd.env_clear()
         .stdin(std::process::Stdio::piped())
@@ -810,7 +821,7 @@ fn spawn_pipe_exec(
         .env("HOME", "/sandbox")
         .env("USER", "sandbox")
         .env("SHELL", "/bin/bash")
-        .env("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", &path)
         .env("TERM", "dumb");
 
     if let Some(ref url) = proxy_url {

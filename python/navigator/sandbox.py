@@ -21,7 +21,6 @@ from navigator._proto import (
     inference_pb2_grpc,
     navigator_pb2,
     navigator_pb2_grpc,
-    sandbox_pb2,
 )
 
 if TYPE_CHECKING:
@@ -594,24 +593,13 @@ def _sandbox_ref(sandbox: datamodel_pb2.Sandbox) -> SandboxRef:
     )
 
 
-def _default_policy() -> sandbox_pb2.SandboxPolicy:
-    return sandbox_pb2.SandboxPolicy(
-        version=1,
-        inference=sandbox_pb2.InferencePolicy(allowed_routes=["local"]),
-        filesystem=sandbox_pb2.FilesystemPolicy(
-            include_workdir=True,
-            read_only=["/usr", "/lib", "/etc", "/app"],
-            read_write=["/sandbox", "/tmp"],
-        ),
-        landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
-        process=sandbox_pb2.ProcessPolicy(
-            run_as_user="sandbox", run_as_group="sandbox"
-        ),
-    )
-
-
 def _default_spec() -> datamodel_pb2.SandboxSpec:
-    return datamodel_pb2.SandboxSpec(policy=_default_policy())
+    # Omit the policy field so the sandbox container discovers its policy
+    # from /etc/navigator/policy.yaml (baked into the image at build time).
+    # This avoids duplicating policy defaults between the SDK and the
+    # container image and ensures sandboxes get the full dev-sandbox-policy
+    # (including network_policies) out of the box.
+    return datamodel_pb2.SandboxSpec()
 
 
 def _xdg_config_home() -> pathlib.Path:

@@ -30,7 +30,7 @@ pub fn apply(policy: &SandboxPolicy, workdir: Option<&str>) -> Result<()> {
     }
 
     let result: Result<()> = (|| {
-        let abi = ABI::V1;
+        let abi = ABI::V2;
         let access_all = AccessFs::from_all(abi);
         let access_read = AccessFs::from_read(abi);
 

@@ -86,8 +86,8 @@ pub struct ProcessPolicy {
 
 #[derive(Debug, Clone, Default)]
 pub enum LandlockCompatibility {
-    #[default]
     BestEffort,
+    #[default]
     HardRequirement,
 }
 

@@ -117,8 +117,9 @@ RUN uv venv /app/.venv && \
     uv sync --frozen --no-dev --no-install-project 2>/dev/null || \
     uv sync --no-dev --no-install-project 2>/dev/null || true
 
-# Install navigator SDK dependencies
-RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grpcio protobuf openai
+# Install navigator SDK dependencies and pip (uv venvs don't include pip by
+# default, and sandbox users need it for `pip install` inside the sandbox).
+RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grpcio protobuf openai pip
 
 # Stage 4: Coding agents layer
 FROM base AS coding-agents
@@ -166,8 +167,14 @@ COPY --from=rust-builder /build/out/navigator-sandbox /usr/local/bin/
 # Copy navigator Python SDK into the virtual environment
 COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
 
-# Add venv to PATH
-ENV PATH="/app/.venv/bin:$PATH"
+# Add venvs to PATH -- /sandbox/.venv (writable, user-installed packages)
+# takes priority over /app/.venv (read-only, build-time packages).
+# ssh.rs inherits PATH at runtime so it stays in sync with this layout.
+# VIRTUAL_ENV and UV_PYTHON_INSTALL_DIR are also exported in .bashrc
+# so that login shell sessions (interactive and exec) see them.
+ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    VIRTUAL_ENV="/sandbox/.venv" \
+    UV_PYTHON_INSTALL_DIR="/sandbox/.uv/python"
 
 # Copy custom navigator skills into the image
 # To add a skill, create a subdirectory under deploy/docker/sandbox/skills/
@@ -184,11 +191,16 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     chown supervisor:supervisor /var/log/navigator.log && \
     chmod 0664 /var/log/navigator.log && \
     chown sandbox:sandbox /sandbox && \
+    # Create a writable venv that inherits all packages from the read-only
+    # /app/.venv.  Sandbox users can `pip install` or `uv pip install` into
+    # this venv without touching the base image layer.
+    uv venv --python /app/.venv/bin/python --seed --system-site-packages /sandbox/.venv && \
+    chown -R sandbox:sandbox /sandbox/.venv && \
     # Minimal shell init files so interactive and non-interactive shells
     # get a sane PATH and prompt.  Without these, bash sources nothing
     # under /sandbox and tools like VS Code Remote-SSH may mis-detect
     # the platform.
-    printf 'export PATH="/app/.venv/bin:$PATH"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
+    printf 'export PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"\nexport VIRTUAL_ENV="/sandbox/.venv"\nexport UV_PYTHON_INSTALL_DIR="/sandbox/.uv/python"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
     > /sandbox/.bashrc && \
     printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > /sandbox/.profile && \
     chown sandbox:sandbox /sandbox/.bashrc /sandbox/.profile && \
