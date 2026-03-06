@@ -22,7 +22,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# NVIDIA NemoClaw Developer Guide
+# NVIDIA NemoClaw
 
 {bdg-link-secondary}`GitHub <https://github.com/NVIDIA/NemoClaw>`
 {bdg-link-primary}`PyPI <https://pypi.org/project/nemoclaw/>`
@@ -32,24 +32,24 @@ that protect your data, credentials, and infrastructure — agents run with exac
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and 
 uncontrolled network activity.
 
-# Install and Create a Sandbox
+## Install and Create a Sandbox
 
 NemoClaw is designed for minimal setup with safety and privacy built in from the start. Two commands take you from zero to a running, policy-enforced sandbox.
 
-## Prerequisites
+### Prerequisites
 
 The following are the prerequisites for the NemoClaw CLI.
 
 - Docker must be running.
 - Python 3.12+ is required.
 
-## Install the CLI
+### Install the CLI
 
 ```console
 $ pip install nemoclaw
 ```
 
-## Create a Sandbox
+### Create a Sandbox
 
 ::::{tab-set}
 
@@ -82,7 +82,7 @@ The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/
 
 The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
 
-For opencode or Codex, see the [Tutorials](tutorials/index.md) for agent-specific setup.
+For opencode or Codex, see the [Tutorials](get-started/tutorials/index.md) for agent-specific setup.
 
 
 ---
@@ -138,15 +138,6 @@ Install the CLI, bootstrap a cluster, and create your first sandbox.
 
 ::::{grid} 1 1 2 2
 :gutter: 3
-
-:::{grid-item-card} About Getting Started
-:link: get-started/installation
-:link-type: doc
-
-Install the CLI, bootstrap a cluster, and launch your first sandbox in minutes.
-+++
-{bdg-secondary}`Get Started`
-:::
 
 :::{grid-item-card} Tutorials
 :link: get-started/tutorials/index
