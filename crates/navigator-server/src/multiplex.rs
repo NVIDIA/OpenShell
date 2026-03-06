@@ -25,6 +25,13 @@ use tower::ServiceExt;
 
 use crate::{NavigatorService, ServerState, http_router, inference::InferenceService};
 
+/// Maximum inbound gRPC message size (1 MB).
+///
+/// Replaces tonic's implicit 4 MB default with a conservative limit to
+/// bound memory allocation from a single request. Sandbox creation is
+/// the largest payload and well within this cap under normal use.
+const MAX_GRPC_DECODE_SIZE: usize = 1_048_576;
+
 /// Multiplexed gRPC/HTTP service.
 #[derive(Clone)]
 pub struct MultiplexService {
@@ -44,8 +51,10 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let navigator = NavigatorServer::new(NavigatorService::new(self.state.clone()));
-        let inference = InferenceServer::new(InferenceService::new(self.state.clone()));
+        let navigator = NavigatorServer::new(NavigatorService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let grpc_service = GrpcRouter::new(navigator, inference);
         let http_service = http_router(self.state.clone());
 
