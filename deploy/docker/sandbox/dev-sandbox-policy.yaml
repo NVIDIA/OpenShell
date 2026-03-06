@@ -100,6 +100,12 @@ network_policies:
     endpoints:
       - { host: pypi.org, port: 443 }
       - { host: files.pythonhosted.org, port: 443 }
+      # uv python install downloads from python-build-standalone on GitHub
+      - { host: github.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      # uv resolves python-build-standalone release metadata via the GitHub API
+      - { host: api.github.com, port: 443 }
+      - { host: downloads.python.org, port: 443 }
     binaries:
       - { path: /sandbox/.venv/bin/python }
       - { path: /sandbox/.venv/bin/python3 }
@@ -108,6 +114,8 @@ network_policies:
       - { path: /app/.venv/bin/python3 }
       - { path: /app/.venv/bin/pip }
       - { path: /usr/local/bin/uv }
+      # Managed Python installations from uv python install
+      - { path: "/sandbox/.uv/python/**" }
 
   vscode:
     name: vscode

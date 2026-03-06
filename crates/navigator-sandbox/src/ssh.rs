@@ -645,9 +645,8 @@ fn spawn_pty_shell(
         pty.term.as_str()
     };
 
-    // Inherit PATH from the container environment (set via Dockerfile ENV) so
-    // that sandbox sessions see the same venv layout without hardcoding paths
-    // in Rust.  Falls back to a minimal default if the variable is unset.
+    // Inherit environment from the container (set via Dockerfile ENV) so that
+    // sandbox sessions see the same venv/tool layout without hardcoding paths.
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     cmd.env_clear()
@@ -660,6 +659,13 @@ fn spawn_pty_shell(
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);
+
+    // Forward optional tool-config env vars from the container image.
+    for key in ["VIRTUAL_ENV", "UV_PYTHON_INSTALL_DIR"] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
 
     // Set proxy environment variables so cooperative tools (curl, wget, etc.)
     // route traffic through the CONNECT proxy for OPA policy evaluation.
@@ -819,6 +825,12 @@ fn spawn_pipe_exec(
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", "dumb");
+
+    for key in ["VIRTUAL_ENV", "UV_PYTHON_INSTALL_DIR"] {
+        if let Ok(val) = std::env::var(key) {
+            cmd.env(key, val);
+        }
+    }
 
     if let Some(ref url) = proxy_url {
         cmd.env("HTTP_PROXY", url)

@@ -171,7 +171,9 @@ COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
 # takes priority over /app/.venv (read-only, build-time packages).
 # This ENV is also read by ssh.rs at runtime so that the hardcoded PATH
 # in the Rust code stays in sync with the container layout.
-ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
+ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
+    VIRTUAL_ENV="/sandbox/.venv" \
+    UV_PYTHON_INSTALL_DIR="/sandbox/.uv/python"
 
 # Copy custom navigator skills into the image
 # To add a skill, create a subdirectory under deploy/docker/sandbox/skills/
