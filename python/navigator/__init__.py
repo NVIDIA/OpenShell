@@ -6,10 +6,10 @@
 from __future__ import annotations
 
 from navigator.sandbox import (
+    ClusterInferenceConfig,
     ExecChunk,
     ExecResult,
     InferenceRouteClient,
-    InferenceRouteRef,
     Sandbox,
     SandboxClient,
     SandboxError,
@@ -26,10 +26,10 @@ except Exception:
     __version__ = "0.0.0"
 
 __all__ = [
+    "ClusterInferenceConfig",
     "ExecChunk",
     "ExecResult",
     "InferenceRouteClient",
-    "InferenceRouteRef",
     "Sandbox",
     "SandboxClient",
     "SandboxError",

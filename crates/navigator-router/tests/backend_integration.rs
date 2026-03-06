@@ -2,17 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use navigator_router::Router;
-use navigator_router::config::{ResolvedRoute, RouteConfig, RouterConfig};
+use navigator_router::config::{AuthHeader, ResolvedRoute, RouteConfig, RouterConfig};
 use wiremock::matchers::{bearer_token, body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
     vec![ResolvedRoute {
-        routing_hint: "local".to_string(),
         endpoint: base_url.to_string(),
         model: "meta/llama-3.1-8b-instruct".to_string(),
         api_key: "test-api-key".to_string(),
         protocols: vec!["openai_chat_completions".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
     }]
 }
 
@@ -108,11 +109,12 @@ async fn proxy_upstream_401_returns_error() {
 async fn proxy_no_compatible_route_returns_error() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
-        routing_hint: "local".to_string(),
         endpoint: "http://localhost:1234".to_string(),
         model: "test".to_string(),
         api_key: "key".to_string(),
         protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Custom("x-api-key"),
+        default_headers: Vec::new(),
     }];
 
     let err = router
@@ -167,11 +169,12 @@ async fn proxy_strips_auth_header() {
 async fn proxy_mock_route_returns_canned_response() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
-        routing_hint: "local".to_string(),
         endpoint: "mock://test".to_string(),
         model: "mock/test-model".to_string(),
         api_key: "unused".to_string(),
         protocols: vec!["openai_chat_completions".to_string()],
+        auth: AuthHeader::Bearer,
+        default_headers: Vec::new(),
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -279,7 +282,7 @@ async fn proxy_inserts_model_when_absent_from_body() {
 }
 
 #[tokio::test]
-async fn proxy_uses_x_api_key_for_anthropic_protocol() {
+async fn proxy_uses_x_api_key_for_anthropic_route() {
     let mock_server = MockServer::start().await;
 
     Mock::given(method("POST"))
@@ -299,11 +302,12 @@ async fn proxy_uses_x_api_key_for_anthropic_protocol() {
 
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
-        routing_hint: "frontier".to_string(),
         endpoint: mock_server.uri(),
         model: "claude-sonnet-4-20250514".to_string(),
         api_key: "test-anthropic-key".to_string(),
         protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Custom("x-api-key"),
+        default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
     }];
 
     let body = serde_json::to_vec(&serde_json::json!({
@@ -355,11 +359,12 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
 
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
-        routing_hint: "frontier".to_string(),
         endpoint: mock_server.uri(),
         model: "claude-sonnet-4-20250514".to_string(),
         api_key: "anthropic-key".to_string(),
         protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Custom("x-api-key"),
+        default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
     }];
 
     let response = router
@@ -381,9 +386,10 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
 fn config_resolves_routes_with_protocol() {
     let config = RouterConfig {
         routes: vec![RouteConfig {
-            routing_hint: "local".to_string(),
+            name: "inference.local".to_string(),
             endpoint: "http://localhost:8000".to_string(),
             model: "test-model".to_string(),
+            provider_type: None,
             protocols: vec!["openai_chat_completions".to_string()],
             api_key: Some("key".to_string()),
             api_key_env: None,

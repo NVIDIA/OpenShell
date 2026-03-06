@@ -28,7 +28,6 @@ if TYPE_CHECKING:
 def _default_policy() -> sandbox_pb2.SandboxPolicy:
     return sandbox_pb2.SandboxPolicy(
         version=1,
-        inference=sandbox_pb2.InferencePolicy(allowed_routes=["local"]),
         filesystem=sandbox_pb2.FilesystemPolicy(
             include_workdir=True,
             read_only=["/usr", "/lib", "/etc", "/app"],

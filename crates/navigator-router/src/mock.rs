@@ -19,7 +19,6 @@ pub fn is_mock_route(route: &ResolvedRoute) -> bool {
 /// Anthropic response, etc. The route's `model` field is echoed in the response.
 pub fn mock_response(route: &ResolvedRoute, source_protocol: &str) -> ProxyResponse {
     tracing::warn!(
-        routing_hint = %route.routing_hint,
         endpoint = %route.endpoint,
         "Serving mock response — mock:// routes should only be used in development/testing"
     );
@@ -125,11 +124,12 @@ mod tests {
 
     fn make_route(endpoint: &str, protocols: &[&str], model: &str) -> ResolvedRoute {
         ResolvedRoute {
-            routing_hint: "test".to_string(),
             endpoint: endpoint.to_string(),
             model: model.to_string(),
             api_key: "key".to_string(),
             protocols: protocols.iter().map(ToString::to_string).collect(),
+            auth: crate::config::AuthHeader::Bearer,
+            default_headers: Vec::new(),
         }
     }
 

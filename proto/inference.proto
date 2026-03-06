@@ -8,93 +8,80 @@ package navigator.inference.v1;
 option java_multiple_files = true;
 option java_package = "com.anthropic.navigator.inference.v1";
 
-// Inference service provides LLM route management and sandbox route delivery.
+// Inference service provides cluster inference configuration and bundle delivery.
 service Inference {
-  // Return the pre-filtered set of routes a sandbox is allowed to execute.
-  rpc GetSandboxInferenceBundle(GetSandboxInferenceBundleRequest)
-      returns (GetSandboxInferenceBundleResponse);
+  // Return the resolved inference route bundle for sandbox-local execution.
+  rpc GetInferenceBundle(GetInferenceBundleRequest)
+      returns (GetInferenceBundleResponse);
 
-  // Create a new inference route.
-  rpc CreateInferenceRoute(CreateInferenceRouteRequest) returns (InferenceRouteResponse);
+  // Set cluster-level inference configuration.
+  //
+  // This controls how requests sent to `inference.local` are routed.
+  rpc SetClusterInference(SetClusterInferenceRequest)
+      returns (SetClusterInferenceResponse);
 
-  // Update an existing inference route.
-  rpc UpdateInferenceRoute(UpdateInferenceRouteRequest) returns (InferenceRouteResponse);
+  // Get cluster-level inference configuration.
+  rpc GetClusterInference(GetClusterInferenceRequest)
+      returns (GetClusterInferenceResponse);
 
-  // Delete an inference route.
-  rpc DeleteInferenceRoute(DeleteInferenceRouteRequest) returns (DeleteInferenceRouteResponse);
-
-  // List inference routes.
-  rpc ListInferenceRoutes(ListInferenceRoutesRequest) returns (ListInferenceRoutesResponse);
 }
 
-message InferenceRouteSpec {
-  string routing_hint = 1;
-  string base_url = 2;
-  // Protocols this route can serve (e.g. "openai_chat_completions").
-  repeated string protocols = 3;
-  string api_key = 4;
-  string model_id = 5;
-  bool enabled = 6;
+// Persisted cluster inference configuration.
+//
+// Only `provider_name` and `model_id` are stored; endpoint, protocols,
+// credentials, and auth style are resolved from the provider at bundle time.
+message ClusterInferenceConfig {
+  // Provider record name backing this route.
+  string provider_name = 1;
+  // Model identifier to force on generation calls.
+  string model_id = 2;
 }
 
-// Inference route model stored by Navigator.
+// Storage envelope for the managed cluster inference route.
 message InferenceRoute {
   string id = 1;
-  InferenceRouteSpec spec = 2;
-  // Human-friendly name, unique per object type. Auto-generated if not provided.
+  ClusterInferenceConfig config = 2;
+  // Object name (always "inference.local" for the managed route).
   string name = 3;
+  // Monotonic version incremented on every update.
+  uint64 version = 4;
 }
 
-message CreateInferenceRouteRequest {
-  InferenceRouteSpec route = 1;
-  // Optional name. If empty, a random 6-char name is generated.
-  string name = 2;
+message SetClusterInferenceRequest {
+  // Provider record name to use for credentials + endpoint mapping.
+  string provider_name = 1;
+  // Model identifier to force on generation calls.
+  string model_id = 2;
 }
 
-message UpdateInferenceRouteRequest {
-  // Route name (canonical lookup key).
-  string name = 1;
-  InferenceRouteSpec route = 2;
+message SetClusterInferenceResponse {
+  string provider_name = 1;
+  string model_id = 2;
+  uint64 version = 3;
 }
 
-message DeleteInferenceRouteRequest {
-  // Route name (canonical lookup key).
-  string name = 1;
+message GetClusterInferenceRequest {}
+
+message GetClusterInferenceResponse {
+  string provider_name = 1;
+  string model_id = 2;
+  uint64 version = 3;
 }
 
-message DeleteInferenceRouteResponse {
-  bool deleted = 1;
-}
-
-message ListInferenceRoutesRequest {
-  uint32 limit = 1;
-  uint32 offset = 2;
-}
-
-message ListInferenceRoutesResponse {
-  repeated InferenceRoute routes = 1;
-}
-
-message InferenceRouteResponse {
-  InferenceRoute route = 1;
-}
-
-message GetSandboxInferenceBundleRequest {
-  // Sandbox to fetch routes for (used for policy-based filtering).
-  string sandbox_id = 1;
-}
+message GetInferenceBundleRequest {}
 
 // A single resolved route ready for sandbox-local execution.
-message SandboxResolvedRoute {
-  string routing_hint = 1;
+message ResolvedRoute {
+  string name = 1;
   string base_url = 2;
   repeated string protocols = 3;
   string api_key = 4;
   string model_id = 5;
+  string provider_type = 6;
 }
 
-message GetSandboxInferenceBundleResponse {
-  repeated SandboxResolvedRoute routes = 1;
+message GetInferenceBundleResponse {
+  repeated ResolvedRoute routes = 1;
   // Opaque revision tag for cache freshness checks.
   string revision = 2;
   // Timestamp (epoch ms) when this bundle was generated.

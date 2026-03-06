@@ -61,7 +61,7 @@ graph TD
 | Gateway runtime | `crates/navigator-server/src/lib.rs` | `ServerState` struct, `run_server()` accept loop |
 | Protocol mux | `crates/navigator-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
 | gRPC: Navigator | `crates/navigator-server/src/grpc.rs` | `NavigatorService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
-| gRPC: Inference | `crates/navigator-server/src/inference.rs` | `InferenceService` -- inference route CRUD and sandbox inference bundle delivery |
+| gRPC: Inference | `crates/navigator-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
 | HTTP | `crates/navigator-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
 | SSH tunnel | `crates/navigator-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
 | TLS | `crates/navigator-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
@@ -78,9 +78,9 @@ Proto definitions consumed by the gateway:
 | Proto file | Package | Defines |
 |------------|---------|---------|
 | `proto/navigator.proto` | `navigator.v1` | `Navigator` service, sandbox/provider/SSH/watch messages |
-| `proto/inference.proto` | `navigator.inference.v1` | `Inference` service, route CRUD messages, `GetSandboxInferenceBundle` |
+| `proto/inference.proto` | `navigator.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
 | `proto/datamodel.proto` | `navigator.datamodel.v1` | `Sandbox`, `SandboxSpec`, `SandboxStatus`, `Provider`, `SandboxPhase` |
-| `proto/sandbox.proto` | `navigator.sandbox.v1` | `SandboxPolicy`, `NetworkPolicyRule`, `InferencePolicy` |
+| `proto/sandbox.proto` | `navigator.sandbox.v1` | `SandboxPolicy`, `NetworkPolicyRule` |
 
 ## Startup Sequence
 
@@ -233,37 +233,46 @@ These RPCs are called by sandbox pods at startup to bootstrap themselves.
 
 Defined in `proto/inference.proto`, implemented in `crates/navigator-server/src/inference.rs` as `InferenceService`.
 
-The gateway acts as the control plane for inference routes. It stores route definitions, enforces sandbox-scoped access policies, and delivers pre-filtered route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
+The gateway acts as the control plane for inference configuration. It stores a single managed cluster inference route (named `inference.local`) and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
 
-#### Route Delivery
+#### Cluster Inference Configuration
+
+The gateway manages a single cluster-wide inference route that maps to a provider record. When set, the route stores only a `provider_name` and `model_id` reference. At bundle resolution time, the gateway looks up the referenced provider and derives the endpoint URL, API key, protocols, and provider type from it. This late-binding design means provider credential rotations are automatically reflected in the next bundle fetch without updating the route itself.
 
 | RPC | Description |
 |-----|-------------|
-| `GetSandboxInferenceBundle` | Returns the set of inference routes a sandbox is authorized to use. Takes a `sandbox_id`, loads the sandbox's `InferencePolicy.allowed_routes`, fetches all enabled `InferenceRoute` records whose `routing_hint` matches, normalizes protocols, and returns them as `SandboxResolvedRoute` messages along with a revision hash and `generated_at_ms` timestamp. |
+| `SetClusterInference` | Configures the cluster inference route. Validates `provider_name` and `model_id` are non-empty, verifies the named provider exists and has a supported type for inference (openai, anthropic, nvidia), validates the provider has a usable API key, then upserts the `inference.local` route record. Increments a monotonic `version` on each update. Returns the configured `provider_name`, `model_id`, and `version`. |
+| `GetClusterInference` | Returns the current cluster inference configuration (`provider_name`, `model_id`, `version`). Returns `NotFound` if no cluster inference is configured, or `FailedPrecondition` if the stored route has empty provider/model metadata. |
+| `GetInferenceBundle` | Returns the resolved inference route bundle for sandbox consumption. See [Route Bundle Delivery](#route-bundle-delivery) below. |
 
-The trait method delegates to the standalone function `resolve_sandbox_inference_bundle(store, sandbox_id)` (`crates/navigator-server/src/inference.rs`), which takes `&Store` and `&str` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server. The function similarly delegates route filtering to `list_sandbox_routes(store, allowed_routes)`.
+#### Route Bundle Delivery
 
-The `GetSandboxInferenceBundleResponse` includes:
+The `GetInferenceBundle` RPC resolves the managed cluster route into a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
 
-- **`routes`** -- a list of `SandboxResolvedRoute` messages, each containing `routing_hint`, `base_url`, `model_id`, `api_key`, and normalized `protocols`. These are flattened from `InferenceRoute.spec` -- no route IDs or names are exposed to the sandbox.
-- **`revision`** -- a hex-encoded hash computed from the route contents (`routing_hint`, `base_url`, `model_id`, `api_key`, `protocols`). Sandboxes can compare this value to detect when their route set has changed.
+The trait method delegates to `resolve_inference_bundle(store)` (`crates/navigator-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
+
+The `GetInferenceBundleResponse` includes:
+
+- **`routes`** -- a list of `ResolvedRoute` messages containing base URL, model ID, API key, protocols, and provider type. Currently contains zero or one routes (the managed cluster route).
+- **`revision`** -- a hex-encoded hash computed from route contents. Sandboxes compare this value to detect when their route set has changed.
 - **`generated_at_ms`** -- epoch milliseconds when the bundle was assembled.
 
-Route filtering in `list_sandbox_routes()` (`crates/navigator-server/src/inference.rs`):
-1. Load the sandbox's `InferencePolicy.allowed_routes` into a `HashSet`.
-2. Fetch all `InferenceRoute` records from the store (up to 500).
-3. Skip routes where `enabled == false`.
-4. Skip routes whose `routing_hint` is not in the allowed set.
-5. Normalize protocols via `navigator_core::inference::normalize_protocols()` and skip routes with no valid protocols after normalization.
+#### Provider-Based Route Resolution
 
-#### Route CRUD
+Managed route resolution in `resolve_managed_cluster_route()` (`crates/navigator-server/src/inference.rs`):
 
-| RPC | Description |
-|-----|-------------|
-| `CreateInferenceRoute` | Creates a route. Normalizes protocols (lowercase + dedupe), validates required fields (`routing_hint`, `base_url`, `protocols`, `model_id`). Auto-generates a 6-char name if empty. Rejects duplicates by name. |
-| `UpdateInferenceRoute` | Updates a route by name. Preserves stored `id`. Normalizes protocols and validates the spec. |
-| `DeleteInferenceRoute` | Deletes a route by name. Returns `deleted: bool`. |
-| `ListInferenceRoutes` | Paginated list (default limit 100). |
+1. Load the managed route by name (`inference.local`).
+2. Skip (return `None`) if the route does not exist, has no spec, or is disabled.
+3. Validate that `provider_name` and `model_id` are non-empty.
+4. Fetch the referenced provider record from the store.
+5. Resolve the provider into a `ResolvedProviderRoute` via `resolve_provider_route()`:
+   - Look up the `InferenceProviderProfile` for the provider's type via `navigator_core::inference::profile_for()`. Supported types: `openai`, `anthropic`, `nvidia`.
+   - Search the provider's credentials map for an API key using the profile's preferred key name (e.g., `OPENAI_API_KEY`), falling back to the first non-empty credential in sorted key order.
+   - Resolve the base URL from the provider's config map using the profile-specific key (e.g., `OPENAI_BASE_URL`), falling back to the profile's default URL.
+   - Derive protocols from the profile (e.g., `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` for OpenAI-compatible providers).
+6. Return a `ResolvedRoute` with the fully materialized endpoint, credentials, and protocols.
+
+The `ClusterInferenceConfig` stored in the database contains only `provider_name` and `model_id`. All other fields (endpoint, credentials, protocols, auth style) are resolved from the provider record at bundle generation time via `build_cluster_inference_config()`.
 
 ## HTTP Endpoints
 
@@ -511,7 +520,7 @@ Updated by the sandbox watcher on every Applied event and by gRPC handlers durin
   - `AlreadyExists` for duplicate creation
   - `FailedPrecondition` for state violations (e.g., exec on non-Ready sandbox, missing provider)
   - `Internal` for store/decode/Kubernetes failures
-  - `PermissionDenied` for policy violations (e.g., sandbox has no inference policy or empty `allowed_routes`)
+  - `PermissionDenied` for policy violations
   - `ResourceExhausted` for broadcast lag (missed messages)
   - `Cancelled` for closed broadcast channels
 

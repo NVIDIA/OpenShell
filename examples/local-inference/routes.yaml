@@ -11,7 +11,7 @@
 #     -- python examples/inference/inference.py
 
 routes:
-  - routing_hint: local
+  - name: inference.local
     endpoint: http://localhost:1234/v1
     model: local-model
     protocols:

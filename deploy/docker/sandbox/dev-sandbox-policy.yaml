@@ -130,7 +130,3 @@ network_policies:
       - { path: /usr/bin/wget }
       - { path: "/sandbox/.vscode-server/**" }
       - { path: "/sandbox/.vscode-remote-containers/**" }
-
-inference:
-  allowed_routes:
-    - local

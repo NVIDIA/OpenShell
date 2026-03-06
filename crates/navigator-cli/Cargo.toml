@@ -76,6 +76,7 @@ futures = { workspace = true }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 reqwest = { workspace = true }
 serde_json = { workspace = true }
+temp-env = "0.3"
 tempfile = "3"
 tokio-stream = { workspace = true }
 url = { workspace = true }

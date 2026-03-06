@@ -79,6 +79,8 @@ impl ProviderRegistry {
         registry.register(providers::codex::CodexProvider);
         registry.register(providers::opencode::OpencodeProvider);
         registry.register(providers::generic::GenericProvider);
+        registry.register(providers::openai::OpenaiProvider);
+        registry.register(providers::anthropic::AnthropicProvider);
         registry.register(providers::nvidia::NvidiaProvider);
         registry.register(providers::gitlab::GitlabProvider);
         registry.register(providers::github::GithubProvider);
@@ -128,6 +130,8 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "codex" => Some("codex"),
         "opencode" => Some("opencode"),
         "generic" => Some("generic"),
+        "openai" => Some("openai"),
+        "anthropic" => Some("anthropic"),
         "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
@@ -157,6 +161,8 @@ mod tests {
         assert_eq!(normalize_provider_type("gh"), Some("github"));
         assert_eq!(normalize_provider_type("CLAUDE"), Some("claude"));
         assert_eq!(normalize_provider_type("generic"), Some("generic"));
+        assert_eq!(normalize_provider_type("openai"), Some("openai"));
+        assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
         assert_eq!(normalize_provider_type("unknown"), None);
     }

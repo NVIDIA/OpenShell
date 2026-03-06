@@ -963,19 +963,6 @@ fn render_policy_lines(
         lines.push(Line::from(""));
     }
 
-    // --- Inference ---
-    if let Some(inference) = &policy.inference {
-        if !inference.allowed_routes.is_empty() {
-            lines.push(Line::from(Span::styled("Inference", styles::HEADING)));
-            let routes = inference.allowed_routes.join(", ");
-            lines.push(Line::from(vec![
-                Span::styled("  Allowed routes: ", styles::MUTED),
-                Span::styled(routes, styles::TEXT),
-            ]));
-            lines.push(Line::from(""));
-        }
-    }
-
     // --- Network Rules ---
     if !policy.network_policies.is_empty() {
         // Sort keys for deterministic display.

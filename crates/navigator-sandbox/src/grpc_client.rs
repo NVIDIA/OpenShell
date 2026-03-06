@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
-    GetSandboxInferenceBundleRequest, GetSandboxInferenceBundleResponse, GetSandboxPolicyRequest,
+    GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxPolicyRequest,
     GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
     SandboxPolicy as ProtoSandboxPolicy, UpdateSandboxPolicyRequest,
     inference_client::InferenceClient, navigator_client::NavigatorClient,
@@ -264,20 +264,15 @@ impl CachedNavigatorClient {
     }
 }
 
-/// Fetch the pre-filtered inference route bundle for a sandbox.
-pub async fn fetch_inference_bundle(
-    endpoint: &str,
-    sandbox_id: &str,
-) -> Result<GetSandboxInferenceBundleResponse> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Fetching inference route bundle");
+/// Fetch the resolved inference route bundle from the server.
+pub async fn fetch_inference_bundle(endpoint: &str) -> Result<GetInferenceBundleResponse> {
+    debug!(endpoint = %endpoint, "Fetching inference route bundle");
 
     let channel = connect_channel(endpoint).await?;
     let mut client = InferenceClient::new(channel);
 
     let response = client
-        .get_sandbox_inference_bundle(GetSandboxInferenceBundleRequest {
-            sandbox_id: sandbox_id.to_string(),
-        })
+        .get_inference_bundle(GetInferenceBundleRequest {})
         .await
         .into_diagnostic()?;
 

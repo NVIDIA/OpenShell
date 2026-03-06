@@ -25,10 +25,4 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-# No network_policies needed for inference routing — any outgoing connection
-# from a binary not explicitly allowed will be intercepted and checked for
-# inference API patterns when inference routing is configured below.
-
-inference:
-  allowed_routes:
-  - local
+# No network policies means all outbound connections are denied and only inference.local is allowed.

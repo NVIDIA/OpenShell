@@ -18,6 +18,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
+const INFERENCE_LOCAL_HOST: &str = "inference.local";
 
 /// Result of a proxy CONNECT policy decision.
 struct ConnectDecision {
@@ -210,6 +211,22 @@ async fn handle_tcp_connection(
     let (host, port) = parse_target(target)?;
     let host_lc = host.to_ascii_lowercase();
 
+    if host_lc == INFERENCE_LOCAL_HOST {
+        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
+        let outcome = handle_inference_interception(
+            client,
+            INFERENCE_LOCAL_HOST,
+            port,
+            tls_state.as_ref(),
+            inference_ctx.as_ref(),
+        )
+        .await?;
+        if let InferenceOutcome::Denied { reason } = outcome {
+            info!(action = "deny", reason = %reason, host = INFERENCE_LOCAL_HOST, "Inference interception denied");
+        }
+        return Ok(());
+    }
+
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
@@ -225,11 +242,6 @@ async fn handle_tcp_connection(
 
     // Extract action string and matched policy for logging
     let (action_str, matched_policy, deny_reason) = match &decision.action {
-        NetworkAction::InspectForInference { matched_policy } => (
-            "inspect_for_inference",
-            matched_policy.clone(),
-            String::new(),
-        ),
         NetworkAction::Allow { matched_policy } => ("allow", matched_policy.clone(), String::new()),
         NetworkAction::Deny { reason } => ("deny", None, reason.clone()),
     };
@@ -283,50 +295,6 @@ async fn handle_tcp_connection(
 
     if matches!(decision.action, NetworkAction::Deny { .. }) {
         respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
-    }
-
-    // InspectForInference: intercept the connection, don't connect upstream.
-    // TLS-terminate the client side, parse HTTP requests, and reroute inference
-    // calls through the gateway's ProxyInference gRPC endpoint.
-    if matches!(decision.action, NetworkAction::InspectForInference { .. }) {
-        respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
-        let outcome = handle_inference_interception(
-            client,
-            &host_lc,
-            port,
-            tls_state.as_ref(),
-            inference_ctx.as_ref(),
-        )
-        .await;
-
-        let deny_reason = match &outcome {
-            Ok(InferenceOutcome::Routed) => None,
-            Ok(InferenceOutcome::Denied { reason }) => Some(reason.clone()),
-            Err(e) => Some(format!("{e}")),
-        };
-
-        if let Some(reason) = deny_reason {
-            info!(
-                src_addr = %peer_addr.ip(),
-                src_port = peer_addr.port(),
-                proxy_addr = %local_addr,
-                dst_host = %host_lc,
-                dst_port = port,
-                binary = %binary_str,
-                binary_pid = %pid_str,
-                ancestors = %ancestors_str,
-                cmdline = %cmdline_str,
-                action = "deny",
-                engine = "opa",
-                policy = %policy_str,
-                reason = %reason,
-                "CONNECT",
-            );
-        }
-
-        // Propagate errors; Ok(Routed|Denied) are both terminal
-        outcome?;
         return Ok(());
     }
 
@@ -688,7 +656,7 @@ async fn handle_inference_interception(
 
     let Some(ctx) = inference_ctx else {
         return Ok(InferenceOutcome::Denied {
-            reason: "connection not allowed by policy".to_string(),
+            reason: "cluster inference context not configured".to_string(),
         });
     };
 
@@ -786,10 +754,14 @@ async fn route_inference_request(
 ) -> Result<bool> {
     use crate::l7::inference::{detect_inference_pattern, format_http_response};
 
-    if let Some(pattern) = detect_inference_pattern(&request.method, &request.path, &ctx.patterns) {
+    let normalized_path = normalize_inference_path(&request.path);
+
+    if let Some(pattern) =
+        detect_inference_pattern(&request.method, &normalized_path, &ctx.patterns)
+    {
         info!(
             method = %request.method,
-            path = %request.path,
+            path = %normalized_path,
             protocol = %pattern.protocol,
             kind = %pattern.kind,
             "Intercepted inference request, routing locally"
@@ -801,7 +773,10 @@ async fn route_inference_request(
         let routes = ctx.routes.read().await;
 
         if routes.is_empty() {
-            let body = serde_json::json!({"error": "inference endpoint detected without matching inference route"});
+            let body = serde_json::json!({
+                "error": "cluster inference is not configured",
+                "hint": "run: nemoclaw cluster inference set --help"
+            });
             let body_bytes = body.to_string();
             let response = format_http_response(
                 503,
@@ -817,7 +792,7 @@ async fn route_inference_request(
             .proxy_with_candidates(
                 &pattern.protocol,
                 &request.method,
-                &request.path,
+                &normalized_path,
                 filtered_headers,
                 bytes::Bytes::from(request.body.clone()),
                 &routes,
@@ -848,7 +823,7 @@ async fn route_inference_request(
         // Not an inference request — deny
         info!(
             method = %request.method,
-            path = %request.path,
+            path = %normalized_path,
             "connection not allowed by policy"
         );
         let body = serde_json::json!({"error": "connection not allowed by policy"});
@@ -866,10 +841,9 @@ async fn route_inference_request(
 fn router_error_to_http(err: &navigator_router::RouterError) -> (u16, String) {
     use navigator_router::RouterError;
     match err {
-        RouterError::RouteNotFound(hint) => (
-            400,
-            format!("no route configured for routing_hint '{hint}'"),
-        ),
+        RouterError::RouteNotFound(hint) => {
+            (400, format!("no route configured for route '{hint}'"))
+        }
         RouterError::NoCompatibleRoute(protocol) => (
             400,
             format!("no compatible route for source protocol '{protocol}'"),
@@ -941,7 +915,7 @@ fn query_l7_config(
     host: &str,
     port: u16,
 ) -> Option<crate::l7::L7EndpointConfig> {
-    // Only query if action is Allow (not Deny or InspectForInference)
+    // Only query if action is Allow (not Deny)
     let has_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
         _ => false,
@@ -1163,6 +1137,17 @@ fn query_allowed_ips(
             vec![]
         }
     }
+}
+
+fn normalize_inference_path(path: &str) -> String {
+    if let Some(scheme_idx) = path.find("://") {
+        let after_scheme = &path[scheme_idx + 3..];
+        if let Some(path_start) = after_scheme.find('/') {
+            return after_scheme[path_start..].to_string();
+        }
+        return "/".to_string();
+    }
+    path.to_string()
 }
 
 /// Extract the hostname from an absolute-form URI used in plain HTTP proxy requests.

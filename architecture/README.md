@@ -10,7 +10,7 @@ The platform packages the entire infrastructure -- orchestration gateway, sandbo
 
 ## How the Subsystems Fit Together
 
-The following diagram shows how the major subsystems interact at a high level. Users interact through the CLI, which communicates with a central gateway. The gateway manages sandbox lifecycle in Kubernetes, and each sandbox enforces its own policy locally.
+The following diagram shows how the major subsystems interact at a high level. Users interact through the CLI, which communicates with a central gateway. The gateway manages sandbox lifecycle in Kubernetes, and each sandbox enforces its own policy locally. Inference API calls to `inference.local` are routed locally within the sandbox by an embedded inference router, without traversing the gateway at request time.
 
 ```mermaid
 flowchart TB
@@ -25,6 +25,7 @@ flowchart TB
         subgraph SBX["Sandbox Pod"]
             SUPERVISOR["Sandbox Supervisor"]
             PROXY["Network Proxy"]
+            ROUTER["Inference Router"]
             CHILD["Agent Process (restricted)"]
             OPA["Policy Engine (OPA)"]
         end
@@ -33,20 +34,20 @@ flowchart TB
     subgraph EXT["External Services"]
         HOSTS["Allowed Hosts (github.com, api.anthropic.com, ...)"]
         CREDS["Provider APIs (Claude, GitHub, GitLab, ...)"]
-        BACKEND["Inference Backends (LM Studio, vLLM, ...)"]
+        BACKEND["Inference Backends (OpenAI, Anthropic, NVIDIA, local)"]
     end
 
     CLI -- "gRPC / HTTPS" --> SERVER
     CLI -- "SSH over HTTP CONNECT" --> SERVER
     SERVER -- "CRUD + Watch" --> DB
     SERVER -- "Create / Delete Pods" --> SBX
-    SUPERVISOR -- "Fetch Policy + Credentials" --> SERVER
+    SUPERVISOR -- "Fetch Policy + Credentials + Inference Bundle" --> SERVER
     SUPERVISOR -- "Spawn + Restrict" --> CHILD
     CHILD -- "All network traffic" --> PROXY
     PROXY -- "Evaluate request" --> OPA
     PROXY -- "Allowed traffic only" --> HOSTS
-    PROXY -- "Inference reroute (gRPC)" --> SERVER
-    SERVER -- "Proxied inference" --> BACKEND
+    PROXY -- "inference.local requests" --> ROUTER
+    ROUTER -- "Proxied inference" --> BACKEND
     SERVER -. "Store / retrieve credentials" .-> CREDS
 ```
 
@@ -83,9 +84,9 @@ When the agent (or any tool running inside the sandbox) tries to connect to a re
 3. **Evaluates the request against policy** using the OPA engine. The policy can allow or deny connections based on the destination hostname, port, and the identity of the requesting program.
 4. **Rejects connections to internal IP addresses** as a defense against SSRF (Server-Side Request Forgery). Even if the policy allows a hostname, the proxy resolves DNS before connecting and blocks any result that points to a private network address (e.g., cloud metadata endpoints, localhost, or RFC 1918 ranges). This prevents an attacker from redirecting an allowed hostname to internal infrastructure.
 5. **Performs protocol-aware inspection (L7)** for configured endpoints. The proxy can terminate TLS, inspect the underlying HTTP traffic, and enforce rules on individual API requests -- not just connection-level allow/deny. This operates in either audit mode (log violations but allow traffic) or enforce mode (block violations).
-6. **Intercepts inference API calls** when the sandbox has inference routing configured. Connections that don't match any explicit network policy but have inference routes available are TLS-terminated and inspected. Known inference API patterns (OpenAI, Anthropic) are detected and rerouted through the gateway to the configured backend, while non-inference requests are denied.
+6. **Intercepts inference API calls** to `inference.local`. When the agent sends an HTTPS CONNECT request to `inference.local`, the proxy bypasses OPA evaluation entirely and handles the connection through a dedicated inference interception path. It TLS-terminates the connection, parses the HTTP request, detects known inference API patterns (OpenAI, Anthropic, model discovery), and routes matching requests locally through the sandbox's embedded inference router (`navigator-router`). Non-inference requests to `inference.local` are denied with 403.
 
-The proxy generates an ephemeral certificate authority at startup and injects it into the sandbox's trust store. This allows it to transparently inspect HTTPS traffic when L7 inspection is configured for an endpoint.
+The proxy generates an ephemeral certificate authority at startup and injects it into the sandbox's trust store. This allows it to transparently inspect HTTPS traffic when L7 inspection is configured for an endpoint, and to serve TLS for `inference.local` interception.
 
 For more detail, see [Sandbox Architecture](sandbox.md) (Proxy Routing section).
 
@@ -101,6 +102,7 @@ Key responsibilities:
 - **TLS termination**: The gateway supports TLS with automatic protocol negotiation, so gRPC and HTTP clients can connect securely on the same port.
 - **SSH tunnel gateway**: The gateway provides the entry point for SSH connections into sandboxes (see Sandbox Connect below).
 - **Real-time updates**: The gateway streams sandbox status changes to the CLI, so users see live progress when a sandbox is starting up.
+- **Inference bundle resolution**: The gateway stores cluster-level inference configuration (provider name + model ID) and resolves it into bundles containing endpoint URLs, API keys, supported protocols, provider type, and auth metadata. Sandboxes fetch these bundles at startup and refresh them periodically. The gateway does not proxy inference traffic at request time -- it only provides configuration.
 
 For more detail, see [Gateway Architecture](gateway.md).
 
@@ -153,7 +155,7 @@ AI agents typically need credentials to access external services -- an API key f
 
 The provider system handles:
 
-- **Automatic discovery**: The CLI scans the user's local machine for existing credentials (environment variables, configuration files) and offers to upload them to the gateway. Supported providers include Claude, Codex, OpenCode, GitHub, GitLab, and others.
+- **Automatic discovery**: The CLI scans the user's local machine for existing credentials (environment variables, configuration files) and offers to upload them to the gateway. Supported providers include Claude, Codex, OpenCode, OpenAI, Anthropic, NVIDIA, GitHub, GitLab, and others.
 - **Secure storage**: Credentials are stored on the gateway, separate from sandbox definitions. They never appear in Kubernetes pod specifications.
 - **Runtime injection**: When a sandbox starts, the supervisor process fetches the credentials from the gateway via gRPC and injects them as environment variables into every process it spawns (both the initial agent process and any SSH sessions).
 - **CLI management**: Users can create, update, list, and delete providers through standard CLI commands.
@@ -164,47 +166,37 @@ For more detail, see [Providers](sandbox-providers.md).
 
 ### Inference Routing
 
-The inference routing system transparently intercepts AI inference API calls from sandboxed agents and reroutes them through the gateway to policy-controlled backends. This enables organizations to redirect inference traffic to local or self-hosted models without modifying the agent's code.
+The inference routing system transparently intercepts AI inference API calls from sandboxed agents and routes them to configured backends. Routing happens locally within the sandbox -- the proxy intercepts connections to `inference.local`, and the embedded `navigator-router` forwards requests directly to the backend without traversing the gateway at request time.
 
 **How it works end-to-end:**
 
-1. The sandbox policy includes an `inference.allowed_routes` list (e.g., `["local"]`).
-2. When the agent makes an HTTPS request to any endpoint (e.g., `api.openai.com`), the proxy evaluates it:
-   - If the endpoint + binary is explicitly allowed in `network_policies` -- pass through directly.
-   - If no policy match but inference routes are configured -- **intercept** (OPA returns the `inspect_for_inference` action).
-   - Otherwise -- deny.
-3. For intercepted connections, the proxy:
-   - TLS-terminates the client connection using the sandbox's ephemeral CA.
-   - Parses the HTTP request.
-   - Detects known inference API patterns (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic).
-   - Strips authorization headers and forwards the request to the gateway via gRPC (`ProxyInference` RPC).
-4. The gateway's inference service:
-   - Loads the sandbox's policy to get `allowed_routes`.
-   - Finds enabled inference routes whose `routing_hint` matches the allowed list.
-   - Selects a compatible route by matching the source protocol (e.g., `openai_chat_completions`).
-   - Forwards the request to the route's backend URL, rewriting the authorization header with the route's API key.
-5. The response flows back through the gateway to the proxy to the agent -- the agent sees a normal HTTP response as if it came from the original API.
+1. An operator configures cluster-level inference via `nemoclaw cluster inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
+2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle every 30 seconds.
+3. The agent sends requests to `https://inference.local` using standard OpenAI or Anthropic SDK calls.
+4. The sandbox proxy intercepts the HTTPS CONNECT to `inference.local` (bypassing OPA policy evaluation), TLS-terminates the connection using the sandbox's ephemeral CA, and parses the HTTP request.
+5. Known inference API patterns are detected (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic, `GET /v1/models` for model discovery). Matching requests are forwarded to the first compatible route by the `navigator-router`, which rewrites the auth header, injects provider-specific default headers (e.g., `anthropic-version` for Anthropic), and overrides the model field in the request body.
+6. Non-inference requests to `inference.local` are denied with 403.
 
 **Key design properties:**
 
-- Agents need zero code changes -- standard OpenAI/Anthropic SDK calls work transparently.
-- The sandbox never sees the real API key for the backend -- credential isolation is maintained.
-- Policy controls which routes a sandbox can access via `inference.allowed_routes`.
-- Routes are managed as server-side resources via CLI (`nemoclaw inference create/update/delete/list`).
+- Agents need zero code changes -- standard OpenAI/Anthropic SDK calls work transparently when pointed at `inference.local`.
+- The sandbox never sees the real API key for the backend -- credential isolation is maintained through the gateway's bundle resolution.
+- Routing is explicit via `inference.local`; OPA network policy is not involved in inference routing.
+- Provider-specific behavior (auth header style, default headers, supported protocols) is centralized in `InferenceProviderProfile` definitions in `navigator-core`. Supported inference provider types are openai, anthropic, and nvidia.
+- Cluster inference is managed via CLI (`nemoclaw cluster inference set/get`).
 
-**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`) and have these fields: `routing_hint` (name for policy matching), `base_url` (backend endpoint), `protocols` (supported API protocols like `openai_chat_completions` or `anthropic_messages`), `api_key`, `model_id`, and `enabled` flag.
+**Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Cluster inference uses a managed singleton route entry keyed by `inference.local` and configured from provider + model settings. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
 
 **Components involved:**
 
 | Component | Location | Role |
 |---|---|---|
-| OPA `network_action` rule | `crates/navigator-sandbox/data/sandbox-policy.rego` | Returns `inspect_for_inference` when no explicit policy match and inference routes exist |
-| Proxy interception | `crates/navigator-sandbox/src/proxy.rs` | TLS-terminates intercepted connections, parses HTTP, calls gateway |
+| Proxy inference interception | `crates/navigator-sandbox/src/proxy.rs` | Intercepts `inference.local` CONNECT requests, TLS-terminates, dispatches to router |
 | Inference pattern detection | `crates/navigator-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
-| gRPC forwarding | `crates/navigator-sandbox/src/grpc_client.rs` | Sends `ProxyInferenceRequest` to the gateway |
-| Gateway inference service | `crates/navigator-server/src/inference.rs` | Resolves routes from policy, delegates to router |
-| Inference router | `crates/navigator-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
-| Proto definitions | `proto/inference.proto` | `InferenceRouteSpec`, `ProxyInferenceRequest/Response`, CRUD RPCs |
+| Local inference router | `crates/navigator-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
+| Provider profiles | `crates/navigator-core/src/inference.rs` | Centralized auth, headers, protocols, and endpoint defaults per provider type |
+| Gateway inference service | `crates/navigator-server/src/inference.rs` | Stores cluster inference config, resolves bundles with credentials from provider records |
+| Proto definitions | `proto/inference.proto` | `ClusterInferenceConfig`, `ResolvedRoute`, bundle RPCs |
 
 
 ### Container and Build System
@@ -228,8 +220,9 @@ Sandbox behavior is governed by policies written in YAML and evaluated by an emb
 - **Filesystem access**: Which directories are readable, which are writable.
 - **Network access**: Which remote hosts each program in the sandbox can connect to, with per-binary granularity.
 - **Process privileges**: What user/group the agent runs as.
-- **Inference routing**: Which AI model backends the sandbox can route inference traffic to, referenced by `routing_hint` name.
 - **L7 inspection rules**: Protocol-level constraints on HTTP API calls for specific endpoints.
+
+Inference routing to `inference.local` is configured separately at the cluster level and does not require network policy entries. The OPA engine evaluates only explicit network policies; `inference.local` connections bypass OPA entirely and are handled by the proxy's dedicated inference interception path.
 
 Policies are not intended to be hand-edited by end users in normal operation. They are associated with sandboxes at creation time and fetched by the sandbox supervisor at startup via gRPC. For development and testing, policies can also be loaded from local files.
 
@@ -242,7 +235,7 @@ The CLI is the primary way users interact with the platform. It provides command
 - **Cluster management** (`nemoclaw cluster`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
 - **Sandbox management** (`nemoclaw sandbox`): Create sandboxes (with optional file sync and provider auto-discovery), list running sandboxes, connect to sandboxes via SSH, and delete sandboxes.
 - **Provider management** (`nemoclaw provider`): Create, update, list, and delete external service credentials.
-- **Inference management** (`nemoclaw inference`): Configure routing rules for AI model API endpoints.
+- **Inference management** (`nemoclaw cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
 
 The CLI resolves which cluster to operate on through a priority chain: explicit `--cluster` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `nemoclaw cluster use`. It supports TLS client certificates for mutual authentication with the gateway.
 
@@ -290,7 +283,9 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 | [Sandbox Architecture](sandbox.md) | The sandbox execution environment: policy enforcement, Landlock, seccomp, network namespaces, and the network proxy. |
 | [Container Management](build-containers.md) | Container images, Dockerfiles, Helm charts, build tasks, and CI/CD. |
 | [Sandbox Connect](sandbox-connect.md) | SSH tunneling into sandboxes through the gateway. |
+| [Sandbox Custom Containers](sandbox-custom-containers.md) | Building and using custom container images for sandboxes. |
 | [Providers](sandbox-providers.md) | External credential management, auto-discovery, and runtime injection. |
 | [Policy Language](security-policy.md) | The YAML/Rego policy system that governs sandbox behavior. |
-| [Inference Routing](inference-routing.md) | Transparent interception and rerouting of AI inference API calls from sandboxed agents to policy-controlled backends. |
-| [Local Inference Routing Demo](inference-routing-local-demo.md) | Step-by-step recording script for showing OpenAI SDK interception and reroute to a local LM Studio backend. |
+| [Inference Routing](inference-routing.md) | Transparent interception and sandbox-local routing of AI inference API calls to configured backends. |
+| [System Architecture](system-architecture.md) | Top-level system architecture diagram with all deployable components and communication flows. |
+| [TUI](tui.md) | Terminal user interface for sandbox interaction. |

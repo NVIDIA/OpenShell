@@ -22,19 +22,17 @@ use navigator_bootstrap::{
 };
 use navigator_core::proto::navigator_client::NavigatorClient;
 use navigator_core::proto::{
-    CreateInferenceRouteRequest, CreateProviderRequest, CreateSandboxRequest,
-    DeleteInferenceRouteRequest, DeleteProviderRequest, DeleteSandboxRequest, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
-    InferenceRoute, InferenceRouteSpec, ListInferenceRoutesRequest, ListProvidersRequest,
+    CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
+    GetClusterInferenceRequest, GetProviderRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
     ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, UpdateInferenceRouteRequest,
+    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
     UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
 };
 use owo_colors::OwoColorize;
-use reqwest::StatusCode as ReqwestStatusCode;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
@@ -2219,374 +2217,85 @@ pub async fn provider_delete(server: &str, names: &[String], tls: &TlsOptions) -
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-pub async fn inference_route_create(
+pub async fn cluster_inference_set(
     server: &str,
-    name: Option<&str>,
-    routing_hint: &str,
-    base_url: &str,
-    protocols: &[String],
-    api_key: &str,
+    provider_name: &str,
     model_id: &str,
-    enabled: bool,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let spinner = inference_route_spinner("Preparing inference route...");
-    let (resolved_protocols, auto_detected) =
-        match resolve_route_protocols(protocols, base_url, api_key, model_id, Some(&spinner)).await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                spinner.finish_and_clear();
-                return Err(err);
-            }
-        };
-
-    spinner.set_message("Creating inference route...".to_string());
-
-    let mut client = match grpc_inference_client(server, tls).await {
-        Ok(client) => client,
-        Err(err) => {
-            spinner.finish_and_clear();
-            return Err(err);
-        }
-    };
-
-    let response = client
-        .create_inference_route(CreateInferenceRouteRequest {
-            name: name.unwrap_or_default().to_string(),
-            route: Some(InferenceRouteSpec {
-                routing_hint: routing_hint.to_string(),
-                base_url: base_url.to_string(),
-                protocols: resolved_protocols.clone(),
-                api_key: api_key.to_string(),
-                model_id: model_id.to_string(),
-                enabled,
-            }),
-        })
-        .await
-        .into_diagnostic();
-
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            spinner.finish_and_clear();
-            return Err(err);
-        }
-    };
-
-    spinner.finish_and_clear();
-
-    if let Some(route) = response.into_inner().route {
-        println!("{} Created route {}", "✓".green().bold(), route.name);
-        if auto_detected {
-            println!(
-                "  {} {}",
-                "Detected protocols:".dimmed(),
-                resolved_protocols.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn inference_route_update(
-    server: &str,
-    name: &str,
-    routing_hint: &str,
-    base_url: &str,
-    protocols: &[String],
-    api_key: &str,
-    model_id: &str,
-    enabled: bool,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let spinner = inference_route_spinner("Preparing inference route update...");
-    let (resolved_protocols, auto_detected) =
-        match resolve_route_protocols(protocols, base_url, api_key, model_id, Some(&spinner)).await
-        {
-            Ok(result) => result,
-            Err(err) => {
-                spinner.finish_and_clear();
-                return Err(err);
-            }
-        };
-
-    spinner.set_message(format!("Updating inference route {name}..."));
-
-    let mut client = match grpc_inference_client(server, tls).await {
-        Ok(client) => client,
-        Err(err) => {
-            spinner.finish_and_clear();
-            return Err(err);
-        }
-    };
-
-    let response = client
-        .update_inference_route(UpdateInferenceRouteRequest {
-            name: name.to_string(),
-            route: Some(InferenceRouteSpec {
-                routing_hint: routing_hint.to_string(),
-                base_url: base_url.to_string(),
-                protocols: resolved_protocols.clone(),
-                api_key: api_key.to_string(),
-                model_id: model_id.to_string(),
-                enabled,
-            }),
-        })
-        .await
-        .into_diagnostic();
-
-    let response = match response {
-        Ok(response) => response,
-        Err(err) => {
-            spinner.finish_and_clear();
-            return Err(err);
-        }
-    };
-
-    spinner.finish_and_clear();
-
-    if let Some(route) = response.into_inner().route {
-        println!("{} Updated route {}", "✓".green().bold(), route.name);
-        if auto_detected {
-            println!(
-                "  {} {}",
-                "Detected protocols:".dimmed(),
-                resolved_protocols.join(", ")
-            );
-        }
-    }
-    Ok(())
-}
-
-pub async fn inference_route_delete(
-    server: &str,
-    names: &[String],
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_inference_client(server, tls).await?;
-    for name in names {
-        let response = client
-            .delete_inference_route(DeleteInferenceRouteRequest { name: name.clone() })
-            .await
-            .into_diagnostic()?;
-        if response.into_inner().deleted {
-            println!("{} Deleted route {name}", "✓".green().bold());
-        } else {
-            println!("{} Route {name} not found", "!".yellow());
-        }
-    }
-    Ok(())
-}
-
-pub async fn inference_route_list(
-    server: &str,
-    limit: u32,
-    offset: u32,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_inference_client(server, tls).await?;
     let response = client
-        .list_inference_routes(ListInferenceRoutesRequest { limit, offset })
+        .set_cluster_inference(SetClusterInferenceRequest {
+            provider_name: provider_name.to_string(),
+            model_id: model_id.to_string(),
+        })
         .await
         .into_diagnostic()?;
-    let routes = response.into_inner().routes;
 
-    if routes.is_empty() {
-        println!("No inference routes found");
-        return Ok(());
-    }
-
-    println!(
-        "{:<12}  {:<16}  {:<40}  {:<30}  {:<30}  {:<8}",
-        "NAME".bold(),
-        "HINT".bold(),
-        "BASE URL".bold(),
-        "PROTOCOLS".bold(),
-        "MODEL".bold(),
-        "ENABLED".bold()
-    );
-    for route in routes {
-        print_route_row(&route);
-    }
-
+    let configured = response.into_inner();
+    println!("{}", "Cluster inference configured:".cyan().bold());
+    println!();
+    println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+    println!("  {} {}", "Model:".dimmed(), configured.model_id);
+    println!("  {} {}", "Version:".dimmed(), configured.version);
     Ok(())
 }
 
-fn print_route_row(route: &InferenceRoute) {
-    let Some(spec) = route.spec.as_ref() else {
-        println!(
-            "{:<12}  {:<16}  {:<40}  {:<30}  {:<30}  {:<8}",
-            route.name, "<missing>", "", "", "", "false"
-        );
-        return;
-    };
-
-    let protocols = route_protocols(spec);
-    let protocol_display = if protocols.is_empty() {
-        "<none>".to_string()
-    } else {
-        protocols.join(",")
-    };
-
-    println!(
-        "{:<12}  {:<16}  {:<40}  {:<30}  {:<30}  {:<8}",
-        route.name, spec.routing_hint, spec.base_url, protocol_display, spec.model_id, spec.enabled
-    );
-}
-
-fn route_protocols(spec: &InferenceRouteSpec) -> Vec<String> {
-    navigator_core::inference::normalize_protocols(&spec.protocols)
-}
-
-fn inference_route_spinner(initial_message: &str) -> ProgressBar {
-    let spinner = ProgressBar::new_spinner();
-    spinner.set_style(
-        ProgressStyle::with_template("{spinner:.cyan} {msg}")
-            .unwrap_or_else(|_| ProgressStyle::default_spinner()),
-    );
-    spinner.enable_steady_tick(Duration::from_millis(120));
-    spinner.set_message(initial_message.to_string());
-    spinner
-}
-
-fn protocol_probe_url(base_url: &str, endpoint_path: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") && endpoint_path.starts_with("/v1/") {
-        format!("{base}{}", &endpoint_path[3..])
-    } else {
-        format!("{base}{endpoint_path}")
-    }
-}
-
-fn is_supported_probe_status(status: ReqwestStatusCode) -> bool {
-    !matches!(status.as_u16(), 404 | 501)
-}
-
-/// Auto-detect which inference protocols a route endpoint supports.
-///
-/// **Note:** This sends real HTTP POST requests (with `max_tokens: 1`) to the
-/// endpoint to probe for protocol support. This may consume a small amount of
-/// API credits on production endpoints.
-async fn detect_route_protocols(
-    base_url: &str,
-    api_key: &str,
-    model_id: &str,
-    spinner: Option<&ProgressBar>,
-) -> Result<Vec<String>> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-        .into_diagnostic()
-        .wrap_err("failed to build protocol detection HTTP client")?;
-
-    let probes = [
-        (
-            "openai_chat_completions",
-            "/v1/chat/completions",
-            serde_json::json!({
-                "model": model_id,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-            }),
-        ),
-        (
-            "openai_completions",
-            "/v1/completions",
-            serde_json::json!({
-                "model": model_id,
-                "prompt": "ping",
-                "max_tokens": 1,
-            }),
-        ),
-        (
-            "anthropic_messages",
-            "/v1/messages",
-            serde_json::json!({
-                "model": model_id,
-                "max_tokens": 1,
-                "messages": [{"role": "user", "content": "ping"}],
-            }),
-        ),
-    ];
-
-    let mut detected = Vec::new();
-    let mut transport_errors = Vec::new();
-
-    let probe_count = probes.len();
-    for (index, (protocol, path, body)) in probes.into_iter().enumerate() {
-        if let Some(spinner) = spinner {
-            spinner.set_message(format!(
-                "Detecting protocols ({}/{}): POST {}",
-                index + 1,
-                probe_count,
-                path
-            ));
-        }
-
-        let url = protocol_probe_url(base_url, path);
-
-        let mut request = client.post(url).header("content-type", "application/json");
-
-        if protocol == "anthropic_messages" {
-            request = request
-                .header("x-api-key", api_key)
-                .header("anthropic-version", "2023-06-01");
-        } else {
-            request = request.bearer_auth(api_key);
-        }
-
-        match request.json(&body).send().await {
-            Ok(response) => {
-                if is_supported_probe_status(response.status()) {
-                    detected.push(protocol.to_string());
-                }
-            }
-            Err(err) => {
-                transport_errors.push(format!("{protocol}: {err}"));
-            }
-        }
-    }
-
-    if detected.is_empty() {
-        if transport_errors.is_empty() {
-            return Err(miette::miette!(
-                "could not detect any supported protocols for {base_url}; pass --protocol manually"
-            ));
-        }
-
+pub async fn cluster_inference_update(
+    server: &str,
+    provider_name: Option<&str>,
+    model_id: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if provider_name.is_none() && model_id.is_none() {
         return Err(miette::miette!(
-            "could not detect any supported protocols for {base_url}; first probe error: {}; pass --protocol manually",
-            transport_errors[0]
+            "at least one of --provider or --model must be specified"
         ));
     }
 
-    Ok(detected)
+    let mut client = grpc_inference_client(server, tls).await?;
+
+    // Fetch current config to use as base for the partial update.
+    let current = client
+        .get_cluster_inference(GetClusterInferenceRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    let provider = provider_name.unwrap_or(&current.provider_name);
+    let model = model_id.unwrap_or(&current.model_id);
+
+    let response = client
+        .set_cluster_inference(SetClusterInferenceRequest {
+            provider_name: provider.to_string(),
+            model_id: model.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let configured = response.into_inner();
+    println!("{}", "Cluster inference updated:".cyan().bold());
+    println!();
+    println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+    println!("  {} {}", "Model:".dimmed(), configured.model_id);
+    println!("  {} {}", "Version:".dimmed(), configured.version);
+    Ok(())
 }
 
-async fn resolve_route_protocols(
-    protocols: &[String],
-    base_url: &str,
-    api_key: &str,
-    model_id: &str,
-    spinner: Option<&ProgressBar>,
-) -> Result<(Vec<String>, bool)> {
-    let normalized = navigator_core::inference::normalize_protocols(protocols);
-    if !normalized.is_empty() {
-        if let Some(spinner) = spinner {
-            spinner.set_message("Using explicitly provided protocols...".to_string());
-        }
-        return Ok((normalized, false));
-    }
+pub async fn cluster_inference_get(server: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_inference_client(server, tls).await?;
+    let response = client
+        .get_cluster_inference(GetClusterInferenceRequest {})
+        .await
+        .into_diagnostic()?;
 
-    if let Some(spinner) = spinner {
-        spinner.set_message(format!("Detecting supported protocols from {base_url}..."));
-    }
-
-    let detected = detect_route_protocols(base_url, api_key, model_id, spinner).await?;
-    Ok((detected, true))
+    let configured = response.into_inner();
+    println!("{}", "Cluster inference:".cyan().bold());
+    println!();
+    println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+    println!("  {} {}", "Model:".dimmed(), configured.model_id);
+    println!("  {} {}", "Version:".dimmed(), configured.version);
+    Ok(())
 }
 
 fn git_repo_root() -> Result<PathBuf> {
@@ -3024,7 +2733,7 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 
 #[cfg(test)]
 mod tests {
-    use super::{inferred_provider_type, parse_credential_pairs, resolve_route_protocols};
+    use super::{inferred_provider_type, parse_credential_pairs};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -3103,44 +2812,6 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
-    }
-
-    #[tokio::test]
-    async fn resolve_route_protocols_skips_autodetect_when_protocols_are_provided() {
-        let (protocols, autodetected) = resolve_route_protocols(
-            &[
-                " OpenAI_Chat_Completions ".to_string(),
-                "openai_chat_completions".to_string(),
-                "anthropic_messages".to_string(),
-            ],
-            "not-a-valid-url",
-            "dummy-key",
-            "dummy-model",
-            None,
-        )
-        .await
-        .expect("manual protocols should bypass auto-detection");
-
-        assert!(!autodetected);
-        assert_eq!(
-            protocols,
-            vec![
-                "openai_chat_completions".to_string(),
-                "anthropic_messages".to_string(),
-            ]
-        );
-    }
-
-    #[tokio::test]
-    async fn resolve_route_protocols_errors_when_autodetect_fails() {
-        let err = resolve_route_protocols(&[], "not-a-valid-url", "dummy-key", "dummy-model", None)
-            .await
-            .expect_err("missing protocols should require auto-detection");
-
-        assert!(
-            err.to_string()
-                .contains("could not detect any supported protocols")
-        );
     }
 
     #[test]

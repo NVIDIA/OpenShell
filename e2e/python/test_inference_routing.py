@@ -1,34 +1,34 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2E tests for inference interception and routing.
+"""E2E tests for explicit inference routing via `inference.local`.
 
-When a process inside the sandbox makes an inference API call (e.g. POST
-/v1/chat/completions) to an endpoint not explicitly allowed by network policy,
-the proxy intercepts it, TLS-terminates the connection, detects the inference
-API pattern, and the sandbox routes the request locally to the configured
-backend (configured with `mock://` for testing).
+In the new model, sandbox traffic is routed only when the request targets
+`inference.local`. There is no implicit catch-all interception for arbitrary
+hosts like `api.openai.com`.
 """
 
 from __future__ import annotations
 
-import time
-
-import grpc
-
+import fcntl
+from contextlib import contextmanager
 from typing import TYPE_CHECKING
 
-from navigator._proto import datamodel_pb2, sandbox_pb2
+import grpc
+import pytest
+
+from navigator._proto import datamodel_pb2, navigator_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
+    from collections.abc import Callable, Iterator
 
-    from navigator import InferenceRouteClient, Sandbox
+    from navigator import (
+        ClusterInferenceConfig,
+        InferenceRouteClient,
+        Sandbox,
+        SandboxClient,
+    )
 
-
-# =============================================================================
-# Policy helpers
-# =============================================================================
 
 _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
     include_workdir=True,
@@ -38,148 +38,168 @@ _BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
 _BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
 _BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
 
+pytestmark = pytest.mark.xdist_group("inference-routing")
 
-def _inference_routing_policy(
-    allowed_route: str = "e2e_mock_local",
-) -> sandbox_pb2.SandboxPolicy:
-    """Policy with inference routing enabled.
+_MANAGED_OPENAI_MODEL_ID = "mock/e2e-openai-model"
+_MANAGED_OPENAI_PROVIDER_NAME = "e2e-managed-openai"
+_INFERENCE_CONFIG_LOCK = "/tmp/nemoclaw-e2e-inference-config.lock"
 
-    No network_policies needed — any connection from any binary to an endpoint
-    not in an explicit policy will be intercepted for inference when
-    allowed_routes is non-empty.
-    """
+
+def _baseline_policy() -> sandbox_pb2.SandboxPolicy:
     return sandbox_pb2.SandboxPolicy(
         version=1,
-        inference=sandbox_pb2.InferencePolicy(allowed_routes=[allowed_route]),
         filesystem=_BASE_FILESYSTEM,
         landlock=_BASE_LANDLOCK,
         process=_BASE_PROCESS,
     )
 
 
-# =============================================================================
-# Tests
-# =============================================================================
-
-
-def test_route_refresh_picks_up_route_created_after_sandbox_start(
-    sandbox: Callable[..., Sandbox],
+def _upsert_managed_inference(
     inference_client: InferenceRouteClient,
+    sandbox_client: SandboxClient,
+    *,
+    provider_name: str,
+    provider_type: str,
+    credential_key: str,
+    base_url_key: str,
+    model_id: str,
+    base_url: str,
 ) -> None:
-    """Route refresh picks up a route created after sandbox startup.
+    provider = datamodel_pb2.Provider(
+        name=provider_name,
+        type=provider_type,
+        credentials={credential_key: "mock"},
+        config={
+            base_url_key: base_url,
+        },
+    )
+    timeout = sandbox_client._timeout
 
-    Regression scenario:
-    1. Sandbox starts with inference allowed_routes configured but no matching route exists yet.
-    2. Initial inference request should be intercepted and return 503 (empty route cache).
-    3. Create the route after sandbox startup.
-    4. Background refresh should load the new route and subsequent requests should succeed.
-    """
-    route_name = "e2e-mock-refresh-late"
-    route_hint = "e2e_mock_refresh_late"
-    spec = datamodel_pb2.SandboxSpec(policy=_inference_routing_policy(route_hint))
+    for _ in range(5):
+        try:
+            sandbox_client._stub.UpdateProvider(
+                navigator_pb2.UpdateProviderRequest(provider=provider),
+                timeout=timeout,
+            )
+            break
+        except grpc.RpcError as exc:
+            if exc.code() != grpc.StatusCode.NOT_FOUND:
+                raise
 
-    def call_chat_completions() -> str:
-        import json
-        import ssl
-        import urllib.error
-        import urllib.request
+            try:
+                sandbox_client._stub.CreateProvider(
+                    navigator_pb2.CreateProviderRequest(provider=provider),
+                    timeout=timeout,
+                )
+                break
+            except grpc.RpcError as create_exc:
+                if create_exc.code() == grpc.StatusCode.ALREADY_EXISTS:
+                    continue
+                if (
+                    create_exc.code() == grpc.StatusCode.INTERNAL
+                    and "UNIQUE constraint failed" in (create_exc.details() or "")
+                ):
+                    continue
+                raise
+    else:
+        raise RuntimeError("failed to upsert managed e2e provider after retries")
 
-        body = json.dumps(
-            {
-                "model": "test-model",
-                "messages": [{"role": "user", "content": "hello"}],
-            }
-        ).encode()
+    inference_client.set_cluster(
+        provider_name=provider_name,
+        model_id=model_id,
+    )
 
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=body,
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": "Bearer dummy-key",
-            },
-            method="POST",
+
+def _current_cluster_inference(
+    inference_client: InferenceRouteClient,
+) -> ClusterInferenceConfig | None:
+    try:
+        return inference_client.get_cluster()
+    except grpc.RpcError as exc:
+        if exc.code() == grpc.StatusCode.NOT_FOUND:
+            return None
+        raise
+
+
+def _restore_cluster_inference(
+    inference_client: InferenceRouteClient,
+    previous: ClusterInferenceConfig | None,
+) -> None:
+    if previous is None:
+        return
+
+    inference_client.set_cluster(
+        provider_name=previous.provider_name,
+        model_id=previous.model_id,
+    )
+
+
+@contextmanager
+def _cluster_config_lock() -> Iterator[None]:
+    with open(_INFERENCE_CONFIG_LOCK, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+@pytest.fixture
+def managed_openai_route(
+    inference_client: InferenceRouteClient,
+    sandbox_client: SandboxClient,
+) -> Iterator[str]:
+    with _cluster_config_lock():
+        previous = _current_cluster_inference(inference_client)
+        _upsert_managed_inference(
+            inference_client,
+            sandbox_client,
+            provider_name=_MANAGED_OPENAI_PROVIDER_NAME,
+            provider_type="openai",
+            credential_key="OPENAI_API_KEY",
+            base_url_key="OPENAI_BASE_URL",
+            model_id=_MANAGED_OPENAI_MODEL_ID,
+            base_url="mock://e2e-managed-openai",
         )
+        try:
+            yield _MANAGED_OPENAI_MODEL_ID
+        finally:
+            _restore_cluster_inference(inference_client, previous)
+
+
+def test_model_discovery_call_routed_to_backend(
+    sandbox: Callable[..., Sandbox],
+    managed_openai_route: str,
+) -> None:
+    """Model discovery endpoint is treated as an inference protocol."""
+    spec = datamodel_pb2.SandboxSpec(policy=_baseline_policy())
+
+    def call_models() -> str:
+        import ssl
+        import urllib.request
 
         ctx = ssl.create_default_context()
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        try:
-            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
-            return resp.read().decode()
-        except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            return f"http_error_{e.code}:{body}"
-        except Exception as e:
-            return f"error:{type(e).__name__}:{e}"
+        req = urllib.request.Request("https://inference.local/v1/models", method="GET")
+        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+        return resp.read().decode()
 
-    try:
-        inference_client.delete(route_name)
-    except grpc.RpcError:
-        pass
-
-    try:
-        with sandbox(spec=spec, delete_on_exit=True) as sb:
-            initial = sb.exec_python(call_chat_completions, timeout_seconds=60)
-            assert initial.exit_code == 0, f"stderr: {initial.stderr}"
-            initial_output = initial.stdout.strip()
-            assert initial_output.startswith("http_error_503"), initial_output
-            assert (
-                "inference endpoint detected without matching inference route"
-                in initial_output
-            ), initial_output
-
-            inference_client.create(
-                name=route_name,
-                routing_hint=route_hint,
-                base_url="mock://e2e-refresh-late",
-                protocols=["openai_chat_completions"],
-                api_key="mock",
-                model_id="mock/late-route-model",
-                enabled=True,
-            )
-
-            deadline = time.time() + 95
-            last_output = initial_output
-
-            while time.time() < deadline:
-                result = sb.exec_python(call_chat_completions, timeout_seconds=60)
-                assert result.exit_code == 0, f"stderr: {result.stderr}"
-                last_output = result.stdout.strip()
-
-                if "Hello from nemoclaw mock backend" in last_output:
-                    break
-
-                time.sleep(5)
-
-            assert "Hello from nemoclaw mock backend" in last_output, last_output
-            assert "mock/late-route-model" in last_output, last_output
-    finally:
-        try:
-            inference_client.delete(route_name)
-        except grpc.RpcError:
-            pass
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(call_models, timeout_seconds=60)
+        assert result.exit_code == 0, f"stderr: {result.stderr}"
+        output = result.stdout.strip()
+        assert "Hello from nemoclaw mock backend" in output
+        assert managed_openai_route in output
 
 
 def test_inference_call_routed_to_backend(
     sandbox: Callable[..., Sandbox],
-    mock_inference_route: str,
+    managed_openai_route: str,
 ) -> None:
-    """Inference call to undeclared endpoint is intercepted and routed.
-
-    A Python process inside the sandbox calls the OpenAI chat completions
-    endpoint via raw urllib. Since api.openai.com is not in any network
-    policy, but inference routing is configured, the proxy should:
-    1. Detect no explicit policy match (inspect_for_inference)
-    2. TLS-terminate the connection
-    3. Detect the inference API pattern (POST /v1/chat/completions)
-    4. Forward locally via sandbox router to the policy-allowed backend
-    5. Return the mock response from the configured route
-    """
-    spec = datamodel_pb2.SandboxSpec(
-        policy=_inference_routing_policy(mock_inference_route)
-    )
+    """OpenAI chat request to `inference.local` is intercepted and routed."""
+    spec = datamodel_pb2.SandboxSpec(policy=_baseline_policy())
 
     def call_chat_completions() -> str:
         import json
@@ -194,7 +214,7 @@ def test_inference_call_routed_to_backend(
         ).encode()
 
         req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
+            "https://inference.local/v1/chat/completions",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -215,22 +235,16 @@ def test_inference_call_routed_to_backend(
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
         assert "Hello from nemoclaw mock backend" in output
-        assert "mock/test-model" in output
+        assert managed_openai_route in output
 
 
 def test_non_inference_request_denied(
     sandbox: Callable[..., Sandbox],
-    mock_inference_route: str,
+    managed_openai_route: str,
 ) -> None:
-    """Non-inference HTTP request on an intercepted connection is denied.
-
-    A process making a non-inference request (e.g. GET /v1/models) to an
-    undeclared endpoint should be denied with 403 when inference routing
-    is configured — only recognized inference API patterns are routed.
-    """
-    spec = datamodel_pb2.SandboxSpec(
-        policy=_inference_routing_policy(mock_inference_route)
-    )
+    """Non-inference path on `inference.local` is denied with 403."""
+    _ = managed_openai_route
+    spec = datamodel_pb2.SandboxSpec(policy=_baseline_policy())
 
     def make_non_inference_request() -> str:
         import ssl
@@ -242,7 +256,7 @@ def test_non_inference_request_denied(
         ctx.verify_mode = ssl.CERT_NONE
 
         try:
-            req = urllib.request.Request("https://api.openai.com/v1/models")
+            req = urllib.request.Request("https://inference.local/v1/not-inference")
             urllib.request.urlopen(req, timeout=10, context=ctx)
             return "unexpected_success"
         except urllib.error.HTTPError as e:
@@ -253,33 +267,21 @@ def test_non_inference_request_denied(
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(make_non_inference_request, timeout_seconds=30)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
-        assert "403" in result.stdout.strip()
+        assert result.stdout.strip() == "http_error_403"
 
 
-def test_inference_anthropic_messages_protocol(
+def test_unsupported_protocol_returns_400(
     sandbox: Callable[..., Sandbox],
-    mock_anthropic_route: str,
+    managed_openai_route: str,
 ) -> None:
-    """Anthropic messages protocol (POST /v1/messages) is intercepted and routed.
-
-    Verifies multi-protocol routing: a request using the Anthropic messages
-    format is correctly detected and forwarded to a route configured with
-    the anthropic_messages protocol.
-    """
-    policy = sandbox_pb2.SandboxPolicy(
-        version=1,
-        inference=sandbox_pb2.InferencePolicy(
-            allowed_routes=[mock_anthropic_route],
-        ),
-        filesystem=_BASE_FILESYSTEM,
-        landlock=_BASE_LANDLOCK,
-        process=_BASE_PROCESS,
-    )
-    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    """Protocol mismatch returns 400 when no compatible route exists."""
+    _ = managed_openai_route
+    spec = datamodel_pb2.SandboxSpec(policy=_baseline_policy())
 
     def call_anthropic_messages() -> str:
         import json
         import ssl
+        import urllib.error
         import urllib.request
 
         body = json.dumps(
@@ -291,7 +293,7 @@ def test_inference_anthropic_messages_protocol(
         ).encode()
 
         req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
+            "https://inference.local/v1/messages",
             data=body,
             headers={
                 "Content-Type": "application/json",
@@ -304,37 +306,34 @@ def test_inference_anthropic_messages_protocol(
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
-        return resp.read().decode()
+        try:
+            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+            return resp.read().decode()
+        except urllib.error.HTTPError as exc:
+            return (
+                f"http_error_{exc.code}:{exc.read().decode('utf-8', errors='replace')}"
+            )
 
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(call_anthropic_messages, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        assert "Hello from nemoclaw mock backend" in output
-        assert "mock/claude-test" in output
+        assert output.startswith("http_error_400"), output
+        assert "no compatible route" in output
 
 
-def test_inference_route_filtering_by_allowed_routes(
+def test_non_inference_host_is_not_intercepted(
     sandbox: Callable[..., Sandbox],
-    mock_inference_route: str,
-    mock_disallowed_route: str,
+    managed_openai_route: str,
 ) -> None:
-    """Only routes in allowed_routes are available; others produce errors.
+    """Requests to non-`inference.local` hosts do not get inference routing."""
+    _ = managed_openai_route
+    spec = datamodel_pb2.SandboxSpec(policy=_baseline_policy())
 
-    Two routes exist (e2e_mock_local and e2e_mock_disallowed), but the
-    policy only allows e2e_mock_local. A request that would match the
-    allowed route should succeed, while inference requests that can't
-    match any allowed route get an error from the sandbox router.
-    """
-    # Policy only allows the mock_inference_route, NOT mock_disallowed_route
-    spec = datamodel_pb2.SandboxSpec(
-        policy=_inference_routing_policy(mock_inference_route)
-    )
-
-    def call_allowed_route() -> str:
+    def call_external_openai_endpoint() -> str:
         import json
         import ssl
+        import urllib.error
         import urllib.request
 
         body = json.dumps(
@@ -357,13 +356,16 @@ def test_inference_route_filtering_by_allowed_routes(
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
 
-        resp = urllib.request.urlopen(req, timeout=30, context=ctx)
-        return resp.read().decode()
+        try:
+            resp = urllib.request.urlopen(req, timeout=30, context=ctx)
+            return resp.read().decode()
+        except urllib.error.URLError as exc:
+            return f"url_error:{exc}"
+        except Exception as exc:
+            return f"error:{type(exc).__name__}:{exc}"
 
     with sandbox(spec=spec, delete_on_exit=True) as sb:
-        result = sb.exec_python(call_allowed_route, timeout_seconds=60)
+        result = sb.exec_python(call_external_openai_endpoint, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        # The allowed route (e2e_mock_local) should serve the request
-        assert "Hello from nemoclaw mock backend" in output
-        assert "mock/test-model" in output
+        assert "Tunnel connection failed: 403 Forbidden" in output
