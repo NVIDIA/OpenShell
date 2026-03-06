@@ -3,7 +3,7 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Inference Routing
+# About Inference Routing
 
 The inference routing system keeps your AI inference traffic private by
 transparently intercepting API calls from sandboxed agents and rerouting them

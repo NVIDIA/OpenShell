@@ -110,7 +110,7 @@ $ nemoclaw sandbox create --keep -- claude
 
 ## Next Steps
 
-- {doc}`../../sandboxes/create-and-manage`: Understand the isolation model and sandbox lifecycle
-- {doc}`../../sandboxes/providers`: How credentials are injected without exposing them to agent code
-- {doc}`../../safety-and-privacy/policies`: Learn how the default policy works and how to customize it
-- {doc}`../../safety-and-privacy/network-access-rules`: Dig into the network proxy and per-endpoint rules
+- {doc}`../sandboxes/create-and-manage`: Understand the isolation model and sandbox lifecycle
+- {doc}`../sandboxes/providers`: How credentials are injected without exposing them to agent code
+- {doc}`../safety-and-privacy/policies`: Learn how the default policy works and how to customize it
+- {doc}`../safety-and-privacy/network-access-rules`: Dig into the network proxy and per-endpoint rules

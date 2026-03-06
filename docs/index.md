@@ -28,72 +28,29 @@ content:
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/NemoClaw/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
 
-NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments 
-that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and 
-nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and 
+NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
+that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
+nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
 uncontrolled network activity.
 
-## Install and Create a Sandbox
+## Get Started
 
-NemoClaw is designed for minimal setup with safety and privacy built in from the start. Two commands take you from zero to a running, policy-enforced sandbox.
-
-### Prerequisites
-
-The following are the prerequisites for the NemoClaw CLI.
-
-- Docker must be running.
-- Python 3.12+ is required.
-
-### Install the NemoClaw CLI
+Install the CLI and create your first sandbox in two commands. Refer to the [Quickstart](get-started/quickstart.md) to get up and running.
 
 ```console
 $ pip install nemoclaw
-```
-
-### Create Your First NemoClaw Sandbox
-
-::::{tab-set}
-
-:::{tab-item} Claude Code
-```console
 $ nemoclaw sandbox create -- claude
 ```
 
-```text
-✓ Runtime ready
-✓ Discovered Claude credentials (ANTHROPIC_API_KEY)
-✓ Created sandbox: keen-fox
-✓ Policy loaded (4 protection layers active)
-
-Connecting to keen-fox...
-```
-
-Claude Code works out of the box with the default policy.
-:::
-
-:::{tab-item} Community Sandbox
-```console
-$ nemoclaw sandbox create --from openclaw
-```
-
-The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog, which contains a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
-:::
-
-::::
-
-The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
-
-For OpenCode or Codex, refer to the [](tutorials/run-opencode.md) tutorial for agent-specific setup.
-
 ---
 
-## Next Steps
+## Explore
 
 ::::{grid} 2 2 3 3
 :gutter: 3
 
 :::{grid-item-card} Tutorials
-:link: tutorials/run-claude
+:link: get-started/tutorials
 :link-type: doc
 
 Step-by-step walkthroughs for Claude Code, OpenClaw, and OpenCode with NVIDIA inference.
@@ -102,18 +59,8 @@ Step-by-step walkthroughs for Claude Code, OpenClaw, and OpenCode with NVIDIA in
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Security Model
-:link: safety-and-privacy/security-model
-:link-type: doc
-
-How NemoClaw protects against data exfiltration, credential theft, unauthorized API calls, and privilege escalation.
-
-+++
-{bdg-secondary}`Concept`
-:::
-
 :::{grid-item-card} Sandboxes
-:link: sandboxes/create-and-manage
+:link: sandboxes/index
 :link-type: doc
 
 Create, manage, and customize sandboxes. Use community images or bring your own container.
@@ -155,24 +102,27 @@ CLI commands, policy schema, environment variables, and system architecture.
 ::::
 
 ```{toctree}
+:caption: About
 :hidden:
 
-Get Started <self>
+Overview <about/overview>
+Architecture <about/architecture>
+Release Notes <about/release-notes>
 ```
 
 ```{toctree}
-:caption: Tutorials
+:caption: Get Started
 :hidden:
 
-Run Claude Safely <tutorials/run-claude>
-Run OpenClaw Safely <tutorials/run-openclaw>
-Run OpenCode with NVIDIA Inference <tutorials/run-opencode>
+get-started/quickstart
+get-started/tutorials
 ```
 
 ```{toctree}
 :caption: Sandboxes
 :hidden:
 
+sandboxes/index
 sandboxes/create-and-manage
 sandboxes/providers
 sandboxes/custom-containers
@@ -202,10 +152,8 @@ inference/configure-routes
 :caption: Reference
 :hidden:
 
-release-notes
 reference/cli
 reference/policy-schema
-reference/architecture
 ```
 
 ```{toctree}

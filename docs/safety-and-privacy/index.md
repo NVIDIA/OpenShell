@@ -3,7 +3,7 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Safety and Privacy
+# About Safety and Privacy
 
 NemoClaw wraps every sandbox in four independent protection layers. No single
 point of failure can compromise your environment. Each layer covers gaps the

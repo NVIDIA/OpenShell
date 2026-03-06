@@ -259,8 +259,8 @@ $ nemoclaw sandbox delete opencode-sandbox
 
 ## Next Steps
 
-- {doc}`../../safety-and-privacy/policies`: Full reference on policy YAML structure, static and dynamic fields, and enforcement modes
-- {doc}`../../safety-and-privacy/network-access-rules`: How the proxy evaluates network rules, L4 and L7 inspection, and TLS termination
-- {doc}`../../inference/index`: Inference route configuration, protocol detection, and transparent rerouting
-- {doc}`../../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation
-- {doc}`../../safety-and-privacy/security-model`: The four protection layers and how they interact
+- {doc}`../safety-and-privacy/policies`: Full reference on policy YAML structure, static and dynamic fields, and enforcement modes
+- {doc}`../safety-and-privacy/network-access-rules`: How the proxy evaluates network rules, L4 and L7 inspection, and TLS termination
+- {doc}`../inference/index`: Inference route configuration, protocol detection, and transparent rerouting
+- {doc}`../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation
+- {doc}`../safety-and-privacy/security-model`: The four protection layers and how they interact

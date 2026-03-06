@@ -1,9 +1,23 @@
+---
+title:
+  page: "Architecture Overview"
+  nav: "Architecture"
+description: "Understand the architecture of NVIDIA NemoClaw: the gateway, sandbox pods, policy engine, and privacy router."
+keywords: ["nemoclaw architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
+topics: ["generative_ai", "cybersecurity"]
+tags: ["ai_agents", "sandboxing", "security", "architecture"]
+content:
+  type: concept
+  difficulty: technical_advanced
+  audience: [engineer, data_scientist]
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Architecture
+# Architecture Overview
 
 NemoClaw runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker
 container. Sandboxes are Kubernetes pods managed by the NemoClaw control plane.

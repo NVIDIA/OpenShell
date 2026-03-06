@@ -21,7 +21,7 @@ Before you begin, make sure you have:
 
 - Docker running on your machine.
 - NVIDIA GPU with drivers installed. Required for GPU-accelerated workloads in the OpenClaw sandbox.
-- [NemoClaw CLI installed](../index.md#install-the-nemoclaw-cli)
+- [NemoClaw CLI installed](quickstart.md#install-the-nemoclaw-cli)
 
 ## Step 1: Create a Sandbox from the Community Image
 
@@ -101,6 +101,6 @@ The NemoClaw Community repository accepts contributions. If you build a sandbox 
 
 ## Next Steps
 
-- {doc}`../../sandboxes/community-sandboxes`: Full reference on community sandbox definitions, available images, and how to contribute your own
-- {doc}`../../safety-and-privacy/policies`: Understand the policy format and how to customize what a sandbox can do
-- {doc}`../../sandboxes/create-and-manage`: The isolation model and lifecycle behind every sandbox
+- {doc}`../sandboxes/community-sandboxes`: Full reference on community sandbox definitions, available images, and how to contribute your own
+- {doc}`../safety-and-privacy/policies`: Understand the policy format and how to customize what a sandbox can do
+- {doc}`../sandboxes/create-and-manage`: The isolation model and lifecycle behind every sandbox
