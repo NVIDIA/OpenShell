@@ -126,12 +126,12 @@ def test_update_policy_rejects_immutable_fields(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """UpdateSandboxPolicy rejects changes to immutable policy fields.
+    """UpdateSandboxPolicy rejects removal of filesystem paths on a live sandbox.
 
-    Both process and filesystem policies are applied at sandbox startup and
-    cannot be changed on a live sandbox. This test verifies that the server
-    rejects such updates, which also prevents unsafe content from being
-    introduced via policy updates to these fields.
+    Filesystem paths are enforced by Landlock at sandbox startup and cannot be
+    removed after the fact. This test verifies that the server rejects updates
+    that remove existing read_only paths, which also prevents unsafe content
+    from being introduced via policy updates.
     """
     safe_policy = _safe_policy()
     spec = datamodel_pb2.SandboxSpec(policy=safe_policy)
@@ -161,4 +161,4 @@ def test_update_policy_rejects_immutable_fields(
             )
 
         assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
-        assert "cannot be changed" in exc_info.value.details().lower()
+        assert "cannot be removed" in exc_info.value.details().lower()
