@@ -12,7 +12,7 @@ on:
 
 env:
   REGISTRY: ghcr.io
-  CI_IMAGE: ghcr.io/nvidia/nv-agent-env/ci
+  CI_IMAGE: ghcr.io/nvidia/nemoclaw/ci
 
 permissions:
   contents: read

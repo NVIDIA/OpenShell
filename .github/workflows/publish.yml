@@ -29,13 +29,34 @@ jobs:
     with:
       component: cluster
 
+  tag-ghcr-latest:
+    name: Tag GHCR Images as Latest
+    needs: [build-server, build-sandbox, build-cluster]
+    runs-on: build-amd64
+    timeout-minutes: 10
+    steps:
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Tag images as latest
+        run: |
+          set -euo pipefail
+          REGISTRY="ghcr.io/nvidia/nemoclaw"
+          for component in server sandbox cluster; do
+            echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as latest..."
+            docker buildx imagetools create \
+              --prefer-index=false \
+              -t "${REGISTRY}/${component}:latest" \
+              "${REGISTRY}/${component}:${{ github.sha }}"
+          done
+
   publish-containers:
     name: Publish Containers
     needs: [build-server, build-sandbox, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 120
     container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      image: ghcr.io/nvidia/nemoclaw/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -76,7 +97,7 @@ jobs:
       wheel_version: ${{ steps.version.outputs.wheel_version }}
       s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
     container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      image: ghcr.io/nvidia/nemoclaw/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -223,7 +244,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      image: ghcr.io/nvidia/nemoclaw/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -313,7 +334,7 @@ jobs:
     runs-on: build-amd64
     timeout-minutes: 60
     container:
-      image: ghcr.io/nvidia/nv-agent-env/ci:latest
+      image: ghcr.io/nvidia/nemoclaw/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
