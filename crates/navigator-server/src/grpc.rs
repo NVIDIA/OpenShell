@@ -42,6 +42,20 @@ use russh::client::AuthResult;
 
 use crate::ServerState;
 
+/// Maximum number of records a single list RPC may return.
+///
+/// Client-provided `limit` values are clamped to this ceiling to prevent
+/// unbounded memory allocation from an excessively large page request.
+pub(crate) const MAX_PAGE_SIZE: u32 = 1000;
+
+/// Clamp a client-provided page `limit`.
+///
+/// Returns `default` when `raw` is 0 (the protobuf zero-value convention),
+/// otherwise returns the smaller of `raw` and `max`.
+pub(crate) fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
+    if raw == 0 { default } else { raw.min(max) }
+}
+
 /// Navigator gRPC service implementation.
 #[derive(Debug, Clone)]
 pub struct NavigatorService {
@@ -425,11 +439,7 @@ impl Navigator for NavigatorService {
         request: Request<ListSandboxesRequest>,
     ) -> Result<Response<ListSandboxesResponse>, Status> {
         let request = request.into_inner();
-        let limit = if request.limit == 0 {
-            100
-        } else {
-            request.limit
-        };
+        let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
         let records = self
             .state
             .store
@@ -544,15 +554,9 @@ impl Navigator for NavigatorService {
         request: Request<ListProvidersRequest>,
     ) -> Result<Response<ListProvidersResponse>, Status> {
         let request = request.into_inner();
-        let (limit, offset) = (
-            if request.limit == 0 {
-                100
-            } else {
-                request.limit
-            },
-            request.offset,
-        );
-        let providers = list_provider_records(self.state.store.as_ref(), limit, offset).await?;
+        let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
+        let providers =
+            list_provider_records(self.state.store.as_ref(), limit, request.offset).await?;
 
         Ok(Response::new(ListProvidersResponse { providers }))
     }
@@ -1023,7 +1027,7 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
 
-        let limit = if req.limit == 0 { 50 } else { req.limit };
+        let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
         let records = self
             .state
             .store
@@ -1977,8 +1981,9 @@ impl ObjectName for Provider {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, resolve_provider_environment, update_provider_record,
+        MAX_PAGE_SIZE, clamp_limit, create_provider_record, delete_provider_record,
+        get_provider_record, is_valid_env_key, list_provider_records, resolve_provider_environment,
+        update_provider_record,
     };
     use crate::persistence::Store;
     use navigator_core::proto::Provider;
@@ -2000,6 +2005,33 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    // ---- clamp_limit tests ----
+
+    #[test]
+    fn clamp_limit_zero_returns_default() {
+        assert_eq!(clamp_limit(0, 100, MAX_PAGE_SIZE), 100);
+        assert_eq!(clamp_limit(0, 50, MAX_PAGE_SIZE), 50);
+    }
+
+    #[test]
+    fn clamp_limit_within_range_passes_through() {
+        assert_eq!(clamp_limit(1, 100, MAX_PAGE_SIZE), 1);
+        assert_eq!(clamp_limit(500, 100, MAX_PAGE_SIZE), 500);
+        assert_eq!(
+            clamp_limit(MAX_PAGE_SIZE, 100, MAX_PAGE_SIZE),
+            MAX_PAGE_SIZE
+        );
+    }
+
+    #[test]
+    fn clamp_limit_exceeding_max_is_capped() {
+        assert_eq!(
+            clamp_limit(MAX_PAGE_SIZE + 1, 100, MAX_PAGE_SIZE),
+            MAX_PAGE_SIZE
+        );
+        assert_eq!(clamp_limit(u32::MAX, 100, MAX_PAGE_SIZE), MAX_PAGE_SIZE);
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
