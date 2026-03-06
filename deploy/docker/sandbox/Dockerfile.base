@@ -166,8 +166,11 @@ COPY --from=rust-builder /build/out/navigator-sandbox /usr/local/bin/
 # Copy navigator Python SDK into the virtual environment
 COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
 
-# Add venv to PATH
-ENV PATH="/app/.venv/bin:$PATH"
+# Add venvs to PATH -- /sandbox/.venv (writable, user-installed packages)
+# takes priority over /app/.venv (read-only, build-time packages).
+# This ENV is also read by ssh.rs at runtime so that the hardcoded PATH
+# in the Rust code stays in sync with the container layout.
+ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"
 
 # Copy custom navigator skills into the image
 # To add a skill, create a subdirectory under deploy/docker/sandbox/skills/
@@ -188,7 +191,7 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     # get a sane PATH and prompt.  Without these, bash sources nothing
     # under /sandbox and tools like VS Code Remote-SSH may mis-detect
     # the platform.
-    printf 'export PATH="/app/.venv/bin:$PATH"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
+    printf 'export PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
     > /sandbox/.bashrc && \
     printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > /sandbox/.profile && \
     chown sandbox:sandbox /sandbox/.bashrc /sandbox/.profile && \

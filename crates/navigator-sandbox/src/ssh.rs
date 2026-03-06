@@ -645,6 +645,11 @@ fn spawn_pty_shell(
         pty.term.as_str()
     };
 
+    // Inherit PATH from the container environment (set via Dockerfile ENV) so
+    // that sandbox sessions see the same venv layout without hardcoding paths
+    // in Rust.  Falls back to a minimal default if the variable is unset.
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+
     cmd.env_clear()
         .stdin(stdin)
         .stdout(stdout)
@@ -653,7 +658,7 @@ fn spawn_pty_shell(
         .env("HOME", "/sandbox")
         .env("USER", "sandbox")
         .env("SHELL", "/bin/bash")
-        .env("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", &path)
         .env("TERM", term);
 
     // Set proxy environment variables so cooperative tools (curl, wget, etc.)
@@ -802,6 +807,8 @@ fn spawn_pipe_exec(
         },
     );
 
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+
     cmd.env_clear()
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
@@ -810,7 +817,7 @@ fn spawn_pipe_exec(
         .env("HOME", "/sandbox")
         .env("USER", "sandbox")
         .env("SHELL", "/bin/bash")
-        .env("PATH", "/app/.venv/bin:/usr/local/bin:/usr/bin:/bin")
+        .env("PATH", &path)
         .env("TERM", "dumb");
 
     if let Some(ref url) = proxy_url {

@@ -95,6 +95,20 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/gh }
 
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+    binaries:
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+      - { path: /sandbox/.venv/bin/pip }
+      - { path: /app/.venv/bin/python }
+      - { path: /app/.venv/bin/python3 }
+      - { path: /app/.venv/bin/pip }
+      - { path: /usr/local/bin/uv }
+
   vscode:
     name: vscode
     endpoints:
