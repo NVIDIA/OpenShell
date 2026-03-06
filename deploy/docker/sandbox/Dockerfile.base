@@ -169,8 +169,9 @@ COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
 
 # Add venvs to PATH -- /sandbox/.venv (writable, user-installed packages)
 # takes priority over /app/.venv (read-only, build-time packages).
-# This ENV is also read by ssh.rs at runtime so that the hardcoded PATH
-# in the Rust code stays in sync with the container layout.
+# ssh.rs inherits PATH at runtime so it stays in sync with this layout.
+# VIRTUAL_ENV and UV_PYTHON_INSTALL_DIR are also exported in .bashrc
+# so that login shell sessions (interactive and exec) see them.
 ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
     VIRTUAL_ENV="/sandbox/.venv" \
     UV_PYTHON_INSTALL_DIR="/sandbox/.uv/python"
@@ -199,7 +200,7 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     # get a sane PATH and prompt.  Without these, bash sources nothing
     # under /sandbox and tools like VS Code Remote-SSH may mis-detect
     # the platform.
-    printf 'export PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
+    printf 'export PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin"\nexport VIRTUAL_ENV="/sandbox/.venv"\nexport UV_PYTHON_INSTALL_DIR="/sandbox/.uv/python"\nexport PS1="\\u@\\h:\\w\\$ "\n' \
     > /sandbox/.bashrc && \
     printf '[ -f ~/.bashrc ] && . ~/.bashrc\n' > /sandbox/.profile && \
     chown sandbox:sandbox /sandbox/.bashrc /sandbox/.profile && \

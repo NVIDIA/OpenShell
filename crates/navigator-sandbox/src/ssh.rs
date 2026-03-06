@@ -645,8 +645,10 @@ fn spawn_pty_shell(
         pty.term.as_str()
     };
 
-    // Inherit environment from the container (set via Dockerfile ENV) so that
-    // sandbox sessions see the same venv/tool layout without hardcoding paths.
+    // Inherit PATH from the container (set via Dockerfile ENV) so that
+    // sandbox sessions see the same tool layout without hardcoding paths.
+    // Tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.) are
+    // set in /sandbox/.bashrc by the Dockerfile and sourced via login shell.
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     cmd.env_clear()
@@ -659,13 +661,6 @@ fn spawn_pty_shell(
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);
-
-    // Forward optional tool-config env vars from the container image.
-    for key in ["VIRTUAL_ENV", "UV_PYTHON_INSTALL_DIR"] {
-        if let Ok(val) = std::env::var(key) {
-            cmd.env(key, val);
-        }
-    }
 
     // Set proxy environment variables so cooperative tools (curl, wget, etc.)
     // route traffic through the CONNECT proxy for OPA policy evaluation.
@@ -808,7 +803,10 @@ fn spawn_pipe_exec(
         },
         |command| {
             let mut c = Command::new("/bin/bash");
-            c.arg("-c").arg(command);
+            // Use login shell (-l) so that .profile/.bashrc are sourced and
+            // tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.)
+            // are available without hardcoding them here.
+            c.arg("-lc").arg(command);
             c
         },
     );
@@ -825,12 +823,6 @@ fn spawn_pipe_exec(
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", "dumb");
-
-    for key in ["VIRTUAL_ENV", "UV_PYTHON_INSTALL_DIR"] {
-        if let Ok(val) = std::env::var(key) {
-            cmd.env(key, val);
-        }
-    }
 
     if let Some(ref url) = proxy_url {
         cmd.env("HTTP_PROXY", url)
