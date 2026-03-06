@@ -9,7 +9,7 @@ Run Anthropic Claude as a coding agent inside a NemoClaw sandbox. This tutorial 
 
 ## Prerequisites
 
-- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-cli).
+- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-nemoclaw-cli).
 - Docker installed and running.
 - An Anthropic API key available as `ANTHROPIC_API_KEY` in your environment or in `~/.claude.json`.
 

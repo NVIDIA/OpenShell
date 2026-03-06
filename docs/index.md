@@ -44,13 +44,13 @@ The following are the prerequisites for the NemoClaw CLI.
 - Docker must be running.
 - Python 3.12+ is required.
 
-### Install the CLI
+### Install the NemoClaw CLI
 
 ```console
 $ pip install nemoclaw
 ```
 
-### Create a Sandbox
+### Create Your First NemoClaw Sandbox
 
 ::::{tab-set}
 
@@ -83,86 +83,51 @@ The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/
 
 The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
 
-For opencode or Codex, see the [Tutorials](get-started/tutorials/index.md) for agent-specific setup.
-
+For OpenCode or Codex, see the [](get-started/tutorials/run-opencode.md) tutorial for agent-specific setup.
 
 ---
 
-## About NemoClaw
+## Next Steps
 
-Understand what NemoClaw is, how the subsystems fit together, and what is new in the latest release.
-
-::::{grid} 1 1 2 2
-:gutter: 3
-
-:::{grid-item-card} NemoClaw Overview
-:link: about/index
-:link-type: doc
-
-Learn about the safety and privacy model, key capabilities, and use cases for sandboxed agent execution.
-+++
-{bdg-secondary}`Concept`
-:::
-
-:::{grid-item-card} How It Works
-:link: about/how-it-works
-:link-type: doc
-
-Explore the architecture, major subsystems, and the end-to-end flow from cluster bootstrap to running sandbox.
-+++
-{bdg-secondary}`Concept`
-:::
-
-:::{grid-item-card} Support Matrix
-:link: about/support-matrix
-:link-type: doc
-
-Platform requirements, supported providers, agent tools, and compatibility details.
-+++
-{bdg-secondary}`Reference`
-:::
-
-:::{grid-item-card} Release Notes
-:link: about/release-notes
-:link-type: doc
-
-Track what changed in each version.
-+++
-{bdg-secondary}`Reference`
-:::
-
-::::
-
-## Get Started
-
-Install the CLI, bootstrap a cluster, and create your first sandbox.
-
-::::{grid} 1 1 2 2
+::::{grid} 2 2 3 3
 :gutter: 3
 
 :::{grid-item-card} Tutorials
 :link: get-started/tutorials/index
 :link-type: doc
 
-Create, connect to, and manage sandboxes. Configure providers, sync files, forward ports, and bring your own containers.
+Step-by-step walkthroughs for Claude Code, OpenClaw, and OpenCode with NVIDIA inference.
+
 +++
-{bdg-secondary}`How To`
+{bdg-secondary}`Tutorial`
 :::
 
-::::
+:::{grid-item-card} Security Model
+:link: safety-and-privacy/security-model
+:link-type: doc
 
-## Developer Guides
+How NemoClaw protects against data exfiltration, credential theft, unauthorized API calls, and privilege escalation.
 
-Configure safety policies, route inference traffic, manage clusters, and monitor agent activity.
++++
+{bdg-secondary}`Concept`
+:::
 
-::::{grid} 1 1 2 2
-:gutter: 3
+:::{grid-item-card} Sandboxes
+:link: sandboxes/create-and-manage
+:link-type: doc
+
+Create, manage, and customize sandboxes. Use community images or bring your own container.
+
++++
+{bdg-secondary}`Concept`
+:::
 
 :::{grid-item-card} Safety and Privacy
 :link: safety-and-privacy/index
 :link-type: doc
 
-Understand how NemoClaw keeps your data safe and private — and write policies that control filesystem, network, and inference access.
+Write policies that control what agents can access. Iterate on network rules in real time.
+
 +++
 {bdg-secondary}`Concept`
 :::
@@ -171,67 +136,23 @@ Understand how NemoClaw keeps your data safe and private — and write policies 
 :link: inference/index
 :link-type: doc
 
-Keep inference traffic private by routing AI API calls to local or self-hosted backends — without modifying agent code.
+Keep inference traffic private by routing API calls to local or self-hosted backends.
+
 +++
-{bdg-secondary}`How To`
+{bdg-secondary}`Concept`
 :::
-
-:::{grid-item-card} Clusters
-:link: clusters/index
-:link-type: doc
-
-Bootstrap, manage, and deploy NemoClaw clusters locally or on remote hosts via SSH.
-+++
-{bdg-secondary}`How To`
-:::
-
-:::{grid-item-card} Observability
-:link: observability/index
-:link-type: doc
-
-Stream sandbox logs, audit agent activity, and monitor policy enforcement with the NemoClaw Terminal and CLI.
-+++
-{bdg-secondary}`How To`
-:::
-
-::::
-
-## References
-
-Look up CLI commands, policy schemas, environment variables, and troubleshooting guidance.
-
-::::{grid} 1 1 2 2
-:gutter: 3
 
 :::{grid-item-card} Reference
-:link: reference/index
+:link: reference/cli
 :link-type: doc
 
-CLI command reference, policy schema, environment variables, and system architecture diagrams.
-+++
-{bdg-secondary}`Reference`
-:::
+CLI commands, policy schema, environment variables, and system architecture.
 
-:::{grid-item-card} Troubleshooting
-:link: troubleshooting/cluster-issues
-:link-type: doc
-
-Diagnose common issues with clusters, sandboxes, and networking.
-+++
-{bdg-secondary}`Troubleshooting`
-:::
-
-:::{grid-item-card} Resources
-:link: resources/index
-:link-type: doc
-
-Links to the GitHub repository, related projects, and additional learning materials.
 +++
 {bdg-secondary}`Reference`
 :::
 
 ::::
-
 
 ```{toctree}
 :hidden:

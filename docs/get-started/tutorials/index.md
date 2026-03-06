@@ -2,7 +2,7 @@
 
 Each tutorial walks through an end-to-end workflow from bootstrapping a cluster to running an agent inside a policy-enforced sandbox. Pick the tutorial that matches your agent and follow along.
 
-All tutorials assume you have [installed the CLI](../../index.md#install-the-cli) and have Docker running.
+All tutorials assume you have [installed the CLI](../../index.md#install-the-nemoclaw-cli) and have Docker running.
 
 ::::{grid} 1 1 2 2
 :gutter: 3

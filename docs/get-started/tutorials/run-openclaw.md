@@ -9,7 +9,7 @@ Run OpenClaw inside a NemoClaw sandbox with zero code changes. This tutorial tak
 
 ## Prerequisites
 
-- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-cli).
+- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-nemoclaw-cli).
 - Docker installed and running.
 
 ## Step 1: Deploy a Cluster

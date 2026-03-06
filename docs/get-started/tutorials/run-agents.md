@@ -11,7 +11,7 @@ This tutorial shows how to run OpenClaw inside NemoClaw with zero code changes. 
 
 Before you begin, ensure the following are in place.
 
-- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-cli).
+- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-nemoclaw-cli).
 - A running cluster. Run `nemoclaw cluster admin deploy` to create one.
 
 ## Why NemoClaw
