@@ -203,18 +203,9 @@ inference/connect-sandboxes
 ```
 
 ```{toctree}
-:caption: Clusters
-:hidden:
-
-clusters/index
-clusters/remote-deploy
-```
-
-```{toctree}
 :caption: Observability
 :hidden:
 
-observability/index
 observability/logs
 observability/health
 ```
@@ -223,7 +214,6 @@ observability/health
 :caption: Reference
 :hidden:
 
-reference/index
 about/support-matrix
 reference/cli
 reference/policy-schema
