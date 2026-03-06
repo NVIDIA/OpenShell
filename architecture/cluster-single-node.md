@@ -238,7 +238,7 @@ After deploy, the CLI calls `save_active_cluster(name)`, writing the cluster nam
 The cluster image is defined in `deploy/docker/Dockerfile.cluster`:
 
 ```
-Base:  rancher/k3s:v1.29.8-k3s1
+Base:  rancher/k3s:v1.35.2-k3s1
 ```
 
 Layers added:

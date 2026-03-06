@@ -7,7 +7,7 @@
 #
 # Environment:
 #   IMAGE_TAG                - Image tag (default: dev)
-#   K3S_VERSION              - k3s version (set by mise.toml [env])
+#   K3S_VERSION              - k3s version override (optional; default in Dockerfile.cluster)
 
 #   DOCKER_PLATFORM          - Target platform (optional)
 #   DOCKER_BUILDER           - Buildx builder name (default: auto-select)
@@ -68,7 +68,7 @@ docker buildx build \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
   -f deploy/docker/Dockerfile.cluster \
   -t ${IMAGE_NAME}:${IMAGE_TAG} \
-  --build-arg K3S_VERSION=${K3S_VERSION} \
+  ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
   ${OUTPUT_FLAG} \
   .
 
