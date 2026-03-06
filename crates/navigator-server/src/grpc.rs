@@ -1541,11 +1541,14 @@ fn validate_static_fields_unchanged(
     baseline: &ProtoSandboxPolicy,
     new: &ProtoSandboxPolicy,
 ) -> Result<(), Status> {
-    if baseline.filesystem != new.filesystem {
-        return Err(Status::invalid_argument(
-            "filesystem policy cannot be changed on a live sandbox (applied at startup)",
-        ));
-    }
+    // Filesystem: allow additive changes (new paths can be added, but
+    // existing paths cannot be removed and include_workdir cannot change).
+    // This supports the supervisor's baseline path enrichment at startup.
+    // Note: Landlock is a one-way door — adding paths to the stored policy
+    // has no effect on a running child process; the enriched paths only
+    // take effect on the next restart.
+    validate_filesystem_additive(baseline.filesystem.as_ref(), new.filesystem.as_ref())?;
+
     if baseline.landlock != new.landlock {
         return Err(Status::invalid_argument(
             "landlock policy cannot be changed on a live sandbox (applied at startup)",
@@ -1555,6 +1558,49 @@ fn validate_static_fields_unchanged(
         return Err(Status::invalid_argument(
             "process policy cannot be changed on a live sandbox (applied at startup)",
         ));
+    }
+    Ok(())
+}
+
+/// Validate that a filesystem policy update is purely additive: all baseline
+/// paths must still be present, `include_workdir` must not change, but new
+/// paths may be added.
+fn validate_filesystem_additive(
+    baseline: Option<&navigator_core::proto::FilesystemPolicy>,
+    new: Option<&navigator_core::proto::FilesystemPolicy>,
+) -> Result<(), Status> {
+    match (baseline, new) {
+        (Some(base), Some(upd)) => {
+            if base.include_workdir != upd.include_workdir {
+                return Err(Status::invalid_argument(
+                    "filesystem include_workdir cannot be changed on a live sandbox",
+                ));
+            }
+            for path in &base.read_only {
+                if !upd.read_only.contains(path) {
+                    return Err(Status::invalid_argument(format!(
+                        "filesystem read_only path '{path}' cannot be removed on a live sandbox"
+                    )));
+                }
+            }
+            for path in &base.read_write {
+                if !upd.read_write.contains(path) {
+                    return Err(Status::invalid_argument(format!(
+                        "filesystem read_write path '{path}' cannot be removed on a live sandbox"
+                    )));
+                }
+            }
+        }
+        (None, Some(_)) => {
+            // Baseline had no filesystem policy, new one adds it — allowed
+            // (enrichment from empty).
+        }
+        (Some(_), None) => {
+            return Err(Status::invalid_argument(
+                "filesystem policy cannot be removed on a live sandbox",
+            ));
+        }
+        (None, None) => {}
     }
     Ok(())
 }
@@ -2762,7 +2808,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_static_fields_rejects_filesystem_change() {
+    fn validate_static_fields_allows_additive_filesystem() {
         use super::validate_static_fields_unchanged;
         use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
 
@@ -2773,16 +2819,107 @@ mod tests {
             }),
             ..Default::default()
         };
-        let changed = ProtoSandboxPolicy {
+        // Adding /lib is purely additive — should be allowed.
+        let additive = ProtoSandboxPolicy {
             filesystem: Some(FilesystemPolicy {
                 read_only: vec!["/usr".into(), "/lib".into()],
                 ..Default::default()
             }),
             ..Default::default()
         };
+        assert!(validate_static_fields_unchanged(&baseline, &additive).is_ok());
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_filesystem_removal() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_only: vec!["/usr".into(), "/lib".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Removing /lib should be rejected.
+        let removed = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_only: vec!["/usr".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let result = validate_static_fields_unchanged(&baseline, &removed);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("/lib"));
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_filesystem_deletion() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_only: vec!["/usr".into()],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        // Removing filesystem entirely should be rejected.
+        let deleted = ProtoSandboxPolicy {
+            filesystem: None,
+            ..Default::default()
+        };
+        let result = validate_static_fields_unchanged(&baseline, &deleted);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().message().contains("removed"));
+    }
+
+    #[test]
+    fn validate_static_fields_allows_filesystem_enrichment_from_none() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: None,
+            ..Default::default()
+        };
+        // Adding filesystem when baseline had none — enrichment, allowed.
+        let enriched = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                read_only: vec!["/usr".into(), "/lib".into(), "/etc".into()],
+                read_write: vec!["/sandbox".into(), "/tmp".into()],
+                include_workdir: true,
+            }),
+            ..Default::default()
+        };
+        assert!(validate_static_fields_unchanged(&baseline, &enriched).is_ok());
+    }
+
+    #[test]
+    fn validate_static_fields_rejects_include_workdir_change() {
+        use super::validate_static_fields_unchanged;
+        use navigator_core::proto::{FilesystemPolicy, SandboxPolicy as ProtoSandboxPolicy};
+
+        let baseline = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: true,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let changed = ProtoSandboxPolicy {
+            filesystem: Some(FilesystemPolicy {
+                include_workdir: false,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
         let result = validate_static_fields_unchanged(&baseline, &changed);
         assert!(result.is_err());
-        assert!(result.unwrap_err().message().contains("filesystem"));
+        assert!(result.unwrap_err().message().contains("include_workdir"));
     }
 
     #[test]

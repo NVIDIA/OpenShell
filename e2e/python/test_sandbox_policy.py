@@ -1496,3 +1496,134 @@ def test_forward_proxy_log_fields(
         assert f"dst_port={_FORWARD_PROXY_PORT}" in log, (
             "Expected dst_port in FORWARD log"
         )
+
+
+# =============================================================================
+# Baseline filesystem path enrichment tests (BFS-*)
+# =============================================================================
+
+
+def _verify_sandbox_functional():
+    """Return a closure that verifies basic sandbox functionality."""
+
+    def fn():
+        import json
+        import os
+        import sys
+
+        checks = {}
+        # Can resolve DNS config
+        checks["resolv_conf"] = os.path.exists("/etc/resolv.conf")
+        # Can access shared libraries
+        checks["lib_exists"] = os.path.isdir("/usr/lib")
+        # Python interpreter works
+        checks["python_version"] = sys.version
+        # Can write to /tmp
+        tmp_path = "/tmp/enrichment_test.txt"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write("ok")
+            with open(tmp_path) as f:
+                checks["tmp_write"] = f.read() == "ok"
+            os.unlink(tmp_path)
+        except Exception as e:
+            checks["tmp_write"] = str(e)
+        # Can write to /sandbox
+        sb_path = "/sandbox/enrichment_test.txt"
+        try:
+            with open(sb_path, "w") as f:
+                f.write("ok")
+            with open(sb_path) as f:
+                checks["sandbox_write"] = f.read() == "ok"
+            os.unlink(sb_path)
+        except Exception as e:
+            checks["sandbox_write"] = str(e)
+        # Can read navigator log
+        checks["var_log"] = os.path.exists("/var/log/navigator.log")
+        return json.dumps(checks)
+
+    return fn
+
+
+def test_baseline_enrichment_missing_filesystem_policy(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """BFS-1: Sandbox with network_policies but NO filesystem_policy should
+    come up and function correctly thanks to baseline path enrichment."""
+    # Intentionally omit filesystem, landlock, and process fields —
+    # only provide network_policies.
+    spec = datamodel_pb2.SandboxSpec(
+        policy=sandbox_pb2.SandboxPolicy(
+            version=1,
+            network_policies={
+                "test": sandbox_pb2.NetworkPolicyRule(
+                    name="test",
+                    endpoints=[
+                        sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                    ],
+                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                ),
+            },
+        ),
+    )
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_verify_sandbox_functional())
+        assert result.exit_code == 0, (
+            f"Sandbox with missing filesystem_policy failed to run: {result.stderr}"
+        )
+        import json
+
+        checks = json.loads(result.stdout)
+        assert checks["resolv_conf"] is True, "DNS config not accessible"
+        assert checks["lib_exists"] is True, "Shared libraries not accessible"
+        assert checks["tmp_write"] is True, f"/tmp not writable: {checks['tmp_write']}"
+        assert checks["sandbox_write"] is True, (
+            f"/sandbox not writable: {checks['sandbox_write']}"
+        )
+        assert checks["var_log"] is True, "Navigator log not accessible"
+
+
+def test_baseline_enrichment_incomplete_filesystem_policy(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """BFS-2: Sandbox with filesystem_policy that only has /sandbox should
+    still function because baseline enrichment adds missing paths."""
+    spec = datamodel_pb2.SandboxSpec(
+        policy=sandbox_pb2.SandboxPolicy(
+            version=1,
+            filesystem=sandbox_pb2.FilesystemPolicy(
+                include_workdir=True,
+                read_only=[],
+                read_write=["/sandbox"],
+            ),
+            landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+            process=sandbox_pb2.ProcessPolicy(
+                run_as_user="sandbox",
+                run_as_group="sandbox",
+            ),
+            network_policies={
+                "test": sandbox_pb2.NetworkPolicyRule(
+                    name="test",
+                    endpoints=[
+                        sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                    ],
+                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                ),
+            },
+        ),
+    )
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_verify_sandbox_functional())
+        assert result.exit_code == 0, (
+            f"Sandbox with incomplete filesystem_policy failed to run: {result.stderr}"
+        )
+        import json
+
+        checks = json.loads(result.stdout)
+        assert checks["resolv_conf"] is True, "DNS config not accessible"
+        assert checks["lib_exists"] is True, "Shared libraries not accessible"
+        assert checks["tmp_write"] is True, f"/tmp not writable: {checks['tmp_write']}"
+        assert checks["sandbox_write"] is True, (
+            f"/sandbox not writable: {checks['sandbox_write']}"
+        )
+        assert checks["var_log"] is True, "Navigator log not accessible"

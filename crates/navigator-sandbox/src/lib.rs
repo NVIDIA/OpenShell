@@ -137,7 +137,7 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
-    let (mut policy, opa_engine) = load_policy(
+    let (policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         sandbox,
         navigator_endpoint.clone(),
@@ -180,8 +180,9 @@ pub async fn run_sandbox(
                 let tls_dir = std::path::Path::new("/etc/navigator-tls");
                 match write_ca_files(&ca, tls_dir) {
                     Ok(paths) => {
-                        // Make the TLS directory readable under Landlock
-                        policy.filesystem.read_only.push(tls_dir.to_path_buf());
+                        // /etc/navigator-tls is subsumed by the /etc baseline
+                        // path injected by enrich_*_baseline_paths(), so no
+                        // explicit Landlock entry is needed here.
 
                         let upstream_config = build_upstream_client_config();
                         let cert_cache = CertCache::new(ca);
@@ -680,6 +681,87 @@ fn spawn_route_refresh(
     });
 }
 
+// ============================================================================
+// Baseline filesystem path enrichment
+// ============================================================================
+
+/// Minimum read-only paths required for a proxy-mode sandbox child process to
+/// function: dynamic linker, shared libraries, DNS resolution, CA certs,
+/// Python venv, and navigator logs.
+const PROXY_BASELINE_READ_ONLY: &[&str] = &["/usr", "/lib", "/etc", "/app", "/var/log"];
+
+/// Minimum read-write paths required for a proxy-mode sandbox child process:
+/// user working directory and temporary files.
+const PROXY_BASELINE_READ_WRITE: &[&str] = &["/sandbox", "/tmp"];
+
+/// Ensure a proto `SandboxPolicy` includes the baseline filesystem paths
+/// required for proxy-mode sandboxes.  Paths are only added if missing;
+/// user-specified paths are never removed.
+///
+/// Returns `true` if the policy was modified (caller may want to sync back).
+fn enrich_proto_baseline_paths(proto: &mut navigator_core::proto::SandboxPolicy) -> bool {
+    // Only enrich if network_policies are present (proxy mode indicator).
+    if proto.network_policies.is_empty() {
+        return false;
+    }
+
+    let fs = proto
+        .filesystem
+        .get_or_insert_with(|| navigator_core::proto::FilesystemPolicy {
+            include_workdir: true,
+            ..Default::default()
+        });
+
+    let mut modified = false;
+    for &path in PROXY_BASELINE_READ_ONLY {
+        if !fs.read_only.iter().any(|p| p.as_str() == path) {
+            fs.read_only.push(path.to_string());
+            modified = true;
+        }
+    }
+    for &path in PROXY_BASELINE_READ_WRITE {
+        if !fs.read_write.iter().any(|p| p.as_str() == path) {
+            fs.read_write.push(path.to_string());
+            modified = true;
+        }
+    }
+
+    if modified {
+        info!("Enriched policy with baseline filesystem paths for proxy mode");
+    }
+
+    modified
+}
+
+/// Ensure a `SandboxPolicy` (Rust type) includes the baseline filesystem
+/// paths required for proxy-mode sandboxes.  Used for the local-file code
+/// path where no proto is available.
+fn enrich_sandbox_baseline_paths(policy: &mut SandboxPolicy) {
+    if !matches!(policy.network.mode, NetworkMode::Proxy) {
+        return;
+    }
+
+    let mut modified = false;
+    for &path in PROXY_BASELINE_READ_ONLY {
+        let p = std::path::PathBuf::from(path);
+        if !policy.filesystem.read_only.contains(&p) {
+            policy.filesystem.read_only.push(p);
+            modified = true;
+        }
+    }
+    for &path in PROXY_BASELINE_READ_WRITE {
+        let p = std::path::PathBuf::from(path);
+        if !policy.filesystem.read_write.contains(&p) {
+            policy.filesystem.read_write.push(p);
+            modified = true;
+        }
+    }
+
+    if modified {
+        info!("Enriched policy with baseline filesystem paths for proxy mode");
+    }
+}
+
 /// Load sandbox policy from local files or gRPC.
 ///
 /// Priority:
@@ -706,7 +788,7 @@ async fn load_policy(
             std::path::Path::new(data_file),
         )?;
         let config = engine.query_sandbox_config()?;
-        let policy = SandboxPolicy {
+        let mut policy = SandboxPolicy {
             version: 1,
             filesystem: config.filesystem,
             network: NetworkPolicy {
@@ -716,6 +798,7 @@ async fn load_policy(
             landlock: config.landlock,
             process: config.process,
         };
+        enrich_sandbox_baseline_paths(&mut policy);
         return Ok((policy, Some(Arc::new(engine))));
     }
 
@@ -728,14 +811,17 @@ async fn load_policy(
         );
         let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
 
-        let proto_policy = match proto_policy {
+        let mut proto_policy = match proto_policy {
             Some(p) => p,
             None => {
                 // No policy configured on the server. Discover from disk or
                 // fall back to the restrictive default, then sync to the
                 // gateway so it becomes the authoritative baseline.
                 info!("Server returned no policy; attempting local discovery");
-                let discovered = discover_policy_from_disk_or_default();
+                let mut discovered = discover_policy_from_disk_or_default();
+                // Enrich before syncing so the gateway baseline includes
+                // baseline paths from the start.
+                enrich_proto_baseline_paths(&mut discovered);
                 let sandbox = sandbox.as_deref().ok_or_else(|| {
                     miette::miette!(
                         "Cannot sync discovered policy: sandbox not available.\n\
@@ -748,6 +834,23 @@ async fn load_policy(
                 grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
             }
         };
+
+        // Ensure baseline filesystem paths are present for proxy-mode
+        // sandboxes.  If the policy was enriched, sync the updated version
+        // back to the gateway so users can see the effective policy.
+        let enriched = enrich_proto_baseline_paths(&mut proto_policy);
+        if enriched {
+            if let Some(sandbox_name) = sandbox.as_deref() {
+                if let Err(e) =
+                    grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
+                {
+                    warn!(
+                        error = %e,
+                        "Failed to sync enriched policy back to gateway (non-fatal)"
+                    );
+                }
+            }
+        }
 
         // Build OPA engine from baked-in rules + typed proto data.
         // In cluster mode, proxy networking is always enabled so OPA is
