@@ -6,7 +6,7 @@ extension so you get a full IDE experience inside the sandbox environment.
 
 ## Prerequisites
 
-- A running nemoclaw cluster (`nemoclaw cluster admin deploy`)
+- A running nemoclaw gateway (`nemoclaw gateway start`)
 - [VSCode](https://code.visualstudio.com/) with the
   [Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
   extension installed

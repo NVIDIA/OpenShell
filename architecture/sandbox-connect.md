@@ -6,7 +6,7 @@ Sandbox connect provides secure remote access into running sandbox environments.
 
 1. **Interactive shell** (`sandbox connect`) -- opens a PTY-backed SSH session for interactive use
 2. **Command execution** (`sandbox create -- <cmd>`) -- runs a command over SSH with stdout/stderr piped back
-3. **File sync** (`sandbox create --sync`) -- rsyncs local files into the sandbox before command execution
+3. **File sync** (`sandbox create --upload`) -- uploads local files into the sandbox before command execution
 
 All three modes tunnel SSH traffic through the gateway's multiplexed port using HTTP CONNECT. The gateway authenticates each connection with a short-lived session token, then performs a custom NSSH1 handshake with the sandbox's embedded SSH daemon before bridging raw bytes between client and sandbox.
 
@@ -150,9 +150,9 @@ The `sandbox exec` path is identical to interactive connect except:
 - The command string is passed as the final SSH argument
 - The sandbox daemon routes it through `exec_request()` instead of `shell_request()`, spawning `/bin/bash -lc <command>`
 
-### Port Forwarding (`sandbox forward start`)
+### Port Forwarding (`forward start`)
 
-`nemoclaw sandbox forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
+`nemoclaw forward start <port> <name>` opens a local SSH tunnel so connections to `127.0.0.1:<port>`
 on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 
 #### CLI
@@ -162,9 +162,9 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 - By default stays attached in foreground until interrupted (Ctrl+C).
 - With `-d`/`--background`, SSH forks after auth and the CLI exits. The PID is
   tracked in `~/.config/nemoclaw/forwards/<name>-<port>.pid` along with sandbox id metadata.
-- `nemoclaw sandbox forward stop <port> <name>` validates PID ownership and then kills a background forward.
-- `nemoclaw sandbox forward list` shows all tracked forwards.
-- `nemoclaw sandbox forward stop` and `nemoclaw sandbox forward list` are local operations and do not require
+- `nemoclaw forward stop <port> <name>` validates PID ownership and then kills a background forward.
+- `nemoclaw forward list` shows all tracked forwards.
+- `nemoclaw forward stop` and `nemoclaw forward list` are local operations and do not require
   resolving an active cluster.
 - `nemoclaw sandbox create --forward <port>` starts a background forward before connect/exec, including
   when no trailing command is provided.
@@ -278,29 +278,29 @@ File sync uses **tar-over-SSH**: the CLI streams a tar archive through the exist
 
 **Files**: `crates/navigator-cli/src/ssh.rs`, `crates/navigator-cli/src/run.rs`
 
-#### `sandbox create --sync`
+#### `sandbox create --upload`
 
-When `--sync` is passed to `sandbox create`, the CLI pushes local git-tracked files into `/sandbox` after the sandbox reaches `Ready` and before any command runs.
+When `--upload` is passed to `sandbox create`, the CLI pushes local files into `/sandbox` (or a specified destination) after the sandbox reaches `Ready` and before any command runs.
 
 1. `git_repo_root()` determines the repository root via `git rev-parse --show-toplevel`
 2. `git_sync_files()` lists files with `git ls-files -co --exclude-standard -z` (tracked + untracked, respecting gitignore, null-delimited)
 3. `sandbox_sync_up_files()` creates an SSH session config, spawns `ssh <proxy> sandbox "tar xf - -C /sandbox"`, and streams a tar archive of the file list to the SSH child's stdin using the `tar` crate
 4. Files land in `/sandbox` inside the container
 
-#### `nemoclaw sandbox sync` command
+#### `nemoclaw sandbox upload` / `nemoclaw sandbox download`
 
-The standalone `sandbox sync` subcommand supports bidirectional file transfer:
+Standalone commands support bidirectional file transfer:
 
 ```bash
 # Push local files up to sandbox
-nemoclaw sandbox sync <name> --up <local-path> [<sandbox-path>]
+nemoclaw sandbox upload <name> <local-path> [<sandbox-path>]
 
 # Pull sandbox files down to local
-nemoclaw sandbox sync <name> --down <sandbox-path> [<local-path>]
+nemoclaw sandbox download <name> <sandbox-path> [<local-path>]
 ```
 
-- **Push (`--up`)**: `sandbox_sync_up()` streams a tar archive of the local path to `ssh ... tar xf - -C <dest>` on the sandbox side. Default destination: `/sandbox`.
-- **Pull (`--down`)**: `sandbox_sync_down()` runs `ssh ... tar cf - -C <dir> <path>` on the sandbox side and extracts the output locally via `tar::Archive`. Default destination: `.` (current directory).
+- **Upload**: `sandbox_upload()` streams a tar archive of the local path to `ssh ... tar xf - -C <dest>` on the sandbox side. Default destination: `/sandbox`.
+- **Download**: `sandbox_download()` runs `ssh ... tar cf - -C <dir> <path>` on the sandbox side and extracts the output locally via `tar::Archive`. Default destination: `.` (current directory).
 - No compression for v1 — the SSH tunnel is local-network; compression adds CPU cost with marginal bandwidth savings.
 
 #### Why tar-over-SSH instead of rsync

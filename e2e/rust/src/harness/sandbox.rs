@@ -183,28 +183,40 @@ impl SandboxGuard {
         })
     }
 
-    /// Run a `nemoclaw sandbox sync` command on this sandbox.
+    /// Create a sandbox that runs a command, with `--upload` to pre-load files.
     ///
-    /// # Arguments
+    /// Equivalent to:
+    /// ```text
+    /// nemoclaw sandbox create --upload <local>:<dest> [extra_args...] -- <command>
+    /// ```
     ///
-    /// * `args` — Arguments after `nemoclaw sandbox sync <name>`,
-    ///   e.g. `["--up", "/local/path", "/sandbox/dest"]`.
+    /// The `--no-git-ignore` flag is passed to avoid needing a git repository.
     ///
     /// # Errors
     ///
-    /// Returns an error if the sync command fails.
-    pub async fn sync(&self, args: &[&str]) -> Result<String, String> {
+    /// Returns an error if the CLI exits with a non-zero status or the sandbox
+    /// name cannot be parsed.
+    pub async fn create_with_upload(
+        upload_local: &str,
+        upload_dest: &str,
+        command: &[&str],
+    ) -> Result<Self, String> {
+        let upload_spec = format!("{upload_local}:{upload_dest}");
+
         let mut cmd = nemoclaw_cmd();
         cmd.arg("sandbox")
-            .arg("sync")
-            .arg(&self.name)
-            .args(args);
+            .arg("create")
+            .arg("--upload")
+            .arg(&upload_spec)
+            .arg("--no-git-ignore")
+            .arg("--")
+            .args(command);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
 
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn nemoclaw sync: {e}"))?;
+            .map_err(|e| format!("failed to spawn nemoclaw: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -212,7 +224,55 @@ impl SandboxGuard {
 
         if !output.status.success() {
             return Err(format!(
-                "sandbox sync failed (exit {:?}):\n{combined}",
+                "sandbox create --upload failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        let name = extract_field(&combined, "Name").ok_or_else(|| {
+            format!("could not parse sandbox name from create output:\n{combined}")
+        })?;
+
+        Ok(Self {
+            name,
+            create_output: combined,
+            child: None,
+            cleaned_up: false,
+        })
+    }
+
+    /// Upload local files to the sandbox via `nemoclaw sandbox upload`.
+    ///
+    /// # Arguments
+    ///
+    /// * `local_path` — Local file or directory to upload.
+    /// * `dest` — Destination path in the sandbox (e.g. `/sandbox/uploaded`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload command fails.
+    pub async fn upload(&self, local_path: &str, dest: &str) -> Result<String, String> {
+        let mut cmd = nemoclaw_cmd();
+        cmd.arg("sandbox")
+            .arg("upload")
+            .arg(&self.name)
+            .arg(local_path)
+            .arg(dest)
+            .arg("--no-git-ignore");
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn nemoclaw upload: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox upload failed (exit {:?}):\n{combined}",
                 output.status.code()
             ));
         }
@@ -220,7 +280,99 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Spawn `nemoclaw sandbox forward start` as a background process.
+    /// Upload local files with `.gitignore` filtering (default behavior).
+    ///
+    /// Unlike [`upload`], this does NOT pass `--no-git-ignore`, so the CLI
+    /// will filter out gitignored files. The `cwd` is set to the given
+    /// directory so that `git_repo_root()` inside the CLI resolves correctly.
+    ///
+    /// # Arguments
+    ///
+    /// * `local_path` — Local file or directory to upload.
+    /// * `dest` — Destination path in the sandbox.
+    /// * `cwd` — Working directory for the CLI process (should be inside a git
+    ///   repo).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the upload command fails.
+    pub async fn upload_with_gitignore(
+        &self,
+        local_path: &str,
+        dest: &str,
+        cwd: &std::path::Path,
+    ) -> Result<String, String> {
+        let mut cmd = nemoclaw_cmd();
+        cmd.arg("sandbox")
+            .arg("upload")
+            .arg(&self.name)
+            .arg(local_path)
+            .arg(dest)
+            .current_dir(cwd);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn nemoclaw upload: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox upload (with gitignore) failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        Ok(combined)
+    }
+
+    /// Download files from the sandbox via `nemoclaw sandbox download`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sandbox_path` — Path inside the sandbox to download.
+    /// * `local_dest` — Local destination directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the download command fails.
+    pub async fn download(
+        &self,
+        sandbox_path: &str,
+        local_dest: &str,
+    ) -> Result<String, String> {
+        let mut cmd = nemoclaw_cmd();
+        cmd.arg("sandbox")
+            .arg("download")
+            .arg(&self.name)
+            .arg(sandbox_path)
+            .arg(local_dest);
+        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .await
+            .map_err(|e| format!("failed to spawn nemoclaw download: {e}"))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let combined = format!("{stdout}{stderr}");
+
+        if !output.status.success() {
+            return Err(format!(
+                "sandbox download failed (exit {:?}):\n{combined}",
+                output.status.code()
+            ));
+        }
+
+        Ok(combined)
+    }
+
+    /// Spawn `nemoclaw forward start` as a background process.
     ///
     /// Returns the child process handle. The caller is responsible for killing
     /// it (or it will be killed on drop since `kill_on_drop(true)` is set).
@@ -230,8 +382,7 @@ impl SandboxGuard {
     /// Returns an error if the process cannot be spawned.
     pub fn spawn_forward(&self, port: u16) -> Result<tokio::process::Child, String> {
         let mut cmd = nemoclaw_cmd();
-        cmd.arg("sandbox")
-            .arg("forward")
+        cmd.arg("forward")
             .arg("start")
             .arg(port.to_string())
             .arg(&self.name);

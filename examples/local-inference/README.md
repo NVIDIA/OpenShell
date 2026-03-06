@@ -51,7 +51,7 @@ requests locally — no gRPC server or cluster required.
 
 ```bash
 mise run cluster
-nemoclaw cluster status
+nemoclaw status
 ```
 
 #### 2. Configure cluster inference

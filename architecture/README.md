@@ -232,12 +232,13 @@ For more detail, see [Policy Language](security-policy.md).
 
 The CLI is the primary way users interact with the platform. It provides commands organized into four groups:
 
-- **Cluster management** (`nemoclaw cluster`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
-- **Sandbox management** (`nemoclaw sandbox`): Create sandboxes (with optional file sync and provider auto-discovery), list running sandboxes, connect to sandboxes via SSH, and delete sandboxes.
+- **Gateway management** (`nemoclaw gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
+- **Sandbox management** (`nemoclaw sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
+- **Top-level commands**: `nemoclaw status` (cluster health), `nemoclaw logs` (sandbox logs), `nemoclaw forward` (port forwarding), `nemoclaw policy` (sandbox policy management).
 - **Provider management** (`nemoclaw provider`): Create, update, list, and delete external service credentials.
 - **Inference management** (`nemoclaw cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
 
-The CLI resolves which cluster to operate on through a priority chain: explicit `--cluster` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `nemoclaw cluster use`. It supports TLS client certificates for mutual authentication with the gateway.
+The CLI resolves which cluster to operate on through a priority chain: explicit `--gateway` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `nemoclaw gateway select`. It supports TLS client certificates for mutual authentication with the gateway.
 
 ## How Users Get Started
 

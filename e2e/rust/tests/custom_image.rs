@@ -5,10 +5,8 @@
 
 //! E2E test: build a custom container image and run a sandbox with it.
 //!
-//! Replaces `e2e/bash/test_sandbox_custom_image.sh`.
-//!
 //! Prerequisites:
-//! - A running nemoclaw cluster (`nemoclaw cluster admin deploy`)
+//! - A running nemoclaw gateway (`nemoclaw gateway start`)
 //! - Docker daemon running (for image build)
 //! - The `nemoclaw` binary (built automatically from the workspace)
 
@@ -18,6 +16,10 @@ use nemoclaw_e2e::harness::output::strip_ansi;
 use nemoclaw_e2e::harness::sandbox::SandboxGuard;
 
 const DOCKERFILE_CONTENT: &str = r#"FROM python:3.12-slim
+
+# iproute2 is required for sandbox network namespace isolation.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
 
 # Create the sandbox user/group so the supervisor can switch to it.
 RUN groupadd -g 1000 sandbox && \

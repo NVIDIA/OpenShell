@@ -9,7 +9,7 @@ Comprehensive reference for any agent working on the NemoClaw TUI.
 
 ## 1. Overview
 
-The NemoClaw TUI is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing clusters, sandboxes, and logs — the same operations available via the `nemoclaw` CLI, but with a live, interactive dashboard.
+The NemoClaw TUI is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing gateways, sandboxes, and logs — the same operations available via the `nemoclaw` CLI, but with a live, interactive dashboard.
 
 - **Launched via:** `nemoclaw term` or `mise run term`
 - **Crate:** `crates/navigator-tui/`
@@ -231,8 +231,8 @@ TUI actions should parallel `nemoclaw` CLI commands so users have familiar menta
 | --- | --- |
 | `nemoclaw sandbox list` | Sandbox table on Dashboard |
 | `nemoclaw sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
-| `nemoclaw sandbox logs <name>` | `[l]` on sandbox detail to open log viewer |
-| `nemoclaw cluster health` | Status in title bar + cluster list |
+| `nemoclaw logs <name>` | `[l]` on sandbox detail to open log viewer |
+| `nemoclaw status` | Status in title bar + cluster list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 

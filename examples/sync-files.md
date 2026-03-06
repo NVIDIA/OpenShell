@@ -1,26 +1,26 @@
 # Syncing Files To and From a Sandbox
 
 Move code, data, and artifacts between your local machine and a NemoClaw
-sandbox using `nemoclaw sandbox sync`.
+sandbox using `nemoclaw sandbox upload` and `nemoclaw sandbox download`.
 
 ## Push local files into a sandbox
 
 Upload your current project directory into `/sandbox` on the sandbox:
 
 ```bash
-nemoclaw sandbox sync my-sandbox --up .
+nemoclaw sandbox upload my-sandbox .
 ```
 
 Push a specific directory to a custom destination:
 
 ```bash
-nemoclaw sandbox sync my-sandbox --up ./src /sandbox/src
+nemoclaw sandbox upload my-sandbox ./src /sandbox/src
 ```
 
 Push a single file:
 
 ```bash
-nemoclaw sandbox sync my-sandbox --up ./config.yaml /sandbox/config.yaml
+nemoclaw sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
 ```
 
 ## Pull files from a sandbox
@@ -28,13 +28,13 @@ nemoclaw sandbox sync my-sandbox --up ./config.yaml /sandbox/config.yaml
 Download sandbox output to your local machine:
 
 ```bash
-nemoclaw sandbox sync my-sandbox --down /sandbox/output ./output
+nemoclaw sandbox download my-sandbox /sandbox/output ./output
 ```
 
 Pull results to the current directory:
 
 ```bash
-nemoclaw sandbox sync my-sandbox --down /sandbox/results
+nemoclaw sandbox download my-sandbox /sandbox/results
 ```
 
 ## Sync on create
@@ -55,14 +55,14 @@ This collects tracked and untracked (non-ignored) files via
 nemoclaw sandbox create --name dev --sync --keep
 
 # Make local changes, then push them
-nemoclaw sandbox sync dev --up ./src /sandbox/src
+nemoclaw sandbox upload dev ./src /sandbox/src
 
 # Run tests inside the sandbox
 nemoclaw sandbox connect dev
 # (inside sandbox) pytest
 
 # Pull test artifacts back
-nemoclaw sandbox sync dev --down /sandbox/coverage ./coverage
+nemoclaw sandbox download dev /sandbox/coverage ./coverage
 ```
 
 ## How it works

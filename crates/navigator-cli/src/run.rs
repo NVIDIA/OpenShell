@@ -509,14 +509,14 @@ pub fn cluster_use(name: &str) -> Result<()> {
     // Verify the cluster exists
     get_cluster_metadata(name).ok_or_else(|| {
         miette::miette!(
-            "No cluster metadata found for '{name}'.\n\
-             Deploy a cluster first with: nemoclaw cluster admin deploy --name {name}\n\
-             Or list available clusters: nemoclaw cluster list"
+            "No gateway metadata found for '{name}'.\n\
+              Deploy a gateway first with: nemoclaw gateway start --name {name}\n\
+              Or list available gateways: nemoclaw gateway select"
         )
     })?;
 
     save_active_cluster(name)?;
-    eprintln!("{} Active cluster set to '{name}'", "✓".green().bold());
+    eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
     Ok(())
 }
 
@@ -526,11 +526,11 @@ pub fn cluster_list(cluster_flag: &Option<String>) -> Result<()> {
     let active = cluster_flag.clone().or_else(load_active_cluster);
 
     if clusters.is_empty() {
-        println!("No clusters found.");
+        println!("No gateways found.");
         println!();
         println!(
-            "Deploy a cluster with: {}",
-            "nemoclaw cluster admin deploy".dimmed()
+            "Deploy a gateway with: {}",
+            "nemoclaw gateway start".dimmed()
         );
         return Ok(());
     }
@@ -633,7 +633,7 @@ fn prompt_existing_cluster(
 /// Deploy a cluster with the rich progress panel (interactive) or simple
 /// logging (non-interactive). Returns the [`ClusterHandle`] on success.
 ///
-/// This is the shared deploy UX used by both `cluster admin deploy` and
+/// This is the shared deploy UX used by both `gateway start` and
 /// the auto-bootstrap path in `sandbox create`.
 pub(crate) async fn deploy_cluster_with_panel(
     options: DeployOptions,
@@ -714,6 +714,7 @@ pub async fn cluster_admin_deploy(
     port: u16,
     gateway_host: Option<&str>,
     kube_port: Option<u16>,
+    recreate: bool,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -739,8 +740,9 @@ pub async fn cluster_admin_deploy(
 
     let interactive = std::io::stderr().is_terminal();
 
-    // Check for existing cluster and prompt user if found
-    if interactive {
+    // Check for existing cluster and prompt user if found.
+    // --recreate skips the prompt and always destroys.
+    {
         let remote_opts = remote.map(|dest| {
             let mut opts = RemoteOptions::new(dest);
             if let Some(key) = ssh_key {
@@ -751,8 +753,15 @@ pub async fn cluster_admin_deploy(
         if let Some(info) =
             navigator_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
         {
-            let recreate = prompt_existing_cluster(name, &info)?;
-            if recreate {
+            let should_recreate = if recreate {
+                true
+            } else if interactive {
+                prompt_existing_cluster(name, &info)?
+            } else {
+                false // non-interactive without --recreate: silently reuse
+            };
+
+            if should_recreate {
                 eprintln!("• Destroying existing cluster...");
                 let handle =
                     navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
@@ -864,8 +873,8 @@ pub async fn cluster_admin_destroy(
 pub fn cluster_admin_info(name: &str) -> Result<()> {
     let metadata = get_cluster_metadata(name).ok_or_else(|| {
         miette::miette!(
-            "No cluster metadata found for '{name}'.\n\
-             Deploy a cluster first with: nemoclaw cluster admin deploy --name {name}"
+            "No gateway metadata found for '{name}'.\n\
+              Deploy a gateway first with: nemoclaw gateway start --name {name}"
         )
     })?;
 
@@ -900,7 +909,7 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
         if let (Some(host), Some(kube_port)) = (&metadata.remote_host, metadata.kube_port) {
             println!();
             println!("{}", "SSH tunnel for kubectl access:".dimmed());
-            println!("  nemoclaw cluster admin tunnel --name {name}");
+            println!("  nemoclaw gateway tunnel --name {name}");
             println!("Or manually:");
             println!("  ssh -L {kube_port}:127.0.0.1:6443 {host}");
         }
@@ -967,7 +976,7 @@ pub fn cluster_admin_tunnel(
 pub async fn sandbox_create_with_bootstrap(
     name: Option<&str>,
     from: Option<&str>,
-    sync: bool,
+    upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -976,12 +985,14 @@ pub async fn sandbox_create_with_bootstrap(
     forward: Option<u16>,
     command: &[String],
     tty_override: Option<bool>,
+    bootstrap_override: Option<bool>,
+    auto_providers_override: Option<bool>,
 ) -> Result<()> {
-    if !crate::bootstrap::confirm_bootstrap()? {
+    if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
         return Err(miette::miette!(
-            "No active cluster.\n\
-             Set one with: nemoclaw cluster use <name>\n\
-             Or deploy a new cluster: nemoclaw cluster admin deploy"
+            "No active gateway.\n\
+             Set one with: nemoclaw gateway select <name>\n\
+             Or deploy a new gateway: nemoclaw gateway start"
         ));
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
@@ -992,7 +1003,7 @@ pub async fn sandbox_create_with_bootstrap(
         name,
         from,
         cluster_name,
-        sync,
+        upload,
         keep,
         remote,
         ssh_key,
@@ -1001,6 +1012,8 @@ pub async fn sandbox_create_with_bootstrap(
         forward,
         command,
         tty_override,
+        bootstrap_override,
+        auto_providers_override,
         &tls,
     )
     .await
@@ -1013,7 +1026,7 @@ pub async fn sandbox_create(
     name: Option<&str>,
     from: Option<&str>,
     cluster_name: &str,
-    sync: bool,
+    upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -1022,6 +1035,8 @@ pub async fn sandbox_create(
     forward: Option<u16>,
     command: &[String],
     tty_override: Option<bool>,
+    bootstrap_override: Option<bool>,
+    auto_providers_override: Option<bool>,
     tls: &TlsOptions,
 ) -> Result<()> {
     // Try connecting to the cluster. If it fails due to an unreachable cluster,
@@ -1032,7 +1047,7 @@ pub async fn sandbox_create(
             if !crate::bootstrap::should_attempt_bootstrap(&err, tls) {
                 return Err(err);
             }
-            if !crate::bootstrap::confirm_bootstrap()? {
+            if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
                 return Err(err);
             }
             let (new_tls, new_server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
@@ -1063,8 +1078,13 @@ pub async fn sandbox_create(
     };
 
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
-    let configured_providers =
-        ensure_required_providers(&mut client, providers, &inferred_types).await?;
+    let configured_providers = ensure_required_providers(
+        &mut client,
+        providers,
+        &inferred_types,
+        auto_providers_override,
+    )
+    .await?;
 
     let mut policy = load_sandbox_policy(policy)?;
 
@@ -1245,16 +1265,29 @@ pub async fn sandbox_create(
             drop(stream);
             drop(client);
 
-            if sync {
-                let repo_root = git_repo_root()?;
-                let files = git_sync_files(&repo_root)?;
-                if !files.is_empty() {
+            if let Some((local_path, sandbox_path, git_ignore)) = upload {
+                let dest = sandbox_path.as_deref().unwrap_or("/sandbox");
+                let local = Path::new(local_path);
+                if *git_ignore
+                    && let Ok(repo_root) = git_repo_root()
+                    && let Ok(files) = git_sync_files(&repo_root)
+                    && !files.is_empty()
+                {
                     sandbox_sync_up_files(
                         &effective_server,
                         &sandbox_name,
                         &repo_root,
                         &files,
-                        "/sandbox",
+                        dest,
+                        &effective_tls,
+                    )
+                    .await?;
+                } else if local.exists() {
+                    sandbox_sync_up(
+                        &effective_server,
+                        &sandbox_name,
+                        local,
+                        dest,
                         &effective_tls,
                     )
                     .await?;
@@ -1278,7 +1311,7 @@ pub async fn sandbox_create(
                     "✓".green().bold(),
                 );
                 eprintln!("Access at: http://127.0.0.1:{port}/");
-                eprintln!("Stop with: nemoclaw sandbox forward stop {port} {sandbox_name}",);
+                eprintln!("Stop with: nemoclaw forward stop {port} {sandbox_name}",);
             }
 
             if command.is_empty() {
@@ -1750,6 +1783,7 @@ async fn ensure_required_providers(
     client: &mut NavigatorClient<Channel>,
     explicit_names: &[String],
     inferred_types: &[String],
+    auto_providers_override: Option<bool>,
 ) -> Result<Vec<String>> {
     if explicit_names.is_empty() && inferred_types.is_empty() {
         return Ok(Vec::new());
@@ -1809,9 +1843,23 @@ async fn ensure_required_providers(
             .collect::<Vec<_>>();
 
         if !missing.is_empty() {
-            if !std::io::stdin().is_terminal() {
+            // --no-auto-providers: skip all missing providers silently.
+            if auto_providers_override == Some(false) {
+                for provider_type in &missing {
+                    eprintln!(
+                        "{} Skipping provider '{provider_type}' (--no-auto-providers)",
+                        "!".yellow(),
+                    );
+                }
+                return Ok(configured_names);
+            }
+
+            // No override and non-interactive: error.
+            if auto_providers_override.is_none() && !std::io::stdin().is_terminal() {
                 return Err(miette::miette!(
-                    "missing required providers: {}. Create them first with `nemoclaw provider create --type <type> --name <name> --from-existing`, or set them up manually from inside the sandbox",
+                    "missing required providers: {}. Create them first with \
+                     `nemoclaw provider create --type <type> --name <name> --from-existing`, \
+                     pass --auto-providers to auto-create, or set them up manually from inside the sandbox",
                     missing.join(", ")
                 ));
             }
@@ -1819,11 +1867,17 @@ async fn ensure_required_providers(
             let registry = ProviderRegistry::new();
             for provider_type in missing {
                 eprintln!("Missing provider: {provider_type}");
-                let should_create = Confirm::new()
-                    .with_prompt("Create from local credentials?")
-                    .default(true)
-                    .interact()
-                    .into_diagnostic()?;
+
+                // --auto-providers: auto-confirm all.
+                let should_create = if auto_providers_override == Some(true) {
+                    true
+                } else {
+                    Confirm::new()
+                        .with_prompt("Create from local credentials?")
+                        .default(true)
+                        .interact()
+                        .into_diagnostic()?
+                };
 
                 if !should_create {
                     eprintln!("{} Skipping provider '{provider_type}'", "!".yellow(),);
@@ -2298,7 +2352,7 @@ pub async fn cluster_inference_get(server: &str, tls: &TlsOptions) -> Result<()>
     Ok(())
 }
 
-fn git_repo_root() -> Result<PathBuf> {
+pub fn git_repo_root() -> Result<PathBuf> {
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
         .output()
@@ -2322,7 +2376,7 @@ fn git_repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
-fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
+pub fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
     let output = Command::new("git")
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
         .current_dir(repo_root)

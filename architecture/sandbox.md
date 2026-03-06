@@ -1128,7 +1128,7 @@ Key structured log events:
 
 ## Log Streaming
 
-In gRPC mode, sandbox supervisor logs are streamed to the gateway in real time. This enables operators and CLI users to view both gateway-side and sandbox-side logs in a unified stream via `nav sandbox logs`.
+In gRPC mode, sandbox supervisor logs are streamed to the gateway in real time. This enables operators and CLI users to view both gateway-side and sandbox-side logs in a unified stream via `nav logs`.
 
 ### Architecture overview
 
@@ -1251,20 +1251,20 @@ Gateway-sourced logs do not currently populate the `fields` map (it remains empt
 
 **File:** `crates/navigator-cli/src/main.rs` (command definition), `crates/navigator-cli/src/run.rs` (`sandbox_logs()`)
 
-The `nav sandbox logs` command supports filtering by source and level:
+The `nav logs` command supports filtering by source and level:
 
 ```bash
 # Show only sandbox-side logs
-nav sandbox logs my-sandbox --source sandbox
+nav logs my-sandbox --source sandbox
 
 # Show only warnings and errors from the gateway
-nav sandbox logs my-sandbox --source gateway --level warn
+nav logs my-sandbox --source gateway --level warn
 
 # Stream live logs from all sources
-nav sandbox logs my-sandbox --tail
+nav logs my-sandbox --tail
 
 # Stream live sandbox logs only
-nav sandbox logs my-sandbox --tail --source sandbox
+nav logs my-sandbox --tail --source sandbox
 ```
 
 **CLI flags:**
@@ -1319,7 +1319,7 @@ sequenceDiagram
     participant BG as Background push task
     participant GW as Gateway (push_sandbox_logs)
     participant TB as TracingLogBus
-    participant CL as CLI (nav sandbox logs)
+    participant CL as CLI (nav logs)
 
     SB->>LP: tracing event (info!(...))
     LP->>LP: Check level >= NEMOCLAW_LOG_PUSH_LEVEL
