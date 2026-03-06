@@ -254,7 +254,6 @@ get-started/tutorials/index
 
 Overview <about/index>
 about/how-it-works
-about/support-matrix
 about/release-notes
 ```
 
