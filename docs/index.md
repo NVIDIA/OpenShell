@@ -49,11 +49,21 @@ $ nemoclaw sandbox create -- claude
 ::::{grid} 2 2 3 3
 :gutter: 3
 
-:::{grid-item-card} Tutorials
-:link: get-started/tutorials
+:::{grid-item-card} About NemoClaw
+:link: about/index
 :link-type: doc
 
-Step-by-step walkthroughs for Claude Code, OpenClaw, and OpenCode with NVIDIA inference.
+Learn about NemoClaw and its capabilities.
+
++++
+{bdg-secondary}`Concept`
+:::
+
+:::{grid-item-card} Get Started
+:link: get-started/quickstart
+:link-type: doc
+
+Quickstart guide for creating a NemoClaw sandbox with Claude Code, OpenClaw, and OpenCode.
 
 +++
 {bdg-secondary}`Tutorial`
