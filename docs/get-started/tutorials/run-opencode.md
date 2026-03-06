@@ -61,7 +61,7 @@ $ nemoclaw sandbox logs opencode-sandbox --tail
 Or launch the NemoClaw Terminal for a live view:
 
 ```console
-$ nemoclaw gator
+$ nemoclaw term
 ```
 
 Look for lines like these in the output:

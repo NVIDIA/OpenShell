@@ -47,6 +47,16 @@ Controls filesystem access inside the sandbox. Paths not listed in either `read_
 | `read_only` | list of strings | No | Paths the agent can read but not modify. Typically system directories like `/usr`, `/lib`, `/etc`. |
 | `read_write` | list of strings | No | Paths the agent can read and write. Typically `/sandbox` (working directory) and `/tmp`. |
 
+**Validation constraints:**
+
+- Every path must be absolute (start with `/`).
+- Paths must not contain `..` traversal components. The server normalizes paths before storage, but rejects policies where traversal would escape the intended scope.
+- Read-write paths must not be overly broad (for example, `/` alone is rejected).
+- Each individual path must not exceed 4096 characters.
+- The combined total of `read_only` and `read_write` paths must not exceed 256.
+
+Policies that violate these constraints are rejected with `INVALID_ARGUMENT` at creation or update time. Disk-loaded YAML policies that fail validation fall back to a restrictive default.
+
 Example:
 
 ```yaml
@@ -91,6 +101,8 @@ Sets the OS-level identity for the agent process inside the sandbox.
 |---|---|---|---|
 | `run_as_user` | string | No | The user name or UID the agent process runs as. Default: `sandbox`. |
 | `run_as_group` | string | No | The group name or GID the agent process runs as. Default: `sandbox`. |
+
+**Validation constraint:** Neither `run_as_user` nor `run_as_group` may be set to `root` or `0`. Policies that request root process identity are rejected at creation or update time.
 
 Example:
 

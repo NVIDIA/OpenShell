@@ -23,12 +23,12 @@ nemoclaw
 │       └── tunnel
 ├── sandbox
 │   ├── create
-│   ├── get <name>
+│   ├── get [name]
 │   ├── list
 │   ├── delete <name...>
-│   ├── connect <name>
-│   ├── sync <name>
-│   ├── logs <name>
+│   ├── connect [name]
+│   ├── sync [name]
+│   ├── logs [name]
 │   ├── ssh-config <name>
 │   ├── forward
 │   │   ├── start <port> <name>
@@ -75,12 +75,12 @@ Create and manage isolated agent execution environments.
 | Command | Description |
 |---|---|
 | `nemoclaw sandbox create` | Create a new sandbox. See flag reference below. |
-| `nemoclaw sandbox get <name>` | Show detailed information about a sandbox. |
+| `nemoclaw sandbox get [name]` | Show detailed information about a sandbox. When name is omitted, uses the last-used sandbox. |
 | `nemoclaw sandbox list` | List all sandboxes in the active cluster. |
 | `nemoclaw sandbox delete <name...>` | Delete one or more sandboxes by name. |
-| `nemoclaw sandbox connect <name>` | Open an interactive SSH session into a running sandbox. |
-| `nemoclaw sandbox sync <name>` | Sync files between host and sandbox. Use `--up` or `--down`. |
-| `nemoclaw sandbox logs <name>` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. |
+| `nemoclaw sandbox connect [name]` | Open an interactive SSH session into a running sandbox. When name is omitted, reconnects to the last-used sandbox. |
+| `nemoclaw sandbox sync [name]` | Sync files between host and sandbox. Use `--up` or `--down`. When name is omitted, uses the last-used sandbox. |
+| `nemoclaw sandbox logs [name]` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. When name is omitted, uses the last-used sandbox. |
 | `nemoclaw sandbox ssh-config <name>` | Print SSH config for a sandbox. Append to `~/.ssh/config` for VS Code Remote-SSH. |
 | `nemoclaw sandbox forward start <port> <name>` | Forward a sandbox port to the host. Add `-d` for background mode. |
 | `nemoclaw sandbox forward stop <port> <name>` | Stop an active port forward. |
@@ -154,6 +154,12 @@ press `f` to follow live output, `s` to filter by source, and `q` to quit.
 
 Refer to {doc}`/sandboxes/terminal` for the full guide, including how to read log
 entries, diagnose blocked connections, and interpret inference interception.
+
+## Sandbox Name Fallback
+
+Commands that accept an optional `[name]` argument---`get`, `connect`, `sync`, and `logs`---fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect to a sandbox. When falling back, the CLI prints a hint showing which sandbox was selected.
+
+If no sandbox has been used yet and no name is provided, the command exits with an error prompting you to specify a name.
 
 ## Environment Variables
 

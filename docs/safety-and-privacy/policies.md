@@ -212,6 +212,23 @@ $ nemoclaw sandbox policy get <name> --rev 3 --full
 | `failed`     | The revision failed validation. The previous good revision remains active. |
 | `superseded` | A newer revision has been loaded, replacing this one. |
 
+## Policy Validation
+
+The server validates every policy at creation and update time. Policies that violate any of the following rules are rejected with exit code `1` (`INVALID_ARGUMENT`):
+
+| Rule | Description |
+|---|---|
+| No root identity | `run_as_user` and `run_as_group` cannot be `root` or `0`. |
+| Absolute paths only | All filesystem paths must start with `/`. |
+| No path traversal | Filesystem paths must not contain `..` components. |
+| No overly broad writes | Read-write paths like `/` alone are rejected. |
+| Path length limit | Each path must not exceed 4096 characters. |
+| Path count limit | The combined total of `read_only` and `read_write` paths must not exceed 256. |
+
+When a disk-loaded YAML policy (via `--policy` or `NEMOCLAW_SANDBOX_POLICY`) fails validation, the sandbox falls back to a restrictive default policy rather than starting with an unsafe configuration.
+
+Refer to the [Policy Schema Reference](../reference/policy-schema.md) for the constraints documented alongside each field.
+
 ## Safety Properties
 
 **Last-known-good.**
