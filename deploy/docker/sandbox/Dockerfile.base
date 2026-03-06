@@ -107,7 +107,7 @@ RUN groupadd -r supervisor && useradd -r -g supervisor -s /usr/sbin/nologin supe
 # Stage 3: Python dependencies builder
 FROM base AS builder
 
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.10.8 /uv /usr/local/bin/uv
 
 # Copy project files for dependency resolution
 COPY pyproject.toml uv.lock ./
@@ -128,7 +128,7 @@ FROM base AS coding-agents
 # Include a minimal native toolchain so npm can compile optional native
 # dependencies on platforms where prebuilt artifacts are unavailable.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends build-essential git nodejs python3 vim-tiny nano && \
+    apt-get install -y --no-install-recommends build-essential git nodejs python3 nano && \
     rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) from the official apt repository
@@ -144,8 +144,11 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
     && cp /root/.local/bin/claude /usr/local/bin/claude \
     && chmod 755 /usr/local/bin/claude
 
-# Install OpenCode CLI and Codex CLI (OpenAI)
-RUN npm install -g opencode-ai @openai/codex openclaw
+# Install OpenCode CLI, Codex CLI (OpenAI), and OpenClaw with pinned versions
+# for reproducible builds. Force-upgrade tar afterward to resolve transitive
+# dependency vulnerabilities (GHSA-r6q2-hw4h-h46w, GHSA-qffp-2rhf-9h96, etc.)
+RUN npm install -g opencode-ai@1.2.18 @openai/codex@0.111.0 openclaw@2026.3.2 && \
+    npm install -g tar@7.5.10
 
 # Install ai-pim-utils (NVIDIA PIM CLI tools: outlook, calendar, transcripts, etc.)
 # The install script auto-detects Debian and installs via .deb package to /usr/bin.
