@@ -17,6 +17,8 @@ into a single package that you can launch with one command.
 
 ## Current Catalog
 
+The following community sandboxes are available in the catalog.
+
 | Sandbox | Description |
 |---|---|
 | `base` | Foundational image with system tools and dev environment |

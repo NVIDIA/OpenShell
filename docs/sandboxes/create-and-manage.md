@@ -43,6 +43,8 @@ with `nemoclaw cluster use <name>`. See the
 
 ## Prerequisites
 
+Ensure the following are installed before creating sandboxes.
+
 - NemoClaw CLI installed (`pip install nemoclaw`)
 - Docker running on your machine
 
@@ -81,6 +83,8 @@ reconnect later from another terminal or VS Code.
 
 ## List and Inspect Sandboxes
 
+Check the status of your sandboxes and retrieve detailed information about individual ones.
+
 List all sandboxes:
 
 ```console
@@ -94,6 +98,8 @@ $ nemoclaw sandbox get my-sandbox
 ```
 
 ## Connect to a Sandbox
+
+Access a running sandbox through an interactive SSH session or VS Code Remote-SSH.
 
 ### Interactive SSH
 
@@ -115,6 +121,8 @@ Then open VS Code, install the **Remote - SSH** extension if you have not
 already, and connect to the host named `my-sandbox`.
 
 ## View Logs
+
+Stream and filter sandbox logs to monitor agent activity and diagnose policy decisions.
 
 Stream sandbox logs:
 
@@ -144,6 +152,8 @@ diagnosing blocked connections.
 :::
 
 ## Sync Files
+
+Transfer files between your host machine and a running sandbox.
 
 Push files from your host into the sandbox:
 
@@ -196,6 +206,8 @@ your workload exposes a service.
 :::
 
 ## Delete Sandboxes
+
+Remove sandboxes when they are no longer needed. Deleting a sandbox stops all processes, releases cluster resources, and purges injected credentials.
 
 Delete a sandbox by name:
 

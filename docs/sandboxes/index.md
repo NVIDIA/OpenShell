@@ -9,6 +9,8 @@ A sandbox is a safe, private execution environment for an AI agent. Each sandbox
 
 ## Concepts
 
+The following concepts are fundamental to how sandboxes operate.
+
 ### Lifecycle
 
 A sandbox goes through these phases:
@@ -40,6 +42,8 @@ See [Safety & Privacy](../safety-and-privacy/index.md) for details.
 
 ## Quick Reference
 
+Common sandbox operations and their CLI commands.
+
 | Task | Command |
 |------|---------|
 | Create sandbox (interactive) | `nemoclaw sandbox create` |
@@ -54,9 +58,10 @@ See [Safety & Privacy](../safety-and-privacy/index.md) for details.
 
 ## In This Section
 
+Guides for each aspect of sandbox management.
+
 - [Create and Manage](create-and-manage.md): About creating, listing, inspecting, and connecting to sandboxes.
 - [Providers](providers.md): About managing external credentials privately.
 - [Custom Containers](custom-containers.md): About bringing your own container images.
 - [Community Sandboxes](community-sandboxes.md): About using pre-built sandboxes from the NemoClaw Community catalog.
-- [Port Forwarding](port-forwarding.md): About forwarding local ports into sandboxes.
 - [Terminal](terminal.md): About using NemoClaw Terminal to monitor sandbox activity and diagnose blocked connections.

@@ -11,6 +11,8 @@ Create and manage providers that supply credentials to sandboxes.
 
 ## Create a Provider
 
+Providers can be created from local environment variables or with explicit credential values.
+
 ### From Local Credentials
 
 The fastest way to create a provider is to let the CLI discover credentials from
@@ -43,6 +45,8 @@ $ nemoclaw provider create --name my-api --type generic --credential API_KEY
 This looks up the current value of `$API_KEY` in your shell and stores it.
 
 ## Manage Providers
+
+List, inspect, update, and delete providers from the active cluster.
 
 List all providers:
 

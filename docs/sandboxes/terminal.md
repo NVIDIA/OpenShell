@@ -89,6 +89,8 @@ The dashboard provides filtering and navigation controls:
 
 ## Keyboard Shortcuts
 
+The following keyboard shortcuts are available in the terminal dashboard.
+
 | Key | Action |
 |---|---|
 | `j` / `k` | Navigate down / up in the log list. |
@@ -100,6 +102,8 @@ The dashboard provides filtering and navigation controls:
 | `q` | Quit. |
 
 ## Related Topics
+
+For deeper dives into topics covered by the terminal dashboard, see the following guides.
 
 - **Blocked connections** — Follow {doc}`../safety-and-privacy/policies` to pull the current policy, add the missing endpoint, and push an update without restarting the sandbox.
 - **Inference interception** — See {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).

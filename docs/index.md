@@ -179,7 +179,6 @@ sandboxes/create-and-manage
 sandboxes/providers
 sandboxes/custom-containers
 sandboxes/community-sandboxes
-sandboxes/port-forwarding
 sandboxes/terminal
 ```
 
