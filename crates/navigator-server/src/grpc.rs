@@ -49,7 +49,7 @@ use crate::ServerState;
 pub(crate) const MAX_PAGE_SIZE: u32 = 1000;
 
 // ---------------------------------------------------------------------------
-// Field-level size limits (issue #24)
+// Field-level size limits
 //
 // Named constants for easy tuning. Each limit is chosen to be generous
 // enough for legitimate payloads while capping resource-exhaustion vectors.
@@ -1328,7 +1328,7 @@ fn level_matches(log_level: &str, min_level: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 // ---------------------------------------------------------------------------
-// Sandbox spec validation (issue #24)
+// Sandbox spec validation
 // ---------------------------------------------------------------------------
 
 /// Validate field sizes on a `CreateSandboxRequest` before persisting.
@@ -1489,7 +1489,7 @@ fn validate_string_map(
 }
 
 // ---------------------------------------------------------------------------
-// Provider field validation (issue #24)
+// Provider field validation
 // ---------------------------------------------------------------------------
 
 /// Validate field sizes on a `Provider` before persisting.
@@ -2935,7 +2935,7 @@ mod tests {
         }
     }
 
-    // ---- Field-level size limit tests (issue #24) ----
+    // ---- Field-level size limit tests ----
 
     fn default_spec() -> SandboxSpec {
         SandboxSpec::default()
