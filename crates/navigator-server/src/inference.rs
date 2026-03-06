@@ -13,6 +13,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     ServerState,
+    grpc::{MAX_PAGE_SIZE, clamp_limit},
     persistence::{ObjectId, ObjectName, ObjectType, Store, generate_name},
 };
 
@@ -165,11 +166,7 @@ impl Inference for InferenceService {
         request: Request<ListInferenceRoutesRequest>,
     ) -> Result<Response<ListInferenceRoutesResponse>, Status> {
         let request = request.into_inner();
-        let limit = if request.limit == 0 {
-            100
-        } else {
-            request.limit
-        };
+        let limit = clamp_limit(request.limit, 100, MAX_PAGE_SIZE);
 
         let records = self
             .state
