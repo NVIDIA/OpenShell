@@ -38,7 +38,6 @@ SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local"
 
 # Shared build constants (overridable via environment)
-K3S_VERSION = "{{env.K3S_VERSION | default(value='v1.34.5-k3s1')}}"
 DOCKER_BUILDKIT = "1"
 
 [vars]

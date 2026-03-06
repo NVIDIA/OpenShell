@@ -17,7 +17,7 @@ graph TB
     %% ============================================================
     subgraph Cluster["NemoClaw Cluster Container (Docker)"]
 
-        subgraph K3s["k3s (v1.29.8-k3s1)"]
+        subgraph K3s["k3s (v1.35.2-k3s1)"]
             KubeAPI["Kubernetes API<br/>:6443"]
             HelmController["Helm Controller"]
             LocalPathProv["local-path-provisioner"]

@@ -99,7 +99,7 @@ A k3s image with bundled Helm charts and Kubernetes manifests for single-contain
 
 **Defined in** `deploy/docker/Dockerfile.cluster`.
 
-**Base image:** `rancher/k3s:v1.29.8-k3s1` (configurable via `K3S_VERSION` build arg).
+**Base image:** `rancher/k3s:v1.35.2-k3s1` (configurable via `K3S_VERSION` build arg).
 
 **Layers added:**
 
@@ -368,7 +368,7 @@ After building, the script:
 |---|---|---|
 | `IMAGE_TAG` | `dev` | Tag for built images |
 | `RUST_BUILD_PROFILE` | `debug` | `debug` or `release` for sandbox builds |
-| `K3S_VERSION` | `v1.29.8-k3s1` | k3s version for cluster image |
+| `K3S_VERSION` | `v1.35.2-k3s1` | k3s version for cluster image (optional override; default in Dockerfile.cluster) |
 
 | `CLUSTER_NAME` | basename of `$PWD` | Name for local cluster deployment |
 | `DOCKER_PLATFORM` | (unset) | Target platform for multi-arch builds (e.g., `linux/amd64`) |
