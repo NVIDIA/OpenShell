@@ -29,8 +29,8 @@ The logs pane streams activity in real time. Outbound connections, policy decisi
 
 Log entries originate from two sources:
 
-- **sandbox** — the sandbox supervisor (proxy decisions, policy enforcement, SSH connections, process lifecycle).
-- **gateway** — the control plane (sandbox creation, phase changes, policy distribution).
+- **sandbox**: The sandbox supervisor (proxy decisions, policy enforcement, SSH connections, process lifecycle).
+- **gateway**: The control plane (sandbox creation, phase changes, policy distribution).
 
 Press `f` to enable follow mode and auto-scroll to new entries.
 
@@ -54,7 +54,7 @@ Each deny entry contains the following fields:
 
 To resolve a blocked connection:
 
-1. Add the host to the network policy if the connection is legitimate. See {doc}`../safety-and-privacy/policies` for the iteration workflow.
+1. Add the host to the network policy if the connection is legitimate. Refer to {doc}`../safety-and-privacy/policies` for the iteration workflow.
 2. Leave it blocked if the connection is unauthorized.
 
 ## Diagnosing Inference Interception
@@ -75,15 +75,15 @@ This sequence indicates:
 :::{note}
 If these calls should go directly to the destination rather than through inference routing, the most likely cause is a binary path mismatch. The process making the HTTP call does not match any binary listed in the network policy.
 
-Check the log entry for the binary path, then update the `binaries` list in the policy. See {doc}`../safety-and-privacy/network-access-rules` for details on binary matching.
+Check the log entry for the binary path, then update the `binaries` list in the policy. Refer to {doc}`../safety-and-privacy/network-access-rules` for details on binary matching.
 :::
 
 ## Filtering and Navigation
 
 The dashboard provides filtering and navigation controls:
 
-- Press **`s`** to filter logs by source — display only `sandbox` logs (policy decisions) or only `gateway` logs (lifecycle events).
-- Press **`f`** to toggle follow mode — auto-scroll to the latest entries.
+- Press **`s`** to filter logs by source. Display only `sandbox` logs (policy decisions) or only `gateway` logs (lifecycle events).
+- Press **`f`** to toggle follow mode. Auto-scroll to the latest entries.
 - Press **`Enter`** on a log entry to open the detail view with the full message.
 - Use **`j`** / **`k`** to navigate up and down the log list.
 
@@ -103,8 +103,8 @@ The following keyboard shortcuts are available in the terminal dashboard.
 
 ## Related Topics
 
-For deeper dives into topics covered by the terminal dashboard, see the following guides.
+For deeper dives into topics covered by the terminal dashboard, refer to the following guides.
 
-- **Blocked connections** — Follow {doc}`../safety-and-privacy/policies` to pull the current policy, add the missing endpoint, and push an update without restarting the sandbox.
-- **Inference interception** — See {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).
-- **General troubleshooting** — See {doc}`../troubleshooting/cluster-issues` for common issues and diagnostics.
+- **Blocked connections**: Follow {doc}`../safety-and-privacy/policies` to pull the current policy, add the missing endpoint, and push an update without restarting the sandbox.
+- **Inference interception**: Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).
+- **General troubleshooting**: Refer to {doc}`../troubleshooting/cluster-issues` for common issues and diagnostics.

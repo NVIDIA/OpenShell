@@ -29,7 +29,7 @@ content:
 [![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
 
 NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments 
-that protect your data, credentials, and infrastructure — agents run with exactly the permissions they need and 
+that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and 
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and 
 uncontrolled network activity.
 
@@ -76,14 +76,14 @@ Claude Code works out of the box with the default policy.
 $ nemoclaw sandbox create --from openclaw
 ```
 
-The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog --- a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
+The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog---a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
 :::
 
 ::::
 
 The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
 
-For OpenCode or Codex, see the [](get-started/tutorials/run-opencode.md) tutorial for agent-specific setup.
+For OpenCode or Codex, refer to the [](get-started/tutorials/run-opencode.md) tutorial for agent-specific setup.
 
 ---
 

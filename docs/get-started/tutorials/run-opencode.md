@@ -5,7 +5,7 @@
 
 # Run OpenCode with NVIDIA Inference
 
-This tutorial walks through a realistic setup where you run [OpenCode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing --- the full policy iteration loop.
+This tutorial walks through a realistic setup where you run [opencode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit policy problems, diagnose them from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop.
 
 **What you will learn:**
 
@@ -21,7 +21,6 @@ Before you begin:
 
 - **`NVIDIA_API_KEY` environment variable** set on your host machine with a valid NVIDIA API key
 - **NemoClaw CLI** installed (`pip install nemoclaw`)
-- Docker installed and running.
 
 ## Step 1: Create the Provider
 
@@ -33,7 +32,7 @@ $ nemoclaw provider create --name nvidia --type nvidia --from-existing
 
 The `--from-existing` flag tells the CLI to discover credentials from your local environment. It finds `NVIDIA_API_KEY` and stores it securely. The provider is now available to attach to any sandbox.
 
-Verify it was created:
+Verify the provider:
 
 ```console
 $ nemoclaw provider list
@@ -41,17 +40,17 @@ $ nemoclaw provider list
 
 ## Step 2: Create the Sandbox
 
-Create a sandbox with the NVIDIA provider attached and OpenCode as the startup command:
+Create a sandbox with the NVIDIA provider attached and opencode as the startup command:
 
 ```console
 $ nemoclaw sandbox create --name opencode-sandbox --provider nvidia --keep -- opencode
 ```
 
-The `--keep` flag keeps the sandbox alive after you exit, which you will need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts OpenCode.
+The `--keep` flag keeps the sandbox alive after you exit, which you will need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts opencode.
 
 ## Step 3: Hit a Problem
 
-Try using OpenCode inside the sandbox. You will likely find that calls to NVIDIA inference endpoints fail or behave unexpectedly. The default policy is designed around Claude Code, not OpenCode.
+Try using opencode inside the sandbox. You will likely find that calls to NVIDIA inference endpoints fail or behave unexpectedly. The default policy is designed around Claude Code, not opencode.
 
 Open a second terminal and check the logs:
 
@@ -62,7 +61,7 @@ $ nemoclaw sandbox logs opencode-sandbox --tail
 Or launch the NemoClaw Terminal for a live view:
 
 ```console
-$ nemoclaw term
+$ nemoclaw gator
 ```
 
 Look for lines like these in the output:
@@ -73,18 +72,18 @@ action=deny  host=opencode.ai               binary=/usr/bin/node            reas
 action=inspect_for_inference  host=integrate.api.nvidia.com  binary=/bin/bash
 ```
 
-These log entries tell you exactly what is being blocked and why.
+These log entries tell you exactly what the policy blocks and why.
 
 ## Step 4: Understand Why
 
-The default policy has a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries --- typically `/usr/local/bin/claude` and `/usr/bin/node`. If opencode makes HTTP calls through a different binary (its own binary, `curl`, or a shell subprocess), those connections do not match any policy rule and get denied.
+The default policy has a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries---typically `/usr/local/bin/claude` and `/usr/bin/node`. If opencode makes HTTP calls through a different binary (its own binary, `curl`, or a shell subprocess), those connections do not match any policy rule and get denied.
 
 There are two separate problems:
 
 1. **opencode's own traffic.** opencode contacts `opencode.ai` for its API and `integrate.api.nvidia.com` for inference. Neither of these endpoints has a matching policy entry for the binaries opencode uses.
 2. **No opencode.ai endpoint.** The default policy has no entry for `opencode.ai` at all. Even if the binary matched, the destination is not listed.
 
-This is the expected behavior --- NemoClaw denies by default. You need to write a policy that explicitly allows what opencode needs.
+This is the expected behavior---NemoClaw denies by default. You need to write a policy that explicitly allows what opencode needs.
 
 ## Step 5: Write a Custom Policy
 
@@ -185,13 +184,13 @@ network_policies:
 
 Compared to the default policy, this adds:
 
-- **`opencode_api`** --- allows opencode and Node.js to reach `opencode.ai:443`
-- **Broader `nvidia_inference` binaries** --- adds `/usr/local/bin/opencode`, `/usr/bin/curl`, and `/bin/bash` so opencode's subprocesses can reach the NVIDIA endpoint
-- **`inference.allowed_routes`** --- includes `nvidia` so inference routing works for userland code
+- **`opencode_api`**---allows opencode and Node.js to reach `opencode.ai:443`
+- **Broader `nvidia_inference` binaries**---adds `/usr/local/bin/opencode`, `/usr/bin/curl`, and `/bin/bash` so opencode's subprocesses can reach the NVIDIA endpoint
+- **`inference.allowed_routes`**---includes `nvidia` so inference routing works for userland code
 - **GitHub access** scoped for opencode's git operations
 
 :::{warning}
-The `filesystem_policy`, `landlock`, and `process` sections are static --- they are set at sandbox creation time and cannot be changed on a running sandbox. If you need to modify these, you must delete and recreate the sandbox. The `network_policies` and `inference` sections are dynamic and can be hot-reloaded.
+The `filesystem_policy`, `landlock`, and `process` sections are static---they are set at sandbox creation time and cannot be changed on a running sandbox. If you need to modify these, you must delete and recreate the sandbox. The `network_policies` and `inference` sections are dynamic and can be hot-reloaded.
 :::
 
 ## Step 6: Push the Policy
@@ -214,7 +213,7 @@ The latest revision should show status `loaded`.
 
 ## Step 7: Set Up Inference Routing
 
-So far, you have allowed the opencode *agent* to reach `integrate.api.nvidia.com` directly via network policy. But what about code that opencode writes and runs inside the sandbox? If that code calls an LLM API, it goes through the privacy router --- a separate mechanism.
+So far, you have allowed the opencode *agent* to reach `integrate.api.nvidia.com` directly through network policy. But what about code that opencode writes and runs inside the sandbox? If that code calls an LLM API, it goes through the privacy router---a separate mechanism.
 
 Create an inference route so userland code can access NVIDIA models:
 
@@ -233,7 +232,7 @@ $ nemoclaw sandbox policy set opencode-sandbox --policy opencode-policy.yaml --w
 ```
 
 :::{note}
-The distinction matters: **network policies** control which hosts the agent binary can reach directly. **Inference routes** control where LLM API calls from userland code (scripts, notebooks, applications the agent writes) get routed. They are two separate enforcement points.
+The *network policies* control which hosts the agent binary can reach directly. The *inference routes* control where LLM API calls from userland code (scripts, notebooks, applications the agent writes) get routed. These are two separate enforcement points.
 :::
 
 ## Step 8: Verify
@@ -246,7 +245,7 @@ $ nemoclaw sandbox logs opencode-sandbox --tail
 
 You should no longer see `action=deny` lines for the endpoints you added. Connections to `opencode.ai`, `integrate.api.nvidia.com`, and GitHub should show `action=allow`.
 
-If you still see denials, read the log line carefully --- it tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again. This observe-modify-push cycle is the policy iteration loop, and it is the normal workflow for getting a new tool running in NemoClaw.
+If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again. This observe-modify-push cycle is the policy iteration loop, and it is the normal workflow for getting a new tool running in NemoClaw.
 
 ## Clean Up
 
@@ -258,8 +257,8 @@ $ nemoclaw sandbox delete opencode-sandbox
 
 ## Next Steps
 
-- [Policies](../../safety-and-privacy/policies.md) --- full reference on policy YAML structure, static vs dynamic fields, and enforcement modes
-- [Network Access Control](../../safety-and-privacy/network-access-rules.md) --- how the proxy evaluates network rules, L4 vs L7 inspection, and TLS termination
-- [Inference Routing](../../inference/index.md) --- inference route configuration, protocol detection, and transparent rerouting
-- [Providers](../../sandboxes/providers.md) --- provider types, credential discovery, and manual vs automatic creation
-- [Security Model](../../safety-and-privacy/security-model.md) --- the four protection layers and how they interact
+- {doc}`../../safety-and-privacy/policies`: Full reference on policy YAML structure, static and dynamic fields, and enforcement modes
+- {doc}`../../safety-and-privacy/network-access-rules`: How the proxy evaluates network rules, L4 and L7 inspection, and TLS termination
+- {doc}`../../inference/index`: Inference route configuration, protocol detection, and transparent rerouting
+- {doc}`../../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation
+- {doc}`../../safety-and-privacy/security-model`: The four protection layers and how they interact

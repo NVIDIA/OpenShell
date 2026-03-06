@@ -8,7 +8,7 @@
 Use `nemoclaw inference create` to register a new inference backend that sandboxes can route AI API calls to.
 
 :::{note}
-Inference routes are for **userland code** --- scripts and programs that the agent writes and executes inside the sandbox. The agent's own API traffic flows directly through network policies, not through inference routing. See {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic and userland traffic.
+Inference routes are for **userland code**: scripts and programs that the agent writes and executes inside the sandbox. The agent's own API traffic flows directly through network policies, not through inference routing. Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic and userland traffic.
 :::
 
 ## Create a Route
@@ -21,7 +21,7 @@ $ nemoclaw inference create \
     --api-key sk-abc123
 ```
 
-This creates a route named after the routing hint. Any sandbox whose policy includes `local` in its `inference.allowed_routes` list can use this route. If you omit `--protocol`, the CLI probes the endpoint and auto-detects the supported protocol (see [Supported API Patterns](index.md#supported-api-patterns)).
+This creates a route named after the routing hint. Any sandbox whose policy includes `local` in its `inference.allowed_routes` list can use this route. If you omit `--protocol`, the CLI probes the endpoint and auto-detects the supported protocol (refer to [Supported API Patterns](index.md#supported-api-patterns)).
 
 ## Flags
 
@@ -34,16 +34,16 @@ This creates a route named after the routing hint. Any sandbox whose policy incl
 | `--protocol` | Supported protocol(s): `openai_chat_completions`, `openai_completions`, `anthropic_messages` (repeatable, auto-detected if omitted). |
 | `--disabled` | Create the route in a disabled state. |
 
-See the [CLI Reference](../reference/cli.md#inference-commands) for the full command specification.
+Refer to the [CLI Reference](../reference/cli.md#inference-commands) for the full command specification.
 
 ## Good to Know
 
-- **Cluster-level** --- routes are shared across all sandboxes in the cluster, not scoped to one sandbox.
-- **Per-model** --- each route maps to one model. Create multiple routes with the same `--routing-hint` but different `--model-id` values to expose multiple models.
-- **Hot-reloadable** --- routes can be created, updated, or deleted at any time without restarting sandboxes.
+- **Cluster-level**: Routes are shared across all sandboxes in the cluster, not scoped to one sandbox.
+- **Per-model**: Each route maps to one model. Create multiple routes with the same `--routing-hint` but different `--model-id` values to expose multiple models.
+- **Hot-reloadable**: Routes can be created, updated, or deleted at any time without restarting sandboxes.
 
 ## Next Steps
 
-- {doc}`manage-routes` --- list, update, and delete inference routes.
-- {doc}`connect-sandboxes` --- connect a sandbox to inference routes via policy.
-- {doc}`index` --- understand the inference routing architecture and interception sequence.
+- {doc}`manage-routes`: List, update, and delete inference routes.
+- {doc}`connect-sandboxes`: Connect a sandbox to inference routes via policy.
+- {doc}`index`: Understand the inference routing architecture and interception sequence.

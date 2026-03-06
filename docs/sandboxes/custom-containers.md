@@ -23,8 +23,8 @@ Point `--from` at the directory containing your Dockerfile:
 $ nemoclaw sandbox create --from ./my-app --keep --name my-app
 ```
 
-The CLI builds the image locally via Docker, pushes it into the cluster, and
-creates the sandbox --- all in one step. No external container registry is
+The CLI builds the image locally using Docker, pushes it into the cluster, and
+creates the sandbox, all in one step. No external container registry is
 needed.
 
 You can also pass a full container image reference if the image is already
@@ -66,7 +66,7 @@ This creates the sandbox, sets up port forwarding on port 8080, and runs
 `./start-server.sh` as the sandbox command.
 
 :::{warning}
-Distroless and `FROM scratch` images are not supported. The NemoClaw
+NemoClaw does not support distroless and `FROM scratch` images. The
 supervisor requires glibc, `/proc`, and a shell to operate. Images missing
 `iproute2` or required Linux capabilities will fail to start in proxy mode.
 Ensure your base image includes these dependencies.
@@ -74,7 +74,7 @@ Ensure your base image includes these dependencies.
 
 ## Next Steps
 
-- {doc}`create-and-manage` --- full sandbox lifecycle commands
-- {doc}`providers` --- attach credentials to your custom container
-- {doc}`/safety-and-privacy/policies` --- write a policy tailored to your workload
-- {doc}`/safety-and-privacy/security-model` --- understand the isolation layers applied to custom images
+- {doc}`create-and-manage`: Full sandbox lifecycle commands
+- {doc}`providers`: Attach credentials to your custom container
+- {doc}`/safety-and-privacy/policies`: Write a policy tailored to your workload
+- {doc}`/safety-and-privacy/security-model`: Understand the isolation layers applied to custom images

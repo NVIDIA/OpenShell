@@ -3,199 +3,102 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Run OpenClaw Safely
+# Run OpenClaw Inside a NemoClaw Sandbox
 
-Run OpenClaw inside a NemoClaw sandbox with zero code changes. This tutorial takes you from a fresh cluster to an OpenClaw instance with inference routing and policy enforcement.
+This tutorial shows you how to launch a community sandbox using the `--from` flag. Community sandboxes are pre-built configurations published to the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) repository. They bundle a container image, a tailored policy, and optional skills into a single package you can run with one command.
+
+**What you will learn:**
+
+- What community sandboxes are and how they differ from default sandboxes
+- How the `--from` flag pulls and builds a complete sandbox configuration
+- How to inspect the bundled policy that ships with a community sandbox
 
 ## Prerequisites
 
-- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-nemoclaw-cli).
-- Docker installed and running.
+Before you begin, make sure you have:
 
-## Step 1: Deploy a Cluster
+- **Docker** running on your machine.
+- **NVIDIA GPU with drivers** installed. Required for GPU-accelerated workloads in the OpenClaw sandbox.
+- [**NemoClaw CLI** installed](../../index.md#install-the-nemoclaw-cli)
 
-NemoClaw runs sandboxes on a lightweight Kubernetes cluster packaged in a single Docker container.
+## Step 1: Create a Sandbox from the Community Image
 
-```console
-$ nemoclaw cluster admin deploy
-```
-
-Verify that the cluster is healthy.
+Run the following command:
 
 ```console
-$ nemoclaw cluster status
+$ nemoclaw sandbox create --from openclaw --keep
 ```
 
-You should see the cluster version and a healthy status. If you already have a running cluster, skip this step.
+The `--from` flag tells the CLI to pull a sandbox definition from the NemoClaw Community catalog. Here is what happens:
 
-## Step 2: Launch OpenClaw
+1. **Fetches the definition.** The CLI downloads the OpenClaw sandbox definition from the NemoClaw-Community repository. This includes a Dockerfile, a policy YAML, and any bundled skills.
+2. **Builds the image.** The CLI builds the Dockerfile locally using Docker. The image includes all tools and dependencies that OpenClaw needs.
+3. **Applies the bundled policy.** Instead of the generic default policy, the sandbox starts with a policy specifically written for the OpenClaw workload---it allows the endpoints and binaries that OpenClaw requires.
+4. **Creates and keeps the sandbox.** The `--keep` flag ensures the sandbox stays running after creation so you can connect and disconnect freely.
 
-The sandbox image includes OpenClaw, the onboarding flow, and a helper script that configures the gateway and prints the access URL. One command starts everything.
+:::{note}
+The first build takes longer because Docker needs to pull base layers and install dependencies. Subsequent creates reuse the cached image.
+:::
+
+## Step 2: Connect to the Sandbox
+
+After the sandbox is running, connect to it:
 
 ```console
-$ nemoclaw sandbox create --name my-openclaw --forward 18789 -- openclaw-start
+$ nemoclaw sandbox connect <name>
 ```
 
-- `--name my-openclaw` — gives the sandbox a name for reconnection and management.
-- `--forward 18789` — forwards sandbox port 18789 to your machine so the OpenClaw UI is reachable locally.
-- `openclaw-start` — runs `openclaw onboard`, starts the OpenClaw gateway in the background, and prints the UI URL and token.
+Replace `<name>` with the sandbox name shown in the creation output. If you did not specify a name with `--name`, the CLI assigns one automatically. Run `nemoclaw sandbox list` to find it.
 
-The CLI returns when the script finishes. The port forward keeps running in the background.
+## Step 3: Explore the Environment
 
-## Step 3: Access the OpenClaw UI
+The sandbox comes pre-configured for the OpenClaw workload. The tools, runtimes, and libraries that OpenClaw needs are already installed in the container image. The policy is tuned to allow the specific network endpoints and operations that OpenClaw uses, so you can start working immediately without policy adjustments.
 
-Once the sandbox is ready, open the Control UI and verify health.
+## Step 4: Check the Bundled Policy
 
-- **Control UI:** `http://127.0.0.1:18789/` — use the token printed during onboarding.
-- **Health check:** run `openclaw health` from your host or inside the sandbox.
-
-No changes are required in OpenClaw itself. It runs as-is inside the sandbox with full isolation.
-
-### What `openclaw-start` Does
-
-Under the hood, the helper script runs:
-
-```bash
-openclaw onboard
-nohup openclaw gateway run > /tmp/gateway.log 2>&1 &
-```
-
-It then prints the UI URL and token from `~/.openclaw/openclaw.json`.
-
-## Step 4: Route Inference to a Private Model
-
-By default, the sandbox blocks outbound traffic that does not match an explicit network policy. To route OpenClaw's inference calls to a private or self-hosted model, create an inference route and allow it in sandbox policy.
-
-### Create the Route
+To see exactly what the sandbox is allowed to do, pull the full policy:
 
 ```console
-$ nemoclaw inference create \
-  --routing-hint local \
-  --base-url https://integrate.api.nvidia.com/ \
-  --model-id nvidia/nemotron-3-nano-30b-a3b \
-  --api-key $NVIDIA_API_KEY
+$ nemoclaw sandbox policy get <name> --full
 ```
 
-### Apply a Policy with the Route
+This outputs the complete policy YAML, including:
 
-Create a policy file `openclaw-policy.yaml`:
+- **Network policies**---which hosts and ports the sandbox can reach, and which binaries are allowed to initiate those connections
+- **Filesystem policy**---which paths are read-only and which are read-write
+- **Process restrictions**---the user and group the sandbox runs as
+- **Inference rules**---which inference routing hints are allowed
 
-```yaml
-version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /etc, /app, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock:
-  compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-inference:
-  allowed_routes:
-    - local
-```
+Reviewing the bundled policy is a good way to understand what a community sandbox has access to before you start using it for sensitive work.
 
-Update the running sandbox with the new policy.
+:::{tip}
+You can save the policy to a file for reference or as a starting point for customization:
 
 ```console
-$ nemoclaw sandbox policy set my-openclaw --policy openclaw-policy.yaml --wait
+$ nemoclaw sandbox policy get <name> --full > openclaw-policy.yaml
 ```
+:::
 
-OpenClaw's inference calls are now transparently intercepted and routed to the configured backend. The agent's code does not change — it still targets the original API, and NemoClaw rewrites the destination and model per policy.
+## Step 5: Clean Up
 
-## Step 5: Monitor and Iterate on Policy
-
-Watch sandbox logs to see which connections are allowed or denied.
+When you are finished, exit the sandbox if you are connected:
 
 ```console
-$ nemoclaw sandbox logs my-openclaw --tail --source sandbox
+$ exit
 ```
 
-If you see denied actions that should be allowed, pull the current policy, add the missing network policy entry, and push it back.
+Then delete it:
 
 ```console
-$ nemoclaw sandbox policy get my-openclaw --full > current-policy.yaml
+$ nemoclaw sandbox delete <name>
 ```
 
-Edit `current-policy.yaml` to add a `network_policies` entry for the denied endpoint, then push it.
-
-```console
-$ nemoclaw sandbox policy set my-openclaw --policy current-policy.yaml --wait
-```
-
-Refer to [Policies](../../safety-and-privacy/policies.md) for the full policy iteration workflow.
-
-## Step 6: Reconnect or Open a Second Session
-
-You can reconnect to the sandbox from any terminal.
-
-```console
-$ nemoclaw sandbox connect my-openclaw
-```
-
-For VS Code Remote-SSH access:
-
-```console
-$ nemoclaw sandbox ssh-config my-openclaw >> ~/.ssh/config
-```
-
-Then connect via VS Code's Remote-SSH extension to the host `my-openclaw`.
-
-## Step 7: Verify Policy Enforcement
-
-With the sandbox running and the OpenClaw UI accessible, confirm that the policy is doing its job.
-
-### Confirm the UI Is Accessible
-
-Open `http://127.0.0.1:18789/` in your browser and sign in with the token printed during onboarding. You should see the OpenClaw control dashboard.
-
-### Test a Blocked Action
-
-From inside the sandbox, attempt to reach an endpoint that is not in the policy.
-
-```console
-sandbox@my-openclaw:~$ curl https://example.com
-```
-
-The proxy blocks the connection because `example.com` is not in any `network_policies` entry and the request is not an inference API pattern. You should see a connection-refused or proxy-denied error.
-
-### Check the Denial in Logs
-
-From your host, view the sandbox logs to see the deny entry.
-
-```console
-$ nemoclaw sandbox logs my-openclaw --tail --source sandbox
-```
-
-Look for a log line with `action: deny` showing the destination host, port, binary (`curl`), and the reason. This confirms that the policy engine is evaluating every outbound connection and only allowing traffic that matches your policy.
-
-### Confirm Inference Routing
-
-If you configured an inference route in Step 4, ask OpenClaw to perform a task that triggers an inference call through the UI. The logs show whether the request was intercepted and routed to your configured backend rather than the original API endpoint.
-
-## Step 8: Clean Up
-
-Delete the sandbox when you are finished to free cluster resources.
-
-```console
-$ nemoclaw sandbox delete my-openclaw
-```
-
-## Quick Reference
-
-| Goal | How |
-| ---- | --- |
-| Launch OpenClaw | `nemoclaw sandbox create --name my-openclaw --forward 18789 -- openclaw-start` |
-| Reconnect | `nemoclaw sandbox connect my-openclaw` |
-| Route inference to a private model | `nemoclaw inference create --routing-hint local --base-url <URL> --model-id <MODEL> --api-key <KEY>` and set `inference.allowed_routes: [local]` in policy |
-| Update policy live | `nemoclaw sandbox policy set my-openclaw --policy updated.yaml --wait` |
-| View logs | `nemoclaw sandbox logs my-openclaw --tail --source sandbox` |
-| Delete | `nemoclaw sandbox delete my-openclaw` |
+:::{note}
+The NemoClaw Community repository accepts contributions. If you build a sandbox configuration that would be useful to others, you can submit it to the [NemoClaw-Community](https://github.com/NVIDIA/NemoClaw-Community) repository.
+:::
 
 ## Next Steps
 
-- [Sandboxes](../../sandboxes/index.md) — full sandbox lifecycle management.
-- [Inference Routing](../../inference/index.md) — route AI API calls to local or self-hosted backends.
-- [Safety & Privacy](../../safety-and-privacy/index.md) — understanding and customizing sandbox policies.
-- [Network Access Control](../../safety-and-privacy/network-access-rules.md) — per-binary, per-endpoint network rules.
+- {doc}`../../sandboxes/community-sandboxes`: Full reference on community sandbox definitions, available images, and how to contribute your own
+- {doc}`../../safety-and-privacy/policies`: Understand the policy format and how to customize what a sandbox can do
+- {doc}`../../sandboxes/create-and-manage`: The isolation model and lifecycle behind every sandbox

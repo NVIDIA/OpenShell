@@ -6,7 +6,7 @@
 # About Safety and Privacy
 
 NemoClaw wraps every sandbox in four independent protection layers. No single
-point of failure can compromise your environment --- each layer covers gaps the
+point of failure can compromise your environment. Each layer covers gaps the
 others cannot.
 
 ```{mermaid}
@@ -38,13 +38,13 @@ graph TB
 ```
 
 You control all four layers through a single YAML policy. Network and inference
-rules are hot-reloadable on a running sandbox; filesystem and process
+rules are hot-reloadable on a running sandbox. Filesystem and process
 restrictions are locked at creation time.
 
-- **{doc}`security-model`** --- threat scenarios (data exfiltration, credential
+- **{doc}`security-model`**: Threat scenarios (data exfiltration, credential
   theft, unauthorized API calls, privilege escalation) and how NemoClaw
   addresses each one.
-- **{doc}`policies`** --- author policies, monitor for blocked actions, and
+- **{doc}`policies`**: Author policies, monitor for blocked actions, and
   iterate on rules without restarting sandboxes.
-- **{doc}`network-access-rules`** --- configure endpoint rules, binary matching,
+- **{doc}`network-access-rules`**: Configure endpoint rules, binary matching,
   L7 inspection, and access presets.

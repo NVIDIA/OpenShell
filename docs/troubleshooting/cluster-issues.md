@@ -31,5 +31,5 @@ Troubleshoot problems with deploying, connecting to, and running NemoClaw cluste
 
 **Check:**
 1. View container logs: `docker logs nemoclaw-cluster`.
-2. Check if k3s started: the bootstrap process waits up to 180 attempts (6 minutes) for cluster readiness.
-3. Look for resource constraints — k3s needs sufficient memory and disk.
+2. Check if k3s started: the bootstrap process waits up to 180 attempts (six minutes) for cluster readiness.
+3. Look for resource constraints. k3s needs sufficient memory and disk.

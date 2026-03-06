@@ -3,233 +3,112 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Run Claude Safely
+# Run Claude Code Inside a NemoClaw Sandbox
 
-Run Anthropic Claude as a coding agent inside a NemoClaw sandbox. This tutorial takes you from a fresh cluster to an interactive Claude session with credential management, inference routing, and policy enforcement.
+This tutorial walks you through the simplest path to running Claude Code inside a NemoClaw sandbox. By the end, you will have an isolated environment with Claude Code running, your credentials securely injected, and a default policy controlling what the agent can access.
 
-## Prerequisites
+**What you will learn:**
 
-- NemoClaw CLI installed. Refer to [Installation](../../index.md#install-the-nemoclaw-cli).
-- Docker installed and running.
-- An Anthropic API key available as `ANTHROPIC_API_KEY` in your environment or in `~/.claude.json`.
+- Creating a sandbox with a single command
+- How NemoClaw auto-discovers provider credentials
+- What the default policy allows and denies
+- Connecting to a sandbox and working inside it
 
-## Step 1: Deploy a Cluster
+## Step 1: Create a Sandbox
 
-NemoClaw runs sandboxes on a lightweight Kubernetes cluster packaged in a single Docker container.
+Run the following command:
 
 ```console
-$ nemoclaw cluster admin deploy
+$ nemoclaw sandbox create -- claude
 ```
 
-Verify that the cluster is healthy.
+This single command does several things:
+
+1. **Bootstraps the runtime.** If this is your first time using NemoClaw, the CLI provisions a local k3s cluster inside Docker and deploys the NemoClaw control plane. This happens once---subsequent commands reuse the existing cluster.
+2. **Auto-discovers credentials.** The CLI detects that `claude` is a recognized tool and looks for your Anthropic credentials. It reads the `ANTHROPIC_API_KEY` environment variable and creates a provider automatically.
+3. **Creates the sandbox.** The CLI provisions an isolated environment and applies the default policy. The policy allows Claude Code to reach `api.anthropic.com` and a small set of supporting endpoints while blocking everything else.
+4. **Drops you into the sandbox.** You land in an interactive SSH session inside the sandbox, ready to work.
+
+:::{note}
+The first bootstrap takes a few minutes depending on your network speed. The CLI prints progress as each component starts. Subsequent sandbox creations are much faster.
+:::
+
+## Step 2: Work Inside the Sandbox
+
+You are now in an SSH session inside the sandbox. Start Claude Code:
 
 ```console
-$ nemoclaw cluster status
+$ claude
 ```
 
-You should see the cluster version and a healthy status. If you already have a running cluster, skip this step.
-
-## Step 2: Create a Claude Sandbox
-
-The simplest way to start Claude in a sandbox auto-discovers your local credentials and drops you into an interactive shell.
+Your credentials are available as environment variables inside the sandbox. You can verify this:
 
 ```console
-$ nemoclaw sandbox create --name my-claude -- claude
-```
-
-- `--name my-claude` — gives the sandbox a name for reconnection and management.
-- `-- claude` — tells NemoClaw to auto-discover Anthropic credentials (`ANTHROPIC_API_KEY`, `CLAUDE_API_KEY`, `~/.claude.json`) and launch Claude inside the sandbox.
-
-The CLI creates a provider from your local credentials, uploads them to the gateway, and opens an interactive SSH session into the sandbox.
-
-### With File Sync and Additional Providers
-
-For working on a project with GitHub access:
-
-```console
-$ nemoclaw sandbox create \
-  --name my-claude \
-  --provider my-github \
-  --sync \
-  -- claude
-```
-
-- `--provider my-github` — attaches a previously created GitHub provider (repeatable for multiple providers).
-- `--sync` — pushes local git-tracked files to `/sandbox` in the container.
-
-## Step 3: Work Inside the Sandbox
-
-Once connected, you are inside an isolated environment. Provider credentials are available as environment variables.
-
-```console
-sandbox@my-claude:~$ echo $ANTHROPIC_API_KEY
+$ echo $ANTHROPIC_API_KEY
 sk-ant-...
-
-sandbox@my-claude:~$ claude
 ```
 
-The sandbox enforces its safety and privacy policy:
+The sandbox has a working directory at `/sandbox` where you can create and edit files. Claude Code has access to standard development tools---git, common language runtimes, and package managers---within the boundaries set by the policy.
 
-- Filesystem access is restricted to allowed directories.
-- All network connections go through the policy-enforcing proxy.
-- Only explicitly permitted hosts and programs can reach the internet.
+## Step 3: Check Sandbox Status
 
-## Step 4: Route Inference to a Private Model
+Open a second terminal on your host machine. You can inspect running sandboxes from there.
 
-By default, Claude's API calls go through the sandbox proxy. You can reroute them to a private or self-hosted model to keep prompts and responses on your own infrastructure.
-
-### Create the Route
+List all sandboxes:
 
 ```console
-$ nemoclaw inference create \
-  --routing-hint local \
-  --base-url https://integrate.api.nvidia.com/ \
-  --model-id nvidia/nemotron-3-nano-30b-a3b \
-  --api-key $NVIDIA_API_KEY
+$ nemoclaw sandbox list
 ```
 
-### Apply a Policy with the Route
-
-Create a policy file `claude-policy.yaml`:
-
-```yaml
-version: 1
-filesystem_policy:
-  include_workdir: true
-  read_only: [/usr, /lib, /etc, /app, /var/log]
-  read_write: [/sandbox, /tmp, /dev/null]
-landlock:
-  compatibility: best_effort
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-network_policies:
-  anthropic:
-    endpoints:
-      - host: api.anthropic.com
-        port: 443
-    binaries:
-      - path_patterns: ["**/claude"]
-      - path_patterns: ["**/node"]
-inference:
-  allowed_routes:
-    - local
-```
-
-This policy explicitly allows the Claude binary to reach `api.anthropic.com` and routes any other inference-shaped traffic to the `local` backend.
-
-Update the running sandbox with the new policy.
+For a live dashboard view, launch the NemoClaw Terminal:
 
 ```console
-$ nemoclaw sandbox policy set my-claude --policy claude-policy.yaml --wait
+$ nemoclaw gator
 ```
 
-Claude continues to work as normal — it still calls the Anthropic SDK as usual, but NemoClaw controls which requests go to the cloud and which are routed to your private model.
+The terminal dashboard shows sandbox status, active network connections, and policy decisions in real time.
 
-## Step 5: Monitor and Iterate on Policy
+## Step 4: Connect from VS Code
 
-Watch sandbox logs to see which connections are allowed or denied.
+If you prefer to work in VS Code rather than a terminal, you can connect using Remote-SSH.
+
+First, export the sandbox's SSH configuration:
 
 ```console
-$ nemoclaw sandbox logs my-claude --tail --source sandbox
+$ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
-If Claude needs access to additional endpoints (for example, GitHub for code retrieval or npm for package installation), pull the current policy, add the missing entry, and push it back.
+Then open VS Code, install the **Remote - SSH** extension if you have not already, and connect to the host named `my-sandbox`. VS Code opens a full editor session inside the sandbox.
+
+:::{tip}
+Replace `my-sandbox` with the actual name of your sandbox. Run `nemoclaw sandbox list` to find it if you did not specify a name at creation time.
+:::
+
+## Step 5: Clean Up
+
+When you are done, exit the sandbox shell:
 
 ```console
-$ nemoclaw sandbox policy get my-claude --full > current-policy.yaml
+$ exit
 ```
 
-Edit `current-policy.yaml` to add a `network_policies` entry, then push it.
+Then delete the sandbox:
 
 ```console
-$ nemoclaw sandbox policy set my-claude --policy current-policy.yaml --wait
+$ nemoclaw sandbox delete my-sandbox
 ```
 
-Refer to [Policies](../../safety-and-privacy/policies.md) for the full policy iteration workflow.
-
-## Step 6: Reconnect or Open a Second Session
-
-You can reconnect to the sandbox from any terminal.
+:::{tip}
+Use the `--keep` flag when you want the sandbox to stay alive after the command exits. This is useful when you plan to connect later or want to iterate on the policy while the sandbox runs.
 
 ```console
-$ nemoclaw sandbox connect my-claude
+$ nemoclaw sandbox create --keep -- claude
 ```
-
-For VS Code Remote-SSH access:
-
-```console
-$ nemoclaw sandbox ssh-config my-claude >> ~/.ssh/config
-```
-
-Then connect via VS Code's Remote-SSH extension to the host `my-claude`.
-
-## Step 7: Verify Policy Enforcement
-
-With Claude running inside the sandbox, confirm that the policy is doing its job.
-
-### Test a Blocked Action
-
-From inside the sandbox, attempt to reach an endpoint that is not in the policy.
-
-```console
-sandbox@my-claude:~$ curl https://example.com
-```
-
-The proxy blocks the connection because `example.com` is not in any `network_policies` entry and the request is not an inference API pattern. You should see a connection-refused or proxy-denied error.
-
-### Test a Blocked File Access
-
-Try to write to a read-only directory.
-
-```console
-sandbox@my-claude:~$ touch /usr/test-file
-touch: cannot touch '/usr/test-file': Permission denied
-```
-
-Landlock prevents writes outside the `read_write` paths defined in your policy.
-
-### Check the Denial in Logs
-
-From your host, view the sandbox logs to see the deny entries.
-
-```console
-$ nemoclaw sandbox logs my-claude --tail --source sandbox
-```
-
-Look for log lines with `action: deny` showing the destination host, port, binary, and the reason. This confirms that the policy engine is evaluating every outbound connection and only allowing traffic that matches your policy.
-
-### Confirm Claude Works Through Policy
-
-Ask Claude to perform a task — for example, reading a file in `/sandbox` or writing code. Claude operates normally within the boundaries of the policy. If you configured an inference route in Step 4, the logs show whether inference calls were intercepted and routed to your private backend.
-
-```console
-sandbox@my-claude:~$ claude "List the files in /sandbox"
-```
-
-## Step 8: Clean Up
-
-Delete the sandbox when you are finished to free cluster resources.
-
-```console
-$ nemoclaw sandbox delete my-claude
-```
-
-## Quick Reference
-
-| Goal | How |
-| ---- | --- |
-| Launch Claude | `nemoclaw sandbox create --name my-claude -- claude` |
-| Launch with file sync | `nemoclaw sandbox create --name my-claude --sync -- claude` |
-| Reconnect | `nemoclaw sandbox connect my-claude` |
-| Route inference to a private model | `nemoclaw inference create --routing-hint local --base-url <URL> --model-id <MODEL> --api-key <KEY>` and set `inference.allowed_routes: [local]` in policy |
-| Update policy live | `nemoclaw sandbox policy set my-claude --policy updated.yaml --wait` |
-| View logs | `nemoclaw sandbox logs my-claude --tail --source sandbox` |
-| Delete | `nemoclaw sandbox delete my-claude` |
+:::
 
 ## Next Steps
 
-- [Sandboxes](../../sandboxes/index.md) — full sandbox lifecycle management.
-- [Providers](../../sandboxes/providers.md) — managing credentials and auto-discovery.
-- [Inference Routing](../../inference/index.md) — route AI API calls to local or self-hosted backends.
-- [Safety & Privacy](../../safety-and-privacy/index.md) — understanding and customizing sandbox policies.
+- {doc}`../../sandboxes/create-and-manage`: Understand the isolation model and sandbox lifecycle
+- {doc}`../../sandboxes/providers`: How credentials are injected without exposing them to agent code
+- {doc}`../../safety-and-privacy/policies`: Learn how the default policy works and how to customize it
+- {doc}`../../safety-and-privacy/network-access-rules`: Dig into the network proxy and per-endpoint rules

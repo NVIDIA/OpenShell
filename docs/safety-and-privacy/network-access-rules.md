@@ -23,7 +23,7 @@ Each outbound connection resolves to one of three outcomes:
 :::{note}
 This is the most important distinction in NemoClaw's network model.
 
-**Agent traffic** is the coding agent (Claude, opencode, Codex) calling its own API to get completions. This traffic matches a `network_policies` entry because the policy declares both the endpoint (for example, `api.anthropic.com:443`) and the binary (for example, `/usr/local/bin/claude`). The proxy allows it through directly. The agent's own API key --- injected by the provider --- is used as-is.
+**Agent traffic** is the coding agent (Claude, opencode, Codex) calling its own API to get completions. This traffic matches a `network_policies` entry because the policy declares both the endpoint (for example, `api.anthropic.com:443`) and the binary (for example, `/usr/local/bin/claude`). The proxy allows it through directly. The agent's own API key (injected by the provider) is used as-is.
 
 **Userland traffic** is code that the agent *writes* making inference calls. A Python script calling the OpenAI-compatible API, a data pipeline hitting an LLM endpoint, a test harness querying a model. This traffic does *not* match any network policy because the calling binary (`/usr/bin/python3`) is not listed in the agent's policy entry. The proxy intercepts it, the privacy router reroutes it to a configured backend, and the route's API key is substituted in. The agent's code never touches your real API key.
 :::
@@ -64,7 +64,7 @@ The key (`my_rule`) is a logical name for reference. The `name` field is the hum
 
 ## Endpoints
 
-Each endpoint entry controls access to a single host-port combination. See [Endpoint Object](../reference/policy-schema.md#endpoint-object) for the full field reference.
+Each endpoint entry controls access to a single host-port combination. Refer to [Endpoint Object](../reference/policy-schema.md#endpoint-object) for the full field reference.
 
 The `access` field provides presets: `full` (all methods), `read-only` (`GET`, `HEAD`, `OPTIONS`), or `read-write` (`GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`).
 
@@ -129,7 +129,7 @@ endpoints:
 With both fields set, the proxy terminates the TLS connection, decrypts the HTTP request, evaluates it against the `access` preset or custom `rules`, and re-encrypts before forwarding to the destination.
 
 :::{warning}
-Without `tls: terminate` on port 443, the proxy cannot decrypt the traffic. L7 rules (`access`, `rules`) are not evaluated because the HTTP payload is encrypted. The connection is handled at L4 only --- allowed or denied based on host and port, with no HTTP-level access control.
+Without `tls: terminate` on port 443, the proxy cannot decrypt the traffic. L7 rules (`access`, `rules`) are not evaluated because the HTTP payload is encrypted. The connection is handled at L4 only: allowed or denied based on host and port, with no HTTP-level access control.
 :::
 
 ### Bare Endpoints (L4-Only)
@@ -145,7 +145,7 @@ endpoints:
 The proxy allows the TCP connection through to the destination without decrypting or inspecting the payload. Use L4-only entries for non-HTTP traffic, package registries where you need connectivity but not method-level control, or endpoints where TLS termination is not desired.
 
 :::{warning}
-With L4-only rules, you have no control over *what* is sent to the endpoint --- only *whether* the connection is allowed. Any binary listed in the entry can send any data to the host. If you need to restrict HTTP methods or paths, add `protocol: rest` and `tls: terminate`.
+With L4-only rules, you have no control over *what* is sent to the endpoint: only *whether* the connection is allowed. Any binary listed in the entry can send any data to the host. If you need to restrict HTTP methods or paths, add `protocol: rest` and `tls: terminate`.
 :::
 
 ## Enforcement Modes
@@ -158,7 +158,7 @@ Each endpoint can operate in one of two enforcement modes:
 | `audit`   | Logs the violation but forwards the traffic to the destination. The agent is not interrupted. |
 
 :::{tip}
-Start with `enforcement: audit` when developing a new policy. Audit mode shows you what *would* be blocked without actually breaking the agent. Once the policy is correct and you have confirmed that no legitimate traffic is flagged, switch to `enforcement: enforce`.
+Start with `enforcement: audit` when developing a new policy. Audit mode shows you what *would* be blocked without actually breaking the agent. After the policy is correct and you have confirmed that no legitimate traffic is flagged, switch to `enforcement: enforce`.
 :::
 
 ## Putting It Together
@@ -212,4 +212,4 @@ network_policies:
 
 ## Next Steps
 
-- [Write Sandbox Policies](policies.md) --- the full iterative workflow for authoring, testing, and updating policies.
+- [Write Sandbox Policies](policies.md): The full iterative workflow for authoring, testing, and updating policies.

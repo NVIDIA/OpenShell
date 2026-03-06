@@ -38,7 +38,7 @@ $ nemoclaw term --cluster prod
 $ NEMOCLAW_CLUSTER=prod nemoclaw term
 ```
 
-The terminal inherits all CLI configuration --- cluster selection, TLS settings, and verbosity flags work the same way. No separate configuration is needed.
+The terminal inherits all CLI configuration: cluster selection, TLS settings, and verbosity flags work the same way. No separate configuration is needed.
 
 ### Screen Layout
 
@@ -56,25 +56,25 @@ The terminal inherits all CLI configuration --- cluster selection, TLS settings,
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- **Title bar** --- NemoClaw logo, cluster name, current view, and live health status.
-- **Main area** --- the active view.
-- **Navigation bar** --- available views with shortcut keys.
-- **Command bar** --- appears when you press `:` (vim-style).
+- **Title bar**: NemoClaw logo, cluster name, current view, and live health status.
+- **Main area**: The active view.
+- **Navigation bar**: Available views with shortcut keys.
+- **Command bar**: Appears when you press `:` (vim-style).
 
 ### Views
 
-#### Dashboard (press `1`)
+#### Dashboard
 
 Shows your cluster at a glance:
 
 - **Cluster name** and **gateway endpoint**.
-- **Health status** --- polls every 2 seconds:
-  - `●` **Healthy** (green) --- everything is running normally.
-  - `◐` **Degraded** (yellow) --- the cluster is up but something needs attention.
-  - `○` **Unhealthy** (red) --- the cluster is not operating correctly.
+- **Health status**: Polls every two seconds:
+  - `●` **Healthy** (green): Everything is running normally.
+  - `◐` **Degraded** (yellow): The cluster is up but something needs attention.
+  - `○` **Unhealthy** (red): The cluster is not operating correctly.
 - **Sandbox count**.
 
-#### Sandboxes (press `2`)
+#### Sandboxes
 
 A live table of all sandboxes:
 
@@ -117,11 +117,11 @@ Press `Esc` to cancel.
 
 ### Port Forwarding
 
-When creating a sandbox in the terminal, specify ports in the **Ports** field (comma-separated, e.g., `8080,3000`). After the sandbox reaches `Ready` state, the terminal automatically spawns background SSH tunnels. Forwarded ports appear in the **NOTES** column and in the sandbox detail view.
+When creating a sandbox in the terminal, specify ports in the **Ports** field (comma-separated, for example, `8080,3000`). After the sandbox reaches `Ready` state, the terminal automatically spawns background SSH tunnels. Forwarded ports appear in the **NOTES** column and in the sandbox detail view.
 
 ### Data Refresh
 
-The terminal polls the cluster every 2 seconds. Both cluster health and the sandbox list update automatically --- no manual refresh needed.
+The terminal polls the cluster every two seconds. Both cluster health and the sandbox list update automatically. No manual refresh needed.
 
 ### Theme
 

@@ -29,13 +29,13 @@ inference: { ... }
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw sandbox policy set` and take effect without restarting.
 
-## `version`
+## Version
 
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `version` | integer | Yes | Schema version number. Currently must be `1`. |
 
-## `filesystem_policy`
+## Filesystem Policy
 
 **Category:** Static
 
@@ -64,7 +64,7 @@ filesystem_policy:
     - /dev/null
 ```
 
-## `landlock`
+## Landlock
 
 **Category:** Static
 
@@ -81,7 +81,7 @@ landlock:
   compatibility: best_effort
 ```
 
-## `process`
+## Process
 
 **Category:** Static
 
@@ -100,11 +100,11 @@ process:
   run_as_group: sandbox
 ```
 
-## `network_policies`
+## Network Policies
 
 **Category:** Dynamic
 
-A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier; the `name` field inside the entry is the display name used in logs.
+A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
 
 ### Network Policy Entry
 
@@ -125,7 +125,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `protocol` | string | No | Set to `rest` to enable L7 (HTTP) inspection. Omit for L4-only (TCP passthrough). |
 | `tls` | string | No | TLS handling mode. `terminate` decrypts TLS at the proxy for inspection. `passthrough` forwards encrypted traffic without inspection. Only relevant when `protocol` is `rest`. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
-| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. See table below. Mutually exclusive with `rules`. |
+| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Refer to table below. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
 
 #### Access Levels
@@ -142,7 +142,7 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `allow.method` | string | Yes | HTTP method to allow (e.g., `GET`, `POST`). |
+| `allow.method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). |
 | `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
 
 Example with rules:
@@ -192,15 +192,15 @@ network_policies:
       - path: /usr/bin/node
 ```
 
-## `inference`
+## Inference
 
 **Category:** Dynamic
 
-Controls which inference routing backends userland code may access. The `allowed_routes` list names route types that the privacy router will accept. Traffic matching an inference API pattern that targets a route type not in this list is denied.
+Controls which inference routing backends userland code can access. The `allowed_routes` list names route types that the privacy router will accept. Traffic matching an inference API pattern that targets a route type not in this list is denied.
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `allowed_routes` | list of strings | No | Routing hint labels (e.g., `local`, `nvidia`, `staging`) that this sandbox may use. Must match the `routing_hint` of inference routes created with `nemoclaw inference create`. |
+| `allowed_routes` | list of strings | No | Routing hint labels (e.g., `local`, `nvidia`, `staging`) that this sandbox can use. Must match the `routing_hint` of inference routes created with `nemoclaw inference create`. |
 
 Example:
 

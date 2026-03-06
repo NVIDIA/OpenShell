@@ -7,8 +7,8 @@
 
 ## Links
 
-- [NemoClaw on GitHub](https://github.com/NVIDIA/NemoClaw) — source code, issues, and pull requests.
-- [Contributing Guide](https://github.com/NVIDIA/NemoClaw/blob/main/CONTRIBUTING.md) — how to build from source and contribute.
+- [NemoClaw on GitHub](https://github.com/NVIDIA/NemoClaw): Source code, issues, and pull requests.
+- [Contributing Guide](https://github.com/NVIDIA/NemoClaw/blob/main/CONTRIBUTING.md): How to build from source and contribute.
 
 ## Related Technologies
 
@@ -32,8 +32,8 @@
 | **Policy** | A YAML document defining what a sandbox can access (filesystem, network, inference). |
 | **Gateway** | The central control plane service that manages sandboxes, providers, and routes. |
 | **Inference Route** | A mapping from a routing hint to a backend AI model endpoint. |
-| **BYOC** | Bring Your Own Container — running custom images as sandboxes. |
+| **BYOC** | Bring Your Own Container: running custom images as sandboxes. |
 | **NemoClaw Terminal** | The NemoClaw terminal user interface (TUI), launched with `nemoclaw term`. |
 | **L7 Inspection** | HTTP-level traffic inspection inside TLS tunnels. |
-| **TOFU** | Trust-On-First-Use — the binary integrity verification model used by the proxy. |
-| **mTLS** | Mutual TLS — both client and server present certificates. Used for all gateway communication. |
+| **TOFU** | Trust-On-First-Use: the binary integrity verification model used by the proxy. |
+| **mTLS** | Mutual TLS: both client and server present certificates. Used for all gateway communication. |

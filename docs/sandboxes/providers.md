@@ -5,7 +5,7 @@
 
 # Providers
 
-AI agents typically need credentials to access external services — an API key for the AI model provider, a token for GitHub or GitLab, and so on. NemoClaw manages these credentials as first-class entities called *providers*.
+AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. NemoClaw manages these credentials as first-class entities called *providers*.
 
 Create and manage providers that supply credentials to sandboxes.
 
@@ -91,8 +91,7 @@ providers specified.
 
 ### Auto-Discovery Shortcut
 
-When the trailing command in `nemoclaw sandbox create` is a recognized tool name
---- `claude`, `codex`, or `opencode` --- the CLI auto-creates the required
+When the trailing command in `nemoclaw sandbox create` is a recognized tool name (`claude`, `codex`, or `opencode`), the CLI auto-creates the required
 provider from your local credentials if one does not already exist. You do not
 need to create the provider separately:
 
@@ -121,15 +120,13 @@ flowchart LR
    `--provider` flag (one or more providers can be attached).
 3. **The sandbox starts.** The supervisor process initializes.
 4. **The supervisor fetches credentials** from the NemoClaw gateway at runtime.
-   Credentials are not stored in the sandbox specification --- they are
-   retrieved on demand.
+   The system does not store credentials in the sandbox specification. It retrieves them on demand.
 5. **Credentials are injected** into the agent process as environment variables.
    They are also available in SSH sessions when you connect to the sandbox.
 
 :::{warning}
-Credentials are never stored in the sandbox container specification. They are
-fetched at runtime by the supervisor and held only in process memory. This
-means credentials are not visible in container inspection, image layers, or
+The system does not store credentials in the sandbox container specification. The supervisor fetches them at runtime and holds them only in process memory. This
+means you cannot find credentials in container inspection, image layers, or
 environment dumps of the container spec.
 :::
 
@@ -139,6 +136,6 @@ For a list of supported provider types, refer to the [Support Matrix](../about/s
 
 ## Next Steps
 
-- {doc}`create-and-manage` --- full sandbox lifecycle management
-- {doc}`custom-containers` --- use providers with custom container images
-- {doc}`../safety-and-privacy/security-model` --- why credential isolation matters
+- {doc}`create-and-manage`: Full sandbox lifecycle management
+- {doc}`custom-containers`: Use providers with custom container images
+- {doc}`../safety-and-privacy/security-model`: Why credential isolation matters

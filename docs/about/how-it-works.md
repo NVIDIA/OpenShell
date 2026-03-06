@@ -55,16 +55,16 @@ Users interact through the CLI, which communicates with a central gateway. The g
 
 Each sandbox runs inside a container as two processes: a privileged **supervisor** and a restricted **child process** (the agent). Safety and privacy are enforced through four independent layers:
 
-- **Filesystem restrictions** — the Linux Landlock LSM controls which directories the agent can read and write. Attempts to access files outside the allowed set are blocked by the kernel.
-- **System call filtering** — seccomp prevents the agent from creating raw network sockets, eliminating proxy bypass.
-- **Network namespace isolation** — the agent is placed in a separate network where the only reachable destination is the proxy, preventing data exfiltration.
-- **Process privilege separation** — the agent runs as an unprivileged user, protecting against privilege escalation.
+- **Filesystem restrictions**: The Linux Landlock LSM controls which directories the agent can read and write. Attempts to access files outside the allowed set are blocked by the kernel.
+- **System call filtering**: Seccomp prevents the agent from creating raw network sockets, eliminating proxy bypass.
+- **Network namespace isolation**: The agent is placed in a separate network where the only reachable destination is the proxy, preventing data exfiltration.
+- **Process privilege separation**: The agent runs as an unprivileged user, protecting against privilege escalation.
 
-All restrictions are driven by a YAML **policy** evaluated by an embedded OPA/Rego engine. See [Safety & Privacy](../safety-and-privacy/index.md).
+All restrictions are driven by a YAML **policy** evaluated by an embedded OPA/Rego engine. Refer to [Safety & Privacy](../safety-and-privacy/index.md).
 
 ### Network Proxy
 
-Every sandbox forces all outbound traffic through an HTTP CONNECT proxy — no data leaves without inspection. The proxy:
+Every sandbox forces all outbound traffic through an HTTP CONNECT proxy. No data leaves without inspection. The proxy:
 
 1. **Identifies the requesting program** via the process table.
 2. **Verifies binary integrity** with trust-on-first-use SHA256 hashing.
@@ -75,15 +75,15 @@ Every sandbox forces all outbound traffic through an HTTP CONNECT proxy — no d
 
 ### Gateway
 
-The central orchestration service providing gRPC and HTTP APIs, sandbox lifecycle management, data persistence, TLS termination, SSH tunnel gateway, and real-time status streaming.
+The gateway is the central orchestration service that provides gRPC and HTTP APIs, sandbox lifecycle management, data persistence, TLS termination, SSH tunnel gateway, and real-time status streaming.
 
 ### Providers
 
-Credentials are managed with a privacy-first design. API keys and tokens are stored separately from sandbox definitions, never appear in pod specs, and are fetched only at runtime. See [Providers](../sandboxes/providers.md).
+Credentials are managed with a privacy-first design. API keys and tokens are stored separately from sandbox definitions, never appear in pod specs, and are fetched only at runtime. Refer to [Providers](../sandboxes/providers.md).
 
 ### Inference Routing
 
-AI inference API calls are transparently intercepted and rerouted to policy-controlled backends, keeping sensitive prompts and responses on private infrastructure. See [Inference Routing](../inference/index.md).
+AI inference API calls are transparently intercepted and rerouted to policy-controlled backends, keeping sensitive prompts and responses on private infrastructure. Refer to [Inference Routing](../inference/index.md).
 
 ### Cluster Infrastructure
 
@@ -126,15 +126,15 @@ sequenceDiagram
 
 When a sandbox starts, the supervisor executes this sequence:
 
-1. **Load policy** — fetches the YAML policy from the gateway. The policy defines all filesystem, network, and process restrictions.
-2. **Fetch credentials** — retrieves provider credentials via gRPC for injection into child processes.
-3. **Set up filesystem isolation** — configures Landlock rules. Writable directories are created and ownership is set automatically.
-4. **Generate ephemeral TLS certificates** — creates a per-sandbox CA for transparent TLS inspection.
-5. **Create network namespace** — isolates the agent's network so the only reachable destination is the proxy.
-6. **Start the proxy** — launches the HTTP CONNECT proxy with OPA policy evaluation.
-7. **Start the SSH server** — launches the embedded SSH daemon for interactive access.
-8. **Spawn the agent** — launches the child process with reduced privileges: seccomp filters, network namespace, Landlock rules, and credentials injected as environment variables.
-9. **Begin policy polling** — checks for policy updates every 30 seconds, enabling live changes without restart.
+1. **Load policy**: Fetches the YAML policy from the gateway. The policy defines all filesystem, network, and process restrictions.
+2. **Fetch credentials**: Retrieves provider credentials via gRPC for injection into child processes.
+3. **Set up filesystem isolation**: Configures Landlock rules. Writable directories are created and ownership is set automatically.
+4. **Generate ephemeral TLS certificates**: Creates a per-sandbox CA for transparent TLS inspection.
+5. **Create network namespace**: Isolates the agent's network so the only reachable destination is the proxy.
+6. **Start the proxy**: Launches the HTTP CONNECT proxy with OPA policy evaluation.
+7. **Start the SSH server**: Launches the embedded SSH daemon for interactive access.
+8. **Spawn the agent**: Launches the child process with reduced privileges: seccomp filters, network namespace, Landlock rules, and credentials injected as environment variables.
+9. **Begin policy polling**: Checks for policy updates every 30 seconds, enabling live changes without restart.
 
 ## How Network Safety Works
 
@@ -162,10 +162,10 @@ Every connection is evaluated with three pieces of context:
 
 Credentials flow through a privacy-preserving pipeline:
 
-1. **Discovery** — the CLI scans local environment variables and config files for credentials.
-2. **Upload** — credentials are sent to the gateway over mTLS and stored separately from sandbox definitions.
-3. **Injection** — the supervisor fetches credentials via gRPC and injects them as environment variables. They never appear in Kubernetes pod specs.
-4. **Isolation** — the sandbox policy controls which endpoints the agent can reach, so credentials cannot be exfiltrated.
+1. **Discovery**: The CLI scans local environment variables and config files for credentials.
+2. **Upload**: Credentials are sent to the gateway over mTLS and stored separately from sandbox definitions.
+3. **Injection**: The supervisor fetches credentials through gRPC and injects them as environment variables. They never appear in Kubernetes pod specs.
+4. **Isolation**: The sandbox policy controls which endpoints the agent can reach, so credentials cannot be exfiltrated.
 
 ## How Inference Privacy Works
 
@@ -174,7 +174,7 @@ When inference routing is configured, the proxy intercepts AI API calls and keep
 1. The agent calls the OpenAI/Anthropic SDK as normal.
 2. The proxy TLS-terminates the connection and detects the inference API pattern.
 3. The proxy strips the original authorization header and routes the request to a configured backend.
-4. The backend's API key is injected by the router — the sandbox never sees it.
+4. The backend's API key is injected by the router. The sandbox never sees it.
 5. The response flows back to the agent transparently.
 
 This keeps prompts and responses on your private infrastructure while the agent operates as if it were calling the original API.

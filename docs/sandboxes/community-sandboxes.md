@@ -49,14 +49,14 @@ preconfigured by the community package.
 
 The `--from` flag also accepts:
 
-- **Local directory paths** --- point to a directory on disk that contains a
+- **Local directory paths**: Point to a directory on disk that contains a
   Dockerfile and optional policy/skills:
 
   ```console
   $ nemoclaw sandbox create --from ./my-sandbox-dir
   ```
 
-- **Container image references** --- use an existing container image directly:
+- **Container image references**: Use an existing container image directly:
 
   ```console
   $ nemoclaw sandbox create --from my-registry.example.com/my-image:latest
@@ -68,14 +68,14 @@ Each community sandbox is a directory under `sandboxes/` in the
 [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) repository.
 At minimum, a sandbox directory must contain:
 
-- `Dockerfile` --- defines the container image
-- `README.md` --- describes the sandbox and how to use it
+- `Dockerfile`: Defines the container image
+- `README.md`: Describes the sandbox and how to use it
 
 Optional files:
 
-- `policy.yaml` --- default policy applied when the sandbox launches
-- `skills/` --- agent skill definitions bundled with the sandbox
-- Startup scripts --- any scripts the Dockerfile or entrypoint invokes
+- `policy.yaml`: Default policy applied when the sandbox launches
+- `skills/`: Agent skill definitions bundled with the sandbox
+- Startup scripts: Any scripts the Dockerfile or entrypoint invokes
 
 To contribute, fork the repository, add your sandbox directory, and open a pull
 request. See the repository's
@@ -84,12 +84,12 @@ for submission guidelines.
 
 :::{note}
 The community catalog is designed to grow. If you have built a sandbox that
-supports a particular workflow --- data processing, simulation, code review,
-or anything else --- consider contributing it back so others can use it.
+supports a particular workflow (data processing, simulation, code review,
+or anything else), consider contributing it back so others can use it.
 :::
 
 ## Next Steps
 
-- {doc}`create-and-manage` --- full sandbox lifecycle management
-- {doc}`custom-containers` --- build a fully custom container with BYOC
-- {doc}`../safety-and-privacy/policies` --- customize the policy applied to any sandbox
+- {doc}`create-and-manage`: Full sandbox lifecycle management
+- {doc}`custom-containers`: Build a fully custom container with BYOC
+- {doc}`../safety-and-privacy/policies`: Customize the policy applied to any sandbox

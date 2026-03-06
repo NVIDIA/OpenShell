@@ -19,7 +19,7 @@ content:
 
 # NVIDIA NemoClaw Overview
 
-NVIDIA NemoClaw is a safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure while giving agents the system access they need to be useful. Each sandbox enforces declarative YAML policies through Linux kernel-level isolation, a policy-enforcing network proxy, and a credential management pipeline — agents run with exactly the permissions you grant and nothing more.
+NVIDIA NemoClaw is a safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure while giving agents the system access they need to be useful. Each sandbox enforces declarative YAML policies through Linux kernel-level isolation, a policy-enforcing network proxy, and a credential management pipeline. Agents run with exactly the permissions you grant and nothing more.
 
 You do not modify agent code to use NemoClaw. Instead, the CLI bootstraps a local Kubernetes cluster packaged in a single Docker container, creates sandboxes with the safety policies you define, and connects you to the running agent through an SSH tunnel.
 
@@ -49,13 +49,13 @@ flowchart LR
     linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
-The CLI bootstraps a cluster, creates sandboxes, and connects you via SSH. Inside each sandbox, an agent process runs with kernel-level filesystem restrictions while all network traffic passes through a policy-enforcing proxy. The proxy evaluates every request against an OPA policy engine before allowing or denying access. For the full architecture and end-to-end flow, refer to [How It Works](how-it-works.md).
+The CLI bootstraps a cluster, creates sandboxes, and connects you through SSH. Inside each sandbox, an agent process runs with kernel-level filesystem restrictions while all network traffic passes through a policy-enforcing proxy. The proxy evaluates every request against an OPA policy engine before allowing or denying access. For the full architecture and end-to-end flow, refer to [How It Works](how-it-works.md).
 
 ## Key Capabilities
 
 :::{dropdown} Data Safety
 
-Filesystem restrictions prevent agents from reading sensitive files or writing outside designated directories. The Linux Landlock LSM controls which paths the agent can access, and seccomp filters block raw network socket creation. Restrictions are enforced at the kernel level — they cannot be bypassed by the agent process.
+Filesystem restrictions prevent agents from reading sensitive files or writing outside designated directories. The Linux Landlock LSM controls which paths the agent can access, and seccomp filters block raw network socket creation. Restrictions are enforced at the kernel level. They cannot be bypassed by the agent process.
 :::
 
 :::{dropdown} Network Privacy
@@ -70,12 +70,12 @@ API keys and tokens are stored separately from sandbox definitions, never appear
 
 :::{dropdown} Inference Privacy
 
-AI API calls (OpenAI, Anthropic) are transparently intercepted by the proxy and rerouted to local or self-hosted backends such as LM Studio or vLLM. The agent calls its SDK as normal — NemoClaw swaps the destination and injects the backend's API key without the sandbox ever seeing it. Prompts and responses stay on your infrastructure. Refer to [Inference Routing](../inference/index.md) for configuration details.
+AI API calls (OpenAI, Anthropic) are transparently intercepted by the proxy and rerouted to local or self-hosted backends such as LM Studio or vLLM. The agent calls its SDK as normal. NemoClaw swaps the destination and injects the backend's API key without the sandbox ever seeing it. Prompts and responses stay on your infrastructure. Refer to [Inference Routing](../inference/index.md) for configuration details.
 :::
 
 :::{dropdown} Declarative Policies
 
-YAML policies define what each sandbox can access — filesystems, network endpoints, inference routes, and credential bindings. Policies can be updated on running sandboxes without restart: push a new policy revision and the OPA engine reloads atomically within 30 seconds. Refer to [Policies](../safety-and-privacy/policies.md) for the schema and examples.
+YAML policies define what each sandbox can access: filesystems, network endpoints, inference routes, and credential bindings. Policies can be updated on running sandboxes without restart: push a new policy revision and the OPA engine reloads atomically within 30 seconds. Refer to [Policies](../safety-and-privacy/policies.md) for the schema and examples.
 :::
 
 :::{dropdown} Zero-Config Deployment

@@ -89,7 +89,7 @@ Create and manage isolated agent execution environments.
 | `nemoclaw sandbox policy get <name>` | Show the active policy for a sandbox. Add `--full` for the complete policy with metadata. |
 | `nemoclaw sandbox policy list <name>` | List all policy versions applied to a sandbox, with status. |
 
-### `sandbox create` Flags
+### Sandbox Create Flags
 
 | Flag | Description |
 |---|---|
@@ -114,7 +114,7 @@ Manage credential providers that inject secrets into sandboxes.
 | `nemoclaw provider update <name>` | Update a provider's credentials or configuration. |
 | `nemoclaw provider delete <name>` | Delete a provider. |
 
-### `provider create` Flags
+### Provider Create Flags
 
 | Flag | Description |
 |---|---|
@@ -135,13 +135,13 @@ Manage inference routes that intercept and reroute LLM API calls from userland c
 | `nemoclaw inference delete <name>` | Delete an inference route. |
 | `nemoclaw inference list` | List all inference routes in the active cluster. |
 
-### `inference create` Flags
+### Inference Create Flags
 
 | Flag | Description |
 |---|---|
-| `--routing-hint` | Short label that identifies this route (e.g., `local`, `nvidia`, `staging`). Referenced by `allowed_routes` in sandbox policies. |
-| `--base-url` | Base URL of the inference backend (e.g., `https://vllm.internal:8000`). |
-| `--model-id` | Model identifier to send to the backend (e.g., `meta/llama-3.1-8b`). |
+| `--routing-hint` | Short label that identifies this route (for example, `local`, `nvidia`, `staging`). Referenced by `allowed_routes` in sandbox policies. |
+| `--base-url` | Base URL of the inference backend (for example, `https://vllm.internal:8000`). |
+| `--model-id` | Model identifier to send to the backend (for example, `meta/llama-3.1-8b`). |
 | `--api-key` | API key for authenticating with the backend. |
 | `--protocol` | API protocol: `openai` or `anthropic`. Defaults to `openai`. |
 | `--disabled` | Create the route in a disabled state. |
@@ -152,7 +152,7 @@ Manage inference routes that intercept and reroute LLM API calls from userland c
 status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
 press `f` to follow live output, `s` to filter by source, and `q` to quit.
 
-See {doc}`/sandboxes/terminal` for the full guide — including how to read log
+Refer to {doc}`/sandboxes/terminal` for the full guide, including how to read log
 entries, diagnose blocked connections, and interpret inference interception.
 
 ## Environment Variables

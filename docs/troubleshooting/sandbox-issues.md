@@ -22,7 +22,7 @@ Troubleshoot problems with creating, connecting to, and configuring sandboxes.
 
 **Check:**
 1. Is the sandbox in `Ready` state? `nemoclaw sandbox get <name>`.
-2. Is SSH accessible? The tunnel goes through the gateway — verify cluster connectivity first.
+2. Is SSH accessible? The tunnel goes through the gateway. Verify cluster connectivity first.
 
 ## Network Requests Denied
 
@@ -30,8 +30,8 @@ Troubleshoot problems with creating, connecting to, and configuring sandboxes.
 
 **Check:**
 1. Stream sandbox logs: `nemoclaw sandbox logs <name> --tail --source sandbox`.
-2. Look for `deny` actions — they include the destination, binary, and reason.
-3. Update the policy to allow the blocked endpoint. See [Policy Iteration Loop](../safety-and-privacy/policies.md#the-policy-iteration-loop).
+2. Look for `deny` actions. They include the destination, binary, and reason.
+3. Update the policy to allow the blocked endpoint. Refer to [Policy Iteration Loop](../safety-and-privacy/policies.md#the-policy-iteration-loop).
 
 ## Policy Update Fails
 
@@ -39,5 +39,5 @@ Troubleshoot problems with creating, connecting to, and configuring sandboxes.
 
 **Check:**
 1. Are you changing a static field? `filesystem_policy`, `landlock`, and `process` cannot change after creation.
-2. Are you adding/removing `network_policies` to change the network mode? This is not allowed — the mode is fixed at creation.
+2. Are you adding/removing `network_policies` to change the network mode? This is not allowed. The mode is fixed at creation.
 3. Check the error message in `nemoclaw sandbox policy list <name>`.

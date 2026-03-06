@@ -66,7 +66,7 @@ inference:
     - local
 ```
 
-See the [Policy Schema Reference](../reference/policy-schema.md) for every field, type, and default value.
+Refer to the [Policy Schema Reference](../reference/policy-schema.md) for every field, type, and default value.
 
 ## Default Policy
 
@@ -74,7 +74,7 @@ NemoClaw ships a built-in default policy designed for Claude Code. It covers Cla
 
 | Agent | Default policy coverage | What you need to do |
 |---|---|---|
-| Claude Code | Full | Nothing --- works out of the box |
+| Claude Code | Full | Nothing: works out of the box |
 | opencode | Partial | Add `opencode.ai` endpoint and opencode binary paths. |
 | Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
 
@@ -92,7 +92,7 @@ $ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
 
 The `--keep` flag keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy.
 
-To avoid passing `--policy` every time, set a default policy via environment variable:
+To avoid passing `--policy` every time, set a default policy by using environment variable:
 
 ```console
 $ export NEMOCLAW_SANDBOX_POLICY=./my-policy.yaml
@@ -115,13 +115,13 @@ flowchart TD
     F --> B
 ```
 
-### Step 1: Create the sandbox with your initial policy
+### Step 1: Create the Sandbox with Your Initial Policy
 
 ```console
 $ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
 ```
 
-### Step 2: Monitor logs for denied actions
+### Step 2: Monitor Logs for Denied Actions
 
 In a second terminal, tail the sandbox logs and look for `action: deny` entries:
 
@@ -136,12 +136,12 @@ that shows status and logs in a single view. See {doc}`/sandboxes/terminal` for
 how to read log entries and diagnose what's being blocked.
 
 :::{tip}
-The NemoClaw Terminal is especially useful during policy iteration — you can
+The NemoClaw Terminal is especially useful during policy iteration. You can
 watch deny entries appear in real time as the agent hits blocked endpoints, then
 push an updated policy without leaving the terminal.
 :::
 
-### Step 3: Pull the current policy
+### Step 3: Pull the Current Policy
 
 Export the running policy to a file:
 
@@ -153,7 +153,7 @@ $ nemoclaw sandbox policy get <name> --full > current-policy.yaml
 The `--full` output includes a metadata header with `Version`, `Hash`, and `Status` lines that are not valid YAML. Strip these lines before re-submitting the file as a policy update, or the push will fail.
 :::
 
-### Step 4: Modify the policy YAML
+### Step 4: Modify the Policy YAML
 
 Edit `current-policy.yaml` to address the denied actions you observed. Common changes include:
 
@@ -163,7 +163,7 @@ Edit `current-policy.yaml` to address the denied actions you observed. Common ch
 - Adjusting `access` levels or adding custom `rules`
 - Updating `inference.allowed_routes`
 
-### Step 5: Push the updated policy
+### Step 5: Push the Updated Policy
 
 ```console
 $ nemoclaw sandbox policy set <name> --policy current-policy.yaml --wait
@@ -177,7 +177,7 @@ The `--wait` flag blocks until the policy engine processes the update. Exit code
 | `1`       | Policy failed validation |
 | `124`     | Timed out waiting for the policy engine |
 
-### Step 6: Verify the new revision loaded
+### Step 6: Verify the New Revision Loaded
 
 ```console
 $ nemoclaw sandbox policy list <name>
@@ -215,12 +215,12 @@ $ nemoclaw sandbox policy get <name> --rev 3 --full
 ## Safety Properties
 
 **Last-known-good.**
-If a new policy revision fails validation, the previous successfully loaded policy stays active. A bad push does not break a running sandbox --- the agent continues operating under the last good policy.
+If a new policy revision fails validation, the previous successfully loaded policy stays active. A bad push does not break a running sandbox. The agent continues operating under the last good policy.
 
 **Idempotent.**
 Submitting the same policy content again does not create a new revision. The CLI detects that the content has not changed and returns without modifying the revision history.
 
 ## Next Steps
 
-- [Network Access Rules](network-access-rules.md) --- how the proxy evaluates connections, endpoint allowlists, binary matching, and enforcement modes.
-- {doc}`../reference/policy-schema` --- complete field reference for the policy YAML.
+- [Network Access Rules](network-access-rules.md): How the proxy evaluates connections, endpoint allowlists, binary matching, and enforcement modes.
+- {doc}`../reference/policy-schema`: Complete field reference for the policy YAML.

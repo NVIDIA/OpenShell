@@ -31,16 +31,16 @@ $ nemoclaw inference update <name> --model-id updated-model-v2 --api-key sk-new-
 $ nemoclaw inference delete <name>
 ```
 
-Deleting a route that is referenced by running sandboxes does not interrupt those sandboxes immediately. Future inference requests that would have matched the deleted route will be denied.
+Deleting a route that is referenced by running sandboxes does not interrupt those sandboxes immediately. The proxy denies future inference requests that would have matched the deleted route.
 
 ## Behavior Notes
 
-- Routes are **cluster-level** --- they are shared across all sandboxes in the cluster, not scoped to one sandbox.
+- Routes are **cluster-level**: They are shared across all sandboxes in the cluster, not scoped to one sandbox.
 - Each route maps to **one model**. Create multiple routes with the same `--routing-hint` but different `--model-id` values to expose multiple models.
-- Route changes are **hot-reloadable** --- sandboxes pick up new, updated, or deleted routes without restarting.
+- Route changes are **hot-reloadable**: Sandboxes pick up new, updated, or deleted routes without restarting.
 
 ## Next Steps
 
-- {doc}`create-routes` --- register a new inference backend.
-- {doc}`connect-sandboxes` --- connect a sandbox to inference routes via policy.
-- [CLI Reference](../reference/cli.md#inference-commands) --- full command specification for all inference commands.
+- {doc}`create-routes`: Register a new inference backend.
+- {doc}`connect-sandboxes`: Connect a sandbox to inference routes through policy.
+- [CLI Reference](../reference/cli.md#inference-commands): Full command specification for all inference commands.

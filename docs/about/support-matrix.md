@@ -15,9 +15,9 @@ The following software and runtime dependencies are required to install and run 
 |-------------|-----------|
 | **Operating System** | Linux (sandbox runtime). macOS and Linux (CLI). |
 | **Docker** | Required for cluster bootstrap. |
-| **Python** | 3.12+ (for CLI installation via `pip`). |
+| **Python** | 3.12+ (for CLI installation with `pip`). |
 | **Rust** | 1.88+ (for building from source). |
-| **Kubernetes** | k3s (bundled — no external cluster needed). |
+| **Kubernetes** | k3s (bundled, no external cluster needed). |
 
 ## Linux Kernel Features
 
@@ -47,7 +47,7 @@ Providers supply credentials to sandboxes. NemoClaw can auto-discover credential
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `generic` | User-defined | Any service with custom credentials |
-| `outlook` | *(none --- no auto-discovery)* | Microsoft Outlook integration |
+| `outlook` | *(none, no auto-discovery)* | Microsoft Outlook integration |
 
 :::{tip}
 Use the `generic` type for any service not listed above. You define the

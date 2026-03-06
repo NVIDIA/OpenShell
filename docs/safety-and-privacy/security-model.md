@@ -10,8 +10,8 @@ file, reach any network host, call any API with your credentials, and install
 arbitrary software. NemoClaw's security model exists to prevent all of that.
 
 :::{note}
-NemoClaw uses defense in depth. Four independent protection layers --- filesystem,
-network, process, and inference --- work together so that no single point of
+NemoClaw uses defense in depth. Four independent protection layers: filesystem,
+network, process, and inference. They work together so that no single point of
 failure can compromise your environment.
 :::
 
@@ -41,7 +41,7 @@ from your home directory and exfiltrates them.
 
 **With NemoClaw:**
 Landlock filesystem restrictions limit the agent to declared paths. The agent
-can access `/sandbox`, `/tmp`, and read-only system directories --- but not your
+can access `/sandbox`, `/tmp`, and read-only system directories, but not your
 home directory, SSH keys, cloud credentials, or anything else outside the
 policy.
 
@@ -55,7 +55,7 @@ data to a third-party inference provider you did not approve.
 
 **With NemoClaw:**
 The privacy router intercepts outbound API calls and reroutes them to a
-backend you control --- a local model, an NVIDIA endpoint, or your own
+backend you control: a local model, an NVIDIA endpoint, or your own
 deployment. The agent's code does not need to change; the rerouting is
 transparent. Your data never reaches an unauthorized provider.
 
@@ -82,6 +82,6 @@ that the others cannot.
 
 ## Next Steps
 
-- {doc}`policies` --- write and iterate on the policy YAML that configures all four layers
-- {doc}`network-access-rules` --- configure network rules, binary matching, and TLS inspection
-- {doc}`../inference/index` --- set up private inference backends
+- {doc}`policies`: Write and iterate on the policy YAML that configures all four layers
+- {doc}`network-access-rules`: Configure network rules, binary matching, and TLS inspection
+- {doc}`../inference/index`: Set up private inference backends

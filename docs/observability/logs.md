@@ -34,7 +34,7 @@ $ nemoclaw sandbox logs my-sandbox --source gateway --level error
 | `--tail` | Stream live logs (does not exit). |
 | `--source` | Filter by source: `gateway`, `sandbox`, or `all` (repeatable). |
 | `--level` | Minimum log level: `error`, `warn`, `info`, `debug`, `trace`. |
-| `--since` | Show logs from this duration ago (e.g., `5m`, `1h`, `30s`). |
+| `--since` | Show logs from this duration ago (for example, `5m`, `1h`, `30s`). |
 | `-n <N>` | Number of log lines to fetch (default: 200). |
 
 ## Log Sources
@@ -54,14 +54,14 @@ $ nemoclaw sandbox logs my-sandbox --tail --source sandbox
 
 Deny log entries include:
 
-- **Destination host and port** --- what the agent tried to reach.
-- **Binary path** --- which program attempted the connection.
-- **Deny reason** --- why the connection was blocked (no matching policy, binary mismatch, etc.).
+- **Destination host and port**: What the agent tried to reach.
+- **Binary path**: Which program attempted the connection.
+- **Deny reason**: Why the connection was blocked (no matching policy, binary mismatch, etc.).
 
 This information drives the [policy iteration loop](../safety-and-privacy/policies.md#the-policy-iteration-loop).
 
 ## Log Architecture
 
-Sandbox logs are pushed from the sandbox process to the gateway using a background batching layer. The sandbox collects log entries from its tracing subscriber and streams them to the gateway via gRPC in batches. The gateway stores log entries and makes them available via the CLI's `logs` command.
+Sandbox logs are pushed from the sandbox process to the gateway using a background batching layer. The sandbox collects log entries from its tracing subscriber and streams them to the gateway through gRPC in batches. The gateway stores log entries and makes them available via the CLI's `logs` command.
 
-This push-based model means logs are available even if you are not actively streaming --- you can always retrieve recent logs after the fact.
+This push-based model means logs are available even if you are not actively streaming. You can always retrieve recent logs after the fact.

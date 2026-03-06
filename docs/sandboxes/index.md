@@ -5,7 +5,7 @@
 
 # About Sandboxes
 
-A sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration: filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+A sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
 
 ## Concepts
 
@@ -27,18 +27,18 @@ A sandbox goes through these phases:
 Each sandbox runs two processes:
 
 - The **supervisor** (`navigator-sandbox`) is a privileged process that sets up isolation, starts the proxy, runs the SSH server, and manages the child process.
-- The **child process** is the agent (e.g., Claude, Codex) running with restricted privileges — reduced filesystem access, filtered system calls, and all network traffic routed through the proxy.
+- The **child process** is the agent (for example, Claude, Codex) running with restricted privileges: reduced filesystem access, filtered system calls, and all network traffic routed through the proxy.
 
 ### Policy
 
-Every sandbox is governed by a policy that defines what the agent can do, ensuring your data and credentials stay safe. Policies are written in YAML and control:
+A policy governs every sandbox, defining what the agent can do and ensuring your data and credentials stay safe. Policies are written in YAML and control:
 
-- **Filesystem access** — which directories are readable and writable, protecting sensitive data.
-- **Network access** — which hosts each program can connect to, preventing data exfiltration.
-- **Inference routing** — which AI model backends are available, keeping inference traffic private.
-- **Process privileges** — the user and group the agent runs as, limiting blast radius.
+- **Filesystem access**: Which directories are readable and writable, protecting sensitive data.
+- **Network access**: Which hosts each program can connect to, preventing data exfiltration.
+- **Inference routing**: Which AI model backends are available, keeping inference traffic private.
+- **Process privileges**: The user and group the agent runs as, limiting blast radius.
 
-See [Safety & Privacy](../safety-and-privacy/index.md) for details.
+Refer to [Safety & Privacy](../safety-and-privacy/index.md) for details.
 
 ## Quick Reference
 

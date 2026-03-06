@@ -16,7 +16,7 @@ Every sandbox moves through a defined set of phases:
 | **Provisioning** | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
 | **Ready** | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
 | **Error** | Something went wrong during provisioning or execution. Check logs with `nemoclaw sandbox logs` for details. |
-| **Deleting** | The sandbox is being torn down. Resources are released and credentials are purged. |
+| **Deleting** | The sandbox is being torn down. The system releases resources and purges credentials. |
 
 ## The NemoClaw Runtime
 
@@ -36,9 +36,9 @@ remote host instead of your local machine:
 $ nemoclaw cluster admin deploy --remote user@host
 ```
 
-See [Remote Deployment](../reference/architecture.md) for
+Refer to [Remote Deployment](../reference/architecture.md) for
 details. If you have multiple clusters (local and remote), switch between them
-with `nemoclaw cluster use <name>`. See the
+with `nemoclaw cluster use <name>`. Refer to the
 [CLI Reference](../reference/cli.md#cluster-commands) for the full command set.
 
 ## Prerequisites
@@ -147,7 +147,7 @@ $ nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn --since 
 
 :::{tip}
 For a real-time dashboard that combines sandbox status and logs in one view,
-run `nemoclaw term`. See {doc}`terminal` for details on reading log entries and
+run `nemoclaw term`. Refer to {doc}`terminal` for details on reading log entries and
 diagnosing blocked connections.
 :::
 
@@ -223,7 +223,7 @@ $ nemoclaw sandbox delete sandbox-a sandbox-b sandbox-c
 
 ## Next Steps
 
-- {doc}`community-sandboxes` --- use pre-built sandboxes from the community catalog
-- {doc}`providers` --- create and attach credential providers
-- {doc}`custom-containers` --- build and run your own container image
-- {doc}`../safety-and-privacy/policies` --- control what the agent can access
+- {doc}`community-sandboxes`: Use pre-built sandboxes from the community catalog
+- {doc}`providers`: Create and attach credential providers
+- {doc}`custom-containers`: Build and run your own container image
+- {doc}`../safety-and-privacy/policies`: Control what the agent can access

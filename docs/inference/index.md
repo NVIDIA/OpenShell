@@ -5,17 +5,17 @@
 
 # About Inference Routing
 
-The inference routing system keeps your AI inference traffic private by transparently intercepting API calls from sandboxed agents and rerouting them to policy-controlled backends. This enables organizations to keep sensitive prompts and model responses on private infrastructure — redirecting traffic to local or self-hosted models without modifying the agent's code.
+The inference routing system keeps your AI inference traffic private by transparently intercepting API calls from sandboxed agents and rerouting them to policy-controlled backends. This enables organizations to keep sensitive prompts and model responses on private infrastructure. It redirects traffic to local or self-hosted models without modifying the agent's code.
 
 ## How It Works
 
-When an agent inside a sandbox makes an API call (e.g., using the OpenAI or Anthropic SDK), the request flows through the sandbox proxy. If the destination does not match any explicit network policy but the sandbox has inference routes configured, the proxy:
+When an agent inside a sandbox makes an API call (for example, using the OpenAI or Anthropic SDK), the request flows through the sandbox proxy. If the destination does not match any explicit network policy but the sandbox has inference routes configured, the proxy:
 
 1. **TLS-terminates** the connection using the sandbox's ephemeral CA.
-2. **Detects the inference API pattern** (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic).
+2. **Detects the inference API pattern** (for example, `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic).
 3. **Strips authorization headers** and forwards the request to a matching backend.
 4. **Rewrites the authorization** with the route's API key and injects the correct model ID.
-5. **Returns the response** to the agent — the agent sees a normal HTTP response as if it came from the original API.
+5. **Returns the response** to the agent. The agent sees a normal HTTP response as if it came from the original API.
 
 Agents need zero code changes. Standard OpenAI/Anthropic SDK calls work transparently.
 
@@ -43,18 +43,18 @@ sequenceDiagram
 
 ## Working with Inference Routes
 
-- {doc}`create-routes` --- register a new inference backend with `nemoclaw inference create`.
-- {doc}`manage-routes` --- list, update, and delete inference routes.
-- {doc}`connect-sandboxes` --- connect a sandbox to inference routes via policy.
+- {doc}`create-routes`: Register a new inference backend with `nemoclaw inference create`.
+- {doc}`manage-routes`: List, update, and delete inference routes.
+- {doc}`connect-sandboxes`: Connect a sandbox to inference routes via policy.
 
 ## Key Design Properties
 
-- **Zero agent code changes** — standard SDK calls work transparently.
-- **Inference privacy** — prompts and responses stay on your infrastructure when routed to local backends.
-- **Credential isolation** — the sandbox never sees the real API key for the backend, protecting your credentials.
-- **Policy-controlled** — `inference.allowed_routes` determines which routes a sandbox can use.
-- **Hot-reloadable** — the `inference` policy field is dynamic and can be updated on a running sandbox.
-- **Automatic cache refresh** — in cluster mode, the sandbox refreshes its route cache from the gateway every 30 seconds.
+- **Zero agent code changes**: Standard SDK calls work transparently.
+- **Inference privacy**: Prompts and responses stay on your infrastructure when routed to local backends.
+- **Credential isolation**: The sandbox never sees the real API key for the backend, protecting your credentials.
+- **Policy-controlled**: `inference.allowed_routes` determines which routes a sandbox can use.
+- **Hot-reloadable**: The `inference` policy field is dynamic and can be updated on a running sandbox.
+- **Automatic cache refresh**: In cluster mode, the sandbox refreshes its route cache from the gateway every 30 seconds.
 
 ## Supported API Patterns
 

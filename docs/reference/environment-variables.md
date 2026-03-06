@@ -26,7 +26,7 @@ These variables are set inside sandbox processes automatically:
 | `NODE_EXTRA_CA_CERTS` | Same CA bundle path, for Node.js applications. |
 | `REQUESTS_CA_BUNDLE` | Same CA bundle path, for Python requests library. |
 
-Provider credentials are also injected as environment variables. The specific variables depend on which providers are attached (e.g., `ANTHROPIC_API_KEY` for Claude, `GITHUB_TOKEN` for GitHub).
+Provider credentials are also injected as environment variables. The specific variables depend on which providers are attached (for example, `ANTHROPIC_API_KEY` for Claude, `GITHUB_TOKEN` for GitHub).
 
 ## Sandbox Supervisor Variables
 

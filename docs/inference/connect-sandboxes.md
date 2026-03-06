@@ -35,7 +35,7 @@ The `inference` section is a dynamic field, so you can add or remove routing hin
 
 ## How It Works
 
-Once a sandbox has `allowed_routes` configured, the proxy intercepts outbound connections that do not match any explicit `network_policies` entry. If the request matches a known inference API pattern (e.g., `POST /v1/chat/completions`), the proxy:
+After a sandbox has `allowed_routes` configured, the proxy intercepts outbound connections that do not match any explicit `network_policies` entry. If the request matches a known inference API pattern (for example, `POST /v1/chat/completions`), the proxy:
 
 1. TLS-terminates the connection.
 2. Strips the original authorization header.
@@ -56,7 +56,7 @@ $ nemoclaw sandbox create --keep -- claude
 
 ## Next Steps
 
-- {doc}`create-routes` --- register new inference backends.
-- {doc}`manage-routes` --- list, update, and delete routes.
-- [Policies](../safety-and-privacy/policies.md) --- the full policy iteration workflow.
-- [Network Access Control](../safety-and-privacy/network-access-rules.md) --- how agent traffic differs from userland inference traffic.
+- {doc}`create-routes`: Register new inference backends.
+- {doc}`manage-routes`: List, update, and delete routes.
+- [Policies](../safety-and-privacy/policies.md): The full policy iteration workflow.
+- [Network Access Control](../safety-and-privacy/network-access-rules.md): How agent traffic differs from userland inference traffic.

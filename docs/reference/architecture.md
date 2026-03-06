@@ -68,11 +68,11 @@ The gateway is the central control-plane API. It coordinates sandbox lifecycle
 and state, acts as the auth boundary, and brokers all requests across the
 platform. It exposes a gRPC API consumed by the CLI and handles:
 
-- Sandbox lifecycle --- creates, monitors, and deletes sandbox pods.
-- Provider storage --- stores encrypted provider credentials.
-- Policy distribution --- delivers policy YAML to sandboxes at startup and on
+- Sandbox lifecycle---creates, monitors, and deletes sandbox pods.
+- Provider storage---stores encrypted provider credentials.
+- Policy distribution---delivers policy YAML to sandboxes at startup and on
   hot-reload.
-- SSH termination --- terminates SSH tunnels from the CLI and routes them to
+- SSH termination---terminates SSH tunnels from the CLI and routes them to
   the correct sandbox.
 
 The CLI never talks to sandbox pods directly. All commands go through the
@@ -104,12 +104,12 @@ boundaries before starting the agent:
 Every outbound TCP connection from any process in the sandbox is routed through
 the proxy. For each connection, the proxy:
 
-1. **Resolves the calling binary** via `/proc/<pid>/exe`, ancestor process
+1. **Resolves the calling binary** through `/proc/<pid>/exe`, ancestor process
    walking, and `/proc/<pid>/cmdline`.
 2. **Queries the policy engine** with the destination host, port, and resolved
    binary path.
-3. **Acts on the decision** --- allow the connection directly, hand it to the
-   privacy router for inference routing, or deny it. See
+3. **Acts on the decision**---allow the connection directly, hand it to the
+   privacy router for inference routing, or deny it. Refer to
    [How the Proxy Evaluates Connections](../safety-and-privacy/network-access-rules.md#how-the-proxy-evaluates-connections)
    for the full decision model.
 
@@ -125,7 +125,7 @@ application layer down to infrastructure and kernel layers.
 
 The engine evaluates policies compiled from the sandbox's policy YAML. It is
 queried synchronously by the proxy on every outbound connection. Policy updates
-delivered via hot-reload are compiled and loaded without restarting the proxy.
+delivered through hot-reload are compiled and loaded without restarting the proxy.
 
 ## Privacy Router
 

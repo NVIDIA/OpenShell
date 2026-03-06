@@ -42,6 +42,5 @@ Set up opencode with NVIDIA inference routing, custom policies, and the full pol
 
 Run OpenClaw Safely <run-openclaw>
 Run Claude Safely <run-claude>
-Run Opencode with NVIDIA Inference <run-opencode>
-Run Any Agent Safely <run-agents>
+Run OpenCode with NVIDIA Inference <run-opencode>
 ```
