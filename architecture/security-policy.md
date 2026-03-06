@@ -492,13 +492,22 @@ When `network_policies` is empty, the OPA engine denies all outbound connections
 
 **Gateway-side validation**: The `validate_network_mode_unchanged()` function on the server still rejects live policy updates that would add `network_policies` to a sandbox created without them or remove all `network_policies` from a sandbox created with them. This prevents unexpected behavioral changes in the OPA allow/deny logic. See `crates/navigator-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
 
+**Proxy sub-modes**: In proxy mode, the proxy handles two distinct request types:
+
+| Client sends | Proxy behavior | Typical use case |
+|---|---|---|
+| `CONNECT host:port` | CONNECT tunnel (bidirectional TCP relay or L7 inspection) | HTTPS to any destination, HTTP through an opaque tunnel |
+| `GET http://host/path HTTP/1.1` (absolute-form) | **Forward proxy** — rewrites to origin-form & relays | Plain HTTP to private IP endpoints |
+
+See [Behavioral Trigger: Forward Proxy Mode](#behavioral-trigger-forward-proxy-mode) for full details on the forward proxy path.
+
 ```mermaid
 flowchart LR
     SANDBOX[Sandbox Startup] --> PROXY[Proxy Mode<br/>Always Active]
 
     PROXY --> SECCOMP_ALLOW["seccomp: allow AF_INET + AF_INET6<br/>block AF_NETLINK, AF_PACKET, etc."]
     PROXY --> NETNS["Create network namespace<br/>veth pair: 10.200.0.1 ↔ 10.200.0.2"]
-    PROXY --> START_PROXY["Start HTTP CONNECT proxy<br/>bound to veth host IP"]
+    PROXY --> START_PROXY["Start HTTP proxy<br/>bound to veth host IP"]
     PROXY --> ENVVARS["Set HTTP_PROXY, HTTPS_PROXY,<br/>ALL_PROXY on child process"]
 
     START_PROXY --> CONNECT{CONNECT request}
@@ -521,6 +530,94 @@ This is the single most important behavioral trigger in the policy language. An 
 **Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.navigator.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/navigator-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
 
 **Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
+
+### Behavioral Trigger: Forward Proxy Mode
+
+**Trigger**: A non-CONNECT HTTP method with an absolute-form URI (e.g., `GET http://host:port/path HTTP/1.1`).
+
+When a client sets `HTTP_PROXY` and makes a plain `http://` request, standard HTTP libraries send a **forward proxy request** instead of a CONNECT tunnel. The proxy handles these requests via the forward proxy path rather than the CONNECT path.
+
+**Security constraint**: Forward proxy mode is restricted to **private IP endpoints** that are explicitly allowed by policy. Plain HTTP traffic never reaches the public internet. All three conditions must be true:
+
+1. OPA policy explicitly allows the destination (`action=allow`)
+2. The matched endpoint has `allowed_ips` configured
+3. All resolved IP addresses are RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`)
+
+If any condition fails, the proxy returns `403 Forbidden`.
+
+| Condition | Forward proxy | CONNECT |
+|---|---|---|
+| Public IP, no `allowed_ips` | 403 | Allowed (standard SSRF check) |
+| Public IP, with `allowed_ips` | 403 (private-IP gate) | Allowed if IP in allowlist |
+| Private IP, no `allowed_ips` | 403 | 403 (SSRF block) |
+| Private IP, with `allowed_ips` | **Allowed** | Allowed |
+| `https://` scheme | 403 (must use CONNECT) | N/A |
+
+**Request processing**: When a forward proxy request is accepted, the proxy:
+
+1. Parses the absolute-form URI to extract scheme, host, port, and path (`parse_proxy_uri`)
+2. Rejects `https://` — clients must use CONNECT for TLS
+3. Evaluates OPA policy (same `evaluate_opa_tcp` as CONNECT)
+4. Requires `allowed_ips` on the matched endpoint
+5. Resolves DNS and validates all IPs are private and within `allowed_ips`
+6. Connects to upstream
+7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 navigator-sandbox` and `Connection: close`
+8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
+
+**V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive) and does not perform L7 inspection on the forwarded traffic. Every forward proxy connection handles exactly one request-response exchange.
+
+**Implementation**: See `crates/navigator-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
+
+**Logging**: Forward proxy requests are logged distinctly from CONNECT:
+
+```
+FORWARD method=GET dst_host=10.86.8.223 dst_port=8000 path=/screenshot/ action=allow policy=computer-control
+```
+
+```mermaid
+flowchart TD
+    A["Non-CONNECT request received<br/>e.g. GET http://host/path"] --> B["parse_proxy_uri(uri)"]
+    B --> C{Scheme = http?}
+    C -- No --> D["403 Forbidden<br/>(HTTPS must use CONNECT)"]
+    C -- Yes --> E["OPA policy evaluation"]
+    E --> F{Allowed?}
+    F -- No --> G["403 Forbidden"]
+    F -- Yes --> H{allowed_ips on endpoint?}
+    H -- No --> I["403 Forbidden<br/>(forward proxy requires allowed_ips)"]
+    H -- Yes --> J["resolve_and_check_allowed_ips()"]
+    J --> K{All IPs private<br/>AND in allowlist?}
+    K -- No --> L["403 Forbidden"]
+    K -- Yes --> M["TCP connect to upstream"]
+    M --> N["Rewrite request to origin-form<br/>Add Via + Connection: close"]
+    N --> O["Forward request + copy_bidirectional"]
+```
+
+#### Example: Forward Proxy Policy
+
+The same policy that enables CONNECT to a private endpoint also enables forward proxy access. No new policy fields are needed:
+
+```yaml
+network_policies:
+  computer_control:
+    name: computer-control
+    endpoints:
+      - host: 10.86.8.223
+        port: 8000
+        allowed_ips:
+          - "10.86.8.223/32"
+    binaries:
+      - { path: /usr/local/bin/python3.12 }
+```
+
+With this policy, both work:
+
+```python
+# CONNECT tunnel (httpx with HTTPS, or explicit tunnel code)
+# Forward proxy (httpx with HTTP_PROXY set for http:// URLs)
+import httpx
+resp = httpx.get("http://10.86.8.223:8000/screenshot/",
+                 proxy="http://10.200.0.1:3128")
+```
 
 ### Behavioral Trigger: TLS Termination
 
@@ -765,11 +862,15 @@ Functions in `crates/navigator-sandbox/src/proxy.rs` implement the SSRF checks:
 
 ### Placement in Proxy Flow
 
+The SSRF check applies to both CONNECT and forward proxy requests. For forward proxy, an additional private-IP gate requires all resolved IPs to be RFC 1918 private.
+
 ```mermaid
 flowchart TD
-    A[CONNECT request received] --> B{inference.local?}
-    B -- Yes --> C["InferenceContext: route locally"]
-    B -- No --> D[OPA policy evaluation]
+    A["Request received"] --> B{CONNECT?}
+    B -- Yes --> INF{inference.local?}
+    INF -- Yes --> C["InferenceContext: route locally"]
+    INF -- No --> D[OPA policy evaluation]
+    B -- No --> FP["Forward proxy path<br/>(see Forward Proxy Mode)"]
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
     E -- Yes --> G{allowed_ips on endpoint?}
@@ -781,7 +882,13 @@ flowchart TD
     L --> M{All IPs public?}
     M -- No --> J
     M -- Yes --> K
-    K --> N[200 Connection Established]
+    K --> N["200 Connection Established"]
+
+    FP --> FP_OPA["OPA evaluation + require allowed_ips"]
+    FP_OPA --> FP_RESOLVE["resolve_and_check_allowed_ips"]
+    FP_RESOLVE --> FP_PRIVATE{All IPs private?}
+    FP_PRIVATE -- No --> J
+    FP_PRIVATE -- Yes --> FP_CONNECT["TCP connect + rewrite + relay"]
 ```
 
 ### Private IP Access via `allowed_ips`
@@ -970,6 +1077,23 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 
+  # Forward proxy + CONNECT: private service accessible via plain HTTP or tunnel
+  # With allowed_ips set and the destination being a private IP, both
+  # `http://10.86.8.223:8000/path` (forward proxy) and
+  # `CONNECT 10.86.8.223:8000` (tunnel) work.
+  computer_control:
+    name: computer-control
+    endpoints:
+      - host: 10.86.8.223
+        port: 8000
+        allowed_ips:
+          - "10.86.8.223/32"
+    binaries:
+      - { path: /usr/local/bin/python3.12 }
+
+inference:
+  allowed_routes:
+    - local
 ```
 
 ---
@@ -1018,7 +1142,9 @@ This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/pa
 
 The OPA engine evaluates two categories of rules:
 
-### L4 Rules (per-CONNECT)
+### L4 Rules (per-connection)
+
+Evaluated on every CONNECT request and every forward proxy request. The same OPA input is used in both cases.
 
 | Rule                      | Signature                                                                                                         | Returns                                                                                       |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
@@ -1108,3 +1234,4 @@ An empty `sources`/`log_sources` list means no source filtering (all sources pas
 - [Gateway Architecture](gateway.md) -- How the gateway stores and delivers policies via gRPC
 - [Inference Routing](inference-routing.md) -- How `inference.local` requests are routed to model backends
 - [Overview](README.md) -- System-level context for how policies fit into the platform
+- [Plain HTTP Forward Proxy Plan](plans/plain-http-forward-proxy.md) -- Design document for the forward proxy feature
