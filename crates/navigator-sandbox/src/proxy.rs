@@ -1429,7 +1429,7 @@ async fn handle_forward_proxy(
             .join(", ")
     };
 
-    // 4. Only proceed on explicit Allow — reject Deny and InspectForInference
+    // 4. Only proceed on explicit Allow — reject Deny
     let matched_policy = match &decision.action {
         NetworkAction::Allow { matched_policy } => matched_policy.clone(),
         NetworkAction::Deny { reason } => {
@@ -1449,28 +1449,6 @@ async fn handle_forward_proxy(
                 engine = "opa",
                 policy = "-",
                 reason = %reason,
-                "FORWARD",
-            );
-            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-            return Ok(());
-        }
-        NetworkAction::InspectForInference { .. } => {
-            info!(
-                src_addr = %peer_addr.ip(),
-                src_port = peer_addr.port(),
-                proxy_addr = %local_addr,
-                dst_host = %host_lc,
-                dst_port = port,
-                method = %method,
-                path = %path,
-                binary = %binary_str,
-                binary_pid = %pid_str,
-                ancestors = %ancestors_str,
-                cmdline = %cmdline_str,
-                action = "deny",
-                engine = "opa",
-                policy = "-",
-                reason = "forward proxy requires explicit Allow (not InspectForInference)",
                 "FORWARD",
             );
             respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
