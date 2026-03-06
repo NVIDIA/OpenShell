@@ -25,4 +25,4 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-# No network policies means all outbound connections are denied.
+# No network policies means all outbound connections are denied and only inference.local is allowed.
