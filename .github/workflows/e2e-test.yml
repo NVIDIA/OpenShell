@@ -53,6 +53,9 @@ jobs:
           NEMOCLAW_CLUSTER_IMAGE: ghcr.io/nvidia/nemoclaw/cluster:${{ inputs.image-tag }}
         run: mise run --no-prepare --skip-deps cluster
 
+      - name: Install SSH client for Rust CLI e2e tests
+        run: apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
+
       - name: Run E2E tests
         run: |
           mise run --no-prepare --skip-deps e2e:python
