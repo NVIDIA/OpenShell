@@ -15,7 +15,7 @@
 # The helm charts are built by the docker:build:cluster mise task
 # and placed in deploy/docker/.build/ before this Dockerfile is built.
 
-ARG K3S_VERSION=v1.29.8-k3s1
+ARG K3S_VERSION=v1.34.5-k3s1
 FROM rancher/k3s:${K3S_VERSION}
 
 # Create directories for manifests, charts, and configuration
