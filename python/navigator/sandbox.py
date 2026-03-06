@@ -375,13 +375,14 @@ class SandboxClient:
 
 
 @dataclass(frozen=True)
-class InferenceRouteRef:
-    id: str
-    name: str
+class ClusterInferenceConfig:
+    provider_name: str
+    model_id: str
+    version: int
 
 
 class InferenceRouteClient:
-    """gRPC client for managing inference routes."""
+    """gRPC client for cluster-level inference configuration."""
 
     def __init__(self, channel: grpc.Channel, *, timeout: float = 30.0) -> None:
         self._stub = inference_pb2_grpc.InferenceStub(channel)
@@ -391,47 +392,35 @@ class InferenceRouteClient:
     def from_sandbox_client(cls, client: SandboxClient) -> InferenceRouteClient:
         return cls(client._channel, timeout=client._timeout)
 
-    def create(
+    def set_cluster(
         self,
         *,
-        name: str,
-        routing_hint: str,
-        base_url: str,
-        protocols: builtins.list[str],
-        api_key: str,
+        provider_name: str,
         model_id: str,
-        enabled: bool = True,
-    ) -> InferenceRouteRef:
-        spec = inference_pb2.InferenceRouteSpec(
-            routing_hint=routing_hint,
-            base_url=base_url,
-            protocols=protocols,
-            api_key=api_key,
-            model_id=model_id,
-            enabled=enabled,
-        )
-        response = self._stub.CreateInferenceRoute(
-            inference_pb2.CreateInferenceRouteRequest(route=spec, name=name),
+    ) -> ClusterInferenceConfig:
+        response = self._stub.SetClusterInference(
+            inference_pb2.SetClusterInferenceRequest(
+                provider_name=provider_name,
+                model_id=model_id,
+            ),
             timeout=self._timeout,
         )
-        route = response.route
-        return InferenceRouteRef(id=route.id, name=route.name)
+        return ClusterInferenceConfig(
+            provider_name=response.provider_name,
+            model_id=response.model_id,
+            version=response.version,
+        )
 
-    def delete(self, name: str) -> bool:
-        response = self._stub.DeleteInferenceRoute(
-            inference_pb2.DeleteInferenceRouteRequest(name=name),
+    def get_cluster(self) -> ClusterInferenceConfig:
+        response = self._stub.GetClusterInference(
+            inference_pb2.GetClusterInferenceRequest(),
             timeout=self._timeout,
         )
-        return bool(response.deleted)
-
-    def list(
-        self, *, limit: int = 100, offset: int = 0
-    ) -> builtins.list[InferenceRouteRef]:
-        response = self._stub.ListInferenceRoutes(
-            inference_pb2.ListInferenceRoutesRequest(limit=limit, offset=offset),
-            timeout=self._timeout,
+        return ClusterInferenceConfig(
+            provider_name=response.provider_name,
+            model_id=response.model_id,
+            version=response.version,
         )
-        return [InferenceRouteRef(id=r.id, name=r.name) for r in response.routes]
 
 
 class Sandbox:

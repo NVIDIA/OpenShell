@@ -1289,9 +1289,6 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
         hasher.update(key.as_bytes());
         hasher.update(value.encode_to_vec());
     }
-    if let Some(inf) = &policy.inference {
-        hasher.update(inf.encode_to_vec());
-    }
     hex::encode(hasher.finalize())
 }
 

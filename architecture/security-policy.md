@@ -36,14 +36,14 @@ When the sandbox runs inside a managed cluster, it fetches its typed protobuf po
 ```bash
 navigator-sandbox \
   --sandbox-id abc123 \
-  --nemoclaw-endpoint https://navigator:8080 \
+  --navigator-endpoint https://navigator:8080 \
   -- /bin/bash
 ```
 
-| Flag                   | Environment Variable   | Description                  |
-| ---------------------- | ---------------------- | ---------------------------- |
-| `--sandbox-id`         | `NEMOCLAW_SANDBOX_ID` | Sandbox ID for policy lookup |
-| `--nemoclaw-endpoint` | `NEMOCLAW_ENDPOINT`   | Gateway gRPC endpoint        |
+| Flag                     | Environment Variable   | Description                  |
+| ------------------------ | ---------------------- | ---------------------------- |
+| `--sandbox-id`           | `NEMOCLAW_SANDBOX_ID` | Sandbox ID for policy lookup |
+| `--navigator-endpoint`   | `NEMOCLAW_ENDPOINT`   | Gateway gRPC endpoint        |
 
 The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
 
@@ -53,7 +53,7 @@ The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbo
 flowchart TD
     START[Sandbox Startup] --> CHECK{File mode?<br/>--policy-rules +<br/>--policy-data}
     CHECK -->|Yes| FILE[Read .rego + .yaml from disk]
-    CHECK -->|No| NEMOCLAW{gRPC mode?<br/>--sandbox-id +<br/>--nemoclaw-endpoint}
+    CHECK -->|No| NEMOCLAW{gRPC mode?<br/>--sandbox-id +<br/>--navigator-endpoint}
     NEMOCLAW -->|Yes| FETCH[Fetch SandboxPolicy proto via gRPC]
     NEMOCLAW -->|No| ERR[Error: no policy source]
 
@@ -69,11 +69,11 @@ flowchart TD
 
 ### Priority
 
-File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--nemoclaw-endpoint` are provided, file mode is used. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`.
+File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--navigator-endpoint` are provided, file mode is used. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`.
 
 ## Live Policy Updates
 
-Policy can be updated on a running sandbox without restarting it. This enables operators to tighten or relax network access rules and inference routing in response to changing requirements.
+Policy can be updated on a running sandbox without restarting it. This enables operators to tighten or relax network access rules in response to changing requirements.
 
 Live updates are only available in **gRPC mode** (production clusters). File-mode sandboxes load policy once at startup and do not poll for changes.
 
@@ -84,7 +84,7 @@ Policy fields fall into two categories based on when they are enforced:
 | Category | Fields | Enforcement Point | Updatable? |
 |----------|--------|-------------------|------------|
 | **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
-| **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `nav sandbox policy set` |
+| **Dynamic** | `network_policies` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `nav sandbox policy set` |
 
 Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/navigator-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
 
@@ -160,8 +160,7 @@ The hash is computed as follows:
 1. Hash the `version` field as little-endian bytes.
 2. Hash the `filesystem`, `landlock`, and `process` sub-messages via `encode_to_vec()` (these contain no `map` fields, so encoding is deterministic).
 3. Collect `network_policies` entries, sort by map key, then hash each key (as UTF-8 bytes) followed by the value's `encode_to_vec()`.
-4. Hash the `inference` sub-message via `encode_to_vec()`.
-5. Return the hex-encoded SHA-256 digest.
+4. Return the hex-encoded SHA-256 digest.
 
 This guarantees that the same logical policy always produces the same hash regardless of protobuf serialization order.
 
@@ -259,7 +258,7 @@ The YAML data file contains top-level keys that map directly to the OPA data nam
 ### Top-Level Structure
 
 ```yaml
-# Optional version field (currently informational)
+# Required version field
 version: 1
 
 # Filesystem access policy (applied at startup via Landlock)
@@ -284,9 +283,6 @@ network_policies:
     endpoints: []
     binaries: []
 
-# Inference routing policy (gRPC mode only)
-inference:
-  allowed_routes: []
 ```
 
 ---
@@ -383,7 +379,7 @@ process:
 
 A map of named network policy rules. Each rule defines which binary/endpoint pairs are allowed to make outbound network connections. This is the core of the network access control system. **Dynamic field** -- can be updated on a running sandbox via live policy updates (see [Live Policy Updates](#live-policy-updates)). However, the overall network mode (Block vs. Proxy) is immutable.
 
-**Behavioral trigger**: The mere presence of any entries in `network_policies` switches the sandbox to **proxy mode**. When `network_policies` is empty or absent, the sandbox operates in **block mode** where all outbound network access is denied via seccomp.
+**Behavioral trigger**: The sandbox always starts in **proxy mode** regardless of whether `network_policies` is present. The proxy is required so that all egress can be evaluated by OPA and the virtual hostname `inference.local` is always addressable for inference routing. When `network_policies` is empty, the OPA engine denies all connections.
 
 ```yaml
 network_policies:
@@ -469,19 +465,11 @@ See `crates/navigator-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
 ---
 
-### `inference`
+### Inference Routing
 
-Controls access to the platform's inference routing system (gRPC mode only, included in the `SandboxPolicy` proto but not consumed by the sandbox supervisor directly). **Dynamic field** -- can be updated on a running sandbox via live policy updates (see [Live Policy Updates](#live-policy-updates)).
+Inference routing to `inference.local` is handled by the proxy's `InferenceContext`, not by the OPA policy engine or an `inference` block in the policy YAML. The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests (e.g., `POST /v1/chat/completions`, `POST /v1/messages`) through the sandbox-local `navigator-router`. See [Inference Routing](inference-routing.md) for details on route configuration and the router architecture.
 
-| Field                   | Type       | Default | Description                                                                                                                                                 |
-| ----------------------- | ---------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `allowed_routes` | `string[]` | `[]`    | Which routing hints the sandbox may request. e.g., `["local"]` for private-only, `["local", "frontier"]` for full access. Empty means no inference allowed. |
-
-```yaml
-inference:
-  allowed_routes:
-    - local
-```
+The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (cluster mode). See `crates/navigator-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/navigator-sandbox/src/l7/inference.rs`.
 
 ---
 
@@ -489,30 +477,33 @@ inference:
 
 Several policy fields trigger fundamentally different enforcement behavior. Understanding these triggers is critical for writing correct policies.
 
-### Network Mode: Block vs. Proxy
+### Network Mode: Always Proxy
 
-**Trigger**: The presence or absence of entries in `network_policies`.
+The sandbox always runs in **proxy mode**. Both file mode and gRPC mode set `NetworkMode::Proxy` unconditionally. This ensures all egress is evaluated by OPA and the virtual hostname `inference.local` is always addressable for inference routing. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`, `crates/navigator-sandbox/src/policy.rs` -- `TryFrom<ProtoSandboxPolicy>`.
 
-| Condition                             | Network Mode | Behavior                                                                                                                                                                                                                           |
-| ------------------------------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `network_policies` is empty or absent | **Block**    | Seccomp blocks all `socket()` calls for `AF_INET` and `AF_INET6`. No network proxy is started. No outbound TCP connections are possible.                                                                                           |
-| `network_policies` has any entries    | **Proxy**    | Seccomp allows `AF_INET` and `AF_INET6` sockets. An HTTP CONNECT proxy starts. A network namespace with veth pair isolates the sandbox. `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables are set on the child process. |
+In proxy mode:
 
-In proxy mode, the seccomp filter still blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, and `AF_VSOCK` socket domains regardless. See `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs` -- `build_filter()`.
+- Seccomp allows `AF_INET` and `AF_INET6` sockets (but blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, `AF_VSOCK`).
+- An HTTP CONNECT proxy starts, bound to the host side of a veth pair.
+- A network namespace with a veth pair isolates the sandbox process.
+- `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables are set on the child process.
 
-**Immutability**: The network mode is determined at sandbox creation and cannot change via live policy updates. Adding `network_policies` to a Block-mode sandbox or removing all policies from a Proxy-mode sandbox is rejected by the gateway. See [Network Mode Immutability](#network-mode-immutability).
+When `network_policies` is empty, the OPA engine denies all outbound connections (except `inference.local` which is handled separately by the proxy before OPA evaluation).
+
+**Gateway-side validation**: The `validate_network_mode_unchanged()` function on the server still rejects live policy updates that would add `network_policies` to a sandbox created without them or remove all `network_policies` from a sandbox created with them. This prevents unexpected behavioral changes in the OPA allow/deny logic. See `crates/navigator-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
 
 ```mermaid
 flowchart LR
-    POLICY{network_policies<br/>present?}
-    POLICY -->|No| BLOCK[Block Mode]
-    POLICY -->|Yes| PROXY[Proxy Mode]
+    SANDBOX[Sandbox Startup] --> PROXY[Proxy Mode<br/>Always Active]
 
-    BLOCK --> SECCOMP_BLOCK["seccomp: block AF_INET + AF_INET6"]
     PROXY --> SECCOMP_ALLOW["seccomp: allow AF_INET + AF_INET6<br/>block AF_NETLINK, AF_PACKET, etc."]
     PROXY --> NETNS["Create network namespace<br/>veth pair: 10.200.0.1 ↔ 10.200.0.2"]
     PROXY --> START_PROXY["Start HTTP CONNECT proxy<br/>bound to veth host IP"]
     PROXY --> ENVVARS["Set HTTP_PROXY, HTTPS_PROXY,<br/>ALL_PROXY on child process"]
+
+    START_PROXY --> CONNECT{CONNECT request}
+    CONNECT -->|inference.local| INFERENCE["InferenceContext:<br/>route to local backend"]
+    CONNECT -->|Other host| OPA["OPA evaluation:<br/>network_policies"]
 ```
 
 ### Behavioral Trigger: L7 Inspection
@@ -600,7 +591,7 @@ Regardless of network mode, certain socket domains are always blocked:
 | `AF_BLUETOOTH` | 31       | Prevents Bluetooth access                                                       |
 | `AF_VSOCK`     | 40       | Prevents VM socket communication                                                |
 
-In **block mode**, `AF_INET` (2) and `AF_INET6` (10) are also blocked, preventing all TCP/UDP networking.
+In proxy mode (which is always active), `AF_INET` (2) and `AF_INET6` (10) are allowed so the sandbox process can reach the proxy.
 
 The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs`.
 
@@ -776,7 +767,9 @@ Functions in `crates/navigator-sandbox/src/proxy.rs` implement the SSRF checks:
 
 ```mermaid
 flowchart TD
-    A[CONNECT request received] --> D[OPA policy evaluation]
+    A[CONNECT request received] --> B{inference.local?}
+    B -- Yes --> C["InferenceContext: route locally"]
+    B -- No --> D[OPA policy evaluation]
     D --> E{Allowed?}
     E -- No --> F["403 Forbidden"]
     E -- Yes --> G{allowed_ips on endpoint?}
@@ -977,9 +970,6 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 
-inference:
-  allowed_routes:
-    - local
 ```
 
 ---
@@ -994,7 +984,6 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `SandboxPolicy`     | `landlock`                                                          | `landlock`                                  |
 | `SandboxPolicy`     | `process`                                                           | `process`                                   |
 | `SandboxPolicy`     | `network_policies`                                                  | `network_policies`                          |
-| `SandboxPolicy`     | `inference`                                                         | `inference`                                 |
 | `FilesystemPolicy`  | `include_workdir`                                                   | `filesystem_policy.include_workdir`         |
 | `FilesystemPolicy`  | `read_only`                                                         | `filesystem_policy.read_only`               |
 | `FilesystemPolicy`  | `read_write`                                                        | `filesystem_policy.read_write`              |
@@ -1007,7 +996,6 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `NetworkEndpoint`   | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules`, `allowed_ips` | Same field names                            |
 | `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
-| `InferencePolicy`   | `allowed_routes`                                                    | `inference.allowed_routes`                  |
 
 The conversion is performed in `crates/navigator-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
 
@@ -1035,6 +1023,7 @@ The OPA engine evaluates two categories of rules:
 | Rule                      | Signature                                                                                                         | Returns                                                                                       |
 | ------------------------- | ----------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------- |
 | `allow_network`           | `input.network.host`, `input.network.port`, `input.exec.path`, `input.exec.ancestors`, `input.exec.cmdline_paths` | `true` if any policy matches both endpoint and binary                                         |
+| `network_action`          | Same input                                                                                                        | `"allow"` if endpoint + binary matched, `"deny"` otherwise                                    |
 | `deny_reason`             | Same input                                                                                                        | Human-readable string explaining why access was denied                                        |
 | `matched_network_policy`  | Same input                                                                                                        | Name of the matched policy (for audit logging)                                                |
 | `matched_endpoint_config` | Same input                                                                                                        | Raw endpoint object for L7 config extraction (returned if endpoint has `protocol` or `allowed_ips` field) |
@@ -1117,4 +1106,5 @@ An empty `sources`/`log_sources` list means no source filtering (all sources pas
 
 - [Sandbox Architecture](sandbox.md) -- Full sandbox lifecycle, enforcement mechanisms, and component interaction
 - [Gateway Architecture](gateway.md) -- How the gateway stores and delivers policies via gRPC
+- [Inference Routing](inference-routing.md) -- How `inference.local` requests are routed to model backends
 - [Overview](README.md) -- System-level context for how policies fit into the platform

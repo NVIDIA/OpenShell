@@ -28,6 +28,10 @@ nemoclaw
 │   ├── status
 │   ├── use <name>
 │   ├── list
+│   ├── inference
+│   │   ├── set --provider --model
+│   │   ├── update [--provider] [--model]
+│   │   └── get
 │   └── admin
 │       ├── deploy [opts]
 │       ├── stop [opts]
@@ -59,11 +63,6 @@ nemoclaw
 │   ├── list [opts]
 │   ├── update <name> --type [opts]
 │   └── delete <name>...
-├── inference
-│   ├── create [opts]
-│   ├── update <name> [opts]
-│   ├── delete <name>...
-│   └── list [opts]
 ├── term
 ├── completions <shell>
 └── ssh-proxy [opts]
@@ -302,38 +301,29 @@ Delete one or more providers by name.
 
 ---
 
-## Inference Commands
+## Cluster Inference Commands
 
-### `nemoclaw inference create`
+### `nemoclaw cluster inference set`
 
-Create an inference route. Auto-detects supported protocols if `--protocol` is omitted.
-
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--name <NAME>` | auto-generated | Route name |
-| `--routing-hint <HINT>` | -- | Routing hint (required) |
-| `--base-url <URL>` | -- | Inference endpoint base URL (required) |
-| `--protocol <PROTO>` | auto-detected | Protocol(s): `openai_chat_completions`, `openai_completions`, `anthropic_messages`. Repeatable. |
-| `--api-key <KEY>` | `""` | API key for the endpoint |
-| `--model-id <ID>` | -- | Model identifier (required) |
-| `--disabled` | false | Create in disabled state |
-
-### `nemoclaw inference update <name>`
-
-Update an existing inference route. Same flags as `create`.
-
-### `nemoclaw inference delete <NAME>...`
-
-Delete inference routes by name.
-
-### `nemoclaw inference list`
-
-List inference routes.
+Configure the managed cluster inference route used by `inference.local`. Both flags are required.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--limit <N>` | 100 | Max routes |
-| `--offset <N>` | 0 | Pagination offset |
+| `--provider <NAME>` | -- | Provider record name (required) |
+| `--model <ID>` | -- | Model identifier to use for generation requests (required) |
+
+### `nemoclaw cluster inference update`
+
+Partially update the cluster inference configuration. Fetches the current config and applies only the provided overrides. At least one flag is required.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--provider <NAME>` | unchanged | Provider record name |
+| `--model <ID>` | unchanged | Model identifier |
+
+### `nemoclaw cluster inference get`
+
+Show the current cluster inference configuration.
 
 ---
 

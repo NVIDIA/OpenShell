@@ -17,32 +17,6 @@ message SandboxPolicy {
   ProcessPolicy process = 4;
   // Network access policies keyed by name (e.g. "claude_code", "gitlab").
   map<string, NetworkPolicyRule> network_policies = 5;
-  // Inference access policy.
-  InferencePolicy inference = 6;
-}
-
-// Inference access policy.
-message InferencePolicy {
-  // Which routing hints this sandbox is allowed to use.
-  // Matched against InferenceRouteSpec.routing_hint, NOT InferenceRoute.name.
-  // e.g. ["local"] for private-only, ["local", "frontier"] for full access.
-  // Empty means no inference allowed.
-  repeated string allowed_routes = 1;
-  // API patterns to detect inference requests at the proxy layer.
-  // If empty, built-in defaults (OpenAI chat/completions) are used.
-  repeated InferenceApiPattern api_patterns = 2;
-}
-
-// Pattern for detecting inference API requests at the proxy layer.
-message InferenceApiPattern {
-  // HTTP method (e.g. "POST").
-  string method = 1;
-  // Path glob pattern (e.g. "/v1/chat/completions").
-  string path_glob = 2;
-  // Source protocol identifier (e.g. "openai_chat_completions").
-  string protocol = 3;
-  // Human-readable kind (e.g. "chat_completion").
-  string kind = 4;
 }
 
 // Filesystem access policy.

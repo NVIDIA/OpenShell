@@ -1,7 +1,7 @@
 # Arch Doc Writer Memory
 
 ## Project Structure
-- Crates: `navigator-cli`, `navigator-server`, `navigator-sandbox`, `navigator-bootstrap`, `navigator-core`, `navigator-providers`, `navigator-router`
+- Crates: `navigator-cli`, `navigator-server`, `navigator-sandbox`, `navigator-bootstrap`, `navigator-core`, `navigator-providers`, `navigator-router`, `navigator-policy`
 - CLI entry: `crates/navigator-cli/src/main.rs` (clap parser + dispatch)
 - CLI logic: `crates/navigator-cli/src/run.rs` (all command implementations)
 - Sandbox entry: `crates/navigator-sandbox/src/lib.rs` (`run_sandbox()`)
@@ -9,12 +9,13 @@
 - Identity cache: `crates/navigator-sandbox/src/identity.rs` (SHA256 TOFU, uses Mutex<HashMap> NOT DashMap)
 - L7 inspection: `crates/navigator-sandbox/src/l7/` (mod.rs, tls.rs, relay.rs, rest.rs, provider.rs, inference.rs)
 - Proxy: `crates/navigator-sandbox/src/proxy.rs`
+- Policy crate: `crates/navigator-policy/src/lib.rs` (YAML<->proto conversion, validation, restrictive default)
 - Server multiplex: `crates/navigator-server/src/multiplex.rs`
 - SSH tunnel: `crates/navigator-server/src/ssh_tunnel.rs`
 - Sandbox SSH server: `crates/navigator-sandbox/src/ssh.rs`
 - Providers: `crates/navigator-providers/src/providers/` (per-provider modules)
 - Bootstrap: `crates/navigator-bootstrap/src/lib.rs` (cluster lifecycle)
-- Proto files: `proto/` directory (navigator.proto, sandbox.proto, datamodel.proto)
+- Proto files: `proto/` directory (navigator.proto, sandbox.proto, datamodel.proto, inference.proto)
 
 ## Architecture Docs
 - Files renamed from numbered prefix format to descriptive names (e.g., `2 - server-architecture.md` -> `gateway-architecture.md`)
@@ -24,7 +25,9 @@
 
 ## Key Patterns
 - OPA baked-in rules: `include_str!("../data/sandbox-policy.rego")` in opa.rs
-- Policy loading: gRPC mode (NAVIGATOR_SANDBOX_ID + NAVIGATOR_ENDPOINT) or file mode (--policy-rules + --policy-data)
+- Policy loading: gRPC mode (NEMOCLAW_SANDBOX_ID + NEMOCLAW_ENDPOINT) or file mode (--policy-rules + --policy-data)
+- Env vars: sandbox uses NEMOCLAW_* prefix (e.g., NEMOCLAW_SANDBOX_ID, NEMOCLAW_ENDPOINT, NEMOCLAW_POLICY_RULES)
+- CLI flag: `--navigator-endpoint` (NOT `--nemoclaw-endpoint`)
 - Provider env injection: both entrypoint process (tokio Command) and SSH shell (std Command)
 - Cluster bootstrap: `sandbox_create_with_bootstrap()` auto-deploys when no cluster exists (main.rs ~line 632)
 - CLI cluster resolution: --cluster flag > NAVIGATOR_CLUSTER env > active cluster file
@@ -41,8 +44,9 @@
 
 ## Server Crate Details
 - Two gRPC services: Navigator (grpc.rs) and Inference (inference.rs), multiplexed via GrpcRouter by URI path
-- Gateway is control-plane only for inference: route CRUD + GetSandboxInferenceBundle
-- GetSandboxInferenceBundle: returns SandboxResolvedRoute list + revision hash + generated_at_ms for a sandbox_id
+- Gateway is control-plane only for inference: SetClusterInference + GetClusterInference + GetInferenceBundle
+- GetInferenceBundle: resolves managed route from provider record at request time, returns ResolvedRoute list + revision hash + generated_at_ms
+- SetClusterInference: takes provider_name + model_id, stores only references (endpoint/key/protocols resolved at bundle time)
 - Persistence: single `objects` table, protobuf payloads, Store enum dispatches SQLite vs Postgres by URL prefix
 - Persistence CRUD: upsert ON CONFLICT (id) not (object_type, id); list ORDER BY created_at_ms ASC, name ASC (not id!)
 - --db-url has no code default; Helm values.yaml sets `sqlite:/var/navigator/navigator.db`
@@ -83,10 +87,10 @@
 - Poll loop: `run_policy_poll_loop()` in lib.rs, spawned after child process, gRPC mode only
 - `OpaEngine::reload_from_proto()`: reuses `from_proto()` pipeline, atomically swaps inner engine, LKG on failure
 - `CachedNavigatorClient` in grpc_client.rs: persistent mTLS channel for poll + status report (mirrors CachedInferenceClient)
-- Dynamic domains: network_policies, inference (OPA engine swap). Static domains: filesystem, landlock, process (pre_exec, immutable)
+- Dynamic domains: network_policies only (inference removed from policy). Static domains: filesystem, landlock, process (pre_exec, immutable)
 - Server-side: `UpdateSandboxPolicy` RPC rejects changes to static fields or network mode changes
 - Server-side validation: `validate_static_fields_unchanged()` + `validate_network_mode_unchanged()` in grpc.rs
-- Poll interval: `NAVIGATOR_POLICY_POLL_INTERVAL_SECS` env var (default 30), no CLI flag
+- Poll interval: `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` env var (default 30), no CLI flag
 - Version tracking: monotonic i64 per sandbox, `GetSandboxPolicyResponse` has version + policy_hash
 - Version 1 backfill: lazy on first `GetSandboxPolicy` from spec.policy if no policy_revisions row exists
 - `supersede_pending_policies()`: marks older pending revisions as superseded when new version persisted
@@ -99,22 +103,34 @@
 - CLI: `sandbox_policy_set()` in run.rs (~line 2901): loads YAML, calls UpdateSandboxPolicy, optionally polls for status
 - CLI: `sandbox_policy_get()` in run.rs (~line 3015): supports --rev N (version=0 means latest) and --full (YAML output via policy_to_yaml)
 - CLI: `sandbox_logs()` in run.rs (~line 3124): --source (all/gateway/sandbox) and --level (error/warn/info/debug/trace) filters
-- Deterministic hashing: `deterministic_policy_hash()` in grpc.rs (~line 1133): sorts network_policies by key, hashes fields individually
+- Deterministic hashing: `deterministic_policy_hash()` in grpc.rs (~line 1222): sorts network_policies by key, hashes fields individually, NO inference field
 - Idempotent UpdateSandboxPolicy: compares hash of new policy to latest stored hash, returns existing version if match
-- `policy_to_yaml()` in run.rs (~line 1623): converts proto to YAML via `PolicyYaml` struct (uses BTreeMap for ordered keys)
-- `policy_record_to_revision()` in grpc.rs (~line 1234): `include_policy` param controls whether full proto is included
+- `policy_to_yaml()` in run.rs: converts proto to YAML via navigator_policy::serialize_sandbox_policy (moved to navigator-policy crate)
+- `policy_record_to_revision()` in grpc.rs (~line 1334): `include_policy` param controls whether full proto is included
 - Server-side log filtering: `source_matches()` + `level_matches()` in grpc.rs, applied in both get_sandbox_logs and watch_sandbox
-- Standalone `proxy_inference()` was removed; proxy uses `CachedInferenceClient` via `InferenceContext.grpc_client` (OnceCell)
+- Standalone `proxy_inference()` was removed; inference handled in-sandbox by navigator-router
+- Provider types: claude, codex, opencode, generic, openai, anthropic, nvidia, gitlab, github, outlook
 
 ## Policy System Details
-- YAML data file top-level keys: filesystem_policy, landlock, process, network_policies, inference
+- YAML data file top-level keys: filesystem_policy, landlock, process, network_policies (NO inference key -- removed)
+- Proto SandboxPolicy fields: version, filesystem, landlock, process, network_policies (NO inference field)
 - Proto message field `filesystem` maps to YAML key `filesystem_policy` (different names!)
-- Behavioral trigger: network_policies non-empty -> proxy mode, empty -> block mode (seccomp blocks AF_INET/AF_INET6)
+- IMPORTANT: Sandbox always runs in Proxy mode. NetworkMode::Block exists as enum variant but is NEVER set.
+- Both file mode and gRPC mode set NetworkMode::Proxy unconditionally (see load_policy() in lib.rs and TryFrom in policy.rs)
+- Reason: proxy always needed so inference.local is addressable + all egress evaluated by OPA
+- OPA two-action model: Allow, Deny (NetworkAction in opa.rs). InspectForInference was REMOVED.
+- Rego network_action rule: "allow" or "deny" only (no "inspect_for_inference")
 - Behavioral trigger: endpoint `protocol` field -> L7 inspection; absent -> L4 raw copy_bidirectional
 - Behavioral trigger: `tls: terminate` -> MITM TLS with ephemeral CA; requires `protocol` to also be set
 - Behavioral trigger: `enforcement: enforce` -> deny at proxy; `audit` (default) -> log + forward
 - Access presets: read-only (GET/HEAD/OPTIONS), read-write (+POST/PUT/PATCH), full (*/*)
 - Validation: rules+access mutual exclusion, protocol requires rules/access, sql+enforce blocked, empty rules rejected
+- YAML policy parsing moved to navigator-policy crate (parse_sandbox_policy, serialize_sandbox_policy)
+- PolicyFile uses deny_unknown_fields for strict YAML parsing
+- restrictive_default_policy() in navigator-policy: no network policies, sandbox user, best_effort landlock
+- CONTAINER_POLICY_PATH: /etc/navigator/policy.yaml (well-known path for container-shipped policy)
+- clear_process_identity(): clears run_as_user/run_as_group for custom images
+- Policy safety validation: validate_sandbox_policy() checks root identity, path traversal, relative paths, overly broad paths, max 256 paths, max 4096 chars
 - Identity binding: /proc/net/tcp -> inode -> PID -> /proc/PID/exe + ancestors + cmdline, SHA256 TOFU cache
 - Network namespace: 10.200.0.1 (host/proxy) <-> 10.200.0.2 (sandbox), port 3128 default
 - Enforcement order in pre_exec: setns -> drop_privileges -> landlock -> seccomp
@@ -132,11 +148,14 @@
 
 ## Inference Routing Details
 - Sandbox-local execution via navigator-router crate
-- OPA three-action model: Allow, InspectForInference, Deny (`NetworkAction` in opa.rs)
-- InferenceContext: Router + patterns + `Arc<RwLock<Vec<ResolvedRoute>>>` route cache
+- InferenceContext in proxy.rs: Router + patterns + `Arc<RwLock<Vec<ResolvedRoute>>>` route cache
 - Route sources: `--inference-routes` YAML file (standalone) > cluster bundle via gRPC; empty routes gracefully disable
 - Cluster bundle refreshed every ROUTE_REFRESH_INTERVAL_SECS (30s)
-- Patterns: POST /v1/chat/completions, /v1/completions, /v1/responses, /v1/messages
+- Patterns: POST /v1/chat/completions, /v1/completions, /v1/responses, /v1/messages; GET /v1/models, /v1/models/*
+- inference.local CONNECT intercepted BEFORE OPA evaluation in proxy
+- InferenceProviderProfile in navigator-core/src/inference.rs: centralized provider metadata
+- proxy.rs: ONLY CONNECT to inference.local is handled; non-CONNECT requests get 403 for ALL hosts
+- Buffer: INITIAL_INFERENCE_BUF=64KiB, MAX_INFERENCE_BUF=10MiB; grows by doubling
 - Dev sandbox: `mise run sandbox -e VAR_NAME` forwards host env vars; NVIDIA_API_KEY always passed
 
 ## Log Streaming Details
@@ -162,4 +181,4 @@
 ## Naming Conventions
 - The project name "Navigator" appears in code but docs should use generic terms per user preference
 - CLI binary: `navigator` (aliased as `nav` in dev via mise)
-- Provider types: claude, codex, opencode, openclaw, generic, nvidia, gitlab, github, outlook
+- Provider types: claude, codex, opencode, generic, openai, anthropic, nvidia, gitlab, github, outlook (see ProviderRegistry::new())

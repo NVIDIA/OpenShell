@@ -4,6 +4,8 @@
 use serde::Deserialize;
 use std::path::Path;
 
+pub use navigator_core::inference::AuthHeader;
+
 use crate::RouterError;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -13,9 +15,11 @@ pub struct RouterConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct RouteConfig {
-    pub routing_hint: String,
+    pub name: String,
     pub endpoint: String,
     pub model: String,
+    #[serde(default)]
+    pub provider_type: Option<String>,
     #[serde(default)]
     pub protocols: Vec<String>,
     #[serde(default)]
@@ -24,23 +28,32 @@ pub struct RouteConfig {
     pub api_key_env: Option<String>,
 }
 
+/// A fully-resolved route ready for the router to forward requests.
+///
+/// The router is provider-agnostic — all provider-specific decisions
+/// (auth header style, default headers, base URL) are made by the
+/// caller during resolution.
 #[derive(Clone)]
 pub struct ResolvedRoute {
-    pub routing_hint: String,
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
     pub protocols: Vec<String>,
+    /// How to inject the API key on outgoing requests.
+    pub auth: AuthHeader,
+    /// Extra headers injected on every request (e.g. `anthropic-version`).
+    pub default_headers: Vec<(String, String)>,
 }
 
 impl std::fmt::Debug for ResolvedRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedRoute")
-            .field("routing_hint", &self.routing_hint)
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
             .field("api_key", &"[REDACTED]")
             .field("protocols", &self.protocols)
+            .field("auth", &self.auth)
+            .field("default_headers", &self.default_headers)
             .finish()
     }
 }
@@ -84,13 +97,13 @@ impl RouteConfig {
             return std::env::var(env_var).map_err(|_| {
                 RouterError::Internal(format!(
                     "environment variable {env_var} not set for route '{}'",
-                    self.routing_hint
+                    self.name
                 ))
             });
         }
         Err(RouterError::Internal(format!(
             "route '{}' has neither api_key nor api_key_env",
-            self.routing_hint
+            self.name
         )))
     }
 
@@ -99,18 +112,29 @@ impl RouteConfig {
         if protocols.is_empty() {
             return Err(RouterError::Internal(format!(
                 "route '{}' has no protocols",
-                self.routing_hint
+                self.name
             )));
         }
 
+        let (auth, default_headers) = auth_from_provider_type(self.provider_type.as_deref());
+
         Ok(ResolvedRoute {
-            routing_hint: self.routing_hint.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             api_key: self.resolve_api_key()?,
             protocols,
+            auth,
+            default_headers,
         })
     }
+}
+
+/// Derive auth header style and default headers from a provider type string.
+///
+/// Delegates to [`navigator_core::inference::auth_for_provider_type`] which
+/// uses the centralized `InferenceProviderProfile` registry.
+fn auth_from_provider_type(provider_type: Option<&str>) -> (AuthHeader, Vec<(String, String)>) {
+    navigator_core::inference::auth_for_provider_type(provider_type.unwrap_or(""))
 }
 
 #[cfg(test)]
@@ -122,12 +146,12 @@ mod tests {
     fn load_from_file_valid_yaml_round_trip() {
         let yaml = r#"
 routes:
-  - routing_hint: local
+  - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
     api_key: sk-test-key
-  - routing_hint: frontier
+  - name: inference.local
     endpoint: https://api.openai.com/v1
     model: gpt-4o
     protocols: [openai_chat_completions, anthropic_messages]
@@ -138,8 +162,8 @@ routes:
 
         let config = RouterConfig::load_from_file(f.path()).unwrap();
         assert_eq!(config.routes.len(), 2);
-        assert_eq!(config.routes[0].routing_hint, "local");
-        assert_eq!(config.routes[1].routing_hint, "frontier");
+        assert_eq!(config.routes[0].name, "inference.local");
+        assert_eq!(config.routes[1].name, "inference.local");
 
         let resolved = config.resolve_routes().unwrap();
         assert_eq!(resolved.len(), 2);
@@ -167,7 +191,7 @@ routes:
     fn load_from_file_missing_api_key_returns_error() {
         let yaml = r#"
 routes:
-  - routing_hint: local
+  - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
@@ -191,7 +215,7 @@ routes:
     fn load_from_file_api_key_env_resolves_from_environment() {
         let yaml = r#"
 routes:
-  - routing_hint: local
+  - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
@@ -221,11 +245,12 @@ routes:
     #[test]
     fn resolved_route_debug_redacts_api_key() {
         let route = ResolvedRoute {
-            routing_hint: "local".to_string(),
             endpoint: "https://api.example.com/v1".to_string(),
             model: "test-model".to_string(),
             api_key: "sk-super-secret-key-12345".to_string(),
             protocols: vec!["openai_chat_completions".to_string()],
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
         };
         let debug_output = format!("{route:?}");
         assert!(
@@ -236,5 +261,26 @@ routes:
             debug_output.contains("[REDACTED]"),
             "Debug output should show [REDACTED] for api_key: {debug_output}"
         );
+    }
+
+    #[test]
+    fn auth_from_anthropic_provider_uses_custom_header() {
+        let (auth, headers) = auth_from_provider_type(Some("anthropic"));
+        assert_eq!(auth, AuthHeader::Custom("x-api-key"));
+        assert!(headers.iter().any(|(k, _)| k == "anthropic-version"));
+    }
+
+    #[test]
+    fn auth_from_openai_provider_uses_bearer() {
+        let (auth, headers) = auth_from_provider_type(Some("openai"));
+        assert_eq!(auth, AuthHeader::Bearer);
+        assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn auth_from_none_defaults_to_bearer() {
+        let (auth, headers) = auth_from_provider_type(None);
+        assert_eq!(auth, AuthHeader::Bearer);
+        assert!(headers.is_empty());
     }
 }

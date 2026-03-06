@@ -754,7 +754,7 @@ An exact IP is treated as `/32` — only that specific address is permitted.
       - { path: /usr/bin/curl }
 ```
 
-The agent uses `StrReplace` to insert after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`, `inference`) are untouched.
+The agent uses `StrReplace` to insert after the last existing policy in the `network_policies` block. All other sections (`filesystem_policy`, `landlock`, `process`) are untouched.
 
 ---
 
@@ -866,13 +866,9 @@ network_policies:
         access: full
     binaries:
       - { path: /usr/local/bin/claude }
-
-inference:
-  allowed_routes:
-    - local
 ```
 
-The agent notes that `filesystem_policy`, `landlock`, `process`, and `inference` are sensible defaults that may need adjustment.
+The agent notes that `filesystem_policy`, `landlock`, and `process` are sensible defaults that may need adjustment, and that cluster inference is configured separately via `nemoclaw cluster inference set/get` rather than an `inference` policy block.
 
 ---
 

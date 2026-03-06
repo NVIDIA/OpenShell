@@ -3,7 +3,7 @@
 
 from openai import OpenAI
 
-client = OpenAI(api_key="dummy")
+client = OpenAI(api_key="dummy", base_url="https://inference.local/v1")
 
 response = client.chat.completions.create(
     model="router",

@@ -3,10 +3,9 @@
 
 //! Inference API pattern detection and gateway rerouting.
 //!
-//! When the proxy intercepts a connection (action = `InspectForInference`),
-//! this module detects whether the HTTP request is a known inference API call
-//! and reroutes it through the gateway's `ProxyInference` gRPC endpoint
-//! instead of forwarding to the original upstream.
+//! For requests targeting `inference.local`, this module detects whether the
+//! HTTP request is a known inference API call and routes it through the local
+//! sandbox router.
 
 /// An inference API pattern for detecting inference calls in intercepted traffic.
 #[derive(Debug, Clone)]
@@ -44,6 +43,18 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             protocol: "anthropic_messages".to_string(),
             kind: "messages".to_string(),
         },
+        InferenceApiPattern {
+            method: "GET".to_string(),
+            path_glob: "/v1/models".to_string(),
+            protocol: "model_discovery".to_string(),
+            kind: "models_list".to_string(),
+        },
+        InferenceApiPattern {
+            method: "GET".to_string(),
+            path_glob: "/v1/models/*".to_string(),
+            protocol: "model_discovery".to_string(),
+            kind: "models_get".to_string(),
+        },
     ]
 }
 
@@ -55,9 +66,20 @@ pub fn detect_inference_pattern<'a>(
 ) -> Option<&'a InferenceApiPattern> {
     // Strip query string for matching
     let path_only = path.split('?').next().unwrap_or(path);
-    patterns
-        .iter()
-        .find(|p| method.eq_ignore_ascii_case(&p.method) && path_only == p.path_glob)
+    patterns.iter().find(|p| {
+        if !method.eq_ignore_ascii_case(&p.method) {
+            return false;
+        }
+
+        if let Some(prefix) = p.path_glob.strip_suffix("/*") {
+            return path_only == prefix
+                || path_only
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.starts_with('/'));
+        }
+
+        path_only == p.path_glob
+    })
 }
 
 /// A parsed HTTP request from the intercepted tunnel.
@@ -273,10 +295,19 @@ mod tests {
     }
 
     #[test]
-    fn no_match_for_unknown_path() {
+    fn detect_get_models() {
         let patterns = default_patterns();
-        let result = detect_inference_pattern("POST", "/v1/models", &patterns);
-        assert!(result.is_none());
+        let result = detect_inference_pattern("GET", "/v1/models", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "model_discovery");
+    }
+
+    #[test]
+    fn detect_get_model_details() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("GET", "/v1/models/gpt-4.1", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "model_discovery");
     }
 
     #[test]

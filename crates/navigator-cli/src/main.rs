@@ -130,12 +130,6 @@ enum Commands {
         command: SandboxCommands,
     },
 
-    /// Manage inference configuration.
-    Inference {
-        #[command(subcommand)]
-        command: InferenceCommands,
-    },
-
     /// Manage provider configuration.
     Provider {
         #[command(subcommand)]
@@ -259,6 +253,8 @@ enum CliProviderType {
     Opencode,
     Codex,
     Generic,
+    Openai,
+    Anthropic,
     Nvidia,
     Gitlab,
     Github,
@@ -272,6 +268,8 @@ impl CliProviderType {
             Self::Opencode => "opencode",
             Self::Codex => "codex",
             Self::Generic => "generic",
+            Self::Openai => "openai",
+            Self::Anthropic => "anthropic",
             Self::Nvidia => "nvidia",
             Self::Gitlab => "gitlab",
             Self::Github => "github",
@@ -387,6 +385,40 @@ enum ClusterCommands {
         #[command(subcommand)]
         command: ClusterAdminCommands,
     },
+
+    /// Manage cluster-level inference configuration.
+    Inference {
+        #[command(subcommand)]
+        command: ClusterInferenceCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterInferenceCommands {
+    /// Set cluster-level inference provider and model.
+    Set {
+        /// Provider name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        /// Model identifier to force for generation calls.
+        #[arg(long)]
+        model: String,
+    },
+
+    /// Update cluster-level inference configuration (partial update).
+    Update {
+        /// Provider name (unchanged if omitted).
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: Option<String>,
+
+        /// Model identifier (unchanged if omitted).
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// Get cluster-level inference provider and model.
+    Get,
 }
 
 #[derive(Subcommand, Debug)]
@@ -746,69 +778,6 @@ enum ForwardCommands {
     List,
 }
 
-#[derive(Subcommand, Debug)]
-enum InferenceCommands {
-    /// Create an inference route.
-    Create {
-        /// Optional route name (auto-generated if omitted).
-        #[arg(long)]
-        name: Option<String>,
-        #[arg(long)]
-        routing_hint: String,
-        #[arg(long)]
-        base_url: String,
-        /// Supported protocol(s). Repeat flag or pass comma-separated values.
-        ///
-        /// If omitted, protocols are auto-detected by probing the base URL.
-        #[arg(long = "protocol", value_delimiter = ',')]
-        protocols: Vec<String>,
-        /// API key for the inference endpoint. Defaults to empty (for local models).
-        #[arg(long, default_value = "")]
-        api_key: String,
-        #[arg(long)]
-        model_id: String,
-        #[arg(long)]
-        disabled: bool,
-    },
-
-    /// Update an inference route.
-    Update {
-        /// Route name.
-        name: String,
-        #[arg(long)]
-        routing_hint: String,
-        #[arg(long)]
-        base_url: String,
-        /// Supported protocol(s). Repeat flag or pass comma-separated values.
-        ///
-        /// If omitted, protocols are auto-detected by probing the base URL.
-        #[arg(long = "protocol", value_delimiter = ',')]
-        protocols: Vec<String>,
-        /// API key for the inference endpoint. Defaults to empty (for local models).
-        #[arg(long, default_value = "")]
-        api_key: String,
-        #[arg(long)]
-        model_id: String,
-        #[arg(long)]
-        disabled: bool,
-    },
-
-    /// Delete inference routes.
-    Delete {
-        /// Route names.
-        #[arg(required = true, num_args = 1.., value_name = "NAME")]
-        names: Vec<String>,
-    },
-
-    /// List inference routes.
-    List {
-        #[arg(long, default_value_t = 100)]
-        limit: u32,
-        #[arg(long, default_value_t = 0)]
-        offset: u32,
-    },
-}
-
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install the rustls crypto provider before completion runs — completers may
@@ -918,6 +887,28 @@ async fn main() -> Result<()> {
                     )?;
                 }
             },
+            ClusterCommands::Inference { command } => {
+                let ctx = resolve_cluster(&cli.cluster)?;
+                let endpoint = &ctx.endpoint;
+                let tls = tls.with_cluster_name(&ctx.name);
+                match command {
+                    ClusterInferenceCommands::Set { provider, model } => {
+                        run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                    }
+                    ClusterInferenceCommands::Update { provider, model } => {
+                        run::cluster_inference_update(
+                            endpoint,
+                            provider.as_deref(),
+                            model.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ClusterInferenceCommands::Get => {
+                        run::cluster_inference_get(endpoint, &tls).await?;
+                    }
+                }
+            }
         },
         Some(Commands::Sandbox { command }) => {
             match command {
@@ -1167,64 +1158,6 @@ async fn main() -> Result<()> {
                             run::print_ssh_config(&ctx.name, &name);
                         }
                     }
-                }
-            }
-        }
-        Some(Commands::Inference { command }) => {
-            let ctx = resolve_cluster(&cli.cluster)?;
-            let endpoint = &ctx.endpoint;
-            let tls = tls.with_cluster_name(&ctx.name);
-
-            match command {
-                InferenceCommands::Create {
-                    name,
-                    routing_hint,
-                    base_url,
-                    protocols,
-                    api_key,
-                    model_id,
-                    disabled,
-                } => {
-                    run::inference_route_create(
-                        endpoint,
-                        name.as_deref(),
-                        &routing_hint,
-                        &base_url,
-                        &protocols,
-                        &api_key,
-                        &model_id,
-                        !disabled,
-                        &tls,
-                    )
-                    .await?;
-                }
-                InferenceCommands::Update {
-                    name,
-                    routing_hint,
-                    base_url,
-                    protocols,
-                    api_key,
-                    model_id,
-                    disabled,
-                } => {
-                    run::inference_route_update(
-                        endpoint,
-                        &name,
-                        &routing_hint,
-                        &base_url,
-                        &protocols,
-                        &api_key,
-                        &model_id,
-                        !disabled,
-                        &tls,
-                    )
-                    .await?;
-                }
-                InferenceCommands::Delete { names } => {
-                    run::inference_route_delete(endpoint, &names, &tls).await?;
-                }
-                InferenceCommands::List { limit, offset } => {
-                    run::inference_route_list(endpoint, limit, offset, &tls).await?;
                 }
             }
         }

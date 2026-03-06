@@ -99,21 +99,11 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
     type Error = miette::Report;
 
     fn try_from(proto: ProtoSandboxPolicy) -> Result<Self, Self::Error> {
-        // Derive network mode: use proxy mode when network policies exist
-        // OR inference routing is configured (inference needs the proxy to
-        // intercept and reroute connections). Otherwise block all network.
-        let has_network_policies = !proto.network_policies.is_empty();
-        let has_inference = proto
-            .inference
-            .as_ref()
-            .is_some_and(|inf| !inf.allowed_routes.is_empty());
-        let network = if has_network_policies || has_inference {
-            NetworkPolicy {
-                mode: NetworkMode::Proxy,
-                proxy: Some(ProxyPolicy { http_addr: None }),
-            }
-        } else {
-            NetworkPolicy::default()
+        // In cluster mode we always run with proxy networking so all egress
+        // can be evaluated by OPA and `inference.local` is always addressable.
+        let network = NetworkPolicy {
+            mode: NetworkMode::Proxy,
+            proxy: Some(ProxyPolicy { http_addr: None }),
         };
 
         Ok(Self {

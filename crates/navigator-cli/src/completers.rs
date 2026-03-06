@@ -118,37 +118,45 @@ where
 }
 
 #[cfg(test)]
-#[allow(unsafe_code)]
 mod tests {
     use super::*;
+    use temp_env::with_vars;
+
+    fn with_isolated_cli_env<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let tmp = tmp.to_string_lossy().into_owned();
+        with_vars(
+            [
+                ("XDG_CONFIG_HOME", Some(tmp.as_str())),
+                ("NEMOCLAW_CLUSTER", None::<&str>),
+            ],
+            f,
+        );
+    }
 
     #[test]
     fn cluster_completer_returns_empty_when_no_config() {
         let temp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only; tests run with --test-threads=1 or are isolated.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.path()) };
-        let result = complete_cluster_names(OsStr::new(""));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert!(result.is_empty());
+        with_isolated_cli_env(temp.path(), || {
+            let result = complete_cluster_names(OsStr::new(""));
+            assert!(result.is_empty());
+        });
     }
 
     #[test]
     fn sandbox_completer_returns_empty_when_no_active_cluster() {
-        unsafe { std::env::remove_var("NEMOCLAW_CLUSTER") };
         let temp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.path()) };
-        let result = complete_sandbox_names(OsStr::new(""));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert!(result.is_empty());
+        with_isolated_cli_env(temp.path(), || {
+            let result = complete_sandbox_names(OsStr::new(""));
+            assert!(result.is_empty());
+        });
     }
 
     #[test]
     fn provider_completer_returns_empty_when_no_active_cluster() {
-        unsafe { std::env::remove_var("NEMOCLAW_CLUSTER") };
         let temp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", temp.path()) };
-        let result = complete_provider_names(OsStr::new(""));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert!(result.is_empty());
+        with_isolated_cli_env(temp.path(), || {
+            let result = complete_provider_names(OsStr::new(""));
+            assert!(result.is_empty());
+        });
     }
 }

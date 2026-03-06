@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Minimal sandbox policy fixture for OPA engine tests.
-# Covers the network policies, filesystem, process, and inference config
+# Covers the network policies, filesystem, and process config
 # exercised by opa.rs unit tests.
 
 version: 1
@@ -63,7 +63,3 @@ network_policies:
       - { host: gitlab.com, port: 443 }
     binaries:
       - { path: /usr/bin/glab }
-
-inference:
-  allowed_routes:
-    - local

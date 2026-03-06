@@ -15,8 +15,8 @@ use std::path::Path;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
-    self, FilesystemPolicy, InferenceApiPattern, L7Allow, L7Rule, LandlockPolicy, NetworkBinary,
-    NetworkEndpoint, NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
+    FilesystemPolicy, L7Allow, L7Rule, LandlockPolicy, NetworkBinary, NetworkEndpoint,
+    NetworkPolicyRule, ProcessPolicy, SandboxPolicy,
 };
 use serde::{Deserialize, Serialize};
 
@@ -28,8 +28,6 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 struct PolicyFile {
     version: u32,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inference: Option<InferenceDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     filesystem_policy: Option<FilesystemDef>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -65,28 +63,6 @@ struct ProcessDef {
     run_as_user: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     run_as_group: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InferenceDef {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    allowed_routes: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    api_patterns: Vec<InferenceApiPatternDef>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct InferenceApiPatternDef {
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    method: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    path_glob: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    protocol: String,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    kind: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -214,19 +190,6 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
             run_as_group: p.run_as_group,
         }),
         network_policies,
-        inference: raw.inference.map(|inf| proto::InferencePolicy {
-            allowed_routes: inf.allowed_routes,
-            api_patterns: inf
-                .api_patterns
-                .into_iter()
-                .map(|p| InferenceApiPattern {
-                    method: p.method,
-                    path_glob: p.path_glob,
-                    protocol: p.protocol,
-                    kind: p.kind,
-                })
-                .collect(),
-        }),
     }
 }
 
@@ -235,20 +198,6 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
 // ---------------------------------------------------------------------------
 
 fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
-    let inference = policy.inference.as_ref().map(|inf| InferenceDef {
-        allowed_routes: inf.allowed_routes.clone(),
-        api_patterns: inf
-            .api_patterns
-            .iter()
-            .map(|p| InferenceApiPatternDef {
-                method: p.method.clone(),
-                path_glob: p.path_glob.clone(),
-                protocol: p.protocol.clone(),
-                kind: p.kind.clone(),
-            })
-            .collect(),
-    });
-
     let filesystem_policy = policy.filesystem.as_ref().map(|fs| FilesystemDef {
         include_workdir: fs.include_workdir,
         read_only: fs.read_only.clone(),
@@ -318,7 +267,6 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
 
     PolicyFile {
         version: policy.version,
-        inference,
         filesystem_policy,
         landlock,
         process,
@@ -412,7 +360,6 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
             run_as_group: "sandbox".into(),
         }),
         network_policies: HashMap::new(),
-        inference: None,
     }
 }
 
@@ -689,35 +636,6 @@ network_policies:
         assert_eq!(proto2.network_policies["my_api"].name, "my-custom-api-name");
     }
 
-    /// Verify that `api_patterns` on inference survives the round-trip.
-    #[test]
-    fn round_trip_preserves_api_patterns() {
-        let yaml = r#"
-version: 1
-inference:
-  allowed_routes:
-    - local
-  api_patterns:
-    - method: POST
-      path_glob: "/v1/chat/completions"
-      protocol: openai_chat_completions
-      kind: chat_completion
-"#;
-        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
-        assert_eq!(proto1.inference.as_ref().unwrap().api_patterns.len(), 1);
-
-        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
-        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
-
-        let patterns1 = &proto1.inference.as_ref().unwrap().api_patterns;
-        let patterns2 = &proto2.inference.as_ref().unwrap().api_patterns;
-        assert_eq!(patterns1.len(), patterns2.len());
-        assert_eq!(patterns1[0].method, patterns2[0].method);
-        assert_eq!(patterns1[0].path_glob, patterns2[0].path_glob);
-        assert_eq!(patterns1[0].protocol, patterns2[0].protocol);
-        assert_eq!(patterns1[0].kind, patterns2[0].kind);
-    }
-
     #[test]
     fn restrictive_default_has_no_network_policies() {
         let policy = restrictive_default_policy();
@@ -725,12 +643,6 @@ inference:
             policy.network_policies.is_empty(),
             "restrictive default must block all network"
         );
-    }
-
-    #[test]
-    fn restrictive_default_has_no_inference() {
-        let policy = restrictive_default_policy();
-        assert!(policy.inference.is_none());
     }
 
     #[test]
@@ -780,7 +692,6 @@ inference:
         assert_eq!(policy.version, 1);
         assert!(policy.network_policies.is_empty());
         assert!(policy.filesystem.is_none());
-        assert!(policy.inference.is_none());
     }
 
     #[test]
@@ -919,7 +830,6 @@ network_policies:
             filesystem: None,
             landlock: None,
             network_policies: HashMap::new(),
-            inference: None,
         };
         assert!(validate_sandbox_policy(&policy).is_ok());
     }

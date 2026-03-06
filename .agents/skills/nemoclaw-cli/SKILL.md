@@ -436,46 +436,39 @@ nemoclaw sandbox delete work-session
 
 ---
 
-## Workflow 7: Inference Routing
+## Workflow 7: Cluster Inference
 
-Configure inference routes so sandboxes can access LLM endpoints.
+Configure the cluster's managed inference route for `inference.local`.
 
-### Create an inference route
+### Set cluster inference
 
-```bash
-nemoclaw inference create \
-  --routing-hint local \
-  --base-url https://my-llm.example.com \
-  --model-id my-model-v1 \
-  --api-key sk-abc123
-```
-
-If `--protocol` is omitted, the CLI auto-detects by probing the endpoint.
-
-### List and manage routes
+First ensure the provider record exists:
 
 ```bash
-nemoclaw inference list
-nemoclaw inference update my-route --routing-hint local --base-url https://new-url.example.com --model-id my-model-v2
-nemoclaw inference delete my-route
+nemoclaw provider list
 ```
 
-### Connect sandbox to inference
-
-Ensure the sandbox policy allows the routing hint:
-
-```yaml
-# In the policy YAML
-inference:
-  allowed_routes:
-    - local
-```
-
-Then create the sandbox with the policy:
+Then point cluster inference at that provider and model:
 
 ```bash
-nemoclaw sandbox create --policy ./policy-with-inference.yaml -- claude
+nemoclaw cluster inference set \
+  --provider nvidia \
+  --model nvidia/nemotron-3-nano-30b-a3b
 ```
+
+This updates the cluster-managed `inference.local` route. There is no per-route create/list/update/delete workflow for sandbox inference.
+
+### Inspect current inference config
+
+```bash
+nemoclaw cluster inference get
+```
+
+### How sandboxes use it
+
+- Agents send HTTPS requests to `inference.local`.
+- The sandbox intercepts those requests locally and routes them through the cluster inference config.
+- Sandbox policy is separate from cluster inference configuration.
 
 ---
 
@@ -553,7 +546,8 @@ $ nemoclaw sandbox sync --help
 | Forward a port | `nemoclaw sandbox forward start <port> <name> -d` |
 | Create provider | `nemoclaw provider create --name N --type T --from-existing` |
 | List providers | `nemoclaw provider list` |
-| Create inference route | `nemoclaw inference create --routing-hint H --base-url U --model-id M` |
+| Configure cluster inference | `nemoclaw cluster inference set --provider P --model M` |
+| View cluster inference | `nemoclaw cluster inference get` |
 | Delete sandbox | `nemoclaw sandbox delete <name>` |
 | Destroy cluster | `nemoclaw cluster admin destroy` |
 | Self-teach any command | `nemoclaw <group> <cmd> --help` |

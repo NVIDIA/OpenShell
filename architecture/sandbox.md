@@ -14,7 +14,7 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 | `policy.rs` | `SandboxPolicy`, `NetworkPolicy`, `ProxyPolicy`, `LandlockPolicy`, `ProcessPolicy` structs and proto conversions |
 | `opa.rs` | OPA/Rego policy engine using `regorus` crate -- network evaluation, sandbox config queries, L7 endpoint queries |
 | `process.rs` | `ProcessHandle` for spawning child processes, privilege dropping, signal handling |
-| `proxy.rs` | HTTP CONNECT proxy with OPA evaluation, process-identity binding, and L7 dispatch |
+| `proxy.rs` | HTTP CONNECT proxy with OPA evaluation, process-identity binding, inference interception, and L7 dispatch |
 | `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
@@ -25,7 +25,7 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 | `sandbox/linux/seccomp.rs` | Syscall filtering via BPF on `SYS_socket` |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, cleanup on drop |
 | `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion |
-| `l7/inference.rs` | Inference API pattern detection (`InferenceApiPattern`, `default_patterns()`, `detect_inference_pattern()`) and HTTP request/response parsing for intercepted inference connections |
+| `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers |
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
@@ -74,7 +74,7 @@ flowchart TD
 
 1. **Policy loading** (`load_policy()`):
    - Priority 1: `--policy-rules` + `--policy-data` provided -- load OPA engine from local Rego file and YAML data file via `OpaEngine::from_files()`. Query `query_sandbox_config()` for filesystem/landlock/process settings. Network mode forced to `Proxy`.
-   - Priority 2: `--sandbox-id` + `--navigator-endpoint` provided -- fetch typed proto policy via `grpc_client::fetch_policy()`. If the proto contains `network_policies` OR has non-empty `inference.allowed_routes`, create OPA engine via `OpaEngine::from_proto()` using baked-in Rego rules. Convert proto to `SandboxPolicy` via `TryFrom`.
+   - Priority 2: `--sandbox-id` + `--navigator-endpoint` provided -- fetch typed proto policy via `grpc_client::fetch_policy()`. Create OPA engine via `OpaEngine::from_proto()` using baked-in Rego rules. Convert proto to `SandboxPolicy` via `TryFrom`, which always forces `NetworkMode::Proxy` so that all egress passes through the proxy and the `inference.local` virtual host is always addressable.
    - Neither present: return fatal error.
    - Output: `(SandboxPolicy, Option<Arc<OpaEngine>>)`
 
@@ -163,7 +163,7 @@ The network mode determines which enforcement mechanisms activate:
 | `Proxy` | Blocks `AF_NETLINK`, `AF_PACKET`, `AF_BLUETOOTH`, `AF_VSOCK` (allows `AF_INET`/`AF_INET6`) | Yes (Linux) | Yes | Controlled network via proxy + OPA |
 | `Allow` | No seccomp filter | No | No | Unrestricted network (seccomp skipped entirely) |
 
-In gRPC mode, the mode is derived from the proto: if `network_policies` is non-empty, mode is `Proxy`; otherwise `Block`. In file mode, the mode is always `Proxy` (the presence of `--policy-rules` implies network policy evaluation).
+In gRPC mode, the mode is always `Proxy`. The `SandboxPolicy::try_from()` conversion forces `NetworkMode::Proxy` unconditionally so that all egress passes through the proxy and the `inference.local` virtual host is always addressable. In file mode, the mode is also always `Proxy` (the presence of `--policy-rules` implies network policy evaluation).
 
 ### Policy loading modes
 
@@ -195,7 +195,7 @@ The Rego rules are compiled into the binary via `include_str!("../data/sandbox-p
 | Rule | Type | Purpose |
 |------|------|---------|
 | `allow_network` | bool | L4 allow/deny decision for a CONNECT request |
-| `network_action` | string | Tri-state routing decision: `"allow"`, `"inspect_for_inference"`, or `"deny"` |
+| `network_action` | string | Routing decision: `"allow"` or `"deny"` |
 | `deny_reason` | string | Human-readable deny reason |
 | `matched_network_policy` | string | Name of the matched policy rule |
 | `matched_endpoint_config` | object | Full endpoint config for L7 inspection lookup |
@@ -223,21 +223,9 @@ The inner `regorus::Engine` requires `&mut self` for evaluation, so access is se
 
 All loading methods run the same preprocessing pipeline: L7 validation (errors block startup, warnings are logged), then access preset expansion (e.g., `access: "read-only"` becomes explicit `rules` with GET/HEAD/OPTIONS).
 
-### Policy data: inference section
-
-The OPA data includes an `inference` key controlling inference interception. In YAML (file mode):
-
-```yaml
-inference:
-  allowed_routes:
-    - local
-```
-
-In proto mode, the `SandboxPolicy.inference` field maps to the same structure. When `allowed_routes` is non-empty, the `network_action` Rego rule returns `"inspect_for_inference"` for connections that do not match any explicit network policy. When `allowed_routes` is empty or absent, unmatched connections are denied as before. The `from_proto()` method defaults to an empty `allowed_routes` list when the proto's `inference` field is `None`.
-
 ### Network evaluation
 
-Two evaluation methods exist: `evaluate_network()` for the legacy bool-based path, and `evaluate_network_action()` for the tri-state routing path used by the proxy.
+Two evaluation methods exist: `evaluate_network()` for the legacy bool-based path, and `evaluate_network_action()` for the two-state routing path used by the proxy.
 
 #### `evaluate_network(input: &NetworkInput) -> Result<PolicyDecision>`
 
@@ -265,28 +253,25 @@ Returns `PolicyDecision { allowed, reason, matched_policy }`.
 
 #### `evaluate_network_action(input: &NetworkInput) -> Result<NetworkAction>`
 
-Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.navigator.sandbox.network_action` Rego rule, which returns one of three string values:
+Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.navigator.sandbox.network_action` Rego rule, which returns one of two string values:
 
 - `"allow"` -- endpoint + binary explicitly matched in a network policy
-- `"inspect_for_inference"` -- no policy match but `inference.allowed_routes` is non-empty
 - `"deny"` -- network connections not allowed by policy
 
 The Rego logic:
 1. If `network_policy_for_request` exists (endpoint + binary match), return `"allow"`
-2. If no match but `count(data.inference.allowed_routes) > 0`, return `"inspect_for_inference"`
-3. Default: `"deny"`
+2. Default: `"deny"`
 
-Returns `NetworkAction`, an enum with three variants:
+Returns `NetworkAction`, an enum with two variants:
 
 ```rust
 pub enum NetworkAction {
     Allow { matched_policy: Option<String> },
-    InspectForInference { matched_policy: Option<String> },
     Deny { reason: String },
 }
 ```
 
-The proxy calls `evaluate_network_action()` (not `evaluate_network()`) as its main decision path. This enables the proxy to route unmatched connections through inference interception when the sandbox has inference routing configured.
+The proxy calls `evaluate_network_action()` (not `evaluate_network()`) as its main decision path. Connections to the `inference.local` virtual host bypass OPA evaluation entirely and are handled by the [inference interception](#inference-interception) path before the OPA check.
 
 ### L7 endpoint config query
 
@@ -309,14 +294,13 @@ Both methods hold the `Mutex` only for the final swap (`*engine = new_engine`), 
 
 **File:** `crates/navigator-sandbox/src/lib.rs` (`run_policy_poll_loop()`)
 
-In gRPC mode, the sandbox can receive policy updates at runtime without restarting. A background task polls the gateway for new policy versions and hot-reloads the OPA engine when changes are detected. Only **dynamic** policy domains (network rules and inference routing) can change at runtime; **static** domains (filesystem, Landlock, process) are applied once in the pre-exec closure and cannot be modified after the child process spawns.
+In gRPC mode, the sandbox can receive policy updates at runtime without restarting. A background task polls the gateway for new policy versions and hot-reloads the OPA engine when changes are detected. Only **dynamic** policy domains (network rules) can change at runtime; **static** domains (filesystem, Landlock, process) are applied once in the pre-exec closure and cannot be modified after the child process spawns.
 
 ### Dynamic vs static policy domains
 
 | Domain | Mutable at runtime | Applied where | Reason |
 |--------|-------------------|---------------|--------|
 | `network_policies` | Yes | OPA engine (proxy evaluates per-CONNECT) | Engine swap updates all future evaluations |
-| `inference` | Yes | OPA engine (proxy evaluates per-CONNECT) | Same mechanism as network policies |
 | `filesystem` | No | Landlock LSM in pre-exec | Kernel-enforced; cannot be modified after `restrict_self()` |
 | `landlock` | No | Landlock LSM in pre_exec | Configuration for the above; same restriction |
 | `process` | No | `setuid`/`setgid` in pre-exec | Privileges dropped irrevocably before exec |
@@ -367,7 +351,7 @@ The `run_policy_poll_loop()` function in `crates/navigator-sandbox/src/lib.rs` i
 
 **File:** `crates/navigator-sandbox/src/grpc_client.rs`
 
-`CachedNavigatorClient` is a persistent gRPC client for the `Navigator` service, analogous to `CachedInferenceClient` for the `Inference` service. It wraps a `NavigatorClient<Channel>` connected once at construction and reused for all subsequent calls.
+`CachedNavigatorClient` is a persistent gRPC client for the `Navigator` service. It wraps a `NavigatorClient<Channel>` connected once at construction and reused for all subsequent calls.
 
 ```rust
 pub struct CachedNavigatorClient {
@@ -385,6 +369,7 @@ Methods:
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
 - **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing the policy, version, and hash.
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
+- **`raw_client()`**: Return a clone of the underlying `NavigatorClient<Channel>` for direct RPC calls (used by the log push task).
 
 ### Server-side policy versioning
 
@@ -504,7 +489,7 @@ If namespace creation fails (e.g., missing capabilities), startup fails in `Prox
 
 **File:** `crates/navigator-sandbox/src/proxy.rs`
 
-The proxy is an async TCP listener that accepts HTTP CONNECT requests. Each connection spawns a handler task. The proxy evaluates every CONNECT request against OPA policy with full process-identity binding.
+The proxy is an async TCP listener that accepts HTTP CONNECT requests. Each connection spawns a handler task. The proxy evaluates every CONNECT request against OPA policy with full process-identity binding, except for connections to the `inference.local` virtual host which bypass OPA and are handled by the inference interception path.
 
 ### Connection flow
 
@@ -518,31 +503,33 @@ sequenceDiagram
     participant Backend as Inference Backend
     participant U as Upstream Server
 
-    S->>P: CONNECT api.example.com:443 HTTP/1.1
+    S->>P: CONNECT host:port HTTP/1.1
     P->>P: Parse CONNECT target (host, port)
-    P->>P: Resolve TCP peer identity via /proc
-    P->>P: TOFU verify binary SHA256
-    P->>P: Walk ancestor chain, verify each
-    P->>P: Collect cmdline paths
-    P->>O: evaluate_network_action(input)
-    O-->>P: NetworkAction (Allow / InspectForInference / Deny)
-    P->>P: Log CONNECT decision (unified log line)
-    alt Deny
-        P-->>S: HTTP/1.1 403 Forbidden
-        else InspectForInference
-            P-->>S: HTTP/1.1 200 Connection Established
-            P->>P: TLS-terminate client (SandboxCa)
-            P->>P: Parse HTTP request from tunnel
-            alt Inference API pattern matched
-                P->>P: Strip Authorization header
-                P->>R: proxy_with_candidates(protocol, method, path, headers, body, routes)
-                R->>Backend: POST /v1/chat/completions (with route API key)
-                Backend-->>R: HTTP response
-                R-->>P: ProxyResponse(status, headers, body)
-                P-->>S: HTTP response (re-encrypted via TLS)
-            else Non-inference request
-                P-->>S: HTTP/1.1 403 JSON error
-            end
+
+    alt Target is inference.local
+        P-->>S: HTTP/1.1 200 Connection Established
+        P->>P: TLS-terminate client (SandboxCa)
+        P->>P: Parse HTTP request from tunnel
+        alt Inference API pattern matched
+            P->>P: Strip Authorization header
+            P->>R: proxy_with_candidates(protocol, method, path, headers, body, routes)
+            R->>Backend: POST /v1/chat/completions (with route API key)
+            Backend-->>R: HTTP response
+            R-->>P: ProxyResponse(status, headers, body)
+            P-->>S: HTTP response (re-encrypted via TLS)
+        else Non-inference request
+            P-->>S: HTTP/1.1 403 JSON error
+        end
+    else Regular host
+        P->>P: Resolve TCP peer identity via /proc
+        P->>P: TOFU verify binary SHA256
+        P->>P: Walk ancestor chain, verify each
+        P->>P: Collect cmdline paths
+        P->>O: evaluate_network_action(input)
+        O-->>P: NetworkAction (Allow / Deny)
+        P->>P: Log CONNECT decision (unified log line)
+        alt Deny
+            P-->>S: HTTP/1.1 403 Forbidden
         else Allow
             P->>DNS: resolve_and_reject_internal(host, port)
             DNS-->>P: Resolved addresses
@@ -578,9 +565,13 @@ Startup steps:
 
 The proxy reads up to 8192 bytes (`MAX_HEADER_BYTES`) looking for `\r\n\r\n`. It validates the method is `CONNECT` (returning 403 for anything else with a structured log) and parses the `host:port` target.
 
+### `inference.local` interception (pre-OPA fast path)
+
+After parsing the CONNECT target, the proxy checks whether the hostname (lowercased) matches `INFERENCE_LOCAL_HOST` (`"inference.local"`). If it does, the proxy immediately sends `200 Connection Established` and hands the connection to `handle_inference_interception()`, bypassing OPA evaluation entirely. This design ensures `inference.local` is always addressable in proxy mode regardless of what network policies are configured.
+
 ### OPA evaluation with identity binding (`evaluate_opa_tcp()`)
 
-This is the core security evaluation path, Linux-only (requires `/proc`).
+For all non-`inference.local` CONNECT targets, the proxy performs OPA evaluation with process-identity binding. This is the core security evaluation path, Linux-only (requires `/proc`).
 
 ```mermaid
 flowchart TD
@@ -607,7 +598,7 @@ On non-Linux platforms, `evaluate_opa_tcp()` always denies with the reason "iden
 
 ```rust
 struct ConnectDecision {
-    action: NetworkAction,          // Allow, InspectForInference, or Deny
+    action: NetworkAction,          // Allow or Deny
     binary: Option<PathBuf>,
     binary_pid: Option<u32>,
     ancestors: Vec<PathBuf>,
@@ -615,21 +606,19 @@ struct ConnectDecision {
 }
 ```
 
-The `action` field carries the matched policy name (for `Allow` and `InspectForInference`) or the deny reason (for `Deny`) inside the `NetworkAction` enum variants. This replaces the previous `allowed: bool` + `matched_policy` + `reason` fields.
+The `action` field carries the matched policy name (for `Allow`) or the deny reason (for `Deny`) inside the `NetworkAction` enum variants.
 
 ### Unified logging
 
-Every CONNECT request produces an `info!()` log line with all context: source/destination addresses, binary path, PID, ancestor chain, cmdline paths, action (`allow`, `inspect_for_inference`, or `deny`), engine, matched policy, and deny reason.
-
-For `InspectForInference` connections, the initial log records `action=inspect_for_inference`. If the subsequent inference interception fails (TLS handshake failure, client disconnect, request not allowed by policy, payload too large, missing context, or I/O error), a second `CONNECT` log is emitted with `action=deny` and a `reason` describing the failure. Successfully routed connections produce no second log. This two-log pattern gives operators visibility into why an `inspect_for_inference` decision ultimately resulted in a denial.
+Every CONNECT request to a non-`inference.local` target produces an `info!()` log line with all context: source/destination addresses, binary path, PID, ancestor chain, cmdline paths, action (`allow` or `deny`), engine, matched policy, and deny reason. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
 
 ### SSRF protection (internal IP rejection)
 
 After OPA allows a connection, the proxy resolves DNS and rejects any host that resolves to an internal IP address (loopback, RFC 1918 private, link-local, or IPv4-mapped IPv6 equivalents). This defense-in-depth measure prevents SSRF attacks where an allowed hostname is pointed at internal infrastructure. The check is implemented by `resolve_and_reject_internal()` which calls `tokio::net::lookup_host()` and validates every resolved address via `is_internal_ip()`. If any resolved IP is internal, the connection receives a `403 Forbidden` response and a warning is logged. See [SSRF Protection](security-policy.md#ssrf-protection-internal-ip-rejection) for the full list of blocked ranges.
 
-### Inference interception (`InspectForInference` path)
+### Inference interception
 
-When OPA returns `InspectForInference`, the proxy does not connect to the upstream server. Instead, it TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `navigator-router` crate. The function `handle_inference_interception()` implements this path and returns an `InferenceOutcome`:
+When a CONNECT target is `inference.local`, the proxy TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `navigator-router` crate. The function `handle_inference_interception()` implements this path and returns an `InferenceOutcome`:
 
 ```rust
 enum InferenceOutcome {
@@ -640,7 +629,7 @@ enum InferenceOutcome {
 }
 ```
 
-Every exit path in `handle_inference_interception` produces an explicit outcome. The `Denied` variant carries a human-readable reason describing the failure. At the call site in `handle_tcp_connection`, `Denied` outcomes (and `Err` results) trigger a structured CONNECT deny log with the same fields as the initial decision log (see [Unified logging](#unified-logging)). The `route_inference_request` helper returns `Result<bool>` where `true` means the request was routed and `false` means the request was not allowed by policy and was denied inline.
+Every exit path in `handle_inference_interception` produces an explicit outcome. The `Denied` variant carries a human-readable reason describing the failure. At the call site in `handle_tcp_connection`, `Denied` outcomes trigger a structured CONNECT deny log with the denial reason. The `route_inference_request` helper returns `Result<bool>` where `true` means the request was routed and `false` means the request was not allowed by policy and was denied inline.
 
 The interception steps:
 
@@ -656,8 +645,10 @@ The interception steps:
    | `POST` | `/v1/completions` | `openai_completions` | `completion` |
    | `POST` | `/v1/responses` | `openai_responses` | `responses` |
    | `POST` | `/v1/messages` | `anthropic_messages` | `messages` |
+   | `GET` | `/v1/models` | `model_discovery` | `models_list` |
+   | `GET` | `/v1/models/*` | `model_discovery` | `models_get` |
 
-   Pattern matching strips query strings and uses exact path comparison (not glob).
+   Pattern matching strips query strings. Exact path comparison is used for most patterns; the `/v1/models/*` pattern matches `/v1/models` itself or any path under `/v1/models/` (e.g., `/v1/models/gpt-4.1`).
 
 4. **Header sanitization**: For matched inference requests, the proxy strips credential headers (`Authorization`, `x-api-key`) and framing/hop-by-hop headers (`host`, `content-length`, `transfer-encoding`, `connection`, etc.). The router rebuilds correct framing for the forwarded body.
 
@@ -666,7 +657,7 @@ The interception steps:
 6. **Response handling**:
    - On success: the router's response (status code, headers, body) is formatted as an HTTP/1.1 response and sent back to the client after stripping response framing/hop-by-hop headers (`transfer-encoding`, `content-length`, `connection`, etc.)
    - On router failure: the error is mapped to an HTTP status code via `router_error_to_http()` and returned as a JSON error body (see error table below)
-   - Empty route cache: returns `503` JSON error (`{"error": "inference endpoint detected without matching inference route"}`)
+   - Empty route cache: returns `503` JSON error (`{"error": "cluster inference is not configured"}`)
    - Non-inference requests: returns `403 Forbidden` with a JSON error body (`{"error": "connection not allowed by policy"}`)
 
 7. **Connection lifecycle**: The handler loops to process multiple HTTP requests on the same connection (HTTP keep-alive). The loop ends when the client closes the connection or an unrecoverable error occurs. Once at least one request has been successfully routed (`routed_any` flag), subsequent failures (client disconnect, I/O error, payload too large, request not allowed by policy) are treated as clean termination (`InferenceOutcome::Routed`) rather than denials.
@@ -677,7 +668,7 @@ When `Router::proxy_with_candidates()` returns an error, `router_error_to_http()
 
 | `RouterError` variant | HTTP status | Response body |
 |----------------------|-------------|---------------|
-| `RouteNotFound(hint)` | `400` | `no route configured for routing_hint '{hint}'` |
+| `RouteNotFound(hint)` | `400` | `no route configured for route '{hint}'` |
 | `NoCompatibleRoute(protocol)` | `400` | `no compatible route for source protocol '{protocol}'` |
 | `Unauthorized(msg)` | `401` | `{msg}` |
 | `UpstreamUnavailable(msg)` | `503` | `{msg}` |
@@ -701,13 +692,13 @@ pub struct InferenceContext {
 
 #### Design decision: standalone capability
 
-The sandbox is designed to operate both as part of a NemoClaw cluster and as a standalone component without any cluster infrastructure. This is intentional — it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full NemoClaw stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs — policy, inference routes — can be provided without any dependency on the control plane.
+The sandbox is designed to operate both as part of a cluster and as a standalone component without any cluster infrastructure. This is intentional -- it enables local development workflows (e.g., a developer running a sandbox against a local LLM server without deploying the full stack), CI/CD environments where sandboxes run as isolated test harnesses, and air-gapped deployments where the gateway is not available. Everything the sandbox needs -- policy, inference routes -- can be provided without any dependency on the control plane.
 
 #### Route sources (priority order)
 
 1. **Route file (standalone mode)**: `--inference-routes` / `NEMOCLAW_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
 
-2. **Cluster bundle (cluster mode)**: When `sandbox_id` and `navigator_endpoint` are available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetSandboxInferenceBundle` gRPC RPC on the `Inference` service. The gateway returns a `GetSandboxInferenceBundleResponse` containing pre-filtered `SandboxResolvedRoute` entries (routes whose `routing_hint` matches the sandbox's `allowed_routes` policy). These proto messages are converted to `ResolvedRoute` structs by `bundle_to_resolved_routes()`.
+2. **Cluster bundle (cluster mode)**: When `navigator_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `navigator_core::inference::auth_for_provider_type()`.
 
 3. **No source**: If neither route file nor cluster credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
 
@@ -722,7 +713,7 @@ Route sources handle empty route lists differently: file mode disables inference
 
 #### Background route cache refresh
 
-In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds. The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
+In cluster mode (when no route file is configured), `spawn_route_refresh()` starts a background tokio task that refreshes the route cache every 30 seconds (`ROUTE_REFRESH_INTERVAL_SECS`). The task calls `fetch_inference_bundle()` on each tick and replaces the `RwLock<Vec<ResolvedRoute>>` contents. On fetch failure, the task logs a warning and keeps the stale routes. The `MissedTickBehavior::Skip` policy prevents refresh storms after temporary gateway outages.
 
 ```mermaid
 flowchart TD
@@ -1130,7 +1121,7 @@ Dual-output logging is configured in `main.rs`:
 - **`/var/log/navigator.log`**: Fixed at `info` level, no ANSI, non-blocking writer
 
 Key structured log events:
-- `CONNECT`: One per proxy CONNECT request with full identity context. `InspectForInference` connections that are ultimately denied produce a second `CONNECT action=deny` log with the denial reason.
+- `CONNECT`: One per proxy CONNECT request (for non-`inference.local` targets) with full identity context. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
 - Sandbox lifecycle events: process start, exit, namespace creation/cleanup
 - Policy reload events: new version detected, reload success/failure, status report outcomes
@@ -1249,7 +1240,7 @@ The `SandboxLogLine.fields` map (`map<string, string>` in proto) carries tracing
 | Field | Source | Description |
 |-------|--------|-------------|
 | `dst_host` | Proxy CONNECT log | Destination hostname |
-| `action` | Proxy CONNECT log | `allow`, `deny`, or `inspect_for_inference` |
+| `action` | Proxy CONNECT log | `allow` or `deny` |
 | `policy` | Proxy CONNECT log | Matched policy name |
 | `version` | Policy reload log | New policy version number |
 | `policy_hash` | Policy reload log | SHA256 hash of new policy |

@@ -562,13 +562,13 @@ async fn build_inference_context(
                 .map_err(|e| miette::miette!("failed to resolve routes from {path}: {e}"))?
         }
         InferenceRouteSource::Cluster => {
-            let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint) else {
+            let (Some(_id), Some(endpoint)) = (sandbox_id, navigator_endpoint) else {
                 return Ok(None);
             };
 
             // Cluster mode: fetch bundle from gateway
-            info!(sandbox_id = %id, endpoint = %endpoint, "Fetching inference route bundle from gateway");
-            match grpc_client::fetch_inference_bundle(endpoint, id).await {
+            info!(endpoint = %endpoint, "Fetching inference route bundle from gateway");
+            match grpc_client::fetch_inference_bundle(endpoint).await {
                 Ok(bundle) => {
                     info!(
                         route_count = bundle.routes.len(),
@@ -578,12 +578,12 @@ async fn build_inference_context(
                     bundle_to_resolved_routes(&bundle)
                 }
                 Err(e) => {
-                    // Distinguish "no inference policy" (expected) from server errors.
-                    // gRPC PermissionDenied/NotFound means inference is not configured
+                    // Distinguish expected "not configured" states from server errors.
+                    // gRPC PermissionDenied/NotFound means inference bundle is unavailable
                     // for this sandbox — skip gracefully. Other errors are unexpected.
                     let msg = e.to_string();
                     if msg.contains("permission denied") || msg.contains("not found") {
-                        info!(error = %e, "Sandbox has no inference policy, inference routing disabled");
+                        info!(error = %e, "Inference bundle unavailable, routing disabled");
                         return Ok(None);
                     }
                     warn!(error = %e, "Failed to fetch inference bundle, inference routing disabled");
@@ -618,9 +618,9 @@ async fn build_inference_context(
 
     // Spawn background route cache refresh for cluster mode
     if matches!(source, InferenceRouteSource::Cluster)
-        && let (Some(id), Some(endpoint)) = (sandbox_id, navigator_endpoint)
+        && let (Some(_id), Some(endpoint)) = (sandbox_id, navigator_endpoint)
     {
-        spawn_route_refresh(ctx.route_cache(), id.to_string(), endpoint.to_string());
+        spawn_route_refresh(ctx.route_cache(), endpoint.to_string());
     }
 
     Ok(Some(ctx))
@@ -628,17 +628,22 @@ async fn build_inference_context(
 
 /// Convert a proto bundle response into resolved routes for the router.
 fn bundle_to_resolved_routes(
-    bundle: &navigator_core::proto::GetSandboxInferenceBundleResponse,
+    bundle: &navigator_core::proto::GetInferenceBundleResponse,
 ) -> Vec<navigator_router::config::ResolvedRoute> {
     bundle
         .routes
         .iter()
-        .map(|r| navigator_router::config::ResolvedRoute {
-            routing_hint: r.routing_hint.clone(),
-            endpoint: r.base_url.clone(),
-            model: r.model_id.clone(),
-            api_key: r.api_key.clone(),
-            protocols: r.protocols.clone(),
+        .map(|r| {
+            let (auth, default_headers) =
+                navigator_core::inference::auth_for_provider_type(&r.provider_type);
+            navigator_router::config::ResolvedRoute {
+                endpoint: r.base_url.clone(),
+                model: r.model_id.clone(),
+                api_key: r.api_key.clone(),
+                protocols: r.protocols.clone(),
+                auth,
+                default_headers,
+            }
         })
         .collect()
 }
@@ -646,7 +651,6 @@ fn bundle_to_resolved_routes(
 /// Spawn a background task that periodically refreshes the route cache from the gateway.
 fn spawn_route_refresh(
     cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
-    sandbox_id: String,
     endpoint: String,
 ) {
     tokio::spawn(async move {
@@ -658,7 +662,7 @@ fn spawn_route_refresh(
         loop {
             tick.tick().await;
 
-            match grpc_client::fetch_inference_bundle(&endpoint, &sandbox_id).await {
+            match grpc_client::fetch_inference_bundle(&endpoint).await {
                 Ok(bundle) => {
                     let routes = bundle_to_resolved_routes(&bundle);
                     debug!(
@@ -746,20 +750,10 @@ async fn load_policy(
         };
 
         // Build OPA engine from baked-in rules + typed proto data.
-        // The engine is needed when network policies exist OR inference routing
-        // is configured (inference routing uses OPA to decide inspect_for_inference).
-        let has_network_policies = !proto_policy.network_policies.is_empty();
-        let has_inference = proto_policy
-            .inference
-            .as_ref()
-            .is_some_and(|inf| !inf.allowed_routes.is_empty());
-        let opa_engine = if has_network_policies || has_inference {
-            info!("Creating OPA engine from proto policy data");
-            Some(Arc::new(OpaEngine::from_proto(&proto_policy)?))
-        } else {
-            info!("No network policies or inference config in proto, skipping OPA engine");
-            None
-        };
+        // In cluster mode, proxy networking is always enabled so OPA is
+        // always required for allow/deny decisions.
+        info!("Creating OPA engine from proto policy data");
+        let opa_engine = Some(Arc::new(OpaEngine::from_proto(&proto_policy)?));
 
         let policy = SandboxPolicy::try_from(proto_policy)?;
         return Ok((policy, opa_engine));
@@ -982,10 +976,10 @@ mod tests {
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
-        let bundle = navigator_core::proto::GetSandboxInferenceBundleResponse {
+        let bundle = navigator_core::proto::GetInferenceBundleResponse {
             routes: vec![
-                navigator_core::proto::SandboxResolvedRoute {
-                    routing_hint: "frontier".to_string(),
+                navigator_core::proto::ResolvedRoute {
+                    name: "frontier".to_string(),
                     base_url: "https://api.example.com/v1".to_string(),
                     api_key: "sk-test-key".to_string(),
                     model_id: "gpt-4".to_string(),
@@ -993,13 +987,15 @@ mod tests {
                         "openai_chat_completions".to_string(),
                         "openai_responses".to_string(),
                     ],
+                    provider_type: "openai".to_string(),
                 },
-                navigator_core::proto::SandboxResolvedRoute {
-                    routing_hint: "local".to_string(),
+                navigator_core::proto::ResolvedRoute {
+                    name: "local".to_string(),
                     base_url: "http://vllm:8000/v1".to_string(),
                     api_key: "local-key".to_string(),
                     model_id: "llama-3".to_string(),
                     protocols: vec!["openai_chat_completions".to_string()],
+                    provider_type: String::new(),
                 },
             ],
             revision: "abc123".to_string(),
@@ -1009,21 +1005,27 @@ mod tests {
         let routes = bundle_to_resolved_routes(&bundle);
 
         assert_eq!(routes.len(), 2);
-        assert_eq!(routes[0].routing_hint, "frontier");
         assert_eq!(routes[0].endpoint, "https://api.example.com/v1");
         assert_eq!(routes[0].model, "gpt-4");
         assert_eq!(routes[0].api_key, "sk-test-key");
         assert_eq!(
+            routes[0].auth,
+            navigator_core::inference::AuthHeader::Bearer
+        );
+        assert_eq!(
             routes[0].protocols,
             vec!["openai_chat_completions", "openai_responses"]
         );
-        assert_eq!(routes[1].routing_hint, "local");
         assert_eq!(routes[1].endpoint, "http://vllm:8000/v1");
+        assert_eq!(
+            routes[1].auth,
+            navigator_core::inference::AuthHeader::Bearer
+        );
     }
 
     #[test]
     fn bundle_to_resolved_routes_handles_empty_bundle() {
-        let bundle = navigator_core::proto::GetSandboxInferenceBundleResponse {
+        let bundle = navigator_core::proto::GetInferenceBundleResponse {
             routes: vec![],
             revision: "empty".to_string(),
             generated_at_ms: 0,
@@ -1041,7 +1043,7 @@ mod tests {
 
         let yaml = r#"
 routes:
-  - routing_hint: local
+  - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
@@ -1059,7 +1061,7 @@ routes:
         let cache = ctx.route_cache();
         let routes = cache.read().await;
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].routing_hint, "local");
+        assert_eq!(routes[0].endpoint, "http://localhost:8000/v1");
     }
 
     #[tokio::test]
@@ -1096,7 +1098,7 @@ routes:
 
         let yaml = r#"
 routes:
-  - routing_hint: file-route
+  - name: inference.local
     endpoint: http://localhost:9999/v1
     model: file-model
     protocols: [openai_chat_completions]
@@ -1114,7 +1116,7 @@ routes:
         let ctx = ctx.expect("context should be Some");
         let cache = ctx.route_cache();
         let routes = cache.read().await;
-        assert_eq!(routes[0].routing_hint, "file-route");
+        assert_eq!(routes[0].endpoint, "http://localhost:9999/v1");
     }
 
     #[test]
@@ -1166,7 +1168,6 @@ routes:
         let policy = discover_policy_from_path(path);
         // Restrictive default has no network policies.
         assert!(policy.network_policies.is_empty());
-        assert!(policy.inference.is_none());
         // But does have filesystem and process policies.
         assert!(policy.filesystem.is_some());
         assert!(policy.process.is_some());
@@ -1246,10 +1247,10 @@ filesystem_policy:
 
     #[test]
     fn discover_policy_restrictive_default_blocks_network() {
-        // Verify that the restrictive default results in NetworkMode::Block
-        // when converted to the sandbox-local SandboxPolicy type.
+        // In cluster mode we keep proxy mode enabled so `inference.local`
+        // can always be routed through proxy/OPA controls.
         let proto = navigator_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
-        assert!(matches!(local_policy.network.mode, NetworkMode::Block));
+        assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
     }
 }

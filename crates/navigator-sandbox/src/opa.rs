@@ -28,13 +28,9 @@ pub struct PolicyDecision {
 /// Network action returned by OPA `network_action` rule.
 ///
 /// - `Allow`: endpoint + binary explicitly matched in a network policy
-/// - `InspectForInference`: no policy match but inference routing is configured —
-///   TLS-terminate and check if the request is an inference call to reroute
-///   through the gateway
-/// - `Deny`: no matching policy and no inference routing configured
+/// - `Deny`: no matching policy
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NetworkAction {
-    InspectForInference { matched_policy: Option<String> },
     Allow { matched_policy: Option<String> },
     Deny { reason: String },
 }
@@ -216,7 +212,7 @@ impl OpaEngine {
     /// Evaluate a network access request and return a routing action.
     ///
     /// Uses the OPA `network_action` rule which returns one of:
-    /// `"inspect_for_inference"`, `"allow"`, or `"deny"`.
+    /// `"allow"` or `"deny"`.
     pub fn evaluate_network_action(&self, input: &NetworkInput) -> Result<NetworkAction> {
         let ancestor_strs: Vec<String> = input
             .ancestors
@@ -264,7 +260,6 @@ impl OpaEngine {
         };
 
         match action_str.as_str() {
-            "inspect_for_inference" => Ok(NetworkAction::InspectForInference { matched_policy }),
             "allow" => Ok(NetworkAction::Allow { matched_policy }),
             _ => {
                 let reason_val = engine
@@ -548,7 +543,6 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
 /// - `data.landlock`
 /// - `data.process`
 /// - `data.network_policies`
-/// - `data.inference`
 fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
     let filesystem_policy = proto.filesystem.as_ref().map_or_else(
         || {
@@ -647,17 +641,11 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
         })
         .collect();
 
-    let inference = proto.inference.as_ref().map_or_else(
-        || serde_json::json!({"allowed_routes": []}),
-        |inf| serde_json::json!({"allowed_routes": inf.allowed_routes}),
-    );
-
     serde_json::json!({
         "filesystem_policy": filesystem_policy,
         "landlock": landlock,
         "process": process,
         "network_policies": network_policies,
-        "inference": inference,
     })
     .to_string()
 }
@@ -732,7 +720,6 @@ mod tests {
                 run_as_group: "sandbox".to_string(),
             }),
             network_policies,
-            inference: None,
         }
     }
 
@@ -1524,7 +1511,7 @@ process:
     }
 
     // ========================================================================
-    // network_action (inference routing) tests
+    // network_action tests
     // ========================================================================
 
     const INFERENCE_TEST_DATA: &str = r#"
@@ -1541,9 +1528,6 @@ network_policies:
       - { host: gitlab.com, port: 443 }
     binaries:
       - { path: /usr/bin/glab }
-inference:
-  allowed_routes:
-    - local
 filesystem_policy:
   include_workdir: true
   read_only: []
@@ -1563,8 +1547,6 @@ network_policies:
       - { host: gitlab.com, port: 443 }
     binaries:
       - { path: /usr/bin/glab }
-inference:
-  allowed_routes: []
 filesystem_policy:
   include_workdir: true
   read_only: []
@@ -1607,7 +1589,7 @@ process:
     }
 
     #[test]
-    fn unknown_endpoint_with_inference_returns_inspect() {
+    fn unknown_endpoint_returns_deny() {
         let engine = inference_engine();
         let input = NetworkInput {
             host: "api.openai.com".into(),
@@ -1618,12 +1600,10 @@ process:
             cmdline_paths: vec![],
         };
         let action = engine.evaluate_network_action(&input).unwrap();
-        assert_eq!(
-            action,
-            NetworkAction::InspectForInference {
-                matched_policy: None
-            },
-        );
+        match &action {
+            NetworkAction::Deny { .. } => {}
+            other => panic!("Expected Deny, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1645,9 +1625,9 @@ process:
     }
 
     #[test]
-    fn endpoint_in_policy_binary_not_allowed_with_inference_returns_inspect() {
+    fn endpoint_in_policy_binary_not_allowed_returns_deny() {
         // api.anthropic.com is declared but python3 is not in the binary list.
-        // With inference configured, this falls through to inference interception.
+        // With binary allow/deny, this is denied.
         let engine = inference_engine();
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
@@ -1658,12 +1638,10 @@ process:
             cmdline_paths: vec![],
         };
         let action = engine.evaluate_network_action(&input).unwrap();
-        assert_eq!(
-            action,
-            NetworkAction::InspectForInference {
-                matched_policy: None
-            },
-        );
+        match &action {
+            NetworkAction::Deny { .. } => {}
+            other => panic!("Expected Deny, got: {other:?}"),
+        }
     }
 
     #[test]
@@ -1706,8 +1684,7 @@ process:
     }
 
     #[test]
-    fn from_proto_unknown_endpoint_no_inference_returns_deny() {
-        // test_proto() has inference: None → defaults to empty allowed_routes
+    fn from_proto_unknown_endpoint_returns_deny() {
         let proto = test_proto();
         let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
         let input = NetworkInput {
@@ -1723,32 +1700,6 @@ process:
             NetworkAction::Deny { .. } => {}
             other => panic!("Expected Deny, got: {other:?}"),
         }
-    }
-
-    #[test]
-    fn from_proto_with_inference_unknown_endpoint_returns_inspect() {
-        use navigator_core::proto::InferencePolicy;
-        let mut proto = test_proto();
-        proto.inference = Some(InferencePolicy {
-            allowed_routes: vec!["local".to_string()],
-            ..Default::default()
-        });
-        let engine = OpaEngine::from_proto(&proto).expect("engine from proto");
-        let input = NetworkInput {
-            host: "api.openai.com".into(),
-            port: 443,
-            binary_path: PathBuf::from("/usr/bin/python3"),
-            binary_sha256: "unused".into(),
-            ancestors: vec![],
-            cmdline_paths: vec![],
-        };
-        let action = engine.evaluate_network_action(&input).unwrap();
-        assert_eq!(
-            action,
-            NetworkAction::InspectForInference {
-                matched_policy: None
-            },
-        );
     }
 
     #[test]
@@ -1971,7 +1922,6 @@ process:
                 run_as_group: "".to_string(),
             }),
             network_policies,
-            inference: None,
         };
         let engine = OpaEngine::from_proto(&proto).expect("Failed to create engine from proto");
 

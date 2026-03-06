@@ -13,7 +13,7 @@ use tracing::info;
 
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
-    #[error("route not found for routing_hint '{0}'")]
+    #[error("route not found for route '{0}'")]
     RouteNotFound(String),
     #[error("no compatible route for protocol '{0}'")]
     NoCompatibleRoute(String),
@@ -72,7 +72,6 @@ impl Router {
             .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
 
         info!(
-            routing_hint = %route.routing_hint,
             protocols = %route.protocols.join(","),
             endpoint = %route.endpoint,
             method = %method,
@@ -81,7 +80,7 @@ impl Router {
         );
 
         if mock::is_mock_route(route) {
-            info!(routing_hint = %route.routing_hint, "returning mock response");
+            info!(endpoint = %route.endpoint, "returning mock response");
             return Ok(mock::mock_response(route, &normalized_source));
         }
 
@@ -105,32 +104,22 @@ mod tests {
 
     fn test_config() -> RouterConfig {
         RouterConfig {
-            routes: vec![
-                RouteConfig {
-                    routing_hint: "local".to_string(),
-                    endpoint: "http://localhost:8000/v1".to_string(),
-                    model: "meta/llama-3.1-8b-instruct".to_string(),
-                    protocols: vec!["openai_chat_completions".to_string()],
-                    api_key: Some("test-key".to_string()),
-                    api_key_env: None,
-                },
-                RouteConfig {
-                    routing_hint: "frontier".to_string(),
-                    endpoint: "http://localhost:8000/v1".to_string(),
-                    model: "meta/llama-3.1-70b-instruct".to_string(),
-                    protocols: vec!["openai_chat_completions".to_string()],
-                    api_key: Some("test-key".to_string()),
-                    api_key_env: None,
-                },
-            ],
+            routes: vec![RouteConfig {
+                name: "inference.local".to_string(),
+                endpoint: "http://localhost:8000/v1".to_string(),
+                model: "meta/llama-3.1-8b-instruct".to_string(),
+                provider_type: None,
+                protocols: vec!["openai_chat_completions".to_string()],
+                api_key: Some("test-key".to_string()),
+                api_key_env: None,
+            }],
         }
     }
 
     #[test]
     fn router_resolves_routes_from_config() {
         let router = Router::from_config(&test_config()).unwrap();
-        assert_eq!(router.routes.len(), 2);
-        assert_eq!(router.routes[0].routing_hint, "local");
+        assert_eq!(router.routes.len(), 1);
         assert_eq!(router.routes[0].protocols, vec!["openai_chat_completions"]);
     }
 
@@ -138,9 +127,10 @@ mod tests {
     fn config_missing_api_key_returns_error() {
         let config = RouterConfig {
             routes: vec![RouteConfig {
-                routing_hint: "test".to_string(),
+                name: "inference.local".to_string(),
                 endpoint: "http://localhost".to_string(),
                 model: "test-model".to_string(),
+                provider_type: None,
                 protocols: vec!["openai_chat_completions".to_string()],
                 api_key: None,
                 api_key_env: None,

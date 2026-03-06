@@ -24,8 +24,8 @@ Current split:
 
 - `navigator-server`:
   - authenticates request origin
-  - enforces sandbox policy (`allowed_routes`)
-  - loads enabled, policy-allowed route candidates from the entity store
+  - resolves cluster-managed inference route candidates from providers
+  - loads enabled route candidates from the entity store
 - `navigator-router`:
   - picks a route from candidates (`proxy_with_candidates`)
   - forwards the HTTP request upstream and returns the raw response

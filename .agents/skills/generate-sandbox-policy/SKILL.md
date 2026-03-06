@@ -365,7 +365,7 @@ The policy needs to go somewhere. Determine which mode applies:
 
 1. **Read the existing file** to understand current state:
    - What policies already exist under `network_policies`
-   - What the `filesystem_policy`, `landlock`, `process`, and `inference` sections look like
+   - What the `filesystem_policy`, `landlock`, and `process` sections look like
    - Whether the file uses compact (`{ host: ..., port: ... }`) or expanded YAML style
 
 2. **Check for conflicts**:
@@ -377,7 +377,7 @@ The policy needs to go somewhere. Determine which mode applies:
    - **Modifying an existing policy**: Edit the specific policy in place — add/remove endpoints, change access presets, update rules, add binaries, etc.
    - **Removing a policy**: Delete the policy block if the user asks.
 
-4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, `inference`, or other policies unless the user explicitly asks.
+4. **Preserve everything else**: Do not modify `filesystem_policy`, `landlock`, `process`, or other policies unless the user explicitly asks.
 
 ### Mode B: Create a New Policy File
 
@@ -410,13 +410,9 @@ process:
 
 network_policies:
   # <generated policies go here>
-
-inference:
-  allowed_routes:
-    - local
 ```
 
-The `filesystem_policy`, `landlock`, `process`, and `inference` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. The generated `network_policies` block is the primary output.
+The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Cluster inference is configured separately through `nemoclaw cluster inference set/get`. The generated `network_policies` block is the primary output.
 
 If the user provides a file path, write to it. Otherwise, suggest `deploy/docker/sandbox/dev-sandbox-policy.yaml` for local development or ask where to place it.
 
