@@ -252,7 +252,7 @@ fi
 # Generate a random SSH handshake secret for the NSSH1 HMAC handshake between
 # the gateway and sandbox SSH servers. This is required — the server will refuse
 # to start without it.
-SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET:-$(openssl rand -hex 32)}"
+SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET:-$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')}"
 
 # Inject SSH gateway host/port into the HelmChart manifest so the navigator
 # server returns the correct address to CLI clients for SSH proxy CONNECT.
