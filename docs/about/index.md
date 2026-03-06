@@ -87,7 +87,7 @@ nemoclaw cluster admin deploy
 nemoclaw sandbox create -- claude
 ```
 
-No Kubernetes expertise is required. Refer to [Get Started](../get-started/installation.md) for full installation steps.
+No Kubernetes expertise is required.
 :::
 
 ## Use Cases
@@ -106,4 +106,3 @@ No Kubernetes expertise is required. Refer to [Get Started](../get-started/insta
 - [How It Works](how-it-works.md): Explore the architecture, major subsystems, and the end-to-end flow from cluster bootstrap to running sandbox.
 - [Support Matrix](support-matrix.md): Find platform requirements, supported providers, agent tools, and compatibility details.
 - [Release Notes](release-notes.md): Track what changed in each version.
-- [Get Started](../get-started/installation.md): Install the CLI and launch your first sandbox.
