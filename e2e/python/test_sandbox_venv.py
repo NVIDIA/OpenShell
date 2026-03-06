@@ -5,22 +5,71 @@
 
 Verifies that:
 - /sandbox/.venv/bin is in PATH for both interactive and non-interactive sessions
-- pip install works inside the sandbox (pypi policy in dev-sandbox-policy.yaml)
+- pip install works inside the sandbox (pypi network policy)
 - uv pip install works (validates Landlock V2 cross-directory rename support)
 - uv run --with works for ephemeral dependency injection
 - Installed packages are importable after installation
 
-All tests use the default dev sandbox policy -- no custom policy overrides.
+The PATH test uses the default (no-network) policy.  Package installation
+tests supply an explicit pypi network policy so the proxy allows egress to
+pypi.org and files.pythonhosted.org.
 """
 
 from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from navigator._proto import datamodel_pb2, sandbox_pb2
+
 if TYPE_CHECKING:
     from collections.abc import Callable
 
     from navigator import Sandbox
+
+
+# ---------------------------------------------------------------------------
+# Policy helpers
+# ---------------------------------------------------------------------------
+
+_BASE_FILESYSTEM = sandbox_pb2.FilesystemPolicy(
+    include_workdir=True,
+    read_only=["/usr", "/lib", "/proc", "/dev/urandom", "/app", "/etc", "/var/log"],
+    read_write=["/sandbox", "/tmp", "/dev/null"],
+)
+_BASE_LANDLOCK = sandbox_pb2.LandlockPolicy(compatibility="best_effort")
+_BASE_PROCESS = sandbox_pb2.ProcessPolicy(run_as_user="sandbox", run_as_group="sandbox")
+
+_PYPI_NETWORK_POLICY = sandbox_pb2.NetworkPolicyRule(
+    name="pypi",
+    endpoints=[
+        sandbox_pb2.NetworkEndpoint(host="pypi.org", port=443),
+        sandbox_pb2.NetworkEndpoint(host="files.pythonhosted.org", port=443),
+    ],
+    binaries=[
+        sandbox_pb2.NetworkBinary(path="/sandbox/.venv/bin/python"),
+        sandbox_pb2.NetworkBinary(path="/sandbox/.venv/bin/python3"),
+        sandbox_pb2.NetworkBinary(path="/sandbox/.venv/bin/pip"),
+        sandbox_pb2.NetworkBinary(path="/app/.venv/bin/python"),
+        sandbox_pb2.NetworkBinary(path="/app/.venv/bin/python3"),
+        sandbox_pb2.NetworkBinary(path="/app/.venv/bin/pip"),
+        sandbox_pb2.NetworkBinary(path="/usr/local/bin/uv"),
+        sandbox_pb2.NetworkBinary(path="/sandbox/.uv/python/**"),
+    ],
+)
+
+
+def _pypi_spec() -> datamodel_pb2.SandboxSpec:
+    """Sandbox spec that allows pip/uv to install packages from PyPI."""
+    return datamodel_pb2.SandboxSpec(
+        policy=sandbox_pb2.SandboxPolicy(
+            version=1,
+            filesystem=_BASE_FILESYSTEM,
+            landlock=_BASE_LANDLOCK,
+            process=_BASE_PROCESS,
+            network_policies={"pypi": _PYPI_NETWORK_POLICY},
+            inference=sandbox_pb2.InferencePolicy(allowed_routes=["local"]),
+        ),
+    )
 
 
 def test_sandbox_venv_in_path(
@@ -46,7 +95,7 @@ def test_pip_install_in_sandbox(
     sandbox: Callable[..., Sandbox],
 ) -> None:
     """pip install works inside the sandbox and installed packages are importable."""
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         install = sb.exec(
             ["pip", "install", "--quiet", "cowsay"],
             timeout_seconds=60,
@@ -75,9 +124,17 @@ def test_uv_pip_install_in_sandbox(
     because uv uses cross-directory rename() for cache population and installation.
     Landlock V2 adds the REFER right which permits this.
     """
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         install = sb.exec(
-            ["uv", "pip", "install", "--quiet", "cowsay"],
+            [
+                "uv",
+                "pip",
+                "install",
+                "--python",
+                "/sandbox/.venv/bin/python",
+                "--quiet",
+                "cowsay",
+            ],
             timeout_seconds=60,
         )
         assert install.exit_code == 0, (
@@ -100,11 +157,13 @@ def test_uv_run_with_ephemeral_dependency(
     sandbox: Callable[..., Sandbox],
 ) -> None:
     """uv run --with installs a dependency on-the-fly and runs a script using it."""
-    with sandbox(delete_on_exit=True) as sb:
+    with sandbox(spec=_pypi_spec(), delete_on_exit=True) as sb:
         result = sb.exec(
             [
                 "uv",
                 "run",
+                "--python",
+                "/sandbox/.venv/bin/python",
                 "--with",
                 "cowsay",
                 "python",
