@@ -15,7 +15,7 @@ crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
 python/navigator/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
-e2e/bash/              # Bash E2E scripts
+e2e/rust/              # Rust CLI E2E tests
 ```
 
 ## Rust Tests
@@ -130,20 +130,41 @@ def test_multiply(sandbox):
 | `inference_client` | session | Client for managing inference routes |
 | `mock_inference_route` | session | Creates a mock OpenAI-protocol route for tests |
 
-### Bash E2E (`e2e/bash/`)
+### Rust CLI E2E (`e2e/rust/`)
 
-Self-contained shell scripts that exercise the CLI directly:
+Rust-based e2e tests that exercise the `nemoclaw` CLI binary as a subprocess.
+They live in the `nemoclaw-e2e` crate and use a shared harness for sandbox
+lifecycle management, output parsing, and cleanup.
 
-- `test_sandbox_sync.sh` — file sync round-trip
-- `test_sandbox_custom_image.sh` — custom Docker image build and run
-- `test_port_forward.sh` — TCP port forwarding through a sandbox
+Tests:
 
-Pattern: `set -euo pipefail`, cleanup via `trap`, poll-based readiness checks
-parsing CLI output.
+- `tests/custom_image.rs` — custom Docker image build and sandbox run
+- `tests/sync.rs` — bidirectional file sync round-trip (including large files)
+- `tests/port_forward.rs` — TCP port forwarding through a sandbox
+
+Run all CLI e2e tests:
+
+```bash
+mise run e2e:rust
+```
+
+Run a single test directly with cargo:
+
+```bash
+cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test sync
+```
+
+The harness (`e2e/rust/src/harness/`) provides:
+
+| Module | Purpose |
+|---|---|
+| `binary` | Builds and resolves the `nemoclaw` binary from the workspace |
+| `sandbox` | `SandboxGuard` RAII type — creates sandboxes and deletes them on drop |
+| `output` | ANSI stripping and field extraction from CLI output |
+| `port` | `wait_for_port()` and `find_free_port()` for TCP testing |
 
 ## Environment Variables
 
 | Variable | Purpose |
 |---|---|
 | `NEMOCLAW_CLUSTER` | Override active cluster name for E2E tests |
-| `NAV_BIN` | Override `nemoclaw` binary path in bash E2E tests |

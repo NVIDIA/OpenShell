@@ -4,6 +4,7 @@
 
 # Build output
 /target/
+e2e/rust/target/
 debug/
 release/
 
