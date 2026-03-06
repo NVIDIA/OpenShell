@@ -48,6 +48,53 @@ use crate::ServerState;
 /// unbounded memory allocation from an excessively large page request.
 pub(crate) const MAX_PAGE_SIZE: u32 = 1000;
 
+// ---------------------------------------------------------------------------
+// Field-level size limits
+//
+// Named constants for easy tuning. Each limit is chosen to be generous
+// enough for legitimate payloads while capping resource-exhaustion vectors.
+// ---------------------------------------------------------------------------
+
+/// Maximum length for a sandbox or provider name (Kubernetes name limit).
+const MAX_NAME_LEN: usize = 253;
+
+/// Maximum number of providers that can be attached to a sandbox.
+const MAX_PROVIDERS: usize = 32;
+
+/// Maximum length for the `log_level` field.
+const MAX_LOG_LEVEL_LEN: usize = 32;
+
+/// Maximum number of entries in `spec.environment`.
+const MAX_ENVIRONMENT_ENTRIES: usize = 128;
+
+/// Maximum length for an environment map key (bytes).
+const MAX_MAP_KEY_LEN: usize = 256;
+
+/// Maximum length for an environment map value (bytes).
+const MAX_MAP_VALUE_LEN: usize = 8192;
+
+/// Maximum length for template string fields (`image`, `runtime_class_name`, `agent_socket`).
+const MAX_TEMPLATE_STRING_LEN: usize = 1024;
+
+/// Maximum number of entries in template map fields (`labels`, `annotations`, `environment`).
+const MAX_TEMPLATE_MAP_ENTRIES: usize = 128;
+
+/// Maximum serialized size (bytes) for template Struct fields (`resources`, `pod_template`,
+/// `volume_claim_templates`).
+const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
+
+/// Maximum serialized size (bytes) for the policy field.
+const MAX_POLICY_SIZE: usize = 262_144;
+
+/// Maximum length for a provider type slug.
+const MAX_PROVIDER_TYPE_LEN: usize = 64;
+
+/// Maximum number of entries in the provider `credentials` map.
+const MAX_PROVIDER_CREDENTIALS_ENTRIES: usize = 32;
+
+/// Maximum number of entries in the provider `config` map.
+const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
+
 /// Clamp a client-provided page `limit`.
 ///
 /// Returns `default` when `raw` is 0 (the protobuf zero-value convention),
@@ -91,6 +138,10 @@ impl Navigator for NavigatorService {
         let spec = request
             .spec
             .ok_or_else(|| Status::invalid_argument("spec is required"))?;
+
+        // Validate field sizes before any I/O (fail fast on oversized payloads).
+        validate_sandbox_spec(&request.name, &spec)?;
+
         // Validate provider names exist (fail fast). Credentials are fetched at
         // runtime by the sandbox supervisor via GetSandboxProviderEnvironment.
         for name in &spec.providers {
@@ -1276,6 +1327,202 @@ fn level_matches(log_level: &str, min_level: &str) -> bool {
 // Policy helper functions
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Sandbox spec validation
+// ---------------------------------------------------------------------------
+
+/// Validate field sizes on a `CreateSandboxRequest` before persisting.
+///
+/// Returns `INVALID_ARGUMENT` on the first field that exceeds its limit.
+fn validate_sandbox_spec(
+    name: &str,
+    spec: &navigator_core::proto::SandboxSpec,
+) -> Result<(), Status> {
+    // --- request.name ---
+    if name.len() > MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "name exceeds maximum length ({} > {MAX_NAME_LEN})",
+            name.len()
+        )));
+    }
+
+    // --- spec.providers ---
+    if spec.providers.len() > MAX_PROVIDERS {
+        return Err(Status::invalid_argument(format!(
+            "providers list exceeds maximum ({} > {MAX_PROVIDERS})",
+            spec.providers.len()
+        )));
+    }
+
+    // --- spec.log_level ---
+    if spec.log_level.len() > MAX_LOG_LEVEL_LEN {
+        return Err(Status::invalid_argument(format!(
+            "log_level exceeds maximum length ({} > {MAX_LOG_LEVEL_LEN})",
+            spec.log_level.len()
+        )));
+    }
+
+    // --- spec.environment ---
+    validate_string_map(
+        &spec.environment,
+        MAX_ENVIRONMENT_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "spec.environment",
+    )?;
+
+    // --- spec.template ---
+    if let Some(ref tmpl) = spec.template {
+        validate_sandbox_template(tmpl)?;
+    }
+
+    // --- spec.policy serialized size ---
+    if let Some(ref policy) = spec.policy {
+        let size = policy.encoded_len();
+        if size > MAX_POLICY_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "policy serialized size exceeds maximum ({size} > {MAX_POLICY_SIZE})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate template-level field sizes.
+fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
+    // String fields.
+    for (field, value) in [
+        ("template.image", &tmpl.image),
+        ("template.runtime_class_name", &tmpl.runtime_class_name),
+        ("template.agent_socket", &tmpl.agent_socket),
+    ] {
+        if value.len() > MAX_TEMPLATE_STRING_LEN {
+            return Err(Status::invalid_argument(format!(
+                "{field} exceeds maximum length ({} > {MAX_TEMPLATE_STRING_LEN})",
+                value.len()
+            )));
+        }
+    }
+
+    // Map fields.
+    validate_string_map(
+        &tmpl.labels,
+        MAX_TEMPLATE_MAP_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "template.labels",
+    )?;
+    validate_string_map(
+        &tmpl.annotations,
+        MAX_TEMPLATE_MAP_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "template.annotations",
+    )?;
+    validate_string_map(
+        &tmpl.environment,
+        MAX_TEMPLATE_MAP_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "template.environment",
+    )?;
+
+    // Struct fields (serialized size).
+    if let Some(ref s) = tmpl.resources {
+        let size = s.encoded_len();
+        if size > MAX_TEMPLATE_STRUCT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
+    }
+    if let Some(ref s) = tmpl.pod_template {
+        let size = s.encoded_len();
+        if size > MAX_TEMPLATE_STRUCT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "template.pod_template serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
+    }
+    if let Some(ref s) = tmpl.volume_claim_templates {
+        let size = s.encoded_len();
+        if size > MAX_TEMPLATE_STRUCT_SIZE {
+            return Err(Status::invalid_argument(format!(
+                "template.volume_claim_templates serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+/// Validate a `map<string, string>` field: entry count, key length, value length.
+fn validate_string_map(
+    map: &std::collections::HashMap<String, String>,
+    max_entries: usize,
+    max_key_len: usize,
+    max_value_len: usize,
+    field_name: &str,
+) -> Result<(), Status> {
+    if map.len() > max_entries {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} exceeds maximum entries ({} > {max_entries})",
+            map.len()
+        )));
+    }
+    for (key, value) in map {
+        if key.len() > max_key_len {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} key exceeds maximum length ({} > {max_key_len})",
+                key.len()
+            )));
+        }
+        if value.len() > max_value_len {
+            return Err(Status::invalid_argument(format!(
+                "{field_name} value exceeds maximum length ({} > {max_value_len})",
+                value.len()
+            )));
+        }
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Provider field validation
+// ---------------------------------------------------------------------------
+
+/// Validate field sizes on a `Provider` before persisting.
+fn validate_provider_fields(provider: &Provider) -> Result<(), Status> {
+    if provider.name.len() > MAX_NAME_LEN {
+        return Err(Status::invalid_argument(format!(
+            "provider.name exceeds maximum length ({} > {MAX_NAME_LEN})",
+            provider.name.len()
+        )));
+    }
+    if provider.r#type.len() > MAX_PROVIDER_TYPE_LEN {
+        return Err(Status::invalid_argument(format!(
+            "provider.type exceeds maximum length ({} > {MAX_PROVIDER_TYPE_LEN})",
+            provider.r#type.len()
+        )));
+    }
+    validate_string_map(
+        &provider.credentials,
+        MAX_PROVIDER_CREDENTIALS_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "provider.credentials",
+    )?;
+    validate_string_map(
+        &provider.config,
+        MAX_PROVIDER_CONFIG_ENTRIES,
+        MAX_MAP_KEY_LEN,
+        MAX_MAP_VALUE_LEN,
+        "provider.config",
+    )?;
+    Ok(())
+}
+
 /// Validate that a policy does not contain unsafe content.
 ///
 /// Delegates to [`navigator_policy::validate_sandbox_policy`] and converts
@@ -1856,6 +2103,9 @@ async fn create_provider_record(
         ));
     }
 
+    // Validate field sizes before any I/O.
+    validate_provider_fields(&provider)?;
+
     let existing = store
         .get_message_by_name::<Provider>(&provider.name)
         .await
@@ -1981,12 +2231,16 @@ impl ObjectName for Provider {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_PAGE_SIZE, clamp_limit, create_provider_record, delete_provider_record,
-        get_provider_record, is_valid_env_key, list_provider_records, resolve_provider_environment,
-        update_provider_record,
+        MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
+        MAX_NAME_LEN, MAX_PAGE_SIZE, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
+        MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
+        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE, clamp_limit,
+        create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
+        list_provider_records, resolve_provider_environment, update_provider_record,
+        validate_provider_fields, validate_sandbox_spec,
     };
     use crate::persistence::Store;
-    use navigator_core::proto::Provider;
+    use navigator_core::proto::{Provider, SandboxSpec, SandboxTemplate};
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -2679,5 +2933,321 @@ mod tests {
                 "fallback name should be all lowercase: {name}"
             );
         }
+    }
+
+    // ---- Field-level size limit tests ----
+
+    fn default_spec() -> SandboxSpec {
+        SandboxSpec::default()
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_empty_defaults() {
+        assert!(validate_sandbox_spec("", &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_at_limit_name() {
+        let name = "a".repeat(MAX_NAME_LEN);
+        assert!(validate_sandbox_spec(&name, &default_spec()).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_over_limit_name() {
+        let name = "a".repeat(MAX_NAME_LEN + 1);
+        let err = validate_sandbox_spec(&name, &default_spec()).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("name"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_at_limit_providers() {
+        let spec = SandboxSpec {
+            providers: (0..MAX_PROVIDERS).map(|i| format!("p-{i}")).collect(),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("ok", &spec).is_ok());
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_over_limit_providers() {
+        let spec = SandboxSpec {
+            providers: (0..=MAX_PROVIDERS).map(|i| format!("p-{i}")).collect(),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("providers"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_over_limit_log_level() {
+        let spec = SandboxSpec {
+            log_level: "x".repeat(MAX_LOG_LEVEL_LEN + 1),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("log_level"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_too_many_env_entries() {
+        let env: HashMap<String, String> = (0..=MAX_ENVIRONMENT_ENTRIES)
+            .map(|i| (format!("K{i}"), "v".to_string()))
+            .collect();
+        let spec = SandboxSpec {
+            environment: env,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("environment"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_oversized_env_key() {
+        let mut env = HashMap::new();
+        env.insert("k".repeat(MAX_MAP_KEY_LEN + 1), "v".to_string());
+        let spec = SandboxSpec {
+            environment: env,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("key"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_oversized_env_value() {
+        let mut env = HashMap::new();
+        env.insert("KEY".to_string(), "v".repeat(MAX_MAP_VALUE_LEN + 1));
+        let spec = SandboxSpec {
+            environment: env,
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("value"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_oversized_template_image() {
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                image: "x".repeat(MAX_TEMPLATE_STRING_LEN + 1),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.image"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_too_many_template_labels() {
+        let labels: HashMap<String, String> = (0..=MAX_TEMPLATE_MAP_ENTRIES)
+            .map(|i| (format!("k{i}"), "v".to_string()))
+            .collect();
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                labels,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.labels"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_oversized_template_struct() {
+        use prost_types::{Struct, Value, value::Kind};
+
+        // Build a Struct with enough data to exceed MAX_TEMPLATE_STRUCT_SIZE.
+        let mut fields = std::collections::BTreeMap::new();
+        let big_str = "x".repeat(MAX_TEMPLATE_STRUCT_SIZE);
+        fields.insert(
+            "big".to_string(),
+            Value {
+                kind: Some(Kind::StringValue(big_str)),
+            },
+        );
+        let big_struct = Struct { fields };
+        let spec = SandboxSpec {
+            template: Some(SandboxTemplate {
+                resources: Some(big_struct),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("template.resources"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_rejects_oversized_policy() {
+        use navigator_core::proto::NetworkPolicyRule;
+        use navigator_core::proto::SandboxPolicy as ProtoSandboxPolicy;
+
+        // Build a policy large enough to exceed MAX_POLICY_SIZE.
+        let mut policy = ProtoSandboxPolicy::default();
+        let big_name = "x".repeat(MAX_POLICY_SIZE);
+        policy
+            .network_policies
+            .insert(big_name, NetworkPolicyRule::default());
+        let spec = SandboxSpec {
+            policy: Some(policy),
+            ..Default::default()
+        };
+        let err = validate_sandbox_spec("ok", &spec).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("policy"));
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_valid_spec() {
+        let spec = SandboxSpec {
+            log_level: "debug".to_string(),
+            providers: vec!["p1".to_string()],
+            environment: std::iter::once(("KEY".to_string(), "val".to_string())).collect(),
+            template: Some(SandboxTemplate {
+                image: "nvcr.io/test:latest".to_string(),
+                runtime_class_name: "kata".to_string(),
+                labels: std::iter::once(("app".to_string(), "test".to_string())).collect(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        assert!(validate_sandbox_spec("my-sandbox", &spec).is_ok());
+    }
+
+    // ---- Provider field limit tests ----
+
+    /// Helper: a single-entry credentials map for test providers.
+    fn one_credential() -> HashMap<String, String> {
+        std::iter::once(("KEY".to_string(), "val".to_string())).collect()
+    }
+
+    #[test]
+    fn validate_provider_fields_accepts_valid() {
+        let provider = Provider {
+            id: String::new(),
+            name: "my-provider".to_string(),
+            r#type: "claude".to_string(),
+            credentials: one_credential(),
+            config: std::iter::once(("endpoint".to_string(), "https://example.com".to_string()))
+                .collect(),
+        };
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_over_limit_name() {
+        let provider = Provider {
+            id: String::new(),
+            name: "a".repeat(MAX_NAME_LEN + 1),
+            r#type: "claude".to_string(),
+            credentials: one_credential(),
+            config: HashMap::new(),
+        };
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.name"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_over_limit_type() {
+        let provider = Provider {
+            id: String::new(),
+            name: "ok".to_string(),
+            r#type: "x".repeat(MAX_PROVIDER_TYPE_LEN + 1),
+            credentials: one_credential(),
+            config: HashMap::new(),
+        };
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.type"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_too_many_credentials() {
+        let creds: HashMap<String, String> = (0..=MAX_PROVIDER_CREDENTIALS_ENTRIES)
+            .map(|i| (format!("K{i}"), "v".to_string()))
+            .collect();
+        let provider = Provider {
+            id: String::new(),
+            name: "ok".to_string(),
+            r#type: "claude".to_string(),
+            credentials: creds,
+            config: HashMap::new(),
+        };
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.credentials"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_too_many_config() {
+        let config: HashMap<String, String> = (0..=MAX_PROVIDER_CONFIG_ENTRIES)
+            .map(|i| (format!("K{i}"), "v".to_string()))
+            .collect();
+        let provider = Provider {
+            id: String::new(),
+            name: "ok".to_string(),
+            r#type: "claude".to_string(),
+            credentials: one_credential(),
+            config,
+        };
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("provider.config"));
+    }
+
+    #[test]
+    fn validate_provider_fields_at_limit_name_accepted() {
+        let provider = Provider {
+            id: String::new(),
+            name: "a".repeat(MAX_NAME_LEN),
+            r#type: "claude".to_string(),
+            credentials: one_credential(),
+            config: HashMap::new(),
+        };
+        assert!(validate_provider_fields(&provider).is_ok());
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_oversized_credential_key() {
+        let mut creds = HashMap::new();
+        creds.insert("k".repeat(MAX_MAP_KEY_LEN + 1), "v".to_string());
+        let provider = Provider {
+            id: String::new(),
+            name: "ok".to_string(),
+            r#type: "claude".to_string(),
+            credentials: creds,
+            config: HashMap::new(),
+        };
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("key"));
+    }
+
+    #[test]
+    fn validate_provider_fields_rejects_oversized_config_value() {
+        let mut config = HashMap::new();
+        config.insert("k".to_string(), "v".repeat(MAX_MAP_VALUE_LEN + 1));
+        let provider = Provider {
+            id: String::new(),
+            name: "ok".to_string(),
+            r#type: "claude".to_string(),
+            credentials: one_credential(),
+            config,
+        };
+        let err = validate_provider_fields(&provider).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("value"));
     }
 }
