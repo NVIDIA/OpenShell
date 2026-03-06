@@ -159,15 +159,7 @@ CLI commands, policy schema, environment variables, and system architecture.
 
 Get Started <self>
 get-started/tutorials/index
-```
-
-```{toctree}
-:caption: Concepts
-:hidden:
-
-Overview <about/index>
-about/how-it-works
-about/release-notes
+release-notes
 ```
 
 ```{toctree}
@@ -214,7 +206,7 @@ observability/health
 :caption: Reference
 :hidden:
 
-about/support-matrix
+reference/support-matrix
 reference/cli
 reference/policy-schema
 reference/environment-variables

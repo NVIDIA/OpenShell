@@ -132,7 +132,7 @@ environment dumps of the container spec.
 
 ## Supported Provider Types
 
-For a list of supported provider types, refer to the [Support Matrix](../about/support-matrix.md#supported-provider-types).
+For a list of supported provider types, refer to the [Support Matrix](../reference/support-matrix.md#supported-provider-types).
 
 ## Next Steps
 
