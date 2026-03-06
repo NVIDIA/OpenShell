@@ -54,4 +54,6 @@ jobs:
         run: mise run --no-prepare --skip-deps cluster
 
       - name: Run E2E tests
-        run: mise run --no-prepare --skip-deps test:e2e:sandbox
+        run: |
+          mise run --no-prepare --skip-deps e2e:python
+          mise run --no-prepare --skip-deps e2e:rust
