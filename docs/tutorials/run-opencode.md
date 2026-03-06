@@ -19,8 +19,8 @@ This tutorial walks through a realistic setup where you run [opencode](https://o
 
 Before you begin:
 
-- **`NVIDIA_API_KEY` environment variable** set on your host machine with a valid NVIDIA API key
-- **NemoClaw CLI** installed (`pip install nemoclaw`)
+- `NVIDIA_API_KEY` environment variable set on your host machine with a valid NVIDIA API key
+- NemoClaw CLI installed (`pip install nemoclaw`)
 
 ## Step 1: Create the Provider
 
@@ -76,14 +76,14 @@ These log entries tell you exactly what the policy blocks and why.
 
 ## Step 4: Understand Why
 
-The default policy has a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries---typically `/usr/local/bin/claude` and `/usr/bin/node`. If opencode makes HTTP calls through a different binary (its own binary, `curl`, or a shell subprocess), those connections do not match any policy rule and get denied.
+The default policy has a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries, typically `/usr/local/bin/claude` and `/usr/bin/node`. If opencode makes HTTP calls through a different binary (its own binary, `curl`, or a shell subprocess), those connections do not match any policy rule and get denied.
 
 There are two separate problems:
 
-1. **opencode's own traffic.** opencode contacts `opencode.ai` for its API and `integrate.api.nvidia.com` for inference. Neither of these endpoints has a matching policy entry for the binaries opencode uses.
-2. **No opencode.ai endpoint.** The default policy has no entry for `opencode.ai` at all. Even if the binary matched, the destination is not listed.
+1. OpenCode's own traffic. opencode contacts `opencode.ai` for its API and `integrate.api.nvidia.com` for inference. Neither of these endpoints has a matching policy entry for the binaries opencode uses.
+2. No opencode.ai endpoint. The default policy has no entry for `opencode.ai` at all. Even if the binary matched, the destination is not listed.
 
-This is the expected behavior---NemoClaw denies by default. You need to write a policy that explicitly allows what opencode needs.
+This is the expected behavior. NemoClaw denies by default. You need to write a policy that explicitly allows what opencode needs.
 
 ## Step 5: Write a Custom Policy
 
@@ -184,13 +184,13 @@ network_policies:
 
 Compared to the default policy, this adds:
 
-- **`opencode_api`**---allows opencode and Node.js to reach `opencode.ai:443`
-- **Broader `nvidia_inference` binaries**---adds `/usr/local/bin/opencode`, `/usr/bin/curl`, and `/bin/bash` so opencode's subprocesses can reach the NVIDIA endpoint
-- **`inference.allowed_routes`**---includes `nvidia` so inference routing works for userland code
-- **GitHub access** scoped for opencode's git operations
+- `opencode_api`: allows opencode and Node.js to reach `opencode.ai:443`
+- Broader `nvidia_inference` binaries: adds `/usr/local/bin/opencode`, `/usr/bin/curl`, and `/bin/bash` so opencode's subprocesses can reach the NVIDIA endpoint
+- `inference.allowed_routes`: includes `nvidia` so inference routing works for userland code
+- GitHub access scoped for opencode's git operations
 
 :::{warning}
-The `filesystem_policy`, `landlock`, and `process` sections are static---they are set at sandbox creation time and cannot be changed on a running sandbox. If you need to modify these, you must delete and recreate the sandbox. The `network_policies` and `inference` sections are dynamic and can be hot-reloaded.
+The `filesystem_policy`, `landlock`, and `process` sections are static. They are set at sandbox creation time and cannot be changed on a running sandbox. If you need to modify these, you must delete and recreate the sandbox. The `network_policies` and `inference` sections are dynamic and can be hot-reloaded.
 :::
 
 ## Step 6: Push the Policy
@@ -213,7 +213,7 @@ The latest revision should show status `loaded`.
 
 ## Step 7: Set Up Inference Routing
 
-So far, you have allowed the opencode *agent* to reach `integrate.api.nvidia.com` directly through network policy. But what about code that opencode writes and runs inside the sandbox? If that code calls an LLM API, it goes through the privacy router---a separate mechanism.
+So far, you have allowed the opencode *agent* to reach `integrate.api.nvidia.com` directly through network policy. But what about code that opencode writes and runs inside the sandbox? If that code calls an LLM API, it goes through the privacy router: a separate mechanism.
 
 Create an inference route so userland code can access NVIDIA models:
 

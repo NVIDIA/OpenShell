@@ -11,10 +11,10 @@ The system has four core components.
 
 | Component | Role |
 |---|---|
-| **Gateway** | Control-plane API that coordinates sandbox lifecycle and state, acts as the auth boundary, and brokers requests across the platform. |
-| **Sandbox** | Isolated runtime that includes container supervision and general L7 egress routing. |
-| **Policy Engine** | Policy definition and enforcement layer for filesystem, network, and process constraints. Defense in depth enforces policies from the application layer down to infrastructure and kernel layers. |
-| **Privacy Router** | Privacy-aware LLM routing layer that keeps sensitive context on sandbox compute and routes based on cost/privacy policy. |
+| Gateway | Control-plane API that coordinates sandbox lifecycle and state, acts as the auth boundary, and brokers requests across the platform. |
+| Sandbox | Isolated runtime that includes container supervision and general L7 egress routing. |
+| Policy Engine | Policy definition and enforcement layer for filesystem, network, and process constraints. Defense in depth enforces policies from the application layer down to infrastructure and kernel layers. |
+| Privacy Router | Privacy-aware LLM routing layer that keeps sensitive context on sandbox compute and routes based on cost/privacy policy. |
 
 ## Component Diagram
 
@@ -68,11 +68,11 @@ The gateway is the central control-plane API. It coordinates sandbox lifecycle
 and state, acts as the auth boundary, and brokers all requests across the
 platform. It exposes a gRPC API consumed by the CLI and handles:
 
-- Sandbox lifecycle---creates, monitors, and deletes sandbox pods.
-- Provider storage---stores encrypted provider credentials.
-- Policy distribution---delivers policy YAML to sandboxes at startup and on
+- Sandbox lifecycle: creates, monitors, and deletes sandbox pods.
+- Provider storage: stores encrypted provider credentials.
+- Policy distribution: delivers policy YAML to sandboxes at startup and on
   hot-reload.
-- SSH termination---terminates SSH tunnels from the CLI and routes them to
+- SSH termination: terminates SSH tunnels from the CLI and routes them to
   the correct sandbox.
 
 The CLI never talks to sandbox pods directly. All commands go through the
@@ -89,14 +89,14 @@ process, an L7 proxy, and the agent.
 The supervisor is the sandbox's init process. It establishes all isolation
 boundaries before starting the agent:
 
-1. **Fetch credentials** from the gateway for all attached providers.
-2. **Set up the network namespace.** The sandbox gets its own network stack
+1. Fetch credentials from the gateway for all attached providers.
+2. Set up the network namespace. The sandbox gets its own network stack
    with no default route. All outbound traffic is redirected through the proxy.
-3. **Apply Landlock** filesystem restrictions based on the policy.
-4. **Apply seccomp** filters to restrict available system calls.
-5. **Start the L7 proxy** in the sandbox's network namespace.
-6. **Start the SSH server** for interactive access.
-7. **Start the agent** as a child process with credentials injected as
+3. Apply Landlock filesystem restrictions based on the policy.
+4. Apply seccomp filters to restrict available system calls.
+5. Start the L7 proxy in the sandbox's network namespace.
+6. Start the SSH server for interactive access.
+7. Start the agent as a child process with credentials injected as
    environment variables.
 
 ### L7 Proxy
@@ -104,11 +104,11 @@ boundaries before starting the agent:
 Every outbound TCP connection from any process in the sandbox is routed through
 the proxy. For each connection, the proxy:
 
-1. **Resolves the calling binary** through `/proc/<pid>/exe`, ancestor process
+1. Resolves the calling binary through `/proc/<pid>/exe`, ancestor process
    walking, and `/proc/<pid>/cmdline`.
-2. **Queries the policy engine** with the destination host, port, and resolved
+2. Queries the policy engine with the destination host, port, and resolved
    binary path.
-3. **Acts on the decision**---allow the connection directly, hand it to the
+3. Acts on the decision: allow the connection directly, hand it to the
    privacy router for inference routing, or deny it. Refer to
    [How the Proxy Evaluates Connections](../safety-and-privacy/network-access-rules.md#how-the-proxy-evaluates-connections)
    for the full decision model.

@@ -16,16 +16,16 @@ Each outbound connection resolves to one of three outcomes:
 
 | Outcome                | When it applies                                                              | What happens                                                                 |
 |------------------------|-----------------------------------------------------------------------------|-----------------------------------------------------------------------------|
-| **Allow**              | A `network_policies` entry matches the destination host *and* the calling binary. | Traffic flows directly to the destination. The agent's own API key is used. |
-| **InspectForInference**| No network policy matches, but `inference.allowed_routes` is configured.     | The proxy intercepts the connection and hands it to the privacy router, which reroutes it to a configured backend. The route's API key is used. |
-| **Deny**               | No network policy matches and no inference route applies.                    | The connection is blocked. The calling process receives a 403 or connection reset. |
+| Allow              | A `network_policies` entry matches the destination host *and* the calling binary. | Traffic flows directly to the destination. The agent's own API key is used. |
+| InspectForInference| No network policy matches, but `inference.allowed_routes` is configured.     | The proxy intercepts the connection and hands it to the privacy router, which reroutes it to a configured backend. The route's API key is used. |
+| Deny               | No network policy matches and no inference route applies.                    | The connection is blocked. The calling process receives a 403 or connection reset. |
 
 :::{note}
 This is the most important distinction in NemoClaw's network model.
 
-**Agent traffic** is the coding agent (Claude, opencode, Codex) calling its own API to get completions. This traffic matches a `network_policies` entry because the policy declares both the endpoint (for example, `api.anthropic.com:443`) and the binary (for example, `/usr/local/bin/claude`). The proxy allows it through directly. The agent's own API key (injected by the provider) is used as-is.
+Agent traffic is the coding agent (Claude, opencode, Codex) calling its own API to get completions. This traffic matches a `network_policies` entry because the policy declares both the endpoint (for example, `api.anthropic.com:443`) and the binary (for example, `/usr/local/bin/claude`). The proxy allows it through directly. The agent's own API key (injected by the provider) is used as-is.
 
-**Userland traffic** is code that the agent *writes* making inference calls. A Python script calling the OpenAI-compatible API, a data pipeline hitting an LLM endpoint, a test harness querying a model. This traffic does *not* match any network policy because the calling binary (`/usr/bin/python3`) is not listed in the agent's policy entry. The proxy intercepts it, the privacy router reroutes it to a configured backend, and the route's API key is substituted in. The agent's code never touches your real API key.
+Userland traffic is code that the agent *writes* making inference calls. A Python script calling the OpenAI-compatible API, a data pipeline hitting an LLM endpoint, a test harness querying a model. This traffic does *not* match any network policy because the calling binary (`/usr/bin/python3`) is not listed in the agent's policy entry. The proxy intercepts it, the privacy router reroutes it to a configured backend, and the route's API key is substituted in. The agent's code never touches your real API key.
 :::
 
 ```{mermaid}

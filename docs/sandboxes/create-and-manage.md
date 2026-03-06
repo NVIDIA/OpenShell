@@ -5,6 +5,8 @@
 
 # Create and Manage Sandboxes
 
+A NemoClaw sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+
 This page walks you through the full sandbox lifecycle: creating, inspecting, connecting to, monitoring, and deleting sandboxes.
 
 ## Sandbox Lifecycle
@@ -13,10 +15,10 @@ Every sandbox moves through a defined set of phases:
 
 | Phase | Description |
 |---|---|
-| **Provisioning** | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
-| **Ready** | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| **Error** | Something went wrong during provisioning or execution. Check logs with `nemoclaw sandbox logs` for details. |
-| **Deleting** | The sandbox is being torn down. The system releases resources and purges credentials. |
+| Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
+| Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
+| Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw sandbox logs` for details. |
+| Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
 ## The NemoClaw Runtime
 
@@ -24,7 +26,7 @@ Sandboxes run inside a lightweight runtime cluster that NemoClaw manages for
 you. The cluster runs as a [k3s](https://k3s.io/) Kubernetes distribution
 inside a Docker container on your machine.
 
-**You do not need to set this up manually.** The first time you run a command
+You do not need to set this up manually. The first time you run a command
 that needs a cluster (such as `nemoclaw sandbox create`), the CLI provisions
 one automatically. This is the "Runtime ready" line you see in the output.
 Subsequent commands reuse the existing cluster.
@@ -117,7 +119,7 @@ Export the sandbox SSH configuration and append it to your SSH config:
 $ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
-Then open VS Code, install the **Remote - SSH** extension if you have not
+Then open VS Code, install the Remote - SSH extension if you have not
 already, and connect to the host named `my-sandbox`.
 
 ## View Logs

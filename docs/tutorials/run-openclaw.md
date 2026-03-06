@@ -7,7 +7,7 @@
 
 This tutorial shows you how to launch a community sandbox using the `--from` flag. Community sandboxes are pre-built configurations published to the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) repository. They bundle a container image, a tailored policy, and optional skills into a single package you can run with one command.
 
-**What you will learn:**
+What you will learn:
 
 - What community sandboxes are and how they differ from default sandboxes
 - How the `--from` flag pulls and builds a complete sandbox configuration
@@ -17,9 +17,9 @@ This tutorial shows you how to launch a community sandbox using the `--from` fla
 
 Before you begin, make sure you have:
 
-- **Docker** running on your machine.
-- **NVIDIA GPU with drivers** installed. Required for GPU-accelerated workloads in the OpenClaw sandbox.
-- [**NemoClaw CLI** installed](../../index.md#install-the-nemoclaw-cli)
+- Docker running on your machine.
+- NVIDIA GPU with drivers installed. Required for GPU-accelerated workloads in the OpenClaw sandbox.
+- [NemoClaw CLI installed](../index.md#install-the-nemoclaw-cli)
 
 ## Step 1: Create a Sandbox from the Community Image
 
@@ -31,10 +31,10 @@ $ nemoclaw sandbox create --from openclaw --keep
 
 The `--from` flag tells the CLI to pull a sandbox definition from the NemoClaw Community catalog. Here is what happens:
 
-1. **Fetches the definition.** The CLI downloads the OpenClaw sandbox definition from the NemoClaw-Community repository. This includes a Dockerfile, a policy YAML, and any bundled skills.
-2. **Builds the image.** The CLI builds the Dockerfile locally using Docker. The image includes all tools and dependencies that OpenClaw needs.
-3. **Applies the bundled policy.** Instead of the generic default policy, the sandbox starts with a policy specifically written for the OpenClaw workload---it allows the endpoints and binaries that OpenClaw requires.
-4. **Creates and keeps the sandbox.** The `--keep` flag ensures the sandbox stays running after creation so you can connect and disconnect freely.
+1. Fetches the definition. The CLI downloads the OpenClaw sandbox definition from the NemoClaw-Community repository. This includes a Dockerfile, a policy YAML, and any bundled skills.
+2. Builds the image. The CLI builds the Dockerfile locally using Docker. The image includes all tools and dependencies that OpenClaw needs.
+3. Applies the bundled policy. Instead of the generic default policy, the sandbox starts with a policy specifically written for the OpenClaw workload. It allows the endpoints and binaries that OpenClaw requires.
+4. Creates and keeps the sandbox. The `--keep` flag ensures the sandbox stays running after creation so you can connect and disconnect freely.
 
 :::{note}
 The first build takes longer because Docker needs to pull base layers and install dependencies. Subsequent creates reuse the cached image.
@@ -64,10 +64,10 @@ $ nemoclaw sandbox policy get <name> --full
 
 This outputs the complete policy YAML, including:
 
-- **Network policies**---which hosts and ports the sandbox can reach, and which binaries are allowed to initiate those connections
-- **Filesystem policy**---which paths are read-only and which are read-write
-- **Process restrictions**---the user and group the sandbox runs as
-- **Inference rules**---which inference routing hints are allowed
+- Network policies: which hosts and ports the sandbox can reach, and which binaries are allowed to initiate those connections
+- Filesystem policy: which paths are read-only and which are read-write
+- Process restrictions: the user and group the sandbox runs as
+- Inference rules: which inference routing hints are allowed
 
 Reviewing the bundled policy is a good way to understand what a community sandbox has access to before you start using it for sensitive work.
 

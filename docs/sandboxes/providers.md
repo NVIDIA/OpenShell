@@ -114,14 +114,14 @@ flowchart LR
     D --> E["Credentials injected into\nagent process + SSH sessions"]
 ```
 
-1. **You create a provider** with credentials from your environment or
+1. You create a provider with credentials from your environment or
    specified explicitly.
-2. **You attach the provider to a sandbox** at creation time using the
+2. You attach the provider to a sandbox at creation time using the
    `--provider` flag (one or more providers can be attached).
-3. **The sandbox starts.** The supervisor process initializes.
-4. **The supervisor fetches credentials** from the NemoClaw gateway at runtime.
+3. The sandbox starts. The supervisor process initializes.
+4. The supervisor fetches credentials from the NemoClaw gateway at runtime.
    The system does not store credentials in the sandbox specification. It retrieves them on demand.
-5. **Credentials are injected** into the agent process as environment variables.
+5. Credentials are injected into the agent process as environment variables.
    They are also available in SSH sessions when you connect to the sandbox.
 
 :::{warning}
@@ -132,7 +132,23 @@ environment dumps of the container spec.
 
 ## Supported Provider Types
 
-For a list of supported provider types, refer to the [Support Matrix](../reference/support-matrix.md#supported-provider-types).
+The following provider types are supported.
+
+| Type | Environment Variables Injected | Typical Use |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
+| `codex` | `OPENAI_API_KEY` | OpenAI Codex |
+| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI |
+| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
+| `generic` | User-defined | Any service with custom credentials |
+| `outlook` | *(none: no auto-discovery)* | Microsoft Outlook integration |
+
+:::{tip}
+Use the `generic` type for any service not listed above. You define the
+environment variable names and values yourself with `--credential`.
+:::
 
 ## Next Steps
 

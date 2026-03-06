@@ -76,14 +76,14 @@ Claude Code works out of the box with the default policy.
 $ nemoclaw sandbox create --from openclaw
 ```
 
-The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog---a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
+The `--from` flag pulls from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog, which contains a collection of domain-specific sandbox images bundled with their own containers, policies, and skills.
 :::
 
 ::::
 
 The agent runs with filesystem, network, process, and inference protection active. Credentials stay inside the sandbox, network access follows your policy, and inference traffic remains private. A single YAML policy controls all four protection layers and is hot-reloadable on a running sandbox.
 
-For OpenCode or Codex, refer to the [](get-started/tutorials/run-opencode.md) tutorial for agent-specific setup.
+For OpenCode or Codex, refer to the [](tutorials/run-opencode.md) tutorial for agent-specific setup.
 
 ---
 
@@ -93,7 +93,7 @@ For OpenCode or Codex, refer to the [](get-started/tutorials/run-opencode.md) tu
 :gutter: 3
 
 :::{grid-item-card} Tutorials
-:link: get-started/tutorials/index
+:link: tutorials/run-claude
 :link-type: doc
 
 Step-by-step walkthroughs for Claude Code, OpenClaw, and OpenCode with NVIDIA inference.
@@ -158,15 +158,21 @@ CLI commands, policy schema, environment variables, and system architecture.
 :hidden:
 
 Get Started <self>
-get-started/tutorials/index
-release-notes
+```
+
+```{toctree}
+:caption: Tutorials
+:hidden:
+
+Run Claude Safely <tutorials/run-claude>
+Run OpenClaw Safely <tutorials/run-openclaw>
+Run OpenCode with NVIDIA Inference <tutorials/run-opencode>
 ```
 
 ```{toctree}
 :caption: Sandboxes
 :hidden:
 
-sandboxes/index
 sandboxes/create-and-manage
 sandboxes/providers
 sandboxes/custom-containers
@@ -189,27 +195,16 @@ safety-and-privacy/network-access-rules
 :hidden:
 
 inference/index
-inference/create-routes
-inference/manage-routes
-inference/connect-sandboxes
-```
-
-```{toctree}
-:caption: Observability
-:hidden:
-
-observability/logs
-observability/health
+inference/configure-routes
 ```
 
 ```{toctree}
 :caption: Reference
 :hidden:
 
-reference/support-matrix
+release-notes
 reference/cli
 reference/policy-schema
-reference/environment-variables
 reference/architecture
 ```
 
@@ -217,17 +212,12 @@ reference/architecture
 :caption: Troubleshooting
 :hidden:
 
-troubleshooting/cluster-issues
-troubleshooting/sandbox-issues
-troubleshooting/provider-issues
-troubleshooting/custom-container-issues
-troubleshooting/port-forwarding-issues
-troubleshooting/getting-more-information
+troubleshooting
 ```
 
 ```{toctree}
 :caption: Resources
 :hidden:
 
-resources/index
+resources/eula
 ```

@@ -15,11 +15,11 @@ $ nemoclaw term
 
 The status pane at the top of the dashboard displays the following sandbox metadata:
 
-- **Name** and **phase** (`Provisioning`, `Ready`, `Error`)
-- **Image** running in the sandbox
-- **Providers** attached and their available credentials
-- **Age** since creation
-- **Port forwards** currently active
+- Name and phase (`Provisioning`, `Ready`, `Error`)
+- Image running in the sandbox
+- Providers attached and their available credentials
+- Age since creation
+- Port forwards currently active
 
 A phase other than `Ready` indicates the sandbox is still initializing or has encountered an error. Inspect the logs pane for details.
 
@@ -29,8 +29,8 @@ The logs pane streams activity in real time. Outbound connections, policy decisi
 
 Log entries originate from two sources:
 
-- **sandbox**: The sandbox supervisor (proxy decisions, policy enforcement, SSH connections, process lifecycle).
-- **gateway**: The control plane (sandbox creation, phase changes, policy distribution).
+- sandbox: The sandbox supervisor (proxy decisions, policy enforcement, SSH connections, process lifecycle).
+- gateway: The control plane (sandbox creation, phase changes, policy distribution).
 
 Press `f` to enable follow mode and auto-scroll to new entries.
 
@@ -82,10 +82,10 @@ Check the log entry for the binary path, then update the `binaries` list in the 
 
 The dashboard provides filtering and navigation controls:
 
-- Press **`s`** to filter logs by source. Display only `sandbox` logs (policy decisions) or only `gateway` logs (lifecycle events).
-- Press **`f`** to toggle follow mode. Auto-scroll to the latest entries.
-- Press **`Enter`** on a log entry to open the detail view with the full message.
-- Use **`j`** / **`k`** to navigate up and down the log list.
+- Press `s` to filter logs by source. Display only `sandbox` logs (policy decisions) or only `gateway` logs (lifecycle events).
+- Press `f` to toggle follow mode. Auto-scroll to the latest entries.
+- Press `Enter` on a log entry to open the detail view with the full message.
+- Use `j` / `k` to navigate up and down the log list.
 
 ## Keyboard Shortcuts
 
@@ -105,6 +105,6 @@ The following keyboard shortcuts are available in the terminal dashboard.
 
 For deeper dives into topics covered by the terminal dashboard, refer to the following guides.
 
-- **Blocked connections**: Follow {doc}`../safety-and-privacy/policies` to pull the current policy, add the missing endpoint, and push an update without restarting the sandbox.
-- **Inference interception**: Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).
-- **General troubleshooting**: Refer to {doc}`../troubleshooting/cluster-issues` for common issues and diagnostics.
+- Blocked connections: Follow {doc}`../safety-and-privacy/policies` to pull the current policy, add the missing endpoint, and push an update without restarting the sandbox.
+- Inference interception: Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).
+- Troubleshooting: Refer to {doc}`../troubleshooting` for troubleshooting tips and diagnostics.

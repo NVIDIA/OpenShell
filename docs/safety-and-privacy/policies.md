@@ -92,7 +92,7 @@ $ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
 
 The `--keep` flag keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy.
 
-To avoid passing `--policy` every time, set a default policy by using environment variable:
+To avoid passing `--policy` every time, set a default policy with an environment variable:
 
 ```console
 $ export NEMOCLAW_SANDBOX_POLICY=./my-policy.yaml
@@ -231,10 +231,10 @@ Refer to the [Policy Schema Reference](../reference/policy-schema.md) for the co
 
 ## Safety Properties
 
-**Last-known-good.**
+Last-known-good.
 If a new policy revision fails validation, the previous successfully loaded policy stays active. A bad push does not break a running sandbox. The agent continues operating under the last good policy.
 
-**Idempotent.**
+Idempotent.
 Submitting the same policy content again does not create a new revision. The CLI detects that the content has not changed and returns without modifying the revision history.
 
 ## Next Steps

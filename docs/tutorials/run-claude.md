@@ -7,7 +7,7 @@
 
 This tutorial walks you through the simplest path to running Claude Code inside a NemoClaw sandbox. By the end, you will have an isolated environment with Claude Code running, your credentials securely injected, and a default policy controlling what the agent can access.
 
-**What you will learn:**
+What you will learn:
 
 - Creating a sandbox with a single command
 - How NemoClaw auto-discovers provider credentials
@@ -24,10 +24,10 @@ $ nemoclaw sandbox create -- claude
 
 This single command does several things:
 
-1. **Bootstraps the runtime.** If this is your first time using NemoClaw, the CLI provisions a local k3s cluster inside Docker and deploys the NemoClaw control plane. This happens once---subsequent commands reuse the existing cluster.
-2. **Auto-discovers credentials.** The CLI detects that `claude` is a recognized tool and looks for your Anthropic credentials. It reads the `ANTHROPIC_API_KEY` environment variable and creates a provider automatically.
-3. **Creates the sandbox.** The CLI provisions an isolated environment and applies the default policy. The policy allows Claude Code to reach `api.anthropic.com` and a small set of supporting endpoints while blocking everything else.
-4. **Drops you into the sandbox.** You land in an interactive SSH session inside the sandbox, ready to work.
+1. Bootstraps the runtime. If this is your first time using NemoClaw, the CLI provisions a local k3s cluster inside Docker and deploys the NemoClaw control plane. This happens once. Subsequent commands reuse the existing cluster.
+2. Auto-discovers credentials. The CLI detects that `claude` is a recognized tool and looks for your Anthropic credentials. It reads the `ANTHROPIC_API_KEY` environment variable and creates a provider automatically.
+3. Creates the sandbox. The CLI provisions an isolated environment and applies the default policy. The policy allows Claude Code to reach `api.anthropic.com` and a small set of supporting endpoints while blocking everything else.
+4. Drops you into the sandbox. You land in an interactive SSH session inside the sandbox, ready to work.
 
 :::{note}
 The first bootstrap takes a few minutes depending on your network speed. The CLI prints progress as each component starts. Subsequent sandbox creations are much faster.
@@ -48,7 +48,7 @@ $ echo $ANTHROPIC_API_KEY
 sk-ant-...
 ```
 
-The sandbox has a working directory at `/sandbox` where you can create and edit files. Claude Code has access to standard development tools---git, common language runtimes, and package managers---within the boundaries set by the policy.
+The sandbox has a working directory at `/sandbox` where you can create and edit files. Claude Code has access to standard development tools (git, common language runtimes, and package managers) within the boundaries set by the policy.
 
 ## Step 3: Check Sandbox Status
 
@@ -78,7 +78,7 @@ First, export the sandbox's SSH configuration:
 $ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
-Then open VS Code, install the **Remote - SSH** extension if you have not already, and connect to the host named `my-sandbox`. VS Code opens a full editor session inside the sandbox.
+Then open VS Code, install the Remote - SSH extension if you have not already, and connect to the host named `my-sandbox`. VS Code opens a full editor session inside the sandbox.
 
 :::{tip}
 Replace `my-sandbox` with the actual name of your sandbox. Run `nemoclaw sandbox list` to find it if you did not specify a name at creation time.

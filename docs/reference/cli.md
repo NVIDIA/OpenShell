@@ -157,7 +157,7 @@ entries, diagnose blocked connections, and interpret inference interception.
 
 ## Sandbox Name Fallback
 
-Commands that accept an optional `[name]` argument---`get`, `connect`, `sync`, and `logs`---fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect to a sandbox. When falling back, the CLI prints a hint showing which sandbox was selected.
+Commands that accept an optional `[name]` argument, such as `get`, `connect`, `sync`, and `logs`, fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect to a sandbox. When falling back, the CLI prints a hint showing which sandbox was selected.
 
 If no sandbox has been used yet and no name is provided, the command exits with an error prompting you to specify a name.
 

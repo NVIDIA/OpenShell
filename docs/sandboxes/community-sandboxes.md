@@ -49,14 +49,14 @@ preconfigured by the community package.
 
 The `--from` flag also accepts:
 
-- **Local directory paths**: Point to a directory on disk that contains a
+- Local directory paths: Point to a directory on disk that contains a
   Dockerfile and optional policy/skills:
 
   ```console
   $ nemoclaw sandbox create --from ./my-sandbox-dir
   ```
 
-- **Container image references**: Use an existing container image directly:
+- Container image references: Use an existing container image directly:
 
   ```console
   $ nemoclaw sandbox create --from my-registry.example.com/my-image:latest
