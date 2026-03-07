@@ -175,7 +175,7 @@ Forward proxy mode is restricted to private IP endpoints that are explicitly
 allowed by policy. Plain HTTP traffic never reaches the public internet. All
 three conditions must be true:
 
-1. The OPA policy explicitly allows the destination.
+1. The network policy explicitly allows the destination.
 2. The matched endpoint has `allowed_ips` configured.
 3. All resolved IP addresses are RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`).
 
@@ -287,3 +287,4 @@ network_policies:
 ## Next Steps
 
 - [Write Sandbox Policies](policies.md): The full iterative workflow for authoring, testing, and updating policies.
+- {doc}`security-model`: Threat scenarios and how the four protection layers work together.

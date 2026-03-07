@@ -47,3 +47,4 @@ with `nemoclaw gateway select <name>`. Refer to the
 - [Providers](providers.md): Create and attach credential providers.
 - [Custom Containers](custom-containers.md): Build and run your own container image.
 - [Community Sandboxes](community-sandboxes.md): Use pre-built sandboxes from the community catalog.
+- [Terminal](terminal.md): Monitor sandbox status and live activity in a dashboard.

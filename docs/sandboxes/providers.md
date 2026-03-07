@@ -146,7 +146,7 @@ The following provider types are supported.
 |---|---|---|
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
-| `OpenCode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
+| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |

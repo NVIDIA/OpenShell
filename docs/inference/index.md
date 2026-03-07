@@ -11,20 +11,20 @@ to backends you control.
 
 :::{note}
 Inference routing applies to userland traffic: code that the agent writes
-or runs, not the agent itself. The agent's own API calls (e.g., Claude calling
-`api.anthropic.com`) go direct via network policy. See
+or runs, not the agent itself. The agent's own API calls (for example, Claude calling
+`api.anthropic.com`) go directly through network policy. Refer to
 {doc}`/safety-and-privacy/network-access-rules` for the distinction.
 :::
 
 ## How It Works
 
-When userland code inside a sandbox makes an API call (e.g., using the OpenAI
+When userland code inside a sandbox makes an API call (for example, using the OpenAI
 or Anthropic SDK), the request flows through the sandbox proxy. If the
 destination does not match any explicit network policy but the sandbox has
 inference routes configured, the proxy:
 
 1. TLS-terminates the connection using the sandbox's ephemeral CA.
-2. Detects the inference API pattern (e.g., `POST /v1/chat/completions`).
+2. Detects the inference API pattern (for example, `POST /v1/chat/completions`).
 3. Strips authorization headers and forwards to a matching backend.
 4. Rewrites the authorization with the route's API key and model ID.
 5. Returns the response to the agent's code. The agent sees a normal HTTP
@@ -79,5 +79,5 @@ If an intercepted request does not match any known pattern, it is denied.
 ## Next Steps
 
 - {doc}`configure-routes`: create and manage inference routes.
-- {doc}`/safety-and-privacy/network-access-rules`: understand agent traffic vs.
+- {doc}`/safety-and-privacy/network-access-rules`: understand agent traffic compared to
   userland traffic.

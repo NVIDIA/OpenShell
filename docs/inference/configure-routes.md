@@ -5,10 +5,10 @@
 
 # Configure Inference Routes
 
-This guide covers how to create and manage inference routes so that sandboxes can route AI API calls from userland code to policy-controlled backends. You will learn to create routes, connect them to sandboxes via policy, and manage routes across a cluster.
+This guide covers how to create and manage inference routes so that sandboxes can route AI API calls from userland code to policy-controlled backends. You will learn to create routes, connect them to sandboxes through policy, and manage routes across a cluster.
 
 :::{note}
-Inference routes are for *userland code*, which are scripts and programs that the agent writes and executes inside the sandbox. The agent's own API traffic flows directly through network policies, not through inference routing. See {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic and userland traffic.
+Inference routes are for *userland code*, which are scripts and programs that the agent writes and executes inside the sandbox. The agent's own API traffic flows directly through network policies, not through inference routing. Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic and userland traffic.
 :::
 
 ## Create a Route
@@ -23,7 +23,7 @@ $ nemoclaw inference create \
     --api-key sk-abc123
 ```
 
-This creates a route named after the routing hint. Any sandbox whose policy includes `local` in its `inference.allowed_routes` list can use this route. If you omit `--protocol`, the CLI probes the endpoint and auto-detects the supported protocol (see [Supported API Patterns](index.md#supported-api-patterns)). See the [CLI Reference](../reference/cli.md#inference-create-flags) for all flags.
+This creates a route named after the routing hint. Any sandbox whose policy includes `local` in its `inference.allowed_routes` list can use this route. If you omit `--protocol`, the CLI probes the endpoint and auto-detects the supported protocol (refer to [Supported API Patterns](index.md#supported-api-patterns)). Refer to the [CLI Reference](../reference/cli.md#inference-create-flags) for all flags.
 
 ## Manage Routes
 

@@ -78,7 +78,7 @@ Optional files:
 - Startup scripts: Any scripts the Dockerfile or entrypoint invokes
 
 To contribute, fork the repository, add your sandbox directory, and open a pull
-request. See the repository's
+request. Refer to the repository's
 [CONTRIBUTING.md](https://github.com/NVIDIA/NemoClaw-Community/blob/main/CONTRIBUTING.md)
 for submission guidelines.
 

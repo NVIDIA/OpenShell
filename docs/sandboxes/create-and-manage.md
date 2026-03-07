@@ -26,7 +26,7 @@ The CLI bootstraps the runtime (if this is your first run), discovers your
 credentials, applies the default policy, and drops you into the sandbox.
 
 You can customize creation with flags like `--name`, `--provider`, `--policy`,
-`--upload`, `--keep`, `--forward`, and `--from`. See the
+`--upload`, `--keep`, `--forward`, and `--from`. Refer to the
 [CLI Reference](../reference/cli.md) for the full flag list.
 
 A fully specified creation command might look like:
