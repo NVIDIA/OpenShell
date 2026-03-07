@@ -17,7 +17,7 @@ This tutorial walks you through a realistic setup where you run [OpenCode](https
 
 ## Prerequisites
 
-- Meet the prerequisites in the [Quickstart](quickstart.md).
+- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
 - `NVIDIA_API_KEY` environment variable set on your host machine with a valid NVIDIA API key.
 
 ## Create the Provider

@@ -15,7 +15,7 @@ This tutorial shows you how to launch a sandbox with OpenClaw from the [NemoClaw
 
 ## Prerequisites
 
-- Meet the prerequisites in the [Quickstart](quickstart.md).
+- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
 - NVIDIA GPU with drivers installed. OpenClaw requires GPU acceleration.<!--Need to specify the NVIDIA GPU driver version or add reference link-->
 
 ## Create the Sandbox

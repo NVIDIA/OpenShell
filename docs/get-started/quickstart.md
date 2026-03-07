@@ -71,12 +71,14 @@ The `--from` flag pulls a pre-built sandbox definition from the [NemoClaw Commun
 
 ## What Happens Behind the Scenes
 
-When you create a sandbox, NemoClaw activates four protection layers:
+When you create a sandbox, NemoClaw activates the following protection layers.
 
-- **Filesystem isolation.** The agent can only read and write paths that the policy explicitly permits.
-- **Network enforcement.** Outbound connections are denied by default. The policy allowlists specific hosts, ports, and binaries.
-- **Process restrictions.** The agent runs as a non-root user inside the container.
-- **Inference privacy.** LLM API traffic is routed through a privacy-aware proxy. Credentials never leak outside the sandbox.
+| Protection Layer        | Description                                                                                   |
+|------------------------|-----------------------------------------------------------------------------------------------|
+| Filesystem isolation   | The agent can only read and write paths that the policy explicitly permits.                   |
+| Network enforcement    | Outbound connections are denied by default. The policy allowlists specific hosts, ports, and binaries. |
+| Process restrictions   | The agent runs as a non-root user inside the container.                                       |
+| Inference privacy     | LLM API traffic is routed through a privacy-aware proxy. Credentials never leak outside the sandbox. |
 
 A single YAML policy file controls all four layers. You can hot-reload network and inference rules on a running sandbox without restarting it.
 

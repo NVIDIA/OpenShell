@@ -16,7 +16,7 @@ This tutorial walks you through the path to running Claude Code inside a NemoCla
 
 ## Prerequisites
 
-- Meet the prerequisites in the [Quickstart](quickstart.md).
+- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
 - `ANTHROPIC_API_KEY` environment variable set on your host machine.
 
 ## Create the Sandbox
@@ -59,17 +59,17 @@ The sandbox provides a working directory at `/sandbox` where you can create and 
 
 Open a second terminal on your host machine to inspect the sandbox from outside.
 
-List all sandboxes:
+1. In the second terminal, list all sandboxes:
 
-```console
-$ nemoclaw sandbox list
-```
+    ```console
+    $ nemoclaw sandbox list
+    ```
 
-Launch the NemoClaw Terminal for a live dashboard that shows sandbox status, active network connections, and policy decisions in real time:
+2. Launch the NemoClaw Terminal for a live dashboard that shows sandbox status, active network connections, and policy decisions in real time:
 
-```console
-$ nemoclaw term
-```
+    ```console
+    $ nemoclaw term
+    ```
 
 ## Connect from VS Code (Optional)
 
