@@ -74,7 +74,7 @@ $ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
 Or, if the sandbox is already running, push an updated policy:
 
 ```console
-$ nemoclaw sandbox policy set <name> --policy ./my-policy.yaml --wait
+$ nemoclaw policy set <name> --policy ./my-policy.yaml --wait
 ```
 
 The `inference` section is a dynamic field, so you can add or remove routing hints on a running sandbox without recreating it.

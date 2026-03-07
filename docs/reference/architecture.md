@@ -182,7 +182,7 @@ shared team environments or running sandboxes on machines with more resources.
 ### Deploy
 
 ```console
-$ nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa
+$ nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 The CLI connects to the remote machine over SSH, installs k3s, deploys the
@@ -194,7 +194,7 @@ needs Docker installed.
 After deploying to a remote host, set up a tunnel for CLI access:
 
 ```console
-$ nemoclaw cluster admin tunnel
+$ nemoclaw gateway tunnel
 ```
 
 This establishes an SSH tunnel from your local machine to the remote cluster's

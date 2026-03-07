@@ -13,20 +13,20 @@ Troubleshoot problems with deploying, connecting to, and running NemoClaw cluste
 
 ### Cluster Deploy Fails
 
-**Symptom:** `nemoclaw cluster admin deploy` exits with an error.
+**Symptom:** `nemoclaw gateway start` exits with an error.
 
 **Check:**
 1. Is Docker running? The cluster requires Docker to be active.
 2. Is the port already in use? Try a different port: `--port 8081`.
-3. Does a stale container exist? Destroy and redeploy: `nemoclaw cluster admin destroy && nemoclaw cluster admin deploy`.
+3. Does a stale container exist? Destroy and redeploy: `nemoclaw gateway destroy && nemoclaw gateway start`.
 
 ### Cluster Not Reachable
 
-**Symptom:** `nemoclaw cluster status` fails to connect.
+**Symptom:** `nemoclaw status` fails to connect.
 
 **Check:**
 1. Is the cluster container running? `docker ps | grep nemoclaw`.
-2. Was the cluster stopped? Redeploy: `nemoclaw cluster admin deploy`.
+2. Was the cluster stopped? Redeploy: `nemoclaw gateway start`.
 3. For remote clusters, is the SSH connection working?
 
 ### Health Check Fails During Deploy
@@ -47,7 +47,7 @@ Troubleshoot problems with creating, connecting to, and configuring sandboxes.
 **Symptom:** Sandbox shows `Provisioning` status and does not become `Ready`.
 
 **Check:**
-1. View sandbox logs: `nemoclaw sandbox logs <name> --source gateway`.
+1. View sandbox logs: `nemoclaw logs <name> --source gateway`.
 2. Check if the container image can be pulled.
 3. For custom images, verify the image was pushed: `nemoclaw sandbox image push`.
 
@@ -64,18 +64,18 @@ Troubleshoot problems with creating, connecting to, and configuring sandboxes.
 **Symptom:** The agent cannot reach a remote host.
 
 **Check:**
-1. Stream sandbox logs: `nemoclaw sandbox logs <name> --tail --source sandbox`.
+1. Stream sandbox logs: `nemoclaw logs <name> --tail --source sandbox`.
 2. Look for `deny` actions. They include the destination, binary, and reason.
 3. Update the policy to allow the blocked endpoint. Refer to [Policy Iteration Loop](safety-and-privacy/policies.md#the-policy-iteration-loop).
 
 ### Policy Update Fails
 
-**Symptom:** `nemoclaw sandbox policy set` returns an error or the status shows `failed`.
+**Symptom:** `nemoclaw policy set` returns an error or the status shows `failed`.
 
 **Check:**
 1. Are you changing a static field? `filesystem_policy`, `landlock`, and `process` cannot change after creation.
 2. Are you adding/removing `network_policies` to change the network mode? This is not allowed. The mode is fixed at creation.
-3. Check the error message in `nemoclaw sandbox policy list <name>`.
+3. Check the error message in `nemoclaw policy list <name>`.
 
 ## Provider Issues
 
@@ -121,15 +121,15 @@ Troubleshoot problems with forwarding local ports into sandbox services.
 **Symptom:** `localhost:<port>` does not connect to the sandbox service.
 
 **Check:**
-1. Is the forward running? `nemoclaw sandbox forward list`.
+1. Is the forward running? `nemoclaw forward list`.
 2. Is the service listening on that port inside the sandbox?
 3. Is the sandbox still in `Ready` state?
-4. Try stopping and restarting: `nemoclaw sandbox forward stop <port> <name> && nemoclaw sandbox forward start <port> <name> -d`.
+4. Try stopping and restarting: `nemoclaw forward stop <port> <name> && nemoclaw forward start <port> <name> -d`.
 
 ## Getting More Information
 
 Use these techniques to gather additional diagnostic detail when troubleshooting.
 
 - Increase CLI verbosity: `nemoclaw -vvv <command>` for trace-level output.
-- View gateway-side logs: `nemoclaw sandbox logs <name> --source gateway`.
-- View sandbox-side logs: `nemoclaw sandbox logs <name> --source sandbox --level debug`.
+- View gateway-side logs: `nemoclaw logs <name> --source gateway`.
+- View sandbox-side logs: `nemoclaw logs <name> --source sandbox --level debug`.

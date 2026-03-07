@@ -26,7 +26,7 @@ The CLI bootstraps the runtime (if this is your first run), discovers your
 credentials, applies the default policy, and drops you into the sandbox.
 
 You can customize creation with flags like `--name`, `--provider`, `--policy`,
-`--sync`, `--keep`, `--forward`, and `--from`. See the
+`--upload`, `--keep`, `--forward`, and `--from`. See the
 [CLI Reference](../reference/cli.md) for the full flag list.
 
 A fully specified creation command might look like:
@@ -36,7 +36,7 @@ $ nemoclaw sandbox create \
     --name dev \
     --provider my-claude \
     --policy policy.yaml \
-    --sync \
+    --upload \
     --keep \
     -- claude
 ```
@@ -93,14 +93,14 @@ Stream and filter sandbox logs to monitor agent activity and diagnose policy dec
 Stream sandbox logs:
 
 ```console
-$ nemoclaw sandbox logs my-sandbox
+$ nemoclaw logs my-sandbox
 ```
 
 Use flags to filter and follow output:
 
 | Flag | Purpose | Example |
 |---|---|---|
-| `--tail` | Stream logs in real time | `nemoclaw sandbox logs my-sandbox --tail` |
+| `--tail` | Stream logs in real time | `nemoclaw logs my-sandbox --tail` |
 | `--source` | Filter by log source | `--source sandbox` |
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
@@ -108,7 +108,7 @@ Use flags to filter and follow output:
 Combine flags to narrow in on what you need:
 
 ```console
-$ nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn --since 5m
+$ nemoclaw logs my-sandbox --tail --source sandbox --level warn --since 5m
 ```
 
 :::{tip}
@@ -117,24 +117,24 @@ run `nemoclaw term`. Refer to {doc}`terminal` for details on reading log entries
 diagnosing blocked connections.
 :::
 
-## Sync Files
+## Transfer Files
 
 Transfer files between your host machine and a running sandbox.
 
-Push files from your host into the sandbox:
+Upload files from your host into the sandbox:
 
 ```console
-$ nemoclaw sandbox sync my-sandbox --up ./src /sandbox/src
+$ nemoclaw sandbox upload my-sandbox ./src /sandbox/src
 ```
 
-Pull files from the sandbox to your host:
+Download files from the sandbox to your host:
 
 ```console
-$ nemoclaw sandbox sync my-sandbox --down /sandbox/output ./local
+$ nemoclaw sandbox download my-sandbox /sandbox/output ./local
 ```
 
 :::{note}
-You can also sync files at creation time with the `--sync` flag on
+You can also upload files at creation time with the `--upload` flag on
 `nemoclaw sandbox create`.
 :::
 
@@ -144,25 +144,25 @@ Forward a port from the sandbox to your host machine. This runs in the
 foreground by default:
 
 ```console
-$ nemoclaw sandbox forward start 8080 my-sandbox
+$ nemoclaw forward start 8080 my-sandbox
 ```
 
 Add `-d` to run the forward in the background:
 
 ```console
-$ nemoclaw sandbox forward start 8080 my-sandbox -d
+$ nemoclaw forward start 8080 my-sandbox -d
 ```
 
 List active port forwards:
 
 ```console
-$ nemoclaw sandbox forward list
+$ nemoclaw forward list
 ```
 
 Stop a port forward:
 
 ```console
-$ nemoclaw sandbox forward stop 8080 my-sandbox
+$ nemoclaw forward stop 8080 my-sandbox
 ```
 
 :::{note}

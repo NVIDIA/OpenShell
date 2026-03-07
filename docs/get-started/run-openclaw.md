@@ -56,7 +56,7 @@ The sandbox comes pre-configured for the OpenClaw workload. The tools, runtimes,
 To see exactly what the sandbox is allowed to do, pull the full policy:
 
 ```console
-$ nemoclaw sandbox policy get <sandbox-name> --full
+$ nemoclaw policy get <sandbox-name> --full
 ```
 
 This outputs the complete policy YAML. Review it to understand the sandbox's permissions:
@@ -72,7 +72,7 @@ Reviewing the bundled policy is a good practice before you use a community sandb
 Save the policy to a file for reference or as a starting point for customization:
 
 ```console
-$ nemoclaw sandbox policy get <name> --full > openclaw-policy.yaml
+$ nemoclaw policy get <name> --full > openclaw-policy.yaml
 ```
 :::
 

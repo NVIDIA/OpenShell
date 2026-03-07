@@ -39,7 +39,7 @@ $ nemoclaw sandbox create --from my-registry.example.com/my-image:latest --keep 
 If your container runs a service, forward the port to your host:
 
 ```console
-$ nemoclaw sandbox forward start 8080 my-app -d
+$ nemoclaw forward start 8080 my-app -d
 ```
 
 The `-d` flag runs the forward in the background so you can continue using

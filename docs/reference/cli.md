@@ -11,33 +11,32 @@ Complete command reference for the `nemoclaw` CLI. Every subcommand, flag, and o
 
 ```text
 nemoclaw
-├── cluster
-│   ├── status
-│   ├── use <name>
-│   ├── list
-│   └── admin
-│       ├── deploy
-│       ├── stop
-│       ├── destroy
-│       ├── info
-│       └── tunnel
+├── status
+├── logs [name]
+├── forward
+│   ├── start <port> <name>
+│   ├── stop <port> <name>
+│   └── list
+├── policy
+│   ├── set <name>
+│   ├── get <name>
+│   └── list <name>
+├── gateway
+│   ├── start
+│   ├── stop
+│   ├── destroy
+│   ├── info
+│   ├── tunnel
+│   └── select [name]
 ├── sandbox
 │   ├── create
 │   ├── get [name]
 │   ├── list
 │   ├── delete <name...>
 │   ├── connect [name]
-│   ├── sync [name]
-│   ├── logs [name]
-│   ├── ssh-config <name>
-│   ├── forward
-│   │   ├── start <port> <name>
-│   │   ├── stop <port> <name>
-│   │   └── list
-│   └── policy
-│       ├── set <name>
-│       ├── get <name>
-│       └── list <name>
+│   ├── upload [name]
+│   ├── download [name]
+│   └── ssh-config <name>
 ├── provider
 │   ├── create
 │   ├── get <name>
@@ -53,20 +52,34 @@ nemoclaw
 └── completions <shell>
 ```
 
-## Cluster Commands
+## Top-Level Commands
+
+Commands available directly under `nemoclaw` for common operations.
+
+| Command | Description |
+|---|---|
+| `nemoclaw status` | Show the health and status of the active gateway. |
+| `nemoclaw logs [name]` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. When name is omitted, uses the last-used sandbox. |
+| `nemoclaw forward start <port> <name>` | Forward a sandbox port to the host. Add `-d` for background mode. |
+| `nemoclaw forward stop <port> <name>` | Stop an active port forward. |
+| `nemoclaw forward list` | List all active port forwards. |
+| `nemoclaw policy set <name>` | Apply or update a policy on a running sandbox. Pass `--policy <file>`. |
+| `nemoclaw policy get <name>` | Show the active policy for a sandbox. Add `--full` for the complete policy with metadata. |
+| `nemoclaw policy list <name>` | List all policy versions applied to a sandbox, with status. |
+
+## Gateway Commands
 
 Manage the NemoClaw runtime cluster.
 
 | Command | Description |
 |---|---|
-| `nemoclaw cluster status` | Show the health and status of the active cluster. |
-| `nemoclaw cluster use <name>` | Set the active cluster. All subsequent commands target this cluster. |
-| `nemoclaw cluster list` | List all registered clusters. |
-| `nemoclaw cluster admin deploy` | Deploy a new cluster. Add `--remote user@host` for remote deployment. |
-| `nemoclaw cluster admin stop` | Stop the active cluster, preserving state. |
-| `nemoclaw cluster admin destroy` | Permanently remove the cluster and all its data. |
-| `nemoclaw cluster admin info` | Show detailed information about the cluster. |
-| `nemoclaw cluster admin tunnel` | Set up a kubectl tunnel to a remote cluster. |
+| `nemoclaw gateway start` | Deploy a new cluster. Add `--remote user@host` for remote deployment. |
+| `nemoclaw gateway stop` | Stop the active cluster, preserving state. |
+| `nemoclaw gateway destroy` | Permanently remove the cluster and all its data. |
+| `nemoclaw gateway info` | Show detailed information about the cluster. |
+| `nemoclaw gateway tunnel` | Set up a kubectl tunnel to a remote cluster. |
+| `nemoclaw gateway select <name>` | Set the active cluster. All subsequent commands target this cluster. |
+| `nemoclaw gateway select` | List all registered clusters (when called without a name). |
 
 ## Sandbox Commands
 
@@ -79,15 +92,9 @@ Create and manage isolated agent execution environments.
 | `nemoclaw sandbox list` | List all sandboxes in the active cluster. |
 | `nemoclaw sandbox delete <name...>` | Delete one or more sandboxes by name. |
 | `nemoclaw sandbox connect [name]` | Open an interactive SSH session into a running sandbox. When name is omitted, reconnects to the last-used sandbox. |
-| `nemoclaw sandbox sync [name]` | Sync files between host and sandbox. Use `--up` or `--down`. When name is omitted, uses the last-used sandbox. |
-| `nemoclaw sandbox logs [name]` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. When name is omitted, uses the last-used sandbox. |
+| `nemoclaw sandbox upload [name]` | Upload files from the host into a sandbox. When name is omitted, uses the last-used sandbox. |
+| `nemoclaw sandbox download [name]` | Download files from a sandbox to the host. When name is omitted, uses the last-used sandbox. |
 | `nemoclaw sandbox ssh-config <name>` | Print SSH config for a sandbox. Append to `~/.ssh/config` for VS Code Remote-SSH. |
-| `nemoclaw sandbox forward start <port> <name>` | Forward a sandbox port to the host. Add `-d` for background mode. |
-| `nemoclaw sandbox forward stop <port> <name>` | Stop an active port forward. |
-| `nemoclaw sandbox forward list` | List all active port forwards. |
-| `nemoclaw sandbox policy set <name>` | Apply or update a policy on a running sandbox. Pass `--policy <file>`. |
-| `nemoclaw sandbox policy get <name>` | Show the active policy for a sandbox. Add `--full` for the complete policy with metadata. |
-| `nemoclaw sandbox policy list <name>` | List all policy versions applied to a sandbox, with status. |
 
 ### Sandbox Create Flags
 
@@ -96,7 +103,7 @@ Create and manage isolated agent execution environments.
 | `--name` | Assign a human-readable name to the sandbox. Auto-generated if omitted. |
 | `--provider` | Attach a credential provider. Repeatable for multiple providers. |
 | `--policy` | Path to a policy YAML file to apply at creation time. |
-| `--sync` | Sync local files into the sandbox before running. |
+| `--upload` | Upload local files into the sandbox before running. |
 | `--keep` | Keep the sandbox alive after the trailing command exits. |
 | `--forward` | Forward a local port into the sandbox at startup. |
 | `--from` | Build from a community sandbox name, local Dockerfile directory, or container image reference. |
@@ -157,7 +164,7 @@ entries, diagnose blocked connections, and interpret inference interception.
 
 ## Sandbox Name Fallback
 
-Commands that accept an optional `[name]` argument, such as `get`, `connect`, `sync`, and `logs`, fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect to a sandbox. When falling back, the CLI prints a hint showing which sandbox was selected.
+Commands that accept an optional `[name]` argument, such as `get`, `connect`, `upload`, `download`, and `logs`, fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect to a sandbox. When falling back, the CLI prints a hint showing which sandbox was selected.
 
 If no sandbox has been used yet and no name is provided, the command exits with an error prompting you to specify a name.
 
@@ -165,7 +172,7 @@ If no sandbox has been used yet and no name is provided, the command exits with 
 
 | Variable | Description |
 |---|---|
-| `NEMOCLAW_CLUSTER` | Name of the cluster to operate on. Overrides the active cluster set by `nemoclaw cluster use`. |
+| `NEMOCLAW_CLUSTER` | Name of the cluster to operate on. Overrides the active cluster set by `nemoclaw gateway select`. |
 | `NEMOCLAW_SANDBOX_POLICY` | Default path to a policy YAML file. When set, `nemoclaw sandbox create` uses this policy if no `--policy` flag is provided. |
 
 ## Shell Completions
@@ -193,5 +200,5 @@ Every command and subcommand includes built-in help. Use `--help` at any level t
 $ nemoclaw --help
 $ nemoclaw sandbox --help
 $ nemoclaw sandbox create --help
-$ nemoclaw cluster admin --help
+$ nemoclaw gateway --help
 ```

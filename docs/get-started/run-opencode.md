@@ -53,7 +53,7 @@ Try using OpenCode inside the sandbox. You will find that calls to NVIDIA infere
 Open a second terminal and check the logs:
 
 ```console
-$ nemoclaw sandbox logs opencode-sandbox --tail
+$ nemoclaw logs opencode-sandbox --tail
 ```
 
 Alternatively, launch the NemoClaw Terminal for a live view:
@@ -196,7 +196,7 @@ The `filesystem_policy`, `landlock`, and `process` sections are static. They are
 Push your custom policy to the running sandbox:
 
 ```console
-$ nemoclaw sandbox policy set opencode-sandbox --policy opencode-policy.yaml --wait
+$ nemoclaw policy set opencode-sandbox --policy opencode-policy.yaml --wait
 ```
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded.
@@ -204,7 +204,7 @@ The `--wait` flag blocks until the sandbox confirms the policy is loaded.
 Verify the policy revision was accepted:
 
 ```console
-$ nemoclaw sandbox policy list opencode-sandbox
+$ nemoclaw policy list opencode-sandbox
 ```
 
 The latest revision should show status `loaded`.
@@ -234,12 +234,12 @@ The policy you wrote earlier already includes `nvidia` in `inference.allowed_rou
 Tail the logs again:
 
 ```console
-$ nemoclaw sandbox logs opencode-sandbox --tail
+$ nemoclaw logs opencode-sandbox --tail
 ```
 
 You should no longer see `action=deny` lines for the endpoints you added. Connections to `opencode.ai`, `integrate.api.nvidia.com`, and GitHub should show `action=allow`.
 
-If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `nemoclaw sandbox policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in NemoClaw.
+If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `nemoclaw policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in NemoClaw.
 
 ## Clean Up
 

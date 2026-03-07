@@ -74,7 +74,7 @@ NemoClaw works in the following way:
 
 ## Remote Deployment
 
-NemoClaw can also run on a remote host. Deploy with `nemoclaw cluster admin deploy --remote user@host`, then set up a tunnel with `nemoclaw cluster admin tunnel`. The architecture is identical—only the Docker container location changes.
+NemoClaw can also run on a remote host. Deploy with `nemoclaw gateway start --remote user@host`, then set up a tunnel with `nemoclaw gateway tunnel`. The architecture is identical—only the Docker container location changes.
 
 ---
 

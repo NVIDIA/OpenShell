@@ -135,7 +135,7 @@ $ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
 In a second terminal, tail the sandbox logs and look for `action: deny` entries:
 
 ```console
-$ nemoclaw sandbox logs <name> --tail --source sandbox
+$ nemoclaw logs <name> --tail --source sandbox
 ```
 
 Each deny entry shows the blocked host, port, calling binary, and reason. This tells you exactly what the agent tried to reach and why it was blocked.
@@ -155,7 +155,7 @@ push an updated policy without leaving the terminal.
 Export the running policy to a file:
 
 ```console
-$ nemoclaw sandbox policy get <name> --full > current-policy.yaml
+$ nemoclaw policy get <name> --full > current-policy.yaml
 ```
 
 :::{warning}
@@ -175,7 +175,7 @@ Edit `current-policy.yaml` to address the denied actions you observed. Common ch
 ### Step 5: Push the Updated Policy
 
 ```console
-$ nemoclaw sandbox policy set <name> --policy current-policy.yaml --wait
+$ nemoclaw policy set <name> --policy current-policy.yaml --wait
 ```
 
 The `--wait` flag blocks until the policy engine processes the update. Exit codes:
@@ -189,7 +189,7 @@ The `--wait` flag blocks until the policy engine processes the update. Exit code
 ### Step 6: Verify the New Revision Loaded
 
 ```console
-$ nemoclaw sandbox policy list <name>
+$ nemoclaw policy list <name>
 ```
 
 Check that the latest revision shows status `loaded`. If it shows `failed`, review the error message and go back to Step 4.
@@ -203,13 +203,13 @@ Return to Step 2. Monitor logs, observe new denied actions (or confirm everythin
 Every `policy set` creates a new revision. You can inspect the full revision history:
 
 ```console
-$ nemoclaw sandbox policy list <name> --limit 50
+$ nemoclaw policy list <name> --limit 50
 ```
 
 To retrieve a specific revision:
 
 ```console
-$ nemoclaw sandbox policy get <name> --rev 3 --full
+$ nemoclaw policy get <name> --rev 3 --full
 ```
 
 ### Revision Statuses

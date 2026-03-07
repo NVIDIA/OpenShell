@@ -15,7 +15,7 @@ Every sandbox moves through a defined set of phases:
 |---|---|
 | Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
 | Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw sandbox logs` for details. |
+| Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
 ## The NemoClaw Runtime
@@ -33,13 +33,13 @@ For teams or when you need more resources, you can deploy the cluster to a
 remote host instead of your local machine:
 
 ```console
-$ nemoclaw cluster admin deploy --remote user@host
+$ nemoclaw gateway start --remote user@host
 ```
 
 Refer to [Remote Deployment](../about/architecture.md) for
 details. If you have multiple clusters (local and remote), switch between them
-with `nemoclaw cluster use <name>`. Refer to the
-[CLI Reference](../reference/cli.md#cluster-commands) for the full command set.
+with `nemoclaw gateway select <name>`. Refer to the
+[CLI Reference](../reference/cli.md#gateway-commands) for the full command set.
 
 ## Next Steps
 

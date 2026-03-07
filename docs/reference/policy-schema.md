@@ -27,7 +27,7 @@ inference: { ... }
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 | `inference` | object | No | Dynamic | Controls which inference routing backends are available. |
 
-Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw sandbox policy set` and take effect without restarting.
+Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw policy set` and take effect without restarting.
 
 ## Version
 

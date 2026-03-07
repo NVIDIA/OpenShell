@@ -160,6 +160,68 @@ The proxy allows the TCP connection through to the destination without decryptin
 With L4-only rules, you have no control over *what* is sent to the endpoint: only *whether* the connection is allowed. Any binary listed in the entry can send any data to the host. If you need to restrict HTTP methods or paths, add `protocol: rest` and `tls: terminate`.
 :::
 
+## Forward Proxy Mode
+
+The sandbox proxy supports two request modes: CONNECT tunnels (the default for
+HTTPS) and forward proxy (for plain HTTP to private endpoints).
+
+When a client inside the sandbox sets `HTTP_PROXY` and makes a plain `http://`
+request, standard HTTP libraries send a forward proxy request instead of a
+CONNECT tunnel. The proxy handles these transparently.
+
+### Security Constraints
+
+Forward proxy mode is restricted to private IP endpoints that are explicitly
+allowed by policy. Plain HTTP traffic never reaches the public internet. All
+three conditions must be true:
+
+1. The OPA policy explicitly allows the destination.
+2. The matched endpoint has `allowed_ips` configured.
+3. All resolved IP addresses are RFC 1918 private (`10/8`, `172.16/12`, `192.168/16`).
+
+If any condition fails, the proxy returns 403.
+
+| Condition | Forward proxy | CONNECT |
+|---|---|---|
+| Public IP, no `allowed_ips` | 403 | Allowed (standard SSRF check) |
+| Public IP, with `allowed_ips` | 403 (private-IP gate) | Allowed if IP in allowlist |
+| Private IP, no `allowed_ips` | 403 | 403 (SSRF block) |
+| Private IP, with `allowed_ips` | Allowed | Allowed |
+| `https://` scheme | 403 (must use CONNECT) | N/A |
+
+### Policy Configuration
+
+No new policy fields are needed. The same `network_policies` entry that enables
+CONNECT access to a private endpoint also enables forward proxy access. Add
+`allowed_ips` to the endpoint:
+
+```yaml
+network_policies:
+  internal_service:
+    name: internal-service
+    endpoints:
+      - host: 10.86.8.223
+        port: 8000
+        allowed_ips:
+          - "10.86.8.223/32"
+    binaries:
+      - path: /usr/local/bin/python3.12
+```
+
+With this policy, both CONNECT and forward proxy requests to the endpoint work:
+
+```python
+import httpx
+resp = httpx.get("http://10.86.8.223:8000/api/",
+                 proxy="http://10.200.0.1:3128")
+```
+
+### Limitations
+
+- Forward proxy v1 injects `Connection: close` (no keep-alive). Each connection handles exactly one request-response exchange.
+- L7 inspection is not performed on forwarded traffic.
+- `https://` URLs must use the CONNECT tunnel, not the forward proxy path.
+
 ## Enforcement Modes
 
 Each endpoint can operate in one of two enforcement modes:
