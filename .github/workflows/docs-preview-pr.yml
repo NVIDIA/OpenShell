@@ -15,4 +15,4 @@ env:
 
 jobs:
     preview:
-        uses: nvidia-merlin/.github/.github/workflows/docs-preview-pr-common.yaml@main
+        uses: nvidia-merlin/.github/.github/workflows/docs-preview-pr-common.yaml@bdb56efb3188fe2bb9be1356bf717e88e7269924
