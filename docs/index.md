@@ -62,31 +62,23 @@ Install the CLI and create your first sandbox in two commands.
 .nc-term-dot-g { background: #27c93f; }
 .nc-term-body { padding: 16px 20px; color: #d4d4d8; }
 .nc-term-body .nc-ps { color: #76b900; user-select: none; }
-.nc-term-agent {
-  position: relative;
-  display: inline-block;
-  min-width: 9ch;
-  height: 1.2em;
+.nc-swap {
+  display: inline-grid;
   vertical-align: baseline;
-  color: #76b900;
-  font-weight: 600;
 }
-.nc-term-agent span {
-  position: absolute;
-  left: 0;
-  top: 0;
+.nc-swap > span {
+  grid-area: 1 / 1;
   white-space: nowrap;
   opacity: 0;
-  animation: nc-cycle 9s ease-in-out infinite;
+  animation: nc-cycle 6s ease-in-out infinite;
 }
-.nc-term-agent span:nth-child(1) { animation-delay: 0s; }
-.nc-term-agent span:nth-child(2) { animation-delay: 3s; }
-.nc-term-agent span:nth-child(3) { animation-delay: 6s; }
+.nc-swap > span:nth-child(2) { animation-delay: 3s; }
 @keyframes nc-cycle {
-  0%, 3%     { opacity: 0; transform: translateY(4px); }
-  8%, 28%    { opacity: 1; transform: translateY(0); }
-  33.33%, 100% { opacity: 0; transform: translateY(-4px); }
+  0%, 5%     { opacity: 0; }
+  10%, 42%   { opacity: 1; }
+  50%, 100%  { opacity: 0; }
 }
+.nc-hl { color: #76b900; font-weight: 600; }
 .nc-cursor {
   display: inline-block;
   width: 2px;
@@ -106,7 +98,7 @@ Install the CLI and create your first sandbox in two commands.
   </div>
   <div class="nc-term-body">
     <div><span class="nc-ps">$ </span>pip install nemoclaw</div>
-    <div><span class="nc-ps">$ </span>nemoclaw sandbox create -- <span class="nc-term-agent"><span>claude</span><span>openclaw</span><span>opencode</span></span><span class="nc-cursor"></span></div>
+    <div><span class="nc-ps">$ </span>nemoclaw sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```
