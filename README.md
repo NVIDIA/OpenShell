@@ -10,26 +10,34 @@ It transforms the data center from a static deployment target into a continuous 
 
 ### Prerequisites
 
+<!-- referenced in docs/get-started/quickstart.md -->
 <!-- quickstart-prereqs-start -->
 | Requirement | Details                                                                   |
 |-------------|---------------------------------------------------------------------------|
 | **Docker**  | Docker Desktop or a standalone Docker Engine daemon, running.             |
 | **Python**  | 3.12 or later.                                                            |
-| **uv**      | [uv](https://docs.astral.sh/uv/) 0.9 or later.                            |
 <!-- quickstart-prereqs-end -->
 
 ### Install
 
+<!-- referenced in docs/get-started/quickstart.md -->
 <!-- quickstart-install-start -->
 ```bash
-uv pip install nemoclaw \
-  --upgrade \
-  --pre \
-  --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
+pip install nemoclaw
+```
+<!-- quickstart-install-end -->
+
+### Install from Source (Developer)
+
+Requires [mise](https://mise.jdx.dev/), Rust 1.88+, Python 3.12+, and Docker.
+
+```bash
+git clone https://github.com/NVIDIA/NemoClaw.git
+cd NemoClaw
+mise trust
 ```
 
-The installer places the `nemoclaw` binary in your Python environment. Run it with `uv run nemoclaw`, or activate the virtual environment first (`source .venv/bin/activate`) and invoke `nemoclaw` directly.
-<!-- quickstart-install-end -->
+`mise` installs all remaining toolchain dependencies automatically. The local `nemoclaw` script builds and runs the debug CLI binary, so you can invoke `nemoclaw` directly from the repo. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full development workflow.
 
 ### Create a sandbox
 
