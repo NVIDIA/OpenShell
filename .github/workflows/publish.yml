@@ -138,9 +138,6 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Fetch tags
-        run: git fetch --tags --force
-
       - name: Compute Python version
         id: version
         run: |
@@ -273,9 +270,6 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Fetch tags
-        run: git fetch --tags --force
-
       - name: Install tools
         run: mise install
 
@@ -364,9 +358,6 @@ jobs:
 
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
