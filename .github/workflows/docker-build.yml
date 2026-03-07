@@ -57,7 +57,7 @@ jobs:
       - name: Compute cargo version
         id: version
         run: |
-          set -euo pipefail
+          set -eu
           echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
