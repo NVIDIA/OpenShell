@@ -35,12 +35,83 @@ uncontrolled network activity.
 
 ## Get Started
 
-Install the CLI and create your first sandbox in two commands. Refer to the [Quickstart](get-started/quickstart.md) to get up and running.
+Install the CLI and create your first sandbox in two commands.
 
-```console
-$ pip install nemoclaw
-$ nemoclaw sandbox create -- claude
+```{raw} html
+<style>
+.nc-term {
+  background: #1a1a2e;
+  border-radius: 8px;
+  overflow: hidden;
+  margin: 1.5em 0;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+  font-family: 'SFMono-Regular', Menlo, Monaco, Consolas, 'Liberation Mono', monospace;
+  font-size: 0.875em;
+  line-height: 1.8;
+}
+.nc-term-bar {
+  background: #252545;
+  padding: 10px 14px;
+  display: flex;
+  gap: 7px;
+  align-items: center;
+}
+.nc-term-dot { width: 12px; height: 12px; border-radius: 50%; }
+.nc-term-dot-r { background: #ff5f56; }
+.nc-term-dot-y { background: #ffbd2e; }
+.nc-term-dot-g { background: #27c93f; }
+.nc-term-body { padding: 16px 20px; color: #d4d4d8; }
+.nc-term-body .nc-ps { color: #76b900; user-select: none; }
+.nc-term-agent {
+  position: relative;
+  display: inline-block;
+  min-width: 9ch;
+  height: 1.2em;
+  vertical-align: baseline;
+  color: #76b900;
+  font-weight: 600;
+}
+.nc-term-agent span {
+  position: absolute;
+  left: 0;
+  top: 0;
+  white-space: nowrap;
+  opacity: 0;
+  animation: nc-cycle 9s ease-in-out infinite;
+}
+.nc-term-agent span:nth-child(1) { animation-delay: 0s; }
+.nc-term-agent span:nth-child(2) { animation-delay: 3s; }
+.nc-term-agent span:nth-child(3) { animation-delay: 6s; }
+@keyframes nc-cycle {
+  0%, 3%     { opacity: 0; transform: translateY(4px); }
+  8%, 28%    { opacity: 1; transform: translateY(0); }
+  33.33%, 100% { opacity: 0; transform: translateY(-4px); }
+}
+.nc-cursor {
+  display: inline-block;
+  width: 2px;
+  height: 1.1em;
+  background: #d4d4d8;
+  vertical-align: text-bottom;
+  margin-left: 1px;
+  animation: nc-blink 1s step-end infinite;
+}
+@keyframes nc-blink { 50% { opacity: 0; } }
+</style>
+<div class="nc-term">
+  <div class="nc-term-bar">
+    <span class="nc-term-dot nc-term-dot-r"></span>
+    <span class="nc-term-dot nc-term-dot-y"></span>
+    <span class="nc-term-dot nc-term-dot-g"></span>
+  </div>
+  <div class="nc-term-body">
+    <div><span class="nc-ps">$ </span>pip install nemoclaw</div>
+    <div><span class="nc-ps">$ </span>nemoclaw sandbox create -- <span class="nc-term-agent"><span>claude</span><span>openclaw</span><span>opencode</span></span><span class="nc-cursor"></span></div>
+  </div>
+</div>
 ```
+
+Refer to the [Quickstart](get-started/quickstart.md) for more details.
 
 ---
 
@@ -63,7 +134,7 @@ Learn about NemoClaw and its capabilities.
 :link: get-started/quickstart
 :link-type: doc
 
-Quickstart guide for creating a NemoClaw sandbox with Claude Code, OpenClaw, and OpenCode.
+Quickstart guide and tutorials for creating a NemoClaw sandbox with Claude Code, OpenClaw, and OpenCode.
 
 +++
 {bdg-secondary}`Tutorial`
