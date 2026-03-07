@@ -460,7 +460,7 @@ Artifactory:
 
 When the cluster container starts, k3s automatically deploys these HelmChart CRs from `/var/lib/rancher/k3s/server/manifests/`:
 
-1. **NemoClaw** (from the packaged `navigator-<version>.tgz` copied into the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. The entrypoint script rewrites the chart filename placeholder, injects the chart checksum, and patches runtime image references from environment variables provided by the bootstrap code.
+1. **NemoClaw** (from `navigator-0.1.0.tgz` in the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. These values are rewritten by the entrypoint script based on environment variables from the bootstrap code.
 
 ## Implementation References
 

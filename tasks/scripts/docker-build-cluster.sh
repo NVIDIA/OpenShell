@@ -16,10 +16,6 @@
 set -euo pipefail
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
-CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
-if [[ -z "${CARGO_VERSION}" ]]; then
-  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-fi
 IMAGE_NAME="navigator/cluster"
 if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
   IMAGE_NAME="${IMAGE_REGISTRY}/cluster"
@@ -52,14 +48,10 @@ fi
 
 # Create build directory for charts
 mkdir -p deploy/docker/.build/charts
-rm -f deploy/docker/.build/charts/navigator-*.tgz
 
 # Package navigator helm chart
 echo "Packaging navigator helm chart..."
-helm package deploy/helm/navigator \
-  --version "${CARGO_VERSION}" \
-  --app-version "${CARGO_VERSION}" \
-  -d deploy/docker/.build/charts/
+helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 
 # Build cluster image (no bundled component images — they are pulled at runtime
 # from the distribution registry; credentials are injected at deploy time)

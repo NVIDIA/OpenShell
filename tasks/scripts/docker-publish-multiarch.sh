@@ -187,12 +187,8 @@ done
 # Step 2: Package helm charts (architecture-independent)
 # ---------------------------------------------------------------------------
 mkdir -p deploy/docker/.build/charts
-rm -f deploy/docker/.build/charts/navigator-*.tgz
 echo "Packaging navigator helm chart..."
-helm package deploy/helm/navigator \
-  --version "${CARGO_VERSION}" \
-  --app-version "${CARGO_VERSION}" \
-  -d deploy/docker/.build/charts/
+helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 
 # ---------------------------------------------------------------------------
 # Step 3: Build and push multi-arch cluster image.
