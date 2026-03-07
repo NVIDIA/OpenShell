@@ -31,23 +31,23 @@ Conventional containers do not solve this. They isolate processes from the host,
 
 NemoClaw addresses these risks through defense-in-depth enforcement across four policy domains: filesystem, network, process, and inference.
 
-:::{dropdown} Kernel-Level Isolation
+:::{dropdown} 🛡️ Kernel-Level Isolation
 NemoClaw enforces isolation at the Linux kernel level using Landlock for filesystem restrictions, seccomp for system call filtering, and network namespaces for traffic control. These mechanisms operate below the application layer, so agents cannot bypass them regardless of the tools or languages they use.
 :::
 
-:::{dropdown} Declarative Policy Enforcement
+:::{dropdown} 📜 Declarative Policy Enforcement
 A single YAML policy file defines all security boundaries for a sandbox: allowed filesystem paths, permitted network destinations, restricted processes, and inference routing rules. Policies are hot-reloadable, so you can tighten or relax rules on a running sandbox without restarting the agent.
 :::
 
-:::{dropdown} Credential Containment
+:::{dropdown} 🔐 Credential Containment
 Credentials are injected into sandboxes as environment variables at startup and are scoped to the sandbox's isolated namespace. They cannot be read by processes outside the sandbox, and network policies prevent agents from transmitting them to unauthorized endpoints.
 :::
 
-:::{dropdown} Private Inference Routing
+:::{dropdown} 🔀 Private Inference Routing
 The built-in inference router intercepts LLM API calls and redirects them to local or self-hosted backends based on your routing policy. Sensitive prompts and completions stay on infrastructure you control. Routes are configurable per sandbox and can be updated without restarting agents.
 :::
 
-:::{dropdown} Full L7 Traffic Inspection
+:::{dropdown} 🔍 Full L7 Traffic Inspection
 Every outbound TCP connection from a sandbox passes through an L7 proxy that resolves the calling process, evaluates the destination against the active policy, and either allows, denies, or reroutes the request. For REST endpoints, the proxy decrypts TLS, inspects HTTP method and path, and applies fine-grained access rules.
 :::
 
@@ -55,19 +55,19 @@ Every outbound TCP connection from a sandbox passes through an L7 proxy that res
 
 The following are common use cases for NemoClaw.
 
-:::{dropdown} Secure Coding Agents
+:::{dropdown} 💻 Secure Coding Agents
 Run AI coding assistants such as Claude Code, OpenCode, or OpenClaw inside a sandbox where they can read and modify project files but cannot access SSH keys, cloud credentials, or files outside the project directory. Network policies restrict which package registries and APIs the agent can reach.
 :::
 
-:::{dropdown} Private Enterprise Development
+:::{dropdown} 🏢 Private Enterprise Development
 Route all LLM inference through self-hosted NVIDIA NIM endpoints or private API backends. Proprietary source code and internal documentation stay on your infrastructure and are never sent to third-party LLM providers.
 :::
 
-:::{dropdown} Compliance and Audit
+:::{dropdown} ✅ Compliance and Audit
 Declarative policies serve as auditable security controls. Each sandbox runs under a well-defined policy that specifies exactly what the agent can access. Policy files can be version-controlled and reviewed as part of your security and compliance processes.
 :::
 
-:::{dropdown} Community and Custom Sandbox Images
+:::{dropdown} 📦 Community and Custom Sandbox Images
 Use pre-built sandbox images from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog or bring your own container. Community sandboxes bundle domain-specific tools, policies, and skills, while custom containers let you package any environment your agents need.
 :::
 
