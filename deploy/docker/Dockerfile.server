@@ -10,6 +10,7 @@
 FROM --platform=$BUILDPLATFORM rust:1.88-slim AS builder
 ARG TARGETARCH
 ARG BUILDARCH
+ARG NEMOCLAW_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 # Install build dependencies
@@ -71,6 +72,9 @@ RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,tar
     --mount=type=cache,id=cargo-target-server-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
+    if [ -n "${NEMOCLAW_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NEMOCLAW_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
     cargo_cross_build --release -p navigator-server && \
     cp "$(cross_output_dir release)/navigator-server" /build/navigator-server
 

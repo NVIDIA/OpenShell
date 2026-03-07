@@ -451,6 +451,10 @@ Artifactory:
 - Wheels are uploaded to `s3://navigator-pypi-artifacts/navigator/<wheel-version>/`.
 - A follow-up job on the `nv` runner lists that version prefix, downloads the
   wheels, and publishes them to Artifactory.
+- Container publish jobs compute the same Cargo version once and pass it through
+  Docker builds so `navigator-server` reports the packaged artifact version at runtime.
+- Published images keep the floating `latest` tag and also receive an explicit
+  version tag for the same manifest.
 
 ### Auto-Deployed Components in Cluster
 

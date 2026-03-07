@@ -80,6 +80,10 @@ fi
 # ---------------------------------------------------------------------------
 IMAGE_TAG=${IMAGE_TAG:-dev}
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
+CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
+if [[ -z "${CARGO_VERSION}" ]]; then
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+fi
 EXTRA_BUILD_FLAGS=""
 TAG_LATEST=${TAG_LATEST:-false}
 EXTRA_DOCKER_TAGS_RAW=${EXTRA_DOCKER_TAGS:-}
@@ -159,6 +163,7 @@ for component in sandbox server; do
   if [ "$component" = "sandbox" ]; then
     BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
   fi
+  BUILD_ARGS="${BUILD_ARGS} --build-arg NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}"
   if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
     BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
   fi

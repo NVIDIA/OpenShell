@@ -45,6 +45,17 @@ jobs:
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Compute cargo version
+        id: version
+        run: |
+          set -euo pipefail
+          echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -55,4 +66,5 @@ jobs:
       - name: Build ${{ inputs.component }} image
         env:
           DOCKER_BUILDER: navigator
+          NEMOCLAW_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
         run: mise run --no-prepare docker:build:${{ inputs.component }}
