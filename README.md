@@ -10,12 +10,17 @@ It transforms the data center from a static deployment target into a continuous 
 
 ### Prerequisites
 
-- **Docker** — Docker Desktop (or a Docker daemon) must be running.
-- **Python 3.12+**
-- [**uv**](https://docs.astral.sh/uv/) 0.9+
+<!-- quickstart-prereqs-start -->
+| Requirement | Details                                                                   |
+|-------------|---------------------------------------------------------------------------|
+| **Docker**  | Docker Desktop or a standalone Docker Engine daemon, running.             |
+| **Python**  | 3.12 or later.                                                            |
+| **uv**      | [uv](https://docs.astral.sh/uv/) 0.9 or later.                            |
+<!-- quickstart-prereqs-end -->
 
 ### Install
 
+<!-- quickstart-install-start -->
 ```bash
 uv pip install nemoclaw \
   --upgrade \
@@ -23,7 +28,8 @@ uv pip install nemoclaw \
   --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
-The `nemoclaw` binary is installed into your Python environment. Use `uv run nemoclaw` to invoke it, or activate your venv first with `source .venv/bin/activate`.
+The installer places the `nemoclaw` binary in your Python environment. Run it with `uv run nemoclaw`, or activate the virtual environment first (`source .venv/bin/activate`) and invoke `nemoclaw` directly.
+<!-- quickstart-install-end -->
 
 ### Create a sandbox
 

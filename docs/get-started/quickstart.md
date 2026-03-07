@@ -25,15 +25,16 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 
 Before you begin, make sure you have:
 
-- Docker installed and running. <!--Need to specify the Docker version-->
-- Python 3.12 or later.
+```{include} ../../README.md
+:start-after: <!-- quickstart-prereqs-start -->
+:end-before: <!-- quickstart-prereqs-end -->
+```
 
 ## Install the NemoClaw CLI
 
-Install the NemoClaw CLI from PyPI.
-
-```console
-$ pip install nemoclaw
+```{include} ../../README.md
+:start-after: <!-- quickstart-install-start -->
+:end-before: <!-- quickstart-install-end -->
 ```
 
 ## Create Your First NemoClaw Sandbox
