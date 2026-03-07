@@ -451,12 +451,16 @@ Artifactory:
 - Wheels are uploaded to `s3://navigator-pypi-artifacts/navigator/<wheel-version>/`.
 - A follow-up job on the `nv` runner lists that version prefix, downloads the
   wheels, and publishes them to Artifactory.
+- Container publish jobs compute the same Cargo version once and pass it through
+  Docker builds so `navigator-server` reports the packaged artifact version at runtime.
+- Published images keep the floating `latest` tag and also receive an explicit
+  version tag for the same manifest.
 
 ### Auto-Deployed Components in Cluster
 
 When the cluster container starts, k3s automatically deploys these HelmChart CRs from `/var/lib/rancher/k3s/server/manifests/`:
 
-1. **NemoClaw** (from `navigator-0.1.0.tgz` in the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. These values are rewritten by the entrypoint script based on environment variables from the bootstrap code.
+1. **NemoClaw** (from the packaged `navigator-<version>.tgz` copied into the static charts directory) -- deployed into `navigator` namespace. The HelmChart CR's `valuesContent` configures image references, SSH gateway settings, and TLS options. The entrypoint script rewrites the chart filename placeholder, injects the chart checksum, and patches runtime image references from environment variables provided by the bootstrap code.
 
 ## Implementation References
 

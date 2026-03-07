@@ -6,7 +6,7 @@
 # automatically installed when the k3s cluster starts.
 #
 # The chart tarball is served from the k3s static file server at:
-# https://<k8s-api>/static/charts/navigator-0.1.0.tgz
+# https://<k8s-api>/static/charts/__NAVIGATOR_CHART_FILENAME__
 #
 # Component images are pulled at runtime from the distribution registry.
 # Authentication is configured via /etc/rancher/k3s/registries.yaml,
@@ -18,7 +18,7 @@ metadata:
   name: navigator
   namespace: kube-system
 spec:
-  chart: https://%{KUBERNETES_API}%/static/charts/navigator-0.1.0.tgz
+  chart: https://%{KUBERNETES_API}%/static/charts/__NAVIGATOR_CHART_FILENAME__
   targetNamespace: navigator
   createNamespace: true
   valuesContent: |-

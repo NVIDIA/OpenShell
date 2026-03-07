@@ -135,6 +135,8 @@ fi
 K3S_CHARTS="/var/lib/rancher/k3s/server/static/charts"
 BUNDLED_CHARTS="/opt/navigator/charts"
 CHART_CHECKSUM=""
+NAV_CHART_FILENAME=""
+NAV_CHART_COUNT=0
 
 if [ -d "$BUNDLED_CHARTS" ]; then
     echo "Copying bundled charts to k3s..."
@@ -146,13 +148,25 @@ if [ -d "$BUNDLED_CHARTS" ]; then
     # HelmChart manifest below. When the chart content changes between image
     # versions the checksum changes, which modifies the HelmChart CR spec and
     # forces the k3s Helm controller to re-install.
-    NAV_CHART="$BUNDLED_CHARTS/navigator-0.1.0.tgz"
-    if [ -f "$NAV_CHART" ]; then
+    for candidate in "$BUNDLED_CHARTS"/navigator-*.tgz; do
+        [ ! -f "$candidate" ] && continue
+        NAV_CHART="$candidate"
+        NAV_CHART_COUNT=$((NAV_CHART_COUNT + 1))
+    done
+
+    if [ "$NAV_CHART_COUNT" -eq 1 ] && [ -n "$NAV_CHART" ]; then
+        NAV_CHART_FILENAME=$(basename "$NAV_CHART")
         if command -v sha256sum >/dev/null 2>&1; then
             CHART_CHECKSUM=$(sha256sum "$NAV_CHART" | cut -d ' ' -f 1)
         elif command -v shasum >/dev/null 2>&1; then
             CHART_CHECKSUM=$(shasum -a 256 "$NAV_CHART" | cut -d ' ' -f 1)
         fi
+    elif [ "$NAV_CHART_COUNT" -eq 0 ]; then
+        echo "Error: bundled navigator chart not found in ${BUNDLED_CHARTS}" >&2
+        exit 1
+    else
+        echo "Error: expected exactly one bundled navigator chart, found ${NAV_CHART_COUNT}" >&2
+        exit 1
     fi
 fi
 
@@ -247,6 +261,11 @@ fi
 if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then
     echo "Overriding image pull policy to: ${IMAGE_PULL_POLICY}"
     sed -i "s|pullPolicy: Always|pullPolicy: ${IMAGE_PULL_POLICY}|" "$HELMCHART"
+fi
+
+if [ -n "$NAV_CHART_FILENAME" ] && [ -f "$HELMCHART" ]; then
+    echo "Setting navigator chart filename: ${NAV_CHART_FILENAME}"
+    sed -i "s|__NAVIGATOR_CHART_FILENAME__|${NAV_CHART_FILENAME}|g" "$HELMCHART"
 fi
 
 # Generate a random SSH handshake secret for the NSSH1 HMAC handshake between

@@ -135,6 +135,14 @@ if [[ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]]; then
   SCCACHE_ARGS=(--build-arg "SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}")
 fi
 
+VERSION_ARGS=()
+if [[ -n "${NEMOCLAW_CARGO_VERSION:-}" ]]; then
+  VERSION_ARGS=(--build-arg "NEMOCLAW_CARGO_VERSION=${NEMOCLAW_CARGO_VERSION}")
+elif [[ "${COMPONENT}" == "server" ]]; then
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+  VERSION_ARGS=(--build-arg "NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}")
+fi
+
 LOCK_HASH=$(sha256_16 Cargo.lock)
 RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
 CACHE_SCOPE_INPUT="v1|${COMPONENT}|${VARIANT:-base}|${LOCK_HASH}|${RUST_SCOPE}"
@@ -145,6 +153,7 @@ docker buildx build \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
   ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
+  ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
   -f "${DOCKERFILE}" \
   -t "${IMAGE_NAME}:${IMAGE_TAG}" \
