@@ -142,6 +142,14 @@ pub async fn run_bootstrap(
         }
         options = options.with_remote(remote_opts);
     }
+    // Read registry token from environment for the auto-bootstrap path.
+    // The explicit `--registry-token` flag is only on `cluster admin deploy`;
+    // when bootstrapping via `sandbox create`, the env var is the mechanism.
+    if let Ok(token) = std::env::var("NEMOCLAW_REGISTRY_TOKEN")
+        && !token.trim().is_empty()
+    {
+        options = options.with_registry_token(token);
+    }
 
     let handle = deploy_cluster_with_panel(options, DEFAULT_CLUSTER_NAME, location).await?;
     let server = handle.gateway_endpoint().to_string();

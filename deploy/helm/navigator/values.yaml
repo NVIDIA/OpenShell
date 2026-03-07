@@ -6,7 +6,7 @@
 replicaCount: 1
 
 image:
-  repository: d1i0nduu2f6qxk.cloudfront.net/navigator/server
+  repository: ghcr.io/nvidia/nemoclaw/server
   pullPolicy: Always
   tag: "latest"
 
@@ -67,7 +67,7 @@ server:
   logLevel: info
   sandboxNamespace: navigator
   dbUrl: "sqlite:/var/navigator/navigator.db"
-  sandboxImage: "d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest"
+  sandboxImage: "ghcr.io/nvidia/nemoclaw/sandbox:latest"
   # gRPC endpoint for sandboxes to callback to NemoClaw (must be reachable from pods)
   grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.

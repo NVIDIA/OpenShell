@@ -118,6 +118,10 @@ pub struct DeployOptions {
     /// Disable gateway authentication (mTLS client certificate requirement).
     /// Ignored when `disable_tls` is true.
     pub disable_gateway_auth: bool,
+    /// Registry authentication token (e.g. a GitHub PAT with `read:packages`
+    /// scope) used to pull images from ghcr.io both during the initial
+    /// bootstrap pull and inside the k3s cluster at runtime.
+    pub registry_token: Option<String>,
 }
 
 impl DeployOptions {
@@ -131,6 +135,7 @@ impl DeployOptions {
             kube_port: None,
             disable_tls: false,
             disable_gateway_auth: false,
+            registry_token: None,
         }
     }
 
@@ -174,6 +179,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_disable_gateway_auth(mut self, disable: bool) -> Self {
         self.disable_gateway_auth = disable;
+        self
+    }
+
+    /// Set the registry authentication token for pulling images from ghcr.io.
+    #[must_use]
+    pub fn with_registry_token(mut self, token: impl Into<String>) -> Self {
+        self.registry_token = Some(token.into());
         self
     }
 }
@@ -240,6 +252,7 @@ where
     let kube_port = options.kube_port;
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
+    let registry_token = options.registry_token;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -274,11 +287,17 @@ where
                 f(msg);
             }
         };
-        image::pull_remote_image(&target_docker, &image_ref, progress_cb).await?;
+        image::pull_remote_image(
+            &target_docker,
+            &image_ref,
+            registry_token.as_deref(),
+            progress_cb,
+        )
+        .await?;
     } else {
         // Local deployment: ensure image exists (pull if needed)
         log("[status] Pulling gateway image".to_string());
-        ensure_image(&target_docker, &image_ref).await?;
+        ensure_image(&target_docker, &image_ref, registry_token.as_deref()).await?;
     }
 
     // All subsequent operations use the target Docker (remote or local)
@@ -333,6 +352,7 @@ where
         kube_port,
         disable_tls,
         disable_gateway_auth,
+        registry_token.as_deref(),
     )
     .await?;
     log("[status] Starting gateway".to_string());
@@ -480,10 +500,10 @@ pub async fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
     })
 }
 
-pub async fn ensure_cluster_image(version: &str) -> Result<String> {
+pub async fn ensure_cluster_image(version: &str, registry_token: Option<&str>) -> Result<String> {
     let docker = Docker::connect_with_local_defaults().into_diagnostic()?;
-    let image_ref = format!("{}:{version}", image::pull_registry_image());
-    ensure_image(&docker, &image_ref).await?;
+    let image_ref = format!("{}:{version}", image::DEFAULT_CLUSTER_IMAGE);
+    ensure_image(&docker, &image_ref, registry_token).await?;
     Ok(image_ref)
 }
 
@@ -493,7 +513,7 @@ fn default_cluster_image_ref() -> String {
     {
         return image;
     }
-    image::pull_registry_image()
+    image::DEFAULT_CLUSTER_IMAGE.to_string()
 }
 
 /// Create the three TLS K8s secrets required by the `NemoClaw` server and sandbox pods.

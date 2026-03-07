@@ -488,7 +488,7 @@ enum GatewayCommands {
     /// Deploy/start the gateway.
     Start {
         /// Gateway name.
-        #[arg(long, default_value = "nemoclaw")]
+        #[arg(long, default_value = "nemoclaw", env = "NEMOCLAW_CLUSTER")]
         name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
@@ -549,12 +549,21 @@ enum GatewayCommands {
         /// Ignored when --plaintext is set.
         #[arg(long)]
         disable_gateway_auth: bool,
+
+        /// Authentication token for pulling container images from ghcr.io.
+        ///
+        /// A GitHub personal access token (PAT) with `read:packages` scope.
+        /// Used to pull the cluster bootstrap image and passed into the k3s
+        /// cluster so it can pull server, sandbox, and community images at
+        /// runtime.
+        #[arg(long, env = "NEMOCLAW_REGISTRY_TOKEN")]
+        registry_token: Option<String>,
     },
 
     /// Stop the gateway (preserves state).
     Stop {
         /// Gateway name (defaults to active gateway).
-        #[arg(long)]
+        #[arg(long, env = "NEMOCLAW_CLUSTER")]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from cluster metadata).
@@ -569,7 +578,7 @@ enum GatewayCommands {
     /// Destroy the gateway and its state.
     Destroy {
         /// Gateway name (defaults to active gateway).
-        #[arg(long)]
+        #[arg(long, env = "NEMOCLAW_CLUSTER")]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from cluster metadata).
@@ -623,14 +632,14 @@ enum GatewayCommands {
     /// Show gateway deployment details.
     Info {
         /// Gateway name (defaults to active gateway).
-        #[arg(long)]
+        #[arg(long, env = "NEMOCLAW_CLUSTER")]
         name: Option<String>,
     },
 
     /// Print or start an SSH tunnel for kubectl access to a remote gateway.
     Tunnel {
         /// Gateway name (defaults to active gateway).
-        #[arg(long)]
+        #[arg(long, env = "NEMOCLAW_CLUSTER")]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from cluster metadata).
@@ -701,7 +710,7 @@ enum ClusterAdminCommands {
     /// Deprecated: use `gateway start`.
     Deploy {
         /// Cluster name.
-        #[arg(long, default_value = "nemoclaw")]
+        #[arg(long, default_value = "nemoclaw", env = "NEMOCLAW_CLUSTER")]
         name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
@@ -735,6 +744,10 @@ enum ClusterAdminCommands {
         /// Destroy and recreate from scratch if a cluster already exists.
         #[arg(long)]
         recreate: bool,
+
+        /// Authentication token for pulling container images from ghcr.io.
+        #[arg(long, env = "NEMOCLAW_REGISTRY_TOKEN")]
+        registry_token: Option<String>,
     },
 }
 
@@ -1042,6 +1055,7 @@ async fn main() -> Result<()> {
                 recreate,
                 plaintext,
                 disable_gateway_auth,
+                registry_token,
             } => {
                 run::cluster_admin_deploy(
                     &name,
@@ -1055,6 +1069,7 @@ async fn main() -> Result<()> {
                     recreate,
                     plaintext,
                     disable_gateway_auth,
+                    registry_token.as_deref(),
                 )
                 .await?;
             }
@@ -1662,6 +1677,7 @@ async fn main() -> Result<()> {
                     gateway_host,
                     kube_port,
                     recreate,
+                    registry_token,
                 } => {
                     eprintln!(
                         "{} `nemoclaw cluster admin deploy` is deprecated. \
@@ -1680,6 +1696,7 @@ async fn main() -> Result<()> {
                         recreate,
                         false, // disable_tls
                         false, // disable_gateway_auth
+                        registry_token.as_deref(),
                     )
                     .await?;
                 }

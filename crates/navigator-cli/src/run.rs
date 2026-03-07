@@ -973,6 +973,7 @@ pub async fn cluster_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    registry_token: Option<&str>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -997,6 +998,9 @@ pub async fn cluster_admin_deploy(
     }
     if let Some(host) = gateway_host {
         options = options.with_gateway_host(host);
+    }
+    if let Some(token) = registry_token {
+        options = options.with_registry_token(token);
     }
 
     let interactive = std::io::stderr().is_terminal();

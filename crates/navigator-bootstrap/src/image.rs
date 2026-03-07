@@ -15,40 +15,40 @@ use tracing::{debug, info};
 const PULL_REGISTRY_DEFAULT_TAG: &str = "latest";
 
 // ---------------------------------------------------------------------------
-// XOR-obfuscated registry credentials
+// GHCR registry defaults
 // ---------------------------------------------------------------------------
-// The credentials below are XOR-encoded so they don't appear as plaintext in
+
+/// Default registry host for pulling images.
+pub const DEFAULT_REGISTRY: &str = "ghcr.io";
+
+/// Default image repository base on GHCR (without component name or tag).
+pub const DEFAULT_IMAGE_REPO_BASE: &str = "ghcr.io/nvidia/nemoclaw";
+
+/// Default full cluster image path on GHCR (without tag).
+pub const DEFAULT_CLUSTER_IMAGE: &str = "ghcr.io/nvidia/nemoclaw/cluster";
+
+/// Default username for token-based GHCR authentication.
+///
+/// GHCR accepts any non-empty username when authenticating with a PAT;
+/// `__token__` is a common convention for token-based OCI registry auth.
+pub const DEFAULT_REGISTRY_USERNAME: &str = "__token__";
+
+// ---------------------------------------------------------------------------
+// XOR-obfuscated default registry token
+// ---------------------------------------------------------------------------
+// A read-only GHCR PAT is XOR-encoded so it doesn't appear as plaintext in
 // the compiled binary. This is a lightweight deterrent against casual
-// inspection — it is NOT a security boundary. The read-only credentials give
-// access to the public distribution registry only.
+// inspection — it is NOT a security boundary. The `--registry-token` flag
+// (or `NEMOCLAW_REGISTRY_TOKEN` env var) overrides this default.
 
-/// XOR key used to decode all credential constants.
+/// XOR key used to decode the default registry token.
 const XOR_KEY: [u8; 32] = [
-    0x5d, 0x23, 0x9c, 0x9c, 0xf2, 0xda, 0x18, 0x0d, 0x87, 0x7c, 0x48, 0x3f, 0x1c, 0xcf, 0x5f, 0x12,
-    0xaf, 0x9b, 0x10, 0x53, 0x63, 0xd6, 0xa0, 0x12, 0x02, 0x9b, 0x8d, 0x72, 0x7b, 0x54, 0xa6, 0xfe,
+    0x9c, 0x87, 0xc1, 0x0c, 0x00, 0xe2, 0x59, 0x14, 0x98, 0xb8, 0xa5, 0x45, 0x48, 0x40, 0x3e, 0x92,
+    0x62, 0x41, 0xfe, 0x5e, 0xd4, 0x09, 0x23, 0xe6, 0x85, 0xa7, 0x94, 0xab, 0xb8, 0x15, 0xcd, 0x45,
 ];
 
-/// XOR-encoded distribution registry host.
-const PULL_REGISTRY_ENC: [u8; 29] = [
-    0x39, 0x12, 0xf5, 0xac, 0x9c, 0xbe, 0x6d, 0x78, 0xb5, 0x1a, 0x7e, 0x4e, 0x64, 0xa4, 0x71, 0x71,
-    0xc3, 0xf4, 0x65, 0x37, 0x05, 0xa4, 0xcf, 0x7c, 0x76, 0xb5, 0xe3, 0x17, 0x0f,
-];
-
-/// XOR-encoded full image path on the distribution registry (without tag).
-const PULL_REGISTRY_IMAGE_ENC: [u8; 47] = [
-    0x39, 0x12, 0xf5, 0xac, 0x9c, 0xbe, 0x6d, 0x78, 0xb5, 0x1a, 0x7e, 0x4e, 0x64, 0xa4, 0x71, 0x71,
-    0xc3, 0xf4, 0x65, 0x37, 0x05, 0xa4, 0xcf, 0x7c, 0x76, 0xb5, 0xe3, 0x17, 0x0f, 0x7b, 0xc8, 0x9f,
-    0x2b, 0x4a, 0xfb, 0xfd, 0x86, 0xb5, 0x6a, 0x22, 0xe4, 0x10, 0x3d, 0x4c, 0x68, 0xaa, 0x2d,
-];
-
-/// XOR-encoded read-only username for the distribution registry.
-const PULL_REGISTRY_USERNAME_ENC: [u8; 6] = [0x39, 0x4c, 0xff, 0xf7, 0x97, 0xa8];
-
-/// XOR-encoded read-only password for the distribution registry.
-const PULL_REGISTRY_PASSWORD_ENC: [u8; 18] = [
-    0x2d, 0x56, 0xf1, 0xec, 0x99, 0xb3, 0x76, 0x20, 0xfd, 0x09, 0x24, 0x4a, 0x31, 0xbc, 0x30, 0x70,
-    0xca, 0xe9,
-];
+/// XOR-encoded default GHCR registry token.
+const DEFAULT_REGISTRY_TOKEN_ENC: [u8; 7] = [0xe8, 0xe2, 0xb2, 0x78, 0x31, 0xd0, 0x6a];
 
 /// Decode an XOR-encoded byte slice using [`XOR_KEY`].
 fn xor_decode(encoded: &[u8]) -> String {
@@ -59,24 +59,9 @@ fn xor_decode(encoded: &[u8]) -> String {
         .collect()
 }
 
-/// Distribution registry host, decoded at runtime.
-pub(crate) fn pull_registry() -> String {
-    xor_decode(&PULL_REGISTRY_ENC)
-}
-
-/// Full image path on the distribution registry (without tag), decoded at runtime.
-pub(crate) fn pull_registry_image() -> String {
-    xor_decode(&PULL_REGISTRY_IMAGE_ENC)
-}
-
-/// Read-only username for the distribution registry, decoded at runtime.
-pub(crate) fn pull_registry_username() -> String {
-    xor_decode(&PULL_REGISTRY_USERNAME_ENC)
-}
-
-/// Read-only password for the distribution registry, decoded at runtime.
-pub(crate) fn pull_registry_password() -> String {
-    xor_decode(&PULL_REGISTRY_PASSWORD_ENC)
+/// Default GHCR registry token, decoded at runtime.
+pub(crate) fn default_registry_token() -> String {
+    xor_decode(&DEFAULT_REGISTRY_TOKEN_ENC)
 }
 
 /// Parse an image reference into (repository, tag).
@@ -150,8 +135,25 @@ pub async fn pull_image(
     Ok(())
 }
 
-/// Pull the cluster image directly on a remote Docker daemon from the distribution
-/// registry, authenticating with the built-in distribution credentials.
+/// Build [`DockerCredentials`] for ghcr.io from a registry token.
+///
+/// When `token` is `None` or empty, falls back to the built-in default
+/// token (XOR-decoded at runtime). Always returns `Some`.
+#[allow(clippy::unnecessary_wraps)]
+pub(crate) fn ghcr_credentials(token: Option<&str>) -> Option<DockerCredentials> {
+    let effective_token = token
+        .filter(|t| !t.is_empty())
+        .map_or_else(default_registry_token, ToString::to_string);
+    Some(DockerCredentials {
+        username: Some(DEFAULT_REGISTRY_USERNAME.to_string()),
+        password: Some(effective_token),
+        serveraddress: Some(DEFAULT_REGISTRY.to_string()),
+        ..Default::default()
+    })
+}
+
+/// Pull the cluster image directly on a remote Docker daemon from ghcr.io,
+/// authenticating with the provided registry token.
 ///
 /// After pulling, the image is tagged to the expected local image ref (e.g.,
 /// `navigator/cluster:dev`) so that all downstream container creation logic works
@@ -165,6 +167,7 @@ pub async fn pull_image(
 pub async fn pull_remote_image(
     remote: &Docker,
     image_ref: &str,
+    registry_token: Option<&str>,
     mut on_progress: impl FnMut(String) + Send + 'static,
 ) -> Result<()> {
     // Query the remote host's platform so we pull the correct architecture.
@@ -179,8 +182,7 @@ pub async fn pull_remote_image(
     // and already points at a registry image, honour its tag.  Otherwise use
     // the distribution registry default tag — the local build tag (e.g. "dev")
     // is a build-time convention that doesn't exist in the registry.
-    let registry = pull_registry();
-    let registry_image_base = pull_registry_image();
+    let registry_image_base = DEFAULT_CLUSTER_IMAGE.to_string();
 
     let tag = if is_local_image_ref(image_ref) {
         PULL_REGISTRY_DEFAULT_TAG.to_string()
@@ -192,18 +194,13 @@ pub async fn pull_remote_image(
 
     info!(
         "Pulling image {} on remote host from {}",
-        registry_image, registry
+        registry_image, DEFAULT_REGISTRY
     );
     on_progress(format!(
         "[status] Pulling navigator/cluster:{tag} ({platform_str}) on remote host"
     ));
 
-    let credentials = DockerCredentials {
-        username: Some(pull_registry_username()),
-        password: Some(pull_registry_password()),
-        serveraddress: Some(registry),
-        ..Default::default()
-    };
+    let credentials = ghcr_credentials(registry_token);
 
     let options = CreateImageOptions {
         from_image: Some(registry_image_base),
@@ -212,7 +209,7 @@ pub async fn pull_remote_image(
         ..Default::default()
     };
 
-    let mut stream = remote.create_image(Some(options), None, Some(credentials));
+    let mut stream = remote.create_image(Some(options), None, credentials);
     while let Some(result) = stream.next().await {
         let info = result
             .into_diagnostic()
@@ -233,7 +230,7 @@ pub async fn pull_remote_image(
 
     // Tag the pulled image to the expected local image ref so downstream code
     // (container creation, image ID checks) works unchanged.
-    // e.g., tag "d1i0nduu2f6qxk.cloudfront.net/navigator/cluster:dev" as "navigator/cluster:dev"
+    // e.g., tag "ghcr.io/nvidia/nemoclaw/cluster:latest" as "navigator/cluster:dev"
     let (target_repo, target_tag) = parse_image_ref(image_ref);
     info!(
         "Tagging {} as {}:{}",
@@ -341,23 +338,52 @@ mod tests {
     }
 
     #[test]
-    fn xor_decode_registry_credentials() {
-        // Verify all encoded constants decode to valid, non-empty ASCII strings.
-        let registry = pull_registry();
-        assert!(!registry.is_empty());
-        assert!(registry.contains('.'), "registry should be a domain name");
+    fn ghcr_credentials_with_token() {
+        let creds = ghcr_credentials(Some("ghp_test123"));
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.username.as_deref(), Some("__token__"));
+        assert_eq!(creds.password.as_deref(), Some("ghp_test123"));
+        assert_eq!(creds.serveraddress.as_deref(), Some("ghcr.io"));
+    }
 
-        let image = pull_registry_image();
+    #[test]
+    fn ghcr_credentials_without_token_uses_default() {
+        // When no explicit token is provided, the built-in default is used.
+        let creds = ghcr_credentials(None).unwrap();
+        assert_eq!(creds.username.as_deref(), Some("__token__"));
+        assert_eq!(creds.serveraddress.as_deref(), Some("ghcr.io"));
+        // The password should be the decoded default token (non-empty).
+        assert!(creds.password.is_some());
+        assert!(!creds.password.as_ref().unwrap().is_empty());
+
+        // Same for empty string.
+        let creds2 = ghcr_credentials(Some("")).unwrap();
+        assert_eq!(creds2.password, creds.password);
+    }
+
+    #[test]
+    fn xor_decode_default_token() {
+        let token = default_registry_token();
         assert!(
-            image.starts_with(&registry),
-            "image path should start with the registry host"
+            !token.is_empty(),
+            "default token should decode to non-empty"
         );
+        assert!(
+            token.chars().all(|c| c.is_ascii_graphic()),
+            "default token should be printable ASCII"
+        );
+    }
 
-        let username = pull_registry_username();
-        assert!(!username.is_empty());
-
-        let password = pull_registry_password();
-        assert!(!password.is_empty());
-        assert!(password.len() > 8, "password should be non-trivial length");
+    #[test]
+    fn default_constants_are_consistent() {
+        assert!(
+            DEFAULT_CLUSTER_IMAGE.starts_with(DEFAULT_IMAGE_REPO_BASE),
+            "cluster image should be under the default repo base"
+        );
+        assert!(
+            DEFAULT_IMAGE_REPO_BASE.starts_with(DEFAULT_REGISTRY),
+            "repo base should start with the registry host"
+        );
     }
 }
