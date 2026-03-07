@@ -113,6 +113,15 @@ flowchart TD
     D --> E["5. Push updated policy"]
     E --> F["6. Verify the new revision loaded"]
     F --> B
+
+    style A fill:#76b900,stroke:#000000,color:#000000
+    style B fill:#76b900,stroke:#000000,color:#000000
+    style C fill:#76b900,stroke:#000000,color:#000000
+    style D fill:#ffffff,stroke:#000000,color:#000000
+    style E fill:#76b900,stroke:#000000,color:#000000
+    style F fill:#76b900,stroke:#000000,color:#000000
+
+    linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
 ### Step 1: Create the Sandbox with Your Initial Policy

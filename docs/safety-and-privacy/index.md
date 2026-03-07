@@ -35,6 +35,17 @@ graph TB
     agent -- "sudo install pkg ✘" --> proc
     agent -- "call api.openai.com" --> inf
     inf -- "reroute → your backend ✔" --> net
+
+    style runtime fill:#f5f5f5,stroke:#000000,color:#000000
+    style layers fill:#e8e8e8,stroke:#000000,color:#000000
+    style sandbox fill:#f5f5f5,stroke:#000000,color:#000000
+    style agent fill:#ffffff,stroke:#000000,color:#000000
+    style fs fill:#76b900,stroke:#000000,color:#000000
+    style net fill:#76b900,stroke:#000000,color:#000000
+    style proc fill:#76b900,stroke:#000000,color:#000000
+    style inf fill:#76b900,stroke:#000000,color:#000000
+
+    linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
 You control all four layers through a single YAML policy. Network and inference

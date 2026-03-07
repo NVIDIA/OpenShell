@@ -39,6 +39,18 @@ flowchart TD
     G -- Yes --> H["Route to configured\ninference backend"]
     G -- No --> I["Deny: 403"]
     E -- No --> I
+
+    style A fill:#ffffff,stroke:#000000,color:#000000
+    style B fill:#76b900,stroke:#000000,color:#000000
+    style C fill:#76b900,stroke:#000000,color:#000000
+    style D fill:#76b900,stroke:#000000,color:#000000
+    style E fill:#76b900,stroke:#000000,color:#000000
+    style F fill:#76b900,stroke:#000000,color:#000000
+    style G fill:#76b900,stroke:#000000,color:#000000
+    style H fill:#76b900,stroke:#000000,color:#000000
+    style I fill:#ff4444,stroke:#000000,color:#ffffff
+
+    linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
 ## Structure of a Network Policy Entry

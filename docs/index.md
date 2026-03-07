@@ -50,7 +50,7 @@ $ nemoclaw sandbox create -- claude
 :gutter: 3
 
 :::{grid-item-card} About NemoClaw
-:link: about/index
+:link: about/overview
 :link-type: doc
 
 Learn about NemoClaw and its capabilities.
@@ -116,7 +116,7 @@ CLI commands, policy schema, environment variables, and system architecture.
 :hidden:
 
 Overview <about/overview>
-Architecture <about/architecture>
+How It Works <about/architecture>
 Release Notes <about/release-notes>
 ```
 
@@ -164,6 +164,7 @@ inference/configure-routes
 
 reference/cli
 reference/policy-schema
+reference/architecture
 ```
 
 ```{toctree}

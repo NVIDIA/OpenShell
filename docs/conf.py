@@ -64,6 +64,23 @@ html_copy_source = False
 html_show_sourcelink = False
 html_show_sphinx = False
 
+mermaid_init_js = (
+    "mermaid.initialize({"
+    "  startOnLoad: true,"
+    "  theme: 'base',"
+    "  themeVariables: {"
+    "    background: '#ffffff',"
+    "    primaryColor: '#76b900',"
+    "    primaryTextColor: '#000000',"
+    "    primaryBorderColor: '#000000',"
+    "    lineColor: '#000000',"
+    "    textColor: '#000000',"
+    "    mainBkg: '#ffffff',"
+    "    nodeBorder: '#000000'"
+    "  }"
+    "});"
+)
+
 html_domain_indices = False
 html_use_index = False
 highlight_language = "console"

@@ -19,7 +19,7 @@ content:
 
 # Tutorials
 
-This section contains tutorials that help you run AI agents inside NemoClaw sandboxes. Each tutorial covers a different agent and setup, from a single-command quickstart to full policy iteration with inference routing.
+Each tutorial below walks you through running a specific AI agent inside a NemoClaw sandbox. Choose the tutorial that matches your agent.
 
 ::::{grid} 1 1 2 2
 :gutter: 3
@@ -28,7 +28,7 @@ This section contains tutorials that help you run AI agents inside NemoClaw sand
 :link: run-claude
 :link-type: doc
 
-Create a sandbox with a single command, auto-discover credentials, and work inside an isolated environment with the default policy.
+Create a sandbox with Claude Code.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -38,7 +38,7 @@ Create a sandbox with a single command, auto-discover credentials, and work insi
 :link: run-openclaw
 :link-type: doc
 
-Launch a community sandbox using the `--from` flag. Explore pre-built configurations bundled with tailored policies and container images.
+Launch a sandbox with OpenClaw from the NemoClaw Community catalog using the `--from` flag.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -48,7 +48,7 @@ Launch a community sandbox using the `--from` flag. Explore pre-built configurat
 :link: run-opencode
 :link-type: doc
 
-Write a custom policy, diagnose denied actions from logs, and configure inference routing to NVIDIA API endpoints.
+Launch a sandbox with OpenCode with NVIDIA inference routed to NVIDIA API endpoints.
 
 +++
 {bdg-secondary}`Tutorial`

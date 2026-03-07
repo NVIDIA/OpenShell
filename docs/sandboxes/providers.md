@@ -112,6 +112,14 @@ flowchart LR
     B --> C["Sandbox starts"]
     C --> D["Supervisor fetches\ncredentials from gateway"]
     D --> E["Credentials injected into\nagent process + SSH sessions"]
+
+    style A fill:#ffffff,stroke:#000000,color:#000000
+    style B fill:#ffffff,stroke:#000000,color:#000000
+    style C fill:#76b900,stroke:#000000,color:#000000
+    style D fill:#76b900,stroke:#000000,color:#000000
+    style E fill:#76b900,stroke:#000000,color:#000000
+
+    linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
 1. You create a provider with credentials from your environment or
