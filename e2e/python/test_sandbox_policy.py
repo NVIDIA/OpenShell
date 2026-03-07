@@ -178,6 +178,84 @@ def _read_navigator_log():
     return fn
 
 
+def _forward_proxy_with_server():
+    """Return a closure that starts an HTTP server and sends a forward proxy request.
+
+    The closure starts a minimal HTTP server on the given port inside the sandbox,
+    then sends a plain HTTP forward proxy request (non-CONNECT) through the sandbox
+    proxy and returns the raw response.
+    """
+
+    def fn(proxy_host, proxy_port, target_host, target_port):
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                body = b"forward-proxy-ok"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass  # suppress log output
+
+        srv = HTTPServer(("0.0.0.0", int(target_port)), Handler)
+        threading.Thread(target=srv.handle_request, daemon=True).start()
+        time.sleep(0.5)
+
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            req = (
+                f"GET http://{target_host}:{target_port}/test HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n\r\n"
+            )
+            conn.sendall(req.encode())
+            data = b""
+            conn.settimeout(5)
+            try:
+                while True:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+            except socket.timeout:
+                pass
+            return data.decode("latin1")
+        finally:
+            conn.close()
+            srv.server_close()
+
+    return fn
+
+
+def _forward_proxy_raw():
+    """Return a closure that sends a forward proxy request (no server needed).
+
+    For testing deny cases — sends the request and returns whatever the proxy
+    responds with.
+    """
+
+    def fn(proxy_host, proxy_port, target_url):
+        import socket
+        from urllib.parse import urlparse
+
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            parsed = urlparse(target_url)
+            host_header = parsed.netloc or parsed.hostname
+            req = f"GET {target_url} HTTP/1.1\r\nHost: {host_header}\r\n\r\n"
+            conn.sendall(req.encode())
+            return conn.recv(4096).decode("latin1")
+        finally:
+            conn.close()
+
+    return fn
+
+
 def test_policy_applies_to_exec_commands(
     sandbox: Callable[..., Sandbox],
 ) -> None:
@@ -1174,3 +1252,378 @@ def test_live_policy_update_and_logs(
             connect_logs = [l for l in sandbox_logs if "CONNECT" in l.message]
             if connect_logs:
                 assert has_fields, "CONNECT logs should have structured fields"
+
+
+# =============================================================================
+# Forward proxy tests (plain HTTP, non-CONNECT)
+# =============================================================================
+
+# The sandbox's own IP within the network namespace
+_SANDBOX_IP = "10.200.0.2"
+_FORWARD_PROXY_PORT = 19876
+
+
+def test_forward_proxy_allows_private_ip_with_allowed_ips(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """FWD-1: Forward proxy GET to private IP with allowed_ips succeeds.
+
+    Starts an HTTP server inside the sandbox, sends a plain forward proxy
+    request through the sandbox proxy, and verifies the response is relayed.
+    """
+    policy = _base_policy(
+        network_policies={
+            "internal_http": sandbox_pb2.NetworkPolicyRule(
+                name="internal_http",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_with_server(),
+            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Expected 200 in forward proxy response, got: {result.stdout}"
+        )
+        assert "forward-proxy-ok" in result.stdout, (
+            f"Expected response body relayed, got: {result.stdout}"
+        )
+
+
+def test_forward_proxy_denied_without_allowed_ips(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """FWD-2: Forward proxy to private IP without allowed_ips -> 403.
+
+    Even though the endpoint matches, forward proxy requires explicit
+    allowed_ips on the endpoint.
+    """
+    policy = _base_policy(
+        network_policies={
+            "internal_http": sandbox_pb2.NetworkPolicyRule(
+                name="internal_http",
+                endpoints=[
+                    # No allowed_ips — forward proxy should be denied
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_raw(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                f"http://{_SANDBOX_IP}:{_FORWARD_PROXY_PORT}/test",
+            ),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"Expected 403 without allowed_ips, got: {result.stdout}"
+        )
+
+
+def test_forward_proxy_rejects_https_scheme(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """FWD-3: Forward proxy with https:// scheme -> 400.
+
+    HTTPS must use CONNECT tunneling, not forward proxy.
+    """
+    policy = _base_policy(
+        network_policies={
+            "internal_http": sandbox_pb2.NetworkPolicyRule(
+                name="internal_http",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_raw(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                f"https://{_SANDBOX_IP}:{_FORWARD_PROXY_PORT}/test",
+            ),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "400" in result.stdout, (
+            f"Expected 400 for HTTPS forward proxy, got: {result.stdout}"
+        )
+
+
+def test_forward_proxy_denied_no_policy_match(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """FWD-4: Forward proxy to unmatched host:port -> 403."""
+    policy = _base_policy(
+        network_policies={
+            "other": sandbox_pb2.NetworkPolicyRule(
+                name="other",
+                endpoints=[
+                    # Policy for a different host/port
+                    sandbox_pb2.NetworkEndpoint(
+                        host="10.200.0.1",
+                        port=9999,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_raw(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                f"http://{_SANDBOX_IP}:{_FORWARD_PROXY_PORT}/test",
+            ),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"Expected 403 for unmatched policy, got: {result.stdout}"
+        )
+
+
+def test_forward_proxy_public_ip_denied(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """FWD-5: Forward proxy to public IP -> 403.
+
+    Even with allowed_ips, forward proxy is restricted to private IPs.
+    Plain HTTP should never traverse the public internet.
+    """
+    policy = _base_policy(
+        network_policies={
+            "public": sandbox_pb2.NetworkPolicyRule(
+                name="public",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="example.com",
+                        port=80,
+                        allowed_ips=["93.184.0.0/16"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_raw(),
+            args=(_PROXY_HOST, _PROXY_PORT, "http://example.com/"),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"Expected 403 for public IP forward proxy, got: {result.stdout}"
+        )
+
+
+def test_forward_proxy_log_fields(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """FWD-6: Forward proxy requests produce structured FORWARD log lines."""
+    policy = _base_policy(
+        network_policies={
+            "internal_http": sandbox_pb2.NetworkPolicyRule(
+                name="internal_http",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # Trigger an allowed forward proxy request (with server)
+        sb.exec_python(
+            _forward_proxy_with_server(),
+            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
+        )
+        # Trigger a denied forward proxy request (no allowed_ips match)
+        sb.exec_python(
+            _forward_proxy_raw(),
+            args=(
+                _PROXY_HOST,
+                _PROXY_PORT,
+                "http://example.com/",
+            ),
+        )
+        # Read the log
+        result = sb.exec_python(_read_navigator_log())
+        assert result.exit_code == 0, result.stderr
+        log = result.stdout
+
+        assert "FORWARD" in log, "Expected FORWARD log lines"
+        # tracing key-value pairs quote string values: action="allow"
+        assert 'action="allow"' in log, "Expected allowed FORWARD in logs"
+        assert f"dst_host={_SANDBOX_IP}" in log, "Expected dst_host in FORWARD log"
+        assert f"dst_port={_FORWARD_PROXY_PORT}" in log, (
+            "Expected dst_port in FORWARD log"
+        )
+
+
+# =============================================================================
+# Baseline filesystem path enrichment tests (BFS-*)
+# =============================================================================
+
+
+def _verify_sandbox_functional():
+    """Return a closure that verifies basic sandbox functionality."""
+
+    def fn():
+        import json
+        import os
+        import sys
+
+        checks = {}
+        # Can resolve DNS config
+        checks["resolv_conf"] = os.path.exists("/etc/resolv.conf")
+        # Can access shared libraries
+        checks["lib_exists"] = os.path.isdir("/usr/lib")
+        # Python interpreter works
+        checks["python_version"] = sys.version
+        # Can write to /tmp
+        tmp_path = "/tmp/enrichment_test.txt"
+        try:
+            with open(tmp_path, "w") as f:
+                f.write("ok")
+            with open(tmp_path) as f:
+                checks["tmp_write"] = f.read() == "ok"
+            os.unlink(tmp_path)
+        except Exception as e:
+            checks["tmp_write"] = str(e)
+        # Can write to /sandbox
+        sb_path = "/sandbox/enrichment_test.txt"
+        try:
+            with open(sb_path, "w") as f:
+                f.write("ok")
+            with open(sb_path) as f:
+                checks["sandbox_write"] = f.read() == "ok"
+            os.unlink(sb_path)
+        except Exception as e:
+            checks["sandbox_write"] = str(e)
+        # Can read navigator log
+        checks["var_log"] = os.path.exists("/var/log/navigator.log")
+        return json.dumps(checks)
+
+    return fn
+
+
+def test_baseline_enrichment_missing_filesystem_policy(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """BFS-1: Sandbox with network_policies but NO filesystem_policy should
+    come up and function correctly thanks to baseline path enrichment."""
+    # Intentionally omit filesystem, landlock, and process fields —
+    # only provide network_policies.
+    spec = datamodel_pb2.SandboxSpec(
+        policy=sandbox_pb2.SandboxPolicy(
+            version=1,
+            network_policies={
+                "test": sandbox_pb2.NetworkPolicyRule(
+                    name="test",
+                    endpoints=[
+                        sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                    ],
+                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                ),
+            },
+        ),
+    )
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_verify_sandbox_functional())
+        assert result.exit_code == 0, (
+            f"Sandbox with missing filesystem_policy failed to run: {result.stderr}"
+        )
+        import json
+
+        checks = json.loads(result.stdout)
+        assert checks["resolv_conf"] is True, "DNS config not accessible"
+        assert checks["lib_exists"] is True, "Shared libraries not accessible"
+        assert checks["tmp_write"] is True, f"/tmp not writable: {checks['tmp_write']}"
+        assert checks["sandbox_write"] is True, (
+            f"/sandbox not writable: {checks['sandbox_write']}"
+        )
+        assert checks["var_log"] is True, "Navigator log not accessible"
+
+
+def test_baseline_enrichment_incomplete_filesystem_policy(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """BFS-2: Sandbox with filesystem_policy that only has /sandbox should
+    still function because baseline enrichment adds missing paths."""
+    spec = datamodel_pb2.SandboxSpec(
+        policy=sandbox_pb2.SandboxPolicy(
+            version=1,
+            filesystem=sandbox_pb2.FilesystemPolicy(
+                include_workdir=True,
+                read_only=[],
+                read_write=["/sandbox"],
+            ),
+            landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+            process=sandbox_pb2.ProcessPolicy(
+                run_as_user="sandbox",
+                run_as_group="sandbox",
+            ),
+            network_policies={
+                "test": sandbox_pb2.NetworkPolicyRule(
+                    name="test",
+                    endpoints=[
+                        sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                    ],
+                    binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+                ),
+            },
+        ),
+    )
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_verify_sandbox_functional())
+        assert result.exit_code == 0, (
+            f"Sandbox with incomplete filesystem_policy failed to run: {result.stderr}"
+        )
+        import json
+
+        checks = json.loads(result.stdout)
+        assert checks["resolv_conf"] is True, "DNS config not accessible"
+        assert checks["lib_exists"] is True, "Shared libraries not accessible"
+        assert checks["tmp_write"] is True, f"/tmp not writable: {checks['tmp_write']}"
+        assert checks["sandbox_write"] is True, (
+            f"/sandbox not writable: {checks['sandbox_write']}"
+        )
+        assert checks["var_log"] is True, "Navigator log not accessible"

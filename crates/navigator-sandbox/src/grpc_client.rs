@@ -160,6 +160,16 @@ pub async fn discover_and_sync_policy(
         })
 }
 
+/// Sync an enriched policy back to the gateway.
+///
+/// Used by the supervisor to push baseline-path-enriched policies so the
+/// gateway stores the effective policy users see via `nemoclaw sandbox get`.
+pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPolicy) -> Result<()> {
+    debug!(endpoint = %endpoint, sandbox = %sandbox, "Syncing enriched policy to gateway");
+    let mut client = connect(endpoint).await?;
+    sync_policy_with_client(&mut client, sandbox, policy).await
+}
+
 /// Fetch provider environment variables for a sandbox from NemoClaw server via gRPC.
 ///
 /// Returns a map of environment variable names to values derived from provider

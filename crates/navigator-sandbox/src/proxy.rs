@@ -198,14 +198,17 @@ async fn handle_tcp_connection(
     let target = parts.next().unwrap_or("");
 
     if method != "CONNECT" {
-        let target_host = extract_host_from_uri(target);
-        info!(
-            method = %method,
-            target_host = %target_host,
-            "Non-CONNECT proxy request denied"
-        );
-        respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
+        return handle_forward_proxy(
+            method,
+            target,
+            &buf[..],
+            used,
+            &mut client,
+            opa_engine,
+            identity_cache,
+            entrypoint_pid,
+        )
+        .await;
     }
 
     let (host, port) = parse_target(target)?;
@@ -1155,6 +1158,7 @@ fn normalize_inference_path(path: &str) -> String {
 /// For example, `"http://example.com/path"` yields `"example.com"` and
 /// `"http://example.com:8080/path"` yields `"example.com"`. Returns `"unknown"`
 /// if the URI cannot be parsed.
+#[cfg(test)]
 fn extract_host_from_uri(uri: &str) -> String {
     // Absolute-form URIs look like "http://host[:port]/path"
     // Strip the scheme prefix, then extract the authority (host[:port]) before the first '/'.
@@ -1175,6 +1179,405 @@ fn extract_host_from_uri(uri: &str) -> String {
     } else {
         host.to_string()
     }
+}
+
+/// Parse an absolute-form proxy request URI into its components.
+///
+/// For example, `"http://10.86.8.223:8000/screenshot/"` yields
+/// `("http", "10.86.8.223", 8000, "/screenshot/")`.
+///
+/// Handles:
+/// - Default port 80 for `http`, 443 for `https`
+/// - IPv6 bracket notation (`[::1]`)
+/// - Missing path (defaults to `/`)
+/// - Query strings (preserved in path)
+fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
+    // Extract scheme
+    let (scheme, rest) = uri
+        .split_once("://")
+        .ok_or_else(|| miette::miette!("Missing scheme in proxy URI: {uri}"))?;
+    let scheme = scheme.to_ascii_lowercase();
+
+    // Split authority from path
+    let (authority, path) = if rest.starts_with('[') {
+        // IPv6: [::1]:port/path
+        let bracket_end = rest
+            .find(']')
+            .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket in URI: {uri}"))?;
+        let after_bracket = &rest[bracket_end + 1..];
+        if let Some(slash_pos) = after_bracket.find('/') {
+            (
+                &rest[..bracket_end + 1 + slash_pos],
+                &after_bracket[slash_pos..],
+            )
+        } else {
+            (&rest[..], "/")
+        }
+    } else if let Some(slash_pos) = rest.find('/') {
+        (&rest[..slash_pos], &rest[slash_pos..])
+    } else {
+        (rest, "/")
+    };
+
+    // Parse host and port from authority
+    let (host, port) = if authority.starts_with('[') {
+        // IPv6: [::1]:port or [::1]
+        let bracket_end = authority
+            .find(']')
+            .ok_or_else(|| miette::miette!("Unclosed IPv6 bracket: {uri}"))?;
+        let host = &authority[1..bracket_end]; // strip brackets
+        let port_str = &authority[bracket_end + 1..];
+        let port = if let Some(port_str) = port_str.strip_prefix(':') {
+            port_str
+                .parse::<u16>()
+                .map_err(|_| miette::miette!("Invalid port in URI: {uri}"))?
+        } else {
+            match scheme.as_str() {
+                "https" => 443,
+                _ => 80,
+            }
+        };
+        (host.to_string(), port)
+    } else if let Some((h, p)) = authority.rsplit_once(':') {
+        let port = p
+            .parse::<u16>()
+            .map_err(|_| miette::miette!("Invalid port in URI: {uri}"))?;
+        (h.to_string(), port)
+    } else {
+        let port = match scheme.as_str() {
+            "https" => 443,
+            _ => 80,
+        };
+        (authority.to_string(), port)
+    };
+
+    if host.is_empty() {
+        return Err(miette::miette!("Empty host in URI: {uri}"));
+    }
+
+    let path = if path.is_empty() { "/" } else { path };
+
+    Ok((scheme, host, port, path.to_string()))
+}
+
+/// Rewrite an absolute-form HTTP proxy request to origin-form for upstream.
+///
+/// Transforms `GET http://host:port/path HTTP/1.1` into `GET /path HTTP/1.1`,
+/// strips proxy hop-by-hop headers, injects `Connection: close` and `Via`.
+///
+/// Returns the rewritten request bytes (headers + any overflow body bytes).
+fn rewrite_forward_request(raw: &[u8], used: usize, path: &str) -> Vec<u8> {
+    let header_end = raw[..used]
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map_or(used, |p| p + 4);
+
+    let header_str = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = header_str.split("\r\n").collect::<Vec<_>>();
+
+    // Rewrite request line: METHOD absolute-uri HTTP/1.1 → METHOD path HTTP/1.1
+    if let Some(first_line) = lines.first_mut() {
+        let parts: Vec<&str> = first_line.splitn(3, ' ').collect();
+        if parts.len() == 3 {
+            let new_line = format!("{} {} {}", parts[0], path, parts[2]);
+            *first_line = Box::leak(new_line.into_boxed_str()); // safe: short-lived
+        }
+    }
+
+    // Rebuild headers, stripping hop-by-hop and adding proxy headers
+    let mut output = Vec::with_capacity(header_end + 128);
+    let mut has_connection = false;
+    let mut has_via = false;
+
+    for (i, line) in lines.iter().enumerate() {
+        if i == 0 {
+            // Request line — already rewritten
+            output.extend_from_slice(line.as_bytes());
+            output.extend_from_slice(b"\r\n");
+            continue;
+        }
+        if line.is_empty() {
+            // End of headers
+            break;
+        }
+
+        let lower = line.to_ascii_lowercase();
+
+        // Strip proxy hop-by-hop headers
+        if lower.starts_with("proxy-connection:")
+            || lower.starts_with("proxy-authorization:")
+            || lower.starts_with("proxy-authenticate:")
+        {
+            continue;
+        }
+
+        // Replace Connection header
+        if lower.starts_with("connection:") {
+            has_connection = true;
+            output.extend_from_slice(b"Connection: close\r\n");
+            continue;
+        }
+
+        // Pass through other headers
+        output.extend_from_slice(line.as_bytes());
+        output.extend_from_slice(b"\r\n");
+
+        if lower.starts_with("via:") {
+            has_via = true;
+        }
+    }
+
+    // Inject missing headers
+    if !has_connection {
+        output.extend_from_slice(b"Connection: close\r\n");
+    }
+    if !has_via {
+        output.extend_from_slice(b"Via: 1.1 navigator-sandbox\r\n");
+    }
+
+    // End of headers
+    output.extend_from_slice(b"\r\n");
+
+    // Append any overflow body bytes from the original buffer
+    if header_end < used {
+        output.extend_from_slice(&raw[header_end..used]);
+    }
+
+    output
+}
+
+/// Handle a plain HTTP forward proxy request (non-CONNECT).
+///
+/// Restricted to private IP endpoints with explicit `allowed_ips` policy.
+/// Rewrites the absolute-form request to origin-form, connects upstream,
+/// and relays the response using `copy_bidirectional` for streaming support.
+async fn handle_forward_proxy(
+    method: &str,
+    target_uri: &str,
+    buf: &[u8],
+    used: usize,
+    client: &mut TcpStream,
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+) -> Result<()> {
+    // 1. Parse the absolute-form URI
+    let (scheme, host, port, path) = match parse_proxy_uri(target_uri) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            warn!(target_uri = %target_uri, error = %e, "FORWARD parse error");
+            respond(client, b"HTTP/1.1 400 Bad Request\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+    let host_lc = host.to_ascii_lowercase();
+
+    // 2. Reject HTTPS — must use CONNECT for TLS
+    if scheme == "https" {
+        info!(
+            dst_host = %host_lc,
+            dst_port = port,
+            "FORWARD rejected: HTTPS requires CONNECT"
+        );
+        respond(
+            client,
+            b"HTTP/1.1 400 Bad Request\r\nContent-Length: 27\r\n\r\nUse CONNECT for HTTPS URLs",
+        )
+        .await?;
+        return Ok(());
+    }
+
+    // 3. Evaluate OPA policy (same identity binding as CONNECT)
+    let peer_addr = client.peer_addr().into_diagnostic()?;
+    let local_addr = client.local_addr().into_diagnostic()?;
+
+    let decision = evaluate_opa_tcp(
+        peer_addr,
+        &opa_engine,
+        &identity_cache,
+        &entrypoint_pid,
+        &host_lc,
+        port,
+    );
+
+    // Build log context
+    let binary_str = decision
+        .binary
+        .as_ref()
+        .map_or_else(|| "-".to_string(), |p| p.display().to_string());
+    let pid_str = decision
+        .binary_pid
+        .map_or_else(|| "-".to_string(), |p| p.to_string());
+    let ancestors_str = if decision.ancestors.is_empty() {
+        "-".to_string()
+    } else {
+        decision
+            .ancestors
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" -> ")
+    };
+    let cmdline_str = if decision.cmdline_paths.is_empty() {
+        "-".to_string()
+    } else {
+        decision
+            .cmdline_paths
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    // 4. Only proceed on explicit Allow — reject Deny
+    let matched_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.clone(),
+        NetworkAction::Deny { reason } => {
+            info!(
+                src_addr = %peer_addr.ip(),
+                src_port = peer_addr.port(),
+                proxy_addr = %local_addr,
+                dst_host = %host_lc,
+                dst_port = port,
+                method = %method,
+                path = %path,
+                binary = %binary_str,
+                binary_pid = %pid_str,
+                ancestors = %ancestors_str,
+                cmdline = %cmdline_str,
+                action = "deny",
+                engine = "opa",
+                policy = "-",
+                reason = %reason,
+                "FORWARD",
+            );
+            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+    let policy_str = matched_policy.as_deref().unwrap_or("-");
+
+    // 5. Require allowed_ips (forward proxy only works with explicit SSRF override)
+    let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
+    if raw_allowed_ips.is_empty() {
+        info!(
+            src_addr = %peer_addr.ip(),
+            src_port = peer_addr.port(),
+            proxy_addr = %local_addr,
+            dst_host = %host_lc,
+            dst_port = port,
+            method = %method,
+            path = %path,
+            binary = %binary_str,
+            binary_pid = %pid_str,
+            ancestors = %ancestors_str,
+            cmdline = %cmdline_str,
+            action = "deny",
+            engine = "opa",
+            policy = %policy_str,
+            reason = "forward proxy requires allowed_ips on endpoint",
+            "FORWARD",
+        );
+        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    // 6. Resolve DNS and validate against allowed_ips
+    let addrs = match parse_allowed_ips(&raw_allowed_ips) {
+        Ok(nets) => match resolve_and_check_allowed_ips(&host, port, &nets).await {
+            Ok(addrs) => addrs,
+            Err(reason) => {
+                warn!(
+                    dst_host = %host_lc,
+                    dst_port = port,
+                    reason = %reason,
+                    "FORWARD blocked: allowed_ips check failed"
+                );
+                respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                return Ok(());
+            }
+        },
+        Err(reason) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                reason = %reason,
+                "FORWARD blocked: invalid allowed_ips in policy"
+            );
+            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    // 7. Private-IP gate: forward proxy only to RFC 1918 private addresses
+    if !addrs.iter().all(|a| is_internal_ip(a.ip())) {
+        info!(
+            src_addr = %peer_addr.ip(),
+            src_port = peer_addr.port(),
+            proxy_addr = %local_addr,
+            dst_host = %host_lc,
+            dst_port = port,
+            method = %method,
+            path = %path,
+            binary = %binary_str,
+            binary_pid = %pid_str,
+            ancestors = %ancestors_str,
+            cmdline = %cmdline_str,
+            action = "deny",
+            engine = "opa",
+            policy = %policy_str,
+            reason = "forward proxy restricted to private IP endpoints",
+            "FORWARD",
+        );
+        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        return Ok(());
+    }
+
+    // 8. Connect upstream
+    let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                dst_host = %host_lc,
+                dst_port = port,
+                error = %e,
+                "FORWARD upstream connect failed"
+            );
+            respond(client, b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await?;
+            return Ok(());
+        }
+    };
+
+    // Log success
+    info!(
+        src_addr = %peer_addr.ip(),
+        src_port = peer_addr.port(),
+        proxy_addr = %local_addr,
+        dst_host = %host_lc,
+        dst_port = port,
+        method = %method,
+        path = %path,
+        binary = %binary_str,
+        binary_pid = %pid_str,
+        ancestors = %ancestors_str,
+        cmdline = %cmdline_str,
+        action = "allow",
+        engine = "opa",
+        policy = %policy_str,
+        reason = "",
+        "FORWARD",
+    );
+
+    // 9. Rewrite request and forward to upstream
+    let rewritten = rewrite_forward_request(buf, used, &path);
+    upstream.write_all(&rewritten).await.into_diagnostic()?;
+
+    // 10. Relay remaining traffic bidirectionally (supports streaming)
+    let _ = tokio::io::copy_bidirectional(client, &mut upstream)
+        .await
+        .into_diagnostic()?;
+
+    Ok(())
 }
 
 fn parse_target(target: &str) -> Result<(String, u16)> {
@@ -1696,5 +2099,134 @@ mod tests {
         // Gracefully handles garbage input
         let result = extract_host_from_uri("not-a-uri");
         assert!(!result.is_empty());
+    }
+
+    // --- parse_proxy_uri tests ---
+
+    #[test]
+    fn test_parse_proxy_uri_standard() {
+        let (scheme, host, port, path) =
+            parse_proxy_uri("http://10.86.8.223:8000/screenshot/").unwrap();
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "10.86.8.223");
+        assert_eq!(port, 8000);
+        assert_eq!(path, "/screenshot/");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_default_port() {
+        let (scheme, host, port, path) = parse_proxy_uri("http://example.com/path").unwrap();
+        assert_eq!(scheme, "http");
+        assert_eq!(host, "example.com");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_https_default_port() {
+        let (scheme, host, port, path) =
+            parse_proxy_uri("https://api.example.com/v1/chat").unwrap();
+        assert_eq!(scheme, "https");
+        assert_eq!(host, "api.example.com");
+        assert_eq!(port, 443);
+        assert_eq!(path, "/v1/chat");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_missing_path() {
+        let (_, host, port, path) = parse_proxy_uri("http://10.0.0.1:9090").unwrap();
+        assert_eq!(host, "10.0.0.1");
+        assert_eq!(port, 9090);
+        assert_eq!(path, "/");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_with_query() {
+        let (_, _, _, path) = parse_proxy_uri("http://host:80/api?key=val&foo=bar").unwrap();
+        assert_eq!(path, "/api?key=val&foo=bar");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_ipv6() {
+        let (_, host, port, path) = parse_proxy_uri("http://[::1]:8080/test").unwrap();
+        assert_eq!(host, "::1");
+        assert_eq!(port, 8080);
+        assert_eq!(path, "/test");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_ipv6_default_port() {
+        let (_, host, port, path) = parse_proxy_uri("http://[fe80::1]/path").unwrap();
+        assert_eq!(host, "fe80::1");
+        assert_eq!(port, 80);
+        assert_eq!(path, "/path");
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_missing_scheme() {
+        let result = parse_proxy_uri("example.com/path");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_proxy_uri_empty_host() {
+        let result = parse_proxy_uri("http:///path");
+        assert!(result.is_err());
+    }
+
+    // --- rewrite_forward_request tests ---
+
+    #[test]
+    fn test_rewrite_get_request() {
+        let raw =
+            b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
+        let result = rewrite_forward_request(raw, raw.len(), "/api");
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
+        assert!(result_str.contains("Host: 10.0.0.1:8000"));
+        assert!(result_str.contains("Connection: close"));
+        assert!(result_str.contains("Via: 1.1 navigator-sandbox"));
+    }
+
+    #[test]
+    fn test_rewrite_strips_proxy_headers() {
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
+        let result = rewrite_forward_request(raw, raw.len(), "/p");
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(
+            !result_str
+                .to_ascii_lowercase()
+                .contains("proxy-authorization")
+        );
+        assert!(!result_str.to_ascii_lowercase().contains("proxy-connection"));
+        assert!(result_str.contains("Accept: */*"));
+    }
+
+    #[test]
+    fn test_rewrite_replaces_connection_header() {
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
+        let result = rewrite_forward_request(raw, raw.len(), "/p");
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("Connection: close"));
+        assert!(!result_str.contains("keep-alive"));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_body_overflow() {
+        let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
+        let result = rewrite_forward_request(raw, raw.len(), "/api");
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("{\"key\":\"val\"}"));
+        assert!(result_str.contains("POST /api HTTP/1.1"));
+    }
+
+    #[test]
+    fn test_rewrite_preserves_existing_via() {
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
+        let result = rewrite_forward_request(raw, raw.len(), "/p");
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("Via: 1.0 upstream"));
+        // Should not add a second Via header
+        assert!(!result_str.contains("Via: 1.1 navigator-sandbox"));
     }
 }
