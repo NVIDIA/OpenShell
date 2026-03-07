@@ -1,6 +1,6 @@
 ---
 name: nemoclaw-cli
-description: Guide agents through using the NemoClaw CLI (nemoclaw) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - nemoclaw, sandbox create, sandbox connect, sandbox logs, provider create, policy set, policy get, image push, port forward, BYOC, bring your own container, use nemoclaw, run nemoclaw, CLI usage, manage sandbox, manage provider.
+description: Guide agents through using the NemoClaw CLI (nemoclaw) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - nemoclaw, sandbox create, sandbox connect, logs, provider create, policy set, policy get, image push, forward, port forward, BYOC, bring your own container, use nemoclaw, run nemoclaw, CLI usage, manage sandbox, manage provider, gateway start, gateway select.
 ---
 
 # NemoClaw CLI
@@ -9,7 +9,7 @@ Guide agents through using the `nemoclaw` CLI for sandbox and platform managemen
 
 ## Overview
 
-The NemoClaw CLI (`nemoclaw`) is the primary interface for managing sandboxes, providers, policies, inference routes, and clusters. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The NemoClaw CLI (`nemoclaw`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateways. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
@@ -26,7 +26,7 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 ## Prerequisites
 
 - `nemoclaw` is on the PATH (install via `cargo install --path crates/navigator-cli`)
-- Docker is running (required for cluster operations and BYOC)
+- Docker is running (required for gateway operations and BYOC)
 - For remote clusters: SSH access to the target host
 
 ## Command Reference
@@ -42,21 +42,21 @@ Use this workflow when no cluster exists yet and the user wants to get a sandbox
 ### Step 1: Bootstrap a cluster
 
 ```bash
-nemoclaw cluster admin deploy
+nemoclaw gateway start
 ```
 
-This provisions a local k3s cluster in Docker. The CLI will prompt interactively if a cluster already exists. The cluster is automatically set as the active cluster.
+This provisions a local k3s cluster in Docker. The CLI will prompt interactively if a cluster already exists. The cluster is automatically set as the active gateway.
 
 For remote deployment:
 
 ```bash
-nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa
+nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 ### Step 2: Verify the cluster
 
 ```bash
-nemoclaw cluster status
+nemoclaw status
 ```
 
 Confirm the cluster is reachable and shows a version.
@@ -139,14 +139,14 @@ nemoclaw sandbox create \
   --provider my-github \
   --provider my-claude \
   --policy ./my-policy.yaml \
-  --sync \
+  --upload .:/sandbox \
   -- claude
 ```
 
 Key flags:
 - `--provider`: Attach one or more providers (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `NEMOCLAW_SANDBOX_POLICY` env var)
-- `--sync`: Push local git-tracked files to `/sandbox` in the container
+- `--upload <PATH>[:<DEST>]`: Upload local files into the sandbox (default dest: `/sandbox`)
 - `--keep`: Keep sandbox alive after the command exits (useful for non-interactive commands)
 - `--forward <PORT>`: Forward a local port (implies `--keep`)
 
@@ -169,30 +169,30 @@ Opens an interactive SSH shell. To configure VS Code Remote-SSH:
 nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
-### Sync files
+### Upload and download files
 
 ```bash
-# Push local files to sandbox
-nemoclaw sandbox sync my-sandbox --up ./src /sandbox/src
+# Upload local files to sandbox
+nemoclaw sandbox upload my-sandbox ./src /sandbox/src
 
-# Pull files from sandbox
-nemoclaw sandbox sync my-sandbox --down /sandbox/output ./local-output
+# Download files from sandbox
+nemoclaw sandbox download my-sandbox /sandbox/output ./local-output
 ```
 
 ### View logs
 
 ```bash
 # Recent logs
-nemoclaw sandbox logs my-sandbox
+nemoclaw logs my-sandbox
 
 # Stream live logs
-nemoclaw sandbox logs my-sandbox --tail
+nemoclaw logs my-sandbox --tail
 
 # Filter by source and level
-nemoclaw sandbox logs my-sandbox --tail --source sandbox --level warn
+nemoclaw logs my-sandbox --tail --source sandbox --level warn
 
 # Logs from the last 5 minutes
-nemoclaw sandbox logs my-sandbox --since 5m
+nemoclaw logs my-sandbox --since 5m
 ```
 
 ### Delete sandboxes
@@ -246,7 +246,7 @@ Use `--keep` so the sandbox stays alive for iteration. The user can work in the 
 In a separate terminal or as the agent:
 
 ```bash
-nemoclaw sandbox logs dev --tail --source sandbox
+nemoclaw logs dev --tail --source sandbox
 ```
 
 Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
@@ -257,7 +257,7 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 ### Step 3: Pull the current policy
 
 ```bash
-nemoclaw sandbox policy get dev --full > current-policy.yaml
+nemoclaw policy get dev --full > current-policy.yaml
 ```
 
 The `--full` flag outputs valid YAML that can be directly re-submitted. This is the round-trip format.
@@ -277,7 +277,7 @@ Only `network_policies` and `inference` sections can be modified at runtime. If 
 ### Step 5: Push the updated policy
 
 ```bash
-nemoclaw sandbox policy set dev --policy current-policy.yaml --wait
+nemoclaw policy set dev --policy current-policy.yaml --wait
 ```
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
@@ -288,7 +288,7 @@ The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls 
 ### Step 6: Verify the update
 
 ```bash
-nemoclaw sandbox policy list dev
+nemoclaw policy list dev
 ```
 
 Check that the latest revision shows status `loaded`. If `failed`, check the error column for details.
@@ -302,13 +302,13 @@ Return to Step 2. Continue monitoring logs and refining the policy until all req
 View all revisions to understand how the policy evolved:
 
 ```bash
-nemoclaw sandbox policy list dev --limit 50
+nemoclaw policy list dev --limit 50
 ```
 
 Fetch a specific historical revision:
 
 ```bash
-nemoclaw sandbox policy get dev --rev 3 --full
+nemoclaw policy get dev --rev 3 --full
 ```
 
 ---
@@ -335,10 +335,10 @@ When `--from` is specified, the CLI:
 
 ```bash
 # Foreground (blocks)
-nemoclaw sandbox forward start 8080 my-app
+nemoclaw forward start 8080 my-app
 
 # Background (returns immediately)
-nemoclaw sandbox forward start 8080 my-app -d
+nemoclaw forward start 8080 my-app -d
 ```
 
 The service is now reachable at `localhost:8080`.
@@ -347,10 +347,10 @@ The service is now reachable at `localhost:8080`.
 
 ```bash
 # List active forwards
-nemoclaw sandbox forward list
+nemoclaw forward list
 
 # Stop a forward
-nemoclaw sandbox forward stop 8080 my-app
+nemoclaw forward stop 8080 my-app
 ```
 
 ### Step 4: Iterate
@@ -412,7 +412,7 @@ nemoclaw sandbox ssh-config work-session >> ~/.ssh/config
 While the user works, monitor the sandbox logs:
 
 ```bash
-nemoclaw sandbox logs work-session --tail --source sandbox --level warn
+nemoclaw logs work-session --tail --source sandbox --level warn
 ```
 
 Watch for `deny` actions that indicate the user's work is being blocked by policy.
@@ -421,10 +421,10 @@ Watch for `deny` actions that indicate the user's work is being blocked by polic
 
 When denied actions are observed:
 
-1. Pull current policy: `nemoclaw sandbox policy get work-session --full > policy.yaml`
+1. Pull current policy: `nemoclaw policy get work-session --full > policy.yaml`
 2. Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
-3. Push the update: `nemoclaw sandbox policy set work-session --policy policy.yaml --wait`
-4. Verify: `nemoclaw sandbox policy list work-session`
+3. Push the update: `nemoclaw policy set work-session --policy policy.yaml --wait`
+4. Verify: `nemoclaw policy list work-session`
 
 The user does not need to disconnect -- policy updates are hot-reloaded within ~30 seconds (or immediately when using `--wait`, which polls for confirmation).
 
@@ -472,36 +472,36 @@ nemoclaw cluster inference get
 
 ---
 
-## Workflow 8: Cluster Management
+## Workflow 8: Gateway Management
 
-### List and switch clusters
+### List and switch gateways
 
 ```bash
-nemoclaw cluster list              # See all clusters
-nemoclaw cluster use my-cluster    # Switch active cluster
-nemoclaw cluster status            # Verify connectivity
+nemoclaw gateway select            # See all gateways (no args shows list)
+nemoclaw gateway select my-cluster # Switch active gateway
+nemoclaw status                    # Verify connectivity
 ```
 
 ### Lifecycle
 
 ```bash
-nemoclaw cluster admin deploy                          # Start local cluster
-nemoclaw cluster admin stop                            # Stop (preserves state)
-nemoclaw cluster admin deploy                          # Restart (reuses state)
-nemoclaw cluster admin destroy                         # Destroy permanently
+nemoclaw gateway start                                 # Start local cluster
+nemoclaw gateway stop                                  # Stop (preserves state)
+nemoclaw gateway start                                 # Restart (reuses state)
+nemoclaw gateway destroy                               # Destroy permanently
 ```
 
 ### Remote clusters
 
 ```bash
 # Deploy to remote host
-nemoclaw cluster admin deploy --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
+nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
 
 # Set up kubectl access
-nemoclaw cluster admin tunnel --name remote-cluster
+nemoclaw gateway tunnel --name remote-cluster
 
 # Get cluster info
-nemoclaw cluster admin info --name remote-cluster
+nemoclaw gateway info --name remote-cluster
 ```
 
 ---
@@ -520,10 +520,10 @@ The CLI help is always authoritative. If the help output contradicts this skill,
 
 ```bash
 $ nemoclaw sandbox --help
-# Shows: create, get, list, delete, connect, sync, logs, ssh-config, forward, image, policy
+# Shows: create, get, list, delete, connect, upload, download, ssh-config, image
 
-$ nemoclaw sandbox sync --help
-# Shows: --up, --down flags, positional arguments, usage examples
+$ nemoclaw sandbox upload --help
+# Shows: positional arguments (name, path, dest), usage examples
 ```
 
 ---
@@ -532,24 +532,27 @@ $ nemoclaw sandbox sync --help
 
 | Task | Command |
 |------|---------|
-| Deploy local cluster | `nemoclaw cluster admin deploy` |
-| Check cluster health | `nemoclaw cluster status` |
+| Deploy local cluster | `nemoclaw gateway start` |
+| Check cluster health | `nemoclaw status` |
+| List/switch gateways | `nemoclaw gateway select [name]` |
 | Create sandbox (interactive) | `nemoclaw sandbox create` |
 | Create sandbox with tool | `nemoclaw sandbox create -- claude` |
 | Create with custom policy | `nemoclaw sandbox create --policy ./p.yaml --keep` |
 | Connect to sandbox | `nemoclaw sandbox connect <name>` |
-| Stream live logs | `nemoclaw sandbox logs <name> --tail` |
-| Pull current policy | `nemoclaw sandbox policy get <name> --full > p.yaml` |
-| Push updated policy | `nemoclaw sandbox policy set <name> --policy p.yaml --wait` |
-| Policy revision history | `nemoclaw sandbox policy list <name>` |
+| Stream live logs | `nemoclaw logs <name> --tail` |
+| Pull current policy | `nemoclaw policy get <name> --full > p.yaml` |
+| Push updated policy | `nemoclaw policy set <name> --policy p.yaml --wait` |
+| Policy revision history | `nemoclaw policy list <name>` |
 | Create sandbox from Dockerfile | `nemoclaw sandbox create --from ./Dockerfile --keep` |
-| Forward a port | `nemoclaw sandbox forward start <port> <name> -d` |
+| Forward a port | `nemoclaw forward start <port> <name> -d` |
+| Upload files to sandbox | `nemoclaw sandbox upload <name> <path>` |
+| Download files from sandbox | `nemoclaw sandbox download <name> <path>` |
 | Create provider | `nemoclaw provider create --name N --type T --from-existing` |
 | List providers | `nemoclaw provider list` |
 | Configure cluster inference | `nemoclaw cluster inference set --provider P --model M` |
 | View cluster inference | `nemoclaw cluster inference get` |
 | Delete sandbox | `nemoclaw sandbox delete <name>` |
-| Destroy cluster | `nemoclaw cluster admin destroy` |
+| Destroy cluster | `nemoclaw gateway destroy` |
 | Self-teach any command | `nemoclaw <group> <cmd> --help` |
 
 ## Companion Skills

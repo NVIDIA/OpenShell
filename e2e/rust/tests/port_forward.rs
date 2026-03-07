@@ -5,10 +5,8 @@
 
 //! E2E test: TCP port forwarding through a sandbox.
 //!
-//! Replaces `e2e/bash/test_port_forward.sh`.
-//!
 //! Prerequisites:
-//! - A running nemoclaw cluster (`nemoclaw cluster admin deploy`)
+//! - A running nemoclaw gateway (`nemoclaw gateway start`)
 //! - The `nemoclaw` binary (built automatically from the workspace)
 
 use std::time::Duration;

@@ -209,7 +209,7 @@ VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
 if [ "${MODE}" = "fast" ]; then
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
-    nemoclaw cluster admin destroy --name "${CLUSTER_NAME}"
+    nemoclaw gateway destroy --name "${CLUSTER_NAME}"
   fi
 fi
 
@@ -236,7 +236,7 @@ if [ -z "${NEMOCLAW_CLUSTER_IMAGE:-}" ]; then
   export NEMOCLAW_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
 fi
 
-DEPLOY_CMD=(nemoclaw cluster admin deploy --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
+DEPLOY_CMD=(nemoclaw gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
 
 if [ -n "${GATEWAY_HOST:-}" ]; then
   DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")

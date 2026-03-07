@@ -1,17 +1,17 @@
 ---
 name: debug-navigator-cluster
-description: Debug why a nemoclaw cluster failed to start or is unhealthy. Use when the user has a failed `nemoclaw cluster admin deploy`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed.
+description: Debug why a nemoclaw cluster failed to start or is unhealthy. Use when the user has a failed `nemoclaw gateway start`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed, gateway start failed, gateway not starting.
 ---
 
 # Debug NemoClaw Cluster
 
-Diagnose why a nemoclaw cluster failed to start after `nemoclaw cluster admin deploy`.
+Diagnose why a nemoclaw cluster failed to start after `nemoclaw gateway start`.
 
 ## Overview
 
-`nemoclaw cluster admin deploy` creates a Docker container running k3s with the NemoClaw server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
+`nemoclaw gateway start` creates a Docker container running k3s with the NemoClaw server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
 
-1. **Pre-deploy check**: `nemoclaw cluster admin deploy` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
+1. **Pre-deploy check**: `nemoclaw gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
 3. Create Docker network (`navigator-cluster`) and volume (`navigator-cluster-{name}`)
 4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
@@ -31,7 +31,7 @@ For local deploys, metadata endpoint selection now depends on Docker connectivit
 - default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
 - TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
 
-The host port is configurable via `--port` on `nemoclaw cluster admin deploy` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
+The host port is configurable via `--port` on `nemoclaw gateway start` (default 8080) and is stored in `ClusterMetadata.gateway_port`.
 
 The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validation succeeds.
 
@@ -302,7 +302,7 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Helm install job failed | Chart values error or dependency issue | Check `helm-install-navigator` job logs in `kube-system` |
 | Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
 | SSH connection failed (remote) | SSH key/host/Docker issues | Test `ssh <host> docker ps` manually |
-| Port conflict | Another service on 6443 or the configured gateway host port (default 8080) | Stop conflicting service or use `--port` to pick a different host port |
+| Port conflict | Another service on 6443 or the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `nemoclaw gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
 | DNS failures inside container | Entrypoint DNS detection failed | Check `/etc/rancher/k3s/resolv.conf` and container startup logs |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
@@ -331,7 +331,7 @@ docker -H ssh://<host> logs navigator-cluster-<name>
 **Setting up kubectl access** (requires tunnel):
 
 ```bash
-nemoclaw cluster admin tunnel --name <name> --remote <host>
+nemoclaw gateway tunnel --name <name> --remote <host>
 # Then in another terminal:
 export KUBECONFIG=~/.config/nemoclaw/clusters/<name>/kubeconfig
 kubectl get pods -A

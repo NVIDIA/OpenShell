@@ -55,13 +55,13 @@ For additional sandbox images see the [NVIDIA/NemoClaw-Community](https://github
 To deploy a cluster explicitly:
 
 ```bash
-nemoclaw cluster admin deploy
+nemoclaw gateway start
 ```
 
 For remote deployment:
 
 ```bash
-nemoclaw cluster admin deploy --remote user@host
+nemoclaw gateway start --remote user@host
 ```
 
 ### Upgrading
@@ -69,7 +69,7 @@ nemoclaw cluster admin deploy --remote user@host
 To upgrade, redeploy your cluster to pick up the latest server and sandbox images:
 
 ```bash
-nemoclaw cluster admin deploy
+nemoclaw gateway start
 ```
 
 This will prompt you to recreate the cluster. Select "yes" to recreate the cluster.

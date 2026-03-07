@@ -97,13 +97,20 @@ fn is_connectivity_error(error: &miette::Report) -> bool {
 
 /// Prompt the user to confirm cluster bootstrap.
 ///
-/// Only prompts when stdin is a terminal. In non-interactive mode, returns an
-/// error with an actionable message.
-pub fn confirm_bootstrap() -> Result<bool> {
+/// When `override_value` is `Some(true)` or `Some(false)`, the decision is
+/// made immediately (from `--bootstrap` / `--no-bootstrap`). Otherwise,
+/// prompts interactively when stdin is a terminal, or returns an error in
+/// non-interactive mode.
+pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
+    // Explicit flag takes precedence over interactive detection.
+    if let Some(value) = override_value {
+        return Ok(value);
+    }
+
     if !std::io::stdin().is_terminal() {
         return Err(miette::miette!(
-            "Cluster not reachable and bootstrap requires confirmation from an interactive terminal.\n\
-             Run 'nemoclaw cluster admin deploy' first, then retry."
+            "Gateway not reachable and bootstrap requires confirmation from an interactive terminal.\n\
+              Pass --bootstrap to auto-confirm, or run 'nemoclaw gateway start' first."
         ));
     }
 

@@ -6,7 +6,7 @@ your local machine through port forwarding.
 
 ## Prerequisites
 
-- A running NemoClaw cluster (`nemoclaw cluster admin deploy`)
+- A running NemoClaw gateway (`nemoclaw gateway start`)
 - Docker daemon running
 
 ## What's in this example

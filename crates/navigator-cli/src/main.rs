@@ -44,17 +44,17 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         .or_else(load_active_cluster)
         .ok_or_else(|| {
             miette::miette!(
-                "No active cluster.\n\
-                 Set one with: nemoclaw cluster use <name>\n\
-                 Or deploy a new cluster: nemoclaw cluster admin deploy"
+                "No active gateway.\n\
+                 Set one with: nemoclaw gateway select <name>\n\
+                 Or deploy a new gateway: nemoclaw gateway start"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
-            "Unknown cluster '{name}'.\n\
-             Deploy it first: nemoclaw cluster admin deploy --name {name}\n\
-             Or list available clusters: nemoclaw cluster list"
+            "Unknown gateway '{name}'.\n\
+             Deploy it first: nemoclaw gateway start --name {name}\n\
+             Or list available gateways: nemoclaw gateway select"
         )
     })?;
 
@@ -66,8 +66,8 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
 
 /// Resolve only the cluster name (without requiring metadata to exist).
 ///
-/// Used by admin commands that operate on a cluster by name but may not need
-/// the gateway endpoint (e.g., `cluster admin deploy` creates the cluster).
+/// Used by gateway commands that operate on a cluster by name but may not need
+/// the gateway endpoint (e.g., `gateway start` creates the cluster).
 fn resolve_cluster_name(cluster_flag: &Option<String>) -> Option<String> {
     cluster_flag
         .clone()
@@ -118,16 +118,64 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Manage cluster.
-    Cluster {
+    /// Manage the gateway lifecycle.
+    Gateway {
         #[command(subcommand)]
-        command: ClusterCommands,
+        command: GatewayCommands,
     },
+
+    /// Show gateway status and information.
+    Status,
 
     /// Manage sandboxes.
     Sandbox {
         #[command(subcommand)]
         command: SandboxCommands,
+    },
+
+    /// Manage port forwarding to a sandbox.
+    Forward {
+        #[command(subcommand)]
+        command: ForwardCommands,
+    },
+
+    /// View sandbox logs.
+    Logs {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Number of log lines to return.
+        #[arg(short, default_value_t = 200)]
+        n: u32,
+
+        /// Stream live logs.
+        #[arg(long)]
+        tail: bool,
+
+        /// Only show logs from this duration ago (e.g. 5m, 1h, 30s).
+        #[arg(long)]
+        since: Option<String>,
+
+        /// Filter by log source: "gateway", "sandbox", or "all" (default).
+        /// Can be specified multiple times: --source gateway --source sandbox
+        #[arg(long, default_value = "all")]
+        source: Vec<String>,
+
+        /// Minimum log level to display: error, warn, info (default), debug, trace.
+        #[arg(long, default_value = "")]
+        level: String,
+    },
+
+    /// Manage sandbox policy.
+    Policy {
+        #[command(subcommand)]
+        command: PolicyCommands,
+    },
+
+    /// Manage inference configuration.
+    Inference {
+        #[command(subcommand)]
+        command: ClusterInferenceCommands,
     },
 
     /// Manage provider configuration.
@@ -180,6 +228,13 @@ enum Commands {
         /// Sandbox name. Used in name mode.
         #[arg(long)]
         name: Option<String>,
+    },
+
+    /// Manage cluster (deprecated: use `gateway`).
+    #[command(hide = true)]
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommands,
     },
 }
 
@@ -365,67 +420,15 @@ enum ProviderCommands {
     },
 }
 
-#[derive(Subcommand, Debug)]
-enum ClusterCommands {
-    /// Show server status and information.
-    Status,
-
-    /// Set the active cluster.
-    Use {
-        /// Cluster name to make active.
-        #[arg(add = ArgValueCompleter::new(completers::complete_cluster_names))]
-        name: String,
-    },
-
-    /// List all provisioned clusters.
-    List,
-
-    /// Manage local development cluster lifecycle.
-    Admin {
-        #[command(subcommand)]
-        command: ClusterAdminCommands,
-    },
-
-    /// Manage cluster-level inference configuration.
-    Inference {
-        #[command(subcommand)]
-        command: ClusterInferenceCommands,
-    },
-}
+// -----------------------------------------------------------------------
+// Gateway commands (replaces the old `cluster` / `cluster admin` groups)
+// -----------------------------------------------------------------------
 
 #[derive(Subcommand, Debug)]
-enum ClusterInferenceCommands {
-    /// Set cluster-level inference provider and model.
-    Set {
-        /// Provider name.
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: String,
-
-        /// Model identifier to force for generation calls.
-        #[arg(long)]
-        model: String,
-    },
-
-    /// Update cluster-level inference configuration (partial update).
-    Update {
-        /// Provider name (unchanged if omitted).
-        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
-        provider: Option<String>,
-
-        /// Model identifier (unchanged if omitted).
-        #[arg(long)]
-        model: Option<String>,
-    },
-
-    /// Get cluster-level inference provider and model.
-    Get,
-}
-
-#[derive(Subcommand, Debug)]
-enum ClusterAdminCommands {
-    /// Provision or start a cluster (local or remote).
-    Deploy {
-        /// Cluster name.
+enum GatewayCommands {
+    /// Deploy/start the gateway.
+    Start {
+        /// Gateway name.
         #[arg(long, default_value = "nemoclaw")]
         name: String,
 
@@ -464,11 +467,18 @@ enum ClusterAdminCommands {
         /// allowing multiple clusters to coexist without port conflicts.
         #[arg(long, num_args = 0..=1, default_missing_value = "0")]
         kube_port: Option<u16>,
+
+        /// Destroy and recreate the gateway from scratch if one already exists.
+        ///
+        /// Without this flag, an interactive prompt asks what to do; in
+        /// non-interactive mode the existing gateway is reused silently.
+        #[arg(long)]
+        recreate: bool,
     },
 
-    /// Stop a cluster (preserves state).
+    /// Stop the gateway (preserves state).
     Stop {
-        /// Cluster name (defaults to active cluster).
+        /// Gateway name (defaults to active gateway).
         #[arg(long)]
         name: Option<String>,
 
@@ -481,9 +491,9 @@ enum ClusterAdminCommands {
         ssh_key: Option<String>,
     },
 
-    /// Destroy a cluster and its state.
+    /// Destroy the gateway and its state.
     Destroy {
-        /// Cluster name (defaults to active cluster).
+        /// Gateway name (defaults to active gateway).
         #[arg(long)]
         name: Option<String>,
 
@@ -496,16 +506,25 @@ enum ClusterAdminCommands {
         ssh_key: Option<String>,
     },
 
-    /// Show cluster deployment details.
+    /// Select the active gateway.
+    ///
+    /// When called without a name, lists available gateways to choose from.
+    Select {
+        /// Gateway name (omit to list available gateways).
+        #[arg(add = ArgValueCompleter::new(completers::complete_cluster_names))]
+        name: Option<String>,
+    },
+
+    /// Show gateway deployment details.
     Info {
-        /// Cluster name (defaults to active cluster).
+        /// Gateway name (defaults to active gateway).
         #[arg(long)]
         name: Option<String>,
     },
 
-    /// Print or start an SSH tunnel for kubectl access to a remote cluster.
+    /// Print or start an SSH tunnel for kubectl access to a remote gateway.
     Tunnel {
-        /// Cluster name (defaults to active cluster).
+        /// Gateway name (defaults to active gateway).
         #[arg(long)]
         name: Option<String>,
 
@@ -520,6 +539,97 @@ enum ClusterAdminCommands {
         /// Only print the SSH command instead of running it.
         #[arg(long)]
         print_command: bool,
+    },
+}
+
+// -----------------------------------------------------------------------
+// Hidden backwards-compat: `cluster admin deploy` → `gateway start`
+// -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum ClusterCommands {
+    /// Deprecated: use `gateway start`.
+    #[command(hide = true)]
+    Admin {
+        #[command(subcommand)]
+        command: ClusterAdminCommands,
+    },
+
+    /// Manage cluster-level inference configuration.
+    #[command(hide = true)]
+    Inference {
+        #[command(subcommand)]
+        command: ClusterInferenceCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterInferenceCommands {
+    /// Set cluster-level inference provider and model.
+    Set {
+        /// Provider name.
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: String,
+
+        /// Model identifier to force for generation calls.
+        #[arg(long)]
+        model: String,
+    },
+
+    /// Update cluster-level inference configuration (partial update).
+    Update {
+        /// Provider name (unchanged if omitted).
+        #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
+        provider: Option<String>,
+
+        /// Model identifier (unchanged if omitted).
+        #[arg(long)]
+        model: Option<String>,
+    },
+
+    /// Get cluster-level inference provider and model.
+    Get,
+}
+
+#[derive(Subcommand, Debug)]
+enum ClusterAdminCommands {
+    /// Deprecated: use `gateway start`.
+    Deploy {
+        /// Cluster name.
+        #[arg(long, default_value = "nemoclaw")]
+        name: String,
+
+        /// Write stored kubeconfig into local kubeconfig.
+        #[arg(long)]
+        update_kube_config: bool,
+
+        /// Print stored kubeconfig to stdout.
+        #[arg(long)]
+        get_kubeconfig: bool,
+
+        /// SSH destination for remote deployment (e.g., user@hostname).
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote deployment.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+
+        /// Host port to map to the gateway (default: 8080).
+        #[arg(long, default_value_t = navigator_bootstrap::DEFAULT_GATEWAY_PORT)]
+        port: u16,
+
+        /// Override the gateway host written into cluster metadata.
+        #[arg(long)]
+        gateway_host: Option<String>,
+
+        /// Expose the Kubernetes control plane on a host port for kubectl access.
+        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
+        kube_port: Option<u16>,
+
+        /// Destroy and recreate from scratch if a cluster already exists.
+        #[arg(long)]
+        recreate: bool,
     },
 }
 
@@ -544,9 +654,19 @@ enum SandboxCommands {
         #[arg(long)]
         from: Option<String>,
 
-        /// Sync local files into the sandbox before running.
-        #[arg(long)]
-        sync: bool,
+        /// Upload local files into the sandbox before running.
+        ///
+        /// Format: `<LOCAL_PATH>[:<SANDBOX_PATH>]`.
+        /// When `SANDBOX_PATH` is omitted, files are uploaded to the container
+        /// working directory (`/sandbox`).
+        /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
+        /// upload everything.
+        #[arg(long, value_hint = ValueHint::AnyPath)]
+        upload: Option<String>,
+
+        /// Disable `.gitignore` filtering for `--upload`.
+        #[arg(long, requires = "upload")]
+        no_git_ignore: bool,
 
         /// Keep the sandbox alive after non-interactive commands.
         #[arg(long)]
@@ -586,6 +706,28 @@ enum SandboxCommands {
         /// Disable pseudo-terminal allocation.
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
+
+        /// Auto-bootstrap a gateway if none is available.
+        ///
+        /// Without this flag, an interactive prompt asks whether to bootstrap;
+        /// in non-interactive mode the command errors.
+        #[arg(long, overrides_with = "no_bootstrap")]
+        bootstrap: bool,
+
+        /// Never bootstrap a gateway automatically; error if none is available.
+        #[arg(long, overrides_with = "bootstrap")]
+        no_bootstrap: bool,
+
+        /// Auto-create missing providers from local credentials.
+        ///
+        /// Without this flag, an interactive prompt asks per-provider;
+        /// in non-interactive mode the command errors.
+        #[arg(long, overrides_with = "no_auto_providers")]
+        auto_providers: bool,
+
+        /// Never auto-create providers; error if required providers are missing.
+        #[arg(long, overrides_with = "auto_providers")]
+        no_auto_providers: bool,
 
         /// Command to run after "--" (defaults to an interactive shell).
         #[arg(trailing_var_arg = true)]
@@ -634,63 +776,35 @@ enum SandboxCommands {
         name: Option<String>,
     },
 
-    /// Manage port forwarding to a sandbox.
-    Forward {
-        #[command(subcommand)]
-        command: ForwardCommands,
-    },
-
-    /// Sync files to or from a sandbox.
-    Sync {
-        /// Sandbox name (defaults to last-used sandbox).
+    /// Upload local files to a sandbox.
+    Upload {
+        /// Sandbox name.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
-        name: Option<String>,
+        name: String,
 
-        /// Push local files up to the sandbox.
-        #[arg(long, conflicts_with = "down", value_name = "LOCAL_PATH", value_hint = ValueHint::AnyPath)]
-        up: Option<String>,
+        /// Local path to upload.
+        #[arg(value_hint = ValueHint::AnyPath)]
+        local_path: String,
 
-        /// Pull sandbox files down to the local machine.
-        #[arg(long, conflicts_with = "up", value_name = "SANDBOX_PATH")]
-        down: Option<String>,
-
-        /// Destination path (sandbox path when pushing, local path when pulling).
-        /// Defaults to /sandbox for --up or . for --down.
-        #[arg(value_name = "DEST")]
+        /// Destination path in the sandbox (defaults to `/sandbox`).
         dest: Option<String>,
+
+        /// Disable `.gitignore` filtering (uploads everything).
+        #[arg(long)]
+        no_git_ignore: bool,
     },
 
-    /// Manage sandbox policy.
-    Policy {
-        #[command(subcommand)]
-        command: PolicyCommands,
-    },
+    /// Download files from a sandbox.
+    Download {
+        /// Sandbox name.
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: String,
 
-    /// View sandbox logs.
-    Logs {
-        /// Sandbox name (defaults to last-used sandbox).
-        name: Option<String>,
+        /// Sandbox path to download.
+        sandbox_path: String,
 
-        /// Number of log lines to return.
-        #[arg(short, default_value_t = 200)]
-        n: u32,
-
-        /// Stream live logs.
-        #[arg(long)]
-        tail: bool,
-
-        /// Only show logs from this duration ago (e.g. 5m, 1h, 30s).
-        #[arg(long)]
-        since: Option<String>,
-
-        /// Filter by log source: "gateway", "sandbox", or "all" (default).
-        /// Can be specified multiple times: --source gateway --source sandbox
-        #[arg(long, default_value = "all")]
-        source: Vec<String>,
-
-        /// Minimum log level to display: error, warn, info (default), debug, trace.
-        #[arg(long, default_value = "")]
-        level: String,
+        /// Local destination (defaults to `.`).
+        dest: Option<String>,
     },
 
     /// Print an SSH config entry for a sandbox.
@@ -807,115 +921,277 @@ async fn main() -> Result<()> {
         .init();
 
     match cli.command {
-        Some(Commands::Cluster { command }) => match command {
-            ClusterCommands::Status => {
-                let ctx = resolve_cluster(&cli.cluster)?;
-                let endpoint = &ctx.endpoint;
-                let tls = tls.with_cluster_name(&ctx.name);
-                run::cluster_status(&ctx.name, endpoint, &tls).await?;
-            }
-            ClusterCommands::Use { name } => {
-                run::cluster_use(&name)?;
-            }
-            ClusterCommands::List => {
-                run::cluster_list(&cli.cluster)?;
-            }
-            ClusterCommands::Admin { command } => match command {
-                ClusterAdminCommands::Deploy {
-                    name,
+        // -----------------------------------------------------------
+        // Gateway commands (was `cluster` / `cluster admin`)
+        // -----------------------------------------------------------
+        Some(Commands::Gateway { command }) => match command {
+            GatewayCommands::Start {
+                name,
+                update_kube_config,
+                get_kubeconfig,
+                remote,
+                ssh_key,
+                port,
+                gateway_host,
+                kube_port,
+                recreate,
+            } => {
+                run::cluster_admin_deploy(
+                    &name,
                     update_kube_config,
                     get_kubeconfig,
-                    remote,
-                    ssh_key,
+                    remote.as_deref(),
+                    ssh_key.as_deref(),
                     port,
-                    gateway_host,
+                    gateway_host.as_deref(),
                     kube_port,
-                } => {
-                    run::cluster_admin_deploy(
-                        &name,
-                        update_kube_config,
-                        get_kubeconfig,
-                        remote.as_deref(),
-                        ssh_key.as_deref(),
-                        port,
-                        gateway_host.as_deref(),
-                        kube_port,
-                    )
-                    .await?;
+                    recreate,
+                )
+                .await?;
+            }
+            GatewayCommands::Stop {
+                name,
+                remote,
+                ssh_key,
+            } => {
+                let name = name
+                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .unwrap_or_else(|| "nemoclaw".to_string());
+                run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
+            }
+            GatewayCommands::Destroy {
+                name,
+                remote,
+                ssh_key,
+            } => {
+                let name = name
+                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .unwrap_or_else(|| "nemoclaw".to_string());
+                run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
+            }
+            GatewayCommands::Select { name } => {
+                if let Some(name) = name {
+                    run::cluster_use(&name)?;
+                } else {
+                    // No name provided — show available gateways.
+                    run::cluster_list(&cli.cluster)?;
+                    eprintln!();
+                    eprintln!(
+                        "Select a gateway with: {}",
+                        "nemoclaw gateway select <name>".dimmed()
+                    );
                 }
-                ClusterAdminCommands::Stop {
-                    name,
-                    remote,
-                    ssh_key,
-                } => {
-                    let name = name
-                        .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "nemoclaw".to_string());
-                    run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
-                }
-                ClusterAdminCommands::Destroy {
-                    name,
-                    remote,
-                    ssh_key,
-                } => {
-                    let name = name
-                        .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "nemoclaw".to_string());
-                    run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref())
-                        .await?;
-                }
-                ClusterAdminCommands::Info { name } => {
-                    let name = name
-                        .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "nemoclaw".to_string());
-                    run::cluster_admin_info(&name)?;
-                }
-                ClusterAdminCommands::Tunnel {
-                    name,
-                    remote,
-                    ssh_key,
+            }
+            GatewayCommands::Info { name } => {
+                let name = name
+                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .unwrap_or_else(|| "nemoclaw".to_string());
+                run::cluster_admin_info(&name)?;
+            }
+            GatewayCommands::Tunnel {
+                name,
+                remote,
+                ssh_key,
+                print_command,
+            } => {
+                let name = name
+                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .unwrap_or_else(|| "nemoclaw".to_string());
+                run::cluster_admin_tunnel(
+                    &name,
+                    remote.as_deref(),
+                    ssh_key.as_deref(),
                     print_command,
-                } => {
-                    let name = name
-                        .or_else(|| resolve_cluster_name(&cli.cluster))
-                        .unwrap_or_else(|| "nemoclaw".to_string());
-                    run::cluster_admin_tunnel(
-                        &name,
-                        remote.as_deref(),
-                        ssh_key.as_deref(),
-                        print_command,
-                    )?;
-                }
-            },
-            ClusterCommands::Inference { command } => {
-                let ctx = resolve_cluster(&cli.cluster)?;
-                let endpoint = &ctx.endpoint;
+                )?;
+            }
+        },
+
+        // -----------------------------------------------------------
+        // Top-level status (was `cluster status`)
+        // -----------------------------------------------------------
+        Some(Commands::Status) => {
+            if let Ok(ctx) = resolve_cluster(&cli.cluster) {
                 let tls = tls.with_cluster_name(&ctx.name);
-                match command {
-                    ClusterInferenceCommands::Set { provider, model } => {
-                        run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
+            } else {
+                println!("{}", "Gateway Status".cyan().bold());
+                println!();
+                println!("  {} No gateway configured.", "Status:".dimmed(),);
+                println!();
+                println!(
+                    "Deploy a gateway with: {}",
+                    "nemoclaw gateway start".dimmed()
+                );
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Top-level forward (was `sandbox forward`)
+        // -----------------------------------------------------------
+        Some(Commands::Forward { command: fwd_cmd }) => match fwd_cmd {
+            ForwardCommands::Stop { port, name } => {
+                let cluster_name = resolve_cluster_name(&cli.cluster).unwrap_or_default();
+                let name = resolve_sandbox_name(name, &cluster_name)?;
+                if run::stop_forward(&name, port)? {
+                    eprintln!(
+                        "{} Stopped forward of port {port} for sandbox {name}",
+                        "✓".green().bold(),
+                    );
+                } else {
+                    eprintln!(
+                        "{} No active forward found for port {port} on sandbox {name}",
+                        "!".yellow(),
+                    );
+                }
+            }
+            ForwardCommands::List => {
+                let forwards = run::list_forwards()?;
+                if forwards.is_empty() {
+                    eprintln!("No active forwards.");
+                } else {
+                    let name_width = forwards
+                        .iter()
+                        .map(|f| f.sandbox.len())
+                        .max()
+                        .unwrap_or(7)
+                        .max(7);
+                    println!(
+                        "{:<width$} {:<8} {:<10} STATUS",
+                        "SANDBOX",
+                        "PORT",
+                        "PID",
+                        width = name_width,
+                    );
+                    for f in &forwards {
+                        let status = if f.alive {
+                            "running".green().to_string()
+                        } else {
+                            "dead".red().to_string()
+                        };
+                        println!(
+                            "{:<width$} {:<8} {:<10} {}",
+                            f.sandbox,
+                            f.port,
+                            f.pid,
+                            status,
+                            width = name_width,
+                        );
                     }
-                    ClusterInferenceCommands::Update { provider, model } => {
-                        run::cluster_inference_update(
-                            endpoint,
-                            provider.as_deref(),
-                            model.as_deref(),
-                            &tls,
-                        )
-                        .await?;
-                    }
-                    ClusterInferenceCommands::Get => {
-                        run::cluster_inference_get(endpoint, &tls).await?;
-                    }
+                }
+            }
+            ForwardCommands::Start {
+                port,
+                name,
+                background,
+            } => {
+                let ctx = resolve_cluster(&cli.cluster)?;
+                let tls = tls.with_cluster_name(&ctx.name);
+                let name = resolve_sandbox_name(name, &ctx.name)?;
+                run::sandbox_forward(&ctx.endpoint, &name, port, background, &tls).await?;
+                if background {
+                    eprintln!(
+                        "{} Forwarding port {port} to sandbox {name} in the background",
+                        "✓".green().bold(),
+                    );
+                    eprintln!("  Access at: http://127.0.0.1:{port}/");
+                    eprintln!("  Stop with: nemoclaw forward stop {port} {name}");
                 }
             }
         },
+
+        // -----------------------------------------------------------
+        // Top-level logs (was `sandbox logs`)
+        // -----------------------------------------------------------
+        Some(Commands::Logs {
+            name,
+            n,
+            tail,
+            since,
+            source,
+            level,
+        }) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let tls = tls.with_cluster_name(&ctx.name);
+            let name = resolve_sandbox_name(name, &ctx.name)?;
+            run::sandbox_logs(
+                &ctx.endpoint,
+                &name,
+                n,
+                tail,
+                since.as_deref(),
+                &source,
+                &level,
+                &tls,
+            )
+            .await?;
+        }
+
+        // -----------------------------------------------------------
+        // Top-level policy (was `sandbox policy`)
+        // -----------------------------------------------------------
+        Some(Commands::Policy {
+            command: policy_cmd,
+        }) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let tls = tls.with_cluster_name(&ctx.name);
+            match policy_cmd {
+                PolicyCommands::Set {
+                    name,
+                    policy,
+                    wait,
+                    timeout,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
+                        .await?;
+                }
+                PolicyCommands::Get { name, rev, full } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                }
+                PolicyCommands::List { name, limit } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Inference commands
+        // -----------------------------------------------------------
+        Some(Commands::Inference { command }) => {
+            let ctx = resolve_cluster(&cli.cluster)?;
+            let endpoint = &ctx.endpoint;
+            let tls = tls.with_cluster_name(&ctx.name);
+            match command {
+                ClusterInferenceCommands::Set { provider, model } => {
+                    run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                }
+                ClusterInferenceCommands::Update { provider, model } => {
+                    run::cluster_inference_update(
+                        endpoint,
+                        provider.as_deref(),
+                        model.as_deref(),
+                        &tls,
+                    )
+                    .await?;
+                }
+                ClusterInferenceCommands::Get => {
+                    run::cluster_inference_get(endpoint, &tls).await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Sandbox commands
+        // -----------------------------------------------------------
         Some(Commands::Sandbox { command }) => {
             match command {
                 SandboxCommands::Create {
                     name,
                     from,
-                    sync,
+                    upload,
+                    no_git_ignore,
                     keep,
                     remote,
                     ssh_key,
@@ -924,6 +1200,10 @@ async fn main() -> Result<()> {
                     forward,
                     tty,
                     no_tty,
+                    bootstrap,
+                    no_bootstrap,
+                    auto_providers,
+                    no_auto_providers,
                     command,
                 } => {
                     // Resolve --tty / --no-tty into an Option<bool> override.
@@ -935,14 +1215,38 @@ async fn main() -> Result<()> {
                         None // auto-detect
                     };
 
+                    // Resolve --bootstrap / --no-bootstrap into an Option<bool>.
+                    let bootstrap_override = if no_bootstrap {
+                        Some(false)
+                    } else if bootstrap {
+                        Some(true)
+                    } else {
+                        None // prompt or auto-detect
+                    };
+
+                    // Resolve --auto-providers / --no-auto-providers.
+                    let auto_providers_override = if no_auto_providers {
+                        Some(false)
+                    } else if auto_providers {
+                        Some(true)
+                    } else {
+                        None // prompt or auto-detect
+                    };
+
+                    // Parse --upload spec into (local_path, sandbox_path, git_ignore).
+                    let upload_spec = upload.as_deref().map(|s| {
+                        let (local, remote) = parse_upload_spec(s);
+                        (local, remote, !no_git_ignore)
+                    });
+
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_cluster(&cli.cluster) {
                         Ok(ctx) => {
                             if remote.is_some() {
                                 eprintln!(
-                                    "{} --remote ignored: cluster '{}' is already active. \
-                                     To redeploy, use: nemoclaw cluster admin deploy",
+                                    "{} --remote ignored: gateway '{}' is already active. \
+                                     To redeploy, use: nemoclaw gateway start",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -955,7 +1259,7 @@ async fn main() -> Result<()> {
                                 name.as_deref(),
                                 from.as_deref(),
                                 &ctx.name,
-                                sync,
+                                upload_spec.as_ref(),
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -964,6 +1268,8 @@ async fn main() -> Result<()> {
                                 forward,
                                 &command,
                                 tty_override,
+                                bootstrap_override,
+                                auto_providers_override,
                                 &tls,
                             ))
                             .await?;
@@ -973,7 +1279,7 @@ async fn main() -> Result<()> {
                             Box::pin(run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
                                 from.as_deref(),
-                                sync,
+                                upload_spec.as_ref(),
                                 keep,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
@@ -982,89 +1288,77 @@ async fn main() -> Result<()> {
                                 forward,
                                 &command,
                                 tty_override,
+                                bootstrap_override,
+                                auto_providers_override,
                             ))
                             .await?;
                         }
                     }
                 }
-                SandboxCommands::Forward {
-                    command: ForwardCommands::Stop { port, name },
+                SandboxCommands::Upload {
+                    name,
+                    local_path,
+                    dest,
+                    no_git_ignore,
                 } => {
-                    let cluster_name = resolve_cluster_name(&cli.cluster).unwrap_or_default();
-                    let name = resolve_sandbox_name(name, &cluster_name)?;
-                    if run::stop_forward(&name, port)? {
-                        eprintln!(
-                            "{} Stopped forward of port {port} for sandbox {name}",
-                            "✓".green().bold(),
-                        );
-                    } else {
-                        eprintln!(
-                            "{} No active forward found for port {port} on sandbox {name}",
-                            "!".yellow(),
-                        );
+                    let ctx = resolve_cluster(&cli.cluster)?;
+                    let tls = tls.with_cluster_name(&ctx.name);
+                    let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
+                    let local = std::path::Path::new(&local_path);
+                    if !local.exists() {
+                        return Err(miette::miette!(
+                            "local path does not exist: {}",
+                            local.display()
+                        ));
                     }
+                    eprintln!("Uploading {} -> sandbox:{}", local.display(), sandbox_dest);
+                    if !no_git_ignore
+                        && let Ok(repo_root) = run::git_repo_root()
+                        && let Ok(files) = run::git_sync_files(&repo_root)
+                        && !files.is_empty()
+                    {
+                        run::sandbox_sync_up_files(
+                            &ctx.endpoint,
+                            &name,
+                            &repo_root,
+                            &files,
+                            sandbox_dest,
+                            &tls,
+                        )
+                        .await?;
+                        eprintln!("{} Upload complete", "✓".green().bold());
+                        return Ok(());
+                    }
+                    // Fallback: upload without git filtering
+                    run::sandbox_sync_up(&ctx.endpoint, &name, local, sandbox_dest, &tls).await?;
+                    eprintln!("{} Upload complete", "✓".green().bold());
                 }
-                SandboxCommands::Forward {
-                    command: ForwardCommands::List,
+                SandboxCommands::Download {
+                    name,
+                    sandbox_path,
+                    dest,
                 } => {
-                    let forwards = run::list_forwards()?;
-                    if forwards.is_empty() {
-                        eprintln!("No active forwards.");
-                    } else {
-                        let name_width = forwards
-                            .iter()
-                            .map(|f| f.sandbox.len())
-                            .max()
-                            .unwrap_or(7)
-                            .max(7); // at least as wide as "SANDBOX"
-                        println!(
-                            "{:<width$} {:<8} {:<10} STATUS",
-                            "SANDBOX",
-                            "PORT",
-                            "PID",
-                            width = name_width,
-                        );
-                        for f in &forwards {
-                            let status = if f.alive {
-                                "running".green().to_string()
-                            } else {
-                                "dead".red().to_string()
-                            };
-                            println!(
-                                "{:<width$} {:<8} {:<10} {}",
-                                f.sandbox,
-                                f.port,
-                                f.pid,
-                                status,
-                                width = name_width,
-                            );
-                        }
-                    }
+                    let ctx = resolve_cluster(&cli.cluster)?;
+                    let tls = tls.with_cluster_name(&ctx.name);
+                    let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
+                    eprintln!(
+                        "Downloading sandbox:{} -> {}",
+                        sandbox_path,
+                        local_dest.display()
+                    );
+                    run::sandbox_sync_down(&ctx.endpoint, &name, &sandbox_path, local_dest, &tls)
+                        .await?;
+                    eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
                     let ctx = resolve_cluster(&cli.cluster)?;
                     let endpoint = &ctx.endpoint;
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
-                        SandboxCommands::Create { .. } => {
+                        SandboxCommands::Create { .. }
+                        | SandboxCommands::Upload { .. }
+                        | SandboxCommands::Download { .. } => {
                             unreachable!()
-                        }
-                        SandboxCommands::Sync {
-                            name,
-                            up,
-                            down,
-                            dest,
-                        } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_sync_command(
-                                endpoint,
-                                &name,
-                                up.as_deref(),
-                                down.as_deref(),
-                                dest.as_deref(),
-                                &tls,
-                            )
-                            .await?;
                         }
                         SandboxCommands::Get { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -1085,73 +1379,6 @@ async fn main() -> Result<()> {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             let _ = save_last_sandbox(&ctx.name, &name);
                             run::sandbox_connect(endpoint, &name, &tls).await?;
-                        }
-                        SandboxCommands::Forward { command: fwd } => match fwd {
-                            ForwardCommands::Start {
-                                port,
-                                name,
-                                background,
-                            } => {
-                                let name = resolve_sandbox_name(name, &ctx.name)?;
-                                run::sandbox_forward(endpoint, &name, port, background, &tls)
-                                    .await?;
-                                if background {
-                                    eprintln!(
-                                        "{} Forwarding port {port} to sandbox {name} in the background",
-                                        "✓".green().bold(),
-                                    );
-                                    eprintln!("  Access at: http://127.0.0.1:{port}/");
-                                    eprintln!(
-                                        "  Stop with: nemoclaw sandbox forward stop {port} {name}",
-                                    );
-                                }
-                            }
-                            ForwardCommands::Stop { .. } | ForwardCommands::List => unreachable!(),
-                        },
-                        SandboxCommands::Policy {
-                            command: policy_cmd,
-                        } => match policy_cmd {
-                            PolicyCommands::Set {
-                                name,
-                                policy,
-                                wait,
-                                timeout,
-                            } => {
-                                let name = resolve_sandbox_name(name, &ctx.name)?;
-                                run::sandbox_policy_set(
-                                    endpoint, &name, &policy, wait, timeout, &tls,
-                                )
-                                .await?;
-                            }
-                            PolicyCommands::Get { name, rev, full } => {
-                                let name = resolve_sandbox_name(name, &ctx.name)?;
-                                run::sandbox_policy_get(endpoint, &name, rev, full, &tls).await?;
-                            }
-                            PolicyCommands::List { name, limit } => {
-                                let name = resolve_sandbox_name(name, &ctx.name)?;
-                                run::sandbox_policy_list(endpoint, &name, limit, &tls).await?;
-                            }
-                        },
-                        SandboxCommands::Logs {
-                            name,
-                            n,
-                            tail,
-                            since,
-                            source,
-                            level,
-                        } => {
-                            let name = resolve_sandbox_name(name, &ctx.name)?;
-                            run::sandbox_logs(
-                                endpoint,
-                                &name,
-                                n,
-                                tail,
-                                since.as_deref(),
-                                &source,
-                                &level,
-                                &tls,
-                            )
-                            .await?;
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -1259,9 +1486,9 @@ async fn main() -> Result<()> {
                     } else {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
-                                "Unknown cluster '{c}'.\n\
-                                  Deploy it first: nemoclaw cluster admin deploy --name {c}\n\
-                                  Or list available clusters: nemoclaw cluster list"
+                                "Unknown gateway '{c}'.\n\
+                                  Deploy it first: nemoclaw gateway start --name {c}\n\
+                                  Or list available gateways: nemoclaw gateway select"
                             )
                         })?;
                         meta.gateway_endpoint
@@ -1280,12 +1507,88 @@ async fn main() -> Result<()> {
                 }
             }
         }
+
+        // -----------------------------------------------------------
+        // Hidden backwards-compat: `cluster admin deploy`
+        // -----------------------------------------------------------
+        Some(Commands::Cluster { command }) => match command {
+            ClusterCommands::Admin { command } => match command {
+                ClusterAdminCommands::Deploy {
+                    name,
+                    update_kube_config,
+                    get_kubeconfig,
+                    remote,
+                    ssh_key,
+                    port,
+                    gateway_host,
+                    kube_port,
+                    recreate,
+                } => {
+                    eprintln!(
+                        "{} `nemoclaw cluster admin deploy` is deprecated. \
+                         Use `nemoclaw gateway start` instead.",
+                        "warning:".yellow().bold(),
+                    );
+                    run::cluster_admin_deploy(
+                        &name,
+                        update_kube_config,
+                        get_kubeconfig,
+                        remote.as_deref(),
+                        ssh_key.as_deref(),
+                        port,
+                        gateway_host.as_deref(),
+                        kube_port,
+                        recreate,
+                    )
+                    .await?;
+                }
+            },
+            ClusterCommands::Inference { command } => {
+                let ctx = resolve_cluster(&cli.cluster)?;
+                let endpoint = &ctx.endpoint;
+                let tls = tls.with_cluster_name(&ctx.name);
+                match command {
+                    ClusterInferenceCommands::Set { provider, model } => {
+                        run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                    }
+                    ClusterInferenceCommands::Update { provider, model } => {
+                        run::cluster_inference_update(
+                            endpoint,
+                            provider.as_deref(),
+                            model.as_deref(),
+                            &tls,
+                        )
+                        .await?;
+                    }
+                    ClusterInferenceCommands::Get => {
+                        run::cluster_inference_get(endpoint, &tls).await?;
+                    }
+                }
+            }
+        },
+
         None => {
             Cli::command().print_help().expect("Failed to print help");
         }
     }
 
     Ok(())
+}
+
+/// Parse an upload spec like `<local>[:<remote>]` into (local_path, optional_sandbox_path).
+fn parse_upload_spec(spec: &str) -> (String, Option<String>) {
+    if let Some((local, remote)) = spec.split_once(':') {
+        (
+            local.to_string(),
+            if remote.is_empty() {
+                None
+            } else {
+                Some(remote.to_string())
+            },
+        )
+    } else {
+        (spec.to_string(), None)
+    }
 }
 
 #[cfg(test)]
@@ -1355,7 +1658,7 @@ mod tests {
     #[test]
     fn completions_policy_flag_falls_back_to_file_paths() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
-        std::fs::write(temp.path().join("policy.yaml"), "version: 1\n")
+        fs::write(temp.path().join("policy.yaml"), "version: 1\n")
             .expect("failed to create policy file");
 
         let mut cmd = Cli::command();
@@ -1382,15 +1685,15 @@ mod tests {
     #[test]
     fn completions_other_path_flags_fall_back_to_path_candidates() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
-        std::fs::write(temp.path().join("id_rsa"), "key").expect("failed to create key file");
-        std::fs::write(temp.path().join("Dockerfile"), "FROM scratch\n")
+        fs::write(temp.path().join("id_rsa"), "key").expect("failed to create key file");
+        fs::write(temp.path().join("Dockerfile"), "FROM scratch\n")
             .expect("failed to create dockerfile");
-        std::fs::create_dir(temp.path().join("ctx")).expect("failed to create context directory");
+        fs::create_dir(temp.path().join("ctx")).expect("failed to create context directory");
 
         let cases: Vec<(Vec<&str>, usize, &str)> = vec![
             (
-                vec!["nemoclaw", "cluster", "admin", "deploy", "--ssh-key", "id"],
-                5,
+                vec!["nemoclaw", "gateway", "start", "--ssh-key", "id"],
+                4,
                 "id_rsa",
             ),
             (
@@ -1399,8 +1702,8 @@ mod tests {
                 "id_rsa",
             ),
             (
-                vec!["nemoclaw", "sandbox", "sync", "demo", "--up", "Do"],
-                5,
+                vec!["nemoclaw", "sandbox", "upload", "demo", "Do"],
+                4,
                 "Dockerfile",
             ),
         ];
@@ -1424,26 +1727,26 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_sync_up_uses_path_value_hint() {
+    fn sandbox_upload_uses_path_value_hint() {
         let cmd = Cli::command();
         let sandbox = cmd
             .get_subcommands()
             .find(|c| c.get_name() == "sandbox")
             .expect("missing sandbox subcommand");
-        let sync = sandbox
+        let upload = sandbox
             .get_subcommands()
-            .find(|c| c.get_name() == "sync")
-            .expect("missing sandbox sync subcommand");
-        let up = sync
+            .find(|c| c.get_name() == "upload")
+            .expect("missing sandbox upload subcommand");
+        let local_path = upload
             .get_arguments()
-            .find(|arg| arg.get_id() == "up")
-            .expect("missing --up argument");
+            .find(|arg| arg.get_id() == "local_path")
+            .expect("missing local_path argument");
 
-        assert_eq!(up.get_value_hint(), ValueHint::AnyPath);
+        assert_eq!(local_path.get_value_hint(), ValueHint::AnyPath);
     }
 
     #[test]
-    fn sandbox_sync_up_completion_suggests_local_paths() {
+    fn sandbox_upload_completion_suggests_local_paths() {
         let temp = tempfile::tempdir().expect("failed to create tempdir");
         fs::write(temp.path().join("sample.txt"), "x").expect("failed to create sample file");
 
@@ -1451,12 +1754,11 @@ mod tests {
         let args: Vec<OsString> = vec![
             "nemoclaw".into(),
             "sandbox".into(),
-            "sync".into(),
+            "upload".into(),
             "demo".into(),
-            "--up".into(),
             "sa".into(),
         ];
-        let candidates = clap_complete::engine::complete(&mut cmd, args, 5, Some(temp.path()))
+        let candidates = clap_complete::engine::complete(&mut cmd, args, 4, Some(temp.path()))
             .expect("completion engine failed");
 
         let names: Vec<String> = candidates
@@ -1465,8 +1767,29 @@ mod tests {
             .collect();
         assert!(
             names.iter().any(|name| name.contains("sample.txt")),
-            "expected path completion for --up, got: {names:?}"
+            "expected path completion for upload local_path, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn parse_upload_spec_without_remote() {
+        let (local, remote) = parse_upload_spec("./src");
+        assert_eq!(local, "./src");
+        assert_eq!(remote, None);
+    }
+
+    #[test]
+    fn parse_upload_spec_with_remote() {
+        let (local, remote) = parse_upload_spec("./src:/sandbox/src");
+        assert_eq!(local, "./src");
+        assert_eq!(remote, Some("/sandbox/src".to_string()));
+    }
+
+    #[test]
+    fn parse_upload_spec_with_trailing_colon() {
+        let (local, remote) = parse_upload_spec("./src:");
+        assert_eq!(local, "./src");
+        assert_eq!(remote, None);
     }
 
     #[test]

@@ -360,7 +360,7 @@ After building, the script:
 1. Resolves the local registry address (defaults to `127.0.0.1:5000/navigator`). In CI, uses `$CI_REGISTRY_IMAGE`.
 2. Ensures a local Docker registry container (`navigator-local-registry`) is running on port 5000 (creates one if needed).
 3. Pushes prebuilt local component images (server, sandbox) to the local registry via `cluster-push-component.sh`.
-4. Runs `nav cluster admin deploy --name <CLUSTER_NAME> --update-kube-config` to create or update the cluster container.
+4. Runs `nav gateway start --name <CLUSTER_NAME> --update-kube-config` to create or update the cluster container.
 
 ### Environment Variables
 

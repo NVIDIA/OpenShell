@@ -9,7 +9,7 @@ Quick-reference for the `nemoclaw` command-line interface. For workflow guidance
 | Flag | Description |
 |------|-------------|
 | `-v`, `--verbose` | Increase verbosity (`-v` = info, `-vv` = debug, `-vvv` = trace) |
-| `-c`, `--cluster <NAME>` | Cluster to operate on. Also settable via `NEMOCLAW_CLUSTER` env var. Falls back to active cluster in `~/.config/nemoclaw/active_cluster`. |
+| `-c`, `--gateway <NAME>` | Gateway to operate on. Also settable via `NEMOCLAW_CLUSTER` env var. Falls back to active gateway in `~/.config/nemoclaw/active_cluster`. |
 
 ## Environment Variables
 
@@ -24,39 +24,38 @@ Quick-reference for the `nemoclaw` command-line interface. For workflow guidance
 
 ```
 nemoclaw
-├── cluster
-│   ├── status
-│   ├── use <name>
-│   ├── list
-│   ├── inference
-│   │   ├── set --provider --model
-│   │   ├── update [--provider] [--model]
-│   │   └── get
-│   └── admin
-│       ├── deploy [opts]
-│       ├── stop [opts]
-│       ├── destroy [opts]
-│       ├── info [--name]
-│       └── tunnel [opts]
+├── gateway
+│   ├── start [opts]
+│   ├── stop [opts]
+│   ├── destroy [opts]
+│   ├── info [--name]
+│   ├── tunnel [opts]
+│   └── select [name]
+├── status
+├── inference
+│   ├── set --provider --model
+│   ├── update [--provider] [--model]
+│   └── get
 ├── sandbox
 │   ├── create [opts] [-- CMD...]
 │   ├── get <name>
 │   ├── list [opts]
 │   ├── delete <name>...
 │   ├── connect <name>
-│   ├── sync <name> {--up|--down} <path> [dest]
-│   ├── logs <name> [opts]
+│   ├── upload <name> <path> [dest]
+│   ├── download <name> <path> [dest]
 │   ├── ssh-config <name>
-│   ├── forward
-│   │   ├── start <port> <name> [-d]
-│   │   ├── stop <port> <name>
-│   │   └── list
-│   ├── image
-│   │   └── push [opts]
-│   └── policy
-│       ├── set <name> --policy <path> [--wait]
-│       ├── get <name> [--full]
-│       └── list <name>
+│   └── image
+│       └── push [opts]
+├── forward
+│   ├── start <port> <name> [-d]
+│   ├── stop <port> <name>
+│   └── list
+├── logs <name> [opts]
+├── policy
+│   ├── set <name> --policy <path> [--wait]
+│   ├── get <name> [--full]
+│   └── list <name>
 ├── provider
 │   ├── create --name --type [opts]
 │   ├── get <name>
@@ -70,21 +69,9 @@ nemoclaw
 
 ---
 
-## Cluster Commands
+## Gateway Commands
 
-### `nemoclaw cluster status`
-
-Show server connectivity and version.
-
-### `nemoclaw cluster use <name>`
-
-Set the active cluster. Writes to `~/.config/nemoclaw/active_cluster`.
-
-### `nemoclaw cluster list`
-
-List all provisioned clusters. Active cluster marked with `*`.
-
-### `nemoclaw cluster admin deploy`
+### `nemoclaw gateway start`
 
 Provision or start a cluster (local or remote).
 
@@ -98,8 +85,9 @@ Provision or start a cluster (local or remote).
 | `--kube-port [PORT]` | none | Expose K8s control plane on host port |
 | `--update-kube-config` | false | Write kubeconfig into `~/.kube/config` |
 | `--get-kubeconfig` | false | Print kubeconfig to stdout |
+| `--recreate` | false | Destroy and recreate from scratch if a gateway already exists (skips interactive prompt) |
 
-### `nemoclaw cluster admin stop`
+### `nemoclaw gateway stop`
 
 Stop a cluster (preserves state for later restart).
 
@@ -109,11 +97,11 @@ Stop a cluster (preserves state for later restart).
 | `--remote <USER@HOST>` | SSH destination |
 | `--ssh-key <PATH>` | SSH private key |
 
-### `nemoclaw cluster admin destroy`
+### `nemoclaw gateway destroy`
 
 Destroy a cluster and all its state. Same flags as `stop`.
 
-### `nemoclaw cluster admin info`
+### `nemoclaw gateway info`
 
 Show deployment details: endpoint, kubeconfig path, kube port, remote host.
 
@@ -121,7 +109,7 @@ Show deployment details: endpoint, kubeconfig path, kube port, remote host.
 |------|-------------|
 | `--name <NAME>` | Cluster name (defaults to active) |
 
-### `nemoclaw cluster admin tunnel`
+### `nemoclaw gateway tunnel`
 
 Print or start an SSH tunnel for kubectl access to a remote cluster.
 
@@ -131,6 +119,18 @@ Print or start an SSH tunnel for kubectl access to a remote cluster.
 | `--remote <USER@HOST>` | SSH destination |
 | `--ssh-key <PATH>` | SSH private key |
 | `--print-command` | Only print the SSH command, don't execute |
+
+### `nemoclaw gateway select [name]`
+
+Set the active gateway. Writes to `~/.config/nemoclaw/active_cluster`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
+
+---
+
+## Status Command
+
+### `nemoclaw status`
+
+Show server connectivity and version for the active gateway.
 
 ---
 
@@ -144,7 +144,7 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 |------|-------------|
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Sandbox source: community name, Dockerfile path, directory, or image reference (BYOC) |
-| `--sync` | Sync local git-tracked files into sandbox at `/sandbox` |
+| `--upload <PATH>[:<DEST>]` | Upload local files into sandbox (default dest: `/sandbox`) |
 | `--keep` | Keep sandbox alive after non-interactive commands finish |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Path to custom policy YAML |
@@ -153,6 +153,10 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 | `--ssh-key <PATH>` | SSH private key for auto-bootstrap |
 | `--tty` | Force pseudo-terminal allocation |
 | `--no-tty` | Disable pseudo-terminal allocation |
+| `--bootstrap` | Auto-bootstrap a gateway if none is available (skips interactive prompt) |
+| `--no-bootstrap` | Never auto-bootstrap; error immediately if no gateway is available |
+| `--auto-providers` | Auto-create missing providers from local credentials (skips interactive prompt) |
+| `--no-auto-providers` | Never auto-create providers; skip missing providers silently |
 | `[-- COMMAND...]` | Command to execute (defaults to interactive shell) |
 
 ### `nemoclaw sandbox get <name>`
@@ -178,17 +182,57 @@ Delete one or more sandboxes by name. Stops any background port forwards.
 
 Open an interactive SSH shell to a sandbox.
 
-### `nemoclaw sandbox sync <name> {--up <path> | --down <path>} [dest]`
+### `nemoclaw sandbox upload <name> <path> [dest]`
 
-Sync files to/from a sandbox using tar-over-SSH.
+Upload local files to a sandbox using tar-over-SSH.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `<name>` | -- | Sandbox name (required) |
+| `<path>` | -- | Local path to upload (required) |
+| `[dest]` | `/sandbox` | Destination path in sandbox |
+
+### `nemoclaw sandbox download <name> <path> [dest]`
+
+Download files from a sandbox using tar-over-SSH.
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `<name>` | -- | Sandbox name (required) |
+| `<path>` | -- | Sandbox path to download (required) |
+| `[dest]` | `.` | Local destination path |
+
+### `nemoclaw sandbox ssh-config <name>`
+
+Print an SSH config `Host` block for a sandbox. Useful for VS Code Remote-SSH.
+
+---
+
+## Port Forwarding Commands
+
+### `nemoclaw forward start <port> <name>`
+
+Start forwarding a local port to a sandbox.
 
 | Flag | Description |
 |------|-------------|
-| `--up <LOCAL_PATH>` | Push local files to sandbox |
-| `--down <SANDBOX_PATH>` | Pull sandbox files to local |
-| `[DEST]` | Destination path (default: `/sandbox` for up, `.` for down) |
+| `<port>` | Port number (used as both local and remote) |
+| `<name>` | Sandbox name |
+| `-d`, `--background` | Run in background |
 
-### `nemoclaw sandbox logs <name>`
+### `nemoclaw forward stop <port> <name>`
+
+Stop a background port forward.
+
+### `nemoclaw forward list`
+
+List all active port forwards (sandbox, port, PID, status).
+
+---
+
+## Logs Command
+
+### `nemoclaw logs <name>`
 
 View sandbox logs. Supports one-shot and streaming.
 
@@ -200,37 +244,11 @@ View sandbox logs. Supports one-shot and streaming.
 | `--source <SOURCE>` | `all` | Filter: `gateway`, `sandbox`, or `all` (repeatable) |
 | `--level <LEVEL>` | none | Minimum level: `error`, `warn`, `info`, `debug`, `trace` |
 
-### `nemoclaw sandbox ssh-config <name>`
-
-Print an SSH config `Host` block for a sandbox. Useful for VS Code Remote-SSH.
-
----
-
-## Port Forwarding Commands
-
-### `nemoclaw sandbox forward start <port> <name>`
-
-Start forwarding a local port to a sandbox.
-
-| Flag | Description |
-|------|-------------|
-| `<port>` | Port number (used as both local and remote) |
-| `<name>` | Sandbox name |
-| `-d`, `--background` | Run in background |
-
-### `nemoclaw sandbox forward stop <port> <name>`
-
-Stop a background port forward.
-
-### `nemoclaw sandbox forward list`
-
-List all active port forwards (sandbox, port, PID, status).
-
 ---
 
 ## Policy Commands
 
-### `nemoclaw sandbox policy set <name> --policy <PATH>`
+### `nemoclaw policy set <name> --policy <PATH>`
 
 Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `inference`) can be changed at runtime.
 
@@ -242,7 +260,7 @@ Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `i
 
 Exit codes with `--wait`: 0 = loaded, 1 = failed, 124 = timeout.
 
-### `nemoclaw sandbox policy get <name>`
+### `nemoclaw policy get <name>`
 
 Show current active policy for a sandbox.
 
@@ -251,7 +269,7 @@ Show current active policy for a sandbox.
 | `--rev <VERSION>` | 0 (latest) | Show a specific revision |
 | `--full` | false | Print the full policy as YAML (round-trips with `--policy` input) |
 
-### `nemoclaw sandbox policy list <name>`
+### `nemoclaw policy list <name>`
 
 List policy revision history (version, hash, status, created, error).
 

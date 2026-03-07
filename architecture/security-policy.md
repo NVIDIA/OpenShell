@@ -84,7 +84,7 @@ Policy fields fall into two categories based on when they are enforced:
 | Category | Fields | Enforcement Point | Updatable? |
 |----------|--------|-------------------|------------|
 | **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
-| **Dynamic** | `network_policies` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `nav sandbox policy set` |
+| **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `nemoclaw policy set` |
 
 Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/navigator-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
 
@@ -103,7 +103,7 @@ The update mechanism uses a poll-based model with versioned policy revisions and
 
 ```mermaid
 sequenceDiagram
-    participant CLI as nav sandbox policy set
+    participant CLI as nav policy set
     participant GW as Gateway (navigator-server)
     participant DB as Persistence (SQLite/Postgres)
     participant SB as Sandbox (navigator-sandbox)
@@ -210,32 +210,32 @@ Failure scenarios that trigger LKG behavior include:
 
 ### CLI Commands
 
-The `nav sandbox policy` subcommand group manages live policy updates:
+The `nav policy` subcommand group manages live policy updates:
 
 ```bash
 # Push a new policy to a running sandbox
-nav sandbox policy set <sandbox-name> --policy updated-policy.yaml
+nav policy set <sandbox-name> --policy updated-policy.yaml
 
 # Push and wait for the sandbox to load it (with 60s timeout)
-nav sandbox policy set <sandbox-name> --policy updated-policy.yaml --wait
+nav policy set <sandbox-name> --policy updated-policy.yaml --wait
 
 # Push and wait with a custom timeout
-nav sandbox policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
+nav policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
 
 # View the current active policy and its status
-nav sandbox policy get <sandbox-name>
+nav policy get <sandbox-name>
 
 # Inspect a specific revision
-nav sandbox policy get <sandbox-name> --rev 3
+nav policy get <sandbox-name> --rev 3
 
 # Print the full policy as YAML (round-trips with --policy input format)
-nav sandbox policy get <sandbox-name> --full
+nav policy get <sandbox-name> --full
 
 # Combine: inspect a specific revision's full policy
-nav sandbox policy get <sandbox-name> --rev 2 --full
+nav policy get <sandbox-name> --rev 2 --full
 
 # List policy revision history
-nav sandbox policy list <sandbox-name> --limit 20
+nav policy list <sandbox-name> --limit 20
 ```
 
 #### `policy get` flags
@@ -243,11 +243,11 @@ nav sandbox policy list <sandbox-name> --limit 20
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--rev N` | `0` (latest) | Retrieve a specific policy revision by version number instead of the latest. Maps to the `version` field of `GetSandboxPolicyStatusRequest` -- version `0` resolves to the latest revision server-side. |
-| `--full` | off | Print the complete policy as YAML after the metadata summary. The YAML output uses the same schema as the `--policy` input file, so it round-trips: you can save it to a file and pass it back to `nav sandbox policy set --policy`. |
+| `--full` | off | Print the complete policy as YAML after the metadata summary. The YAML output uses the same schema as the `--policy` input file, so it round-trips: you can save it to a file and pass it back to `nav policy set --policy`. |
 
-When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/navigator-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/navigator-cli/src/run.rs` -- `policy_to_yaml()`, `sandbox_policy_get()`.
+When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/navigator-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/navigator-cli/src/run.rs` -- `policy_to_yaml()`, `policy_get()`.
 
-See `crates/navigator-cli/src/main.rs` -- `PolicyCommands` enum, `crates/navigator-cli/src/run.rs` -- `sandbox_policy_set()`, `sandbox_policy_get()`, `sandbox_policy_list()`.
+See `crates/navigator-cli/src/main.rs` -- `PolicyCommands` enum, `crates/navigator-cli/src/run.rs` -- `policy_set()`, `policy_get()`, `policy_list()`.
 
 ---
 
@@ -1041,7 +1041,7 @@ See `sandbox-policy.rego` for the full Rego implementation.
 
 ## Sandbox Log Filtering
 
-The `nav sandbox logs` command retrieves log lines from the gateway's in-memory log buffer. Two server-side filters narrow the output before logs are sent to the CLI.
+The `nav logs` command retrieves log lines from the gateway's in-memory log buffer. Two server-side filters narrow the output before logs are sent to the CLI.
 
 ### Source Filter (`--source`)
 
@@ -1057,10 +1057,10 @@ Multiple sources can be specified: `--source gateway --source sandbox` is equiva
 
 ```bash
 # Show only proxy/OPA logs from the sandbox supervisor
-nav sandbox logs my-sandbox --source sandbox
+nav logs my-sandbox --source sandbox
 
 # Show only gateway-side reconciler logs
-nav sandbox logs my-sandbox --source gateway
+nav logs my-sandbox --source gateway
 ```
 
 The filter applies to both one-shot mode (`GetSandboxLogs` RPC) and streaming mode (`--tail`, via `WatchSandbox` RPC). In both cases, the server evaluates `source_matches()` before sending each log line to the client. See `crates/navigator-server/src/grpc.rs` -- `source_matches()`, `get_sandbox_logs()`.
@@ -1081,10 +1081,10 @@ The default (empty string) disables level filtering -- all levels pass. An unrec
 
 ```bash
 # Show only WARN and ERROR logs
-nav sandbox logs my-sandbox --level warn
+nav logs my-sandbox --level warn
 
 # Combine with source filter: only sandbox ERROR logs
-nav sandbox logs my-sandbox --source sandbox --level error
+nav logs my-sandbox --source sandbox --level error
 ```
 
 The filter is applied server-side via `level_matches()` in both one-shot and streaming modes. See `crates/navigator-server/src/grpc.rs` -- `level_matches()`.

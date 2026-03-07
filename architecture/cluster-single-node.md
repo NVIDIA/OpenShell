@@ -18,7 +18,7 @@ Out of scope:
 ## Components
 
 - `crates/navigator-cli/src/main.rs`: CLI entry point; `clap`-based command parsing.
-- `crates/navigator-cli/src/run.rs`: CLI command implementations (`cluster_admin_deploy`, `cluster_admin_stop`, `cluster_admin_destroy`, `cluster_admin_info`, `cluster_admin_tunnel`).
+- `crates/navigator-cli/src/run.rs`: CLI command implementations (`gateway_start`, `gateway_stop`, `gateway_destroy`, `gateway_info`, `gateway_tunnel`).
 - `crates/navigator-cli/src/bootstrap.rs`: Auto-bootstrap helpers for `sandbox create` (offers to deploy a cluster when one is unreachable).
 - `crates/navigator-bootstrap/src/lib.rs`: Cluster lifecycle orchestration (`deploy_cluster`, `deploy_cluster_with_logs`, `cluster_handle`, `check_existing_deployment`).
 - `crates/navigator-bootstrap/src/docker.rs`: Docker API wrappers (network, volume, container, image operations).
@@ -39,20 +39,20 @@ Out of scope:
 
 ## CLI Commands
 
-All cluster lifecycle commands live under `nemoclaw cluster admin`:
+All cluster lifecycle commands live under `nemoclaw gateway`:
 
 | Command | Description |
 |---|---|
-| `nemoclaw cluster admin deploy [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
-| `nemoclaw cluster admin stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `nemoclaw cluster admin destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
-| `nemoclaw cluster admin info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
-| `nemoclaw cluster admin tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
-| `nemoclaw cluster status` | Show gateway health via gRPC/HTTP |
-| `nemoclaw cluster use <name>` | Set the active cluster |
-| `nemoclaw cluster list` | List all clusters with metadata |
+| `nemoclaw gateway start [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a cluster |
+| `nemoclaw gateway stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
+| `nemoclaw gateway destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
+| `nemoclaw gateway info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
+| `nemoclaw gateway tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
+| `nemoclaw status` | Show gateway health via gRPC/HTTP |
+| `nemoclaw gateway select <name>` | Set the active cluster |
+| `nemoclaw gateway select` | List all clusters with metadata |
 
-The `--name` flag defaults to `"nemoclaw"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--cluster` flag, then `NEMOCLAW_CLUSTER` env, then `~/.config/nemoclaw/active_cluster` file.
+The `--name` flag defaults to `"nemoclaw"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--gateway` flag, then `NEMOCLAW_CLUSTER` env, then `~/.config/nemoclaw/active_cluster` file.
 
 ## Local Task Flows (`mise`)
 
@@ -76,7 +76,7 @@ sequenceDiagram
   participant L as Local Docker daemon
   participant R as Remote Docker daemon (SSH)
 
-  U->>C: nemoclaw cluster admin deploy --remote user@host
+  U->>C: nemoclaw gateway start --remote user@host
   C->>B: deploy_cluster(DeployOptions)
 
   B->>B: create_ssh_docker_client (ssh://, 600s timeout)
@@ -149,7 +149,7 @@ flowchart LR
 
 The `deploy_cluster_with_logs` variant accepts an `FnMut(String)` callback for progress reporting. The CLI wraps this in a `ClusterDeployLogPanel` for interactive terminals.
 
-**Pre-deploy check** (CLI layer in `cluster_admin_deploy`): In interactive terminals, `check_existing_deployment` inspects whether a container or volume already exists. If found, the user is prompted to destroy and recreate or reuse the existing cluster.
+**Pre-deploy check** (CLI layer in `gateway_start`): In interactive terminals, `check_existing_deployment` inspects whether a container or volume already exists. If found, the user is prompted to destroy and recreate or reuse the existing cluster.
 
 ### 2) Image readiness
 
@@ -231,7 +231,7 @@ Metadata location: `~/.config/nemoclaw/clusters/{name}_metadata.json`
 
 Note: metadata is stored at the `clusters/` level (not nested inside `{name}/` like kubeconfig and mTLS).
 
-After deploy, the CLI calls `save_active_cluster(name)`, writing the cluster name to `~/.config/nemoclaw/active_cluster`. Subsequent commands that don't specify `--cluster` or `NEMOCLAW_CLUSTER` resolve to this active cluster.
+After deploy, the CLI calls `save_active_cluster(name)`, writing the cluster name to `~/.config/nemoclaw/active_cluster`. Subsequent commands that don't specify `--gateway` or `NEMOCLAW_CLUSTER` resolve to this active cluster.
 
 ## Container Image
 
@@ -328,7 +328,7 @@ ssh -L 6443:127.0.0.1:6443 -N user@host
 CLI helper:
 
 ```bash
-nemoclaw cluster admin tunnel --name <name>
+nemoclaw gateway tunnel --name <name>
 ```
 
 The `--remote` flag is optional; the CLI resolves the SSH destination from stored cluster metadata. Pass `--print-command` to print the SSH command without executing it.
@@ -355,7 +355,7 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 4. Remove the stored kubeconfig file.
 5. Remove the network if no containers remain attached (`cleanup_network_if_unused()`).
 
-**CLI layer** (`cluster_admin_destroy()` in `run.rs` additionally):
+**CLI layer** (`gateway_destroy()` in `run.rs` additionally):
 
 6. Remove the metadata JSON file via `remove_cluster_metadata()`.
 7. Clear the active cluster reference if it matches the destroyed cluster.
