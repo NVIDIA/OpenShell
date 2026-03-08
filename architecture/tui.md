@@ -7,17 +7,17 @@ The NemoClaw TUI is a terminal user interface for NemoClaw, inspired by [k9s](ht
 The TUI is a subcommand of the NemoClaw CLI, so it inherits all your existing configuration — cluster selection, TLS settings, and verbosity flags all work the same way.
 
 ```bash
-nemoclaw term                   # launch against the active cluster
+nemoclaw term                   # launch against the active gateway
 nav term                         # dev alias (builds from source)
-nav term --cluster prod          # target a specific cluster
+nav term --gateway prod          # target a specific gateway
 NEMOCLAW_CLUSTER=prod nav term  # same thing, via environment variable
 ```
 
-Cluster resolution follows the same priority as the rest of the CLI:
+Gateway resolution follows the same priority as the rest of the CLI:
 
-1. `--cluster` flag (if provided)
+1. `--gateway` flag (if provided)
 2. `NEMOCLAW_CLUSTER` environment variable
-3. Active cluster from `~/.config/nemoclaw/active_cluster`
+3. Active gateway from `~/.config/nemoclaw/active_cluster`
 
 No separate configuration files or authentication are needed.
 

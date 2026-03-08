@@ -17,24 +17,24 @@ use navigator_cli::completers;
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;
 
-/// Resolved cluster context: name + gateway endpoint.
-struct ClusterContext {
-    /// The cluster name (used for TLS cert directory, metadata lookup, etc.).
+/// Resolved gateway context: name + endpoint.
+struct GatewayContext {
+    /// The gateway name (used for TLS cert directory, metadata lookup, etc.).
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
 }
 
-/// Resolve the cluster name to a [`ClusterContext`] with the gateway endpoint.
+/// Resolve the gateway name to a [`GatewayContext`] with the endpoint URL.
 ///
 /// Resolution priority:
-/// 1. `--cluster` flag (explicit name)
+/// 1. `--gateway` flag (explicit name)
 /// 2. `NEMOCLAW_CLUSTER` environment variable
-/// 3. Active cluster from `~/.config/nemoclaw/active_cluster`
+/// 3. Active gateway from `~/.config/nemoclaw/active_cluster`
 ///
-/// Once the name is determined, loads the cluster metadata to get the endpoint.
-fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
-    let name = cluster_flag
+/// Once the name is determined, loads the gateway metadata to get the endpoint.
+fn resolve_gateway(gateway_flag: &Option<String>) -> Result<GatewayContext> {
+    let name = gateway_flag
         .clone()
         .or_else(|| {
             std::env::var("NEMOCLAW_CLUSTER")
@@ -58,18 +58,18 @@ fn resolve_cluster(cluster_flag: &Option<String>) -> Result<ClusterContext> {
         )
     })?;
 
-    Ok(ClusterContext {
+    Ok(GatewayContext {
         name: metadata.name,
         endpoint: metadata.gateway_endpoint,
     })
 }
 
-/// Resolve only the cluster name (without requiring metadata to exist).
+/// Resolve only the gateway name (without requiring metadata to exist).
 ///
-/// Used by gateway commands that operate on a cluster by name but may not need
-/// the gateway endpoint (e.g., `gateway start` creates the cluster).
-fn resolve_cluster_name(cluster_flag: &Option<String>) -> Option<String> {
-    cluster_flag
+/// Used by gateway commands that operate by name but may not need
+/// the endpoint (e.g., `gateway start` creates the gateway).
+fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
+    gateway_flag
         .clone()
         .or_else(|| {
             std::env::var("NEMOCLAW_CLUSTER")
@@ -108,9 +108,9 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Cluster name to operate on (resolved from stored metadata).
-    #[arg(long, short, global = true, env = "NEMOCLAW_CLUSTER")]
-    cluster: Option<String>,
+    /// Gateway name to operate on (resolved from stored metadata).
+    #[arg(long, short = 'g', global = true, env = "NEMOCLAW_CLUSTER")]
+    gateway: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -202,7 +202,7 @@ enum Commands {
     ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `nemoclaw ssh-proxy --gateway-name <name> --name <sandbox-name>`
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -217,13 +217,13 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
 
-        /// Cluster endpoint URL. Used in name mode. Deprecated: prefer --cluster.
+        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway-name.
         #[arg(long)]
         server: Option<String>,
 
-        /// Cluster name (resolves endpoint from stored metadata). Used in name mode.
-        #[arg(long, short)]
-        cluster: Option<String>,
+        /// Gateway name (resolves endpoint from stored metadata). Used in name mode.
+        #[arg(long = "gateway-name", visible_alias = "cluster")]
+        gateway_name: Option<String>,
 
         /// Sandbox name. Used in name mode.
         #[arg(long)]
@@ -937,7 +937,7 @@ async fn main() -> Result<()> {
                 recreate,
             } => {
                 let name = name
-                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_deploy(
                     &name,
@@ -958,7 +958,7 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
@@ -968,7 +968,7 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
@@ -977,7 +977,7 @@ async fn main() -> Result<()> {
                     run::cluster_use(&name)?;
                 } else {
                     // No name provided — show available gateways.
-                    run::cluster_list(&cli.cluster)?;
+                    run::cluster_list(&cli.gateway)?;
                     eprintln!();
                     eprintln!(
                         "Select a gateway with: {}",
@@ -987,7 +987,7 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Info { name } => {
                 let name = name
-                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_info(&name)?;
             }
@@ -998,7 +998,7 @@ async fn main() -> Result<()> {
                 print_command,
             } => {
                 let name = name
-                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_tunnel(
                     &name,
@@ -1013,7 +1013,7 @@ async fn main() -> Result<()> {
         // Top-level status (was `cluster status`)
         // -----------------------------------------------------------
         Some(Commands::Status) => {
-            if let Ok(ctx) = resolve_cluster(&cli.cluster) {
+            if let Ok(ctx) = resolve_gateway(&cli.gateway) {
                 let tls = tls.with_cluster_name(&ctx.name);
                 run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
             } else {
@@ -1033,7 +1033,7 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         Some(Commands::Forward { command: fwd_cmd }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
-                let cluster_name = resolve_cluster_name(&cli.cluster).unwrap_or_default();
+                let cluster_name = resolve_gateway_name(&cli.gateway).unwrap_or_default();
                 let name = resolve_sandbox_name(name, &cluster_name)?;
                 if run::stop_forward(&name, port)? {
                     eprintln!(
@@ -1087,7 +1087,7 @@ async fn main() -> Result<()> {
                 name,
                 background,
             } => {
-                let ctx = resolve_cluster(&cli.cluster)?;
+                let ctx = resolve_gateway(&cli.gateway)?;
                 let tls = tls.with_cluster_name(&ctx.name);
                 let name = resolve_sandbox_name(name, &ctx.name)?;
                 run::sandbox_forward(&ctx.endpoint, &name, port, background, &tls).await?;
@@ -1113,7 +1113,7 @@ async fn main() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_cluster(&cli.cluster)?;
+            let ctx = resolve_gateway(&cli.gateway)?;
             let tls = tls.with_cluster_name(&ctx.name);
             let name = resolve_sandbox_name(name, &ctx.name)?;
             run::sandbox_logs(
@@ -1135,7 +1135,7 @@ async fn main() -> Result<()> {
         Some(Commands::Policy {
             command: policy_cmd,
         }) => {
-            let ctx = resolve_cluster(&cli.cluster)?;
+            let ctx = resolve_gateway(&cli.gateway)?;
             let tls = tls.with_cluster_name(&ctx.name);
             match policy_cmd {
                 PolicyCommands::Set {
@@ -1163,7 +1163,7 @@ async fn main() -> Result<()> {
         // Inference commands
         // -----------------------------------------------------------
         Some(Commands::Inference { command }) => {
-            let ctx = resolve_cluster(&cli.cluster)?;
+            let ctx = resolve_gateway(&cli.gateway)?;
             let endpoint = &ctx.endpoint;
             let tls = tls.with_cluster_name(&ctx.name);
             match command {
@@ -1244,7 +1244,7 @@ async fn main() -> Result<()> {
 
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
-                    match resolve_cluster(&cli.cluster) {
+                    match resolve_gateway(&cli.gateway) {
                         Ok(ctx) => {
                             if remote.is_some() {
                                 eprintln!(
@@ -1304,7 +1304,7 @@ async fn main() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_cluster(&cli.cluster)?;
+                    let ctx = resolve_gateway(&cli.gateway)?;
                     let tls = tls.with_cluster_name(&ctx.name);
                     let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
                     let local = std::path::Path::new(&local_path);
@@ -1337,7 +1337,7 @@ async fn main() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_cluster(&cli.cluster)?;
+                    let ctx = resolve_gateway(&cli.gateway)?;
                     let tls = tls.with_cluster_name(&ctx.name);
                     let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
                     eprintln!(
@@ -1350,7 +1350,7 @@ async fn main() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_cluster(&cli.cluster)?;
+                    let ctx = resolve_gateway(&cli.gateway)?;
                     let endpoint = &ctx.endpoint;
                     let tls = tls.with_cluster_name(&ctx.name);
                     match other {
@@ -1388,7 +1388,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Provider { command }) => {
-            let ctx = resolve_cluster(&cli.cluster)?;
+            let ctx = resolve_gateway(&cli.gateway)?;
             let endpoint = &ctx.endpoint;
             let tls = tls.with_cluster_name(&ctx.name);
 
@@ -1445,7 +1445,7 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Term) => {
-            let ctx = resolve_cluster(&cli.cluster)?;
+            let ctx = resolve_gateway(&cli.gateway)?;
             let tls = tls.with_cluster_name(&ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
@@ -1466,19 +1466,19 @@ async fn main() -> Result<()> {
             sandbox_id,
             token,
             server,
-            cluster,
+            gateway_name,
             name,
         }) => {
-            match (gateway, sandbox_id, token, server, cluster, name) {
+            match (gateway, sandbox_id, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, cluster_opt, _) => {
-                    let effective_tls = match cluster_opt {
+                (Some(gw), Some(sid), Some(tok), _, gw_name_opt, _) => {
+                    let effective_tls = match gw_name_opt {
                         Some(ref c) => tls.with_cluster_name(c),
                         None => tls,
                     };
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
-                // Name mode with --cluster: resolve endpoint from metadata.
+                // Name mode with --gateway-name: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(c), Some(n)) => {
                     let endpoint = if let Some(srv) = server_override {
                         srv
@@ -1495,13 +1495,13 @@ async fn main() -> Result<()> {
                     let tls = tls.with_cluster_name(&c);
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
                 }
-                // Legacy name mode with --server only (no --cluster).
+                // Legacy name mode with --server only (no --gateway-name).
                 (_, _, _, Some(srv), None, Some(n)) => {
                     run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway/--sandbox-id/--token or --cluster/--name (or --server/--name)"
+                        "provide either --gateway/--sandbox-id/--token or --gateway-name/--name (or --server/--name)"
                     ));
                 }
             }
@@ -1543,7 +1543,7 @@ async fn main() -> Result<()> {
                 }
             },
             ClusterCommands::Inference { command } => {
-                let ctx = resolve_cluster(&cli.cluster)?;
+                let ctx = resolve_gateway(&cli.gateway)?;
                 let endpoint = &ctx.endpoint;
                 let tls = tls.with_cluster_name(&ctx.name);
                 match command {
