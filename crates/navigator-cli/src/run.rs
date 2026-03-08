@@ -105,19 +105,81 @@ fn civil_from_days(days: u64) -> (i64, u64, u64) {
     (y, m, d)
 }
 
-/// Live-updating display showing spinner with phase and latest log line.
-struct LogDisplay {
-    mp: MultiProgress,
-    spinner: ProgressBar,
-    phase: String,
-    latest_log: String,
+/// Known provisioning steps derived from Kubernetes events and sandbox lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ProvisioningStep {
+    Scheduled,
+    Pulling,
+    Pulled,
+    ContainerCreated,
+    ContainerStarted,
+    GatewayReady,
+    SandboxReady,
 }
 
-impl LogDisplay {
+impl ProvisioningStep {
+    /// Human-readable label for a completed step.
+    fn completed_label(self) -> &'static str {
+        match self {
+            Self::Scheduled => "Scheduled on node",
+            Self::Pulling => "Image pulled",
+            Self::Pulled => "Image pulled",
+            Self::ContainerCreated => "Container created",
+            Self::ContainerStarted => "Container started",
+            Self::GatewayReady => "Gateway ready",
+            Self::SandboxReady => "Sandbox ready",
+        }
+    }
+
+    /// Human-readable label for an in-progress step (shown on the spinner).
+    fn active_label(self) -> &'static str {
+        match self {
+            Self::Scheduled => "Scheduling on node...",
+            Self::Pulling => "Pulling image...",
+            Self::Pulled => "Pulling image...",
+            Self::ContainerCreated => "Creating container...",
+            Self::ContainerStarted => "Starting container...",
+            Self::GatewayReady => "Waiting for gateway...",
+            Self::SandboxReady => "Waiting for sandbox...",
+        }
+    }
+}
+
+/// Map a Kubernetes event reason to a provisioning step.
+fn kube_event_to_step(reason: &str) -> Option<ProvisioningStep> {
+    match reason {
+        "Scheduled" => Some(ProvisioningStep::Scheduled),
+        "Pulling" => Some(ProvisioningStep::Pulling),
+        "Pulled" => Some(ProvisioningStep::Pulled),
+        "Created" => Some(ProvisioningStep::ContainerCreated),
+        "Started" => Some(ProvisioningStep::ContainerStarted),
+        _ => None,
+    }
+}
+
+/// Live-updating display showing a provisioning step checklist with spinner.
+///
+/// Completed steps are printed as static `✓ Step` lines.  The current
+/// in-progress step is shown on a spinner with elapsed time.
+struct ProvisioningDisplay {
+    mp: MultiProgress,
+    spinner: ProgressBar,
+    /// Steps that have been completed, in order.
+    completed_steps: Vec<ProvisioningStep>,
+    /// The currently active step label (shown on the spinner).
+    active_label: String,
+    /// Detail text shown next to the active step (e.g. image name).
+    active_detail: String,
+    /// When the current active step started (for elapsed time).
+    step_start: Instant,
+    /// Overall provisioning start time.
+    provision_start: Instant,
+}
+
+impl ProvisioningDisplay {
     fn new() -> Self {
         let mp = MultiProgress::new();
 
-        // Spinner for phase status + latest log
         let spinner = mp.add(ProgressBar::new_spinner());
         spinner.set_style(
             ProgressStyle::with_template("{spinner:.cyan} {msg}")
@@ -125,66 +187,148 @@ impl LogDisplay {
         );
         spinner.enable_steady_tick(Duration::from_millis(120));
 
+        let now = Instant::now();
         Self {
             mp,
             spinner,
-            phase: String::new(),
-            latest_log: String::new(),
+            completed_steps: Vec::new(),
+            active_label: "Provisioning...".to_string(),
+            active_detail: String::new(),
+            step_start: now,
+            provision_start: now,
         }
     }
 
-    fn set_phase(&mut self, phase: &str) {
-        self.phase = phase.to_string();
+    /// Record a completed provisioning step.
+    ///
+    /// The step is printed as a static `✓` line and the spinner advances
+    /// to the next expected state.
+    fn complete_step(&mut self, step: ProvisioningStep) {
+        self.complete_step_with_label(step, step.completed_label());
+    }
+
+    /// Record a completed provisioning step with a custom label.
+    fn complete_step_with_label(&mut self, step: ProvisioningStep, label: &str) {
+        // Don't duplicate steps we've already printed.
+        if self.completed_steps.contains(&step) {
+            return;
+        }
+        self.completed_steps.push(step);
+
+        let elapsed = self.step_start.elapsed();
+        let elapsed_str = format_elapsed(elapsed);
+        let _ = self.mp.println(format!(
+            "  {} {} {}",
+            "\u{2713}".green().bold(),
+            label,
+            elapsed_str.dimmed()
+        ));
+
+        // Reset step timer for the next step.
+        self.step_start = Instant::now();
+        self.active_detail.clear();
+    }
+
+    /// Set the active (in-progress) step shown on the spinner.
+    fn set_active(&mut self, label: &str) {
+        self.active_label = label.to_string();
+        self.active_detail.clear();
         self.update_spinner();
     }
 
-    fn finish_phase(&mut self, phase: &str) {
-        self.phase = phase.to_string();
-        self.latest_log.clear();
-        // Print the final phase as a static line above the spinner, then
-        // clear the spinner itself.  This leaves the phase label visible
-        // in scrollback instead of erasing it with finish_and_clear().
-        let _ = self
-            .mp
-            .println(format!("  {}", format_phase_label(&self.phase)));
-        self.spinner.finish_and_clear();
+    /// Set the active step from a known provisioning step enum.
+    fn set_active_step(&mut self, step: ProvisioningStep) {
+        self.set_active(step.active_label());
     }
 
-    fn set_log(&mut self, line: String) {
-        let line = line.trim().to_string();
-        if line.is_empty() {
-            return;
-        }
-        self.latest_log = line;
+    /// Set detail text shown alongside the active step (e.g. image name).
+    fn set_active_detail(&mut self, detail: &str) {
+        self.active_detail = detail.to_string();
         self.update_spinner();
     }
 
     fn update_spinner(&self) {
-        let msg = if self.latest_log.is_empty() {
-            format_phase_label(&self.phase)
+        let elapsed = self.step_start.elapsed();
+        let elapsed_str = format_elapsed(elapsed);
+        let msg = if self.active_detail.is_empty() {
+            format!("{} {}", self.active_label, elapsed_str.dimmed())
         } else {
             format!(
-                "{} {}",
-                format_phase_label(&self.phase),
-                self.latest_log.dimmed()
+                "{} {} {}",
+                self.active_label,
+                self.active_detail.dimmed(),
+                elapsed_str.dimmed()
             )
         };
         self.spinner.set_message(msg);
+    }
+
+    /// Finish the display, printing the final status line.
+    fn finish(&mut self, final_label: &str, success: bool) {
+        if success {
+            let elapsed = self.provision_start.elapsed();
+            let elapsed_str = format_elapsed(elapsed);
+            let _ = self.mp.println(format!(
+                "  {} {} {}",
+                "\u{2713}".green().bold(),
+                final_label.green().bold(),
+                elapsed_str.dimmed()
+            ));
+        } else {
+            let _ = self.mp.println(format!(
+                "  {} {}",
+                "\u{2717}".red().bold(),
+                final_label.red().bold()
+            ));
+        }
+        self.spinner.finish_and_clear();
+    }
+
+    /// Finish with an error message shown on the last step line.
+    fn finish_error(&mut self, msg: &str) {
+        let _ = self
+            .mp
+            .println(format!("  {} {}", "\u{2717}".red().bold(), msg.red()));
+        self.spinner.finish_and_clear();
     }
 
     /// Print a line above the progress bars (for static header content).
     fn println(&self, msg: &str) {
         let _ = self.mp.println(msg);
     }
+
+    /// Return a description of the current active step for error messages.
+    fn current_step_description(&self) -> &str {
+        &self.active_label
+    }
 }
 
-fn print_sandbox_header(sandbox: &Sandbox, display: Option<&LogDisplay>) {
+/// Format a duration as a compact elapsed time string, e.g. `(3s)` or `(1m 12s)`.
+fn format_elapsed(d: Duration) -> String {
+    let secs = d.as_secs();
+    if secs < 60 {
+        format!("({secs}s)")
+    } else {
+        let mins = secs / 60;
+        let rem = secs % 60;
+        format!("({mins}m {rem}s)")
+    }
+}
+
+/// Format a total elapsed time for non-interactive mode timestamps.
+fn format_timestamp(d: Duration) -> String {
+    let secs = d.as_secs_f64();
+    format!("[{secs:.1}s]")
+}
+
+fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
     let lines = [
         String::new(),
         format!("{}", "Created sandbox:".cyan().bold()),
         String::new(),
         format!("  {} {}", "Name:".dimmed(), sandbox.name),
         format!("  {} {}", "Namespace:".dimmed(), sandbox.namespace),
+        String::new(),
     ];
     match display {
         Some(d) => {
@@ -198,16 +342,6 @@ fn print_sandbox_header(sandbox: &Sandbox, display: Option<&LogDisplay>) {
             }
         }
     }
-}
-
-fn format_phase_label(phase: &str) -> String {
-    let colored = match phase {
-        "Ready" => phase.green().to_string(),
-        "Error" => phase.red().to_string(),
-        "Provisioning" => phase.yellow().to_string(),
-        _ => phase.dimmed().to_string(),
-    };
-    format!("{} {colored}", "Phase:".dimmed())
 }
 
 const CLUSTER_DEPLOY_LOG_LINES: usize = 15;
@@ -1128,9 +1262,10 @@ pub async fn sandbox_create(
         let _ = save_last_sandbox(cluster, &sandbox_name);
     }
 
-    // Set up display
+    // Set up display — interactive terminals get a step-based checklist with
+    // spinners; non-interactive (pipes / CI) get timestamped lines.
     let mut display = if interactive {
-        Some(LogDisplay::new())
+        Some(ProvisioningDisplay::new())
     } else {
         None
     };
@@ -1138,12 +1273,16 @@ pub async fn sandbox_create(
     // Print header
     print_sandbox_header(&sandbox, display.as_ref());
 
-    // Set initial phase
+    // Set initial active step on the spinner.
     if let Some(d) = display.as_mut() {
-        d.set_phase(phase_name(sandbox.phase));
+        d.set_active("Provisioning...");
     } else {
-        println!("  {}", format_phase_label(phase_name(sandbox.phase)));
+        let ts = format_timestamp(Duration::ZERO);
+        println!("  {} Created sandbox {}", ts.dimmed(), sandbox_name);
     }
+
+    // Non-interactive mode: track start time for timestamps.
+    let provision_start = Instant::now();
 
     // Don't use stop_on_terminal on the server — the Kubernetes CRD may
     // briefly report a stale Ready status before the controller reconciles
@@ -1173,17 +1312,23 @@ pub async fn sandbox_create(
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
     let start_time = Instant::now();
     let provision_timeout = Duration::from_secs(120);
+    // Track whether we saw the gateway become ready (from log messages).
+    let mut saw_gateway_ready = false;
 
     while let Some(item) = stream.next().await {
         // Check for timeout
         if start_time.elapsed() > provision_timeout {
             if let Some(d) = display.as_mut() {
-                d.finish_phase(phase_name(last_phase));
+                let step_desc = d.current_step_description().to_string();
+                d.finish_error(&format!(
+                    "Timed out after {}s (stuck at: {step_desc})",
+                    provision_timeout.as_secs()
+                ));
             }
             println!();
             return Err(miette::miette!(
-                "sandbox provisioning timed out after {:?}",
-                provision_timeout
+                "sandbox provisioning timed out after {}s",
+                provision_timeout.as_secs()
             ));
         }
 
@@ -1211,65 +1356,153 @@ pub async fn sandbox_create(
                         }
                     }
                 }
-                if let Some(d) = display.as_mut() {
-                    d.set_phase(phase_name(s.phase));
-                } else {
-                    println!("  {}", format_phase_label(phase_name(s.phase)));
-                }
 
                 // Only accept Ready as terminal after we've observed a
                 // non-Ready phase, proving the controller has reconciled.
                 if saw_non_ready && phase == SandboxPhase::Ready {
+                    // Complete the gateway step if we haven't already.
+                    if !saw_gateway_ready {
+                        if let Some(d) = display.as_mut() {
+                            d.complete_step(ProvisioningStep::GatewayReady);
+                        }
+                    }
+                    // Complete the final step.
+                    if let Some(d) = display.as_mut() {
+                        d.finish("Sandbox ready", true);
+                    } else {
+                        let ts = format_timestamp(provision_start.elapsed());
+                        println!("  {} {}", ts.dimmed(), "Sandbox ready".green().bold());
+                    }
                     break;
                 }
             }
             Some(navigator_core::proto::sandbox_stream_event::Payload::Log(line)) => {
-                if let Some(d) = display.as_mut() {
-                    d.set_log(line.message);
+                // Detect gateway readiness from log messages.
+                if !saw_gateway_ready && line.message.contains("listening") {
+                    saw_gateway_ready = true;
+                    if let Some(d) = display.as_mut() {
+                        d.complete_step(ProvisioningStep::GatewayReady);
+                        d.set_active_step(ProvisioningStep::SandboxReady);
+                    } else {
+                        let ts = format_timestamp(provision_start.elapsed());
+                        println!("  {} Gateway ready", ts.dimmed());
+                    }
+                } else if let Some(d) = display.as_mut() {
+                    // Show other log lines as detail on the spinner.
+                    d.set_active_detail(&line.message);
                 }
             }
             Some(navigator_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
-                let reason = if ev.reason.is_empty() {
-                    "Event"
-                } else {
-                    &ev.reason
-                };
-                let msg = if ev.message.is_empty() {
-                    ""
-                } else {
-                    &ev.message
-                };
-                let line = format!("{} {} {}", "EVENT".dimmed(), reason, msg);
-                if let Some(d) = display.as_mut() {
-                    d.set_log(line);
+                // Map Kubernetes events to provisioning steps.
+                if let Some(step) = kube_event_to_step(&ev.reason) {
+                    match step {
+                        ProvisioningStep::Scheduled => {
+                            if let Some(d) = display.as_mut() {
+                                d.complete_step(ProvisioningStep::Scheduled);
+                                d.set_active_step(ProvisioningStep::Pulling);
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                println!("  {} Scheduled on node", ts.dimmed());
+                            }
+                        }
+                        ProvisioningStep::Pulling => {
+                            // Extract image name from the event message.
+                            let image_detail = ev
+                                .message
+                                .strip_prefix("Pulling image ")
+                                .map(|s| s.trim_matches('"'))
+                                .unwrap_or("");
+                            if let Some(d) = display.as_mut() {
+                                d.set_active("Pulling image...");
+                                if !image_detail.is_empty() {
+                                    d.set_active_detail(image_detail);
+                                }
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                if image_detail.is_empty() {
+                                    println!("  {} Pulling image...", ts.dimmed());
+                                } else {
+                                    println!("  {} Pulling image {image_detail}", ts.dimmed());
+                                }
+                            }
+                        }
+                        ProvisioningStep::Pulled => {
+                            if let Some(d) = display.as_mut() {
+                                d.complete_step(ProvisioningStep::Pulled);
+                                d.set_active_step(ProvisioningStep::ContainerCreated);
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                println!("  {} Image pulled", ts.dimmed());
+                            }
+                        }
+                        ProvisioningStep::ContainerCreated => {
+                            if let Some(d) = display.as_mut() {
+                                d.complete_step(ProvisioningStep::ContainerCreated);
+                                d.set_active_step(ProvisioningStep::ContainerStarted);
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                println!("  {} Container created", ts.dimmed());
+                            }
+                        }
+                        ProvisioningStep::ContainerStarted => {
+                            if let Some(d) = display.as_mut() {
+                                d.complete_step(ProvisioningStep::ContainerStarted);
+                                d.set_active_step(ProvisioningStep::GatewayReady);
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                println!("  {} Container started", ts.dimmed());
+                            }
+                        }
+                        _ => {}
+                    }
+                } else if let Some(d) = display.as_mut() {
+                    // Unknown events: show as detail on the current spinner.
+                    if !ev.message.is_empty() {
+                        d.set_active_detail(&ev.message);
+                    }
                 }
             }
             Some(navigator_core::proto::sandbox_stream_event::Payload::Warning(w)) => {
-                let line = format!("{} {}", "WARN".yellow(), w.message);
                 if let Some(d) = display.as_mut() {
-                    d.set_log(line);
+                    d.println(&format!("  {} {}", "!".yellow().bold(), w.message.yellow()));
+                } else {
+                    let ts = format_timestamp(provision_start.elapsed());
+                    eprintln!("  {} {} {}", ts.dimmed(), "WARN".yellow(), w.message);
                 }
             }
             None => {}
         }
     }
 
-    // Finish up - check final phase
-    if let Some(d) = display.as_mut() {
-        d.finish_phase(phase_name(last_phase));
+    // If we exited the loop without hitting the Ready break, finish the display.
+    let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
+    if final_phase != SandboxPhase::Ready {
+        if let Some(d) = display.as_mut() {
+            if final_phase == SandboxPhase::Error {
+                let msg = if last_error_reason.is_empty() {
+                    "Sandbox entered error phase".to_string()
+                } else {
+                    format!("Error: {last_error_reason}")
+                };
+                d.finish_error(&msg);
+            } else {
+                d.finish_error("Provisioning stream ended unexpectedly");
+            }
+        }
     }
     drop(display);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
     println!();
 
-    match SandboxPhase::try_from(last_phase) {
-        Ok(SandboxPhase::Ready) => {
+    match final_phase {
+        SandboxPhase::Ready => {
             drop(stream);
             drop(client);
 
             if let Some((local_path, sandbox_path, git_ignore)) = upload {
                 let dest = sandbox_path.as_deref().unwrap_or("/sandbox");
+                eprintln!("  {} Uploading files to {dest}...", "\u{2022}".dimmed(),);
                 let local = Path::new(local_path);
                 if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
                     sandbox_sync_up_files(
@@ -1291,6 +1524,7 @@ pub async fn sandbox_create(
                     )
                     .await?;
                 }
+                eprintln!("  {} Files uploaded", "\u{2713}".green().bold(),);
             }
 
             // If --forward was requested, start the background port forward
@@ -1306,19 +1540,19 @@ pub async fn sandbox_create(
                 )
                 .await?;
                 eprintln!(
-                    "{} Forwarding port {port} to sandbox {sandbox_name} in the background\n",
-                    "✓".green().bold(),
+                    "  {} Forwarding port {port} to sandbox {sandbox_name} in the background\n",
+                    "\u{2713}".green().bold(),
                 );
-                eprintln!("Access at: http://127.0.0.1:{port}/");
-                eprintln!("Stop with: nemoclaw forward stop {port} {sandbox_name}",);
+                eprintln!("  Access at: http://127.0.0.1:{port}/");
+                eprintln!("  Stop with: nemoclaw forward stop {port} {sandbox_name}",);
             }
 
             if command.is_empty() {
-                eprintln!("Connecting...");
+                eprintln!("  {} Connecting via SSH...", "\u{2022}".dimmed(),);
                 return sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await;
             }
 
-            eprintln!("Connecting...");
+            eprintln!("  {} Connecting via SSH...", "\u{2022}".dimmed(),);
             // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
             // auto-detect from the local terminal.
             let tty = tty_override.unwrap_or_else(|| {
@@ -1355,7 +1589,7 @@ pub async fn sandbox_create(
 
             exec_result
         }
-        Ok(SandboxPhase::Error) => {
+        SandboxPhase::Error => {
             if last_error_reason.is_empty() {
                 Err(miette::miette!(
                     "sandbox entered error phase while provisioning"
