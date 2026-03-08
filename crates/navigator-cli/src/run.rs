@@ -844,14 +844,15 @@ pub(crate) async fn deploy_cluster_with_panel(
 
 /// Print post-deploy summary showing the cluster name and gateway endpoint.
 pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::ClusterHandle) {
+    eprintln!();
     eprintln!(
         "{} {} {name}",
         "✓".green().bold(),
-        "Gateway ready:".green().bold(),
+        "Gateway ready:".green(),
     );
     eprintln!(
         "  {} {}",
-        "Gateway endpoint:".dimmed(),
+        "Gateway endpoint:".bold(),
         handle.gateway_endpoint()
     );
     eprintln!();
