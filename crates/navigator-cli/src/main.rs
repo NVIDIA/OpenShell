@@ -1312,15 +1312,11 @@ async fn main() -> Result<()> {
                         ));
                     }
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), sandbox_dest);
-                    if !no_git_ignore
-                        && let Ok(repo_root) = run::git_repo_root()
-                        && let Ok(files) = run::git_sync_files(&repo_root)
-                        && !files.is_empty()
-                    {
+                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
                             &name,
-                            &repo_root,
+                            &base_dir,
                             &files,
                             sandbox_dest,
                             &tls,
