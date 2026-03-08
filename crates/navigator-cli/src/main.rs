@@ -199,15 +199,15 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `nemoclaw ssh-proxy --gateway-endpoint <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `nemoclaw ssh-proxy --gateway-name <name> --name <sandbox-name>`
+    ///   `nemoclaw ssh-proxy --gateway <name> --name <sandbox-name>`
     SshProxy {
-        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
+        /// Gateway endpoint URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
         #[arg(long)]
-        gateway: Option<String>,
+        gateway_endpoint: Option<String>,
 
         /// Sandbox id. Required in token mode.
         #[arg(long)]
@@ -217,13 +217,13 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
 
-        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway-name.
+        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
         #[arg(long)]
         server: Option<String>,
 
         /// Gateway name (resolves endpoint from stored metadata). Used in name mode.
-        #[arg(long = "gateway-name", visible_alias = "cluster")]
-        gateway_name: Option<String>,
+        #[arg(long, visible_alias = "cluster")]
+        gateway: Option<String>,
 
         /// Sandbox name. Used in name mode.
         #[arg(long)]
@@ -1462,14 +1462,14 @@ async fn main() -> Result<()> {
                 .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
         }
         Some(Commands::SshProxy {
-            gateway,
+            gateway_endpoint,
             sandbox_id,
             token,
             server,
-            gateway_name,
+            gateway,
             name,
         }) => {
-            match (gateway, sandbox_id, token, server, gateway_name, name) {
+            match (gateway_endpoint, sandbox_id, token, server, gateway, name) {
                 // Token mode (existing behavior): pre-created session credentials.
                 (Some(gw), Some(sid), Some(tok), _, gw_name_opt, _) => {
                     let effective_tls = match gw_name_opt {
@@ -1478,7 +1478,7 @@ async fn main() -> Result<()> {
                     };
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
-                // Name mode with --gateway-name: resolve endpoint from metadata.
+                // Name mode with --gateway: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(c), Some(n)) => {
                     let endpoint = if let Some(srv) = server_override {
                         srv
@@ -1495,13 +1495,13 @@ async fn main() -> Result<()> {
                     let tls = tls.with_cluster_name(&c);
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
                 }
-                // Legacy name mode with --server only (no --gateway-name).
+                // Legacy name mode with --server only (no --gateway).
                 (_, _, _, Some(srv), None, Some(n)) => {
                     run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway/--sandbox-id/--token or --gateway-name/--name (or --server/--name)"
+                        "provide either --gateway-endpoint/--sandbox-id/--token or --gateway/--name (or --server/--name)"
                     ));
                 }
             }
