@@ -113,7 +113,6 @@ enum ProvisioningStep {
     Pulled,
     ContainerCreated,
     ContainerStarted,
-    GatewayReady,
     SandboxReady,
 }
 
@@ -126,7 +125,6 @@ impl ProvisioningStep {
             Self::Pulled => "Image pulled",
             Self::ContainerCreated => "Container created",
             Self::ContainerStarted => "Container started",
-            Self::GatewayReady => "Gateway ready",
             Self::SandboxReady => "Sandbox ready",
         }
     }
@@ -139,7 +137,6 @@ impl ProvisioningStep {
             Self::Pulled => "Pulling image...",
             Self::ContainerCreated => "Creating container...",
             Self::ContainerStarted => "Starting container...",
-            Self::GatewayReady => "Waiting for gateway...",
             Self::SandboxReady => "Waiting for sandbox...",
         }
     }
@@ -172,8 +169,6 @@ struct ProvisioningDisplay {
     active_detail: String,
     /// When the current active step started (for elapsed time).
     step_start: Instant,
-    /// Overall provisioning start time.
-    provision_start: Instant,
 }
 
 impl ProvisioningDisplay {
@@ -182,7 +177,7 @@ impl ProvisioningDisplay {
 
         let spinner = mp.add(ProgressBar::new_spinner());
         spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}")
+            ProgressStyle::with_template("{spinner:.cyan} {msg}\n")
                 .unwrap_or_else(|_| ProgressStyle::default_spinner()),
         );
         spinner.enable_steady_tick(Duration::from_millis(120));
@@ -195,7 +190,6 @@ impl ProvisioningDisplay {
             active_label: "Provisioning...".to_string(),
             active_detail: String::new(),
             step_start: now,
-            provision_start: now,
         }
     }
 
@@ -263,27 +257,6 @@ impl ProvisioningDisplay {
         self.spinner.set_message(msg);
     }
 
-    /// Finish the display, printing the final status line.
-    fn finish(&mut self, final_label: &str, success: bool) {
-        if success {
-            let elapsed = self.provision_start.elapsed();
-            let elapsed_str = format_elapsed(elapsed);
-            let _ = self.mp.println(format!(
-                "  {} {} {}",
-                "\u{2713}".green().bold(),
-                final_label.green().bold(),
-                elapsed_str.dimmed()
-            ));
-        } else {
-            let _ = self.mp.println(format!(
-                "  {} {}",
-                "\u{2717}".red().bold(),
-                final_label.red().bold()
-            ));
-        }
-        self.spinner.finish_and_clear();
-    }
-
     /// Finish with an error message shown on the last step line.
     fn finish_error(&mut self, msg: &str) {
         let _ = self
@@ -324,10 +297,11 @@ fn format_timestamp(d: Duration) -> String {
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
     let lines = [
         String::new(),
-        format!("{}", "Created sandbox:".cyan().bold()),
-        String::new(),
-        format!("  {} {}", "Name:".dimmed(), sandbox.name),
-        format!("  {} {}", "Namespace:".dimmed(), sandbox.namespace),
+        format!(
+            "{} {}",
+            "Created sandbox:".cyan().bold(),
+            sandbox.name.bold()
+        ),
         String::new(),
     ];
     match display {
@@ -1376,18 +1350,8 @@ pub async fn sandbox_create(
                 // Only accept Ready as terminal after we've observed a
                 // non-Ready phase, proving the controller has reconciled.
                 if saw_non_ready && phase == SandboxPhase::Ready {
-                    // Complete the gateway step if we haven't already.
-                    if !saw_gateway_ready {
-                        if let Some(d) = display.as_mut() {
-                            d.complete_step(ProvisioningStep::GatewayReady);
-                        }
-                    }
-                    // Complete the final step.
                     if let Some(d) = display.as_mut() {
-                        d.finish("Sandbox ready", true);
-                    } else {
-                        let ts = format_timestamp(provision_start.elapsed());
-                        println!("  {} {}", ts.dimmed(), "Sandbox ready".green().bold());
+                        d.spinner.finish_and_clear();
                     }
                     break;
                 }
@@ -1397,11 +1361,7 @@ pub async fn sandbox_create(
                 if !saw_gateway_ready && line.message.contains("listening") {
                     saw_gateway_ready = true;
                     if let Some(d) = display.as_mut() {
-                        d.complete_step(ProvisioningStep::GatewayReady);
                         d.set_active_step(ProvisioningStep::SandboxReady);
-                    } else {
-                        let ts = format_timestamp(provision_start.elapsed());
-                        println!("  {} Gateway ready", ts.dimmed());
                     }
                 } else if let Some(d) = display.as_mut() {
                     // Show other log lines as detail on the spinner.
@@ -1463,7 +1423,7 @@ pub async fn sandbox_create(
                         ProvisioningStep::ContainerStarted => {
                             if let Some(d) = display.as_mut() {
                                 d.complete_step(ProvisioningStep::ContainerStarted);
-                                d.set_active_step(ProvisioningStep::GatewayReady);
+                                d.set_active_step(ProvisioningStep::SandboxReady);
                             } else {
                                 let ts = format_timestamp(provision_start.elapsed());
                                 println!("  {} Container started", ts.dimmed());
@@ -1509,7 +1469,6 @@ pub async fn sandbox_create(
     drop(display);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
-    println!();
 
     match final_phase {
         SandboxPhase::Ready => {
@@ -1564,11 +1523,9 @@ pub async fn sandbox_create(
             }
 
             if command.is_empty() {
-                eprintln!("  {} Connecting via SSH...", "\u{2022}".dimmed(),);
                 return sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await;
             }
 
-            eprintln!("  {} Connecting via SSH...", "\u{2022}".dimmed(),);
             // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
             // auto-detect from the local terminal.
             let tty = tty_override.unwrap_or_else(|| {
