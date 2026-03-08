@@ -408,17 +408,12 @@ pub async fn ensure_container(
         env_vars.push(format!("IMAGE_TAG={tag}"));
     }
 
-    // Cloudflare tunnel auth: pass team domain and app AUD to the entrypoint
-    // so they are injected into the HelmChart manifest.
-    if let Ok(team_domain) = std::env::var("NEMOCLAW_CF_TEAM_DOMAIN")
-        && !team_domain.trim().is_empty()
+    // Disable gateway auth: pass through to the entrypoint so the HelmChart
+    // manifest sets the flag on the server pod.
+    if let Ok(val) = std::env::var("NEMOCLAW_DISABLE_GATEWAY_AUTH")
+        && val.trim().eq_ignore_ascii_case("true")
     {
-        env_vars.push(format!("CF_TEAM_DOMAIN={team_domain}"));
-    }
-    if let Ok(app_aud) = std::env::var("NEMOCLAW_CF_APP_AUD")
-        && !app_aud.trim().is_empty()
-    {
-        env_vars.push(format!("CF_APP_AUD={app_aud}"));
+        env_vars.push("DISABLE_GATEWAY_AUTH=true".to_string());
     }
 
     let env = Some(env_vars);

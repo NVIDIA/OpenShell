@@ -14,5 +14,5 @@ pub mod forward;
 pub mod inference;
 pub mod proto;
 
-pub use config::{CloudflareConfig, Config, TlsConfig};
+pub use config::{Config, TlsConfig};
 pub use error::{Error, Result};
