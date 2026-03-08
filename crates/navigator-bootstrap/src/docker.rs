@@ -123,14 +123,11 @@ pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> 
 }
 
 pub async fn ensure_network(docker: &Docker) -> Result<()> {
-    match docker
-        .inspect_network(NETWORK_NAME, None::<InspectNetworkOptions>)
-        .await
-    {
-        Ok(_) => return Ok(()),
-        Err(err) if is_not_found(&err) => {}
-        Err(err) => return Err(err).into_diagnostic(),
-    }
+    // Always remove and recreate the network to guarantee a clean state.
+    // Stale Docker networks (e.g., from a previous interrupted destroy or
+    // Docker Desktop restart) can leave broken routing that causes the
+    // container to fail with "no default routes found".
+    force_remove_network(docker).await?;
 
     docker
         .create_network(NetworkCreateRequest {
