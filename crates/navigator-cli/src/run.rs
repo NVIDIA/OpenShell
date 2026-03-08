@@ -545,7 +545,11 @@ impl ClusterDeployLogPanel {
         if let Some(step) = self.current_step.take() {
             self.push_completed_step(&step, true);
         }
-        self.finish_all_bars();
+        // Keep completed step checkmarks visible, clear the log panel.
+        for bar in &self.completed_steps {
+            bar.finish();
+        }
+        self.clear_log_panel();
         self.spinner.finish_and_clear();
     }
 
@@ -553,12 +557,7 @@ impl ClusterDeployLogPanel {
         if let Some(step) = self.current_step.take() {
             self.push_completed_step(&step, false);
         }
-        self.finish_all_bars();
-        self.spinner.finish_and_clear();
-    }
-
-    /// Finish all progress bars so they are preserved when `MultiProgress` is dropped.
-    fn finish_all_bars(&self) {
+        // On failure, preserve everything (including logs) for debugging.
         for bar in &self.completed_steps {
             bar.finish();
         }
@@ -570,6 +569,20 @@ impl ClusterDeployLogPanel {
         }
         if let Some(bottom_border) = &self.bottom_border {
             bottom_border.finish();
+        }
+        self.spinner.finish_and_clear();
+    }
+
+    /// Clear the container log panel from the terminal output.
+    fn clear_log_panel(&self) {
+        if let Some(top_border) = &self.top_border {
+            top_border.finish_and_clear();
+        }
+        for bar in &self.log_lines {
+            bar.finish_and_clear();
+        }
+        if let Some(bottom_border) = &self.bottom_border {
+            bottom_border.finish_and_clear();
         }
     }
 
