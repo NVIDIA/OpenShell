@@ -186,6 +186,11 @@ impl Navigator for NavigatorService {
             ..Default::default()
         };
 
+        // Persist to the store FIRST so the sandbox watcher always finds
+        // the record with `spec` populated.  If we created the k8s
+        // resource first, the watcher could race us and write a fallback
+        // record with `spec: None`, causing the supervisor to fail with
+        // "sandbox has no spec".
         self.state.sandbox_index.update_from_sandbox(&sandbox);
 
         self.state
@@ -194,49 +199,47 @@ impl Navigator for NavigatorService {
             .await
             .map_err(|e| Status::internal(format!("persist sandbox failed: {e}")))?;
 
-        self.state.sandbox_watch_bus.notify(&id);
-
+        // Now create the Kubernetes resource.  If this fails, clean up
+        // the store entry to avoid orphans.
         match self.state.sandbox_client.create(&sandbox).await {
-            Ok(_) => {
-                info!(
-                    sandbox_id = %id,
-                    sandbox_name = %name,
-                    "CreateSandbox request completed successfully"
-                );
-                Ok(Response::new(SandboxResponse {
-                    sandbox: Some(sandbox),
-                }))
-            }
+            Ok(_) => {}
             Err(kube::Error::Api(err)) if err.code == 409 => {
+                // Clean up the store entry we just wrote.
+                let _ = self.state.store.delete("sandbox", &id).await;
+                self.state.sandbox_index.remove_sandbox(&id);
                 warn!(
                     sandbox_id = %id,
                     sandbox_name = %name,
                     "Sandbox already exists in Kubernetes"
                 );
-                if let Err(e) = self.state.store.delete(Sandbox::object_type(), &id).await {
-                    warn!(sandbox_id = %id, error = %e, "Failed to clean up store after conflict");
-                }
-                self.state.sandbox_index.remove_sandbox(&id);
-                self.state.sandbox_watch_bus.notify(&id);
-                Err(Status::already_exists("sandbox already exists"))
+                return Err(Status::already_exists("sandbox already exists"));
             }
             Err(err) => {
+                // Clean up the store entry we just wrote.
+                let _ = self.state.store.delete("sandbox", &id).await;
+                self.state.sandbox_index.remove_sandbox(&id);
                 warn!(
                     sandbox_id = %id,
                     sandbox_name = %name,
                     error = %err,
                     "CreateSandbox request failed"
                 );
-                if let Err(e) = self.state.store.delete(Sandbox::object_type(), &id).await {
-                    warn!(sandbox_id = %id, error = %e, "Failed to clean up store after creation failure");
-                }
-                self.state.sandbox_index.remove_sandbox(&id);
-                self.state.sandbox_watch_bus.notify(&id);
-                Err(Status::internal(format!(
+                return Err(Status::internal(format!(
                     "create sandbox in kubernetes failed: {err}"
-                )))
+                )));
             }
         }
+
+        self.state.sandbox_watch_bus.notify(&id);
+
+        info!(
+            sandbox_id = %id,
+            sandbox_name = %name,
+            "CreateSandbox request completed successfully"
+        );
+        Ok(Response::new(SandboxResponse {
+            sandbox: Some(sandbox),
+        }))
     }
 
     type WatchSandboxStream = ReceiverStream<Result<SandboxStreamEvent, Status>>;

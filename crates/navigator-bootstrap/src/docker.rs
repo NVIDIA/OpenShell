@@ -355,6 +355,26 @@ pub async fn ensure_container(
         env_vars.push(format!("REGISTRY_USERNAME={username}"));
         env_vars.push(format!("REGISTRY_PASSWORD={password}"));
     }
+
+    // When the primary registry is NOT the distribution registry (e.g. a
+    // local registry in push-mode), we still need containerd credentials for
+    // the distribution registry so that community sandbox images
+    // (d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes/*) can be
+    // pulled at runtime.  Pass the distribution registry credentials as a
+    // separate set of env vars so the entrypoint can add a second block to
+    // registries.yaml.
+    if registry_host != pull_registry() {
+        env_vars.push(format!("DIST_REGISTRY_HOST={}", pull_registry()));
+        env_vars.push(format!(
+            "DIST_REGISTRY_USERNAME={}",
+            pull_registry_username()
+        ));
+        env_vars.push(format!(
+            "DIST_REGISTRY_PASSWORD={}",
+            pull_registry_password()
+        ));
+    }
+
     if !extra_sans.is_empty() {
         env_vars.push(format!("EXTRA_SANS={}", extra_sans.join(",")));
     }
