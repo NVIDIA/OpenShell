@@ -70,12 +70,19 @@ pub struct Config {
     /// the server over mTLS.
     #[serde(default)]
     pub client_tls_secret_name: String,
+
+    /// Cloudflare Access configuration.  When present, the gateway accepts
+    /// `cf-authorization` JWT headers as an alternative to mTLS.
+    #[serde(default)]
+    pub cloudflare: Option<CloudflareConfig>,
 }
 
 /// TLS configuration.
 ///
-/// mTLS is always enforced — all clients must present a certificate signed
-/// by the given CA.
+/// By default mTLS is enforced — all clients must present a certificate
+/// signed by the given CA.  When `allow_unauthenticated` is `true`, the
+/// TLS handshake also accepts connections without a client certificate
+/// (needed for reverse-proxy deployments like Cloudflare Tunnel).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
@@ -88,6 +95,25 @@ pub struct TlsConfig {
     /// The server requires all clients to present a valid certificate signed by
     /// this CA.
     pub client_ca_path: PathBuf,
+
+    /// When `true`, the TLS handshake succeeds even without a client
+    /// certificate.  Application-layer middleware must then enforce auth
+    /// (e.g. via a CF JWT header).
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
+}
+
+/// Cloudflare Access configuration for tunnel-mode authentication.
+///
+/// When present, the gateway accepts `cf-authorization` JWTs as an
+/// alternative to mTLS client certificates.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CloudflareConfig {
+    /// Cloudflare Access team domain (e.g., `myteam.cloudflareaccess.com`).
+    pub team_domain: String,
+
+    /// Application Audience (AUD) tag from the Cloudflare Access policy.
+    pub app_aud: String,
 }
 
 impl Config {
@@ -109,6 +135,7 @@ impl Config {
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
+            cloudflare: None,
         }
     }
 
@@ -207,6 +234,17 @@ impl Config {
     #[must_use]
     pub fn with_client_tls_secret_name(mut self, name: impl Into<String>) -> Self {
         self.client_tls_secret_name = name.into();
+        self
+    }
+
+    /// Set the Cloudflare Access configuration for tunnel-mode auth.
+    ///
+    /// When set, the server TLS layer will allow unauthenticated connections
+    /// and defer auth to application-layer JWT verification.
+    #[must_use]
+    pub fn with_cloudflare(mut self, cf: CloudflareConfig) -> Self {
+        self.tls.allow_unauthenticated = true;
+        self.cloudflare = Some(cf);
         self
     }
 }

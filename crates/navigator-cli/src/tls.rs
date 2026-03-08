@@ -224,6 +224,54 @@ pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClie
     Ok(NavigatorClient::new(channel))
 }
 
+/// Interceptor that injects a `cf-authorization` metadata header into every
+/// outgoing gRPC request.
+#[derive(Clone)]
+pub struct CfAuthInterceptor {
+    token: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+}
+
+/// Build a gRPC client using bearer-token auth (no mTLS).
+///
+/// Connects over TLS but does **not** present a client certificate.  Instead,
+/// every request carries a `cf-authorization` header with the supplied JWT.
+/// The server CA is still validated to prevent MitM.
+pub async fn grpc_client_bearer(
+    server: &str,
+    ca_pem: &[u8],
+    token: &str,
+) -> Result<
+    NavigatorClient<tonic::service::interceptor::InterceptedService<Channel, CfAuthInterceptor>>,
+> {
+    let ca_cert = Certificate::from_pem(ca_pem);
+    let tls_config = ClientTlsConfig::new().ca_certificate(ca_cert);
+    let endpoint = Endpoint::from_shared(server.to_string())
+        .into_diagnostic()?
+        .connect_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(Duration::from_secs(10))
+        .keep_alive_while_idle(true)
+        .tls_config(tls_config)
+        .into_diagnostic()?;
+    let channel = endpoint.connect().await.into_diagnostic()?;
+    let interceptor = CfAuthInterceptor {
+        token: token
+            .parse()
+            .map_err(|_| miette::miette!("invalid cf-authorization token value"))?,
+    };
+    Ok(NavigatorClient::with_interceptor(channel, interceptor))
+}
+
+impl tonic::service::Interceptor for CfAuthInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        req.metadata_mut()
+            .insert("cf-authorization", self.token.clone());
+        Ok(req)
+    }
+}
+
 pub async fn grpc_inference_client(
     server: &str,
     tls: &TlsOptions,

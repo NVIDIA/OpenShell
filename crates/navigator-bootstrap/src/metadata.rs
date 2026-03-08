@@ -29,6 +29,18 @@ pub struct ClusterMetadata {
     /// For remote clusters, the resolved hostname/IP from SSH config.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_host: Option<String>,
+
+    /// Auth mode: `None` or `"mtls"` = mTLS (default), `"cloudflare_jwt"` = CF JWT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_mode: Option<String>,
+
+    /// Cloudflare Access team domain (e.g., `brevlab.cloudflareaccess.com`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_team_domain: Option<String>,
+
+    /// URL for triggering re-authentication in the browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cf_auth_url: Option<String>,
 }
 
 pub fn create_cluster_metadata(
@@ -84,6 +96,9 @@ pub fn create_cluster_metadata_with_host(
         kube_port,
         remote_host,
         resolved_host,
+        auth_mode: None,
+        cf_team_domain: None,
+        cf_auth_url: None,
     }
 }
 
@@ -425,6 +440,9 @@ mod tests {
             kube_port: Some(7443),
             remote_host: Some("user@navigator-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
+            auth_mode: None,
+            cf_team_domain: None,
+            cf_auth_url: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let parsed: ClusterMetadata = serde_json::from_str(&json).unwrap();
@@ -444,6 +462,9 @@ mod tests {
             kube_port: None,
             remote_host: Some("user@navigator-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
+            auth_mode: None,
+            cf_team_domain: None,
+            cf_auth_url: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(

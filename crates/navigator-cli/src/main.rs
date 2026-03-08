@@ -17,12 +17,26 @@ use navigator_cli::completers;
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;
 
+/// Auth mode for connecting to the gateway.
+#[derive(Debug, Clone)]
+enum AuthMode {
+    /// Standard mTLS using client certificates.
+    Mtls,
+    /// Cloudflare tunnel: no client cert, send `cf-authorization` JWT header.
+    CloudflareJwt {
+        /// The CF JWT token value.
+        token: String,
+    },
+}
+
 /// Resolved gateway context: name + endpoint.
 struct GatewayContext {
     /// The gateway name (used for TLS cert directory, metadata lookup, etc.).
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
+    /// How to authenticate to the gateway.
+    auth_mode: AuthMode,
 }
 
 /// Resolve the gateway name to a [`GatewayContext`] with the endpoint URL.
@@ -58,9 +72,18 @@ fn resolve_gateway(gateway_flag: &Option<String>) -> Result<GatewayContext> {
         )
     })?;
 
+    let auth_mode = if metadata.auth_mode.as_deref() == Some("cloudflare_jwt") {
+        // Try loading the token from: file, env var, or prompt.
+        let token = load_cf_token(&metadata.name)?;
+        AuthMode::CloudflareJwt { token }
+    } else {
+        AuthMode::Mtls
+    };
+
     Ok(GatewayContext {
         name: metadata.name,
         endpoint: metadata.gateway_endpoint,
+        auth_mode,
     })
 }
 
@@ -96,6 +119,50 @@ fn resolve_sandbox_name(name: Option<String>, cluster: &str) -> Result<String> {
     })?;
     eprintln!("{} Using sandbox '{}' (last used)", "→".bold(), last.bold(),);
     Ok(last)
+}
+
+/// Load the Cloudflare JWT token for a cluster.
+///
+/// Resolution priority:
+/// 1. `NEMOCLAW_CF_TOKEN` environment variable
+/// 2. Token file at `~/.config/nemoclaw/clusters/<name>/cf_token`
+fn load_cf_token(cluster_name: &str) -> Result<String> {
+    // 1. Environment variable
+    if let Ok(token) = std::env::var("NEMOCLAW_CF_TOKEN") {
+        let token = token.trim().to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    // 2. Token file
+    let config_dir = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.config")
+    });
+    let token_path = std::path::PathBuf::from(config_dir)
+        .join("nemoclaw")
+        .join("clusters")
+        .join(cluster_name)
+        .join("cf_token");
+
+    if token_path.exists() {
+        let token = std::fs::read_to_string(&token_path)
+            .map_err(|e| {
+                miette::miette!("failed to read CF token from {}: {e}", token_path.display())
+            })?
+            .trim()
+            .to_string();
+        if !token.is_empty() {
+            return Ok(token);
+        }
+    }
+
+    Err(miette::miette!(
+        "No Cloudflare token found for cluster '{cluster_name}'.\n\
+         Set NEMOCLAW_CF_TOKEN or write the token to:\n  {}",
+        token_path.display()
+    ))
 }
 
 /// NemoClaw CLI - agent execution and management.
@@ -1015,7 +1082,14 @@ async fn main() -> Result<()> {
         Some(Commands::Status) => {
             if let Ok(ctx) = resolve_gateway(&cli.gateway) {
                 let tls = tls.with_cluster_name(&ctx.name);
-                run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                match &ctx.auth_mode {
+                    AuthMode::Mtls => {
+                        run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                    }
+                    AuthMode::CloudflareJwt { token } => {
+                        run::cluster_status_bearer(&ctx.name, &ctx.endpoint, &tls, token).await?;
+                    }
+                }
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();

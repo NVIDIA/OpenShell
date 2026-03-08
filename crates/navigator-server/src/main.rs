@@ -85,6 +85,17 @@ struct Args {
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
     #[arg(long, env = "NEMOCLAW_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
+
+    /// Cloudflare Access team domain (e.g., `myteam.cloudflareaccess.com`).
+    /// When set together with --cf-app-aud, the gateway accepts
+    /// `cf-authorization` JWT headers as an alternative to mTLS.
+    #[arg(long, env = "NEMOCLAW_CF_TEAM_DOMAIN")]
+    cf_team_domain: Option<String>,
+
+    /// Cloudflare Access application audience (AUD) tag.
+    /// Required when --cf-team-domain is set.
+    #[arg(long, env = "NEMOCLAW_CF_APP_AUD")]
+    cf_app_aud: Option<String>,
 }
 
 #[tokio::main]
@@ -108,6 +119,7 @@ async fn main() -> Result<()> {
         cert_path: args.tls_cert,
         key_path: args.tls_key,
         client_ca_path: args.tls_client_ca,
+        allow_unauthenticated: false, // overridden by with_cloudflare() below
     };
 
     let mut config = navigator_core::Config::new(tls)
@@ -137,6 +149,33 @@ async fn main() -> Result<()> {
 
     if let Some(name) = args.client_tls_secret_name {
         config = config.with_client_tls_secret_name(name);
+    }
+
+    // Cloudflare tunnel auth: both --cf-team-domain and --cf-app-aud must be
+    // set together.  When present, the server allows unauthenticated TLS
+    // connections and validates CF JWTs at the application layer.
+    match (args.cf_team_domain, args.cf_app_aud) {
+        (Some(team_domain), Some(app_aud)) => {
+            info!(
+                cf_team_domain = %team_domain,
+                "Cloudflare tunnel auth enabled — accepting CF JWTs"
+            );
+            config = config.with_cloudflare(navigator_core::CloudflareConfig {
+                team_domain,
+                app_aud,
+            });
+        }
+        (Some(_), None) => {
+            return Err(miette::miette!(
+                "--cf-team-domain requires --cf-app-aud to also be set"
+            ));
+        }
+        (None, Some(_)) => {
+            return Err(miette::miette!(
+                "--cf-app-aud requires --cf-team-domain to also be set"
+            ));
+        }
+        (None, None) => {} // standard mTLS-only mode
     }
 
     info!(bind = %config.bind_address, "Starting NemoClaw server");

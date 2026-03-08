@@ -68,6 +68,12 @@ spec:
               value: /etc/navigator-tls/client-ca/ca.crt
             - name: NEMOCLAW_CLIENT_TLS_SECRET_NAME
               value: {{ .Values.server.tls.clientTlsSecretName | quote }}
+            {{- if and .Values.server.cfTeamDomain .Values.server.cfAppAud }}
+            - name: NEMOCLAW_CF_TEAM_DOMAIN
+              value: {{ .Values.server.cfTeamDomain | quote }}
+            - name: NEMOCLAW_CF_APP_AUD
+              value: {{ .Values.server.cfAppAud | quote }}
+            {{- end }}
           volumeMounts:
             - name: navigator-data
               mountPath: /var/navigator

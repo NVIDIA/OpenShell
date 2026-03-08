@@ -629,6 +629,74 @@ pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) 
     Ok(())
 }
 
+/// Display cluster status using Cloudflare JWT auth (no mTLS).
+///
+/// Same output as [`cluster_status`] but connects without a client certificate,
+/// instead injecting a `cf-authorization` header with the provided JWT.
+pub async fn cluster_status_bearer(
+    cluster_name: &str,
+    server: &str,
+    tls: &TlsOptions,
+    token: &str,
+) -> Result<()> {
+    println!("{}", "Server Status".cyan().bold());
+    println!();
+    println!("  {} {}", "Cluster:".dimmed(), cluster_name);
+    println!("  {} {}", "Server:".dimmed(), server);
+    println!("  {} {}", "Auth:".dimmed(), "Cloudflare JWT");
+
+    // Load CA cert — we still validate the server, just don't send a client cert.
+    let ca_pem = load_ca_for_bearer(cluster_name, tls)?;
+
+    match crate::tls::grpc_client_bearer(server, &ca_pem, token).await {
+        Ok(mut client) => match client.health(HealthRequest {}).await {
+            Ok(response) => {
+                let health = response.into_inner();
+                println!("  {} {}", "Status:".dimmed(), "Connected".green());
+                println!("  {} {}", "Version:".dimmed(), health.version);
+            }
+            Err(e) => {
+                println!("  {} {}", "Status:".dimmed(), "Error".red());
+                println!("  {} {}", "Error:".dimmed(), e);
+            }
+        },
+        Err(e) => {
+            println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
+            println!("  {} {}", "Error:".dimmed(), e);
+        }
+    }
+
+    Ok(())
+}
+
+/// Load the CA certificate PEM for bearer-auth connections.
+///
+/// We still need the CA to verify the server's certificate even though we
+/// don't send a client cert.
+fn load_ca_for_bearer(cluster_name: &str, _tls: &TlsOptions) -> Result<Vec<u8>> {
+    // Try the standard cluster mtls directory
+    let config_dir = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
+        let home = std::env::var("HOME").unwrap_or_default();
+        format!("{home}/.config")
+    });
+    let ca_path = PathBuf::from(config_dir)
+        .join("nemoclaw")
+        .join("clusters")
+        .join(cluster_name)
+        .join("mtls")
+        .join("ca.crt");
+    if ca_path.exists() {
+        return std::fs::read(&ca_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read CA from {}", ca_path.display()));
+    }
+
+    Err(miette::miette!(
+        "No CA certificate found for cluster '{cluster_name}'.\n\
+         The CA is needed to verify the server even in Cloudflare JWT mode."
+    ))
+}
+
 /// Set the active cluster.
 pub fn cluster_use(name: &str) -> Result<()> {
     // Verify the cluster exists

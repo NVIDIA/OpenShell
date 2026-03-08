@@ -310,6 +310,16 @@ if [ -f "$HELMCHART" ]; then
     fi
     echo "Setting SSH handshake secret"
     sed -i "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART"
+
+    # Cloudflare tunnel auth: inject team domain and app AUD if set.
+    if [ -n "${CF_TEAM_DOMAIN:-}" ] && [ -n "${CF_APP_AUD:-}" ]; then
+        echo "Setting Cloudflare tunnel auth: team=$CF_TEAM_DOMAIN"
+        sed -i "s|__CF_TEAM_DOMAIN__|${CF_TEAM_DOMAIN}|g" "$HELMCHART"
+        sed -i "s|__CF_APP_AUD__|${CF_APP_AUD}|g" "$HELMCHART"
+    else
+        sed -i "s|cfTeamDomain: __CF_TEAM_DOMAIN__|cfTeamDomain: \"\"|g" "$HELMCHART"
+        sed -i "s|cfAppAud: __CF_APP_AUD__|cfAppAud: \"\"|g" "$HELMCHART"
+    fi
 fi
 
 # Inject chart checksum into the HelmChart manifest so that a changed chart

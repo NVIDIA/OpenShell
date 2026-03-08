@@ -163,6 +163,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         &config.tls.cert_path,
         &config.tls.key_path,
         &config.tls.client_ca_path,
+        config.tls.allow_unauthenticated,
     )?;
 
     // Accept connections

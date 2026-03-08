@@ -33,6 +33,8 @@ spec:
       sshGatewayPort: __SSH_GATEWAY_PORT__
       sshHandshakeSecret: __SSH_HANDSHAKE_SECRET__
       grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
+      cfTeamDomain: __CF_TEAM_DOMAIN__
+      cfAppAud: __CF_APP_AUD__
       tls:
         certSecretName: navigator-server-tls
         clientCaSecretName: navigator-server-client-ca
