@@ -428,9 +428,9 @@ enum ProviderCommands {
 enum GatewayCommands {
     /// Deploy/start the gateway.
     Start {
-        /// Gateway name.
-        #[arg(long, default_value = "nemoclaw")]
-        name: String,
+        /// Gateway name (defaults to active gateway).
+        #[arg(long)]
+        name: Option<String>,
 
         /// Write stored kubeconfig into local kubeconfig.
         #[arg(long)]
@@ -936,6 +936,9 @@ async fn main() -> Result<()> {
                 kube_port,
                 recreate,
             } => {
+                let name = name
+                    .or_else(|| resolve_cluster_name(&cli.cluster))
+                    .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_deploy(
                     &name,
                     update_kube_config,
