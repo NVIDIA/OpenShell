@@ -17,7 +17,13 @@ use navigator_core::proto::{
 use std::collections::BTreeMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 use tracing::{debug, info, warn};
+
+/// Timeout for individual Kubernetes API calls (create, delete, get).
+/// This prevents gRPC handlers from blocking indefinitely when the k8s
+/// API server is unreachable or slow.
+const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION: &str = "v1alpha1";
@@ -59,7 +65,16 @@ impl SandboxClient {
         ssh_handshake_skew_secs: u64,
         client_tls_secret_name: String,
     ) -> Result<Self, KubeError> {
-        let client = Client::try_default().await?;
+        let mut config = match kube::Config::incluster() {
+            Ok(c) => c,
+            Err(_) => kube::Config::infer()
+                .await
+                .map_err(kube::Error::InferConfig)?,
+        };
+        config.connect_timeout = Some(Duration::from_secs(10));
+        config.read_timeout = Some(Duration::from_secs(30));
+        config.write_timeout = Some(Duration::from_secs(30));
+        let client = Client::try_from(config)?;
         Ok(Self {
             client,
             namespace,
@@ -144,8 +159,9 @@ impl SandboxClient {
         );
         let api = self.api();
 
-        match api.create(&PostParams::default(), &obj).await {
-            Ok(result) => {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.create(&PostParams::default(), &obj)).await
+        {
+            Ok(Ok(result)) => {
                 info!(
                     sandbox_id = %sandbox.id,
                     sandbox_name = %name,
@@ -153,7 +169,7 @@ impl SandboxClient {
                 );
                 Ok(result)
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 warn!(
                     sandbox_id = %sandbox.id,
                     sandbox_name = %name,
@@ -161,6 +177,23 @@ impl SandboxClient {
                     "Failed to create sandbox in Kubernetes"
                 );
                 Err(err)
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_id = %sandbox.id,
+                    sandbox_name = %name,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out creating sandbox in Kubernetes"
+                );
+                Err(KubeError::Api(kube::core::ErrorResponse {
+                    status: "Failure".to_string(),
+                    message: format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ),
+                    reason: "Timeout".to_string(),
+                    code: 504,
+                }))
             }
         }
     }
@@ -173,22 +206,40 @@ impl SandboxClient {
         );
 
         let api = self.api();
-        match api.delete(name, &DeleteParams::default()).await {
-            Ok(_response) => {
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.delete(name, &DeleteParams::default()))
+            .await
+        {
+            Ok(Ok(_response)) => {
                 info!(sandbox_name = %name, "Sandbox deleted from Kubernetes");
                 Ok(true)
             }
-            Err(KubeError::Api(err)) if err.code == 404 => {
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
                 debug!(sandbox_name = %name, "Sandbox not found in Kubernetes (already deleted)");
                 Ok(false)
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 warn!(
                     sandbox_name = %name,
                     error = %err,
                     "Failed to delete sandbox from Kubernetes"
                 );
                 Err(err)
+            }
+            Err(_elapsed) => {
+                warn!(
+                    sandbox_name = %name,
+                    timeout_secs = KUBE_API_TIMEOUT.as_secs(),
+                    "Timed out deleting sandbox from Kubernetes"
+                );
+                Err(KubeError::Api(kube::core::ErrorResponse {
+                    status: "Failure".to_string(),
+                    message: format!(
+                        "timed out after {}s waiting for Kubernetes API",
+                        KUBE_API_TIMEOUT.as_secs()
+                    ),
+                    reason: "Timeout".to_string(),
+                    code: 504,
+                }))
             }
         }
     }
@@ -274,6 +325,126 @@ pub fn spawn_sandbox_watcher(
     });
 }
 
+/// Interval between store-vs-k8s reconciliation sweeps.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
+
+/// How long a sandbox can stay in `Provisioning` in the store without a
+/// corresponding Kubernetes resource before it is considered orphaned and
+/// removed.
+const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(120);
+
+/// Periodically reconcile the store against Kubernetes to clean up orphaned
+/// sandbox records.  A record is orphaned when it exists in the store but
+/// has no corresponding Kubernetes `Sandbox` CR — typically because the
+/// k8s create timed out or the gRPC handler was cancelled.
+pub fn spawn_store_reconciler(
+    store: Arc<Store>,
+    client: SandboxClient,
+    index: crate::sandbox_index::SandboxIndex,
+    watch_bus: crate::sandbox_watch::SandboxWatchBus,
+    tracing_log_bus: crate::tracing_bus::TracingLogBus,
+) {
+    tokio::spawn(async move {
+        // Wait for initial startup to settle before running the first sweep.
+        tokio::time::sleep(RECONCILE_INTERVAL).await;
+
+        loop {
+            if let Err(e) =
+                reconcile_orphaned_sandboxes(&store, &client, &index, &watch_bus, &tracing_log_bus)
+                    .await
+            {
+                warn!(error = %e, "Store reconciliation sweep failed");
+            }
+            tokio::time::sleep(RECONCILE_INTERVAL).await;
+        }
+    });
+}
+
+/// Single reconciliation sweep: list all sandboxes in the store that are
+/// still `Provisioning`, check if they have a corresponding k8s resource,
+/// and remove any that have been orphaned beyond the grace period.
+async fn reconcile_orphaned_sandboxes(
+    store: &Store,
+    client: &SandboxClient,
+    index: &crate::sandbox_index::SandboxIndex,
+    watch_bus: &crate::sandbox_watch::SandboxWatchBus,
+    tracing_log_bus: &crate::tracing_bus::TracingLogBus,
+) -> Result<(), String> {
+    let records = store
+        .list(Sandbox::object_type(), 500, 0)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let api = client.api();
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    for record in records {
+        let sandbox: Sandbox = match prost::Message::decode(record.payload.as_slice()) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "Failed to decode sandbox record during reconciliation");
+                continue;
+            }
+        };
+
+        // Only check sandboxes that are still provisioning — these are the
+        // ones at risk of being orphaned.
+        if sandbox.phase != SandboxPhase::Provisioning as i32 {
+            continue;
+        }
+
+        // Check how old this record is using the store's created_at_ms.
+        let age_ms = now_ms.saturating_sub(record.created_at_ms);
+        if age_ms < ORPHAN_GRACE_PERIOD.as_millis() as i64 {
+            continue;
+        }
+
+        // Check if a corresponding k8s resource exists.
+        match tokio::time::timeout(KUBE_API_TIMEOUT, api.get(&sandbox.name)).await {
+            Ok(Ok(_)) => {
+                // k8s resource exists — not orphaned.
+                continue;
+            }
+            Ok(Err(KubeError::Api(err))) if err.code == 404 => {
+                // k8s resource does not exist — orphaned store entry.
+                info!(
+                    sandbox_id = %sandbox.id,
+                    sandbox_name = %sandbox.name,
+                    age_secs = age_ms / 1000,
+                    "Removing orphaned sandbox from store (no corresponding k8s resource)"
+                );
+                if let Err(e) = store.delete(Sandbox::object_type(), &sandbox.id).await {
+                    warn!(sandbox_id = %sandbox.id, error = %e, "Failed to remove orphaned sandbox");
+                }
+                index.remove_sandbox(&sandbox.id);
+                watch_bus.notify(&sandbox.id);
+                tracing_log_bus.remove(&sandbox.id);
+                tracing_log_bus.platform_event_bus.remove(&sandbox.id);
+                watch_bus.remove(&sandbox.id);
+            }
+            Ok(Err(err)) => {
+                // k8s API error — skip this record and try again next cycle.
+                debug!(
+                    sandbox_id = %sandbox.id,
+                    error = %err,
+                    "Skipping orphan check due to k8s API error"
+                );
+            }
+            Err(_elapsed) => {
+                debug!(
+                    sandbox_id = %sandbox.id,
+                    "Skipping orphan check due to k8s API timeout"
+                );
+            }
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_applied(
     store: &Store,
     client: &SandboxClient,
@@ -293,19 +464,24 @@ async fn handle_applied(
     let status = status_from_object(&obj);
     let phase = derive_phase(&status, deletion_timestamp);
 
-    let mut sandbox = store
+    let existing = store
         .get_message::<Sandbox>(&id)
         .await
-        .map_err(|e| e.to_string())?
-        .unwrap_or_else(|| Sandbox {
-            id: id.clone(),
-            name: name.clone(),
-            namespace,
-            spec: None,
-            status: None,
-            phase: SandboxPhase::Unknown as i32,
-            ..Default::default()
-        });
+        .map_err(|e| e.to_string())?;
+
+    // If the record doesn't exist yet, the `create_sandbox` handler may
+    // still be in-flight (it creates the k8s resource first, then writes
+    // to the store).  Build a minimal placeholder but never overwrite an
+    // existing record's `spec` — only the `create_sandbox` handler sets it.
+    let mut sandbox = existing.unwrap_or_else(|| Sandbox {
+        id: id.clone(),
+        name: name.clone(),
+        namespace,
+        spec: None,
+        status: None,
+        phase: SandboxPhase::Unknown as i32,
+        ..Default::default()
+    });
 
     // Log phase transitions
     let old_phase = SandboxPhase::try_from(sandbox.phase).unwrap_or(SandboxPhase::Unknown);
@@ -465,9 +641,15 @@ fn supervisor_volume_mount() -> serde_json::Value {
 
 /// Apply supervisor bootstrap transforms to an already-built pod template JSON.
 ///
-/// This injects the init container, shared volume, volume mount, and command
-/// override into the pod template, targeting the `agent` container (or the
-/// first container if no `agent` is found).
+/// This injects the init container, shared volume, volume mount, command
+/// override, and `runAsUser: 0` into the pod template, targeting the `agent`
+/// container (or the first container if no `agent` is found).
+///
+/// The `runAsUser: 0` override ensures the side-loaded supervisor binary runs
+/// as root regardless of the image's `USER` directive. The supervisor needs
+/// root for network namespace creation, proxy setup, and Landlock/seccomp
+/// configuration. It drops to the appropriate non-root user for child
+/// processes via the policy's `run_as_user`/`run_as_group`.
 fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_image: &str) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
@@ -511,6 +693,18 @@ fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_imag
             "command".to_string(),
             serde_json::json!([format!("{}/navigator-sandbox", SUPERVISOR_MOUNT_PATH)]),
         );
+
+        // Force the supervisor to run as root (UID 0). Custom/community images
+        // may set a non-root USER directive (e.g. `USER sandbox`), but the
+        // supervisor needs root to create network namespaces, set up the proxy,
+        // and configure Landlock/seccomp. The supervisor itself drops privileges
+        // for child processes via the policy's `run_as_user`/`run_as_group`.
+        let security_context = container
+            .entry("securityContext")
+            .or_insert_with(|| serde_json::json!({}));
+        if let Some(sc) = security_context.as_object_mut() {
+            sc.insert("runAsUser".to_string(), serde_json::json!(0));
+        }
 
         // Add volume mount
         let volume_mounts = container
@@ -1251,5 +1445,128 @@ mod tests {
             secret_entry.get("value").and_then(|v| v.as_str()),
             Some("my-secret-value")
         );
+    }
+
+    #[test]
+    fn supervisor_bootstrap_injects_run_as_user_zero() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest",
+                    "securityContext": {
+                        "capabilities": {
+                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+                        }
+                    }
+                }]
+            }
+        });
+
+        apply_supervisor_bootstrap(&mut pod_template, "default-image:latest");
+
+        let sc = &pod_template["spec"]["containers"][0]["securityContext"];
+        assert_eq!(sc["runAsUser"], 0, "runAsUser must be 0 for supervisor");
+        // Capabilities should be preserved
+        assert!(
+            sc["capabilities"]["add"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::json!("SYS_ADMIN"))
+        );
+    }
+
+    #[test]
+    fn supervisor_bootstrap_adds_security_context_when_missing() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest"
+                }]
+            }
+        });
+
+        apply_supervisor_bootstrap(&mut pod_template, "default-image:latest");
+
+        let sc = &pod_template["spec"]["containers"][0]["securityContext"];
+        assert_eq!(
+            sc["runAsUser"], 0,
+            "runAsUser must be 0 even when no prior securityContext"
+        );
+    }
+
+    #[test]
+    fn supervisor_bootstrap_injects_init_container_and_volume() {
+        let mut pod_template = serde_json::json!({
+            "spec": {
+                "containers": [{
+                    "name": "agent",
+                    "image": "custom-image:latest"
+                }]
+            }
+        });
+
+        apply_supervisor_bootstrap(&mut pod_template, "default-image:latest");
+
+        // Init container should be present
+        let init_containers = pod_template["spec"]["initContainers"]
+            .as_array()
+            .expect("initContainers should exist");
+        assert_eq!(init_containers.len(), 1);
+        assert_eq!(init_containers[0]["name"], "copy-supervisor");
+        assert_eq!(init_containers[0]["image"], "default-image:latest");
+
+        // Volume should be present
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        assert_eq!(volumes.len(), 1);
+        assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
+
+        // Agent container command should be overridden
+        let command = pod_template["spec"]["containers"][0]["command"]
+            .as_array()
+            .expect("command should be set");
+        assert_eq!(
+            command[0].as_str().unwrap(),
+            format!("{}/navigator-sandbox", SUPERVISOR_MOUNT_PATH)
+        );
+    }
+
+    #[test]
+    fn needs_supervisor_bootstrap_true_for_custom_image() {
+        let template = SandboxTemplate {
+            image: "custom-image:latest".to_string(),
+            ..SandboxTemplate::default()
+        };
+        assert!(needs_supervisor_bootstrap(
+            &template,
+            "default-image:latest"
+        ));
+    }
+
+    #[test]
+    fn needs_supervisor_bootstrap_false_for_default_image() {
+        let template = SandboxTemplate {
+            image: "default-image:latest".to_string(),
+            ..SandboxTemplate::default()
+        };
+        assert!(!needs_supervisor_bootstrap(
+            &template,
+            "default-image:latest"
+        ));
+    }
+
+    #[test]
+    fn needs_supervisor_bootstrap_false_for_empty_image() {
+        let template = SandboxTemplate {
+            image: String::new(),
+            ..SandboxTemplate::default()
+        };
+        assert!(!needs_supervisor_bootstrap(
+            &template,
+            "default-image:latest"
+        ));
     }
 }
