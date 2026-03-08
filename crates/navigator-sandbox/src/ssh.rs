@@ -596,6 +596,25 @@ impl Default for PtyRequest {
     }
 }
 
+/// Derive the session USER and HOME from the policy's `run_as_user`.
+///
+/// Falls back to `("sandbox", "/sandbox")` when the policy has no explicit user,
+/// preserving backward compatibility with images that use the default layout.
+fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
+    match policy.process.run_as_user.as_deref() {
+        Some(user) if !user.is_empty() => {
+            // Look up the user's home directory from /etc/passwd.
+            let home = nix::unistd::User::from_name(user)
+                .ok()
+                .flatten()
+                .map(|u| u.dir.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("/home/{user}"));
+            (user.to_string(), home)
+        }
+        _ => ("sandbox".to_string(), "/sandbox".to_string()),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
@@ -651,13 +670,17 @@ fn spawn_pty_shell(
     // set in /sandbox/.bashrc by the Dockerfile and sourced via login shell.
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
+    // Derive USER and HOME from the policy's run_as_user when available,
+    // falling back to "sandbox" / "/sandbox" for backward compatibility.
+    let (session_user, session_home) = session_user_and_home(policy);
+
     cmd.env_clear()
         .stdin(stdin)
         .stdout(stdout)
         .stderr(stderr)
         .env("NEMOCLAW_SANDBOX", "1")
-        .env("HOME", "/sandbox")
-        .env("USER", "sandbox")
+        .env("HOME", &session_home)
+        .env("USER", &session_user)
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", term);
@@ -813,13 +836,15 @@ fn spawn_pipe_exec(
 
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
+    let (session_user, session_home) = session_user_and_home(policy);
+
     cmd.env_clear()
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .env("NEMOCLAW_SANDBOX", "1")
-        .env("HOME", "/sandbox")
-        .env("USER", "sandbox")
+        .env("HOME", &session_home)
+        .env("USER", &session_user)
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
         .env("TERM", "dumb");
