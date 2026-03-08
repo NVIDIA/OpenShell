@@ -34,6 +34,7 @@ spec:
       sshHandshakeSecret: __SSH_HANDSHAKE_SECRET__
       grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
       disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
+      disableTls: __DISABLE_TLS__
       tls:
         certSecretName: navigator-server-tls
         clientCaSecretName: navigator-server-client-ca

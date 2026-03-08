@@ -18,8 +18,8 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// TLS configuration (mTLS is always enforced).
-    pub tls: TlsConfig,
+    /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
+    pub tls: Option<TlsConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -99,8 +99,8 @@ pub struct TlsConfig {
 }
 
 impl Config {
-    /// Create a new config with the required TLS paths.
-    pub fn new(tls: TlsConfig) -> Self {
+    /// Create a new config with optional TLS.
+    pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
             bind_address: default_bind_address(),
             log_level: default_log_level(),

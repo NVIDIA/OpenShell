@@ -59,18 +59,25 @@ async fn ssh_session_config(
         .wrap_err("failed to resolve NemoClaw executable")?;
     let exe_command = shell_escape(&exe.to_string_lossy());
 
-    // If the server returned a loopback gateway address, override it with the
-    // cluster endpoint's host. This handles the case where the server defaults
-    // to 127.0.0.1 but the cluster is actually running on a remote host.
-    #[allow(clippy::cast_possible_truncation)]
-    let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-
-    let gateway_url = format!(
-        "{}://{}:{}{}",
-        session.gateway_scheme, gateway_host, gateway_port, session.connect_path
-    );
+    // When using Cloudflare bearer auth, the SSH CONNECT must go through the
+    // external tunnel endpoint (the cluster URL), not the server's internal
+    // scheme/host/port which may be plaintext HTTP on 127.0.0.1.
+    let gateway_url = if tls.is_bearer_auth() {
+        let base = server.trim_end_matches('/');
+        format!("{base}{}", session.connect_path)
+    } else {
+        // If the server returned a loopback gateway address, override it with the
+        // cluster endpoint's host. This handles the case where the server defaults
+        // to 127.0.0.1 but the cluster is actually running on a remote host.
+        #[allow(clippy::cast_possible_truncation)]
+        let gateway_port_u16 = session.gateway_port as u16;
+        let (gateway_host, gateway_port) =
+            resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
+        format!(
+            "{}://{}:{}{}",
+            session.gateway_scheme, gateway_host, gateway_port, session.connect_path
+        )
+    };
     let cluster_name = tls
         .cluster_name()
         .ok_or_else(|| miette::miette!("cluster name is required to build SSH proxy command"))?;
@@ -602,6 +609,24 @@ async fn connect_gateway(
     port: u16,
     tls: &TlsOptions,
 ) -> Result<Box<dyn ProxyStream>> {
+    // When using CF bearer auth, route through the WebSocket tunnel proxy
+    // regardless of the origin scheme. The proxy handles CF Access headers
+    // and TLS termination at the edge; the origin may be plaintext HTTP
+    // behind the tunnel.
+    if tls.is_bearer_auth() {
+        let token = tls
+            .cf_token
+            .as_deref()
+            .ok_or_else(|| miette::miette!("CF token required for tunnel"))?;
+        let gateway_url = format!("https://{host}:{port}");
+        let proxy = crate::cf_tunnel::start_tunnel_proxy(&gateway_url, token).await?;
+        let tcp = TcpStream::connect(proxy.local_addr)
+            .await
+            .into_diagnostic()?;
+        tcp.set_nodelay(true).into_diagnostic()?;
+        return Ok(Box::new(tcp));
+    }
+
     let tcp = TcpStream::connect((host, port)).await.into_diagnostic()?;
     tcp.set_nodelay(true).into_diagnostic()?;
     if scheme.eq_ignore_ascii_case("https") {

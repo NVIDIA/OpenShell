@@ -5,7 +5,9 @@
 //!
 //! This crate provides the CLI implementation for NemoClaw.
 
+pub mod auth;
 pub mod bootstrap;
+pub mod cf_tunnel;
 pub mod completers;
 pub mod run;
 pub mod ssh;

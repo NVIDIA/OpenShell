@@ -408,6 +408,14 @@ pub async fn ensure_container(
         env_vars.push(format!("IMAGE_TAG={tag}"));
     }
 
+    // Disable TLS: pass through to the entrypoint so the HelmChart manifest
+    // configures the server pod for plaintext HTTP.
+    if let Ok(val) = std::env::var("NEMOCLAW_DISABLE_TLS")
+        && val.trim().eq_ignore_ascii_case("true")
+    {
+        env_vars.push("DISABLE_TLS=true".to_string());
+    }
+
     // Disable gateway auth: pass through to the entrypoint so the HelmChart
     // manifest sets the flag on the server pod.
     if let Ok(val) = std::env::var("NEMOCLAW_DISABLE_GATEWAY_AUTH")

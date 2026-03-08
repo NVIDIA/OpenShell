@@ -16,11 +16,11 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
-    DeployOptions, RemoteOptions, clear_active_cluster, default_local_kubeconfig_path,
-    get_cluster_metadata, list_clusters, load_active_cluster, print_kubeconfig,
-    remove_cluster_metadata, save_active_cluster, save_last_sandbox, update_local_kubeconfig,
+    ClusterMetadata, DeployOptions, RemoteOptions, clear_active_cluster,
+    default_local_kubeconfig_path, get_cluster_metadata, list_clusters, load_active_cluster,
+    print_kubeconfig, remove_cluster_metadata, save_active_cluster, save_last_sandbox,
+    store_cluster_metadata, update_local_kubeconfig,
 };
-use navigator_core::proto::navigator_client::NavigatorClient;
 use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     GetClusterInferenceRequest, GetProviderRequest, GetSandboxLogsRequest,
@@ -38,7 +38,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use tonic::{Code, transport::Channel};
+use tonic::Code;
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::print_ssh_config;
@@ -582,6 +582,9 @@ pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) 
     println!();
     println!("  {} {}", "Cluster:".dimmed(), cluster_name);
     println!("  {} {}", "Server:".dimmed(), server);
+    if tls.is_bearer_auth() {
+        println!("  {} {}", "Auth:".dimmed(), "Cloudflare JWT");
+    }
 
     // Try to connect and get health
     match grpc_client(server, tls).await {
@@ -629,74 +632,6 @@ pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) 
     Ok(())
 }
 
-/// Display cluster status using Cloudflare JWT auth (no mTLS).
-///
-/// Same output as [`cluster_status`] but connects without a client certificate,
-/// instead injecting a `cf-authorization` header with the provided JWT.
-pub async fn cluster_status_bearer(
-    cluster_name: &str,
-    server: &str,
-    tls: &TlsOptions,
-    token: &str,
-) -> Result<()> {
-    println!("{}", "Server Status".cyan().bold());
-    println!();
-    println!("  {} {}", "Cluster:".dimmed(), cluster_name);
-    println!("  {} {}", "Server:".dimmed(), server);
-    println!("  {} {}", "Auth:".dimmed(), "Cloudflare JWT");
-
-    // Load CA cert — we still validate the server, just don't send a client cert.
-    let ca_pem = load_ca_for_bearer(cluster_name, tls)?;
-
-    match crate::tls::grpc_client_bearer(server, &ca_pem, token).await {
-        Ok(mut client) => match client.health(HealthRequest {}).await {
-            Ok(response) => {
-                let health = response.into_inner();
-                println!("  {} {}", "Status:".dimmed(), "Connected".green());
-                println!("  {} {}", "Version:".dimmed(), health.version);
-            }
-            Err(e) => {
-                println!("  {} {}", "Status:".dimmed(), "Error".red());
-                println!("  {} {}", "Error:".dimmed(), e);
-            }
-        },
-        Err(e) => {
-            println!("  {} {}", "Status:".dimmed(), "Disconnected".red());
-            println!("  {} {}", "Error:".dimmed(), e);
-        }
-    }
-
-    Ok(())
-}
-
-/// Load the CA certificate PEM for bearer-auth connections.
-///
-/// We still need the CA to verify the server's certificate even though we
-/// don't send a client cert.
-fn load_ca_for_bearer(cluster_name: &str, _tls: &TlsOptions) -> Result<Vec<u8>> {
-    // Try the standard cluster mtls directory
-    let config_dir = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.config")
-    });
-    let ca_path = PathBuf::from(config_dir)
-        .join("nemoclaw")
-        .join("clusters")
-        .join(cluster_name)
-        .join("mtls")
-        .join("ca.crt");
-    if ca_path.exists() {
-        return std::fs::read(&ca_path)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to read CA from {}", ca_path.display()));
-    }
-
-    Err(miette::miette!(
-        "No CA certificate found for cluster '{cluster_name}'.\n\
-         The CA is needed to verify the server even in Cloudflare JWT mode."
-    ))
-}
-
 /// Set the active cluster.
 pub fn cluster_use(name: &str) -> Result<()> {
     // Verify the cluster exists
@@ -710,6 +645,114 @@ pub fn cluster_use(name: &str) -> Result<()> {
 
     save_active_cluster(name)?;
     eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
+    Ok(())
+}
+
+/// Register an external Cloudflare-fronted gateway.
+///
+/// Creates local metadata for the given endpoint so it appears in
+/// `gateway select`. When `no_auth` is false, opens a browser for
+/// Cloudflare Access authentication and stores the JWT locally.
+pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> Result<()> {
+    // Normalise the endpoint: ensure it has a scheme.
+    let endpoint = if !endpoint.contains("://") {
+        format!("https://{endpoint}")
+    } else {
+        endpoint.to_string()
+    };
+
+    // Derive a gateway name from the hostname when none is provided.
+    let derived_name;
+    let name = match name {
+        Some(n) => n,
+        None => {
+            // Parse out just the host portion of the URL.
+            derived_name = url::Url::parse(&endpoint)
+                .ok()
+                .and_then(|u| u.host_str().map(String::from))
+                .unwrap_or_else(|| endpoint.clone());
+            &derived_name
+        }
+    };
+
+    // Build metadata for a Cloudflare-fronted remote gateway.
+    let metadata = ClusterMetadata {
+        name: name.to_string(),
+        gateway_endpoint: endpoint.clone(),
+        is_remote: true,
+        gateway_port: 0,
+        kube_port: None,
+        remote_host: None,
+        resolved_host: None,
+        auth_mode: Some("cloudflare_jwt".to_string()),
+        cf_team_domain: None,
+        cf_auth_url: None,
+    };
+
+    store_cluster_metadata(name, &metadata)?;
+    save_active_cluster(name)?;
+
+    if no_auth {
+        eprintln!(
+            "{} Gateway '{}' added and set as active",
+            "✓".green().bold(),
+            name,
+        );
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
+        eprintln!();
+        eprintln!("Authenticate with: {}", "nemoclaw gateway login".dimmed(),);
+        return Ok(());
+    }
+
+    // Run the browser-based auth flow.
+    eprintln!(
+        "{} Gateway '{}' added and set as active",
+        "✓".green().bold(),
+        name,
+    );
+    eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
+    eprintln!();
+
+    match crate::auth::browser_auth_flow(&endpoint).await {
+        Ok(token) => {
+            navigator_bootstrap::cf_token::store_cf_token(name, &token)?;
+            eprintln!("{} Authenticated successfully", "✓".green().bold(),);
+        }
+        Err(e) => {
+            eprintln!("{} Authentication skipped: {e}", "!".yellow(),);
+            eprintln!(
+                "  Authenticate later with: {}",
+                "nemoclaw gateway login".dimmed(),
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Re-authenticate with a Cloudflare-fronted gateway.
+///
+/// Opens a browser for CF Access login and stores the updated token.
+pub async fn gateway_login(name: &str) -> Result<()> {
+    let metadata = navigator_bootstrap::load_cluster_metadata(name).map_err(|_| {
+        miette::miette!(
+            "Unknown gateway '{name}'.\n\
+             List available gateways: nemoclaw gateway select"
+        )
+    })?;
+
+    if metadata.auth_mode.as_deref() != Some("cloudflare_jwt") {
+        return Err(miette::miette!(
+            "Gateway '{name}' does not use Cloudflare authentication.\n\
+             Only Cloudflare-fronted gateways support browser login."
+        ));
+    }
+
+    let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
+    navigator_bootstrap::cf_token::store_cf_token(name, &token)?;
+
+    eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold(),);
+
     Ok(())
 }
 
@@ -754,7 +797,11 @@ pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
     for cluster in &clusters {
         let is_active = active.as_deref() == Some(&cluster.name);
         let marker = if is_active { "*" } else { " " };
-        let cluster_type = if cluster.is_remote { "remote" } else { "local" };
+        let cluster_type = match cluster.auth_mode.as_deref() {
+            Some("cloudflare_jwt") => "cloudflare",
+            _ if cluster.is_remote => "remote",
+            _ => "local",
+        };
         let line = format!(
             "{marker} {:<name_width$}  {:<endpoint_width$}  {cluster_type}",
             cluster.name, cluster.gateway_endpoint,
@@ -772,17 +819,33 @@ pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
 async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<StatusCode>> {
     let base = server.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
-    let materials = require_tls_materials(server, tls)?;
-    let tls_config = build_rustls_config(&materials)?;
-    let https = HttpsConnectorBuilder::new()
-        .with_tls_config(tls_config)
-        .https_only()
-        .enable_http1()
-        .build();
+
+    let https = if tls.is_bearer_auth() || tls.disable_tls_verify {
+        // No client cert — use native/system roots for server verification.
+        HttpsConnectorBuilder::new()
+            .with_native_roots()
+            .into_diagnostic()?
+            .https_only()
+            .enable_http1()
+            .build()
+    } else {
+        let materials = require_tls_materials(server, tls)?;
+        let tls_config = build_rustls_config(&materials)?;
+        HttpsConnectorBuilder::new()
+            .with_tls_config(tls_config)
+            .https_only()
+            .enable_http1()
+            .build()
+    };
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
-    let req = Request::builder()
-        .method("GET")
-        .uri(uri)
+    let mut req_builder = Request::builder().method("GET").uri(uri);
+    // Inject Cloudflare Access headers when a CF token is configured.
+    if let Some(ref token) = tls.cf_token {
+        req_builder = req_builder
+            .header("Cf-Access-Jwt-Assertion", token.as_str())
+            .header("Cookie", format!("CF_Authorization={token}"));
+    }
+    let req = req_builder
         .body(Full::new(Bytes::new()))
         .into_diagnostic()?;
     let resp = client.request(req).await.into_diagnostic()?;
@@ -2052,7 +2115,7 @@ fn inferred_provider_type(command: &[String]) -> Option<String> {
 /// Returns a deduplicated list of provider **names** suitable for
 /// `SandboxSpec.providers`.
 pub async fn ensure_required_providers(
-    client: &mut NavigatorClient<Channel>,
+    client: &mut crate::tls::GrpcClient,
     explicit_names: &[String],
     inferred_types: &[String],
     auto_providers_override: Option<bool>,

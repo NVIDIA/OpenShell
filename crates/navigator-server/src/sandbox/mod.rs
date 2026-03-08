@@ -874,6 +874,7 @@ fn sandbox_template_to_k8s(
         ssh_listen_addr,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
+        !client_tls_secret_name.is_empty(),
     );
 
     container.insert("env".to_string(), serde_json::Value::Array(env));
@@ -1002,6 +1003,7 @@ fn inject_pod_template(
             ssh_handshake_secret,
             ssh_handshake_skew_secs,
             spec_environment,
+            !client_tls_secret_name.is_empty(),
         );
 
         // Inject TLS volumeMount on the agent container.
@@ -1045,6 +1047,7 @@ fn update_container_env(
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
+    tls_enabled: bool,
 ) {
     let Some(container_obj) = container.as_object_mut() else {
         return;
@@ -1063,6 +1066,7 @@ fn update_container_env(
         ssh_listen_addr,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
+        tls_enabled,
     );
     container_obj.insert("env".to_string(), serde_json::Value::Array(env));
 }
@@ -1078,6 +1082,7 @@ fn build_env_list(
     ssh_listen_addr: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
+    tls_enabled: bool,
 ) -> Vec<serde_json::Value> {
     let mut env = existing_env.cloned().unwrap_or_default();
     apply_env_map(&mut env, template_environment);
@@ -1090,6 +1095,7 @@ fn build_env_list(
         ssh_listen_addr,
         ssh_handshake_secret,
         ssh_handshake_skew_secs,
+        tls_enabled,
     );
     env
 }
@@ -1111,6 +1117,7 @@ fn apply_required_env(
     ssh_listen_addr: &str,
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
+    tls_enabled: bool,
 ) {
     upsert_env(env, "NEMOCLAW_SANDBOX_ID", sandbox_id);
     upsert_env(env, "NEMOCLAW_SANDBOX", sandbox_name);
@@ -1125,16 +1132,17 @@ fn apply_required_env(
         "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS",
         &ssh_handshake_skew_secs.to_string(),
     );
-    // TLS cert paths for sandbox-to-server mTLS. The actual secret is mounted
-    // as a volume; these env vars tell the sandbox gRPC client where to find
-    // the certs.
-    upsert_env(env, "NEMOCLAW_TLS_CA", "/etc/navigator-tls/client/ca.crt");
-    upsert_env(
-        env,
-        "NEMOCLAW_TLS_CERT",
-        "/etc/navigator-tls/client/tls.crt",
-    );
-    upsert_env(env, "NEMOCLAW_TLS_KEY", "/etc/navigator-tls/client/tls.key");
+    // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
+    // and the client TLS secret is mounted into the sandbox pod.
+    if tls_enabled {
+        upsert_env(env, "NEMOCLAW_TLS_CA", "/etc/navigator-tls/client/ca.crt");
+        upsert_env(
+            env,
+            "NEMOCLAW_TLS_CERT",
+            "/etc/navigator-tls/client/tls.crt",
+        );
+        upsert_env(env, "NEMOCLAW_TLS_KEY", "/etc/navigator-tls/client/tls.key");
+    }
 }
 
 fn upsert_env(env: &mut Vec<serde_json::Value>, name: &str, value: &str) {
@@ -1433,6 +1441,7 @@ mod tests {
             "0.0.0.0:2222",
             "my-secret-value",
             300,
+            true,
         );
 
         let secret_entry = env

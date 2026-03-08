@@ -9,9 +9,19 @@ use rustls::{
     pki_types::{CertificateDer, PrivateKeyDer},
 };
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::OnceCell;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tracing::debug;
+
+/// Concrete gRPC client type used by all commands.
+pub type GrpcClient = NavigatorClient<InterceptedService<Channel, CfAuthInterceptor>>;
+/// Concrete inference client type.
+pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, CfAuthInterceptor>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -20,6 +30,11 @@ pub struct TlsOptions {
     key: Option<PathBuf>,
     /// Cluster name for resolving default cert directory.
     cluster_name: Option<String>,
+    /// Skip server certificate verification (insecure; for Cloudflare tunnel).
+    pub disable_tls_verify: bool,
+    /// Cloudflare JWT token — when set, disables mTLS client certs and injects
+    /// a `cf-authorization` header on every gRPC request instead.
+    pub cf_token: Option<String>,
 }
 
 impl TlsOptions {
@@ -29,6 +44,8 @@ impl TlsOptions {
             cert,
             key,
             cluster_name: None,
+            disable_tls_verify: false,
+            cf_token: None,
         }
     }
 
@@ -45,10 +62,8 @@ impl TlsOptions {
     #[must_use]
     pub fn with_cluster_name(&self, name: &str) -> Self {
         Self {
-            ca: self.ca.clone(),
-            cert: self.cert.clone(),
-            key: self.key.clone(),
             cluster_name: Some(name.to_string()),
+            ..self.clone()
         }
     }
 
@@ -73,7 +88,13 @@ impl TlsOptions {
                 .clone()
                 .or_else(|| base.as_ref().map(|dir| dir.join("tls.key"))),
             cluster_name: self.cluster_name.clone(),
+            ..self.clone()
         }
+    }
+
+    /// Returns `true` when using Cloudflare token auth (no mTLS client certs).
+    pub fn is_bearer_auth(&self) -> bool {
+        self.cf_token.is_some()
     }
 }
 
@@ -207,58 +228,115 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
+/// Global tunnel proxy address.  Started once on the first
+/// `build_channel` call that uses CF bearer auth, then reused for all
+/// subsequent connections in the same process.
+static CF_TUNNEL_ADDR: OnceLock<OnceCell<SocketAddr>> = OnceLock::new();
+
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
+    // When CF bearer auth is active and the server is HTTPS (behind CF),
+    // route traffic through a local WebSocket tunnel proxy instead.
+    if tls.is_bearer_auth() && server.starts_with("https://") {
+        let cell = CF_TUNNEL_ADDR.get_or_init(OnceCell::new);
+        let local_addr = cell
+            .get_or_try_init(|| async {
+                let token = tls
+                    .cf_token
+                    .as_deref()
+                    .ok_or_else(|| miette::miette!("CF token required for tunnel"))?;
+                let proxy = crate::cf_tunnel::start_tunnel_proxy(server, token).await?;
+                debug!(
+                    local_addr = %proxy.local_addr,
+                    "CF tunnel proxy started, routing gRPC through local proxy"
+                );
+                Result::<SocketAddr>::Ok(proxy.local_addr)
+            })
+            .await?;
+
+        // Connect to the local tunnel proxy over plaintext HTTP/2.
+        let local_url = format!("http://{local_addr}");
+        let endpoint = Endpoint::from_shared(local_url)
+            .into_diagnostic()?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        return endpoint.connect().await.into_diagnostic();
+    }
+
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
-    let materials = require_tls_materials(server, tls)?;
-    let tls_config = build_tonic_tls_config(&materials);
+
+    let tls_config = if tls.is_bearer_auth() {
+        // Bearer mode without HTTPS (e.g. http:// direct) — no tunnel needed,
+        // but also no TLS config to set. This branch shouldn't normally happen
+        // (CF endpoints are always HTTPS) but handle gracefully.
+        return endpoint.connect().await.into_diagnostic();
+    } else if tls.disable_tls_verify {
+        // mTLS with verify disabled — unusual but supported.
+        let materials = require_tls_materials(server, tls)?;
+        let identity = Identity::from_pem(materials.cert.clone(), materials.key.clone());
+        ClientTlsConfig::new()
+            .with_native_roots()
+            .identity(identity)
+            .assume_http2(true)
+    } else {
+        // Standard mTLS: private CA + client cert.
+        let materials = require_tls_materials(server, tls)?;
+        build_tonic_tls_config(&materials)
+    };
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     endpoint.connect().await.into_diagnostic()
 }
 
-pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClient<Channel>> {
+/// Build a gRPC [`NavigatorClient`].
+///
+/// When `tls.cf_token` is set, the returned client is wrapped with an
+/// interceptor that injects the `cf-authorization` header on every request.
+/// Otherwise, standard mTLS is used (interceptor is a no-op).
+pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let channel = build_channel(server, tls).await?;
-    Ok(NavigatorClient::new(channel))
+    let interceptor = CfAuthInterceptor::maybe_from(tls)?;
+    Ok(NavigatorClient::with_interceptor(channel, interceptor))
 }
 
-/// Interceptor that injects a `cf-authorization` metadata header into every
-/// outgoing gRPC request.
+/// Interceptor that injects Cloudflare Access authentication headers into every
+/// outgoing gRPC request.  When no token is set, acts as a no-op.
+///
+/// Cloudflare Access recognises the JWT via:
+/// - `Cf-Access-Jwt-Assertion` header
+/// - `CF_Authorization` cookie
+/// We send both for maximum compatibility.
 #[derive(Clone)]
 pub struct CfAuthInterceptor {
-    token: tonic::metadata::MetadataValue<tonic::metadata::Ascii>,
+    header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
-/// Build a gRPC client using bearer-token auth (no mTLS).
-///
-/// Connects over TLS but does **not** present a client certificate.  Instead,
-/// every request carries a `cf-authorization` header with the supplied JWT.
-/// The server CA is still validated to prevent MitM.
-pub async fn grpc_client_bearer(
-    server: &str,
-    ca_pem: &[u8],
-    token: &str,
-) -> Result<
-    NavigatorClient<tonic::service::interceptor::InterceptedService<Channel, CfAuthInterceptor>>,
-> {
-    let ca_cert = Certificate::from_pem(ca_pem);
-    let tls_config = ClientTlsConfig::new().ca_certificate(ca_cert);
-    let endpoint = Endpoint::from_shared(server.to_string())
-        .into_diagnostic()?
-        .connect_timeout(Duration::from_secs(10))
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_while_idle(true)
-        .tls_config(tls_config)
-        .into_diagnostic()?;
-    let channel = endpoint.connect().await.into_diagnostic()?;
-    let interceptor = CfAuthInterceptor {
-        token: token
-            .parse()
-            .map_err(|_| miette::miette!("invalid cf-authorization token value"))?,
-    };
-    Ok(NavigatorClient::with_interceptor(channel, interceptor))
+impl CfAuthInterceptor {
+    /// Create an interceptor from [`TlsOptions`].  Returns a no-op interceptor
+    /// when no CF token is configured.
+    pub fn maybe_from(tls: &TlsOptions) -> Result<Self> {
+        let (header_value, cookie_value) = match tls.cf_token.as_deref() {
+            Some(t) => {
+                let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
+                    .parse()
+                    .map_err(|_| miette::miette!("invalid CF token value"))?;
+                let cv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+                    format!("CF_Authorization={t}")
+                        .parse()
+                        .map_err(|_| miette::miette!("invalid CF token value for cookie"))?;
+                (Some(hv), Some(cv))
+            }
+            None => (None, None),
+        };
+        Ok(Self {
+            header_value,
+            cookie_value,
+        })
+    }
 }
 
 impl tonic::service::Interceptor for CfAuthInterceptor {
@@ -266,24 +344,19 @@ impl tonic::service::Interceptor for CfAuthInterceptor {
         &mut self,
         mut req: tonic::Request<()>,
     ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
-        req.metadata_mut()
-            .insert("cf-authorization", self.token.clone());
+        if let Some(ref val) = self.header_value {
+            req.metadata_mut()
+                .insert("cf-access-jwt-assertion", val.clone());
+        }
+        if let Some(ref val) = self.cookie_value {
+            req.metadata_mut().insert("cookie", val.clone());
+        }
         Ok(req)
     }
 }
 
-pub async fn grpc_inference_client(
-    server: &str,
-    tls: &TlsOptions,
-) -> Result<InferenceClient<Channel>> {
-    let mut endpoint = Endpoint::from_shared(server.to_string())
-        .into_diagnostic()?
-        .connect_timeout(Duration::from_secs(10))
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
-    let materials = require_tls_materials(server, tls)?;
-    let tls_config = build_tonic_tls_config(&materials);
-    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    let channel = endpoint.connect().await.into_diagnostic()?;
-    Ok(InferenceClient::new(channel))
+pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
+    let channel = build_channel(server, tls).await?;
+    let interceptor = CfAuthInterceptor::maybe_from(tls)?;
+    Ok(InferenceClient::with_interceptor(channel, interceptor))
 }

@@ -25,17 +25,17 @@ struct Args {
     #[arg(long, default_value = "info", env = "NEMOCLAW_LOG_LEVEL")]
     log_level: String,
 
-    /// Path to TLS certificate file.
+    /// Path to TLS certificate file (required unless --disable-tls).
     #[arg(long, env = "NEMOCLAW_TLS_CERT")]
-    tls_cert: PathBuf,
+    tls_cert: Option<PathBuf>,
 
-    /// Path to TLS private key file.
+    /// Path to TLS private key file (required unless --disable-tls).
     #[arg(long, env = "NEMOCLAW_TLS_KEY")]
-    tls_key: PathBuf,
+    tls_key: Option<PathBuf>,
 
     /// Path to CA certificate for client certificate verification (mTLS).
     #[arg(long, env = "NEMOCLAW_TLS_CLIENT_CA")]
-    tls_client_ca: PathBuf,
+    tls_client_ca: Option<PathBuf>,
 
     /// Database URL for persistence.
     #[arg(long, env = "NEMOCLAW_DB_URL", required = true)]
@@ -86,10 +86,15 @@ struct Args {
     #[arg(long, env = "NEMOCLAW_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
 
+    /// Disable TLS entirely — listen on plaintext HTTP.
+    /// Use this when the gateway sits behind a reverse proxy or tunnel
+    /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
+    #[arg(long, env = "NEMOCLAW_DISABLE_TLS")]
+    disable_tls: bool,
+
     /// Disable gateway authentication (mTLS client certificate requirement).
     /// When set, the TLS handshake accepts connections without a client
-    /// certificate. Use this when the gateway sits behind a reverse proxy
-    /// (e.g. Cloudflare Tunnel) that terminates TLS.
+    /// certificate. Ignored when --disable-tls is set.
     #[arg(long, env = "NEMOCLAW_DISABLE_GATEWAY_AUTH")]
     disable_gateway_auth: bool,
 }
@@ -111,11 +116,28 @@ async fn main() -> Result<()> {
     // Build configuration
     let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
 
-    let tls = navigator_core::TlsConfig {
-        cert_path: args.tls_cert,
-        key_path: args.tls_key,
-        client_ca_path: args.tls_client_ca,
-        allow_unauthenticated: args.disable_gateway_auth,
+    let tls = if args.disable_tls {
+        None
+    } else {
+        let cert_path = args.tls_cert.ok_or_else(|| {
+            miette::miette!(
+                "--tls-cert is required when TLS is enabled (use --disable-tls to skip)"
+            )
+        })?;
+        let key_path = args.tls_key.ok_or_else(|| {
+            miette::miette!("--tls-key is required when TLS is enabled (use --disable-tls to skip)")
+        })?;
+        let client_ca_path = args.tls_client_ca.ok_or_else(|| {
+            miette::miette!(
+                "--tls-client-ca is required when TLS is enabled (use --disable-tls to skip)"
+            )
+        })?;
+        Some(navigator_core::TlsConfig {
+            cert_path,
+            key_path,
+            client_ca_path,
+            allow_unauthenticated: args.disable_gateway_auth,
+        })
     };
 
     let mut config = navigator_core::Config::new(tls)
@@ -147,7 +169,9 @@ async fn main() -> Result<()> {
         config = config.with_client_tls_secret_name(name);
     }
 
-    if args.disable_gateway_auth {
+    if args.disable_tls {
+        info!("TLS disabled — listening on plaintext HTTP");
+    } else if args.disable_gateway_auth {
         info!("Gateway auth disabled — accepting connections without client certificates");
     }
 

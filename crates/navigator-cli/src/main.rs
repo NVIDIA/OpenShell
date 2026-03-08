@@ -11,44 +11,47 @@ use owo_colors::OwoColorize;
 use std::io::Write;
 
 use navigator_bootstrap::{
-    load_active_cluster, load_cluster_metadata, load_last_sandbox, save_last_sandbox,
+    cf_token::load_cf_token, get_cluster_metadata, load_active_cluster, load_cluster_metadata,
+    load_last_sandbox, save_last_sandbox,
 };
 use navigator_cli::completers;
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;
 
-/// Auth mode for connecting to the gateway.
-#[derive(Debug, Clone)]
-enum AuthMode {
-    /// Standard mTLS using client certificates.
-    Mtls,
-    /// Cloudflare tunnel: no client cert, send `cf-authorization` JWT header.
-    CloudflareJwt {
-        /// The CF JWT token value.
-        token: String,
-    },
-}
-
-/// Resolved gateway context: name + endpoint.
+/// Resolved cluster context: name + gateway endpoint.
 struct GatewayContext {
-    /// The gateway name (used for TLS cert directory, metadata lookup, etc.).
+    /// The cluster name (used for TLS cert directory, metadata lookup, etc.).
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
-    /// How to authenticate to the gateway.
-    auth_mode: AuthMode,
 }
 
-/// Resolve the gateway name to a [`GatewayContext`] with the endpoint URL.
+/// Resolve the cluster name to a [`GatewayContext`] with the gateway endpoint.
 ///
 /// Resolution priority:
-/// 1. `--gateway` flag (explicit name)
-/// 2. `NEMOCLAW_CLUSTER` environment variable
-/// 3. Active gateway from `~/.config/nemoclaw/active_cluster`
+/// 1. `--gateway-endpoint` flag (direct URL, bypasses metadata lookup)
+/// 2. `--cluster` flag (explicit name)
+/// 3. `NEMOCLAW_CLUSTER` environment variable
+/// 4. Active cluster from `~/.config/nemoclaw/active_cluster`
 ///
-/// Once the name is determined, loads the gateway metadata to get the endpoint.
-fn resolve_gateway(gateway_flag: &Option<String>) -> Result<GatewayContext> {
-    let name = gateway_flag
+/// When `--gateway-endpoint` is provided, it is used directly as the endpoint
+/// without looking up cluster metadata.  This allows connecting to gateways
+/// behind reverse proxies (e.g. Cloudflare Tunnel) without a local cluster
+/// deployment.
+fn resolve_gateway(
+    cluster_flag: &Option<String>,
+    gateway_endpoint: &Option<String>,
+) -> Result<GatewayContext> {
+    // Direct endpoint URL — skip metadata lookup entirely.
+    if let Some(endpoint) = gateway_endpoint {
+        let name = cluster_flag.clone().unwrap_or_else(|| endpoint.clone());
+        return Ok(GatewayContext {
+            name,
+            endpoint: endpoint.clone(),
+        });
+    }
+
+    let name = cluster_flag
         .clone()
         .or_else(|| {
             std::env::var("NEMOCLAW_CLUSTER")
@@ -72,27 +75,18 @@ fn resolve_gateway(gateway_flag: &Option<String>) -> Result<GatewayContext> {
         )
     })?;
 
-    let auth_mode = if metadata.auth_mode.as_deref() == Some("cloudflare_jwt") {
-        // Try loading the token from: file, env var, or prompt.
-        let token = load_cf_token(&metadata.name)?;
-        AuthMode::CloudflareJwt { token }
-    } else {
-        AuthMode::Mtls
-    };
-
     Ok(GatewayContext {
         name: metadata.name,
         endpoint: metadata.gateway_endpoint,
-        auth_mode,
     })
 }
 
-/// Resolve only the gateway name (without requiring metadata to exist).
+/// Resolve only the cluster name (without requiring metadata to exist).
 ///
-/// Used by gateway commands that operate by name but may not need
-/// the endpoint (e.g., `gateway start` creates the gateway).
-fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
-    gateway_flag
+/// Used by gateway commands that operate on a cluster by name but may not need
+/// the gateway endpoint (e.g., `gateway start` creates the cluster).
+fn resolve_gateway_name(cluster_flag: &Option<String>) -> Option<String> {
+    cluster_flag
         .clone()
         .or_else(|| {
             std::env::var("NEMOCLAW_CLUSTER")
@@ -100,6 +94,27 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
                 .filter(|v| !v.trim().is_empty())
         })
         .or_else(load_active_cluster)
+}
+
+/// Apply Cloudflare Access token from local storage when the cluster uses CF auth.
+///
+/// When the resolved cluster has `auth_mode == "cloudflare_jwt"`, loads the
+/// stored CF token from disk and sets it on the `TlsOptions`. This makes
+/// `--cf-token` and `--disable-tls-verify` unnecessary for daily use.
+///
+/// An explicit `--cf-token` flag takes precedence over the stored token.
+fn apply_cf_auth(tls: &mut TlsOptions, cluster_name: &str) {
+    if tls.cf_token.is_some() {
+        return; // Explicit --cf-token takes precedence.
+    }
+    if let Some(meta) = get_cluster_metadata(cluster_name) {
+        if meta.auth_mode.as_deref() == Some("cloudflare_jwt") {
+            if let Some(token) = load_cf_token(cluster_name) {
+                tls.cf_token = Some(token);
+                tls.disable_tls_verify = true;
+            }
+        }
+    }
 }
 
 /// Resolve a sandbox name, falling back to the last-used sandbox for the cluster.
@@ -121,50 +136,6 @@ fn resolve_sandbox_name(name: Option<String>, cluster: &str) -> Result<String> {
     Ok(last)
 }
 
-/// Load the Cloudflare JWT token for a cluster.
-///
-/// Resolution priority:
-/// 1. `NEMOCLAW_CF_TOKEN` environment variable
-/// 2. Token file at `~/.config/nemoclaw/clusters/<name>/cf_token`
-fn load_cf_token(cluster_name: &str) -> Result<String> {
-    // 1. Environment variable
-    if let Ok(token) = std::env::var("NEMOCLAW_CF_TOKEN") {
-        let token = token.trim().to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    // 2. Token file
-    let config_dir = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-        let home = std::env::var("HOME").unwrap_or_default();
-        format!("{home}/.config")
-    });
-    let token_path = std::path::PathBuf::from(config_dir)
-        .join("nemoclaw")
-        .join("clusters")
-        .join(cluster_name)
-        .join("cf_token");
-
-    if token_path.exists() {
-        let token = std::fs::read_to_string(&token_path)
-            .map_err(|e| {
-                miette::miette!("failed to read CF token from {}: {e}", token_path.display())
-            })?
-            .trim()
-            .to_string();
-        if !token.is_empty() {
-            return Ok(token);
-        }
-    }
-
-    Err(miette::miette!(
-        "No Cloudflare token found for cluster '{cluster_name}'.\n\
-         Set NEMOCLAW_CF_TOKEN or write the token to:\n  {}",
-        token_path.display()
-    ))
-}
-
 /// NemoClaw CLI - agent execution and management.
 #[derive(Parser, Debug)]
 #[command(name = "nemoclaw")]
@@ -175,9 +146,22 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Gateway name to operate on (resolved from stored metadata).
-    #[arg(long, short = 'g', global = true, env = "NEMOCLAW_CLUSTER")]
-    gateway: Option<String>,
+    /// Cluster name to operate on (resolved from stored metadata).
+    #[arg(long, short, global = true, env = "NEMOCLAW_CLUSTER")]
+    cluster: Option<String>,
+
+    /// Gateway endpoint URL (e.g. https://gateway.example.com).
+    /// Connects directly without looking up cluster metadata.
+    #[arg(long, global = true, env = "NEMOCLAW_GATEWAY_ENDPOINT")]
+    gateway_endpoint: Option<String>,
+
+    /// Skip TLS server certificate verification (insecure; for Cloudflare tunnel testing).
+    #[arg(long, global = true, env = "NEMOCLAW_DISABLE_TLS_VERIFY")]
+    disable_tls_verify: bool,
+
+    /// Cloudflare JWT token for gateway auth (disables mTLS client certs).
+    #[arg(long, global = true, env = "NEMOCLAW_CF_TOKEN")]
+    cf_token: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -266,15 +250,15 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `nemoclaw ssh-proxy --gateway-endpoint <url> --sandbox-id <id> --token <token>`
+    ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `nemoclaw ssh-proxy --gateway <name> --name <sandbox-name>`
+    ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
     SshProxy {
-        /// Gateway endpoint URL (e.g., <https://gw.example.com:443/proxy/connect>).
+        /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
         #[arg(long)]
-        gateway_endpoint: Option<String>,
+        gateway: Option<String>,
 
         /// Sandbox id. Required in token mode.
         #[arg(long)]
@@ -284,13 +268,13 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
 
-        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
+        /// Cluster endpoint URL. Used in name mode. Deprecated: prefer --cluster.
         #[arg(long)]
         server: Option<String>,
 
-        /// Gateway name (resolves endpoint from stored metadata). Used in name mode.
-        #[arg(long)]
-        gateway: Option<String>,
+        /// Cluster name (resolves endpoint from stored metadata). Used in name mode.
+        #[arg(long, short)]
+        cluster: Option<String>,
 
         /// Sandbox name. Used in name mode.
         #[arg(long)]
@@ -495,9 +479,9 @@ enum ProviderCommands {
 enum GatewayCommands {
     /// Deploy/start the gateway.
     Start {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long)]
-        name: Option<String>,
+        /// Gateway name.
+        #[arg(long, default_value = "nemoclaw")]
+        name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
         #[arg(long)]
@@ -571,6 +555,35 @@ enum GatewayCommands {
         /// Path to SSH private key for remote cluster.
         #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
+    },
+
+    /// Add a Cloudflare-fronted gateway.
+    ///
+    /// Registers an external gateway endpoint that is fronted by Cloudflare
+    /// Access. Opens a browser for authentication and stores the token
+    /// locally. After adding, the gateway appears in `nemoclaw gateway select`.
+    Add {
+        /// Gateway endpoint URL (e.g., `https://8080-3vdegyusg.brevlab.com`).
+        endpoint: String,
+
+        /// Gateway name (auto-derived from the endpoint hostname when omitted).
+        #[arg(long)]
+        name: Option<String>,
+
+        /// Skip browser authentication (authenticate later with `gateway login`).
+        #[arg(long)]
+        no_auth: bool,
+    },
+
+    /// Authenticate with a Cloudflare-fronted gateway.
+    ///
+    /// Opens a browser for Cloudflare Access login and stores the token
+    /// locally. Use this to re-authenticate when a token expires or to
+    /// authenticate a gateway added with `--no-auth`.
+    Login {
+        /// Gateway name (defaults to the active gateway).
+        #[arg(add = ArgValueCompleter::new(completers::complete_cluster_names))]
+        name: Option<String>,
     },
 
     /// Select the active gateway.
@@ -713,7 +726,7 @@ enum SandboxCommands {
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
         /// Community names are resolved to
-        /// `d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes/<name>:latest`
+        /// `ghcr.io/nvidia/nemoclaw-community/sandboxes/<name>:latest`
         /// (override the prefix with `NEMOCLAW_COMMUNITY_REGISTRY`).
         ///
         /// When given a Dockerfile or directory, the image is built and pushed
@@ -970,7 +983,9 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
-    let tls = TlsOptions::default();
+    let mut tls = TlsOptions::default();
+    tls.disable_tls_verify = cli.disable_tls_verify;
+    tls.cf_token = cli.cf_token.clone();
 
     // Set up logging based on verbosity
     let log_level = match cli.verbose {
@@ -1003,9 +1018,6 @@ async fn main() -> Result<()> {
                 kube_port,
                 recreate,
             } => {
-                let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
-                    .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_deploy(
                     &name,
                     update_kube_config,
@@ -1025,7 +1037,7 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.cluster))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
@@ -1035,16 +1047,35 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.cluster))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
+            }
+            GatewayCommands::Add {
+                endpoint,
+                name,
+                no_auth,
+            } => {
+                run::gateway_add(&endpoint, name.as_deref(), no_auth).await?;
+            }
+            GatewayCommands::Login { name } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.cluster))
+                    .ok_or_else(|| {
+                        miette::miette!(
+                            "No active gateway.\n\
+                             Specify a gateway name: nemoclaw gateway login <name>\n\
+                             Or set one with: nemoclaw gateway select <name>"
+                        )
+                    })?;
+                run::gateway_login(&name).await?;
             }
             GatewayCommands::Select { name } => {
                 if let Some(name) = name {
                     run::cluster_use(&name)?;
                 } else {
                     // No name provided — show available gateways.
-                    run::cluster_list(&cli.gateway)?;
+                    run::cluster_list(&cli.cluster)?;
                     eprintln!();
                     eprintln!(
                         "Select a gateway with: {}",
@@ -1054,7 +1085,7 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Info { name } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.cluster))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_info(&name)?;
             }
@@ -1065,7 +1096,7 @@ async fn main() -> Result<()> {
                 print_command,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.cluster))
                     .unwrap_or_else(|| "nemoclaw".to_string());
                 run::cluster_admin_tunnel(
                     &name,
@@ -1080,16 +1111,10 @@ async fn main() -> Result<()> {
         // Top-level status (was `cluster status`)
         // -----------------------------------------------------------
         Some(Commands::Status) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway) {
-                let tls = tls.with_cluster_name(&ctx.name);
-                match &ctx.auth_mode {
-                    AuthMode::Mtls => {
-                        run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
-                    }
-                    AuthMode::CloudflareJwt { token } => {
-                        run::cluster_status_bearer(&ctx.name, &ctx.endpoint, &tls, token).await?;
-                    }
-                }
+            if let Ok(ctx) = resolve_gateway(&cli.cluster, &cli.gateway_endpoint) {
+                let mut tls = tls.with_cluster_name(&ctx.name);
+                apply_cf_auth(&mut tls, &ctx.name);
+                run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -1107,7 +1132,7 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         Some(Commands::Forward { command: fwd_cmd }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
-                let cluster_name = resolve_gateway_name(&cli.gateway).unwrap_or_default();
+                let cluster_name = resolve_gateway_name(&cli.cluster).unwrap_or_default();
                 let name = resolve_sandbox_name(name, &cluster_name)?;
                 if run::stop_forward(&name, port)? {
                     eprintln!(
@@ -1161,8 +1186,9 @@ async fn main() -> Result<()> {
                 name,
                 background,
             } => {
-                let ctx = resolve_gateway(&cli.gateway)?;
-                let tls = tls.with_cluster_name(&ctx.name);
+                let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_cluster_name(&ctx.name);
+                apply_cf_auth(&mut tls, &ctx.name);
                 let name = resolve_sandbox_name(name, &ctx.name)?;
                 run::sandbox_forward(&ctx.endpoint, &name, port, background, &tls).await?;
                 if background {
@@ -1187,8 +1213,9 @@ async fn main() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_gateway(&cli.gateway)?;
-            let tls = tls.with_cluster_name(&ctx.name);
+            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_cluster_name(&ctx.name);
+            apply_cf_auth(&mut tls, &ctx.name);
             let name = resolve_sandbox_name(name, &ctx.name)?;
             run::sandbox_logs(
                 &ctx.endpoint,
@@ -1209,8 +1236,9 @@ async fn main() -> Result<()> {
         Some(Commands::Policy {
             command: policy_cmd,
         }) => {
-            let ctx = resolve_gateway(&cli.gateway)?;
-            let tls = tls.with_cluster_name(&ctx.name);
+            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_cluster_name(&ctx.name);
+            apply_cf_auth(&mut tls, &ctx.name);
             match policy_cmd {
                 PolicyCommands::Set {
                     name,
@@ -1237,9 +1265,10 @@ async fn main() -> Result<()> {
         // Inference commands
         // -----------------------------------------------------------
         Some(Commands::Inference { command }) => {
-            let ctx = resolve_gateway(&cli.gateway)?;
+            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
-            let tls = tls.with_cluster_name(&ctx.name);
+            let mut tls = tls.with_cluster_name(&ctx.name);
+            apply_cf_auth(&mut tls, &ctx.name);
             match command {
                 ClusterInferenceCommands::Set { provider, model } => {
                     run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
@@ -1318,7 +1347,7 @@ async fn main() -> Result<()> {
 
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
-                    match resolve_gateway(&cli.gateway) {
+                    match resolve_gateway(&cli.cluster, &cli.gateway_endpoint) {
                         Ok(ctx) => {
                             if remote.is_some() {
                                 eprintln!(
@@ -1330,7 +1359,8 @@ async fn main() -> Result<()> {
                                 return Ok(());
                             }
                             let endpoint = &ctx.endpoint;
-                            let tls = tls.with_cluster_name(&ctx.name);
+                            let mut tls = tls.with_cluster_name(&ctx.name);
+                            apply_cf_auth(&mut tls, &ctx.name);
                             Box::pin(run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
@@ -1378,8 +1408,9 @@ async fn main() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway)?;
-                    let tls = tls.with_cluster_name(&ctx.name);
+                    let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+                    let mut tls = tls.with_cluster_name(&ctx.name);
+                    apply_cf_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
                     let local = std::path::Path::new(&local_path);
                     if !local.exists() {
@@ -1389,7 +1420,9 @@ async fn main() -> Result<()> {
                         ));
                     }
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), sandbox_dest);
-                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
+                    if !no_git_ignore
+                        && let Ok((base_dir, files)) = run::git_sync_files(local)
+                    {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
                             &name,
@@ -1411,8 +1444,9 @@ async fn main() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway)?;
-                    let tls = tls.with_cluster_name(&ctx.name);
+                    let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+                    let mut tls = tls.with_cluster_name(&ctx.name);
+                    apply_cf_auth(&mut tls, &ctx.name);
                     let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
                     eprintln!(
                         "Downloading sandbox:{} -> {}",
@@ -1424,9 +1458,10 @@ async fn main() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_gateway(&cli.gateway)?;
+                    let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
-                    let tls = tls.with_cluster_name(&ctx.name);
+                    let mut tls = tls.with_cluster_name(&ctx.name);
+                    apply_cf_auth(&mut tls, &ctx.name);
                     match other {
                         SandboxCommands::Create { .. }
                         | SandboxCommands::Upload { .. }
@@ -1462,9 +1497,10 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Provider { command }) => {
-            let ctx = resolve_gateway(&cli.gateway)?;
+            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
-            let tls = tls.with_cluster_name(&ctx.name);
+            let mut tls = tls.with_cluster_name(&ctx.name);
+            apply_cf_auth(&mut tls, &ctx.name);
 
             match command {
                 ProviderCommands::Create {
@@ -1519,8 +1555,9 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Term) => {
-            let ctx = resolve_gateway(&cli.gateway)?;
-            let tls = tls.with_cluster_name(&ctx.name);
+            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_cluster_name(&ctx.name);
+            apply_cf_auth(&mut tls, &ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
         }
@@ -1536,23 +1573,26 @@ async fn main() -> Result<()> {
                 .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
         }
         Some(Commands::SshProxy {
-            gateway_endpoint,
+            gateway,
             sandbox_id,
             token,
             server,
-            gateway,
+            cluster,
             name,
         }) => {
-            match (gateway_endpoint, sandbox_id, token, server, gateway, name) {
+            match (gateway, sandbox_id, token, server, cluster, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, gw_name_opt, _) => {
-                    let effective_tls = match gw_name_opt {
+                (Some(gw), Some(sid), Some(tok), _, cluster_opt, _) => {
+                    let mut effective_tls = match cluster_opt {
                         Some(ref c) => tls.with_cluster_name(c),
                         None => tls,
                     };
+                    if let Some(ref c) = cluster_opt {
+                        apply_cf_auth(&mut effective_tls, c);
+                    }
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
-                // Name mode with --gateway: resolve endpoint from metadata.
+                // Name mode with --cluster: resolve endpoint from metadata.
                 (_, _, _, server_override, Some(c), Some(n)) => {
                     let endpoint = if let Some(srv) = server_override {
                         srv
@@ -1566,16 +1606,17 @@ async fn main() -> Result<()> {
                         })?;
                         meta.gateway_endpoint
                     };
-                    let tls = tls.with_cluster_name(&c);
+                    let mut tls = tls.with_cluster_name(&c);
+                    apply_cf_auth(&mut tls, &c);
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
                 }
-                // Legacy name mode with --server only (no --gateway).
+                // Legacy name mode with --server only (no --cluster).
                 (_, _, _, Some(srv), None, Some(n)) => {
                     run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway-endpoint/--sandbox-id/--token or --gateway/--name (or --server/--name)"
+                        "provide either --gateway/--sandbox-id/--token or --cluster/--name (or --server/--name)"
                     ));
                 }
             }
@@ -1617,9 +1658,10 @@ async fn main() -> Result<()> {
                 }
             },
             ClusterCommands::Inference { command } => {
-                let ctx = resolve_gateway(&cli.gateway)?;
+                let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
                 let endpoint = &ctx.endpoint;
-                let tls = tls.with_cluster_name(&ctx.name);
+                let mut tls = tls.with_cluster_name(&ctx.name);
+                apply_cf_auth(&mut tls, &ctx.name);
                 match command {
                     ClusterInferenceCommands::Set { provider, model } => {
                         run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;

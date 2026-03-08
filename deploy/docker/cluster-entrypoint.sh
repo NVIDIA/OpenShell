@@ -319,6 +319,17 @@ if [ -f "$HELMCHART" ]; then
     else
         sed -i "s|__DISABLE_GATEWAY_AUTH__|false|g" "$HELMCHART"
     fi
+
+    # Disable TLS entirely: the server listens on plaintext HTTP.
+    # Used when a reverse proxy / tunnel terminates TLS at the edge.
+    if [ "${DISABLE_TLS:-}" = "true" ]; then
+        echo "Disabling TLS (plaintext HTTP)"
+        sed -i "s|__DISABLE_TLS__|true|g" "$HELMCHART"
+        # The Helm template automatically rewrites https:// to http:// in
+        # NEMOCLAW_GRPC_ENDPOINT when disableTls is true, so no sed needed here.
+    else
+        sed -i "s|__DISABLE_TLS__|false|g" "$HELMCHART"
+    fi
 fi
 
 # Inject chart checksum into the HelmChart manifest so that a changed chart
