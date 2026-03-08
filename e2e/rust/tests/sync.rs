@@ -287,3 +287,60 @@ async fn upload_respects_gitignore_by_default() {
     // ---------------------------------------------------------------
     guard.cleanup().await;
 }
+
+/// Verify that uploading a single tracked file from inside a git repo does not
+/// expand to the entire repository.
+#[tokio::test]
+async fn upload_single_file_from_git_repo_only_uploads_that_file() {
+    let mut guard = SandboxGuard::create_keep(&["sleep", "infinity"], "Ready")
+        .await
+        .expect("sandbox create --keep");
+
+    let tmpdir = tempfile::tempdir().expect("create tmpdir");
+    let repo = tmpdir.path().join("repo");
+    fs::create_dir_all(repo.join("nested")).expect("create repo dir");
+
+    let git_init = tokio::process::Command::new("git")
+        .args(["init"])
+        .current_dir(&repo)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .await
+        .expect("git init");
+    assert!(git_init.success(), "git init should succeed");
+
+    fs::write(repo.join(".gitignore"), "*.log\n").expect("write .gitignore");
+    fs::write(repo.join("nested/config.txt"), "single-file-from-repo").expect("write config.txt");
+    fs::write(repo.join("tracked.txt"), "should-not-upload").expect("write tracked.txt");
+    fs::write(repo.join("ignored.log"), "ignored").expect("write ignored.log");
+
+    let local_path = repo.join("nested/config.txt");
+    let local_str = local_path.to_str().expect("local path is UTF-8");
+    guard
+        .upload_with_gitignore(local_str, "/sandbox/single-file", &repo)
+        .await
+        .expect("upload single tracked file with gitignore");
+
+    let download_dir = tmpdir.path().join("single-file-download");
+    fs::create_dir_all(&download_dir).expect("create download dir");
+    let download_str = download_dir.to_str().expect("download path is UTF-8");
+
+    guard
+        .download("/sandbox/single-file", download_str)
+        .await
+        .expect("download uploaded single file");
+
+    let uploaded = fs::read_to_string(download_dir.join("config.txt")).expect("read config.txt");
+    assert_eq!(uploaded, "single-file-from-repo");
+    assert!(
+        !download_dir.join("tracked.txt").exists(),
+        "tracked.txt should not have been uploaded"
+    );
+    assert!(
+        !download_dir.join("ignored.log").exists(),
+        "ignored.log should not have been uploaded"
+    );
+
+    guard.cleanup().await;
+}

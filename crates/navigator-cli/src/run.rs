@@ -1268,15 +1268,11 @@ pub async fn sandbox_create(
             if let Some((local_path, sandbox_path, git_ignore)) = upload {
                 let dest = sandbox_path.as_deref().unwrap_or("/sandbox");
                 let local = Path::new(local_path);
-                if *git_ignore
-                    && let Ok(repo_root) = git_repo_root()
-                    && let Ok(files) = git_sync_files(&repo_root)
-                    && !files.is_empty()
-                {
+                if *git_ignore && let Ok((base_dir, files)) = git_sync_files(local) {
                     sandbox_sync_up_files(
                         &effective_server,
                         &sandbox_name,
-                        &repo_root,
+                        &base_dir,
                         &files,
                         dest,
                         &effective_tls,
@@ -2352,9 +2348,17 @@ pub async fn cluster_inference_get(server: &str, tls: &TlsOptions) -> Result<()>
     Ok(())
 }
 
-pub fn git_repo_root() -> Result<PathBuf> {
+pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {
+    let git_dir = if local_path.is_dir() {
+        local_path
+    } else {
+        local_path
+            .parent()
+            .ok_or_else(|| miette::miette!("path has no parent: {}", local_path.display()))?
+    };
     let output = Command::new("git")
         .args(["rev-parse", "--show-toplevel"])
+        .current_dir(git_dir)
         .output()
         .into_diagnostic()
         .wrap_err("failed to run git rev-parse")?;
@@ -2376,10 +2380,51 @@ pub fn git_repo_root() -> Result<PathBuf> {
     Ok(PathBuf::from(root))
 }
 
-pub fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
+pub fn git_sync_files(local_path: &Path) -> Result<(PathBuf, Vec<String>)> {
+    let repo_root = std::fs::canonicalize(git_repo_root(local_path)?)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize git repository root")?;
+    let local_path = if local_path.is_absolute() {
+        local_path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .into_diagnostic()
+            .wrap_err("failed to resolve current directory")?
+            .join(local_path)
+    };
+    let local_path = std::fs::canonicalize(local_path)
+        .into_diagnostic()
+        .wrap_err("failed to canonicalize local upload path")?;
+    let relative_path = local_path
+        .strip_prefix(&repo_root)
+        .into_diagnostic()
+        .wrap_err_with(|| {
+            format!(
+                "local path '{}' is not inside git repository '{}'",
+                local_path.display(),
+                repo_root.display()
+            )
+        })?;
+
+    let is_file = local_path.is_file();
+    let base_dir = if is_file {
+        local_path
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| miette::miette!("path has no parent: {}", local_path.display()))?
+    } else {
+        local_path.clone()
+    };
+    let pathspec = if relative_path.as_os_str().is_empty() {
+        None
+    } else {
+        Some(relative_path.to_string_lossy().into_owned())
+    };
+
     let output = Command::new("git")
         .args(["ls-files", "-co", "--exclude-standard", "-z"])
-        .current_dir(repo_root)
+        .args(pathspec.as_deref())
+        .current_dir(&repo_root)
         .output()
         .into_diagnostic()
         .wrap_err("failed to run git ls-files")?;
@@ -2396,11 +2441,29 @@ pub fn git_sync_files(repo_root: &Path) -> Result<Vec<String>> {
         if entry.is_empty() {
             continue;
         }
-        let path = String::from_utf8_lossy(entry).to_string();
-        files.push(path);
+        let repo_relative = Path::new(std::str::from_utf8(entry).into_diagnostic()?);
+        let path = if is_file {
+            repo_relative
+                .file_name()
+                .map(PathBuf::from)
+                .ok_or_else(|| {
+                    miette::miette!("path has no file name: {}", repo_relative.display())
+                })?
+        } else if relative_path.as_os_str().is_empty() {
+            repo_relative.to_path_buf()
+        } else {
+            repo_relative
+                .strip_prefix(relative_path)
+                .into_diagnostic()?
+                .to_path_buf()
+        };
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        files.push(path.to_string_lossy().into_owned());
     }
 
-    Ok(files)
+    Ok((base_dir, files))
 }
 
 // ---------------------------------------------------------------------------
@@ -2787,7 +2850,10 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 
 #[cfg(test)]
 mod tests {
-    use super::{inferred_provider_type, parse_credential_pairs};
+    use super::{git_sync_files, inferred_provider_type, parse_credential_pairs};
+    use std::fs;
+    use std::path::Path;
+    use std::process::Command;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -2901,5 +2967,55 @@ mod tests {
     fn inferred_provider_type_handles_full_path() {
         let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
         assert_eq!(result, Some("claude".to_string()));
+    }
+
+    fn init_git_repo(path: &Path) {
+        let status = Command::new("git")
+            .args(["init"])
+            .current_dir(path)
+            .status()
+            .expect("git init");
+        assert!(status.success(), "git init should succeed");
+    }
+
+    #[test]
+    fn git_sync_files_scopes_single_file_to_requested_path() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("nested")).expect("create repo");
+        init_git_repo(&repo);
+
+        fs::write(repo.join("tracked.txt"), "tracked").expect("write tracked.txt");
+        fs::write(repo.join("nested/other.txt"), "other").expect("write other.txt");
+
+        let result = git_sync_files(&repo.join("tracked.txt"));
+        let (base_dir, files) = result.expect("git_sync_files should succeed");
+        assert_eq!(
+            base_dir,
+            fs::canonicalize(&repo).expect("canonicalize repo path")
+        );
+        assert_eq!(files, vec!["tracked.txt"]);
+    }
+
+    #[test]
+    fn git_sync_files_scopes_directory_to_requested_subtree() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        let repo = tmpdir.path().join("repo");
+        fs::create_dir_all(repo.join("nested/inner")).expect("create repo");
+        init_git_repo(&repo);
+
+        fs::write(repo.join("nested/file.txt"), "file").expect("write file.txt");
+        fs::write(repo.join("nested/inner/child.txt"), "child").expect("write child.txt");
+        fs::write(repo.join("top.txt"), "top").expect("write top.txt");
+
+        let result = git_sync_files(&repo.join("nested"));
+        let (base_dir, mut files) = result.expect("git_sync_files should succeed");
+        files.sort();
+
+        assert_eq!(
+            base_dir,
+            fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
+        );
+        assert_eq!(files, vec!["file.txt", "inner/child.txt"]);
     }
 }
