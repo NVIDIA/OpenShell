@@ -9,13 +9,13 @@ Quick-reference for the `nemoclaw` command-line interface. For workflow guidance
 | Flag | Description |
 |------|-------------|
 | `-v`, `--verbose` | Increase verbosity (`-v` = info, `-vv` = debug, `-vvv` = trace) |
-| `-c`, `--gateway <NAME>` | Gateway to operate on. Also settable via `NEMOCLAW_CLUSTER` env var. Falls back to active gateway in `~/.config/nemoclaw/active_cluster`. |
+| `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `NEMOCLAW_CLUSTER` env var. Falls back to active gateway in `~/.config/nemoclaw/active_cluster`. |
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `NEMOCLAW_CLUSTER` | Override active cluster name (same as `--cluster`) |
+| `NEMOCLAW_CLUSTER` | Override active gateway name (same as `--gateway`) |
 | `NEMOCLAW_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
 
 ---

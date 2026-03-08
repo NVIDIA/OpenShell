@@ -1277,7 +1277,7 @@ async fn start_port_forwards(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let cluster = shell_escape(cluster_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --cluster {cluster}",
+        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway {cluster}",
         session.sandbox_id, session.token,
     );
 

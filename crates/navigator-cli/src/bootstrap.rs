@@ -116,7 +116,7 @@ pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
 
     let confirmed = Confirm::new()
         .with_prompt(format!(
-            "{} No cluster available to launch sandbox in. Create one now?",
+            "{} No gateway available to launch sandbox in. Create one now?",
             "!".yellow()
         ))
         .default(true)

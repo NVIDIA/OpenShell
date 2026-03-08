@@ -38,7 +38,7 @@ Host nemoclaw-my-sandbox
     UserKnownHostsFile /dev/null
     GlobalKnownHostsFile /dev/null
     LogLevel ERROR
-    ProxyCommand nemoclaw ssh-proxy --cluster <cluster-name> --name my-sandbox
+    ProxyCommand nemoclaw ssh-proxy --gateway <gateway-name> --name my-sandbox
 ```
 
 ### 3. Open VSCode

@@ -123,14 +123,11 @@ pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> 
 }
 
 pub async fn ensure_network(docker: &Docker) -> Result<()> {
-    match docker
-        .inspect_network(NETWORK_NAME, None::<InspectNetworkOptions>)
-        .await
-    {
-        Ok(_) => return Ok(()),
-        Err(err) if is_not_found(&err) => {}
-        Err(err) => return Err(err).into_diagnostic(),
-    }
+    // Always remove and recreate the network to guarantee a clean state.
+    // Stale Docker networks (e.g., from a previous interrupted destroy or
+    // Docker Desktop restart) can leave broken routing that causes the
+    // container to fail with "no default routes found".
+    force_remove_network(docker).await?;
 
     docker
         .create_network(NetworkCreateRequest {
@@ -527,22 +524,45 @@ pub async fn destroy_cluster_resources(
 
     // Remove the cluster image so the next deploy always pulls the latest
     // version from the registry instead of reusing a stale local copy.
+    // Docker may briefly report the container as still running after a
+    // force-remove, so retry a few times on conflict (409) errors.
     if let Some(ref image_id) = container_image {
         tracing::debug!("Removing cluster image: {}", image_id);
-        let result = docker
-            .remove_image(
-                image_id,
-                Some(RemoveImageOptions {
-                    force: true,
-                    noprune: true,
-                    ..Default::default()
-                }),
-                None,
-            )
-            .await;
-        if let Err(err) = result
-            && !is_not_found(&err)
-        {
+        let mut last_err = None;
+        for attempt in 0..5 {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            match docker
+                .remove_image(
+                    image_id,
+                    Some(RemoveImageOptions {
+                        force: true,
+                        noprune: true,
+                        ..Default::default()
+                    }),
+                    None,
+                )
+                .await
+            {
+                Ok(_) => {
+                    last_err = None;
+                    break;
+                }
+                Err(err) if is_not_found(&err) => {
+                    last_err = None;
+                    break;
+                }
+                Err(err) if is_conflict(&err) => {
+                    last_err = Some(err);
+                }
+                Err(err) => {
+                    last_err = Some(err);
+                    break;
+                }
+            }
+        }
+        if let Some(err) = last_err {
             tracing::warn!("Failed to remove cluster image {}: {}", image_id, err);
         }
     }

@@ -75,7 +75,7 @@ async fn ssh_session_config(
         .cluster_name()
         .ok_or_else(|| miette::miette!("cluster name is required to build SSH proxy command"))?;
     let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --cluster {}",
+        "{exe_command} ssh-proxy --gateway-endpoint {} --sandbox-id {} --token {} --gateway {}",
         gateway_url,
         session.sandbox_id,
         session.token,
@@ -565,14 +565,14 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
 /// The output is suitable for appending to `~/.ssh/config` so that tools like
 /// `VSCode` Remote-SSH can connect to the sandbox by host alias.
 ///
-/// The `ProxyCommand` uses `--cluster` so that `ssh-proxy` resolves the
-/// gateway endpoint and TLS certificates from the cluster metadata directory
+/// The `ProxyCommand` uses `--gateway` so that `ssh-proxy` resolves the
+/// gateway endpoint and TLS certificates from the gateway metadata directory
 /// (`~/.config/nemoclaw/clusters/<name>/mtls/`).
 pub fn print_ssh_config(cluster: &str, name: &str) {
     let exe = std::env::current_exe().expect("failed to resolve NemoClaw executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
-    let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
+    let proxy_cmd = format!("{exe} ssh-proxy --gateway {cluster} --name {name}");
 
     println!("Host nemoclaw-{name}");
     println!("    User sandbox");
