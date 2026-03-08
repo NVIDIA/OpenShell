@@ -1363,9 +1363,6 @@ pub async fn sandbox_create(
                     if let Some(d) = display.as_mut() {
                         d.set_active_step(ProvisioningStep::SandboxReady);
                     }
-                } else if let Some(d) = display.as_mut() {
-                    // Show other log lines as detail on the spinner.
-                    d.set_active_detail(&line.message);
                 }
             }
             Some(navigator_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
