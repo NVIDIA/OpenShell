@@ -845,6 +845,7 @@ These ranges are blocked by default but can be selectively allowed via the `allo
 | `10.0.0.0/8` | RFC 1918 private (Class A) |
 | `172.16.0.0/12` | RFC 1918 private (Class B) |
 | `192.168.0.0/16` | RFC 1918 private (Class C) |
+| `fc00::/7` | IPv6 Unique Local Address (ULA) private space |
 
 ### Implementation
 
