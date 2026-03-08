@@ -113,6 +113,18 @@ mirrors:
 
 REGEOF
 
+    # If the distribution registry is a separate host (e.g. we're using a
+    # local registry for component images), add it as an additional mirror
+    # so community sandbox images can be pulled at runtime.
+    if [ -n "${DIST_REGISTRY_HOST:-}" ] && [ "${DIST_REGISTRY_HOST}" != "${REGISTRY_HOST}" ]; then
+        echo "Adding distribution registry mirror for ${DIST_REGISTRY_HOST}"
+        cat >> "$REGISTRIES_YAML" <<REGEOF
+  "${DIST_REGISTRY_HOST}":
+    endpoint:
+      - "https://${DIST_REGISTRY_HOST}"
+REGEOF
+    fi
+
     if [ -n "${REGISTRY_USERNAME:-}" ] && [ -n "${REGISTRY_PASSWORD:-}" ]; then
         cat >> "$REGISTRIES_YAML" <<REGEOF
 
@@ -122,6 +134,31 @@ configs:
       username: ${REGISTRY_USERNAME}
       password: ${REGISTRY_PASSWORD}
 REGEOF
+    fi
+
+    # Add auth for the distribution registry when it differs from the
+    # primary registry (community sandbox images live there).
+    if [ -n "${DIST_REGISTRY_HOST:-}" ] && [ "${DIST_REGISTRY_HOST}" != "${REGISTRY_HOST}" ] \
+       && [ -n "${DIST_REGISTRY_USERNAME:-}" ] && [ -n "${DIST_REGISTRY_PASSWORD:-}" ]; then
+        # Append to existing configs block or start a new one.
+        if [ -n "${REGISTRY_USERNAME:-}" ] && [ -n "${REGISTRY_PASSWORD:-}" ]; then
+            # configs: block already started above — just append the entry.
+            cat >> "$REGISTRIES_YAML" <<REGEOF
+  "${DIST_REGISTRY_HOST}":
+    auth:
+      username: ${DIST_REGISTRY_USERNAME}
+      password: ${DIST_REGISTRY_PASSWORD}
+REGEOF
+        else
+            cat >> "$REGISTRIES_YAML" <<REGEOF
+
+configs:
+  "${DIST_REGISTRY_HOST}":
+    auth:
+      username: ${DIST_REGISTRY_USERNAME}
+      password: ${DIST_REGISTRY_PASSWORD}
+REGEOF
+        fi
     fi
 else
     echo "Warning: REGISTRY_HOST not set; skipping registry config"

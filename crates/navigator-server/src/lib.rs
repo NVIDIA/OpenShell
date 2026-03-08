@@ -30,7 +30,7 @@ pub use grpc::NavigatorService;
 pub use http::{health_router, http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
 use persistence::Store;
-use sandbox::{SandboxClient, spawn_sandbox_watcher};
+use sandbox::{SandboxClient, spawn_sandbox_watcher, spawn_store_reconciler};
 use sandbox_index::SandboxIndex;
 use sandbox_watch::{SandboxWatchBus, spawn_kube_event_tailer};
 pub use tls::TlsAcceptor;
@@ -124,6 +124,13 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     ));
 
     spawn_sandbox_watcher(
+        store.clone(),
+        state.sandbox_client.clone(),
+        state.sandbox_index.clone(),
+        state.sandbox_watch_bus.clone(),
+        state.tracing_log_bus.clone(),
+    );
+    spawn_store_reconciler(
         store.clone(),
         state.sandbox_client.clone(),
         state.sandbox_index.clone(),
