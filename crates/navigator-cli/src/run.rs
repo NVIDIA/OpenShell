@@ -397,9 +397,8 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
 
 struct ClusterDeployLogPanel {
     mp: MultiProgress,
-    name: String,
-    location: String,
     status: String,
+    progress: Option<String>,
     current_step: Option<String>,
     spinner: ProgressBar,
     completed_steps: Vec<ProgressBar>,
@@ -410,7 +409,7 @@ struct ClusterDeployLogPanel {
 }
 
 impl ClusterDeployLogPanel {
-    fn new(name: &str, location: &str) -> Self {
+    fn new(_name: &str, _location: &str) -> Self {
         let mp = MultiProgress::new();
 
         let spinner = mp.add(ProgressBar::new_spinner());
@@ -422,9 +421,8 @@ impl ClusterDeployLogPanel {
 
         let panel = Self {
             mp,
-            name: name.to_string(),
-            location: location.to_string(),
-            status: "Starting bootstrap".to_string(),
+            status: "Starting".to_string(),
+            progress: None,
             current_step: None,
             spinner,
             completed_steps: Vec::new(),
@@ -448,6 +446,11 @@ impl ClusterDeployLogPanel {
             return;
         }
 
+        if let Some(detail) = line.strip_prefix("[progress] ") {
+            self.handle_progress(detail.to_string());
+            return;
+        }
+
         self.ensure_log_panel();
 
         if self.buffer.len() == CLUSTER_DEPLOY_LOG_LINES {
@@ -459,12 +462,7 @@ impl ClusterDeployLogPanel {
 
     fn handle_status(&mut self, status: String) {
         if is_progress_status(&status) {
-            if let Some(step) = &self.current_step {
-                self.status = format!("{step} ({status})");
-            } else {
-                self.status = status;
-            }
-            self.update_spinner_message();
+            self.handle_progress(status);
             return;
         }
 
@@ -473,6 +471,12 @@ impl ClusterDeployLogPanel {
         }
 
         self.status = status;
+        self.progress = None;
+        self.update_spinner_message();
+    }
+
+    fn handle_progress(&mut self, detail: String) {
+        self.progress = Some(detail);
         self.update_spinner_message();
     }
 
@@ -529,12 +533,12 @@ impl ClusterDeployLogPanel {
     }
 
     fn update_spinner_message(&self) {
-        self.spinner.set_message(format!(
-            "Bootstrapping {} cluster {}: {}",
-            self.location,
-            self.name,
-            self.status.dimmed()
-        ));
+        let msg = if let Some(detail) = &self.progress {
+            format!("{} ({})", self.status, detail.dimmed())
+        } else {
+            self.status.clone()
+        };
+        self.spinner.set_message(msg);
     }
 
     fn finish_success(&mut self) {
@@ -745,13 +749,13 @@ fn prompt_existing_cluster(
         "volume only"
     };
 
-    eprintln!("• Existing cluster '{name}' detected ({status})");
+    eprintln!("• Existing gateway '{name}' detected ({status})");
     if let Some(image) = &info.container_image {
         eprintln!("  {} {}", "Image:".dimmed(), image);
     }
     eprintln!();
 
-    eprint!("Destroy and recreate from scratch? [y/N] ");
+    eprint!("Destroy and recreate gateway from scratch? [y/N] ");
     std::io::stderr().flush().ok();
 
     let mut input = String::new();
@@ -803,22 +807,24 @@ pub(crate) async fn deploy_cluster_with_panel(
                 eprintln!(
                     "{} {} {name}",
                     "x".red().bold(),
-                    "Cluster failed:".red().bold(),
+                    "Gateway failed:".red().bold(),
                 );
                 Err(err)
             }
         }
     } else {
-        eprintln!("Deploying {location} cluster {name}...");
+        eprintln!("Deploying {location} gateway {name}...");
         let handle = navigator_bootstrap::deploy_cluster_with_logs(options, |line| {
             if let Some(status) = line.strip_prefix("[status] ") {
                 eprintln!("  {status}");
+            } else if line.strip_prefix("[progress] ").is_some() {
+                // Sub-step progress: skip in non-interactive mode
             } else {
                 eprintln!("  {line}");
             }
         })
         .await?;
-        eprintln!("Cluster {name} ready.");
+        eprintln!("Gateway {name} ready.");
         Ok(handle)
     }
 }
@@ -828,7 +834,7 @@ pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::Clu
     eprintln!(
         "{} {} {name}",
         "✓".green().bold(),
-        "Cluster ready:".green().bold(),
+        "Gateway ready:".green().bold(),
     );
     eprintln!(
         "  {} {}",
@@ -896,11 +902,11 @@ pub async fn cluster_admin_deploy(
             };
 
             if should_recreate {
-                eprintln!("• Destroying existing cluster...");
+                eprintln!("• Destroying existing gateway...");
                 let handle =
                     navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
                 handle.destroy().await?;
-                eprintln!("{} Cluster destroyed, starting fresh.", "✓".green().bold());
+                eprintln!("{} Gateway destroyed, starting fresh.", "✓".green().bold());
                 eprintln!();
             }
             // If reusing, the deploy flow will handle stale node cleanup automatically
@@ -927,7 +933,7 @@ pub async fn cluster_admin_deploy(
 
     // Auto-activate: set this cluster as the active cluster.
     save_active_cluster(name)?;
-    eprintln!("{} Active cluster set to '{name}'", "✓".green().bold());
+    eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
 
     Ok(())
 }

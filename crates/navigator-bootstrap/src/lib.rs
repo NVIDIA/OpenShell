@@ -243,7 +243,7 @@ where
 
     // Ensure the image is available on the target Docker daemon
     if remote_opts.is_some() {
-        log("[status] Pulling cluster image on remote host".to_string());
+        log("[status] Pulling gateway image".to_string());
         let on_log_clone = Arc::clone(&on_log);
         let progress_cb = move |msg: String| {
             if let Ok(mut f) = on_log_clone.lock() {
@@ -253,14 +253,15 @@ where
         image::pull_remote_image(&target_docker, &image_ref, progress_cb).await?;
     } else {
         // Local deployment: ensure image exists (pull if needed)
-        log("[status] Ensuring cluster image is available".to_string());
+        log("[status] Pulling gateway image".to_string());
         ensure_image(&target_docker, &image_ref).await?;
     }
 
     // All subsequent operations use the target Docker (remote or local)
-    log("[status] Creating cluster network".to_string());
+    log("[status] Preparing gateway".to_string());
+    log("[progress] Creating gateway network".to_string());
     ensure_network(&target_docker).await?;
-    log("[status] Preparing cluster volume".to_string());
+    log("[progress] Preparing gateway volume".to_string());
     ensure_volume(&target_docker, &volume_name(&name)).await?;
 
     // Compute extra TLS SANs for remote deployments so the gateway and k3s
@@ -297,7 +298,7 @@ where
             (sans, gateway_host)
         };
 
-    log("[status] Creating cluster container".to_string());
+    log("[progress] Creating gateway container".to_string());
     ensure_container(
         &target_docker,
         &name,
@@ -308,10 +309,10 @@ where
         kube_port,
     )
     .await?;
-    log("[status] Starting cluster container".to_string());
+    log("[status] Starting gateway".to_string());
     start_container(&target_docker, &name).await?;
 
-    log("[status] Waiting for kubeconfig".to_string());
+    log("[progress] Waiting for kubeconfig".to_string());
     let raw_kubeconfig = wait_for_kubeconfig(&target_docker, &name).await?;
 
     // Rewrite kubeconfig based on deployment mode
@@ -319,15 +320,15 @@ where
         || rewrite_kubeconfig(&raw_kubeconfig, &name, kube_port),
         |opts| rewrite_kubeconfig_remote(&raw_kubeconfig, &name, &opts.destination, kube_port),
     );
-    log("[status] Writing kubeconfig".to_string());
+    log("[progress] Writing kubeconfig".to_string());
     store_kubeconfig(&kubeconfig_path, &rewritten)?;
     // Clean up stale k3s nodes left over from previous container instances that
     // used the same persistent volume. Without this, pods remain scheduled on
     // NotReady ghost nodes and the health check will time out.
-    log("[status] Cleaning stale nodes".to_string());
+    log("[progress] Cleaning stale nodes".to_string());
     match clean_stale_nodes(&target_docker, &name).await {
         Ok(0) => {}
-        Ok(n) => log(format!("[status] Removed {n} stale node(s)")),
+        Ok(n) => log(format!("[progress] Removed {n} stale node(s)")),
         Err(err) => {
             tracing::debug!("stale node cleanup failed (non-fatal): {err}");
         }
@@ -344,7 +345,7 @@ where
     // cluster, secrets are always newly generated and a restart is unnecessary.
     // Restarting only when workload pre-existed avoids extra rollout latency.
     let workload_existed_before_pki = navigator_workload_exists(&target_docker, &name).await?;
-    log("[status] Reconciling TLS certificates".to_string());
+    log("[progress] Reconciling TLS certificates".to_string());
     let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
 
     if rotated && workload_existed_before_pki {
@@ -352,11 +353,11 @@ where
         // it picks up the new TLS secrets before we write CLI-side certs.
         // A failed rollout is a hard error — CLI certs must not be persisted
         // if the server cannot come up with the new PKI.
-        log("[status] PKI rotated — restarting navigator workload".to_string());
+        log("[progress] PKI rotated — restarting navigator workload".to_string());
         restart_navigator_deployment(&target_docker, &name).await?;
     }
 
-    log("[status] Storing CLI mTLS credentials".to_string());
+    log("[progress] Storing CLI mTLS credentials".to_string());
     store_pki_bundle(&name, &pki_bundle)?;
 
     // Push locally-built component images into the k3s containerd runtime.
@@ -373,7 +374,7 @@ where
             .collect();
         if !images.is_empty() {
             log(format!(
-                "[status] Push mode: importing {} local image(s) into cluster",
+                "[progress] Importing {} local image(s) into gateway",
                 images.len()
             ));
             let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
@@ -393,12 +394,12 @@ where
             )
             .await?;
 
-            log("[status] Restarting navigator deployment to pick up imported images".to_string());
+            log("[progress] Restarting navigator deployment".to_string());
             restart_navigator_deployment(&target_docker, &name).await?;
         }
     }
 
-    log("[status] Waiting for control plane health checks".to_string());
+    log("[status] Waiting for gateway".to_string());
     {
         // Create a short-lived closure that locks on each call rather than holding
         // the MutexGuard across await points.
@@ -412,7 +413,7 @@ where
     }
 
     // Create and store cluster metadata
-    log("[status] Persisting cluster metadata".to_string());
+    log("[progress] Persisting gateway metadata".to_string());
     let metadata = create_cluster_metadata_with_host(
         &name,
         remote_opts.as_ref(),
@@ -590,12 +591,12 @@ where
     // Try to load existing secrets.
     match load_existing_pki_bundle(docker, &cname, kubeconfig).await {
         Ok(bundle) => {
-            log("[status] Reusing existing TLS certificates".to_string());
+            log("[progress] Reusing existing TLS certificates".to_string());
             return Ok((bundle, false));
         }
         Err(reason) => {
             log(format!(
-                "[status] Cannot reuse existing TLS secrets ({reason}) — generating new PKI"
+                "[progress] Cannot reuse existing TLS secrets ({reason}) — generating new PKI"
             ));
         }
     }
@@ -603,8 +604,11 @@ where
     // Generate fresh PKI and apply to cluster.
     // Namespace may still be creating on first bootstrap, so wait here only
     // when rotation is actually needed.
+    log("[progress] Waiting for navigator namespace".to_string());
     wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
+    log("[progress] Generating TLS certificates".to_string());
     let bundle = generate_pki(extra_sans)?;
+    log("[progress] Applying TLS secrets to gateway".to_string());
     create_k8s_tls_secrets(docker, name, &bundle)
         .await
         .wrap_err("failed to apply new TLS secrets")?;
