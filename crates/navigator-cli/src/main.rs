@@ -222,7 +222,7 @@ enum Commands {
         server: Option<String>,
 
         /// Gateway name (resolves endpoint from stored metadata). Used in name mode.
-        #[arg(long, visible_alias = "cluster")]
+        #[arg(long)]
         gateway: Option<String>,
 
         /// Sandbox name. Used in name mode.
