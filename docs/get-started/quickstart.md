@@ -25,16 +25,13 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 
 Before you begin, make sure you have:
 
-```{include} ../../README.md
-:start-after: <!-- quickstart-prereqs-start -->
-:end-before: <!-- quickstart-prereqs-end -->
-```
+- Python 3.12 or later
+- Docker Desktop running on your machine <!-- TODO: add compatible version -->
 
 ## Install the OpenShell CLI
 
-```{include} ../../README.md
-:start-after: <!-- quickstart-install-start -->
-:end-before: <!-- quickstart-install-end -->
+```bash
+pip install nemoclaw
 ```
 
 ## Create Your First OpenShell Sandbox
