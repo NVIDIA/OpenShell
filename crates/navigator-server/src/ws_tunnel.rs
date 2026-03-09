@@ -115,7 +115,7 @@ where
                 }
             }
             Err(e) => {
-                debug!(error = %e, "WS tunnel: tcp read error");
+                debug!(error = %e, "WS tunnel: read error");
                 let _ = ws_sink.close().await;
                 break;
             }
