@@ -176,6 +176,8 @@ CLI commands, policy schema, environment variables, and system architecture.
 
 test
 
+test2
+
 ```{toctree}
 :hidden:
 
