@@ -204,9 +204,7 @@ get-started/tutorials
 sandboxes/index
 sandboxes/create-and-manage
 sandboxes/providers
-sandboxes/custom-containers
 sandboxes/community-sandboxes
-sandboxes/terminal
 ```
 
 ```{toctree}
@@ -216,7 +214,6 @@ sandboxes/terminal
 safety-and-privacy/index
 safety-and-privacy/security-model
 safety-and-privacy/policies
-safety-and-privacy/network-access-rules
 ```
 
 ```{toctree}

@@ -159,8 +159,7 @@ Manage inference routes that intercept and reroute LLM API calls from userland c
 status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
 press `f` to follow live output, `s` to filter by source, and `q` to quit.
 
-Refer to {doc}`/sandboxes/terminal` for the full guide, including how to read log
-entries, diagnose blocked connections, and interpret inference interception.
+Refer to {doc}`/sandboxes/create-and-manage` for more on monitoring sandboxes and reading log entries.
 
 ## Sandbox Name Fallback
 
