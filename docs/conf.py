@@ -7,7 +7,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-project = "NVIDIA NemoClaw Developer Guide"
+project = "NVIDIA OpenShell Developer Guide"
 this_year = date.today().year
 copyright = f"2025-{this_year}, NVIDIA Corporation"
 author = "NVIDIA Corporation"
@@ -38,6 +38,7 @@ copybutton_exclude = ".linenos, .gp, .go"
 
 exclude_patterns = [
     "README.md",
+    "SETUP.md",
     "_build/**",
 ]
 
@@ -63,6 +64,23 @@ html_copy_source = False
 html_show_sourcelink = False
 html_show_sphinx = False
 
+mermaid_init_js = (
+    "mermaid.initialize({"
+    "  startOnLoad: true,"
+    "  theme: 'base',"
+    "  themeVariables: {"
+    "    background: '#ffffff',"
+    "    primaryColor: '#76b900',"
+    "    primaryTextColor: '#000000',"
+    "    primaryBorderColor: '#000000',"
+    "    lineColor: '#000000',"
+    "    textColor: '#000000',"
+    "    mainBkg: '#ffffff',"
+    "    nodeBorder: '#000000'"
+    "  }"
+    "});"
+)
+
 html_domain_indices = False
 html_use_index = False
 highlight_language = "console"
@@ -73,6 +91,12 @@ html_theme_options = {
             "name": "GitHub",
             "url": "https://github.com/NVIDIA/NemoClaw",
             "icon": "fa-brands fa-github",
+            "type": "fontawesome",
+        },
+        {
+            "name": "PyPI",
+            "url": "https://pypi.org/project/nemoclaw/",
+            "icon": "fa-brands fa-python",
             "type": "fontawesome",
         },
     ],
