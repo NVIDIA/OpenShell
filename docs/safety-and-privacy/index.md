@@ -53,7 +53,7 @@ rules are hot-reloadable on a running sandbox. Filesystem and process
 restrictions are locked at creation time.
 
 - {doc}`security-model`: Threat scenarios (data exfiltration, credential
-  theft, unauthorized API calls, privilege escalation) and how NemoClaw
+  theft, unauthorized API calls, privilege escalation) and how OpenShell
   addresses each one.
 - {doc}`policies`: Author policies, monitor for blocked actions, and
   iterate on rules without restarting sandboxes.

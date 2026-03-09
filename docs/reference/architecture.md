@@ -2,7 +2,7 @@
 title:
   page: "Architecture Reference"
   nav: "Architecture"
-description: "Detailed reference for NemoClaw architecture: gateway, sandbox internals, policy engine, privacy router, and remote deployment."
+description: "Detailed reference for OpenShell architecture: gateway, sandbox internals, policy engine, privacy router, and remote deployment."
 keywords: ["nemoclaw architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "security", "architecture"]
@@ -19,7 +19,7 @@ content:
 
 # Architecture Reference
 
-This page provides detailed technical information about each NemoClaw component.
+This page provides detailed technical information about each OpenShell component.
 For a high-level summary, refer to the [Architecture Overview](../about/architecture.md).
 
 ## Component Diagram

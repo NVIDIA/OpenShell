@@ -5,11 +5,11 @@
 
 # Troubleshooting
 
-Use this guide to troubleshoot problems with NemoClaw.
+Use this guide to troubleshoot problems with OpenShell.
 
 ## Cluster Issues
 
-Troubleshoot problems with deploying, connecting to, and running NemoClaw clusters.
+Troubleshoot problems with deploying, connecting to, and running OpenShell clusters.
 
 ### Cluster Deploy Fails
 

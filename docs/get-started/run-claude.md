@@ -5,18 +5,18 @@
 
 # Run Claude Code Safely
 
-This tutorial walks you through the path to running Claude Code inside a NemoClaw sandbox. By the end of this tutorial, you will have an isolated environment with credentials securely injected and a default policy controlling what the agent can access.
+This tutorial walks you through the path to running Claude Code inside a OpenShell sandbox. By the end of this tutorial, you will have an isolated environment with credentials securely injected and a default policy controlling what the agent can access.
 
 ## What You Will Learn
 
 - Create a sandbox with a single command.
-- Understand how NemoClaw auto-discovers provider credentials.
+- Understand how OpenShell auto-discovers provider credentials.
 - Inspect what the default policy allows and denies.
 - Connect to a running sandbox and work inside it.
 
 ## Prerequisites
 
-- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
+- Met the prerequisites and installed the OpenShell CLI as described in the {doc}`quickstart` guide.
 - `ANTHROPIC_API_KEY` environment variable set on your host machine.
 
 ## Create the Sandbox
@@ -29,7 +29,7 @@ $ nemoclaw sandbox create -- claude
 
 This single command performs four actions:
 
-1. Bootstraps the runtime. On first use, the CLI provisions a local k3s cluster inside Docker and deploys the NemoClaw control plane. This happens once. Subsequent commands reuse the existing cluster.
+1. Bootstraps the runtime. On first use, the CLI provisions a local k3s cluster inside Docker and deploys the OpenShell control plane. This happens once. Subsequent commands reuse the existing cluster.
 2. Auto-discovers credentials. The CLI detects that `claude` is a recognized tool and reads the `ANTHROPIC_API_KEY` environment variable from your shell. It creates a provider automatically.
 3. Creates the sandbox. The CLI provisions an isolated container and applies the default policy. This policy allows Claude Code to reach `api.anthropic.com` and a small set of supporting endpoints while blocking everything else.
 4. Drops you into the sandbox. You land in an interactive SSH session, ready to work.
@@ -65,7 +65,7 @@ Open a second terminal on your host machine to inspect the sandbox from outside.
     $ nemoclaw sandbox list
     ```
 
-2. Launch the NemoClaw Terminal for a live dashboard that shows sandbox status, active network connections, and policy decisions in real time:
+2. Launch the OpenShell Terminal for a live dashboard that shows sandbox status, active network connections, and policy decisions in real time:
 
     ```console
     $ nemoclaw term

@@ -11,7 +11,7 @@ This page walks you through the full sandbox lifecycle: creating, inspecting, co
 
 Ensure the following are installed before creating sandboxes.
 
-- NemoClaw CLI installed (`pip install nemoclaw`)
+- OpenShell CLI installed (`pip install nemoclaw`)
 - Docker running on your machine
 
 ## Create a Sandbox

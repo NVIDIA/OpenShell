@@ -5,7 +5,7 @@
 
 # Run OpenCode with NVIDIA Inference
 
-This tutorial walks you through a realistic setup where you run [OpenCode](https://opencode.ai) inside a NemoClaw sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit a policy denial, diagnose it from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop that you will use whenever you onboard a new tool.
+This tutorial walks you through a realistic setup where you run [OpenCode](https://opencode.ai) inside a OpenShell sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit a policy denial, diagnose it from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop that you will use whenever you onboard a new tool.
 
 ## What You Will Learn
 
@@ -17,7 +17,7 @@ This tutorial walks you through a realistic setup where you run [OpenCode](https
 
 ## Prerequisites
 
-- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
+- Met the prerequisites and installed the OpenShell CLI as described in the {doc}`quickstart` guide.
 - `NVIDIA_API_KEY` environment variable set on your host machine with a valid NVIDIA API key.
 
 ## Create the Provider
@@ -56,7 +56,7 @@ Open a second terminal and check the logs:
 $ nemoclaw logs opencode-sandbox --tail
 ```
 
-Alternatively, launch the NemoClaw Terminal for a live view:
+Alternatively, launch the OpenShell Terminal for a live view:
 
 ```console
 $ nemoclaw term
@@ -81,7 +81,7 @@ Two separate problems are at play:
 - OpenCode's own traffic. OpenCode contacts `opencode.ai` for its API and `integrate.api.nvidia.com` for inference. Neither endpoint has a matching rule for the binaries OpenCode uses.
 - Missing endpoint. The default policy has no entry for `opencode.ai` at all. Even if the binary matched, the destination is not listed.
 
-This is expected behavior. NemoClaw denies everything by default. You need to write a policy that explicitly allows what OpenCode needs.
+This is expected behavior. OpenShell denies everything by default. You need to write a policy that explicitly allows what OpenCode needs.
 
 ## Write a Custom Policy
 
@@ -239,7 +239,7 @@ $ nemoclaw logs opencode-sandbox --tail
 
 You should no longer see `action=deny` lines for the endpoints you added. Connections to `opencode.ai`, `integrate.api.nvidia.com`, and GitHub should show `action=allow`.
 
-If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `nemoclaw policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in NemoClaw.
+If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `nemoclaw policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in OpenShell.
 
 ## Clean Up
 

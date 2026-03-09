@@ -82,7 +82,7 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 
 | Field | Type | Required | Values | Description |
 |---|---|---|---|---|
-| `compatibility` | string | No | `best_effort`, `hard_requirement` | How NemoClaw handles kernel ABI differences. `best_effort` uses the highest Landlock ABI the host kernel supports. `hard_requirement` fails if the required ABI is unavailable. |
+| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles kernel ABI differences. `best_effort` uses the highest Landlock ABI the host kernel supports. `hard_requirement` fails if the required ABI is unavailable. |
 
 Example:
 

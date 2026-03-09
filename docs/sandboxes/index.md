@@ -5,7 +5,7 @@
 
 # About Sandboxes
 
-A NemoClaw sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+A OpenShell sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
 
 ## Sandbox Lifecycle
 
@@ -18,9 +18,9 @@ Every sandbox moves through a defined set of phases:
 | Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
-## The NemoClaw Runtime
+## The OpenShell Runtime
 
-Sandboxes run inside a lightweight runtime cluster that NemoClaw manages for
+Sandboxes run inside a lightweight runtime cluster that OpenShell manages for
 you. The cluster runs as a [k3s](https://k3s.io/) Kubernetes distribution
 inside a Docker container on your machine.
 

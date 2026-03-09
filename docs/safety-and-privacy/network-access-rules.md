@@ -5,7 +5,7 @@
 
 # Network Access Rules
 
-Every outbound connection from a sandbox passes through NemoClaw's transparent
+Every outbound connection from a sandbox passes through OpenShell's transparent
 proxy. Nothing leaves the sandbox directly. The proxy identifies which binary
 initiated the connection, evaluates the active policy, and decides what happens
 next.
@@ -21,7 +21,7 @@ Each outbound connection resolves to one of three outcomes:
 | Deny               | No network policy matches and no inference route applies.                    | The connection is blocked. The calling process receives a 403 or connection reset. |
 
 :::{note}
-This is the most important distinction in NemoClaw's network model.
+This is the most important distinction in OpenShell's network model.
 
 *Agent traffic* is the coding agent (Claude, OpenCode, Codex) calling its own API to get completions. This traffic matches a `network_policies` entry because the policy declares both the endpoint (for example, `api.anthropic.com:443`) and the binary (for example, `/usr/local/bin/claude`). The proxy allows it through directly. The agent's own API key (injected by the provider) is used as-is.
 
@@ -72,7 +72,7 @@ network_policies:
       - path: /usr/local/bin/my-agent
 ```
 
-The key (`my_rule`) is a logical name for reference. The `name` field is the human-readable label that appears in logs and the NemoClaw Terminal.
+The key (`my_rule`) is a logical name for reference. The `name` field is the human-readable label that appears in logs and the OpenShell Terminal.
 
 ## Endpoints
 

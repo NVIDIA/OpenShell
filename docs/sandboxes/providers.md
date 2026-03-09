@@ -5,7 +5,7 @@
 
 # Providers
 
-AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. NemoClaw manages these credentials as first-class entities called *providers*.
+AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
 
 Create and manage providers that supply credentials to sandboxes.
 
@@ -127,7 +127,7 @@ flowchart LR
 2. You attach the provider to a sandbox at creation time using the
    `--provider` flag (one or more providers can be attached).
 3. The sandbox starts. The supervisor process initializes.
-4. The supervisor fetches credentials from the NemoClaw gateway at runtime.
+4. The supervisor fetches credentials from the OpenShell gateway at runtime.
    The system does not store credentials in the sandbox specification. It retrieves them on demand.
 5. Credentials are injected into the agent process as environment variables.
    They are also available in SSH sessions when you connect to the sandbox.

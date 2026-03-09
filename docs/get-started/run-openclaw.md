@@ -15,7 +15,7 @@ This tutorial shows you how to launch a sandbox with OpenClaw from the [NemoClaw
 
 ## Prerequisites
 
-- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
+- Met the prerequisites and installed the OpenShell CLI as described in the {doc}`quickstart` guide.
 - NVIDIA GPU with drivers installed. OpenClaw requires GPU acceleration.<!--Need to specify the NVIDIA GPU driver version or add reference link-->
 
 ## Create the Sandbox
@@ -26,9 +26,9 @@ Run the following command:
 $ nemoclaw sandbox create --from openclaw --keep
 ```
 
-The `--from` flag tells the CLI to pull a sandbox definition from the NemoClaw Community catalog. Here is what happens behind the scenes:
+The `--from` flag tells the CLI to pull a sandbox definition from the OpenShell Community catalog. Here is what happens behind the scenes:
 
-1. Fetches the definition. The CLI downloads the OpenClaw sandbox definition from the NemoClaw-Community repository. This includes a Dockerfile, a policy YAML, and any bundled skills.
+1. Fetches the definition. The CLI downloads the OpenClaw sandbox definition from the OpenShell-Community repository. This includes a Dockerfile, a policy YAML, and any bundled skills.
 2. Builds the image. The CLI builds the Dockerfile locally using Docker. The resulting image includes all tools and dependencies that OpenClaw needs.
 3. Applies the bundled policy. Instead of the generic default policy, the sandbox starts with a policy written specifically for the OpenClaw workload. It allows the endpoints and binaries that OpenClaw requires.
 4. Creates and keeps the sandbox. The `--keep` flag ensures the sandbox stays running after creation so you can connect and disconnect freely.
@@ -91,7 +91,7 @@ $ nemoclaw sandbox delete <name>
 ```
 
 :::{note}
-The NemoClaw Community repository accepts contributions. If you build a sandbox configuration that would be useful to others, submit it to the [NemoClaw-Community](https://github.com/NVIDIA/NemoClaw-Community) repository.
+The OpenShell Community repository accepts contributions. If you build a sandbox configuration that would be useful to others, submit it to the [NemoClaw-Community](https://github.com/NVIDIA/NemoClaw-Community) repository.
 :::
 
 ## Next Steps

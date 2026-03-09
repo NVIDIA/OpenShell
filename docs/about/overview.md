@@ -1,6 +1,6 @@
 ---
 title:
-  page: "Overview of NVIDIA NemoClaw"
+  page: "Overview of NVIDIA OpenShell"
   nav: "Overview"
 description: "NemoClaw is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
 keywords: ["nemoclaw", "ai agent sandbox", "agent security", "agent isolation", "inference routing"]
@@ -17,9 +17,9 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Overview of NVIDIA NemoClaw
+# Overview of NVIDIA OpenShell
 
-NVIDIA NemoClaw is an open-source runtime that executes autonomous AI agents inside sandboxed environments with kernel-level isolation. It prevents agents from accessing unauthorized files, exfiltrating data, leaking credentials, or making uncontrolled network requests. A single declarative YAML policy governs filesystem, network, process, and inference protections across all sandboxes and is hot-reloadable without restarting running agents.
+NVIDIA OpenShell is an open-source runtime that executes autonomous AI agents inside sandboxed environments with kernel-level isolation. It prevents agents from accessing unauthorized files, exfiltrating data, leaking credentials, or making uncontrolled network requests. A single declarative YAML policy governs filesystem, network, process, and inference protections across all sandboxes and is hot-reloadable without restarting running agents.
 
 ## Common Challenges with AI Agents
 
@@ -27,7 +27,7 @@ AI agents are most useful when they have broad access to reading files, installi
 
 Conventional containers do not solve this. They isolate processes from the host, but they do not control what an agent does *inside* the container — which files it reads, which hosts it contacts, or where it sends your prompts.
 
-## Benefits of Using NemoClaw
+## Benefits of Using OpenShell
 
 NemoClaw addresses these risks through defense-in-depth enforcement across four policy domains: filesystem, network, process, and inference.
 
@@ -53,7 +53,7 @@ Every outbound TCP connection from a sandbox passes through an L7 proxy that res
 
 ## Use Cases
 
-The following are common use cases for NemoClaw.
+The following are common use cases for OpenShell.
 
 :::{dropdown} 💻 Secure Coding Agents
 Run AI coding assistants such as Claude Code, OpenCode, or OpenClaw inside a sandbox where they can read and modify project files but cannot access SSH keys, cloud credentials, or files outside the project directory. Network policies restrict which package registries and APIs the agent can reach.
@@ -75,6 +75,6 @@ Use pre-built sandbox images from the [NemoClaw Community](https://github.com/NV
 
 ## Next Steps
 
-- [Architecture Overview](architecture.md): Understand the components that make up the NemoClaw runtime.
+- [Architecture Overview](architecture.md): Understand the components that make up the OpenShell runtime.
 - [Get Started](../index.md): Install the CLI and create your first sandbox.
-- [Security Model](../safety-and-privacy/security-model.md): Learn how NemoClaw enforces isolation across all protection layers.
+- [Security Model](../safety-and-privacy/security-model.md): Learn how OpenShell enforces isolation across all protection layers.

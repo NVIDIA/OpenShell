@@ -2,7 +2,7 @@
 title:
   page: "Quickstart"
   nav: "Quickstart"
-description: "Install the NemoClaw CLI and create your first sandboxed AI agent in two commands."
+description: "Install the OpenShell CLI and create your first sandboxed AI agent in two commands."
 keywords: ["nemoclaw install", "quickstart", "sandbox create", "getting started"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "installation", "quickstart"]
@@ -30,14 +30,14 @@ Before you begin, make sure you have:
 :end-before: <!-- quickstart-prereqs-end -->
 ```
 
-## Install the NemoClaw CLI
+## Install the OpenShell CLI
 
 ```{include} ../../README.md
 :start-after: <!-- quickstart-install-start -->
 :end-before: <!-- quickstart-install-end -->
 ```
 
-## Create Your First NemoClaw Sandbox
+## Create Your First OpenShell Sandbox
 
 Choose the tab that matches your agent:
 
@@ -72,7 +72,7 @@ The `--from` flag pulls a pre-built sandbox definition from the [NemoClaw Commun
 
 ## What Happens Behind the Scenes
 
-When you create a sandbox, NemoClaw activates the following protection layers.
+When you create a sandbox, OpenShell activates the following protection layers.
 
 | Protection Layer        | Description                                                                                   |
 |------------------------|-----------------------------------------------------------------------------------------------|

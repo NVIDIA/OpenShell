@@ -5,7 +5,7 @@
 
 # Community Sandboxes
 
-Use pre-built sandboxes from the NemoClaw Community catalog, or contribute your
+Use pre-built sandboxes from the OpenShell Community catalog, or contribute your
 own.
 
 ## What Are Community Sandboxes

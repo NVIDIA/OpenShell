@@ -5,7 +5,7 @@
 
 # Write Sandbox Policies
 
-This guide covers how to author, iterate, and manage sandbox policies that control what an agent can do inside a NemoClaw sandbox. You will learn to create sandboxes with custom policies, monitor denied traffic to discover missing rules, and push policy updates without restarting the sandbox.
+This guide covers how to author, iterate, and manage sandbox policies that control what an agent can do inside a OpenShell sandbox. You will learn to create sandboxes with custom policies, monitor denied traffic to discover missing rules, and push policy updates without restarting the sandbox.
 
 ## Policy Structure
 
@@ -32,7 +32,7 @@ filesystem_policy:
     - /dev/null
 
 landlock:
-  # How NemoClaw applies Landlock LSM enforcement.
+  # How OpenShell applies Landlock LSM enforcement.
   # "best_effort" uses the highest Landlock ABI the host kernel supports.
   # "strict" requires a specific ABI version and fails if unavailable.
   compatibility: best_effort
@@ -140,12 +140,12 @@ $ nemoclaw logs <name> --tail --source sandbox
 
 Each deny entry shows the blocked host, port, calling binary, and reason. This tells you exactly what the agent tried to reach and why it was blocked.
 
-Alternatively, run `nemoclaw term` for the NemoClaw Terminal, a live dashboard
+Alternatively, run `nemoclaw term` for the OpenShell Terminal, a live dashboard
 that shows status and logs in a single view. Refer to {doc}`/sandboxes/terminal` for
 how to read log entries and diagnose what is being blocked.
 
 :::{tip}
-The NemoClaw Terminal is especially useful during policy iteration. You can
+The OpenShell Terminal is especially useful during policy iteration. You can
 watch deny entries appear in real time as the agent hits blocked endpoints, then
 push an updated policy without leaving the terminal.
 :::

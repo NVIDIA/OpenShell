@@ -69,7 +69,7 @@ Commands available directly under `nemoclaw` for common operations.
 
 ## Gateway Commands
 
-Manage the NemoClaw runtime cluster.
+Manage the OpenShell runtime cluster.
 
 | Command | Description |
 |---|---|
@@ -153,9 +153,9 @@ Manage inference routes that intercept and reroute LLM API calls from userland c
 | `--protocol` | API protocol: `openai` or `anthropic`. Defaults to `openai`. |
 | `--disabled` | Create the route in a disabled state. |
 
-## NemoClaw Terminal
+## OpenShell Terminal
 
-`nemoclaw term` launches the NemoClaw Terminal, a dashboard that shows sandbox
+`nemoclaw term` launches the OpenShell Terminal, a dashboard that shows sandbox
 status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
 press `f` to follow live output, `s` to filter by source, and `q` to quit.
 

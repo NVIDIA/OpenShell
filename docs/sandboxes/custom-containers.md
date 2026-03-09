@@ -5,13 +5,13 @@
 
 # Custom Containers
 
-Build a custom container image and run it as a NemoClaw sandbox.
+Build a custom container image and run it as a OpenShell sandbox.
 
 ## Prerequisites
 
 Ensure the following are installed before building custom container sandboxes.
 
-- NemoClaw CLI installed (`pip install nemoclaw`)
+- OpenShell CLI installed (`pip install nemoclaw`)
 - Docker running on your machine
 - A Dockerfile for your workload
 
