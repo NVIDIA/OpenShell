@@ -238,6 +238,8 @@ pub async fn ensure_container(
     ssh_gateway_host: Option<&str>,
     gateway_port: u16,
     kube_port: Option<u16>,
+    disable_tls: bool,
+    disable_gateway_auth: bool,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -437,17 +439,13 @@ pub async fn ensure_container(
 
     // Disable TLS: pass through to the entrypoint so the HelmChart manifest
     // configures the server pod for plaintext HTTP.
-    if let Ok(val) = std::env::var("NEMOCLAW_DISABLE_TLS")
-        && val.trim().eq_ignore_ascii_case("true")
-    {
+    if disable_tls {
         env_vars.push("DISABLE_TLS=true".to_string());
     }
 
     // Disable gateway auth: pass through to the entrypoint so the HelmChart
     // manifest sets the flag on the server pod.
-    if let Ok(val) = std::env::var("NEMOCLAW_DISABLE_GATEWAY_AUTH")
-        && val.trim().eq_ignore_ascii_case("true")
-    {
+    if disable_gateway_auth {
         env_vars.push("DISABLE_GATEWAY_AUTH=true".to_string());
     }
 

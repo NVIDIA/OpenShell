@@ -33,6 +33,7 @@ use tokio::net::TcpListener;
 #[derive(Deserialize)]
 struct ConnectParams {
     callback_port: u16,
+    code: String,
 }
 
 fn test_auth_router(bind_addr: SocketAddr) -> Router {
@@ -58,12 +59,13 @@ async fn test_auth_connect(
         .map_or_else(|| bind_addr.to_string(), String::from);
 
     cf_token.map_or_else(
-        || Html(render_waiting_page(params.callback_port)),
+        || Html(render_waiting_page(params.callback_port, &params.code)),
         |token| {
             Html(render_connect_page(
                 &gateway_display,
                 params.callback_port,
                 &token,
+                &params.code,
             ))
         },
     )
@@ -82,8 +84,20 @@ fn extract_cookie(cookies: &str, name: &str) -> Option<String> {
     })
 }
 
-fn render_connect_page(gateway_addr: &str, callback_port: u16, cf_token: &str) -> String {
+fn render_connect_page(
+    gateway_addr: &str,
+    callback_port: u16,
+    cf_token: &str,
+    code: &str,
+) -> String {
     let escaped_token = cf_token
+        .replace('\\', "\\\\")
+        .replace('\'', "\\'")
+        .replace('"', "\\\"")
+        .replace('<', "\\x3c")
+        .replace('>', "\\x3e");
+
+    let escaped_code = code
         .replace('\\', "\\\\")
         .replace('\'', "\\'")
         .replace('"', "\\\"")
@@ -98,14 +112,28 @@ fn render_connect_page(gateway_addr: &str, callback_port: u16, cf_token: &str) -
     <div class="card">
         <div class="logo">NemoClaw</div>
         <div class="gateway">{gateway_addr}</div>
-        <button onclick="connect()">Connect to Gateway</button>
+        <div class="code">{escaped_code}</div>
+        <button id="connectBtn" onclick="connect()">Connect to Gateway</button>
+        <div id="status"></div>
     </div>
     <script>
         var token = '{escaped_token}';
+        var code = '{escaped_code}';
         var port = {callback_port};
         function connect() {{
-            window.location.href =
-                'http://127.0.0.1:' + port + '/callback?token=' + encodeURIComponent(token);
+            fetch('http://127.0.0.1:' + port + '/callback', {{
+                method: 'POST',
+                headers: {{ 'Content-Type': 'application/json' }},
+                body: JSON.stringify({{ token: token, code: code }})
+            }})
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+                document.getElementById('status').textContent =
+                    data.ok ? 'Connected!' : (data.error || 'Failed');
+            }})
+            .catch(function() {{
+                document.getElementById('status').textContent = 'Connection failed';
+            }});
         }}
     </script>
 </body>
@@ -113,12 +141,12 @@ fn render_connect_page(gateway_addr: &str, callback_port: u16, cf_token: &str) -
     )
 }
 
-fn render_waiting_page(callback_port: u16) -> String {
+fn render_waiting_page(callback_port: u16, code: &str) -> String {
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}">
+    <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;code={code}">
     <title>NemoClaw — Authenticating</title>
 </head>
 <body>
@@ -199,7 +227,7 @@ async fn auth_connect_serves_page_with_cf_cookie() {
     let (status, body) = http_get(
         server_addr,
         &format!(
-            "http://127.0.0.1:{}/auth/connect?callback_port=54321",
+            "http://127.0.0.1:{}/auth/connect?callback_port=54321&code=TST-CODE",
             server_addr.port()
         ),
         &[("cookie", &cookie), ("host", "gateway.example.com")],
@@ -227,6 +255,14 @@ async fn auth_connect_serves_page_with_cf_cookie() {
         body.contains("connect()"),
         "response should contain the connect() JS function:\n{body}"
     );
+    assert!(
+        body.contains("TST-CODE"),
+        "response should contain the confirmation code:\n{body}"
+    );
+    assert!(
+        body.contains("fetch("),
+        "response should use fetch() for XHR POST:\n{body}"
+    );
 
     server.abort();
 }
@@ -247,7 +283,7 @@ async fn auth_connect_serves_waiting_page_without_cookie() {
     let (status, body) = http_get(
         server_addr,
         &format!(
-            "http://127.0.0.1:{}/auth/connect?callback_port=12345",
+            "http://127.0.0.1:{}/auth/connect?callback_port=12345&code=ABC-1234",
             server_addr.port()
         ),
         &[],
@@ -262,6 +298,10 @@ async fn auth_connect_serves_waiting_page_without_cookie() {
     assert!(
         body.contains("callback_port=12345"),
         "refresh URL should contain the callback port:\n{body}"
+    );
+    assert!(
+        body.contains("code=ABC-1234"),
+        "refresh URL should preserve the confirmation code:\n{body}"
     );
     assert!(
         body.contains("Authenticating"),
@@ -284,7 +324,7 @@ async fn auth_connect_prefers_x_forwarded_host() {
     let (status, body) = http_get(
         server_addr,
         &format!(
-            "http://127.0.0.1:{}/auth/connect?callback_port=11111",
+            "http://127.0.0.1:{}/auth/connect?callback_port=11111&code=XFH-TEST",
             server_addr.port()
         ),
         &[
@@ -319,7 +359,7 @@ async fn auth_connect_falls_back_to_bind_address() {
     let (status, body) = http_get(
         server_addr,
         &format!(
-            "http://127.0.0.1:{}/auth/connect?callback_port=22222",
+            "http://127.0.0.1:{}/auth/connect?callback_port=22222&code=FBK-TEST",
             server_addr.port()
         ),
         &[("cookie", "CF_Authorization=test-jwt")],

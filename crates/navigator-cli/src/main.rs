@@ -518,6 +518,15 @@ enum GatewayCommands {
         /// Tunnel) that terminates TLS at the edge.
         #[arg(long)]
         plaintext: bool,
+
+        /// Disable gateway authentication (mTLS client certificate requirement).
+        ///
+        /// The server still listens on TLS, but clients are not required to
+        /// present a certificate. Use when a reverse proxy (e.g., Cloudflare
+        /// Tunnel) terminates TLS and cannot forward client certs.
+        /// Ignored when --plaintext is set.
+        #[arg(long)]
+        disable_gateway_auth: bool,
     },
 
     /// Stop the gateway (preserves state).
@@ -1009,12 +1018,8 @@ async fn main() -> Result<()> {
                 kube_port,
                 recreate,
                 plaintext,
+                disable_gateway_auth,
             } => {
-                if plaintext {
-                    // SAFETY: This runs before any threads are spawned (single-threaded
-                    // CLI startup). The bootstrap code reads this env var later.
-                    unsafe { std::env::set_var("NEMOCLAW_DISABLE_TLS", "true") };
-                }
                 run::cluster_admin_deploy(
                     &name,
                     update_kube_config,
@@ -1025,6 +1030,8 @@ async fn main() -> Result<()> {
                     gateway_host.as_deref(),
                     kube_port,
                     recreate,
+                    plaintext,
+                    disable_gateway_auth,
                 )
                 .await?;
             }
@@ -1417,9 +1424,7 @@ async fn main() -> Result<()> {
                         ));
                     }
                     eprintln!("Uploading {} -> sandbox:{}", local.display(), sandbox_dest);
-                    if !no_git_ignore
-                        && let Ok((base_dir, files)) = run::git_sync_files(local)
-                    {
+                    if !no_git_ignore && let Ok((base_dir, files)) = run::git_sync_files(local) {
                         run::sandbox_sync_up_files(
                             &ctx.endpoint,
                             &name,
@@ -1650,6 +1655,8 @@ async fn main() -> Result<()> {
                         gateway_host.as_deref(),
                         kube_port,
                         recreate,
+                        false, // disable_tls
+                        false, // disable_gateway_auth
                     )
                     .await?;
                 }

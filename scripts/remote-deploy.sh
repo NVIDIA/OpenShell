@@ -67,7 +67,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 2: Install mise if missing, then run cluster bootstrap
 # ---------------------------------------------------------------------------
-info "Deploying cluster on ${REMOTE_HOST} (TLS disabled for tunnel)..."
+info "Deploying cluster on ${REMOTE_HOST} (plaintext behind tunnel)..."
 ssh -t "${REMOTE_HOST}" bash -s -- "${REMOTE_DIR}" "${CLUSTER_NAME}" "${GATEWAY_PORT}" <<'REMOTE_EOF'
 set -euo pipefail
 
