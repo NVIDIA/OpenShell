@@ -102,42 +102,6 @@ $ nemoclaw sandbox create -- claude
 This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
 a provider, attaches it to the sandbox, and launches Claude Code.
 
-## How Credentials Flow
-
-Credentials follow a secure path from your machine into the agent process.
-
-```{mermaid}
-flowchart LR
-    A["You create a provider"] --> B["Attach provider\nto sandbox at creation"]
-    B --> C["Sandbox starts"]
-    C --> D["Supervisor fetches\ncredentials from gateway"]
-    D --> E["Credentials injected into\nagent process + SSH sessions"]
-
-    style A fill:#ffffff,stroke:#000000,color:#000000
-    style B fill:#ffffff,stroke:#000000,color:#000000
-    style C fill:#76b900,stroke:#000000,color:#000000
-    style D fill:#76b900,stroke:#000000,color:#000000
-    style E fill:#76b900,stroke:#000000,color:#000000
-
-    linkStyle default stroke:#76b900,stroke-width:2px
-```
-
-1. You create a provider with credentials from your environment or
-   specified explicitly.
-2. You attach the provider to a sandbox at creation time using the
-   `--provider` flag (one or more providers can be attached).
-3. The sandbox starts. The supervisor process initializes.
-4. The supervisor fetches credentials from the OpenShell gateway at runtime.
-   The system does not store credentials in the sandbox specification. It retrieves them on demand.
-5. Credentials are injected into the agent process as environment variables.
-   They are also available in SSH sessions when you connect to the sandbox.
-
-:::{warning}
-The system does not store credentials in the sandbox container specification. The supervisor fetches them at runtime and holds them only in process memory. This
-means you cannot find credentials in container inspection, image layers, or
-environment dumps of the container spec.
-:::
-
 ## Supported Provider Types
 
 The following provider types are supported.
@@ -161,5 +125,4 @@ environment variable names and values yourself with `--credential`.
 ## Next Steps
 
 - {doc}`create-and-manage`: Full sandbox lifecycle management
-- {doc}`custom-containers`: Use providers with custom container images
 - {doc}`../safety-and-privacy/security-model`: Why credential isolation matters

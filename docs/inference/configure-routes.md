@@ -8,7 +8,7 @@
 This guide covers how to create and manage inference routes so that sandboxes can route AI API calls from userland code to policy-controlled backends. You will learn to create routes, connect them to sandboxes through policy, and manage routes across a cluster.
 
 :::{note}
-Inference routes are for *userland code*, which are scripts and programs that the agent writes and executes inside the sandbox. The agent's own API traffic flows directly through network policies, not through inference routing. Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic and userland traffic.
+Inference routes are for *user code*, which are scripts and programs that the agent writes and executes inside the sandbox. The agent's own API traffic flows directly through network policies, not through inference routing. Refer to {doc}`../safety-and-privacy/policies` for the distinction between agent traffic and user traffic.
 :::
 
 ## Create a Route
@@ -88,5 +88,5 @@ The `inference` section is a dynamic field, so you can add or remove routing hin
 ## Next Steps
 
 - {doc}`index`: understand the inference routing architecture, interception sequence, and routing hints.
-- {doc}`../safety-and-privacy/network-access-rules`: configure the network policies that control agent traffic (as opposed to userland inference traffic).
+- {doc}`../safety-and-privacy/policies`: configure the network policies that control agent traffic (as opposed to userland inference traffic).
 - {doc}`../safety-and-privacy/policies`: the full policy iteration workflow.

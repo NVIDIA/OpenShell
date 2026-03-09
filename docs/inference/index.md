@@ -13,7 +13,7 @@ to backends you control.
 Inference routing applies to userland traffic: code that the agent writes
 or runs, not the agent itself. The agent's own API calls (for example, Claude calling
 `api.anthropic.com`) go directly through network policy. Refer to
-{doc}`/safety-and-privacy/network-access-rules` for the distinction.
+{doc}`/safety-and-privacy/policies` for the distinction.
 :::
 
 ## How It Works
@@ -79,5 +79,5 @@ If an intercepted request does not match any known pattern, it is denied.
 ## Next Steps
 
 - {doc}`configure-routes`: Create and manage inference routes.
-- {doc}`/safety-and-privacy/network-access-rules`: Understand agent traffic versus
+- {doc}`/safety-and-privacy/policies`: Understand agent traffic versus
   userland traffic and how network rules interact with inference routing.

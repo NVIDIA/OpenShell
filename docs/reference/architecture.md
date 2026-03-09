@@ -136,8 +136,7 @@ the proxy. For each connection, the proxy:
    binary path.
 3. Acts on the decision: allow the connection directly, hand it to the
    privacy router for inference routing, or deny it. Refer to
-   [How the Proxy Evaluates Connections](../safety-and-privacy/network-access-rules.md#how-the-proxy-evaluates-connections)
-   for the full decision model.
+   {doc}`../safety-and-privacy/policies` for the full decision model.
 
 For endpoints configured with `protocol: rest` and `tls: terminate`, the proxy
 performs full L7 inspection: it decrypts TLS, reads the HTTP method and path,
