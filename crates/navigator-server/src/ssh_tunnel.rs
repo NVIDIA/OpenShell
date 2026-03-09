@@ -26,7 +26,7 @@ const HEADER_TOKEN: &str = "x-sandbox-token";
 const PREFACE_MAGIC: &str = "NSSH1";
 
 /// Maximum concurrent SSH tunnel connections per session token.
-const MAX_CONNECTIONS_PER_TOKEN: u32 = 10;
+const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
 
 /// Maximum concurrent SSH tunnel connections per sandbox.
 const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;

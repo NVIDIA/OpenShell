@@ -386,7 +386,7 @@ This section defines the primary attacker profiles, what the current design prot
 | Weak cryptoperiod | Certificates are effectively non-expiring by default |
 | Limited fine-grained revocation | CA private key is not persisted; rotation is coarse-grained |
 | Local credential theft risk | CLI mTLS key material is stored on developer filesystem |
-| SSH token + mTLS = persistent access within trust boundary | SSH tokens expire after 24h (configurable) and are capped at 10 concurrent connections per token / 20 per sandbox, but within the mTLS trust boundary a stolen token remains usable until TTL expires |
+| SSH token + mTLS = persistent access within trust boundary | SSH tokens expire after 24h (configurable) and are capped at 3 concurrent connections per token / 20 per sandbox, but within the mTLS trust boundary a stolen token remains usable until TTL expires |
 
 ### Out of Scope / Not Defended By This Layer
 
