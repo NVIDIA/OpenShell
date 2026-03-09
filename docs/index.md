@@ -175,6 +175,12 @@ CLI commands, policy schema, environment variables, and system architecture.
 ::::
 
 ```{toctree}
+:hidden:
+
+Home <self>
+```
+
+```{toctree}
 :caption: About
 :hidden:
 
