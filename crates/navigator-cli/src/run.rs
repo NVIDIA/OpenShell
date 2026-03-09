@@ -1983,7 +1983,7 @@ fn inferred_provider_type(command: &[String]) -> Option<String> {
 ///
 /// Returns a deduplicated list of provider **names** suitable for
 /// `SandboxSpec.providers`.
-async fn ensure_required_providers(
+pub async fn ensure_required_providers(
     client: &mut NavigatorClient<Channel>,
     explicit_names: &[String],
     inferred_types: &[String],
@@ -1996,20 +1996,14 @@ async fn ensure_required_providers(
     let mut configured_names: Vec<String> = Vec::new();
     let mut seen_names: HashSet<String> = HashSet::new();
 
-    // ── Explicit provider names (validated server-side) ───────────────────
-    for name in explicit_names {
-        if seen_names.insert(name.clone()) {
-            configured_names.push(name.clone());
-        }
-    }
-
-    // ── Resolve inferred provider types ───────────────────────────────────
-    if !inferred_types.is_empty() {
-        // Map from lowercase type -> first provider name found with that type.
-        let mut type_to_name: HashMap<String, String> = HashMap::new();
+    // ── Fetch all existing providers ─────────────────────────────────────
+    // Build both a name set (for explicit --provider lookups) and a
+    // type-to-name map (for inferred provider resolution).
+    let mut known_names: HashSet<String> = HashSet::new();
+    let mut type_to_name: HashMap<String, String> = HashMap::new();
+    {
         let mut offset = 0_u32;
         let limit = 100_u32;
-
         loop {
             let response = client
                 .list_providers(ListProvidersRequest { limit, offset })
@@ -2017,6 +2011,7 @@ async fn ensure_required_providers(
                 .into_diagnostic()?;
             let providers = response.into_inner().providers;
             for provider in &providers {
+                known_names.insert(provider.name.clone());
                 if !provider.r#type.is_empty() {
                     let type_lower = provider.r#type.to_ascii_lowercase();
                     type_to_name
@@ -2024,13 +2019,47 @@ async fn ensure_required_providers(
                         .or_insert_with(|| provider.name.clone());
                 }
             }
-
             if providers.len() < limit as usize {
                 break;
             }
             offset = offset.saturating_add(limit);
         }
+    }
 
+    // ── Explicit provider names ──────────────────────────────────────────
+    // If the name exists on the server, use it directly. Otherwise, if the
+    // name matches a known provider type, auto-create a provider of that
+    // type with the requested name.
+    for name in explicit_names {
+        if known_names.contains(name) {
+            if seen_names.insert(name.clone()) {
+                configured_names.push(name.clone());
+            }
+        } else if let Some(provider_type) = normalize_provider_type(name) {
+            auto_create_provider(
+                client,
+                provider_type,
+                Some(name),
+                auto_providers_override,
+                &mut seen_names,
+                &mut configured_names,
+            )
+            .await?;
+            // Record the type mapping so the inferred-types pass below
+            // doesn't attempt to create a duplicate provider.
+            type_to_name
+                .entry(provider_type.to_ascii_lowercase())
+                .or_insert_with(|| name.clone());
+        } else {
+            return Err(miette::miette!(
+                "provider '{name}' not found and '{name}' is not a recognized provider type. \
+                 Create it first with `nemoclaw provider create --type <type> --name {name}`"
+            ));
+        }
+    }
+
+    // ── Resolve inferred provider types ──────────────────────────────────
+    if !inferred_types.is_empty() {
         // Collect resolved names for types that already have a provider.
         for t in inferred_types {
             if let Some(name) = type_to_name.get(&t.to_ascii_lowercase())
@@ -2046,119 +2075,172 @@ async fn ensure_required_providers(
             .cloned()
             .collect::<Vec<_>>();
 
-        if !missing.is_empty() {
-            // --no-auto-providers: skip all missing providers silently.
-            if auto_providers_override == Some(false) {
-                for provider_type in &missing {
-                    eprintln!(
-                        "{} Skipping provider '{provider_type}' (--no-auto-providers)",
-                        "!".yellow(),
-                    );
-                }
-                return Ok(configured_names);
-            }
-
-            // No override and non-interactive: error.
-            if auto_providers_override.is_none() && !std::io::stdin().is_terminal() {
-                return Err(miette::miette!(
-                    "missing required providers: {}. Create them first with \
-                     `nemoclaw provider create --type <type> --name <name> --from-existing`, \
-                     pass --auto-providers to auto-create, or set them up manually from inside the sandbox",
-                    missing.join(", ")
-                ));
-            }
-
-            let registry = ProviderRegistry::new();
-            for provider_type in missing {
-                eprintln!("Missing provider: {provider_type}");
-
-                // --auto-providers: auto-confirm all.
-                let should_create = if auto_providers_override == Some(true) {
-                    true
-                } else {
-                    Confirm::new()
-                        .with_prompt("Create from local credentials?")
-                        .default(true)
-                        .interact()
-                        .into_diagnostic()?
-                };
-
-                if !should_create {
-                    eprintln!("{} Skipping provider '{provider_type}'", "!".yellow(),);
-                    eprintln!();
-                    continue;
-                }
-
-                let discovered = registry.discover_existing(&provider_type).map_err(|err| {
-                    miette::miette!("failed to discover provider '{provider_type}': {err}")
-                })?;
-                let Some(discovered) = discovered else {
-                    eprintln!(
-                        "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
-                        "!".yellow(),
-                        provider_type
-                    );
-                    eprintln!();
-                    continue;
-                };
-
-                let mut created = false;
-                for attempt in 0..5 {
-                    let name = if attempt == 0 {
-                        provider_type.clone()
-                    } else {
-                        format!("{provider_type}-{attempt}")
-                    };
-
-                    let request = CreateProviderRequest {
-                        provider: Some(Provider {
-                            id: String::new(),
-                            name: name.clone(),
-                            r#type: provider_type.clone(),
-                            credentials: discovered.credentials.clone(),
-                            config: discovered.config.clone(),
-                        }),
-                    };
-
-                    match client.create_provider(request).await {
-                        Ok(response) => {
-                            let provider = response
-                                .into_inner()
-                                .provider
-                                .ok_or_else(|| miette::miette!("provider missing from response"))?;
-                            eprintln!(
-                                "{} Created provider {} ({}) from existing local state",
-                                "✓".green().bold(),
-                                provider.name,
-                                provider.r#type
-                            );
-                            if seen_names.insert(provider.name.clone()) {
-                                configured_names.push(provider.name);
-                            }
-                            created = true;
-                            break;
-                        }
-                        Err(status) if status.code() == Code::AlreadyExists => {}
-                        Err(status) => {
-                            return Err(miette::miette!(
-                                "failed to create provider for type '{provider_type}': {status}"
-                            ));
-                        }
-                    }
-                }
-
-                if !created {
-                    return Err(miette::miette!(
-                        "failed to create provider for type '{provider_type}' after name retries"
-                    ));
-                }
-
-                eprintln!();
-            }
+        for provider_type in missing {
+            auto_create_provider(
+                client,
+                &provider_type,
+                None,
+                auto_providers_override,
+                &mut seen_names,
+                &mut configured_names,
+            )
+            .await?;
         }
     }
 
     Ok(configured_names)
+}
+
+/// Prompt for (or auto-confirm) creation of a provider from local credentials.
+///
+/// When `preferred_name` is `Some`, the provider is created with that exact
+/// name (used for explicit `--provider <name>` values). When `None`, the name
+/// defaults to the type and retries with suffixes on conflict (used for
+/// inferred provider types).
+async fn auto_create_provider(
+    client: &mut NavigatorClient<Channel>,
+    provider_type: &str,
+    preferred_name: Option<&str>,
+    auto_providers_override: Option<bool>,
+    seen_names: &mut HashSet<String>,
+    configured_names: &mut Vec<String>,
+) -> Result<()> {
+    eprintln!("Missing provider: {provider_type}");
+
+    // --no-auto-providers: skip silently.
+    if auto_providers_override == Some(false) {
+        eprintln!(
+            "{} Skipping provider '{provider_type}' (--no-auto-providers)",
+            "!".yellow(),
+        );
+        eprintln!();
+        return Ok(());
+    }
+
+    // No override and non-interactive: error.
+    if auto_providers_override.is_none() && !std::io::stdin().is_terminal() {
+        return Err(miette::miette!(
+            "missing required provider '{provider_type}'. Create it first with \
+             `nemoclaw provider create --type {provider_type} --name {provider_type} --from-existing`, \
+             pass --auto-providers to auto-create, or set it up manually from inside the sandbox"
+        ));
+    }
+
+    // --auto-providers: auto-confirm; otherwise prompt.
+    let should_create = if auto_providers_override == Some(true) {
+        true
+    } else {
+        Confirm::new()
+            .with_prompt("Create from local credentials?")
+            .default(true)
+            .interact()
+            .into_diagnostic()?
+    };
+
+    if !should_create {
+        eprintln!("{} Skipping provider '{provider_type}'", "!".yellow());
+        eprintln!();
+        return Ok(());
+    }
+
+    let registry = ProviderRegistry::new();
+    let discovered = registry
+        .discover_existing(provider_type)
+        .map_err(|err| miette::miette!("failed to discover provider '{provider_type}': {err}"))?;
+    let Some(discovered) = discovered else {
+        eprintln!(
+            "{} No existing local credentials/config found for '{}'. You can configure it from inside the sandbox.",
+            "!".yellow(),
+            provider_type
+        );
+        eprintln!();
+        return Ok(());
+    };
+
+    if let Some(exact_name) = preferred_name {
+        // Explicit name: create with exactly that name, no retries.
+        let request = CreateProviderRequest {
+            provider: Some(Provider {
+                id: String::new(),
+                name: exact_name.to_string(),
+                r#type: provider_type.to_string(),
+                credentials: discovered.credentials.clone(),
+                config: discovered.config.clone(),
+            }),
+        };
+
+        let response = client.create_provider(request).await.map_err(|status| {
+            miette::miette!("failed to create provider '{exact_name}': {status}")
+        })?;
+        let provider = response
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider missing from response"))?;
+        eprintln!(
+            "{} Created provider {} ({}) from existing local state",
+            "✓".green().bold(),
+            provider.name,
+            provider.r#type
+        );
+        if seen_names.insert(provider.name.clone()) {
+            configured_names.push(provider.name);
+        }
+    } else {
+        // Inferred type: try type as name, then suffixed variants.
+        let mut created = false;
+        for attempt in 0..5 {
+            let name = if attempt == 0 {
+                provider_type.to_string()
+            } else {
+                format!("{provider_type}-{attempt}")
+            };
+
+            let request = CreateProviderRequest {
+                provider: Some(Provider {
+                    id: String::new(),
+                    name: name.clone(),
+                    r#type: provider_type.to_string(),
+                    credentials: discovered.credentials.clone(),
+                    config: discovered.config.clone(),
+                }),
+            };
+
+            match client.create_provider(request).await {
+                Ok(response) => {
+                    let provider = response
+                        .into_inner()
+                        .provider
+                        .ok_or_else(|| miette::miette!("provider missing from response"))?;
+                    eprintln!(
+                        "{} Created provider {} ({}) from existing local state",
+                        "✓".green().bold(),
+                        provider.name,
+                        provider.r#type
+                    );
+                    if seen_names.insert(provider.name.clone()) {
+                        configured_names.push(provider.name);
+                    }
+                    created = true;
+                    break;
+                }
+                Err(status) if status.code() == Code::AlreadyExists => {}
+                Err(status) => {
+                    return Err(miette::miette!(
+                        "failed to create provider for type '{provider_type}': {status}"
+                    ));
+                }
+            }
+        }
+
+        if !created {
+            return Err(miette::miette!(
+                "failed to create provider for type '{provider_type}' after name retries"
+            ));
+        }
+    }
+
+    eprintln!();
+    Ok(())
 }
 
 fn parse_key_value_pairs(items: &[String], flag: &str) -> Result<HashMap<String, String>> {
