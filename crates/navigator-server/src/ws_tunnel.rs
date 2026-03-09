@@ -12,11 +12,12 @@
 //!
 //! This handler:
 //! 1. Accepts a WebSocket upgrade on `/_ws_tunnel`.
-//! 2. Opens a TCP connection back to itself (`127.0.0.1:<bind_port>`).
-//! 3. Bidirectionally copies bytes between the WebSocket and the TCP stream.
+//! 2. Spawns an in-memory connection into the normal `MultiplexedService`.
+//! 3. Bidirectionally copies bytes between the WebSocket and that stream.
 //!
-//! The loopback TCP connection enters the normal `MultiplexedService` path,
-//! which inspects `content-type` and routes gRPC traffic to the gRPC service.
+//! Using an in-memory stream keeps the tunnel mode-independent: it works for
+//! both plaintext gateways and TLS-backed gateways without needing to re-enter
+//! the public listener or negotiate a second local TLS hop.
 
 use axum::{
     Router,
@@ -26,8 +27,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use std::sync::Arc;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, warn};
 
 use crate::ServerState;
@@ -44,60 +44,63 @@ async fn ws_tunnel_handler(
     State(state): State<Arc<ServerState>>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
-    let bind_addr = state.config.bind_address;
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws_tunnel(socket, bind_addr).await {
+        if let Err(e) = handle_ws_tunnel(socket, state).await {
             warn!(error = %e, "WebSocket tunnel connection failed");
         }
     })
 }
 
-/// Pipe bytes between the WebSocket and a loopback TCP connection.
+/// Pipe bytes between the WebSocket and an in-memory `MultiplexService` stream.
 async fn handle_ws_tunnel(
     ws: axum::extract::ws::WebSocket,
-    bind_addr: std::net::SocketAddr,
+    state: Arc<ServerState>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Connect back to ourselves on the loopback interface.
-    let loopback = format!("127.0.0.1:{}", bind_addr.port());
-    debug!(target = %loopback, "WS tunnel: opening loopback TCP connection");
-
-    let tcp_stream = TcpStream::connect(&loopback).await?;
-    tcp_stream.set_nodelay(true)?;
-
-    debug!("WS tunnel: loopback connected, starting bidirectional copy");
+    let service = crate::MultiplexService::new(state);
+    let (tunnel_stream, service_stream) = tokio::io::duplex(64 * 1024);
+    debug!("WS tunnel: spawned in-memory multiplex connection");
 
     let (ws_sink, ws_source) = ws.split();
-    let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
+    let (tunnel_read, tunnel_write) = tokio::io::split(tunnel_stream);
 
-    let tcp_to_ws = tokio::spawn(copy_tcp_to_ws(tcp_read, ws_sink));
-    let ws_to_tcp = tokio::spawn(copy_ws_to_tcp(ws_source, tcp_write));
-
-    // When either direction finishes, the other is implicitly cancelled
-    // by dropping the join handle.
-    tokio::select! {
-        res = tcp_to_ws => {
-            if let Ok(Err(e)) = res {
-                debug!(error = %e, "WS tunnel: tcp->ws error");
-            }
+    let service_task = tokio::spawn(async move {
+        if let Err(e) = service.serve(service_stream).await {
+            debug!(error = %e, "WS tunnel: multiplex service error");
         }
-        res = ws_to_tcp => {
+    });
+    let mut tunnel_to_ws = tokio::spawn(copy_reader_to_ws(tunnel_read, ws_sink));
+    let mut ws_to_tunnel = tokio::spawn(copy_ws_to_writer(ws_source, tunnel_write));
+
+    tokio::select! {
+        res = &mut tunnel_to_ws => {
             if let Ok(Err(e)) = res {
-                debug!(error = %e, "WS tunnel: ws->tcp error");
+                debug!(error = %e, "WS tunnel: tunnel->ws error");
             }
+            ws_to_tunnel.abort();
+        }
+        res = &mut ws_to_tunnel => {
+            if let Ok(Err(e)) = res {
+                debug!(error = %e, "WS tunnel: ws->tunnel error");
+            }
+            tunnel_to_ws.abort();
         }
     }
+    service_task.abort();
 
     Ok(())
 }
 
-/// Copy bytes from the loopback TCP stream into WebSocket binary frames.
-async fn copy_tcp_to_ws(
-    mut tcp_read: tokio::io::ReadHalf<TcpStream>,
+/// Copy bytes from an async reader into WebSocket binary frames.
+async fn copy_reader_to_ws<R>(
+    mut reader: R,
     mut ws_sink: futures::stream::SplitSink<axum::extract::ws::WebSocket, Message>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = vec![0u8; 32 * 1024];
     loop {
-        match tcp_read.read(&mut buf).await {
+        match reader.read(&mut buf).await {
             Ok(0) => {
                 let _ = ws_sink.close().await;
                 break;
@@ -121,21 +124,24 @@ async fn copy_tcp_to_ws(
     Ok(())
 }
 
-/// Copy bytes from WebSocket binary frames into the loopback TCP stream.
-async fn copy_ws_to_tcp(
+/// Copy bytes from WebSocket binary/text frames into an async writer.
+async fn copy_ws_to_writer<W>(
     mut ws_source: futures::stream::SplitStream<axum::extract::ws::WebSocket>,
-    mut tcp_write: tokio::io::WriteHalf<TcpStream>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    mut writer: W,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    W: AsyncWrite + Unpin,
+{
     while let Some(msg) = ws_source.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                if tcp_write.write_all(&data).await.is_err() {
+                if writer.write_all(&data).await.is_err() {
                     break;
                 }
             }
             Ok(Message::Text(text)) => {
                 // Some proxies send text frames — treat as binary.
-                if tcp_write.write_all(text.as_bytes()).await.is_err() {
+                if writer.write_all(text.as_bytes()).await.is_err() {
                     break;
                 }
             }
@@ -149,6 +155,6 @@ async fn copy_ws_to_tcp(
             }
         }
     }
-    let _ = tcp_write.shutdown().await;
+    let _ = writer.shutdown().await;
     Ok(())
 }

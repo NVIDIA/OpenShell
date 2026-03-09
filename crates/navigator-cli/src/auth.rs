@@ -9,10 +9,27 @@
 //! A confirmation code binds the browser session to this CLI session,
 //! preventing port-redirection attacks.
 
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::{
+    Method, Request, Response, StatusCode,
+    body::Incoming,
+    header::{
+        ACCESS_CONTROL_ALLOW_HEADERS, ACCESS_CONTROL_ALLOW_METHODS, ACCESS_CONTROL_ALLOW_ORIGIN,
+        ACCESS_CONTROL_MAX_AGE, CONTENT_TYPE, ORIGIN, VARY,
+    },
+    service::service_fn,
+};
+use hyper_util::{
+    rt::{TokioExecutor, TokioIo},
+    server::conn::auto::Builder,
+};
 use miette::{IntoDiagnostic, Result};
+use serde::Deserialize;
+use std::convert::Infallible;
 use std::io::Write;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 use tracing::debug;
@@ -177,15 +194,173 @@ fn extract_origin(gateway_endpoint: &str) -> Option<String> {
     Some(format!("{scheme}://{host}"))
 }
 
-/// Build CORS headers for the given allowed origin.
-fn cors_headers(allowed_origin: &str) -> String {
-    format!(
-        "Access-Control-Allow-Origin: {allowed_origin}\r\n\
-         Access-Control-Allow-Methods: POST, OPTIONS\r\n\
-         Access-Control-Allow-Headers: Content-Type\r\n\
-         Access-Control-Max-Age: 60\r\n\
-         Vary: Origin"
-    )
+#[derive(Deserialize)]
+struct CallbackPayload {
+    token: String,
+    code: String,
+}
+
+struct CallbackServerState {
+    allowed_origin: Option<String>,
+    expected_code: String,
+    tx: Mutex<Option<oneshot::Sender<String>>>,
+}
+
+impl CallbackServerState {
+    fn take_sender(&self) -> Option<oneshot::Sender<String>> {
+        self.tx
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+type CallbackResponse = Response<Full<Bytes>>;
+
+fn callback_response(
+    status: StatusCode,
+    allowed_origin: Option<&str>,
+    content_type: Option<&str>,
+    body: impl Into<Bytes>,
+) -> CallbackResponse {
+    let mut response = Response::new(Full::new(body.into()));
+    *response.status_mut() = status;
+    let headers = response.headers_mut();
+    if let Some(origin) = allowed_origin {
+        headers.insert(
+            ACCESS_CONTROL_ALLOW_ORIGIN,
+            hyper::header::HeaderValue::from_str(origin).expect("callback origin is valid"),
+        );
+        headers.insert(
+            ACCESS_CONTROL_ALLOW_METHODS,
+            hyper::header::HeaderValue::from_static("POST, OPTIONS"),
+        );
+        headers.insert(
+            ACCESS_CONTROL_ALLOW_HEADERS,
+            hyper::header::HeaderValue::from_static("Content-Type"),
+        );
+        headers.insert(
+            ACCESS_CONTROL_MAX_AGE,
+            hyper::header::HeaderValue::from_static("60"),
+        );
+        headers.insert(VARY, hyper::header::HeaderValue::from_static("Origin"));
+    }
+    if let Some(content_type) = content_type {
+        headers.insert(
+            CONTENT_TYPE,
+            hyper::header::HeaderValue::from_str(content_type)
+                .expect("callback content type is valid"),
+        );
+    }
+    response
+}
+
+fn empty_response(status: StatusCode, allowed_origin: Option<&str>) -> CallbackResponse {
+    callback_response(status, allowed_origin, None, Bytes::new())
+}
+
+fn json_response(
+    status: StatusCode,
+    allowed_origin: Option<&str>,
+    body: &'static str,
+) -> CallbackResponse {
+    callback_response(status, allowed_origin, Some("application/json"), body)
+}
+
+async fn handle_callback_request(
+    req: Request<Incoming>,
+    state: Arc<CallbackServerState>,
+) -> CallbackResponse {
+    let method = req.method().clone();
+    let path = req.uri().path().to_string();
+    debug!(method = %method, path = %path, "callback request received");
+
+    let allowed_origin = state.allowed_origin.as_deref();
+    if path != "/callback" {
+        return empty_response(StatusCode::NOT_FOUND, allowed_origin);
+    }
+
+    if let Some(expected_origin) = allowed_origin {
+        let request_origin = req
+            .headers()
+            .get(ORIGIN)
+            .and_then(|value| value.to_str().ok());
+        if request_origin != Some(expected_origin) {
+            debug!(
+                request_origin = ?request_origin,
+                allowed_origin = expected_origin,
+                "callback origin mismatch"
+            );
+            let _ = state.take_sender();
+            return json_response(
+                StatusCode::FORBIDDEN,
+                allowed_origin,
+                r#"{"ok":false,"error":"origin not allowed"}"#,
+            );
+        }
+    }
+
+    if method == Method::OPTIONS {
+        return empty_response(StatusCode::NO_CONTENT, allowed_origin);
+    }
+
+    if method != Method::POST {
+        return json_response(
+            StatusCode::METHOD_NOT_ALLOWED,
+            allowed_origin,
+            r#"{"error":"method not allowed"}"#,
+        );
+    }
+
+    let body = match req.into_body().collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(error) => {
+            debug!(error = %error, "failed to read callback body");
+            let _ = state.take_sender();
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                allowed_origin,
+                r#"{"ok":false,"error":"invalid request body"}"#,
+            );
+        }
+    };
+
+    let payload: CallbackPayload = match serde_json::from_slice(&body) {
+        Ok(payload) => payload,
+        Err(error) => {
+            debug!(error = %error, "failed to decode callback JSON");
+            let _ = state.take_sender();
+            return json_response(
+                StatusCode::BAD_REQUEST,
+                allowed_origin,
+                r#"{"ok":false,"error":"missing token or code"}"#,
+            );
+        }
+    };
+
+    if payload.token.is_empty() || payload.code.is_empty() {
+        let _ = state.take_sender();
+        return json_response(
+            StatusCode::BAD_REQUEST,
+            allowed_origin,
+            r#"{"ok":false,"error":"missing token or code"}"#,
+        );
+    }
+
+    if payload.code != state.expected_code {
+        let _ = state.take_sender();
+        return json_response(
+            StatusCode::FORBIDDEN,
+            allowed_origin,
+            r#"{"ok":false,"error":"confirmation code mismatch"}"#,
+        );
+    }
+
+    if let Some(sender) = state.take_sender() {
+        let _ = sender.send(payload.token);
+    }
+
+    json_response(StatusCode::OK, allowed_origin, r#"{"ok":true}"#)
 }
 
 /// Run the ephemeral callback server.
@@ -204,225 +379,37 @@ async fn run_callback_server(
     expected_code: String,
     gateway_endpoint: String,
 ) {
-    let allowed_origin = extract_origin(&gateway_endpoint).unwrap_or_default();
-    // We may need to handle up to two requests: one OPTIONS preflight, then
-    // the actual POST. Use a loop with a request limit.
-    let mut tx = Some(tx);
-    for _ in 0..2 {
-        let Ok((mut stream, _)) = listener.accept().await else {
+    let state = Arc::new(CallbackServerState {
+        allowed_origin: extract_origin(&gateway_endpoint),
+        expected_code,
+        tx: Mutex::new(Some(tx)),
+    });
+
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
             return;
         };
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let service = service_fn(move |req| {
+                let state = Arc::clone(&state);
+                async move { Ok::<_, Infallible>(handle_callback_request(req, state).await) }
+            });
 
-        let mut buf = vec![0u8; 16384];
-        let Ok(n) = stream.read(&mut buf).await else {
-            continue;
-        };
-
-        let request = String::from_utf8_lossy(&buf[..n]);
-        let request_line = request.lines().next().unwrap_or("");
-        debug!(request_line = %request_line, "callback request received");
-
-        let method = request_line.split_whitespace().next().unwrap_or("");
-        let path = request_line.split_whitespace().nth(1).unwrap_or("");
-        let cors = cors_headers(&allowed_origin);
-
-        if !path.starts_with("/callback") {
-            let response = format!(
-                "HTTP/1.1 404 Not Found\r\n\
-                 {cors}\r\n\
-                 Content-Length: 0\r\n\
-                 Connection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-            continue;
-        }
-
-        // Validate the Origin header — only the gateway origin is allowed.
-        // A mismatch terminates the server: if the origin is wrong, no
-        // subsequent request from that browser session will be valid either.
-        let request_origin = extract_header(&request, "Origin");
-        if !allowed_origin.is_empty() {
-            match request_origin {
-                Some(ref origin) if origin == &allowed_origin => {}
-                _ => {
-                    debug!(
-                        request_origin = ?request_origin,
-                        allowed_origin = %allowed_origin,
-                        "CORS origin mismatch — rejecting request"
-                    );
-                    let body = r#"{"ok":false,"error":"origin not allowed"}"#;
-                    let response = format!(
-                        "HTTP/1.1 403 Forbidden\r\n\
-                         {cors}\r\n\
-                         Content-Type: application/json\r\n\
-                         Content-Length: {}\r\n\
-                         Connection: close\r\n\r\n\
-                         {body}",
-                        body.len(),
-                    );
-                    let _ = stream.write_all(response.as_bytes()).await;
-                    let _ = stream.shutdown().await;
-                    return;
-                }
+            if let Err(error) = Builder::new(TokioExecutor::new())
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+            {
+                debug!(error = %error, "callback server connection failed");
             }
-        }
-
-        if method == "OPTIONS" {
-            // CORS preflight response.
-            let response = format!(
-                "HTTP/1.1 204 No Content\r\n\
-                 {cors}\r\n\
-                 Content-Length: 0\r\n\
-                 Connection: close\r\n\r\n"
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-            continue;
-        }
-
-        if method != "POST" {
-            let body = r#"{"error":"method not allowed"}"#;
-            let response = format!(
-                "HTTP/1.1 405 Method Not Allowed\r\n\
-                 {cors}\r\n\
-                 Content-Type: application/json\r\n\
-                 Content-Length: {}\r\n\
-                 Connection: close\r\n\r\n\
-                 {}",
-                body.len(),
-                body,
-            );
-            let _ = stream.write_all(response.as_bytes()).await;
-            let _ = stream.shutdown().await;
-            // Non-POST, non-OPTIONS request — continue loop (could be a
-            // stray request before the real POST arrives).
-            continue;
-        }
-
-        // Parse the JSON body from the POST request.
-        let body = extract_body(&request);
-        let (token, code) = parse_callback_json(body);
-
-        let (status, response_body) = match (token, code) {
-            (Some(ref t), Some(ref c)) if !t.is_empty() && c == &expected_code => {
-                if let Some(sender) = tx.take() {
-                    let _ = sender.send(t.clone());
-                }
-                ("200 OK", r#"{"ok":true}"#)
-            }
-            (Some(_), Some(_)) => {
-                // Code mismatch — possible port-redirection attack.
-                (
-                    "403 Forbidden",
-                    r#"{"ok":false,"error":"confirmation code mismatch"}"#,
-                )
-            }
-            _ => (
-                "400 Bad Request",
-                r#"{"ok":false,"error":"missing token or code"}"#,
-            ),
-        };
-
-        let response = format!(
-            "HTTP/1.1 {status}\r\n\
-             {cors}\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Connection: close\r\n\r\n\
-             {}",
-            response_body.len(),
-            response_body,
-        );
-        let _ = stream.write_all(response.as_bytes()).await;
-        let _ = stream.shutdown().await;
-
-        // POST always terminates the loop — whether success or failure.
-        // On success, `tx` is consumed. On failure, dropping `tx` signals
-        // the receiver that auth failed.
-        return;
+        });
     }
-}
-
-/// Extract a header value from a raw HTTP request string (case-insensitive).
-fn extract_header<'a>(request: &'a str, name: &str) -> Option<String> {
-    let lower_name = name.to_ascii_lowercase();
-    for line in request.lines() {
-        if let Some((key, value)) = line.split_once(':') {
-            if key.trim().to_ascii_lowercase() == lower_name {
-                return Some(value.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Extract the HTTP body from a raw request string.
-///
-/// Finds the `\r\n\r\n` header/body boundary and returns the body portion.
-fn extract_body(request: &str) -> &str {
-    request
-        .find("\r\n\r\n")
-        .map(|i| &request[i + 4..])
-        .unwrap_or("")
-}
-
-/// Parse `{"token":"...","code":"..."}` from a JSON body.
-///
-/// Uses a minimal hand-written parser to avoid pulling in serde for the CLI
-/// callback server. Only extracts the `token` and `code` string fields.
-fn parse_callback_json(body: &str) -> (Option<String>, Option<String>) {
-    let token = extract_json_string(body, "token");
-    let code = extract_json_string(body, "code");
-    (token, code)
-}
-
-/// Extract a string value for the given key from a JSON object body.
-///
-/// Handles JSON string escapes (`\"`, `\\`). This is intentionally minimal —
-/// it only needs to handle well-formed requests from our own JavaScript.
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    // Look for `"key":"` pattern.
-    let pattern = format!("\"{}\"", key);
-    let key_pos = json.find(&pattern)?;
-    let after_key = &json[key_pos + pattern.len()..];
-
-    // Skip optional whitespace and the colon.
-    let after_colon = after_key.trim_start().strip_prefix(':')?;
-    let after_colon = after_colon.trim_start();
-
-    // Expect opening quote.
-    let value_start = after_colon.strip_prefix('"')?;
-
-    // Read until unescaped closing quote.
-    let mut result = String::new();
-    let mut chars = value_start.chars();
-    loop {
-        match chars.next()? {
-            '\\' => {
-                // Handle escaped character.
-                match chars.next()? {
-                    '"' => result.push('"'),
-                    '\\' => result.push('\\'),
-                    '/' => result.push('/'),
-                    'n' => result.push('\n'),
-                    't' => result.push('\t'),
-                    other => {
-                        result.push('\\');
-                        result.push(other);
-                    }
-                }
-            }
-            '"' => break,
-            c => result.push(c),
-        }
-    }
-    Some(result)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     // ---------------------------------------------------------------
     // Confirmation code generation
@@ -457,53 +444,6 @@ mod tests {
     }
 
     // ---------------------------------------------------------------
-    // JSON parsing
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_callback_json_basic() {
-        let body = r#"{"token":"my-jwt-123","code":"ABC-1234"}"#;
-        let (token, code) = parse_callback_json(body);
-        assert_eq!(token.as_deref(), Some("my-jwt-123"));
-        assert_eq!(code.as_deref(), Some("ABC-1234"));
-    }
-
-    #[test]
-    fn parse_callback_json_with_escapes() {
-        let body = r#"{"token":"jwt-with-\"quotes\"","code":"XY7-9KLM"}"#;
-        let (token, code) = parse_callback_json(body);
-        assert_eq!(token.as_deref(), Some("jwt-with-\"quotes\""));
-        assert_eq!(code.as_deref(), Some("XY7-9KLM"));
-    }
-
-    #[test]
-    fn parse_callback_json_missing_fields() {
-        let body = r#"{"token":"jwt"}"#;
-        let (token, code) = parse_callback_json(body);
-        assert_eq!(token.as_deref(), Some("jwt"));
-        assert_eq!(code, None);
-    }
-
-    #[test]
-    fn parse_callback_json_empty_body() {
-        let (token, code) = parse_callback_json("");
-        assert_eq!(token, None);
-        assert_eq!(code, None);
-    }
-
-    #[test]
-    fn extract_body_finds_content() {
-        let request =
-            "POST /callback HTTP/1.1\r\nContent-Type: application/json\r\n\r\n{\"token\":\"x\"}";
-        assert_eq!(extract_body(request), "{\"token\":\"x\"}");
-    }
-
-    #[test]
-    fn extract_body_no_boundary() {
-        assert_eq!(extract_body("no boundary here"), "");
-    }
-
-    // ---------------------------------------------------------------
     // Origin extraction
     // ---------------------------------------------------------------
 
@@ -534,35 +474,6 @@ mod tests {
     #[test]
     fn extract_origin_no_scheme() {
         assert_eq!(extract_origin("gateway.example.com"), None);
-    }
-
-    // ---------------------------------------------------------------
-    // Header extraction
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn extract_header_finds_origin() {
-        let request =
-            "POST /callback HTTP/1.1\r\nHost: 127.0.0.1\r\nOrigin: https://gw.example.com\r\n\r\n";
-        assert_eq!(
-            extract_header(request, "Origin"),
-            Some("https://gw.example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_header_case_insensitive() {
-        let request = "POST /callback HTTP/1.1\r\norigin: https://gw.example.com\r\n\r\n";
-        assert_eq!(
-            extract_header(request, "Origin"),
-            Some("https://gw.example.com".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_header_missing() {
-        let request = "POST /callback HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n";
-        assert_eq!(extract_header(request, "Origin"), None);
     }
 
     // ---------------------------------------------------------------
@@ -633,12 +544,17 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let n = stream.read(&mut buf).await.unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
+        let expected_header = format!("access-control-allow-origin: {TEST_GATEWAY}");
         assert!(
-            response.contains(&format!("Access-Control-Allow-Origin: {TEST_GATEWAY}")),
+            response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected_header)),
             "response should reflect gateway origin:\n{response}"
         );
         assert!(
-            !response.contains("Access-Control-Allow-Origin: *"),
+            !response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("access-control-allow-origin: *")),
             "response should NOT use wildcard origin:\n{response}"
         );
     }
@@ -843,12 +759,15 @@ mod tests {
         let mut buf = vec![0u8; 4096];
         let n = stream.read(&mut buf).await.unwrap();
         let response = String::from_utf8_lossy(&buf[..n]);
+        let expected_header = format!("access-control-allow-origin: {TEST_GATEWAY}");
         assert!(
             response.contains("204 No Content"),
             "preflight should return 204:\n{response}"
         );
         assert!(
-            response.contains(&format!("Access-Control-Allow-Origin: {TEST_GATEWAY}")),
+            response
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case(&expected_header)),
             "preflight should reflect gateway origin:\n{response}"
         );
 
@@ -869,6 +788,39 @@ mod tests {
 
         let token = rx.await.unwrap();
         assert_eq!(token, "jwt-after-preflight");
+    }
+
+    #[tokio::test]
+    async fn callback_server_handles_fragmented_post_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(run_callback_server(
+            listener,
+            tx,
+            "ABC-1234".to_string(),
+            TEST_GATEWAY.to_string(),
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let body = r#"{"token":"fragmented-jwt","code":"ABC-1234"}"#;
+        let headers = format!(
+            "POST /callback HTTP/1.1\r\n\
+             Host: 127.0.0.1\r\n\
+             Origin: {TEST_GATEWAY}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\r\n",
+            body.len(),
+        );
+
+        stream.write_all(headers.as_bytes()).await.unwrap();
+        stream.write_all(&body.as_bytes()[..18]).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        stream.write_all(&body.as_bytes()[18..]).await.unwrap();
+
+        let token = rx.await.unwrap();
+        assert_eq!(token, "fragmented-jwt");
     }
 
     #[tokio::test]

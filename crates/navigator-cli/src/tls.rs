@@ -8,12 +8,13 @@ use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
+use std::collections::HashMap;
 use std::io::Cursor;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::Duration;
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -225,30 +226,43 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
-/// Global tunnel proxy address.  Started once on the first
-/// `build_channel` call that uses CF bearer auth, then reused for all
-/// subsequent connections in the same process.
-static CF_TUNNEL_ADDR: OnceLock<OnceCell<SocketAddr>> = OnceLock::new();
+/// Tunnel proxy addresses keyed by upstream endpoint + token.
+///
+/// Each distinct Cloudflare-backed gateway gets its own local proxy instead of
+/// reusing the first gateway touched in the current process.
+static CF_TUNNEL_ADDRS: OnceLock<Mutex<HashMap<(String, String), SocketAddr>>> = OnceLock::new();
+
+async fn cf_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
+    let key = (server.to_string(), token.to_string());
+    let registry = CF_TUNNEL_ADDRS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    {
+        let addrs = registry.lock().await;
+        if let Some(addr) = addrs.get(&key).copied() {
+            return Ok(addr);
+        }
+    }
+
+    let proxy = crate::cf_tunnel::start_tunnel_proxy(server, token).await?;
+    debug!(
+        local_addr = %proxy.local_addr,
+        server,
+        "CF tunnel proxy started, routing gRPC through local proxy"
+    );
+
+    let mut addrs = registry.lock().await;
+    Ok(*addrs.entry(key).or_insert(proxy.local_addr))
+}
 
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     // When CF bearer auth is active and the server is HTTPS (behind CF),
     // route traffic through a local WebSocket tunnel proxy instead.
     if tls.is_bearer_auth() && server.starts_with("https://") {
-        let cell = CF_TUNNEL_ADDR.get_or_init(OnceCell::new);
-        let local_addr = cell
-            .get_or_try_init(|| async {
-                let token = tls
-                    .cf_token
-                    .as_deref()
-                    .ok_or_else(|| miette::miette!("CF token required for tunnel"))?;
-                let proxy = crate::cf_tunnel::start_tunnel_proxy(server, token).await?;
-                debug!(
-                    local_addr = %proxy.local_addr,
-                    "CF tunnel proxy started, routing gRPC through local proxy"
-                );
-                Result::<SocketAddr>::Ok(proxy.local_addr)
-            })
-            .await?;
+        let token = tls
+            .cf_token
+            .as_deref()
+            .ok_or_else(|| miette::miette!("CF token required for tunnel"))?;
+        let local_addr = cf_tunnel_addr(server, token).await?;
 
         // Connect to the local tunnel proxy over plaintext HTTP/2.
         let local_url = format!("http://{local_addr}");

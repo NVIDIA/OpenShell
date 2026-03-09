@@ -40,8 +40,8 @@ use tracing::{debug, error, warn};
 /// A running Cloudflare tunnel proxy.
 ///
 /// The proxy listens on a local TCP port and tunnels each connection over a
-/// WebSocket to the Cloudflare edge.  Drop the handle to shut down the
-/// listener (the background task is detached via `tokio::spawn`).
+/// WebSocket to the Cloudflare edge. The listener runs in a detached task for
+/// the lifetime of the current process.
 pub struct CfTunnelProxy {
     /// Local address the proxy is listening on (e.g. `127.0.0.1:54321`).
     pub local_addr: SocketAddr,
@@ -122,22 +122,23 @@ async fn handle_connection(tcp_stream: TcpStream, config: &TunnelConfig) -> Resu
     let (ws_sink, ws_source) = ws_stream.split();
     let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
 
-    // Two tasks: TCP->WS and WS->TCP.  When either direction finishes (EOF or
-    // error), we drop the other to clean up.
-    let tcp_to_ws = tokio::spawn(copy_tcp_to_ws(tcp_read, ws_sink));
-    let ws_to_tcp = tokio::spawn(copy_ws_to_tcp(ws_source, tcp_write));
+    // Two tasks: TCP->WS and WS->TCP. Abort the peer task once either
+    // direction finishes so the connection tears down promptly.
+    let mut tcp_to_ws = tokio::spawn(copy_tcp_to_ws(tcp_read, ws_sink));
+    let mut ws_to_tcp = tokio::spawn(copy_ws_to_tcp(ws_source, tcp_write));
 
-    // Wait for either direction to finish, then cancel the other.
     tokio::select! {
-        res = tcp_to_ws => {
+        res = &mut tcp_to_ws => {
             if let Err(e) = res {
                 debug!(error = %e, "tcp->ws task panicked");
             }
+            ws_to_tcp.abort();
         }
-        res = ws_to_tcp => {
+        res = &mut ws_to_tcp => {
             if let Err(e) = res {
                 debug!(error = %e, "ws->tcp task panicked");
             }
+            tcp_to_ws.abort();
         }
     }
 

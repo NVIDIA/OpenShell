@@ -15,14 +15,13 @@
 //!                          │
 //!                     WS tunnel server (port B)  ──/_ws_tunnel handler──▶
 //!                          │
-//!                     loopback TCP
+//!                     in-memory duplex stream
 //!                          │
-//!                     gRPC server (port A)  ──MultiplexedService──▶ TestNavigator
+//!                     MultiplexedService ──▶ TestNavigator
 //! ```
 //!
-//! **Option B**: The WS tunnel handler is a standalone axum endpoint that takes
-//! only a `SocketAddr` (the loopback target) as state, isolating it from the
-//! full `ServerState` dependency.
+//! The WS tunnel handler is kept standalone so it stays isolated from the full
+//! `ServerState` dependency while still matching the production bridge logic.
 
 use axum::{
     Router,
@@ -52,7 +51,7 @@ use navigator_core::proto::{
 };
 use navigator_server::{MultiplexedService, health_router};
 use std::net::SocketAddr;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -239,64 +238,80 @@ impl Navigator for TestNavigator {
 
 /// Standalone WS tunnel router for testing.
 ///
-/// Functionally identical to `ws_tunnel::router()` in the server, but takes
-/// a `SocketAddr` (the loopback target) instead of `Arc<ServerState>`.
-fn test_ws_tunnel_router(loopback_addr: SocketAddr) -> Router {
+/// Functionally identical to `ws_tunnel::router()` in the server, but takes a
+/// ready-made multiplex service instead of the full server state.
+fn test_ws_tunnel_router(service: TestTunnelService) -> Router {
     Router::new()
         .route("/_ws_tunnel", get(test_ws_tunnel_handler))
-        .with_state(loopback_addr)
+        .with_state(TestTunnelState { service })
 }
 
+#[derive(Clone)]
+struct TestTunnelState {
+    service: TestTunnelService,
+}
+
+type TestTunnelService = MultiplexedService<NavigatorServer<TestNavigator>, Router>;
+
 async fn test_ws_tunnel_handler(
-    State(loopback_addr): State<SocketAddr>,
+    State(state): State<TestTunnelState>,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
     ws.on_upgrade(move |socket| async move {
-        if let Err(e) = handle_ws_tunnel(socket, loopback_addr).await {
+        if let Err(e) = handle_ws_tunnel(socket, state.service).await {
             eprintln!("WS tunnel error: {e}");
         }
     })
 }
 
-/// Bridge bytes between a WebSocket and a loopback TCP connection.
+/// Bridge bytes between a WebSocket and an in-memory multiplex service.
 ///
 /// This is the same logic as `ws_tunnel::handle_ws_tunnel` in the server.
 async fn handle_ws_tunnel(
     ws: axum::extract::ws::WebSocket,
-    target_addr: SocketAddr,
+    service: TestTunnelService,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tcp_stream = TcpStream::connect(target_addr).await?;
-    tcp_stream.set_nodelay(true)?;
-
+    let (tunnel_stream, service_stream) = tokio::io::duplex(64 * 1024);
     let (ws_sink, ws_source) = ws.split();
-    let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
+    let (tunnel_read, tunnel_write) = tokio::io::split(tunnel_stream);
 
-    let tcp_to_ws = tokio::spawn(copy_tcp_to_ws(tcp_read, ws_sink));
-    let ws_to_tcp = tokio::spawn(copy_ws_to_tcp(ws_source, tcp_write));
+    let service_task = tokio::spawn(async move {
+        let _ = Builder::new(TokioExecutor::new())
+            .serve_connection_with_upgrades(TokioIo::new(service_stream), service)
+            .await;
+    });
+    let mut tunnel_to_ws = tokio::spawn(copy_reader_to_ws(tunnel_read, ws_sink));
+    let mut ws_to_tunnel = tokio::spawn(copy_ws_to_writer(ws_source, tunnel_write));
 
     tokio::select! {
-        res = tcp_to_ws => {
+        res = &mut tunnel_to_ws => {
             if let Ok(Err(e)) = res {
-                eprintln!("tcp->ws error: {e}");
+                eprintln!("tunnel->ws error: {e}");
             }
+            ws_to_tunnel.abort();
         }
-        res = ws_to_tcp => {
+        res = &mut ws_to_tunnel => {
             if let Ok(Err(e)) = res {
-                eprintln!("ws->tcp error: {e}");
+                eprintln!("ws->tunnel error: {e}");
             }
+            tunnel_to_ws.abort();
         }
     }
+    service_task.abort();
 
     Ok(())
 }
 
-async fn copy_tcp_to_ws(
-    mut tcp_read: tokio::io::ReadHalf<TcpStream>,
+async fn copy_reader_to_ws<R>(
+    mut reader: R,
     mut ws_sink: futures_util::stream::SplitSink<axum::extract::ws::WebSocket, Message>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    R: AsyncRead + Unpin,
+{
     let mut buf = vec![0u8; 32 * 1024];
     loop {
-        match tcp_read.read(&mut buf).await {
+        match reader.read(&mut buf).await {
             Ok(0) | Err(_) => {
                 let _ = ws_sink.close().await;
                 break;
@@ -315,19 +330,22 @@ async fn copy_tcp_to_ws(
     Ok(())
 }
 
-async fn copy_ws_to_tcp(
+async fn copy_ws_to_writer<W>(
     mut ws_source: futures_util::stream::SplitStream<axum::extract::ws::WebSocket>,
-    mut tcp_write: tokio::io::WriteHalf<TcpStream>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    mut writer: W,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+where
+    W: AsyncWrite + Unpin,
+{
     while let Some(msg) = ws_source.next().await {
         match msg {
             Ok(Message::Binary(data)) => {
-                if tcp_write.write_all(&data).await.is_err() {
+                if writer.write_all(&data).await.is_err() {
                     break;
                 }
             }
             Ok(Message::Text(text)) => {
-                if tcp_write.write_all(text.as_bytes()).await.is_err() {
+                if writer.write_all(text.as_bytes()).await.is_err() {
                     break;
                 }
             }
@@ -336,7 +354,7 @@ async fn copy_ws_to_tcp(
             Err(_) => break,
         }
     }
-    let _ = tcp_write.shutdown().await;
+    let _ = writer.shutdown().await;
     Ok(())
 }
 
@@ -375,12 +393,16 @@ async fn proxy_connection(
     let (ws_sink, ws_source) = ws_stream.split();
     let (tcp_read, tcp_write) = tokio::io::split(tcp_stream);
 
-    let tcp_to_ws = tokio::spawn(proxy_tcp_to_ws(tcp_read, ws_sink));
-    let ws_to_tcp = tokio::spawn(proxy_ws_to_tcp(ws_source, tcp_write));
+    let mut tcp_to_ws = tokio::spawn(proxy_tcp_to_ws(tcp_read, ws_sink));
+    let mut ws_to_tcp = tokio::spawn(proxy_ws_to_tcp(ws_source, tcp_write));
 
     tokio::select! {
-        _ = tcp_to_ws => {}
-        _ = ws_to_tcp => {}
+        _ = &mut tcp_to_ws => {
+            ws_to_tcp.abort();
+        }
+        _ = &mut ws_to_tcp => {
+            tcp_to_ws.abort();
+        }
     }
 
     Ok(())
@@ -470,16 +492,16 @@ async fn start_grpc_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     (addr, handle)
 }
 
-/// Start the standalone WS tunnel axum server that loops back to the given address.
+/// Start the standalone WS tunnel axum server backed by an in-memory service.
 ///
 /// Returns the bound address and a handle to abort the server.
-async fn start_ws_tunnel_server(
-    loopback_target: SocketAddr,
-) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+async fn start_ws_tunnel_server() -> (SocketAddr, tokio::task::JoinHandle<()>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
-    let app = test_ws_tunnel_router(loopback_target);
+    let grpc_service = NavigatorServer::new(TestNavigator);
+    let http_service = health_router();
+    let app = test_ws_tunnel_router(MultiplexedService::new(grpc_service, http_service));
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
@@ -509,7 +531,7 @@ struct TestStack {
 impl TestStack {
     async fn start() -> Self {
         let (grpc_addr, grpc_server) = start_grpc_server().await;
-        let (ws_tunnel_addr, ws_tunnel_server) = start_ws_tunnel_server(grpc_addr).await;
+        let (ws_tunnel_addr, ws_tunnel_server) = start_ws_tunnel_server().await;
         let ws_url = format!("ws://127.0.0.1:{}/_ws_tunnel", ws_tunnel_addr.port());
         let proxy_addr = start_ws_proxy(ws_url).await;
 
