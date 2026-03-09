@@ -544,6 +544,33 @@ impl Navigator for NavigatorService {
         self.state.sandbox_index.update_from_sandbox(&sandbox);
         self.state.sandbox_watch_bus.notify(&id);
 
+        // Clean up SSH sessions associated with this sandbox.
+        if let Ok(records) = self
+            .state
+            .store
+            .list(SshSession::object_type(), 1000, 0)
+            .await
+        {
+            for record in records {
+                if let Ok(session) = SshSession::decode(record.payload.as_slice()) {
+                    if session.sandbox_id == id {
+                        if let Err(e) = self
+                            .state
+                            .store
+                            .delete(SshSession::object_type(), &session.id)
+                            .await
+                        {
+                            warn!(
+                                session_id = %session.id,
+                                error = %e,
+                                "Failed to delete SSH session during sandbox cleanup"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let deleted = match self.state.sandbox_client.delete(&sandbox.name).await {
             Ok(deleted) => deleted,
             Err(err) => {
@@ -787,14 +814,21 @@ impl Navigator for NavigatorService {
         }
 
         let token = uuid::Uuid::new_v4().to_string();
+        let now_ms = current_time_ms()
+            .map_err(|e| Status::internal(format!("timestamp generation failed: {e}")))?;
+        let expires_at_ms = if self.state.config.ssh_session_ttl_secs > 0 {
+            now_ms + (self.state.config.ssh_session_ttl_secs as i64 * 1000)
+        } else {
+            0
+        };
         let session = SshSession {
             id: token.clone(),
             sandbox_id: req.sandbox_id.clone(),
             token: token.clone(),
-            created_at_ms: current_time_ms()
-                .map_err(|e| Status::internal(format!("timestamp generation failed: {e}")))?,
+            created_at_ms: now_ms,
             revoked: false,
             name: generate_name(),
+            expires_at_ms,
         };
 
         self.state
@@ -814,6 +848,7 @@ impl Navigator for NavigatorService {
             gateway_scheme: scheme.to_string(),
             connect_path: self.state.config.ssh_connect_path.clone(),
             host_key_fingerprint: String::new(),
+            expires_at_ms,
         }))
     }
 

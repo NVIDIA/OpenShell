@@ -22,7 +22,8 @@ mod tls;
 pub mod tracing_bus;
 
 use navigator_core::{Config, Error, Result};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
 use tracing::{error, info};
 
@@ -56,6 +57,12 @@ pub struct ServerState {
 
     /// In-memory bus for server process logs.
     pub tracing_log_bus: TracingLogBus,
+
+    /// Active SSH tunnel connection counts per session token.
+    pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
+
+    /// Active SSH tunnel connection counts per sandbox id.
+    pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
 }
 
 impl ServerState {
@@ -76,6 +83,8 @@ impl ServerState {
             sandbox_index,
             sandbox_watch_bus,
             tracing_log_bus,
+            ssh_connections_by_token: Mutex::new(HashMap::new()),
+            ssh_connections_by_sandbox: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -138,6 +147,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         state.tracing_log_bus.clone(),
     );
     spawn_kube_event_tailer(state.clone());
+    ssh_tunnel::spawn_session_reaper(store.clone(), std::time::Duration::from_secs(3600));
 
     // Create the multiplexed service
     let service = MultiplexService::new(state.clone());
