@@ -48,11 +48,24 @@ graph TB
     linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
-You control all four layers through a single YAML policy. Network and inference
-rules are hot-reloadable on a running sandbox. Filesystem and process
-restrictions are locked at creation time.
+## How the Layers Work Together
 
-- {doc}`security-model`: Threat scenarios (data exfiltration, credential
-  theft, unauthorized API calls, privilege escalation) and how OpenShell
-  addresses each one.
-- {doc}`policies`: What a policy is, how it's evaluated, its structure, how to edit it, network access rules (including the GitHub push example), and the iteration workflow.
+You control all four layers through a single YAML policy.
+
+| Layer | What It Protects | When It Applies |
+|---|---|---|
+| **Filesystem** (Landlock LSM) | Prevents reads/writes outside allowed paths. | Locked at sandbox creation. |
+| **Network** (Proxy + Policy Engine) | Blocks unauthorized outbound connections. | Hot-reloadable at runtime. |
+| **Process** (seccomp + unprivileged user) | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
+| **Inference** (Privacy Router) | Reroutes API calls to backends you control. | Hot-reloadable at runtime. |
+
+Filesystem and process restrictions are locked at creation time. Network and
+inference rules are hot-reloadable on a running sandbox, so you can iterate on
+access rules without recreating the sandbox.
+
+## Next Steps
+
+- {doc}`security-model`: Threat scenarios and how each protection layer
+  addresses them.
+- {doc}`policies`: Policy structure, evaluation order, and how to iterate on
+  rules.

@@ -78,6 +78,7 @@ If an intercepted request does not match any known pattern, it is denied.
 
 ## Next Steps
 
-- {doc}`configure-routes`: create and manage inference routes.
-- {doc}`/safety-and-privacy/network-access-rules`: understand agent traffic compared to
-  userland traffic.
+- {doc}`configure-routes`: Create and manage inference routes for your
+  backends.
+- {doc}`/safety-and-privacy/network-access-rules`: Agent traffic versus
+  userland traffic and how network rules interact with inference routing.

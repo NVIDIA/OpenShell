@@ -43,8 +43,13 @@ with `nemoclaw gateway select <name>`. Refer to the
 
 ## Next Steps
 
-- [Create and Manage Sandboxes](create-and-manage.md): The full sandbox lifecycle — create, inspect, connect, monitor, and delete.
-- [Providers](providers.md): Create and attach credential providers.
-- [Custom Containers](custom-containers.md): Build and run your own container image.
-- [Community Sandboxes](community-sandboxes.md): Use pre-built sandboxes from the community catalog.
-- [Terminal](terminal.md): Monitor sandbox status and live activity in a dashboard.
+- {doc}`create-and-manage`: Create, inspect, connect, monitor, and delete
+  sandboxes.
+- {doc}`providers`: Create and attach credential providers so agents can
+  authenticate with external services.
+- {doc}`custom-containers`: Build and run your own container image inside a
+  sandbox.
+- {doc}`community-sandboxes`: Use pre-built sandboxes from the community
+  catalog.
+- {doc}`terminal`: Monitor sandbox status and live activity in a terminal
+  dashboard.
