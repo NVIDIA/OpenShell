@@ -66,7 +66,7 @@ Troubleshoot problems with creating, connecting to, and configuring sandboxes.
 **Check:**
 1. Stream sandbox logs: `nemoclaw logs <name> --tail --source sandbox`.
 2. Look for `deny` actions. They include the destination, binary, and reason.
-3. Update the policy to allow the blocked endpoint. Refer to [Policy Iteration Loop](safety-and-privacy/policies.md#the-policy-iteration-loop).
+3. Update the policy to allow the blocked endpoint. Refer to [](safety-and-privacy/policies.md).
 
 ### Policy Update Fails
 

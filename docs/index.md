@@ -181,7 +181,7 @@ Home <self>
 ```
 
 ```{toctree}
-:caption: About
+:caption: About NVIDIA OpenShell
 :hidden:
 
 Overview <about/overview>
