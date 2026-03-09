@@ -5,13 +5,13 @@
 
 # About Safety and Privacy
 
-NemoClaw wraps every sandbox in four independent protection layers. No single
+OpenShell wraps every sandbox in four independent protection layers. No single
 point of failure can compromise your environment. Each layer covers gaps the
 others cannot.
 
 ```{mermaid}
 graph TB
-    subgraph runtime["NemoClaw Runtime"]
+    subgraph runtime["OpenShell Runtime"]
         direction TB
 
         subgraph layers["Protection Layers"]
@@ -53,9 +53,6 @@ rules are hot-reloadable on a running sandbox. Filesystem and process
 restrictions are locked at creation time.
 
 - {doc}`security-model`: Threat scenarios (data exfiltration, credential
-  theft, unauthorized API calls, privilege escalation) and how NemoClaw
+  theft, unauthorized API calls, privilege escalation) and how OpenShell
   addresses each one.
-- {doc}`policies`: Author policies, monitor for blocked actions, and
-  iterate on rules without restarting sandboxes.
-- {doc}`network-access-rules`: Configure endpoint rules, binary matching,
-  L7 inspection, and access presets.
+- {doc}`policies`: What a policy is, how it's evaluated, its structure, how to edit it, network access rules (including the GitHub push example), and the iteration workflow.

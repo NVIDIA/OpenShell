@@ -1,9 +1,9 @@
 ---
 title:
-  page: "NVIDIA NemoClaw Developer Guide"
+  page: "NVIDIA OpenShell Developer Guide"
   nav: "Get Started"
-  card: "NVIDIA NemoClaw"
-description: "NemoClaw is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
+  card: "NVIDIA OpenShell"
+description: "OpenShell is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
 topics:
 - Generative AI
 - Cybersecurity
@@ -22,13 +22,13 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# NVIDIA NemoClaw
+# NVIDIA OpenShell
 
-[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/NemoClaw)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/NemoClaw/blob/main/LICENSE)
-[![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
+[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/OpenShell)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 
-NemoClaw is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
+OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
 uncontrolled network activity.
@@ -97,8 +97,8 @@ Install the CLI and create your first sandbox in two commands.
     <span class="nc-term-dot nc-term-dot-g"></span>
   </div>
   <div class="nc-term-body">
-    <div><span class="nc-ps">$ </span>pip install nemoclaw</div>
-    <div><span class="nc-ps">$ </span>nemoclaw sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
+    <div><span class="nc-ps">$ </span>pip install openshell</div>
+    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```
@@ -112,11 +112,11 @@ Refer to the [Quickstart](get-started/quickstart.md) for more details.
 ::::{grid} 2 2 3 3
 :gutter: 3
 
-:::{grid-item-card} About NemoClaw
+:::{grid-item-card} About OpenShell
 :link: about/overview
 :link-type: doc
 
-Learn about NemoClaw and its capabilities.
+Learn about OpenShell and its capabilities.
 
 +++
 {bdg-secondary}`Concept`
@@ -126,7 +126,7 @@ Learn about NemoClaw and its capabilities.
 :link: get-started/quickstart
 :link-type: doc
 
-Quickstart guide and tutorials for creating a NemoClaw sandbox with Claude Code, OpenClaw, and OpenCode.
+Quickstart guide and tutorials for creating a OpenShell sandbox with Claude Code, OpenClaw, and OpenCode.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -210,7 +210,6 @@ sandboxes/terminal
 safety-and-privacy/index
 safety-and-privacy/security-model
 safety-and-privacy/policies
-safety-and-privacy/network-access-rules
 ```
 
 ```{toctree}

@@ -2,8 +2,8 @@
 title:
   page: "Architecture Reference"
   nav: "Architecture"
-description: "Detailed reference for NemoClaw architecture: gateway, sandbox internals, policy engine, privacy router, and remote deployment."
-keywords: ["nemoclaw architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
+description: "Detailed reference for OpenShell architecture: gateway, sandbox internals, policy engine, privacy router, and remote deployment."
+keywords: ["openshell architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "security", "architecture"]
 content:
@@ -19,7 +19,7 @@ content:
 
 # Architecture Reference
 
-This page provides detailed technical information about each NemoClaw component.
+This page provides detailed technical information about each OpenShell component.
 For a high-level summary, refer to the [Architecture Overview](../about/architecture.md).
 
 ## Component Diagram
@@ -58,7 +58,7 @@ graph TB
         end
     end
 
-    cli["nemoclaw CLI"] -- "gRPC" --> gw
+    cli["openshell CLI"] -- "gRPC" --> gw
     agent1 -- "all outbound<br/>traffic" --> proxy1
     agent2 -- "all outbound<br/>traffic" --> proxy2
     proxy1 -- "policy-approved<br/>traffic" --> internet["External Services"]
@@ -118,7 +118,7 @@ boundaries before starting the agent:
 1. Fetch credentials from the gateway for all attached providers.
 2. Set up the network namespace. The sandbox gets its own network stack
    with no default route. All outbound traffic is redirected through the proxy.
-3. Apply Landlock filesystem restrictions based on the policy.
+3. Apply [Landlock](https://docs.kernel.org/security/landlock.html) filesystem restrictions based on the policy.
 4. Apply seccomp filters to restrict available system calls.
 5. Start the L7 proxy in the sandbox's network namespace.
 6. Start the SSH server for interactive access.
@@ -136,7 +136,7 @@ the proxy. For each connection, the proxy:
    binary path.
 3. Acts on the decision: allow the connection directly, hand it to the
    privacy router for inference routing, or deny it. Refer to
-   [How the Proxy Evaluates Connections](../safety-and-privacy/network-access-rules.md#how-the-proxy-evaluates-connections)
+   [How network access is evaluated](../safety-and-privacy/policies.md#how-network-access-is-evaluated)
    for the full decision model.
 
 For endpoints configured with `protocol: rest` and `tls: terminate`, the proxy
@@ -171,22 +171,22 @@ inference, the privacy router:
 6. Forwards the request to the route's backend URL.
 
 The router refreshes its route list periodically from the gateway, so routes
-created with `nemoclaw inference create` become available without restarting
+created with `openshell inference create` become available without restarting
 sandboxes.
 
 ## Remote Deployment
 
-NemoClaw can deploy the cluster to a remote host via SSH. This is useful for
+OpenShell can deploy the cluster to a remote host via SSH. This is useful for
 shared team environments or running sandboxes on machines with more resources.
 
 ### Deploy
 
 ```console
-$ nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
+$ openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 The CLI connects to the remote machine over SSH, installs k3s, deploys the
-NemoClaw control plane, and registers the cluster locally. The remote machine
+OpenShell control plane, and registers the cluster locally. The remote machine
 needs Docker installed.
 
 ### Tunnel
@@ -194,7 +194,7 @@ needs Docker installed.
 After deploying to a remote host, set up a tunnel for CLI access:
 
 ```console
-$ nemoclaw gateway tunnel
+$ openshell gateway tunnel
 ```
 
 This establishes an SSH tunnel from your local machine to the remote cluster's

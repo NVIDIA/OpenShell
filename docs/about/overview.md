@@ -1,9 +1,9 @@
 ---
 title:
-  page: "Overview of NVIDIA NemoClaw"
+  page: "Overview of NVIDIA OpenShell"
   nav: "Overview"
-description: "NemoClaw is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
-keywords: ["nemoclaw", "ai agent sandbox", "agent security", "agent isolation", "inference routing"]
+description: "OpenShell is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
+keywords: ["openshell", "ai agent sandbox", "agent security", "agent isolation", "inference routing"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "security", "privacy", "inference_routing"]
 content:
@@ -17,9 +17,9 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Overview of NVIDIA NemoClaw
+# Overview of NVIDIA OpenShell
 
-NVIDIA NemoClaw is an open-source runtime that executes autonomous AI agents inside sandboxed environments with kernel-level isolation. It prevents agents from accessing unauthorized files, exfiltrating data, leaking credentials, or making uncontrolled network requests. A single declarative YAML policy governs filesystem, network, process, and inference protections across all sandboxes and is hot-reloadable without restarting running agents.
+NVIDIA OpenShell is an open-source runtime that executes autonomous AI agents inside sandboxed environments with kernel-level isolation. It prevents agents from accessing unauthorized files, exfiltrating data, leaking credentials, or making uncontrolled network requests. A single declarative YAML policy governs filesystem, network, process, and inference protections across all sandboxes and is hot-reloadable without restarting running agents.
 
 ## Common Challenges with AI Agents
 
@@ -27,12 +27,12 @@ AI agents are most useful when they have broad access to reading files, installi
 
 Conventional containers do not solve this. They isolate processes from the host, but they do not control what an agent does *inside* the container — which files it reads, which hosts it contacts, or where it sends your prompts.
 
-## Benefits of Using NemoClaw
+## Benefits of Using OpenShell
 
-NemoClaw addresses these risks through defense-in-depth enforcement across four policy domains: filesystem, network, process, and inference.
+OpenShell addresses these risks through defense-in-depth enforcement across four policy domains: filesystem, network, process, and inference.
 
 :::{dropdown} 🛡️ Kernel-Level Isolation
-NemoClaw enforces isolation at the Linux kernel level using Landlock for filesystem restrictions, seccomp for system call filtering, and network namespaces for traffic control. These mechanisms operate below the application layer, so agents cannot bypass them regardless of the tools or languages they use.
+OpenShell enforces isolation at the Linux kernel level using [Landlock](https://docs.kernel.org/security/landlock.html) for filesystem restrictions, seccomp for system call filtering, and network namespaces for traffic control. These mechanisms operate below the application layer, so agents cannot bypass them regardless of the tools or languages they use.
 :::
 
 :::{dropdown} 📜 Declarative Policy Enforcement
@@ -53,7 +53,7 @@ Every outbound TCP connection from a sandbox passes through an L7 proxy that res
 
 ## Use Cases
 
-The following are common use cases for NemoClaw.
+The following are common use cases for OpenShell.
 
 :::{dropdown} 💻 Secure Coding Agents
 Run AI coding assistants such as Claude Code, OpenCode, or OpenClaw inside a sandbox where they can read and modify project files but cannot access SSH keys, cloud credentials, or files outside the project directory. Network policies restrict which package registries and APIs the agent can reach.
@@ -68,13 +68,13 @@ Declarative policies serve as auditable security controls. Each sandbox runs und
 :::
 
 :::{dropdown} 📦 Community and Custom Sandbox Images
-Use pre-built sandbox images from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog or bring your own container. Community sandboxes bundle domain-specific tools, policies, and skills, while custom containers let you package any environment your agents need.
+Use pre-built sandbox images from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog or bring your own container. Community sandboxes bundle domain-specific tools, policies, and skills, while custom containers let you package any environment your agents need.
 :::
 
 ---
 
 ## Next Steps
 
-- [Architecture Overview](architecture.md): Understand the components that make up the NemoClaw runtime.
+- [Architecture Overview](architecture.md): Understand the components that make up the OpenShell runtime.
 - [Get Started](../index.md): Install the CLI and create your first sandbox.
-- [Security Model](../safety-and-privacy/security-model.md): Learn how NemoClaw enforces isolation across all protection layers.
+- [Security Model](../safety-and-privacy/security-model.md): Learn how OpenShell enforces isolation across all protection layers.

@@ -5,10 +5,10 @@
 
 # Terminal
 
-NemoClaw Terminal is a terminal dashboard that displays sandbox status and live activity in a single view. Use it to monitor agent behavior, diagnose blocked connections, and observe inference interception in real time.
+OpenShell Terminal is a terminal dashboard that displays sandbox status and live activity in a single view. Use it to monitor agent behavior, diagnose blocked connections, and observe inference interception in real time.
 
 ```console
-$ nemoclaw term
+$ openshell term
 ```
 
 ## Sandbox Status
@@ -75,7 +75,7 @@ This sequence indicates:
 :::{note}
 If these calls should go directly to the destination rather than through inference routing, the most likely cause is a binary path mismatch. The process making the HTTP call does not match any binary listed in the network policy.
 
-Check the log entry for the binary path, then update the `binaries` list in the policy. Refer to {doc}`../safety-and-privacy/network-access-rules` for details on binary matching.
+Check the log entry for the binary path, then update the `binaries` list in the policy. Refer to [Write Sandbox Policies](../safety-and-privacy/policies.md#network-access-rules) for details on binary matching.
 :::
 
 ## Filtering and Navigation
@@ -106,5 +106,5 @@ The following keyboard shortcuts are available in the terminal dashboard.
 For deeper dives into topics covered by the terminal dashboard, refer to the following guides.
 
 - Blocked connections: Follow {doc}`../safety-and-privacy/policies` to pull the current policy, add the missing endpoint, and push an update without restarting the sandbox.
-- Inference interception: Refer to {doc}`../safety-and-privacy/network-access-rules` for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).
+- Inference interception: Refer to [Write Sandbox Policies](../safety-and-privacy/policies.md#how-network-access-is-evaluated) for the distinction between agent traffic (routed directly) and userland traffic (routed through inference routing).
 - Troubleshooting: Refer to {doc}`../troubleshooting` for troubleshooting tips and diagnostics.

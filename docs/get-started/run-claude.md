@@ -5,115 +5,85 @@
 
 # Run Claude Code Safely
 
-This tutorial walks you through the path to running Claude Code inside a NemoClaw sandbox. By the end of this tutorial, you will have an isolated environment with credentials securely injected and a default policy controlling what the agent can access.
-
-## What You Will Learn
-
-- Create a sandbox with a single command.
-- Understand how NemoClaw auto-discovers provider credentials.
-- Inspect what the default policy allows and denies.
-- Connect to a running sandbox and work inside it.
+Create a sandbox with Claude Code: isolated environment, credentials injected, default policy applied. The default policy allows the Anthropic API, GitHub read-only (clone/fetch), and common development endpoints; other traffic is denied.
 
 ## Prerequisites
 
-- Met the prerequisites and installed the NemoClaw CLI as described in the {doc}`quickstart` guide.
-- `ANTHROPIC_API_KEY` environment variable set on your host machine.
+- **Docker** running (required for the OpenShell runtime). See {doc}`quickstart` for details.
+- **OpenShell CLI** installed (`pip install openshell` or from source).
+- **`ANTHROPIC_API_KEY`** set in your environment on the host.
 
 ## Create the Sandbox
 
-Run the following command:
-
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
-This single command performs four actions:
+This command:
 
-1. Bootstraps the runtime. On first use, the CLI provisions a local k3s cluster inside Docker and deploys the NemoClaw control plane. This happens once. Subsequent commands reuse the existing cluster.
-2. Auto-discovers credentials. The CLI detects that `claude` is a recognized tool and reads the `ANTHROPIC_API_KEY` environment variable from your shell. It creates a provider automatically.
-3. Creates the sandbox. The CLI provisions an isolated container and applies the default policy. This policy allows Claude Code to reach `api.anthropic.com` and a small set of supporting endpoints while blocking everything else.
-4. Drops you into the sandbox. You land in an interactive SSH session, ready to work.
+1. Bootstraps the runtime (on first use: provisions a local k3s cluster in Docker; subsequent runs reuse it).
+2. Auto-discovers credentials from `ANTHROPIC_API_KEY` and creates a provider.
+3. Creates the sandbox with the default policy and drops you into an interactive SSH session.
 
 :::{note}
-The first bootstrap takes a few minutes depending on your network speed. The CLI prints progress as each component starts. Subsequent sandbox creations are much faster.
+First bootstrap can take a few minutes. Later sandbox creations are much faster.
 :::
 
 ## Work Inside the Sandbox
 
-You are now inside the sandbox. Start Claude Code:
+Start Claude Code:
 
 ```console
 $ claude
 ```
 
-Your credentials are available as environment variables. Verify this with:
-
-```console
-$ echo $ANTHROPIC_API_KEY
-sk-ant-...
-```
-
-The sandbox provides a working directory at `/sandbox` where you can create and edit files. Standard development tools — git, common language runtimes, and package managers — are available within the boundaries set by the policy.
+Credentials are available as environment variables (e.g. `echo $ANTHROPIC_API_KEY`). Use `/sandbox` as the working directory. Git and common runtimes are available within policy limits.
 
 ## Check Sandbox Status
 
-Open a second terminal on your host machine to inspect the sandbox from outside.
+From a second terminal on the host:
 
-1. In the second terminal, list all sandboxes:
+```console
+$ openshell sandbox list
+```
 
-    ```console
-    $ nemoclaw sandbox list
-    ```
+For a live dashboard (status, connections, policy decisions):
 
-2. Launch the NemoClaw Terminal for a live dashboard that shows sandbox status, active network connections, and policy decisions in real time:
-
-    ```console
-    $ nemoclaw term
-    ```
+```console
+$ openshell term
+```
 
 ## Connect from VS Code (Optional)
 
-If you prefer a graphical editor, connect to the sandbox with VS Code Remote-SSH.
-
-Export the sandbox SSH configuration:
+Export SSH config, then connect with Remote-SSH to the host named after your sandbox:
 
 ```console
-$ nemoclaw sandbox ssh-config <sandbox-name> >> ~/.ssh/config
+$ openshell sandbox ssh-config <name> >> ~/.ssh/config
 ```
 
-Then open VS Code, install the Remote - SSH extension if needed, and connect to the host named after your sandbox. VS Code opens a full editor session inside the isolated environment.
-
-:::{tip}
-Replace `<sandbox-name>` with your sandbox name. Run `nemoclaw sandbox list` to find it if you did not specify one at creation time.
-:::
+Use `<name>` from `openshell sandbox list`, or the name you passed to `--name` at creation.
 
 ## Clean Up
 
-Exit the sandbox shell:
+Exit the sandbox shell (`exit` or Ctrl-D), then:
 
 ```console
-$ exit
+$ openshell sandbox delete <name>
 ```
 
-Delete the sandbox:
-
-```console
-$ nemoclaw sandbox delete <name>
-```
+Use the sandbox name from `openshell sandbox list` or the one you set with `--name`.
 
 :::{tip}
-If you want the sandbox to persist after you disconnect, add the `--keep` flag at creation time:
+To keep the sandbox running after you disconnect, create with `--keep`:
 
 ```console
-$ nemoclaw sandbox create --keep -- claude
+$ openshell sandbox create --keep -- claude
 ```
-
-This is useful when you plan to reconnect later or iterate on the policy while the sandbox runs.
 :::
 
 ## Next Steps
 
-- {doc}`../sandboxes/create-and-manage`: Learn the isolation model and sandbox lifecycle.
-- {doc}`../sandboxes/providers`: Understand how credentials are injected without exposing them to agent code.
-- {doc}`../safety-and-privacy/policies`: Customize the default policy or write your own.
-- {doc}`../safety-and-privacy/network-access-rules`: Explore the network proxy and per-endpoint rules.
+- {doc}`../sandboxes/create-and-manage`: Sandbox lifecycle and isolation model.
+- {doc}`../sandboxes/providers`: How credentials are injected.
+- {doc}`../safety-and-privacy/policies`: Customize or replace the default policy.
+- [Write Sandbox Policies (network access rules)](../safety-and-privacy/policies.md#network-access-rules): Network proxy and per-endpoint rules.

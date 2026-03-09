@@ -5,13 +5,13 @@
 
 # Custom Containers
 
-Build a custom container image and run it as a NemoClaw sandbox.
+Build a custom container image and run it as a OpenShell sandbox.
 
 ## Prerequisites
 
 Ensure the following are installed before building custom container sandboxes.
 
-- NemoClaw CLI installed (`pip install nemoclaw`)
+- OpenShell CLI installed (`pip install openshell`)
 - Docker running on your machine
 - A Dockerfile for your workload
 
@@ -20,7 +20,7 @@ Ensure the following are installed before building custom container sandboxes.
 Point `--from` at the directory containing your Dockerfile:
 
 ```console
-$ nemoclaw sandbox create --from ./my-app --keep --name my-app
+$ openshell sandbox create --from ./my-app --keep --name my-app
 ```
 
 The CLI builds the image locally using Docker, pushes it into the cluster, and
@@ -31,7 +31,7 @@ You can also pass a full container image reference if the image is already
 built:
 
 ```console
-$ nemoclaw sandbox create --from my-registry.example.com/my-image:latest --keep --name my-app
+$ openshell sandbox create --from my-registry.example.com/my-image:latest --keep --name my-app
 ```
 
 ## Step 2: Forward Ports
@@ -39,7 +39,7 @@ $ nemoclaw sandbox create --from my-registry.example.com/my-image:latest --keep 
 If your container runs a service, forward the port to your host:
 
 ```console
-$ nemoclaw forward start 8080 my-app -d
+$ openshell forward start 8080 my-app -d
 ```
 
 The `-d` flag runs the forward in the background so you can continue using
@@ -50,8 +50,8 @@ your terminal.
 When you change your Dockerfile, delete the sandbox and recreate:
 
 ```console
-$ nemoclaw sandbox delete my-app && \
-    nemoclaw sandbox create --from ./my-app --keep --name my-app
+$ openshell sandbox delete my-app && \
+    openshell sandbox create --from ./my-app --keep --name my-app
 ```
 
 ## Shortcut: Create with Forwarding and a Startup Command
@@ -59,14 +59,14 @@ $ nemoclaw sandbox delete my-app && \
 You can combine port forwarding and a startup command in a single step:
 
 ```console
-$ nemoclaw sandbox create --from ./my-app --forward 8080 --keep -- ./start-server.sh
+$ openshell sandbox create --from ./my-app --forward 8080 --keep -- ./start-server.sh
 ```
 
 This creates the sandbox, sets up port forwarding on port 8080, and runs
 `./start-server.sh` as the sandbox command.
 
 :::{warning}
-NemoClaw does not support distroless and `FROM scratch` images. The
+OpenShell does not support distroless and `FROM scratch` images. The
 supervisor requires glibc, `/proc`, and a shell to operate. Images missing
 `iproute2` or required Linux capabilities will fail to start in proxy mode.
 Ensure your base image includes these dependencies.

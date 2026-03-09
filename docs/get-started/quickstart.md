@@ -2,8 +2,8 @@
 title:
   page: "Quickstart"
   nav: "Quickstart"
-description: "Install the NemoClaw CLI and create your first sandboxed AI agent in two commands."
-keywords: ["nemoclaw install", "quickstart", "sandbox create", "getting started"]
+description: "Install the OpenShell CLI and create your first sandboxed AI agent in two commands."
+keywords: ["openshell install", "quickstart", "sandbox create", "getting started"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "installation", "quickstart"]
 content:
@@ -30,14 +30,14 @@ Before you begin, make sure you have:
 :end-before: <!-- quickstart-prereqs-end -->
 ```
 
-## Install the NemoClaw CLI
+## Install the OpenShell CLI
 
 ```{include} ../../README.md
 :start-after: <!-- quickstart-install-start -->
 :end-before: <!-- quickstart-install-end -->
 ```
 
-## Create Your First NemoClaw Sandbox
+## Create Your First OpenShell Sandbox
 
 Choose the tab that matches your agent:
 
@@ -45,7 +45,7 @@ Choose the tab that matches your agent:
 
 :::{tab-item} Claude Code
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
 ```text
@@ -62,17 +62,17 @@ The CLI detects your `ANTHROPIC_API_KEY`, creates a provider, builds the sandbox
 
 :::{tab-item} Community Sandbox
 ```console
-$ nemoclaw sandbox create --from openclaw
+$ openshell sandbox create --from openclaw
 ```
 
-The `--from` flag pulls a pre-built sandbox definition from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog. Each definition bundles a container image, a tailored policy, and optional skills into a single package.
+The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog. Each definition bundles a container image, a tailored policy, and optional skills into a single package.
 :::
 
 ::::
 
 ## What Happens Behind the Scenes
 
-When you create a sandbox, NemoClaw activates the following protection layers.
+When you create a sandbox, OpenShell activates the following protection layers.
 
 | Protection Layer        | Description                                                                                   |
 |------------------------|-----------------------------------------------------------------------------------------------|

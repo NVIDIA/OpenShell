@@ -1,9 +1,9 @@
 ---
 title:
-  page: "NemoClaw Tutorials"
+  page: "OpenShell Tutorials"
   nav: "Tutorials"
-description: "Step-by-step tutorials for running AI agents inside NemoClaw sandboxes."
-keywords: ["nemoclaw tutorials", "claude code sandbox", "opencode sandbox", "openclaw sandbox"]
+description: "Step-by-step tutorials for running AI agents inside OpenShell sandboxes."
+keywords: ["openshell tutorials", "claude code sandbox", "opencode sandbox", "openclaw sandbox"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "tutorial"]
 content:
@@ -19,7 +19,7 @@ content:
 
 # Tutorials
 
-Each tutorial below walks you through running a specific AI agent inside a NemoClaw sandbox. Choose the tutorial that matches your agent.
+Step-by-step tutorials for running AI agents inside OpenShell sandboxes.
 
 ::::{grid} 1 1 2 2
 :gutter: 3
@@ -38,7 +38,7 @@ Create a sandbox with Claude Code.
 :link: run-openclaw
 :link-type: doc
 
-Launch a sandbox with OpenClaw from the NemoClaw Community catalog using the `--from` flag.
+Launch a sandbox with OpenClaw from the OpenShell Community catalog using the `--from` flag.
 
 +++
 {bdg-secondary}`Tutorial`

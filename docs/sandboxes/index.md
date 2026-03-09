@@ -5,7 +5,7 @@
 
 # About Sandboxes
 
-A NemoClaw sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+A OpenShell sandbox is a safe, private execution environment for an AI agent. Each sandbox runs inside a Kubernetes pod with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions ([Landlock](https://docs.kernel.org/security/landlock.html)), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
 
 ## Sandbox Lifecycle
 
@@ -15,17 +15,17 @@ Every sandbox moves through a defined set of phases:
 |---|---|
 | Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
 | Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw logs` for details. |
+| Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
-## The NemoClaw Runtime
+## The OpenShell Runtime
 
-Sandboxes run inside a lightweight runtime cluster that NemoClaw manages for
+Sandboxes run inside a lightweight runtime cluster that OpenShell manages for
 you. The cluster runs as a [k3s](https://k3s.io/) Kubernetes distribution
 inside a Docker container on your machine.
 
 You do not need to set this up manually. The first time you run a command
-that needs a cluster (such as `nemoclaw sandbox create`), the CLI provisions
+that needs a cluster (such as `openshell sandbox create`), the CLI provisions
 one automatically. This is the "Runtime ready" line you see in the output.
 Subsequent commands reuse the existing cluster.
 
@@ -33,12 +33,12 @@ For teams or when you need more resources, you can deploy the cluster to a
 remote host instead of your local machine:
 
 ```console
-$ nemoclaw gateway start --remote user@host
+$ openshell gateway start --remote user@host
 ```
 
 Refer to [Remote Deployment](../about/architecture.md) for
 details. If you have multiple clusters (local and remote), switch between them
-with `nemoclaw gateway select <name>`. Refer to the
+with `openshell gateway select <name>`. Refer to the
 [CLI Reference](../reference/cli.md#gateway-commands) for the full command set.
 
 ## Next Steps
@@ -48,3 +48,4 @@ with `nemoclaw gateway select <name>`. Refer to the
 - [Custom Containers](custom-containers.md): Build and run your own container image.
 - [Community Sandboxes](community-sandboxes.md): Use pre-built sandboxes from the community catalog.
 - [Terminal](terminal.md): Monitor sandbox status and live activity in a dashboard.
+- To allow or restrict network access (e.g. git push to GitHub, or custom APIs), see [Write Sandbox Policies](../safety-and-privacy/policies.md#network-access-rules).

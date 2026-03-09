@@ -27,7 +27,7 @@ inference: { ... }
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 | `inference` | object | No | Dynamic | Controls which inference routing backends are available. |
 
-Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw policy set` and take effect without restarting.
+Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy set` and take effect without restarting.
 
 ## Version
 
@@ -82,7 +82,7 @@ Configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforc
 
 | Field | Type | Required | Values | Description |
 |---|---|---|---|---|
-| `compatibility` | string | No | `best_effort`, `hard_requirement` | How NemoClaw handles kernel ABI differences. `best_effort` uses the highest Landlock ABI the host kernel supports. `hard_requirement` fails if the required ABI is unavailable. |
+| `compatibility` | string | No | `best_effort`, `hard_requirement` | How OpenShell handles kernel ABI differences. `best_effort` uses the highest Landlock ABI the host kernel supports. `hard_requirement` fails if the required ABI is unavailable. |
 
 Example:
 
@@ -116,7 +116,7 @@ process:
 
 **Category:** Dynamic
 
-A map of named network policy entries. Each entry declares a set of endpoints and a set of binaries. Only the listed binaries are permitted to connect to the listed endpoints. The map key is a logical identifier. The `name` field inside the entry is the display name used in logs.
+The policy is a map of named entries. Each entry defines which binaries can reach which endpoints; use multiple entries for different services or different permission levels (e.g. one entry for GitHub, another for your own API). A connection is allowed only when both the destination (host and port) and the calling binary match the same entry. The map key is a logical identifier; the `name` field inside the entry is the display name used in logs.
 
 ### Network Policy Entry
 
@@ -137,16 +137,18 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `protocol` | string | No | Set to `rest` to enable L7 (HTTP) inspection. Omit for L4-only (TCP passthrough). |
 | `tls` | string | No | TLS handling mode. `terminate` decrypts TLS at the proxy for inspection. `passthrough` forwards encrypted traffic without inspection. Only relevant when `protocol` is `rest`. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
-| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Refer to table below. Mutually exclusive with `rules`. |
+| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, `full`, `git-fetch`, or `git-full`. Refer to table below. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
 
 #### Access Levels
 
-| Value | Allowed HTTP Methods |
-|---|---|
-| `full` | All methods and paths. |
-| `read-only` | `GET`, `HEAD`, `OPTIONS`. |
-| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH`. |
+| Value | Description |
+|-------|--------------|
+| `full` | All HTTP methods and paths. |
+| `read-only` | `GET`, `HEAD`, `OPTIONS` on any path. |
+| `read-write` | `GET`, `HEAD`, `OPTIONS`, `POST`, `PUT`, `PATCH` on any path. |
+| `git-fetch` | Git Smart HTTP fetch only (clone, pull): `GET /**/info/refs*`, `POST /**/git-upload-pack`. Use only for Git Smart HTTP endpoints (e.g. github.com, gitlab.com). |
+| `git-full` | Git Smart HTTP fetch and push: same as `git-fetch` plus `POST /**/git-receive-pack`. Use only for Git Smart HTTP endpoints (e.g. github.com, gitlab.com). |
 
 #### Rule Object
 
@@ -154,10 +156,10 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `allow.method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). |
-| `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+| `allow.method` | string | Yes | HTTP method to allow (e.g. `GET`, `POST`). Use `"*"` to allow any HTTP method on the given path. |
+| `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax; path matching uses `/` as the segment delimiter. |
 
-Example with rules:
+Example with rules. Git Smart HTTP paths are `/{owner}/{repo}.git/{operation}` (e.g. `/{owner}/{repo}.git/git-upload-pack`). Use `/**/` to match any owner/repo.
 
 ```yaml
 rules:
@@ -212,7 +214,7 @@ Controls which inference routing backends userland code can access. The `allowed
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| `allowed_routes` | list of strings | No | Routing hint labels (e.g., `local`, `nvidia`, `staging`) that this sandbox can use. Must match the `routing_hint` of inference routes created with `nemoclaw inference create`. |
+| `allowed_routes` | list of strings | No | Routing hint labels (e.g., `local`, `nvidia`, `staging`) that this sandbox can use. Must match the `routing_hint` of inference routes created with `openshell inference create`. |
 
 Example:
 

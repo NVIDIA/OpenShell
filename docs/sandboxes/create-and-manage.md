@@ -11,7 +11,7 @@ This page walks you through the full sandbox lifecycle: creating, inspecting, co
 
 Ensure the following are installed before creating sandboxes.
 
-- NemoClaw CLI installed (`pip install nemoclaw`)
+- OpenShell CLI installed (`pip install openshell`)
 - Docker running on your machine
 
 ## Create a Sandbox
@@ -19,7 +19,7 @@ Ensure the following are installed before creating sandboxes.
 The simplest way to create a sandbox is to specify a trailing command:
 
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
 The CLI bootstraps the runtime (if this is your first run), discovers your
@@ -32,7 +32,7 @@ You can customize creation with flags like `--name`, `--provider`, `--policy`,
 A fully specified creation command might look like:
 
 ```console
-$ nemoclaw sandbox create \
+$ openshell sandbox create \
     --name dev \
     --provider my-claude \
     --policy policy.yaml \
@@ -54,13 +54,13 @@ Check the status of your sandboxes and retrieve detailed information about indiv
 List all sandboxes:
 
 ```console
-$ nemoclaw sandbox list
+$ openshell sandbox list
 ```
 
 Get detailed information about a specific sandbox:
 
 ```console
-$ nemoclaw sandbox get my-sandbox
+$ openshell sandbox get my-sandbox
 ```
 
 ## Connect to a Sandbox
@@ -72,7 +72,7 @@ Access a running sandbox through an interactive SSH session or VS Code Remote-SS
 Open an SSH session into a running sandbox:
 
 ```console
-$ nemoclaw sandbox connect my-sandbox
+$ openshell sandbox connect my-sandbox
 ```
 
 ### VS Code Remote-SSH
@@ -80,7 +80,7 @@ $ nemoclaw sandbox connect my-sandbox
 Export the sandbox SSH configuration and append it to your SSH config:
 
 ```console
-$ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
+$ openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
 Then open VS Code, install the Remote - SSH extension if you have not
@@ -93,14 +93,14 @@ Stream and filter sandbox logs to monitor agent activity and diagnose policy dec
 Stream sandbox logs:
 
 ```console
-$ nemoclaw logs my-sandbox
+$ openshell logs my-sandbox
 ```
 
 Use flags to filter and follow output:
 
 | Flag | Purpose | Example |
 |---|---|---|
-| `--tail` | Stream logs in real time | `nemoclaw logs my-sandbox --tail` |
+| `--tail` | Stream logs in real time | `openshell logs my-sandbox --tail` |
 | `--source` | Filter by log source | `--source sandbox` |
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
@@ -108,12 +108,12 @@ Use flags to filter and follow output:
 Combine flags to narrow in on what you need:
 
 ```console
-$ nemoclaw logs my-sandbox --tail --source sandbox --level warn --since 5m
+$ openshell logs my-sandbox --tail --source sandbox --level warn --since 5m
 ```
 
 :::{tip}
 For a real-time dashboard that combines sandbox status and logs in one view,
-run `nemoclaw term`. Refer to {doc}`terminal` for details on reading log entries and
+run `openshell term`. Refer to {doc}`terminal` for details on reading log entries and
 diagnosing blocked connections.
 :::
 
@@ -124,18 +124,18 @@ Transfer files between your host machine and a running sandbox.
 Upload files from your host into the sandbox:
 
 ```console
-$ nemoclaw sandbox upload my-sandbox ./src /sandbox/src
+$ openshell sandbox upload my-sandbox ./src /sandbox/src
 ```
 
 Download files from the sandbox to your host:
 
 ```console
-$ nemoclaw sandbox download my-sandbox /sandbox/output ./local
+$ openshell sandbox download my-sandbox /sandbox/output ./local
 ```
 
 :::{note}
 You can also upload files at creation time with the `--upload` flag on
-`nemoclaw sandbox create`.
+`openshell sandbox create`.
 :::
 
 ## Port Forwarding
@@ -144,30 +144,30 @@ Forward a port from the sandbox to your host machine. This runs in the
 foreground by default:
 
 ```console
-$ nemoclaw forward start 8080 my-sandbox
+$ openshell forward start 8080 my-sandbox
 ```
 
 Add `-d` to run the forward in the background:
 
 ```console
-$ nemoclaw forward start 8080 my-sandbox -d
+$ openshell forward start 8080 my-sandbox -d
 ```
 
 List active port forwards:
 
 ```console
-$ nemoclaw forward list
+$ openshell forward list
 ```
 
 Stop a port forward:
 
 ```console
-$ nemoclaw forward stop 8080 my-sandbox
+$ openshell forward stop 8080 my-sandbox
 ```
 
 :::{note}
 You can set up port forwarding at creation time with the `--forward` flag on
-`nemoclaw sandbox create`, which is convenient when you know upfront that
+`openshell sandbox create`, which is convenient when you know upfront that
 your workload exposes a service.
 :::
 
@@ -178,13 +178,13 @@ Remove sandboxes when they are no longer needed. Deleting a sandbox stops all pr
 Delete a sandbox by name:
 
 ```console
-$ nemoclaw sandbox delete my-sandbox
+$ openshell sandbox delete my-sandbox
 ```
 
 You can delete multiple sandboxes in a single command:
 
 ```console
-$ nemoclaw sandbox delete sandbox-a sandbox-b sandbox-c
+$ openshell sandbox delete sandbox-a sandbox-b sandbox-c
 ```
 
 ## Next Steps

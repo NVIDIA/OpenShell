@@ -5,72 +5,119 @@
 
 # Write Sandbox Policies
 
-This guide covers how to author, iterate, and manage sandbox policies that control what an agent can do inside a NemoClaw sandbox. You will learn to create sandboxes with custom policies, monitor denied traffic to discover missing rules, and push policy updates without restarting the sandbox.
+This guide covers how to author, iterate, and manage sandbox policies that control what an agent can do inside a OpenShell sandbox. You will learn to create sandboxes with custom policies, monitor denied traffic to discover missing rules, and push policy updates without restarting the sandbox.
 
-## Policy Structure
+## What is a policy
 
-A policy is a YAML document with five sections. Static fields (`filesystem_policy`, `landlock`, `process`) are locked at sandbox creation and require recreation to change. Dynamic fields (`network_policies`, `inference`) are hot-reloadable on a running sandbox.
+A policy is a single YAML document that controls what a sandbox can do: filesystem access, process identity, network access, and inference routing. You attach it when creating a sandbox; the network and inference parts can be updated on a running sandbox without restarting. OpenShell's four protection layers (filesystem, network, process, inference) are all configured through this one policy.
+
+## How is it evaluated
+
+For **network** traffic, the proxy matches destination (host and port) and calling binary to a policy block and optionally applies per-endpoint rules; see [Network access rules](#network-access-rules) below. For filesystem and process, the policy is applied at sandbox start (and for static fields, at creation only). For the full endpoint schema and binary matching, see the [Policy Schema Reference](../reference/policy-schema.md).
+
+## How is it structured
+
+A policy is a YAML document with five top-level sections: `version`, `filesystem_policy`, `landlock`, `process`, `network_policies`, and `inference`. Static fields (`filesystem_policy`, `landlock`, `process`) are locked at sandbox creation and require recreation to change. Dynamic fields (`network_policies`, `inference`) are hot-reloadable on a running sandbox. The `landlock` section configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforcement at the kernel level.
 
 ```yaml
 version: 1
 
-# --- STATIC FIELDS (require sandbox recreation to change) ---
-
+# Static: locked at sandbox creation. Paths the agent can read vs read/write.
 filesystem_policy:
-  # Directories the agent can read but not modify.
-  read_only:
-    - /usr
-    - /lib
-    - /proc
-    - /dev/urandom
-    - /etc
-    - /var/log
-  # Directories the agent can read and write.
-  read_write:
-    - /sandbox       # the agent's working directory
-    - /tmp
-    - /dev/null
+  read_only: [/usr, /lib, /etc]
+  read_write: [/sandbox, /tmp]
 
+# Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
 landlock:
-  # How NemoClaw applies Landlock LSM enforcement.
-  # "best_effort" uses the highest Landlock ABI the host kernel supports.
-  # "strict" requires a specific ABI version and fails if unavailable.
   compatibility: best_effort
 
+# Static: Unprivileged user/group the agent process runs as.
 process:
-  # The OS user and group the agent process runs as inside the sandbox.
-  # "sandbox" is a non-root user created in the container image.
   run_as_user: sandbox
   run_as_group: sandbox
 
-# --- DYNAMIC FIELDS (hot-reloadable on a running sandbox) ---
-
+# Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
 network_policies:
-  # Each key is a logical name for a set of allowed connections.
-  claude_api:
+  my_api:
+    name: my-api
     endpoints:
-      - host: api.anthropic.com
+      - host: api.example.com
         port: 443
-        protocol: rest       # enables L7 (HTTP) inspection
-        tls: terminate        # proxy decrypts TLS to inspect traffic
-        enforcement: enforce  # actively enforce access rules
-        access: full          # allow all HTTP methods and paths
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
     binaries:
-      # Only these binaries may connect to the endpoints above.
-      - path: /usr/local/bin/claude
-      - path: /usr/bin/node
+      - path: /usr/bin/curl
 
+# Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).
 inference:
-  # Which inference route types userland code is allowed to use.
-  allowed_routes:
-    - local
+  allowed_routes: [local]
 ```
 
-Refer to the [Policy Schema Reference](../reference/policy-schema.md) for every field, type, and default value.
+For the complete structure and every field, see the [Policy Schema Reference](../reference/policy-schema.md).
+
+## Network access rules
+
+Network access is controlled by policy blocks under `network_policies`. Each block has a **name**, a list of **endpoints** (host, port, protocol, and optional rules), and a list of **binaries** that are allowed to use those endpoints. The example below shows a full policy block.
+
+### How network access is evaluated
+
+Every outbound connection from the sandbox goes through the proxy. The proxy matches the **destination** (host and port) and the **calling binary** to an endpoint in one of your policy blocks. If an endpoint matches the destination and the binary is listed in that block's `binaries`, the connection is **allowed**. For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). If no endpoint matches and inference routes are configured, the request may be **rerouted for inference**. Otherwise the connection is **denied**. Endpoints without `protocol` or `tls` (L4-only) allow the TCP stream through without inspecting payloads. For the full endpoint schema, access presets, and binary matching, see the [Policy Schema Reference](../reference/policy-schema.md).
+
+### Enable GitHub push
+
+The following policy block allows the listed binaries (Claude and the GitHub CLI) to reach `api.github.com` with the given rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
+
+```yaml
+  github_repos:
+    name: github_repos
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          # Read-only access to all GitHub API paths
+          - allow:
+              method: GET
+              path: "/**"
+          - allow:
+              method: HEAD
+              path: "/**"
+          - allow:
+              method: OPTIONS
+              path: "/**"
+          # GraphQL API (used by gh CLI for most operations)
+          - allow:
+             method: POST
+             path: "/graphql"
+          # alpha-repo: full write access
+          - allow:
+              method: "*"
+              path: "/repos/<org_name>/alpha-repo/**"
+          # bravo-repo: create + edit issues
+          - allow:
+              method: POST
+              path: "/repos/<org_name>/bravo-repo/issues"
+          - allow:
+              method: PATCH
+              path: "/repos/<org_name>/bravo-repo/issues/*"
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/gh }
+```
+
+Then run `openshell policy set <name> --policy <file> --wait` to apply.
+
+### If something is blocked
+
+Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary. Add or adjust the matching endpoint or rules in the relevant policy block (e.g. add a new `allow` rule for the method and path, or add the binary to that block's `binaries` list). See [How do I edit it](#how-do-i-edit-it) for the full iteration workflow.
 
 ## Default Policy
 
-NemoClaw ships a built-in default policy designed for Claude Code. It covers Claude's API endpoints, telemetry hosts, GitHub access, and VS Code marketplace traffic out of the box.
+OpenShell ships a built-in default policy designed for Claude Code. It covers Claude's API endpoints, telemetry hosts, GitHub access, and VS Code marketplace traffic out of the box.
 
 | Agent | Default policy coverage | What you need to do |
 |---|---|---|
@@ -87,7 +134,7 @@ If you run a non-Claude agent without a custom policy, the agent's API calls wil
 Pass a policy YAML file when creating the sandbox:
 
 ```console
-$ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
+$ openshell sandbox create --policy ./my-policy.yaml --keep -- claude
 ```
 
 The `--keep` flag keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy.
@@ -95,15 +142,15 @@ The `--keep` flag keeps the sandbox running after the initial command exits, whi
 To avoid passing `--policy` every time, set a default policy with an environment variable:
 
 ```console
-$ export NEMOCLAW_SANDBOX_POLICY=./my-policy.yaml
-$ nemoclaw sandbox create --keep -- claude
+$ export OPENSHELL_SANDBOX_POLICY=./my-policy.yaml
+$ openshell sandbox create --keep -- claude
 ```
 
-The CLI uses the policy from `NEMOCLAW_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.
+The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.
 
-## The Policy Iteration Loop
+## How do I edit it
 
-Policy authoring is an iterative process. You start with a minimal policy, observe what the agent needs, and refine the rules until everything works. This is the core workflow:
+To change what the sandbox can access, you pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.
 
 ```{mermaid}
 flowchart TD
@@ -124,129 +171,41 @@ flowchart TD
     linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
-### Step 1: Create the Sandbox with Your Initial Policy
+**Steps**
 
-```console
-$ nemoclaw sandbox create --policy ./my-policy.yaml --keep -- claude
-```
+1. **Create** the sandbox with your initial policy (or set `OPENSHELL_SANDBOX_POLICY`).
 
-### Step 2: Monitor Logs for Denied Actions
+   ```console
+   $ openshell sandbox create --policy ./my-policy.yaml --keep -- claude
+   ```
 
-In a second terminal, tail the sandbox logs and look for `action: deny` entries:
+2. **Monitor** denials — each log entry shows host, port, binary, and reason. Alternatively use `openshell term` for a live dashboard.
 
-```console
-$ nemoclaw logs <name> --tail --source sandbox
-```
+   ```console
+   $ openshell logs <name> --tail --source sandbox
+   ```
 
-Each deny entry shows the blocked host, port, calling binary, and reason. This tells you exactly what the agent tried to reach and why it was blocked.
+3. **Pull** the current policy. Strip the metadata header (Version, Hash, Status) before reusing the file.
 
-Alternatively, run `nemoclaw term` for the NemoClaw Terminal, a live dashboard
-that shows status and logs in a single view. Refer to {doc}`/sandboxes/terminal` for
-how to read log entries and diagnose what is being blocked.
+   ```console
+   $ openshell policy get <name> --full > current-policy.yaml
+   ```
 
-:::{tip}
-The NemoClaw Terminal is especially useful during policy iteration. You can
-watch deny entries appear in real time as the agent hits blocked endpoints, then
-push an updated policy without leaving the terminal.
-:::
+4. **Edit** the YAML: add or adjust `network_policies` entries, binaries, `access` or `rules`, or `inference.allowed_routes`.
 
-### Step 3: Pull the Current Policy
+5. **Push** the updated policy. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
-Export the running policy to a file:
+   ```console
+   $ openshell policy set <name> --policy current-policy.yaml --wait
+   ```
 
-```console
-$ nemoclaw policy get <name> --full > current-policy.yaml
-```
+6. **Verify** the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
 
-:::{warning}
-The `--full` output includes a metadata header with `Version`, `Hash`, and `Status` lines that are not valid YAML. Strip these lines before re-submitting the file as a policy update, or the push will fail.
-:::
-
-### Step 4: Modify the Policy YAML
-
-Edit `current-policy.yaml` to address the denied actions you observed. Common changes include:
-
-- Adding endpoints to `network_policies` entries
-- Adding binary paths to existing endpoint rules
-- Creating new named policy entries for new destinations
-- Adjusting `access` levels or adding custom `rules`
-- Updating `inference.allowed_routes`
-
-### Step 5: Push the Updated Policy
-
-```console
-$ nemoclaw policy set <name> --policy current-policy.yaml --wait
-```
-
-The `--wait` flag blocks until the policy engine processes the update. Exit codes:
-
-| Exit code | Meaning |
-|-----------|---------|
-| `0`       | Policy loaded successfully |
-| `1`       | Policy failed validation |
-| `124`     | Timed out waiting for the policy engine |
-
-### Step 6: Verify the New Revision Loaded
-
-```console
-$ nemoclaw policy list <name>
-```
-
-Check that the latest revision shows status `loaded`. If it shows `failed`, review the error message and go back to Step 4.
-
-### Step 7: Repeat
-
-Return to Step 2. Monitor logs, observe new denied actions (or confirm everything works), and refine the policy until the agent operates correctly within the rules you have set.
-
-## Policy Revision History
-
-Every `policy set` creates a new revision. You can inspect the full revision history:
-
-```console
-$ nemoclaw policy list <name> --limit 50
-```
-
-To retrieve a specific revision:
-
-```console
-$ nemoclaw policy get <name> --rev 3 --full
-```
-
-### Revision Statuses
-
-| Status       | Meaning |
-|--------------|---------|
-| `pending`    | The revision has been submitted and is awaiting processing by the policy engine. |
-| `loaded`     | The revision passed validation and is the active policy for the sandbox. |
-| `failed`     | The revision failed validation. The previous good revision remains active. |
-| `superseded` | A newer revision has been loaded, replacing this one. |
-
-## Policy Validation
-
-The server validates every policy at creation and update time. Policies that violate any of the following rules are rejected with exit code `1` (`INVALID_ARGUMENT`):
-
-| Rule | Description |
-|---|---|
-| No root identity | `run_as_user` and `run_as_group` cannot be `root` or `0`. |
-| Absolute paths only | All filesystem paths must start with `/`. |
-| No path traversal | Filesystem paths must not contain `..` components. |
-| No overly broad writes | Read-write paths like `/` alone are rejected. |
-| Path length limit | Each path must not exceed 4096 characters. |
-| Path count limit | The combined total of `read_only` and `read_write` paths must not exceed 256. |
-
-When a disk-loaded YAML policy (via `--policy` or `NEMOCLAW_SANDBOX_POLICY`) fails validation, the sandbox falls back to a restrictive default policy rather than starting with an unsafe configuration.
-
-Refer to the [Policy Schema Reference](../reference/policy-schema.md) for the constraints documented alongside each field.
-
-## Safety Properties
-
-**Last-known-good.**
-If a new policy revision fails validation, the previous successfully loaded policy stays active. A bad push does not break a running sandbox. The agent continues operating under the last good policy.
-
-**Idempotent.**
-Submitting the same policy content again does not create a new revision. The CLI detects that the content has not changed and returns without modifying the revision history.
+   ```console
+   $ openshell policy list <name>
+   ```
 
 ## Next Steps
 
-- [Network Access Rules](network-access-rules.md): How the proxy evaluates connections, endpoint allowlists, binary matching, and enforcement modes.
-- {doc}`../reference/policy-schema`: Complete field reference for the policy YAML.
+- [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.
+- [Security Model](security-model.md): Threat scenarios and protection layers.
