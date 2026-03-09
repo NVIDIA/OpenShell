@@ -311,4 +311,70 @@ mod tests {
         let token = rx.await.unwrap();
         assert_eq!(token, "test-jwt-123");
     }
+
+    /// Callback server returns an error page and does NOT send a token
+    /// when the `?token=` parameter is missing.
+    #[tokio::test]
+    async fn callback_server_rejects_missing_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(run_callback_server(listener, tx));
+
+        // Simulate a browser callback WITHOUT a token parameter.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /callback HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Read the response — should contain the error page.
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("Authentication failed"),
+            "missing token should return error page:\n{response}"
+        );
+
+        // The oneshot sender should have been dropped without sending,
+        // so the receiver gets a RecvError.
+        assert!(
+            rx.await.is_err(),
+            "token channel should not receive a value when token is missing"
+        );
+    }
+
+    /// Callback server rejects an empty token.
+    #[tokio::test]
+    async fn callback_server_rejects_empty_token() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = oneshot::channel();
+
+        tokio::spawn(run_callback_server(listener, tx));
+
+        // Simulate a browser callback with an empty token value.
+        let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        stream
+            .write_all(b"GET /callback?token= HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
+            .await
+            .unwrap();
+
+        // Read the response — should contain the error page.
+        let mut buf = vec![0u8; 4096];
+        let n = stream.read(&mut buf).await.unwrap();
+        let response = String::from_utf8_lossy(&buf[..n]);
+        assert!(
+            response.contains("Authentication failed"),
+            "empty token should return error page:\n{response}"
+        );
+
+        // Channel should not receive a value.
+        assert!(
+            rx.await.is_err(),
+            "token channel should not receive a value when token is empty"
+        );
+    }
 }
