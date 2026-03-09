@@ -10,7 +10,7 @@ file, reach any network host, call any API with your credentials, and install
 arbitrary software. OpenShell's security model exists to prevent all of that.
 
 :::{note}
-NemoClaw uses defense in depth. Four independent protection layers: filesystem,
+OpenShell uses defense in depth. Four independent protection layers: filesystem,
 network, process, and inference. They work together so that no single point of
 failure can compromise your environment.
 :::
@@ -40,7 +40,7 @@ The agent reads `~/.ssh/id_rsa`, `~/.aws/credentials`, or other sensitive files
 from your home directory and exfiltrates them.
 
 **With OpenShell:**
-Landlock filesystem restrictions limit the agent to declared paths. The agent
+[Landlock](https://docs.kernel.org/security/landlock.html) filesystem restrictions limit the agent to declared paths. The agent
 can access `/sandbox`, `/tmp`, and read-only system directories, but not your
 home directory, SSH keys, cloud credentials, or anything else outside the
 policy.
@@ -69,7 +69,7 @@ or uses raw sockets to scan your internal network.
 
 **With OpenShell:**
 The agent runs as an unprivileged user with seccomp filters that block
-dangerous system calls. Landlock prevents writes outside allowed paths. There
+dangerous system calls. [Landlock](https://docs.kernel.org/security/landlock.html) prevents writes outside allowed paths. There
 is no `sudo`, no `setuid`, and no path to elevated privileges.
 
 :::{important}
@@ -82,6 +82,5 @@ that the others cannot.
 
 ## Next Steps
 
-- {doc}`policies`: Write and iterate on the policy YAML that configures all four layers
-- {doc}`network-access-rules`: Configure network rules, binary matching, and TLS inspection
+- {doc}`policies`: Write and iterate on the policy YAML that configures all four layers (including network rules, binary matching, and TLS inspection).
 - {doc}`../inference/index`: Set up private inference backends
