@@ -49,7 +49,7 @@ pub fn create_cluster_metadata(
     port: u16,
     kube_port: Option<u16>,
 ) -> ClusterMetadata {
-    create_cluster_metadata_with_host(name, remote, port, kube_port, None)
+    create_cluster_metadata_with_host(name, remote, port, kube_port, None, false)
 }
 
 /// Create cluster metadata, optionally overriding the gateway host.
@@ -57,20 +57,27 @@ pub fn create_cluster_metadata(
 /// When `gateway_host` is `Some`, that value is used as the host portion of
 /// `gateway_endpoint` instead of the default (`127.0.0.1` for local clusters,
 /// or the resolved SSH host for remote clusters).
+///
+/// When `disable_tls` is `true`, the gateway endpoint uses the `http://`
+/// scheme instead of `https://`.  This must match the server configuration
+/// so that the CLI connects with the correct protocol.
 pub fn create_cluster_metadata_with_host(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
     kube_port: Option<u16>,
     gateway_host: Option<&str>,
+    disable_tls: bool,
 ) -> ClusterMetadata {
+    let scheme = if disable_tls { "http" } else { "https" };
+
     let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
         || {
             let host = gateway_host.map_or_else(
                 || local_gateway_host().unwrap_or_else(|| "127.0.0.1".to_string()),
                 String::from,
             );
-            (format!("https://{host}:{port}"), false, None, None)
+            (format!("{scheme}://{host}:{port}"), false, None, None)
         },
         |opts| {
             // Extract the host portion from the SSH destination, then resolve it
@@ -78,7 +85,7 @@ pub fn create_cluster_metadata_with_host(
             let ssh_host = extract_host_from_ssh_destination(&opts.destination);
             let resolved = resolve_ssh_hostname(&ssh_host);
             let host = gateway_host.unwrap_or(&resolved);
-            let endpoint = format!("https://{host}:{port}");
+            let endpoint = format!("{scheme}://{host}:{port}");
             (
                 endpoint,
                 true,
@@ -500,6 +507,7 @@ mod tests {
             8080,
             None,
             Some("host.docker.internal"),
+            false,
         );
         assert_eq!(meta.name, "test");
         assert_eq!(meta.gateway_endpoint, "https://host.docker.internal:8080");
@@ -512,8 +520,37 @@ mod tests {
     #[test]
     fn local_cluster_metadata_with_no_gateway_host_override() {
         // When gateway_host is None, behaviour matches create_cluster_metadata.
-        let meta = create_cluster_metadata_with_host("test", None, 8080, None, None);
+        let meta = create_cluster_metadata_with_host("test", None, 8080, None, None, false);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn local_cluster_metadata_with_tls_disabled() {
+        let meta = create_cluster_metadata_with_host("test", None, 8080, None, None, true);
+        assert_eq!(meta.gateway_endpoint, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn local_cluster_metadata_with_tls_disabled_and_gateway_host() {
+        let meta = create_cluster_metadata_with_host(
+            "test",
+            None,
+            8080,
+            None,
+            Some("host.docker.internal"),
+            true,
+        );
+        assert_eq!(meta.gateway_endpoint, "http://host.docker.internal:8080");
+    }
+
+    #[test]
+    fn remote_cluster_metadata_with_tls_disabled() {
+        let opts = RemoteOptions::new("user@10.0.0.5");
+        let meta =
+            create_cluster_metadata_with_host("test", Some(&opts), 8080, Some(6443), None, true);
+        assert!(meta.is_remote);
+        assert!(meta.gateway_endpoint.starts_with("http://"));
+        assert!(!meta.gateway_endpoint.starts_with("https://"));
     }
 
     // ── last-sandbox persistence ──────────────────────────────────────

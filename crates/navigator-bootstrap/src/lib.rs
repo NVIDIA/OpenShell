@@ -413,7 +413,11 @@ where
         wait_for_cluster_ready(&target_docker, &name, &mut cluster_log).await?;
     }
 
-    // Create and store cluster metadata
+    // Create and store cluster metadata.
+    // Check whether TLS is disabled so the endpoint uses the correct scheme.
+    let disable_tls = std::env::var("NEMOCLAW_DISABLE_TLS")
+        .map(|v| v.trim().eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
     log("[progress] Persisting gateway metadata".to_string());
     let metadata = create_cluster_metadata_with_host(
         &name,
@@ -421,6 +425,7 @@ where
         port,
         kube_port,
         ssh_gateway_host.as_deref(),
+        disable_tls,
     );
     store_cluster_metadata(&name, &metadata)?;
 
