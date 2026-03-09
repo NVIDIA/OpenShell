@@ -61,6 +61,10 @@ pub struct Config {
     #[serde(default = "default_ssh_handshake_skew_secs")]
     pub ssh_handshake_skew_secs: u64,
 
+    /// TTL for SSH session tokens, in seconds. 0 disables expiry.
+    #[serde(default = "default_ssh_session_ttl_secs")]
+    pub ssh_session_ttl_secs: u64,
+
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
     /// When set, sandbox pods get this secret mounted so they can connect to
     /// the server over mTLS.
@@ -103,6 +107,7 @@ impl Config {
             sandbox_ssh_port: default_sandbox_ssh_port(),
             ssh_handshake_secret: String::new(),
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
+            ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
         }
     }
@@ -191,6 +196,13 @@ impl Config {
         self
     }
 
+    /// Create a new configuration with the SSH session TTL.
+    #[must_use]
+    pub const fn with_ssh_session_ttl_secs(mut self, secs: u64) -> Self {
+        self.ssh_session_ttl_secs = secs;
+        self
+    }
+
     /// Set the Kubernetes secret name for sandbox client TLS materials.
     #[must_use]
     pub fn with_client_tls_secret_name(mut self, name: impl Into<String>) -> Self {
@@ -229,4 +241,8 @@ const fn default_sandbox_ssh_port() -> u16 {
 
 const fn default_ssh_handshake_skew_secs() -> u64 {
     300
+}
+
+const fn default_ssh_session_ttl_secs() -> u64 {
+    86400 // 24 hours
 }

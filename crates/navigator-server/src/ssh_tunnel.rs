@@ -9,6 +9,7 @@ use hyper::Request;
 use hyper::upgrade::Upgraded;
 use hyper_util::rt::TokioIo;
 use navigator_core::proto::{Sandbox, SandboxPhase, SshSession};
+use prost::Message;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -18,11 +19,17 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::ServerState;
-use crate::persistence::{ObjectId, ObjectName, ObjectType};
+use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
 
 const HEADER_SANDBOX_ID: &str = "x-sandbox-id";
 const HEADER_TOKEN: &str = "x-sandbox-token";
 const PREFACE_MAGIC: &str = "NSSH1";
+
+/// Maximum concurrent SSH tunnel connections per session token.
+const MAX_CONNECTIONS_PER_TOKEN: u32 = 3;
+
+/// Maximum concurrent SSH tunnel connections per sandbox.
+const MAX_CONNECTIONS_PER_SANDBOX: u32 = 20;
 
 pub fn router(state: Arc<ServerState>) -> Router {
     Router::new()
@@ -60,6 +67,17 @@ async fn ssh_connect(
         return StatusCode::UNAUTHORIZED.into_response();
     }
 
+    // Check token expiry (0 means no expiry for backward compatibility).
+    if session.expires_at_ms > 0 {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as i64;
+        if now_ms > session.expires_at_ms {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+    }
+
     let sandbox = match state.store.get_message::<Sandbox>(&sandbox_id).await {
         Ok(Some(sandbox)) => sandbox,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -93,8 +111,40 @@ async fn ssh_connect(
     } else {
         return StatusCode::PRECONDITION_FAILED.into_response();
     };
+    // Enforce per-token concurrent connection limit.
+    {
+        let mut counts = state.ssh_connections_by_token.lock().unwrap();
+        let count = counts.entry(token.clone()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_TOKEN {
+            warn!(token = %token, "SSH tunnel: per-token connection limit reached");
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        *count += 1;
+    }
+
+    // Enforce per-sandbox concurrent connection limit.
+    {
+        let mut counts = state.ssh_connections_by_sandbox.lock().unwrap();
+        let count = counts.entry(sandbox_id.clone()).or_insert(0);
+        if *count >= MAX_CONNECTIONS_PER_SANDBOX {
+            // Roll back the per-token increment.
+            let mut token_counts = state.ssh_connections_by_token.lock().unwrap();
+            if let Some(c) = token_counts.get_mut(&token) {
+                *c = c.saturating_sub(1);
+                if *c == 0 {
+                    token_counts.remove(&token);
+                }
+            }
+            warn!(sandbox_id = %sandbox_id, "SSH tunnel: per-sandbox connection limit reached");
+            return StatusCode::TOO_MANY_REQUESTS.into_response();
+        }
+        *count += 1;
+    }
+
     let handshake_secret = state.config.ssh_handshake_secret.clone();
     let sandbox_id_clone = sandbox_id.clone();
+    let token_clone = token.clone();
+    let state_clone = state.clone();
 
     let upgrade = hyper::upgrade::on(req);
     tokio::spawn(async move {
@@ -103,7 +153,7 @@ async fn ssh_connect(
                 if let Err(err) = handle_tunnel(
                     &mut upgraded,
                     connect_target,
-                    &token,
+                    &token_clone,
                     &handshake_secret,
                     &sandbox_id_clone,
                 )
@@ -116,6 +166,10 @@ async fn ssh_connect(
                 warn!(error = %err, "SSH upgrade failed");
             }
         }
+
+        // Decrement connection counts on tunnel completion.
+        decrement_connection_count(&state_clone.ssh_connections_by_token, &token_clone);
+        decrement_connection_count(&state_clone.ssh_connections_by_sandbox, &sandbox_id_clone);
     });
 
     StatusCode::OK.into_response()
@@ -292,4 +346,260 @@ impl ObjectName for SshSession {
 enum ConnectTarget {
     Ip(SocketAddr),
     Host(String, u16),
+}
+
+/// Decrement a connection count entry, removing it if it reaches zero.
+fn decrement_connection_count(
+    counts: &std::sync::Mutex<std::collections::HashMap<String, u32>>,
+    key: &str,
+) {
+    let mut map = counts.lock().unwrap();
+    if let Some(count) = map.get_mut(key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            map.remove(key);
+        }
+    }
+}
+
+/// Spawn a background task that periodically reaps expired and revoked SSH sessions.
+pub fn spawn_session_reaper(store: Arc<Store>, interval: Duration) {
+    tokio::spawn(async move {
+        // Initial delay to let startup settle.
+        tokio::time::sleep(interval).await;
+
+        loop {
+            if let Err(e) = reap_expired_sessions(&store).await {
+                warn!(error = %e, "SSH session reaper sweep failed");
+            }
+            tokio::time::sleep(interval).await;
+        }
+    });
+}
+
+async fn reap_expired_sessions(store: &Store) -> Result<(), String> {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64;
+
+    let records = store
+        .list(SshSession::object_type(), 1000, 0)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    let mut reaped = 0u32;
+    for record in records {
+        let session: SshSession = match Message::decode(record.payload.as_slice()) {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        let should_delete =
+            // Expired sessions (expires_at_ms > 0 means expiry is set).
+            (session.expires_at_ms > 0 && now_ms > session.expires_at_ms)
+            // Revoked sessions — already invalidated, just cleaning up storage.
+            || session.revoked;
+
+        if should_delete {
+            if let Err(e) = store.delete(SshSession::object_type(), &session.id).await {
+                warn!(session_id = %session.id, error = %e, "Failed to reap SSH session");
+            } else {
+                reaped += 1;
+            }
+        }
+    }
+
+    if reaped > 0 {
+        info!(count = reaped, "SSH session reaper: cleaned up sessions");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::persistence::Store;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    fn make_session(id: &str, sandbox_id: &str, expires_at_ms: i64, revoked: bool) -> SshSession {
+        SshSession {
+            id: id.to_string(),
+            sandbox_id: sandbox_id.to_string(),
+            token: id.to_string(),
+            created_at_ms: 1000,
+            revoked,
+            name: format!("session-{id}"),
+            expires_at_ms,
+        }
+    }
+
+    fn now_ms() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+    }
+
+    // ---- Connection limit tests ----
+
+    #[test]
+    fn decrement_removes_entry_at_zero() {
+        let counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        counts.lock().unwrap().insert("tok1".to_string(), 1);
+        decrement_connection_count(&counts, "tok1");
+        assert!(counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn decrement_reduces_count() {
+        let counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        counts.lock().unwrap().insert("tok1".to_string(), 5);
+        decrement_connection_count(&counts, "tok1");
+        assert_eq!(*counts.lock().unwrap().get("tok1").unwrap(), 4);
+    }
+
+    #[test]
+    fn decrement_missing_key_is_noop() {
+        let counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        decrement_connection_count(&counts, "nonexistent");
+        assert!(counts.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn per_token_connection_limit_enforced() {
+        let counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        counts
+            .lock()
+            .unwrap()
+            .insert("tok1".to_string(), MAX_CONNECTIONS_PER_TOKEN);
+        let current = *counts.lock().unwrap().get("tok1").unwrap();
+        assert!(current >= MAX_CONNECTIONS_PER_TOKEN);
+    }
+
+    #[test]
+    fn per_sandbox_connection_limit_enforced() {
+        let counts: Mutex<HashMap<String, u32>> = Mutex::new(HashMap::new());
+        counts
+            .lock()
+            .unwrap()
+            .insert("sbx1".to_string(), MAX_CONNECTIONS_PER_SANDBOX);
+        let current = *counts.lock().unwrap().get("sbx1").unwrap();
+        assert!(current >= MAX_CONNECTIONS_PER_SANDBOX);
+    }
+
+    // ---- Session reaper tests ----
+
+    #[tokio::test]
+    async fn reaper_deletes_expired_sessions() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let expired = make_session("expired1", "sbx1", now_ms() - 60_000, false);
+        store.put_message(&expired).await.unwrap();
+
+        let valid = make_session("valid1", "sbx1", now_ms() + 3_600_000, false);
+        store.put_message(&valid).await.unwrap();
+
+        reap_expired_sessions(&store).await.unwrap();
+
+        assert!(
+            store
+                .get_message::<SshSession>("expired1")
+                .await
+                .unwrap()
+                .is_none(),
+            "expired session should be reaped"
+        );
+        assert!(
+            store
+                .get_message::<SshSession>("valid1")
+                .await
+                .unwrap()
+                .is_some(),
+            "valid session should be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_deletes_revoked_sessions() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let revoked = make_session("revoked1", "sbx1", 0, true);
+        store.put_message(&revoked).await.unwrap();
+
+        let active = make_session("active1", "sbx1", 0, false);
+        store.put_message(&active).await.unwrap();
+
+        reap_expired_sessions(&store).await.unwrap();
+
+        assert!(
+            store
+                .get_message::<SshSession>("revoked1")
+                .await
+                .unwrap()
+                .is_none(),
+            "revoked session should be reaped"
+        );
+        assert!(
+            store
+                .get_message::<SshSession>("active1")
+                .await
+                .unwrap()
+                .is_some(),
+            "active session should be kept"
+        );
+    }
+
+    #[tokio::test]
+    async fn reaper_preserves_zero_expiry_sessions() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // expires_at_ms = 0 means no expiry (backward compatible).
+        let no_expiry = make_session("noexpiry1", "sbx1", 0, false);
+        store.put_message(&no_expiry).await.unwrap();
+
+        reap_expired_sessions(&store).await.unwrap();
+
+        assert!(
+            store
+                .get_message::<SshSession>("noexpiry1")
+                .await
+                .unwrap()
+                .is_some(),
+            "session with no expiry should be preserved"
+        );
+    }
+
+    // ---- Expiry validation logic tests ----
+
+    #[test]
+    fn expired_session_is_detected() {
+        let session = make_session("tok1", "sbx1", now_ms() - 1000, false);
+        let is_expired = session.expires_at_ms > 0 && now_ms() > session.expires_at_ms;
+        assert!(is_expired, "session in the past should be expired");
+    }
+
+    #[test]
+    fn future_session_is_not_expired() {
+        let session = make_session("tok1", "sbx1", now_ms() + 3_600_000, false);
+        let is_expired = session.expires_at_ms > 0 && now_ms() > session.expires_at_ms;
+        assert!(!is_expired, "session in the future should not be expired");
+    }
+
+    #[test]
+    fn zero_expiry_is_not_expired() {
+        let session = make_session("tok1", "sbx1", 0, false);
+        let is_expired = session.expires_at_ms > 0 && now_ms() > session.expires_at_ms;
+        assert!(
+            !is_expired,
+            "session with zero expiry should never be expired"
+        );
+    }
 }

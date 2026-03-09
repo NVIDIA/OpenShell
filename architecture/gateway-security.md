@@ -229,7 +229,31 @@ SSH connections into sandboxes pass through the gateway's HTTP CONNECT tunnel at
 | `x-sandbox-id` | Identifies the target sandbox |
 | `x-sandbox-token` | Session token (created via `CreateSshSession` RPC) |
 
-The gateway validates the token against the stored `SshSession` record, checks that it has not been revoked, and confirms the `sandbox_id` matches.
+The gateway validates the token against the stored `SshSession` record and checks:
+
+1. The token has not been revoked.
+2. The `sandbox_id` matches the request header.
+3. The token has not expired (`expires_at_ms` check; 0 means no expiry for backward compatibility).
+
+### Session Lifecycle
+
+SSH session tokens have a configurable TTL (`ssh_session_ttl_secs`, default 24 hours). The `expires_at_ms` field is set at creation time and checked on every tunnel request. Setting the TTL to 0 disables expiry.
+
+Sessions are cleaned up automatically:
+
+- **On sandbox deletion**: all SSH sessions for the deleted sandbox are removed from the store.
+- **Background reaper**: a periodic task (hourly) deletes expired and revoked session records to prevent unbounded database growth.
+
+### Connection Limits
+
+The gateway enforces two concurrent connection limits to bound the impact of credential misuse:
+
+| Limit | Value | Purpose |
+|---|---|---|
+| Per-token | 10 concurrent tunnels | Limits damage from a single leaked token |
+| Per-sandbox | 20 concurrent tunnels | Prevents bypass via creating many tokens for one sandbox |
+
+These limits are tracked in-memory and decremented when tunnels close. Exceeding either limit returns HTTP 429 (Too Many Requests).
 
 ### NSSH1 Handshake
 
@@ -362,6 +386,7 @@ This section defines the primary attacker profiles, what the current design prot
 | Weak cryptoperiod | Certificates are effectively non-expiring by default |
 | Limited fine-grained revocation | CA private key is not persisted; rotation is coarse-grained |
 | Local credential theft risk | CLI mTLS key material is stored on developer filesystem |
+| SSH token + mTLS = persistent access within trust boundary | SSH tokens expire after 24h (configurable) and are capped at 3 concurrent connections per token / 20 per sandbox, but within the mTLS trust boundary a stolen token remains usable until TTL expires |
 
 ### Out of Scope / Not Defended By This Layer
 

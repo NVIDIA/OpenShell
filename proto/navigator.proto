@@ -171,6 +171,9 @@ message CreateSshSessionResponse {
 
   // Optional host key fingerprint.
   string host_key_fingerprint = 7;
+
+  // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
+  int64 expires_at_ms = 8;
 }
 
 // Revoke SSH session request.
@@ -249,6 +252,10 @@ message SshSession {
 
   // Human-friendly name (auto-generated if not provided).
   string name = 6;
+
+  // Expiry timestamp in milliseconds since epoch. 0 means no expiry
+  // (backward-compatible default for sessions created before this field existed).
+  int64 expires_at_ms = 7;
 }
 
 // Watch sandbox request.
