@@ -164,7 +164,7 @@ pub async fn ensure_network(docker: &Docker) -> Result<()> {
             }
         }
     }
-    Err(last_err.unwrap())
+    Err(last_err.expect("at least one retry attempt"))
         .into_diagnostic()
         .wrap_err("failed to create Docker network after retries (network still in use)")
 }

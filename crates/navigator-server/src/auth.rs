@@ -320,19 +320,39 @@ fn render_connect_page(
     )
 }
 
+/// Minimal HTML attribute escaping for untrusted values.
+///
+/// Escapes `&`, `"`, `'`, `<`, and `>` so the value is safe for embedding
+/// inside a quoted HTML attribute.
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#x27;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Render a waiting page shown when the CF Access cookie is not yet present.
 ///
 /// This can happen if CF Access hasn't completed authentication yet. The page
 /// auto-reloads after a short delay to pick up the cookie once login finishes.
 /// The `code` parameter is preserved across reloads.
 fn render_waiting_page(callback_port: u16, code: &str) -> String {
+    let safe_code = html_escape(code);
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;code={code}">
+    <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;code={safe_code}">
     <title>NemoClaw — Authenticating</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
@@ -389,7 +409,7 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
 </body>
 </html>"#,
         callback_port = callback_port,
-        code = code,
+        safe_code = safe_code,
     )
 }
 
@@ -465,5 +485,23 @@ mod tests {
         assert!(html.contains("meta http-equiv=\"refresh\""));
         assert!(html.contains("callback_port=12345"));
         assert!(html.contains("code=ABC-1234"));
+    }
+
+    #[test]
+    fn render_waiting_page_escapes_code() {
+        let html = render_waiting_page(1234, "x\"onload=\"alert(1)");
+        // The double quote should be escaped so it can't break out of the
+        // meta-refresh content attribute.
+        assert!(!html.contains("x\"onload"));
+        assert!(html.contains("&quot;"));
+    }
+
+    #[test]
+    fn html_escape_basic() {
+        assert_eq!(html_escape("hello"), "hello");
+        assert_eq!(html_escape("<b>bold</b>"), "&lt;b&gt;bold&lt;/b&gt;");
+        assert_eq!(html_escape("a&b"), "a&amp;b");
+        assert_eq!(html_escape("a\"b"), "a&quot;b");
+        assert_eq!(html_escape("a'b"), "a&#x27;b");
     }
 }

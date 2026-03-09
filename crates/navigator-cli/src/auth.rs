@@ -33,17 +33,29 @@ fn generate_confirmation_code() -> String {
     let charset = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no 0/O/1/I ambiguity
     let mut code = String::with_capacity(CODE_LENGTH + 1); // +1 for dash
 
-    // Use RandomState as a source of randomness — available in std without
-    // external crate dependencies. Each `build_hasher()` call is seeded from
-    // the OS via `RandomState::new()`.
+    // Use two independent RandomState instances as entropy sources. Each
+    // `RandomState::new()` is seeded from the OS. We combine both hashers'
+    // output per character to avoid depending on a single seed, and mix in
+    // the character index plus the previous hash for avalanche diffusion.
+    let state_a = RandomState::new();
+    let state_b = RandomState::new();
+    let mut prev_hash: u64 = 0;
     for i in 0..CODE_LENGTH {
         if i == 3 {
             code.push('-');
         }
-        let state = RandomState::new();
-        let mut hasher = state.build_hasher();
-        hasher.write_usize(i);
-        let idx = (hasher.finish() as usize) % charset.len();
+        let mut hasher_a = state_a.build_hasher();
+        hasher_a.write_usize(i);
+        hasher_a.write_u64(prev_hash);
+        let hash_a = hasher_a.finish();
+
+        let mut hasher_b = state_b.build_hasher();
+        hasher_b.write_u64(hash_a);
+        hasher_b.write_usize(i);
+        let hash_b = hasher_b.finish();
+
+        prev_hash = hash_b;
+        let idx = (hash_b as usize) % charset.len();
         code.push(charset[idx] as char);
     }
     code

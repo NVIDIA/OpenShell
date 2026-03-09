@@ -70,8 +70,8 @@ pub async fn start_tunnel_proxy(gateway_endpoint: &str, cf_token: &str) -> Resul
     let ws_url = format!(
         "{}/_ws_tunnel",
         gateway_endpoint
-            .replace("https://", "wss://")
-            .replace("http://", "ws://")
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1)
             .trim_end_matches('/')
     );
 
