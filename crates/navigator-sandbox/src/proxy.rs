@@ -951,7 +951,7 @@ fn query_l7_config(
 /// This is a defense-in-depth check to prevent SSRF via the CONNECT proxy.
 /// It covers:
 /// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16)
-/// - IPv6 loopback (`::1`), link-local (`fe80::/10`)
+/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`)
 /// - IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped and checked as IPv4
 fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
@@ -962,6 +962,10 @@ fn is_internal_ip(ip: IpAddr) -> bool {
             }
             // fe80::/10 — IPv6 link-local
             if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // fc00::/7 — IPv6 unique local addresses (ULA)
+            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
                 return true;
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
@@ -1679,6 +1683,14 @@ mod tests {
         // fe80::1
         assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
             0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn test_rejects_ipv6_unique_local_address() {
+        // fdc4:f303:9324::254
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfdc4, 0xf303, 0x9324, 0, 0, 0, 0, 0x0254
         ))));
     }
 
