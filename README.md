@@ -23,21 +23,16 @@ It transforms the data center from a static deployment target into a continuous 
 <!-- referenced in docs/get-started/quickstart.md -->
 <!-- quickstart-install-start -->
 ```bash
-pip install nemoclaw
+uv pip install nemoclaw \
+  --upgrade \
+  --pre \
+  --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 <!-- quickstart-install-end -->
 
 ### Install from Source (Developer)
 
-Requires [mise](https://mise.jdx.dev/), Rust 1.88+, Python 3.12+, and Docker.
-
-```bash
-git clone https://github.com/NVIDIA/NemoClaw.git
-cd NemoClaw
-mise trust
-```
-
-`mise` installs all remaining toolchain dependencies automatically. The local `nemoclaw` script builds and runs the debug CLI binary, so you can invoke `nemoclaw` directly from the repo. See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full development workflow.
+Refer to [`CONTRIBUTING.md`](CONTRIBUTING.md) for the full development workflow and installation instructions.
 
 ### Create a sandbox
 
