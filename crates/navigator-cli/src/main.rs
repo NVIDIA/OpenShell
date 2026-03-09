@@ -525,6 +525,13 @@ enum GatewayCommands {
         /// non-interactive mode the existing gateway is reused silently.
         #[arg(long)]
         recreate: bool,
+
+        /// Listen on plaintext HTTP instead of mTLS.
+        ///
+        /// Use when the gateway sits behind a reverse proxy (e.g., Cloudflare
+        /// Tunnel) that terminates TLS at the edge.
+        #[arg(long)]
+        plaintext: bool,
     },
 
     /// Stop the gateway (preserves state).
@@ -1017,7 +1024,13 @@ async fn main() -> Result<()> {
                 gateway_host,
                 kube_port,
                 recreate,
+                plaintext,
             } => {
+                if plaintext {
+                    // SAFETY: This runs before any threads are spawned (single-threaded
+                    // CLI startup). The bootstrap code reads this env var later.
+                    unsafe { std::env::set_var("NEMOCLAW_DISABLE_TLS", "true") };
+                }
                 run::cluster_admin_deploy(
                     &name,
                     update_kube_config,

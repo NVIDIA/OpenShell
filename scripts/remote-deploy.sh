@@ -138,11 +138,11 @@ export NEMOCLAW_CLUSTER_IMAGE="navigator/cluster:dev"
 export NEMOCLAW_PUSH_IMAGES="navigator/server:dev,navigator/sandbox:dev"
 export IMAGE_TAG="dev"
 
-echo "==> Deploying gateway (TLS disabled for tunnel, port=${GATEWAY_PORT})..."
-export NEMOCLAW_DISABLE_TLS=true
+echo "==> Deploying gateway (plaintext behind tunnel, port=${GATEWAY_PORT})..."
 mise exec -- nemoclaw gateway start \
   --name "${CLUSTER_NAME}" \
-  --port "${GATEWAY_PORT}"
+  --port "${GATEWAY_PORT}" \
+  --plaintext
 
 echo ""
 echo "============================================"
