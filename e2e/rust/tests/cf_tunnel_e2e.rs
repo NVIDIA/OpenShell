@@ -38,6 +38,63 @@ async fn run_cli(args: &[&str]) -> (String, i32) {
     (combined, code)
 }
 
+/// Run `nemoclaw <args>` with a custom config directory so the CLI reads
+/// our seeded cluster metadata and CF token instead of the real config.
+async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let mut cmd = nemoclaw_cmd();
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", config_dir)
+        .env("HOME", config_dir)
+        .env_remove("NEMOCLAW_CLUSTER")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn nemoclaw");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let code = output.status.code().unwrap_or(-1);
+    (combined, code)
+}
+
+/// Seed a temporary config directory with cluster metadata that has
+/// `auth_mode: "cloudflare_jwt"`, a stored CF token, and an active cluster
+/// pointing at the given endpoint.
+fn seed_cf_cluster_config(
+    config_dir: &std::path::Path,
+    cluster_name: &str,
+    gateway_endpoint: &str,
+    cf_token: &str,
+) {
+    let nemoclaw_dir = config_dir.join("nemoclaw");
+    let clusters_dir = nemoclaw_dir.join("clusters");
+
+    // Write active_cluster file.
+    std::fs::create_dir_all(&nemoclaw_dir).expect("create nemoclaw config dir");
+    std::fs::write(nemoclaw_dir.join("active_cluster"), cluster_name)
+        .expect("write active_cluster");
+
+    // Write cluster metadata JSON.
+    std::fs::create_dir_all(&clusters_dir).expect("create clusters dir");
+    let metadata = serde_json::json!({
+        "name": cluster_name,
+        "gateway_endpoint": gateway_endpoint,
+        "is_remote": false,
+        "gateway_port": 0,
+        "auth_mode": "cloudflare_jwt"
+    });
+    std::fs::write(
+        clusters_dir.join(format!("{cluster_name}_metadata.json")),
+        serde_json::to_string_pretty(&metadata).unwrap(),
+    )
+    .expect("write cluster metadata");
+
+    // Write CF token file.
+    let token_dir = clusters_dir.join(cluster_name);
+    std::fs::create_dir_all(&token_dir).expect("create token dir");
+    std::fs::write(token_dir.join("cf_token"), cf_token).expect("write cf_token");
+}
+
 // -------------------------------------------------------------------
 // Test 12: gRPC health check against a plaintext cluster
 // -------------------------------------------------------------------
@@ -72,19 +129,18 @@ async fn plaintext_cluster_status_reports_healthy() {
 // Test 13: gRPC through the WS tunnel proxy (CF token path)
 // -------------------------------------------------------------------
 
-/// When a gateway is registered with `gateway add` (CF auth mode), the CLI
-/// routes gRPC through the WebSocket tunnel proxy.  This test verifies the
-/// full tunnel path:
+/// When a cluster's metadata has `auth_mode == "cloudflare_jwt"` and a
+/// stored CF token, the CLI routes gRPC through the WebSocket tunnel proxy.
+/// This test verifies the full tunnel path:
 ///
 /// CLI → local TCP proxy → WebSocket → /_ws_tunnel → loopback TCP → gRPC
 ///
-/// This test registers the current cluster's endpoint as a CF gateway,
-/// provides a dummy CF token, and verifies that `nemoclaw status` can
-/// reach the server through the WS tunnel.
+/// The test seeds a temporary config directory with CF auth metadata and a
+/// dummy token, then runs `nemoclaw status` against the live plaintext
+/// gateway.
 ///
-/// Note: This test modifies the active gateway config (creates a new CF
-/// gateway entry). It cleans up afterward but may interfere with other
-/// tests if run in parallel.
+/// Note: The dummy token won't be validated (no CF Access middleware on
+/// the plaintext cluster), but it triggers the CLI's tunnel proxy codepath.
 #[tokio::test]
 async fn ws_tunnel_status_through_cf_proxy() {
     // Read the current cluster name to restore it later.
@@ -139,14 +195,15 @@ async fn ws_tunnel_status_through_cf_proxy() {
         return;
     }
 
-    // Use --cf-token + --gateway-endpoint to force the CF tunnel path.
-    // The dummy token won't be validated (no CF Access middleware), but
-    // it triggers the CLI's tunnel proxy codepath.
-    let (output, code) = run_cli(&[
-        "--cf-token",
-        "dummy-test-jwt",
-        "--gateway-endpoint",
-        &endpoint,
+    // Seed a temporary config directory with CF auth metadata pointing at
+    // the live gateway. The dummy token triggers the WS tunnel codepath
+    // without requiring real CF Access middleware.
+    let tmpdir = tempfile::tempdir().expect("create temp config dir");
+    seed_cf_cluster_config(tmpdir.path(), "cf-tunnel-test", &endpoint, "dummy-test-jwt");
+
+    let (output, code) = run_cli_with_config(tmpdir.path(), &[
+        "--cluster",
+        "cf-tunnel-test",
         "status",
     ])
     .await;

@@ -30,8 +30,6 @@ pub struct TlsOptions {
     key: Option<PathBuf>,
     /// Cluster name for resolving default cert directory.
     cluster_name: Option<String>,
-    /// Skip server certificate verification (insecure; for Cloudflare tunnel).
-    pub disable_tls_verify: bool,
     /// Cloudflare JWT token — when set, disables mTLS client certs and injects
     /// a `cf-authorization` header on every gRPC request instead.
     pub cf_token: Option<String>,
@@ -44,7 +42,6 @@ impl TlsOptions {
             cert,
             key,
             cluster_name: None,
-            disable_tls_verify: false,
             cf_token: None,
         }
     }
@@ -274,14 +271,6 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
         // but also no TLS config to set. This branch shouldn't normally happen
         // (CF endpoints are always HTTPS) but handle gracefully.
         return endpoint.connect().await.into_diagnostic();
-    } else if tls.disable_tls_verify {
-        // mTLS with verify disabled — unusual but supported.
-        let materials = require_tls_materials(server, tls)?;
-        let identity = Identity::from_pem(materials.cert.clone(), materials.key.clone());
-        ClientTlsConfig::new()
-            .with_native_roots()
-            .identity(identity)
-            .assume_http2(true)
     } else {
         // Standard mTLS: private CA + client cert.
         let materials = require_tls_materials(server, tls)?;

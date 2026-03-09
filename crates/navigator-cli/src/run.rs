@@ -820,7 +820,7 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     let base = server.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
 
-    let https = if tls.is_bearer_auth() || tls.disable_tls_verify {
+    let https = if tls.is_bearer_auth() {
         // No client cert — use native/system roots for server verification.
         HttpsConnectorBuilder::new()
             .with_native_roots()

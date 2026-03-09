@@ -99,19 +99,13 @@ fn resolve_gateway_name(cluster_flag: &Option<String>) -> Option<String> {
 /// Apply Cloudflare Access token from local storage when the cluster uses CF auth.
 ///
 /// When the resolved cluster has `auth_mode == "cloudflare_jwt"`, loads the
-/// stored CF token from disk and sets it on the `TlsOptions`. This makes
-/// `--cf-token` and `--disable-tls-verify` unnecessary for daily use.
-///
-/// An explicit `--cf-token` flag takes precedence over the stored token.
+/// stored CF token from disk and sets it on the `TlsOptions`. The token is
+/// always read from cluster metadata rather than supplied via a CLI flag.
 fn apply_cf_auth(tls: &mut TlsOptions, cluster_name: &str) {
-    if tls.cf_token.is_some() {
-        return; // Explicit --cf-token takes precedence.
-    }
     if let Some(meta) = get_cluster_metadata(cluster_name) {
         if meta.auth_mode.as_deref() == Some("cloudflare_jwt") {
             if let Some(token) = load_cf_token(cluster_name) {
                 tls.cf_token = Some(token);
-                tls.disable_tls_verify = true;
             }
         }
     }
@@ -154,14 +148,6 @@ struct Cli {
     /// Connects directly without looking up cluster metadata.
     #[arg(long, global = true, env = "NEMOCLAW_GATEWAY_ENDPOINT")]
     gateway_endpoint: Option<String>,
-
-    /// Skip TLS server certificate verification (insecure; for Cloudflare tunnel testing).
-    #[arg(long, global = true, env = "NEMOCLAW_DISABLE_TLS_VERIFY")]
-    disable_tls_verify: bool,
-
-    /// Cloudflare JWT token for gateway auth (disables mTLS client certs).
-    #[arg(long, global = true, env = "NEMOCLAW_CF_TOKEN")]
-    cf_token: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -990,9 +976,7 @@ async fn main() -> Result<()> {
     CompleteEnv::with_factory(Cli::command).complete();
 
     let cli = Cli::parse();
-    let mut tls = TlsOptions::default();
-    tls.disable_tls_verify = cli.disable_tls_verify;
-    tls.cf_token = cli.cf_token.clone();
+    let tls = TlsOptions::default();
 
     // Set up logging based on verbosity
     let log_level = match cli.verbose {

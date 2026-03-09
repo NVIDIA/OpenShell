@@ -252,49 +252,4 @@ async fn gateway_add_derives_name_from_hostname() {
     );
 }
 
-// -------------------------------------------------------------------
-// Test 11: `--cf-token` global flag is recognized
-// -------------------------------------------------------------------
 
-/// `nemoclaw --cf-token test-jwt status` should not crash on the flag itself.
-/// It will fail to connect (no gateway), but the flag should be parsed.
-#[tokio::test]
-async fn cf_token_flag_is_recognized() {
-    let (output, _code) = run_isolated(&["--cf-token", "test-jwt-token", "status"]).await;
-
-    // The command will either:
-    // - Exit 0 with "No gateway configured" (if no gateway found)
-    // - Exit non-zero with a connection error (if it tries to connect)
-    // But it should NOT fail with an "unknown flag" error.
-    let clean = strip_ansi(&output);
-    assert!(
-        !clean.contains("unexpected argument") && !clean.contains("error: Found argument"),
-        "--cf-token should be a recognized global flag:\n{clean}"
-    );
-}
-
-/// `nemoclaw --help` should list `--cf-token` as a global option.
-#[tokio::test]
-async fn help_shows_cf_token_option() {
-    let (output, code) = run_isolated(&["--help"]).await;
-    assert_eq!(code, 0, "--help should exit 0:\n{output}");
-
-    let clean = strip_ansi(&output);
-    assert!(
-        clean.contains("--cf-token"),
-        "expected '--cf-token' in global --help output:\n{clean}"
-    );
-}
-
-/// `nemoclaw --help` should list `--disable-tls-verify` as a global option.
-#[tokio::test]
-async fn help_shows_disable_tls_verify_option() {
-    let (output, code) = run_isolated(&["--help"]).await;
-    assert_eq!(code, 0, "--help should exit 0:\n{output}");
-
-    let clean = strip_ansi(&output);
-    assert!(
-        clean.contains("--disable-tls-verify"),
-        "expected '--disable-tls-verify' in global --help output:\n{clean}"
-    );
-}
