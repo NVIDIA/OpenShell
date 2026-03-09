@@ -91,5 +91,4 @@ or anything else), consider contributing it back so others can use it.
 ## Next Steps
 
 - {doc}`create-and-manage`: Full sandbox lifecycle management
-- {doc}`custom-containers`: Build a fully custom container with BYOC
 - {doc}`../safety-and-privacy/policies`: Customize the policy applied to any sandbox

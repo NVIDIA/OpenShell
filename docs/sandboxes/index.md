@@ -26,20 +26,7 @@ inside a Docker container on your machine.
 
 You do not need to set this up manually. The first time you run a command
 that needs a cluster (such as `nemoclaw sandbox create`), the CLI provisions
-one automatically. This is the "Runtime ready" line you see in the output.
-Subsequent commands reuse the existing cluster.
-
-For teams or when you need more resources, you can deploy the cluster to a
-remote host instead of your local machine:
-
-```console
-$ nemoclaw gateway start --remote user@host
-```
-
-Refer to [Remote Deployment](../about/architecture.md) for
-details. If you have multiple clusters (local and remote), switch between them
-with `nemoclaw gateway select <name>`. Refer to the
-[CLI Reference](../reference/cli.md#gateway-commands) for the full command set.
+one automatically.
 
 ## Next Steps
 
@@ -47,9 +34,5 @@ with `nemoclaw gateway select <name>`. Refer to the
   sandboxes.
 - {doc}`providers`: Create and attach credential providers so agents can
   authenticate with external services.
-- {doc}`custom-containers`: Build and run your own container image inside a
-  sandbox.
 - {doc}`community-sandboxes`: Use pre-built sandboxes from the community
   catalog.
-- {doc}`terminal`: Monitor sandbox status and live activity in a terminal
-  dashboard.

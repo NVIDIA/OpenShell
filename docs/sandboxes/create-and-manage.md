@@ -16,18 +16,12 @@ Ensure the following are installed before creating sandboxes.
 
 ## Create a Sandbox
 
-The simplest way to create a sandbox is to specify a trailing command:
-
 ```console
 $ nemoclaw sandbox create -- claude
 ```
 
-The CLI bootstraps the runtime (if this is your first run), discovers your
-credentials, applies the default policy, and drops you into the sandbox.
+If you have an existing gateway, a sandbox will be created within that gateway or if you don't have one, one will be created for you.
 
-You can customize creation with flags like `--name`, `--provider`, `--policy`,
-`--upload`, `--keep`, `--forward`, and `--from`. Refer to the
-[CLI Reference](../reference/cli.md) for the full flag list.
 
 A fully specified creation command might look like:
 
@@ -75,17 +69,6 @@ Open an SSH session into a running sandbox:
 $ nemoclaw sandbox connect my-sandbox
 ```
 
-### VS Code Remote-SSH
-
-Export the sandbox SSH configuration and append it to your SSH config:
-
-```console
-$ nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
-```
-
-Then open VS Code, install the Remote - SSH extension if you have not
-already, and connect to the host named `my-sandbox`.
-
 ## View Logs
 
 Stream and filter sandbox logs to monitor agent activity and diagnose policy decisions.
@@ -105,17 +88,21 @@ Use flags to filter and follow output:
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
 
-Combine flags to narrow in on what you need:
+## Monitor your Sandbox
+
+NemoClaw Terminal is a real-time dashboard that combines sandbox status and live logs in a single view.
 
 ```console
-$ nemoclaw logs my-sandbox --tail --source sandbox --level warn --since 5m
+$ nemoclaw term
 ```
 
-:::{tip}
-For a real-time dashboard that combines sandbox status and logs in one view,
-run `nemoclaw term`. Refer to {doc}`terminal` for details on reading log entries and
-diagnosing blocked connections.
-:::
+The dashboard shows:
+
+- **Sandbox status** — name, phase, image, attached providers, age, and active port forwards.
+- **Live log stream** — outbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
+
+Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy — refer to {doc}`../safety-and-privacy/policies` for the workflow.
+
 
 ## Transfer Files
 
@@ -138,39 +125,6 @@ You can also upload files at creation time with the `--upload` flag on
 `nemoclaw sandbox create`.
 :::
 
-## Port Forwarding
-
-Forward a port from the sandbox to your host machine. This runs in the
-foreground by default:
-
-```console
-$ nemoclaw forward start 8080 my-sandbox
-```
-
-Add `-d` to run the forward in the background:
-
-```console
-$ nemoclaw forward start 8080 my-sandbox -d
-```
-
-List active port forwards:
-
-```console
-$ nemoclaw forward list
-```
-
-Stop a port forward:
-
-```console
-$ nemoclaw forward stop 8080 my-sandbox
-```
-
-:::{note}
-You can set up port forwarding at creation time with the `--forward` flag on
-`nemoclaw sandbox create`, which is convenient when you know upfront that
-your workload exposes a service.
-:::
-
 ## Delete Sandboxes
 
 Remove sandboxes when they are no longer needed. Deleting a sandbox stops all processes, releases cluster resources, and purges injected credentials.
@@ -181,15 +135,8 @@ Delete a sandbox by name:
 $ nemoclaw sandbox delete my-sandbox
 ```
 
-You can delete multiple sandboxes in a single command:
-
-```console
-$ nemoclaw sandbox delete sandbox-a sandbox-b sandbox-c
-```
-
 ## Next Steps
 
 - {doc}`community-sandboxes`: Use pre-built sandboxes from the community catalog
 - {doc}`providers`: Create and attach credential providers
-- {doc}`custom-containers`: Build and run your own container image
 - {doc}`../safety-and-privacy/policies`: Control what the agent can access
