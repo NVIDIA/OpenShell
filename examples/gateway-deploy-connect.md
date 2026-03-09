@@ -103,17 +103,18 @@ nemoclaw gateway start --port 9090
 The CLI stores the port in cluster metadata, so subsequent commands
 resolve it automatically.
 
-## Cloudflare-fronted gateway
+## Edge-authenticated gateway
 
-For gateways already running behind Cloudflare Access, no deployment
-is needed -- register the endpoint and authenticate via browser:
+For gateways running behind a reverse proxy that handles
+authentication (e.g. Cloudflare Access), no deployment is needed --
+register the endpoint and authenticate via browser:
 
 ```bash
 nemoclaw gateway add https://gateway.example.com
 ```
 
-This opens your browser for Cloudflare Access login. After
-authentication, the CLI stores a JWT token and sets the gateway as
+This opens your browser for the proxy's login flow. After
+authentication, the CLI stores a bearer token and sets the gateway as
 active.
 
 To re-authenticate after token expiry:
@@ -121,6 +122,23 @@ To re-authenticate after token expiry:
 ```bash
 nemoclaw gateway login
 ```
+
+### How edge-authenticated connections differ
+
+Reverse proxies that authenticate via browser-style GET requests are
+incompatible with gRPC's HTTP/2 POST transport. To work around this,
+the CLI uses a **WebSocket tunnel**:
+
+1. The CLI starts a local proxy that listens on an ephemeral port.
+2. gRPC traffic is sent as plaintext HTTP/2 to this local proxy.
+3. The proxy opens a WebSocket (`wss://`) to the gateway's tunnel
+   endpoint, attaching the bearer token in the upgrade headers.
+4. The edge proxy authenticates the WebSocket upgrade request.
+5. The gateway receives the WebSocket connection and pipes it into the
+   same gRPC service that handles direct mTLS connections.
+
+This is transparent to the user -- all CLI commands work the same
+regardless of whether the gateway uses mTLS or edge authentication.
 
 ## Managing multiple gateways
 
@@ -144,20 +162,22 @@ nemoclaw status -g my-other-cluster
 
 ## How it works
 
-The `gateway start` command runs a full bootstrap sequence:
+The `gateway start` command:
 
-1. Pulls the NemoClaw cluster image (k3s + gateway + sandbox images).
-2. Creates a Docker network, volume, and privileged container.
-3. Waits for k3s to start and the gateway workload to become healthy.
-4. Generates (or reuses) a TLS PKI: cluster CA, server cert, client cert.
-5. Stores mTLS credentials at `~/.config/nemoclaw/clusters/<name>/mtls/`.
-6. Writes cluster metadata to `~/.config/nemoclaw/clusters/<name>_metadata.json`.
-7. Sets the cluster as the active gateway.
+1. Pulls the NemoClaw cluster image and provisions a container.
+2. Waits for the gateway to become healthy.
+3. Generates mTLS certificates for secure communication.
+4. Stores connection credentials and metadata locally.
+5. Sets the cluster as the active gateway.
 
-All subsequent CLI commands resolve the active gateway, load TLS
-credentials from disk, and open a gRPC channel over mTLS. For
-Cloudflare-fronted gateways, the CLI routes traffic through a local
-WebSocket tunnel proxy instead of direct mTLS.
+All subsequent CLI commands automatically resolve the active gateway
+and authenticate using stored credentials.
+
+For local and remote gateways, the CLI connects directly over mTLS.
+For edge-authenticated gateways, the CLI routes gRPC traffic through
+a local WebSocket tunnel proxy (see
+[How edge-authenticated connections differ](#how-edge-authenticated-connections-differ)
+above).
 
 ## Troubleshooting
 

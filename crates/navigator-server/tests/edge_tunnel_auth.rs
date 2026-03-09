@@ -1,26 +1,26 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Integration tests for Cloudflare Tunnel auth compatibility.
+//! Integration tests for edge tunnel auth compatibility.
 //!
 //! These tests verify that the gateway can operate in "dual-auth" mode where
 //! the TLS layer accepts connections both with and without client certificates.
-//! This is the foundation for Cloudflare Tunnel support: Cloudflare terminates
-//! TLS at its edge and re-originates a new connection to the gateway without a
+//! This is the foundation for edge-authenticated tunnel support: the edge proxy
+//! terminates TLS and re-originates a new connection to the gateway without a
 //! client cert.  The gateway must accept these connections and defer auth to the
-//! application layer (e.g. a `cf-authorization` JWT header).
+//! application layer (e.g. a bearer JWT header).
 //!
 //! Test matrix:
 //!
-//! | allow_unauthenticated | client cert | cf-authorization header | expected |
-//! |-----------------------|-------------|-------------------------|----------|
-//! | false                 | valid       | —                       | OK       |
-//! | false                 | none        | —                       | rejected |
-//! | true                  | valid       | —                       | OK       |
-//! | true                  | none        | present                 | OK (*)   |
-//! | true                  | none        | absent                  | OK (**)  |
+//! | allow_unauthenticated | client cert | bearer auth header | expected |
+//! |-----------------------|-------------|--------------------|----------|
+//! | false                 | valid       | —                  | OK       |
+//! | false                 | none        | —                  | rejected |
+//! | true                  | valid       | —                  | OK       |
+//! | true                  | none        | present            | OK (*)   |
+//! | true                  | none        | absent             | OK (**)  |
 //!
-//! (*) Simulates the Cloudflare tunnel path: no client cert but a JWT header.
+//! (*) Simulates the edge tunnel path: no client cert but a JWT header.
 //! (**) TLS handshake succeeds, but in production the auth middleware (not yet
 //!      implemented) would reject.  This test proves the TLS layer alone does
 //!      not block unauthenticated connections when the flag is set.

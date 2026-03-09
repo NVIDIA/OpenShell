@@ -1,18 +1,18 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Auth endpoint for Cloudflare Access browser-based login.
+//! Auth endpoint for edge-proxy browser-based login.
 //!
 //! When the CLI runs `gateway add` or `gateway login`, it opens the user's
-//! browser to `GET /auth/connect?callback_port=<port>`. Cloudflare Access
-//! intercepts the request and shows its IdP login page. After authentication,
-//! CF sets the `CF_Authorization` cookie and proxies the request to this
-//! endpoint.
+//! browser to `GET /auth/connect?callback_port=<port>`. The edge proxy
+//! (e.g., Cloudflare Access) intercepts the request and shows its IdP login
+//! page. After authentication, the proxy sets the `CF_Authorization` cookie
+//! and proxies the request to this endpoint.
 //!
 //! The handler reads the `CF_Authorization` cookie from the request headers
 //! (required because the cookie is typically `HttpOnly`) and serves a styled
-//! confirmation page. When the user clicks "Connect", JavaScript redirects
-//! to `http://127.0.0.1:<callback_port>/callback?token=<jwt>`, where the
+//! confirmation page. When the user clicks "Connect", JavaScript POSTs
+//! the token to `http://127.0.0.1:<callback_port>/callback`, where the
 //! CLI's ephemeral localhost server captures and stores the token.
 
 use axum::{
@@ -94,7 +94,7 @@ fn extract_cookie(cookies: &str, name: &str) -> Option<String> {
     })
 }
 
-/// Render the styled confirmation page with the CF token embedded.
+/// Render the styled confirmation page with the edge auth token embedded.
 ///
 /// The page displays the confirmation code so the user can verify it matches
 /// their terminal. Clicking "Connect" sends an XHR POST (not a redirect) to
@@ -339,11 +339,11 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// Render a waiting page shown when the CF Access cookie is not yet present.
+/// Render a waiting page shown when the edge proxy auth cookie is not yet present.
 ///
-/// This can happen if CF Access hasn't completed authentication yet. The page
-/// auto-reloads after a short delay to pick up the cookie once login finishes.
-/// The `code` parameter is preserved across reloads.
+/// This can happen if the edge proxy hasn't completed authentication yet. The
+/// page auto-reloads after a short delay to pick up the cookie once login
+/// finishes. The `code` parameter is preserved across reloads.
 fn render_waiting_page(callback_port: u16, code: &str) -> String {
     let safe_code = html_escape(code);
     format!(
@@ -404,7 +404,7 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
     <div class="card">
         <div class="logo">NemoClaw</div>
         <div class="spinner"></div>
-        <div class="message">Authenticating with Cloudflare Access...</div>
+        <div class="message">Authenticating...</div>
     </div>
 </body>
 </html>"#,

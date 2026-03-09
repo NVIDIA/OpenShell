@@ -1,28 +1,27 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Cloudflare Access tunnel proxy.
+//! Edge-authenticated WebSocket tunnel proxy.
 //!
-//! When the gateway sits behind a Cloudflare Tunnel with Cloudflare Access
-//! enabled, gRPC (HTTP/2 POST) requests are rejected at the CF edge because
-//! Access auth operates at the HTTP layer and does not support non-browser POST
-//! traffic with browser-flow JWTs.
+//! When the gateway sits behind a reverse proxy with edge authentication
+//! (e.g., Cloudflare Access), gRPC (HTTP/2 POST) requests are rejected at the
+//! edge because browser-flow JWTs only authenticate GET requests.
 //!
-//! `cloudflared access tcp` solves this by opening a **WebSocket** to the edge
-//! (WebSocket upgrades are GET requests, which Access authenticates normally)
-//! and then piping raw TCP bytes through WebSocket binary frames.
+//! The workaround is to open a **WebSocket** to the edge (WebSocket upgrades
+//! are GET requests, which the edge authenticates normally) and then pipe raw
+//! TCP bytes through WebSocket binary frames.
 //!
-//! This module implements the same pattern:
+//! This module implements the pattern:
 //!
 //! 1. Bind a local TCP listener on an ephemeral port.
-//! 2. For each accepted connection, open a WebSocket (`wss://`) to the CF
-//!    tunnel hostname with the JWT in the `Cf-Access-Token` header.
+//! 2. For each accepted connection, open a WebSocket (`wss://`) to the
+//!    gateway's tunnel endpoint with the bearer token in upgrade headers.
 //! 3. Bidirectionally pipe bytes between the local TCP stream and the
 //!    WebSocket.
 //!
 //! The gRPC [`Channel`] then connects to `http://127.0.0.1:<local_port>`
-//! (plaintext) — Cloudflare handles TLS on the edge, and the WebSocket
-//! carries the raw bytes to the origin.
+//! (plaintext) — the edge handles TLS, and the WebSocket carries the raw
+//! bytes to the origin.
 
 use futures::stream::{SplitSink, SplitStream};
 use futures::{SinkExt, StreamExt};
@@ -37,12 +36,12 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, error, warn};
 
-/// A running Cloudflare tunnel proxy.
+/// A running edge-authenticated tunnel proxy.
 ///
 /// The proxy listens on a local TCP port and tunnels each connection over a
-/// WebSocket to the Cloudflare edge. The listener runs in a detached task for
-/// the lifetime of the current process.
-pub struct CfTunnelProxy {
+/// WebSocket to the edge. The listener runs in a detached task for the
+/// lifetime of the current process.
+pub struct EdgeTunnelProxy {
     /// Local address the proxy is listening on (e.g. `127.0.0.1:54321`).
     pub local_addr: SocketAddr,
 }
@@ -52,21 +51,24 @@ pub struct CfTunnelProxy {
 struct TunnelConfig {
     /// The `wss://` URL to connect to (derived from the gateway endpoint).
     ws_url: String,
-    /// The CF Access JWT token.
-    cf_token: String,
+    /// The bearer token for edge authentication.
+    edge_token: String,
 }
 
 /// Start the local tunnel proxy.
 ///
-/// Returns a [`CfTunnelProxy`] with the local address to connect to.
+/// Returns an [`EdgeTunnelProxy`] with the local address to connect to.
 /// The proxy runs as a background tokio task.
-pub async fn start_tunnel_proxy(gateway_endpoint: &str, cf_token: &str) -> Result<CfTunnelProxy> {
+pub async fn start_tunnel_proxy(
+    gateway_endpoint: &str,
+    edge_token: &str,
+) -> Result<EdgeTunnelProxy> {
     let listener = TcpListener::bind("127.0.0.1:0").await.into_diagnostic()?;
     let local_addr = listener.local_addr().into_diagnostic()?;
 
     // Convert the gateway endpoint to a WebSocket URL.
     // https://foo.com -> wss://foo.com
-    // http://foo.com  -> ws://foo.com  (shouldn't happen with CF, but handle it)
+    // http://foo.com  -> ws://foo.com  (edge proxy over plain HTTP, uncommon but handled)
     let ws_url = format!(
         "{}/_ws_tunnel",
         gateway_endpoint
@@ -77,23 +79,23 @@ pub async fn start_tunnel_proxy(gateway_endpoint: &str, cf_token: &str) -> Resul
 
     let config = Arc::new(TunnelConfig {
         ws_url,
-        cf_token: cf_token.to_string(),
+        edge_token: edge_token.to_string(),
     });
 
     debug!(
         local_addr = %local_addr,
         gateway = %gateway_endpoint,
-        "starting Cloudflare tunnel proxy"
+        "starting edge tunnel proxy"
     );
 
     // Spawn the accept loop.
     tokio::spawn(accept_loop(listener, config));
 
-    Ok(CfTunnelProxy { local_addr })
+    Ok(EdgeTunnelProxy { local_addr })
 }
 
 /// Accept loop: for each incoming TCP connection, spawn a handler that
-/// opens a WebSocket to the CF edge and pipes bytes bidirectionally.
+/// opens a WebSocket to the edge and pipes bytes bidirectionally.
 async fn accept_loop(listener: TcpListener, config: Arc<TunnelConfig>) {
     loop {
         match listener.accept().await {
@@ -115,7 +117,7 @@ async fn accept_loop(listener: TcpListener, config: Arc<TunnelConfig>) {
     }
 }
 
-/// Handle a single tunneled connection: open a WebSocket to the CF edge and
+/// Handle a single tunneled connection: open a WebSocket to the edge and
 /// bidirectionally copy bytes.
 async fn handle_connection(tcp_stream: TcpStream, config: &TunnelConfig) -> Result<()> {
     let ws_stream = open_ws(config).await?;
@@ -145,15 +147,15 @@ async fn handle_connection(tcp_stream: TcpStream, config: &TunnelConfig) -> Resu
     Ok(())
 }
 
-/// Open a WebSocket connection to the Cloudflare edge.
+/// Open a WebSocket connection to the edge proxy.
 async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream<TcpStream>>> {
     let mut request = (&config.ws_url).into_client_request().into_diagnostic()?;
 
-    // Inject the CF Access token via multiple headers for maximum compatibility.
-    // cloudflared uses `Cf-Access-Token`, but CF Access also checks the
-    // `CF_Authorization` cookie and `Cf-Access-Jwt-Assertion` header.
-    let token_val = HeaderValue::from_str(&config.cf_token)
-        .map_err(|e| miette::miette!("invalid CF token header value: {e}"))?;
+    // Inject the bearer token via multiple headers for compatibility with
+    // Cloudflare Access (which checks `Cf-Access-Token`, the
+    // `CF_Authorization` cookie, and the `Cf-Access-Jwt-Assertion` header).
+    let token_val = HeaderValue::from_str(&config.edge_token)
+        .map_err(|e| miette::miette!("invalid edge token header value: {e}"))?;
     request
         .headers_mut()
         .insert("Cf-Access-Token", token_val.clone());
@@ -162,11 +164,11 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
         .insert("Cf-Access-Jwt-Assertion", token_val);
     request.headers_mut().insert(
         "Cookie",
-        HeaderValue::from_str(&format!("CF_Authorization={}", config.cf_token))
-            .map_err(|e| miette::miette!("invalid CF cookie value: {e}"))?,
+        HeaderValue::from_str(&format!("CF_Authorization={}", config.edge_token))
+            .map_err(|e| miette::miette!("invalid edge token cookie value: {e}"))?,
     );
 
-    debug!(url = %config.ws_url, "opening WebSocket to CF edge");
+    debug!(url = %config.ws_url, "opening WebSocket to edge");
 
     let (ws_stream, response) = tokio_tungstenite::connect_async(request)
         .await
@@ -174,7 +176,7 @@ async fn open_ws(config: &TunnelConfig) -> Result<WebSocketStream<MaybeTlsStream
 
     debug!(
         status = %response.status(),
-        "WebSocket connected to CF edge"
+        "WebSocket connected to edge"
     );
 
     Ok(ws_stream)

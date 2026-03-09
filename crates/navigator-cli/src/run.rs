@@ -583,7 +583,7 @@ pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) 
     println!("  {} {}", "Cluster:".dimmed(), cluster_name);
     println!("  {} {}", "Server:".dimmed(), server);
     if tls.is_bearer_auth() {
-        println!("  {} {}", "Auth:".dimmed(), "Cloudflare JWT");
+        println!("  {} {}", "Auth:".dimmed(), "Edge (bearer token)");
     }
 
     // Try to connect and get health
@@ -648,11 +648,11 @@ pub fn cluster_use(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Register an external Cloudflare-fronted gateway.
+/// Register an external edge-authenticated gateway.
 ///
 /// Creates local metadata for the given endpoint so it appears in
 /// `gateway select`. When `no_auth` is false, opens a browser for
-/// Cloudflare Access authentication and stores the JWT locally.
+/// authentication and stores the bearer token locally.
 pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> Result<()> {
     // Normalise the endpoint: ensure it has a scheme.
     let endpoint = if !endpoint.contains("://") {
@@ -675,7 +675,7 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         }
     };
 
-    // Build metadata for a Cloudflare-fronted remote gateway.
+    // Build metadata for an edge-authenticated remote gateway.
     let metadata = ClusterMetadata {
         name: name.to_string(),
         gateway_endpoint: endpoint.clone(),
@@ -685,8 +685,8 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         remote_host: None,
         resolved_host: None,
         auth_mode: Some("cloudflare_jwt".to_string()),
-        cf_team_domain: None,
-        cf_auth_url: None,
+        edge_team_domain: None,
+        edge_auth_url: None,
     };
 
     store_cluster_metadata(name, &metadata)?;
@@ -715,7 +715,7 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
 
     match crate::auth::browser_auth_flow(&endpoint).await {
         Ok(token) => {
-            navigator_bootstrap::cf_token::store_cf_token(name, &token)?;
+            navigator_bootstrap::edge_token::store_edge_token(name, &token)?;
             eprintln!("{} Authenticated successfully", "✓".green().bold(),);
         }
         Err(e) => {
@@ -730,9 +730,9 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
     Ok(())
 }
 
-/// Re-authenticate with a Cloudflare-fronted gateway.
+/// Re-authenticate with an edge-authenticated gateway.
 ///
-/// Opens a browser for CF Access login and stores the updated token.
+/// Opens a browser for edge proxy login and stores the updated token.
 pub async fn gateway_login(name: &str) -> Result<()> {
     let metadata = navigator_bootstrap::load_cluster_metadata(name).map_err(|_| {
         miette::miette!(
@@ -743,13 +743,13 @@ pub async fn gateway_login(name: &str) -> Result<()> {
 
     if metadata.auth_mode.as_deref() != Some("cloudflare_jwt") {
         return Err(miette::miette!(
-            "Gateway '{name}' does not use Cloudflare authentication.\n\
-             Only Cloudflare-fronted gateways support browser login."
+            "Gateway '{name}' does not use edge authentication.\n\
+             Only edge-authenticated gateways support browser login."
         ));
     }
 
     let token = crate::auth::browser_auth_flow(&metadata.gateway_endpoint).await?;
-    navigator_bootstrap::cf_token::store_cf_token(name, &token)?;
+    navigator_bootstrap::edge_token::store_edge_token(name, &token)?;
 
     eprintln!("{} Authenticated to gateway '{name}'", "✓".green().bold(),);
 
@@ -798,7 +798,7 @@ pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
         let is_active = active.as_deref() == Some(&cluster.name);
         let marker = if is_active { "*" } else { " " };
         let cluster_type = match cluster.auth_mode.as_deref() {
-            Some("cloudflare_jwt") => "cloudflare",
+            Some("cloudflare_jwt") => "edge",
             _ if cluster.is_remote => "remote",
             _ => "local",
         };
@@ -820,14 +820,15 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     let base = server.trim_end_matches('/');
     let uri: hyper::Uri = format!("{base}/healthz").parse().into_diagnostic()?;
 
-    let https = if tls.is_bearer_auth() {
-        // No client cert — use native/system roots for server verification.
-        HttpsConnectorBuilder::new()
+    let scheme = uri.scheme_str().unwrap_or("https");
+    let https = if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
+        let https = HttpsConnectorBuilder::new()
             .with_native_roots()
             .into_diagnostic()?
-            .https_only()
+            .https_or_http()
             .enable_http1()
-            .build()
+            .build();
+        https
     } else {
         let materials = require_tls_materials(server, tls)?;
         let tls_config = build_rustls_config(&materials)?;
@@ -839,8 +840,8 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     };
     let client: Client<_, Full<Bytes>> = Client::builder(TokioExecutor::new()).build(https);
     let mut req_builder = Request::builder().method("GET").uri(uri);
-    // Inject Cloudflare Access headers when a CF token is configured.
-    if let Some(ref token) = tls.cf_token {
+    // Inject edge authentication headers when an edge token is configured.
+    if let Some(ref token) = tls.edge_token {
         req_builder = req_builder
             .header("Cf-Access-Jwt-Assertion", token.as_str())
             .header("Cookie", format!("CF_Authorization={token}"));
@@ -1061,16 +1062,80 @@ pub async fn cluster_admin_deploy(
 /// Resolve the remote SSH destination for a cluster.
 ///
 /// If `remote_override` is provided, use it. Otherwise, look up the remote
-/// host from stored cluster metadata. Returns `None` for local clusters.
-fn resolve_remote(name: &str, remote_override: Option<&str>) -> Option<String> {
+/// host from stored cluster metadata.
+enum ClusterControlTarget {
+    Local,
+    Remote(String),
+    ExternalRegistration,
+}
+
+fn resolve_cluster_control_target(
+    name: &str,
+    remote_override: Option<&str>,
+) -> ClusterControlTarget {
     if let Some(r) = remote_override {
-        return Some(r.to_string());
+        return ClusterControlTarget::Remote(r.to_string());
     }
-    let metadata = get_cluster_metadata(name)?;
-    if metadata.is_remote {
-        metadata.remote_host
-    } else {
-        None
+
+    match get_cluster_metadata(name) {
+        Some(metadata) if metadata.is_remote => metadata
+            .remote_host
+            .map(ClusterControlTarget::Remote)
+            .unwrap_or(ClusterControlTarget::ExternalRegistration),
+        _ => ClusterControlTarget::Local,
+    }
+}
+
+fn cluster_control_target_options(
+    name: &str,
+    remote_override: Option<&str>,
+    ssh_key: Option<&str>,
+) -> Result<Option<RemoteOptions>> {
+    match resolve_cluster_control_target(name, remote_override) {
+        ClusterControlTarget::Local => Ok(None),
+        ClusterControlTarget::Remote(dest) => {
+            let mut opts = RemoteOptions::new(&dest);
+            if let Some(key) = ssh_key {
+                opts = opts.with_ssh_key(key);
+            }
+            Ok(Some(opts))
+        }
+        ClusterControlTarget::ExternalRegistration => Err(miette::miette!(
+            "Gateway '{name}' is an external registration, not a managed Docker cluster.\n\
+             `nemoclaw gateway stop` is only supported for local or SSH-managed gateways."
+        )),
+    }
+}
+
+fn remove_gateway_registration(name: &str) {
+    if let Err(err) = navigator_bootstrap::edge_token::remove_edge_token(name) {
+        tracing::debug!("failed to remove edge token: {err}");
+    }
+    if let Err(err) = remove_cluster_metadata(name) {
+        tracing::debug!("failed to remove cluster metadata: {err}");
+    }
+    if load_active_cluster().as_deref() == Some(name)
+        && let Err(err) = clear_active_cluster()
+    {
+        tracing::debug!("failed to clear active cluster: {err}");
+    }
+}
+
+fn cleanup_cluster_metadata(name: &str) {
+    if let Err(err) = remove_cluster_metadata(name) {
+        tracing::debug!("failed to remove cluster metadata: {err}");
+    }
+    if load_active_cluster().as_deref() == Some(name)
+        && let Err(err) = clear_active_cluster()
+    {
+        tracing::debug!("failed to clear active cluster: {err}");
+    }
+}
+
+fn resolve_remote(name: &str, remote_override: Option<&str>) -> Option<String> {
+    match resolve_cluster_control_target(name, remote_override) {
+        ClusterControlTarget::Remote(dest) => Some(dest),
+        ClusterControlTarget::Local | ClusterControlTarget::ExternalRegistration => None,
     }
 }
 
@@ -1080,14 +1145,7 @@ pub async fn cluster_admin_stop(
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    let resolved_remote = resolve_remote(name, remote);
-    let remote_opts = resolved_remote.as_deref().map(|dest| {
-        let mut opts = RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            opts = opts.with_ssh_key(key);
-        }
-        opts
-    });
+    let remote_opts = cluster_control_target_options(name, remote, ssh_key)?;
 
     eprintln!("• Stopping cluster {name}...");
     let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
@@ -1102,31 +1160,29 @@ pub async fn cluster_admin_destroy(
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    let resolved_remote = resolve_remote(name, remote);
-    let remote_opts = resolved_remote.as_deref().map(|dest| {
-        let mut opts = RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            opts = opts.with_ssh_key(key);
+    match resolve_cluster_control_target(name, remote) {
+        ClusterControlTarget::ExternalRegistration => {
+            eprintln!("• Removing gateway registration {name}...");
+            remove_gateway_registration(name);
+            eprintln!(
+                "{} Gateway registration {name} removed.",
+                "✓".green().bold()
+            );
+            Ok(())
         }
-        opts
-    });
+        ClusterControlTarget::Local | ClusterControlTarget::Remote(_) => {
+            let remote_opts = cluster_control_target_options(name, remote, ssh_key)?;
 
-    eprintln!("• Destroying cluster {name}...");
-    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
-    handle.destroy().await?;
+            eprintln!("• Destroying cluster {name}...");
+            let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
+            handle.destroy().await?;
 
-    // Clean up metadata and active cluster reference
-    if let Err(err) = remove_cluster_metadata(name) {
-        tracing::debug!("failed to remove cluster metadata: {err}");
+            cleanup_cluster_metadata(name);
+
+            eprintln!("{} Cluster {name} destroyed.", "✓".green().bold());
+            Ok(())
+        }
     }
-    if load_active_cluster().as_deref() == Some(name)
-        && let Err(err) = clear_active_cluster()
-    {
-        tracing::debug!("failed to clear active cluster: {err}");
-    }
-
-    eprintln!("{} Cluster {name} destroyed.", "✓".green().bold());
-    Ok(())
 }
 
 /// Show cluster deployment details.
@@ -1161,6 +1217,8 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
     if metadata.is_remote {
         if let Some(ref host) = metadata.remote_host {
             println!("  {} {host}", "Remote host:".dimmed());
+        } else {
+            println!("  {} {}", "Type:".dimmed(), "External registration");
         }
         if let Some(ref resolved) = metadata.resolved_host {
             println!("  {} {resolved}", "Resolved host:".dimmed());
@@ -2234,7 +2292,7 @@ pub async fn ensure_required_providers(
 /// defaults to the type and retries with suffixes on conflict (used for
 /// inferred provider types).
 async fn auto_create_provider(
-    client: &mut NavigatorClient<Channel>,
+    client: &mut crate::tls::GrpcClient,
     provider_type: &str,
     preferred_name: Option<&str>,
     auto_providers_override: Option<bool>,
@@ -3276,15 +3334,26 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 
 #[cfg(test)]
 mod tests {
-    use super::{git_sync_files, inferred_provider_type, parse_credential_pairs};
+    use super::{
+        ClusterControlTarget, TlsOptions, git_sync_files, http_health_check,
+        inferred_provider_type, parse_credential_pairs, resolve_cluster_control_target,
+    };
+    use hyper::StatusCode;
     use std::fs;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
     use std::path::Path;
     use std::process::Command;
+    use std::thread;
+
+    use navigator_bootstrap::{ClusterMetadata, store_cluster_metadata};
 
     struct EnvVarGuard {
         key: &'static str,
         original: Option<String>,
     }
+
+    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[allow(unsafe_code)]
     impl EnvVarGuard {
@@ -3317,6 +3386,39 @@ mod tests {
                     std::env::remove_var(self.key);
                 }
             }
+        }
+    }
+
+    #[allow(unsafe_code)]
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &Path, f: F) {
+        let _guard = XDG_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let orig = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", tmp);
+        }
+        f();
+        unsafe {
+            match orig {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    fn edge_registration(name: &str, endpoint: &str) -> ClusterMetadata {
+        ClusterMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.to_string(),
+            is_remote: true,
+            gateway_port: 0,
+            kube_port: None,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: Some("cloudflare_jwt".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
         }
     }
 
@@ -3443,5 +3545,59 @@ mod tests {
             fs::canonicalize(repo.join("nested")).expect("canonicalize nested path")
         );
         assert_eq!(files, vec!["file.txt", "inner/child.txt"]);
+    }
+
+    #[test]
+    fn resolve_cluster_control_target_marks_edge_registration_unmanaged() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            store_cluster_metadata(
+                "edge-gateway",
+                &edge_registration("edge-gateway", "https://gw.example.com"),
+            )
+            .unwrap();
+
+            let target = resolve_cluster_control_target("edge-gateway", None);
+            assert!(matches!(target, ClusterControlTarget::ExternalRegistration));
+        });
+    }
+
+    #[test]
+    fn resolve_cluster_control_target_prefers_explicit_remote_override() {
+        let target = resolve_cluster_control_target("any", Some("user@host"));
+        match target {
+            ClusterControlTarget::Remote(dest) => assert_eq!(dest, "user@host"),
+            ClusterControlTarget::Local | ClusterControlTarget::ExternalRegistration => {
+                panic!("expected remote target")
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_health_check_supports_plain_http_endpoints() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept connection");
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).expect("read request");
+            let response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Length: 2\r\n",
+                "Content-Type: text/plain\r\n",
+                "Connection: close\r\n\r\n",
+                "ok"
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+        });
+
+        let status = http_health_check(&format!("http://{addr}"), &TlsOptions::default())
+            .await
+            .expect("health check");
+
+        server.join().expect("server thread");
+        assert_eq!(status, Some(StatusCode::OK));
     }
 }

@@ -359,7 +359,7 @@ where
 }
 
 // ---------------------------------------------------------------------------
-// Test client-side TCP↔WS bridge (mirrors cf_tunnel.rs from navigator-cli)
+// Test client-side TCP↔WS bridge (mirrors edge_tunnel.rs from navigator-cli)
 // ---------------------------------------------------------------------------
 
 /// Start a local TCP listener that bridges each connection to the WS tunnel.

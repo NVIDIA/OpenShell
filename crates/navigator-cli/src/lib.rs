@@ -7,8 +7,8 @@
 
 pub mod auth;
 pub mod bootstrap;
-pub mod cf_tunnel;
 pub mod completers;
+pub mod edge_tunnel;
 pub mod run;
 pub mod ssh;
 pub mod tls;

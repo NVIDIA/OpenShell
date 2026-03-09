@@ -287,7 +287,7 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 |---|---|
 | [Cluster Bootstrap](cluster-single-node.md) | How the platform bootstraps a Kubernetes cluster from a single Docker container, for local and remote targets. |
 | [Gateway Architecture](gateway.md) | The control plane gateway: API multiplexing, gRPC services, persistence, TLS, and sandbox orchestration. |
-| [Gateway Deploy and Connect](gateway-deploy-connect.md) | End-to-end flow for deploying a gateway and connecting to it: local, remote, and Cloudflare-fronted modes. |
+| [Gateway Communication](gateway-deploy-connect.md) | How the CLI resolves a gateway and communicates with it over mTLS, plaintext HTTP/2, or an edge-authenticated WebSocket tunnel. |
 | [Gateway Security](gateway-security.md) | mTLS enforcement, PKI bootstrap, certificate hierarchy, and the gateway trust model. |
 | [Sandbox Architecture](sandbox.md) | The sandbox execution environment: policy enforcement, Landlock, seccomp, network namespaces, and the network proxy. |
 | [Container Management](build-containers.md) | Container images, Dockerfiles, Helm charts, build tasks, and CI/CD. |

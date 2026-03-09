@@ -20,9 +20,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use tracing::debug;
 
 /// Concrete gRPC client type used by all commands.
-pub type GrpcClient = NavigatorClient<InterceptedService<Channel, CfAuthInterceptor>>;
+pub type GrpcClient = NavigatorClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 /// Concrete inference client type.
-pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, CfAuthInterceptor>>;
+pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -31,9 +31,9 @@ pub struct TlsOptions {
     key: Option<PathBuf>,
     /// Cluster name for resolving default cert directory.
     cluster_name: Option<String>,
-    /// Cloudflare JWT token — when set, disables mTLS client certs and injects
-    /// a `cf-authorization` header on every gRPC request instead.
-    pub cf_token: Option<String>,
+    /// Edge auth bearer token — when set, disables mTLS client certs and
+    /// injects authentication headers on every gRPC request instead.
+    pub edge_token: Option<String>,
 }
 
 impl TlsOptions {
@@ -43,7 +43,7 @@ impl TlsOptions {
             cert,
             key,
             cluster_name: None,
-            cf_token: None,
+            edge_token: None,
         }
     }
 
@@ -90,9 +90,9 @@ impl TlsOptions {
         }
     }
 
-    /// Returns `true` when using Cloudflare token auth (no mTLS client certs).
+    /// Returns `true` when using edge token auth (no mTLS client certs).
     pub fn is_bearer_auth(&self) -> bool {
-        self.cf_token.is_some()
+        self.edge_token.is_some()
     }
 }
 
@@ -228,13 +228,13 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
 
 /// Tunnel proxy addresses keyed by upstream endpoint + token.
 ///
-/// Each distinct Cloudflare-backed gateway gets its own local proxy instead of
+/// Each distinct edge-authenticated gateway gets its own local proxy instead of
 /// reusing the first gateway touched in the current process.
-static CF_TUNNEL_ADDRS: OnceLock<Mutex<HashMap<(String, String), SocketAddr>>> = OnceLock::new();
+static EDGE_TUNNEL_ADDRS: OnceLock<Mutex<HashMap<(String, String), SocketAddr>>> = OnceLock::new();
 
-async fn cf_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
+async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
     let key = (server.to_string(), token.to_string());
-    let registry = CF_TUNNEL_ADDRS.get_or_init(|| Mutex::new(HashMap::new()));
+    let registry = EDGE_TUNNEL_ADDRS.get_or_init(|| Mutex::new(HashMap::new()));
 
     {
         let addrs = registry.lock().await;
@@ -243,11 +243,11 @@ async fn cf_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
         }
     }
 
-    let proxy = crate::cf_tunnel::start_tunnel_proxy(server, token).await?;
+    let proxy = crate::edge_tunnel::start_tunnel_proxy(server, token).await?;
     debug!(
         local_addr = %proxy.local_addr,
         server,
-        "CF tunnel proxy started, routing gRPC through local proxy"
+        "edge tunnel proxy started, routing gRPC through local proxy"
     );
 
     let mut addrs = registry.lock().await;
@@ -255,14 +255,14 @@ async fn cf_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
 }
 
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
-    // When CF bearer auth is active and the server is HTTPS (behind CF),
+    // When edge bearer auth is active and the server is HTTPS,
     // route traffic through a local WebSocket tunnel proxy instead.
     if tls.is_bearer_auth() && server.starts_with("https://") {
         let token = tls
-            .cf_token
+            .edge_token
             .as_deref()
-            .ok_or_else(|| miette::miette!("CF token required for tunnel"))?;
-        let local_addr = cf_tunnel_addr(server, token).await?;
+            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
+        let local_addr = edge_tunnel_addr(server, token).await?;
 
         // Connect to the local tunnel proxy over plaintext HTTP/2.
         let local_url = format!("http://{local_addr}");
@@ -283,7 +283,7 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
     let tls_config = if tls.is_bearer_auth() {
         // Bearer mode without HTTPS (e.g. http:// direct) — no tunnel needed,
         // but also no TLS config to set. This branch shouldn't normally happen
-        // (CF endpoints are always HTTPS) but handle gracefully.
+        // (edge endpoints are always HTTPS) but handle gracefully.
         return endpoint.connect().await.into_diagnostic();
     } else {
         // Standard mTLS: private CA + client cert.
@@ -296,41 +296,40 @@ pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
 
 /// Build a gRPC [`NavigatorClient`].
 ///
-/// When `tls.cf_token` is set, the returned client is wrapped with an
-/// interceptor that injects the `cf-authorization` header on every request.
+/// When `tls.edge_token` is set, the returned client is wrapped with an
+/// interceptor that injects authentication headers on every request.
 /// Otherwise, standard mTLS is used (interceptor is a no-op).
 pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let channel = build_channel(server, tls).await?;
-    let interceptor = CfAuthInterceptor::maybe_from(tls)?;
+    let interceptor = EdgeAuthInterceptor::maybe_from(tls)?;
     Ok(NavigatorClient::with_interceptor(channel, interceptor))
 }
 
-/// Interceptor that injects Cloudflare Access authentication headers into every
-/// outgoing gRPC request.  When no token is set, acts as a no-op.
+/// Interceptor that injects edge authentication headers into every outgoing
+/// gRPC request. When no token is set, acts as a no-op.
 ///
-/// Cloudflare Access recognises the JWT via:
+/// Currently sends Cloudflare Access headers for compatibility:
 /// - `Cf-Access-Jwt-Assertion` header
 /// - `CF_Authorization` cookie
-/// We send both for maximum compatibility.
 #[derive(Clone)]
-pub struct CfAuthInterceptor {
+pub struct EdgeAuthInterceptor {
     header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
     cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
 }
 
-impl CfAuthInterceptor {
+impl EdgeAuthInterceptor {
     /// Create an interceptor from [`TlsOptions`].  Returns a no-op interceptor
-    /// when no CF token is configured.
+    /// when no edge token is configured.
     pub fn maybe_from(tls: &TlsOptions) -> Result<Self> {
-        let (header_value, cookie_value) = match tls.cf_token.as_deref() {
+        let (header_value, cookie_value) = match tls.edge_token.as_deref() {
             Some(t) => {
                 let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
                     .parse()
-                    .map_err(|_| miette::miette!("invalid CF token value"))?;
+                    .map_err(|_| miette::miette!("invalid edge token value"))?;
                 let cv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
                     format!("CF_Authorization={t}")
                         .parse()
-                        .map_err(|_| miette::miette!("invalid CF token value for cookie"))?;
+                        .map_err(|_| miette::miette!("invalid edge token value for cookie"))?;
                 (Some(hv), Some(cv))
             }
             None => (None, None),
@@ -342,7 +341,7 @@ impl CfAuthInterceptor {
     }
 }
 
-impl tonic::service::Interceptor for CfAuthInterceptor {
+impl tonic::service::Interceptor for EdgeAuthInterceptor {
     fn call(
         &mut self,
         mut req: tonic::Request<()>,
@@ -360,6 +359,6 @@ impl tonic::service::Interceptor for CfAuthInterceptor {
 
 pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
     let channel = build_channel(server, tls).await?;
-    let interceptor = CfAuthInterceptor::maybe_from(tls)?;
+    let interceptor = EdgeAuthInterceptor::maybe_from(tls)?;
     Ok(InferenceClient::with_interceptor(channel, interceptor))
 }

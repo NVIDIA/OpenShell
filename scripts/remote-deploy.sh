@@ -34,7 +34,7 @@ Examples:
   ./scripts/remote-deploy.sh ubuntu@devbox
   ./scripts/remote-deploy.sh ubuntu@devbox --recreate --port 18080
   ./scripts/remote-deploy.sh ubuntu@devbox --plaintext --ssh-key ~/.ssh/devbox
-  ./scripts/remote-deploy.sh my-sandbox --remote-dir /home/ubuntu/nemoclaw --name nemoclaw --port 8080 --recreate --plaintext
+  ./scripts/remote-deploy.sh my-sandbox -./scripts/remote-deploy.sh my-sandbox --remote-dir --name nemoclaw --port 8080 --recreate --plaintext
 EOF
 }
 

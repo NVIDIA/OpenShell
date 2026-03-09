@@ -609,17 +609,17 @@ async fn connect_gateway(
     port: u16,
     tls: &TlsOptions,
 ) -> Result<Box<dyn ProxyStream>> {
-    // When using CF bearer auth, route through the WebSocket tunnel proxy
-    // regardless of the origin scheme. The proxy handles CF Access headers
+    // When using edge bearer auth, route through the WebSocket tunnel proxy
+    // regardless of the origin scheme. The proxy handles edge auth headers
     // and TLS termination at the edge; the origin may be plaintext HTTP
     // behind the tunnel.
     if tls.is_bearer_auth() {
         let token = tls
-            .cf_token
+            .edge_token
             .as_deref()
-            .ok_or_else(|| miette::miette!("CF token required for tunnel"))?;
+            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
         let gateway_url = format!("https://{host}:{port}");
-        let proxy = crate::cf_tunnel::start_tunnel_proxy(&gateway_url, token).await?;
+        let proxy = crate::edge_tunnel::start_tunnel_proxy(&gateway_url, token).await?;
         let tcp = TcpStream::connect(proxy.local_addr)
             .await
             .into_diagnostic()?;

@@ -3,7 +3,7 @@
 
 #![cfg(feature = "e2e")]
 
-//! E2E tests for Cloudflare tunnel auth flow against a running cluster.
+//! E2E tests for edge tunnel auth flow against a running cluster.
 //!
 //! Prerequisites:
 //! - A running nemoclaw gateway deployed with `--plaintext`
@@ -39,7 +39,7 @@ async fn run_cli(args: &[&str]) -> (String, i32) {
 }
 
 /// Run `nemoclaw <args>` with a custom config directory so the CLI reads
-/// our seeded cluster metadata and CF token instead of the real config.
+/// our seeded cluster metadata and edge token instead of the real config.
 async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (String, i32) {
     let mut cmd = nemoclaw_cmd();
     cmd.args(args)
@@ -58,13 +58,13 @@ async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (St
 }
 
 /// Seed a temporary config directory with cluster metadata that has
-/// `auth_mode: "cloudflare_jwt"`, a stored CF token, and an active cluster
+/// `auth_mode: "cloudflare_jwt"`, a stored edge token, and an active cluster
 /// pointing at the given endpoint.
-fn seed_cf_cluster_config(
+fn seed_edge_cluster_config(
     config_dir: &std::path::Path,
     cluster_name: &str,
     gateway_endpoint: &str,
-    cf_token: &str,
+    edge_token: &str,
 ) {
     let nemoclaw_dir = config_dir.join("nemoclaw");
     let clusters_dir = nemoclaw_dir.join("clusters");
@@ -89,10 +89,10 @@ fn seed_cf_cluster_config(
     )
     .expect("write cluster metadata");
 
-    // Write CF token file.
+    // Write edge token file.
     let token_dir = clusters_dir.join(cluster_name);
     std::fs::create_dir_all(&token_dir).expect("create token dir");
-    std::fs::write(token_dir.join("cf_token"), cf_token).expect("write cf_token");
+    std::fs::write(token_dir.join("edge_token"), edge_token).expect("write edge_token");
 }
 
 // -------------------------------------------------------------------
@@ -126,23 +126,23 @@ async fn plaintext_cluster_status_reports_healthy() {
 }
 
 // -------------------------------------------------------------------
-// Test 13: gRPC through the WS tunnel proxy (CF token path)
+// Test 13: gRPC through the WS tunnel proxy (edge token path)
 // -------------------------------------------------------------------
 
 /// When a cluster's metadata has `auth_mode == "cloudflare_jwt"` and a
-/// stored CF token, the CLI routes gRPC through the WebSocket tunnel proxy.
+/// stored edge token, the CLI routes gRPC through the WebSocket tunnel proxy.
 /// This test verifies the full tunnel path:
 ///
 /// CLI → local TCP proxy → WebSocket → /_ws_tunnel → loopback TCP → gRPC
 ///
-/// The test seeds a temporary config directory with CF auth metadata and a
+/// The test seeds a temporary config directory with edge auth metadata and a
 /// dummy token, then runs `nemoclaw status` against the live plaintext
 /// gateway.
 ///
-/// Note: The dummy token won't be validated (no CF Access middleware on
+/// Note: The dummy token won't be validated (no edge auth middleware on
 /// the plaintext cluster), but it triggers the CLI's tunnel proxy codepath.
 #[tokio::test]
-async fn ws_tunnel_status_through_cf_proxy() {
+async fn ws_tunnel_status_through_edge_proxy() {
     // Read the current cluster name to restore it later.
     let (original_status, _) = run_cli(&["status"]).await;
     let clean_status = strip_ansi(&original_status);
@@ -195,15 +195,15 @@ async fn ws_tunnel_status_through_cf_proxy() {
         return;
     }
 
-    // Seed a temporary config directory with CF auth metadata pointing at
+    // Seed a temporary config directory with edge auth metadata pointing at
     // the live gateway. The dummy token triggers the WS tunnel codepath
-    // without requiring real CF Access middleware.
+    // without requiring real edge auth middleware.
     let tmpdir = tempfile::tempdir().expect("create temp config dir");
-    seed_cf_cluster_config(tmpdir.path(), "cf-tunnel-test", &endpoint, "dummy-test-jwt");
+    seed_edge_cluster_config(tmpdir.path(), "edge-tunnel-test", &endpoint, "dummy-test-jwt");
 
     let (output, code) = run_cli_with_config(tmpdir.path(), &[
         "--cluster",
-        "cf-tunnel-test",
+        "edge-tunnel-test",
         "status",
     ])
     .await;

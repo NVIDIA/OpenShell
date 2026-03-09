@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! WebSocket tunnel endpoint for Cloudflare Access bypass.
+//! WebSocket tunnel endpoint for edge-authenticated connections.
 //!
-//! When the gateway is behind a Cloudflare Tunnel with CF Access enabled,
-//! gRPC POST requests are rejected because CF Access only authenticates
-//! browser-like GET requests.  The client-side proxy (`cf_tunnel.rs` in
-//! `navigator-cli`) opens a WebSocket to this endpoint — the upgrade is a
-//! GET so CF Access passes it — and then pipes raw TCP bytes through binary
-//! WebSocket frames.
+//! When the gateway is behind an edge proxy that only authenticates
+//! browser-like GET requests, gRPC POST requests are rejected.  The
+//! client-side proxy (`edge_tunnel.rs` in `navigator-cli`) opens a WebSocket
+//! to this endpoint — the upgrade is a GET so the edge proxy passes it —
+//! and then pipes raw TCP bytes through binary WebSocket frames.
 //!
 //! This handler:
 //! 1. Accepts a WebSocket upgrade on `/_ws_tunnel`.
