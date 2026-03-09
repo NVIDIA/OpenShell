@@ -28,8 +28,6 @@ content:
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/NemoClaw/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
 
-Test
-
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
