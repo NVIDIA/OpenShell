@@ -120,9 +120,13 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_ENV_LOCK;
     use temp_env::with_vars;
 
     fn with_isolated_cli_env<F: FnOnce()>(tmp: &std::path::Path, f: F) {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tmp.to_string_lossy().into_owned();
         with_vars(
             [

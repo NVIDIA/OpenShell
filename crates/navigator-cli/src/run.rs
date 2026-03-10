@@ -1073,11 +1073,18 @@ fn resolve_cluster_control_target(
     name: &str,
     remote_override: Option<&str>,
 ) -> ClusterControlTarget {
+    resolve_cluster_control_target_from(get_cluster_metadata(name), remote_override)
+}
+
+fn resolve_cluster_control_target_from(
+    metadata: Option<ClusterMetadata>,
+    remote_override: Option<&str>,
+) -> ClusterControlTarget {
     if let Some(r) = remote_override {
         return ClusterControlTarget::Remote(r.to_string());
     }
 
-    match get_cluster_metadata(name) {
+    match metadata {
         Some(metadata) if metadata.is_remote => metadata
             .remote_host
             .map(ClusterControlTarget::Remote)
@@ -3336,7 +3343,7 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 mod tests {
     use super::{
         ClusterControlTarget, TlsOptions, git_sync_files, http_health_check,
-        inferred_provider_type, parse_credential_pairs, resolve_cluster_control_target,
+        inferred_provider_type, parse_credential_pairs, resolve_cluster_control_target_from,
     };
     use hyper::StatusCode;
     use std::fs;
@@ -3346,14 +3353,12 @@ mod tests {
     use std::process::Command;
     use std::thread;
 
-    use navigator_bootstrap::{ClusterMetadata, store_cluster_metadata};
+    use navigator_bootstrap::ClusterMetadata;
 
     struct EnvVarGuard {
         key: &'static str,
         original: Option<String>,
     }
-
-    static XDG_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[allow(unsafe_code)]
     impl EnvVarGuard {
@@ -3385,24 +3390,6 @@ mod tests {
                 unsafe {
                     std::env::remove_var(self.key);
                 }
-            }
-        }
-    }
-
-    #[allow(unsafe_code)]
-    fn with_tmp_xdg<F: FnOnce()>(tmp: &Path, f: F) {
-        let _guard = XDG_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let orig = std::env::var("XDG_CONFIG_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CONFIG_HOME", tmp);
-        }
-        f();
-        unsafe {
-            match orig {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
             }
         }
     }
@@ -3549,22 +3536,14 @@ mod tests {
 
     #[test]
     fn resolve_cluster_control_target_marks_edge_registration_unmanaged() {
-        let tmp = tempfile::tempdir().unwrap();
-        with_tmp_xdg(tmp.path(), || {
-            store_cluster_metadata(
-                "edge-gateway",
-                &edge_registration("edge-gateway", "https://gw.example.com"),
-            )
-            .unwrap();
-
-            let target = resolve_cluster_control_target("edge-gateway", None);
-            assert!(matches!(target, ClusterControlTarget::ExternalRegistration));
-        });
+        let metadata = edge_registration("edge-gateway", "https://gw.example.com");
+        let target = resolve_cluster_control_target_from(Some(metadata), None);
+        assert!(matches!(target, ClusterControlTarget::ExternalRegistration));
     }
 
     #[test]
     fn resolve_cluster_control_target_prefers_explicit_remote_override() {
-        let target = resolve_cluster_control_target("any", Some("user@host"));
+        let target = resolve_cluster_control_target_from(None, Some("user@host"));
         match target {
             ClusterControlTarget::Remote(dest) => assert_eq!(dest, "user@host"),
             ClusterControlTarget::Local | ClusterControlTarget::ExternalRegistration => {
