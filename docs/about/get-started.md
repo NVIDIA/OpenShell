@@ -55,10 +55,10 @@ If you're running locally, skip this step — the CLI creates a gateway automati
 Deploy an OpenShell gateway on Brev by hitting **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT).
 :::
 
-Once the instance is running, connect to it:
+Once the instance is running, find the gateway URL in the Brev console under **Using Secure Links**. Copy the shareable URL for **port 8080** — this is the gateway endpoint.
 
 ```console
-$ nemoclaw gateway add <your-brev-instance-url>
+$ nemoclaw gateway add https://<your-port-8080-url>.brevlab.com
 $ nemoclaw status
 ```
 
