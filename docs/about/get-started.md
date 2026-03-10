@@ -40,7 +40,8 @@ uv venv && source .venv/bin/activate
 Install the CLI:
 
 ```bash
-uv pip install openshell
+uv pip install openshell \
+  --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
 ## Connect to a Remote Gateway (Optional)
