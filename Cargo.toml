@@ -23,7 +23,7 @@ prost = "0.13"
 prost-types = "0.13"
 
 # HTTP server
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 hyper = { version = "1.6", features = ["full"] }
@@ -67,6 +67,9 @@ serde_yaml = "0.9"
 
 # HTTP client
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# WebSocket
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 
 # Utilities
 futures = "0.3"

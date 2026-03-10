@@ -17,12 +17,15 @@ use navigator_core::proto::{
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
-/// Create an mTLS-configured channel to the NemoClaw server.
+/// Create a channel to the NemoClaw server.
 ///
-/// TLS materials are read from the environment variables:
+/// When the endpoint uses `https://`, mTLS is configured using these env vars:
 /// - `NEMOCLAW_TLS_CA` -- path to the CA certificate
 /// - `NEMOCLAW_TLS_CERT` -- path to the client certificate
 /// - `NEMOCLAW_TLS_KEY` -- path to the client private key
+///
+/// When the endpoint uses `http://`, a plaintext connection is used (for
+/// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
 async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let mut ep = Endpoint::from_shared(endpoint.to_string())
         .into_diagnostic()
@@ -32,34 +35,38 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .keep_alive_while_idle(true)
         .keep_alive_timeout(Duration::from_secs(20));
 
-    let ca_path = std::env::var("NEMOCLAW_TLS_CA")
-        .into_diagnostic()
-        .wrap_err("NEMOCLAW_TLS_CA is required")?;
-    let cert_path = std::env::var("NEMOCLAW_TLS_CERT")
-        .into_diagnostic()
-        .wrap_err("NEMOCLAW_TLS_CERT is required")?;
-    let key_path = std::env::var("NEMOCLAW_TLS_KEY")
-        .into_diagnostic()
-        .wrap_err("NEMOCLAW_TLS_KEY is required")?;
+    let tls_enabled = endpoint.starts_with("https://");
 
-    let ca_pem = std::fs::read(&ca_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
-    let cert_pem = std::fs::read(&cert_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read client cert from {cert_path}"))?;
-    let key_pem = std::fs::read(&key_path)
-        .into_diagnostic()
-        .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
+    if tls_enabled {
+        let ca_path = std::env::var("NEMOCLAW_TLS_CA")
+            .into_diagnostic()
+            .wrap_err("NEMOCLAW_TLS_CA is required")?;
+        let cert_path = std::env::var("NEMOCLAW_TLS_CERT")
+            .into_diagnostic()
+            .wrap_err("NEMOCLAW_TLS_CERT is required")?;
+        let key_path = std::env::var("NEMOCLAW_TLS_KEY")
+            .into_diagnostic()
+            .wrap_err("NEMOCLAW_TLS_KEY is required")?;
 
-    let tls_config = ClientTlsConfig::new()
-        .ca_certificate(Certificate::from_pem(ca_pem))
-        .identity(Identity::from_pem(cert_pem, key_pem));
+        let ca_pem = std::fs::read(&ca_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read CA cert from {ca_path}"))?;
+        let cert_pem = std::fs::read(&cert_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read client cert from {cert_path}"))?;
+        let key_pem = std::fs::read(&key_path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to read client key from {key_path}"))?;
 
-    ep = ep
-        .tls_config(tls_config)
-        .into_diagnostic()
-        .wrap_err("failed to configure TLS")?;
+        let tls_config = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(ca_pem))
+            .identity(Identity::from_pem(cert_pem, key_pem));
+
+        ep = ep
+            .tls_config(tls_config)
+            .into_diagnostic()
+            .wrap_err("failed to configure TLS")?;
+    }
 
     ep.connect()
         .await
@@ -67,7 +74,7 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
         .wrap_err("failed to connect to NemoClaw server")
 }
 
-/// Connect to the NemoClaw server using mTLS.
+/// Connect to the NemoClaw server (mTLS or plaintext based on endpoint scheme).
 async fn connect(endpoint: &str) -> Result<NavigatorClient<Channel>> {
     let channel = connect_channel(endpoint).await?;
     Ok(NavigatorClient::new(channel))
@@ -132,7 +139,7 @@ async fn sync_policy_with_client(
 
 /// Discover and sync policy using a single gRPC connection.
 ///
-/// Performs the full discovery flow (fetch → sync → re-fetch) over one TLS
+/// Performs the full discovery flow (fetch → sync → re-fetch) over one
 /// channel instead of establishing three separate connections.
 pub async fn discover_and_sync_policy(
     endpoint: &str,

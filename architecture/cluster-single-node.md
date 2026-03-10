@@ -54,6 +54,12 @@ All cluster lifecycle commands live under `nemoclaw gateway`:
 
 The `--name` flag defaults to `"nemoclaw"`. When omitted on commands that accept it, the CLI resolves the active cluster via: `--gateway` flag, then `NEMOCLAW_CLUSTER` env, then `~/.config/nemoclaw/active_cluster` file.
 
+For remote dev/test deploys from a local checkout, `scripts/remote-deploy.sh`
+wraps a different workflow: it rsyncs the repository to a remote host, builds
+the release CLI plus cluster/server/sandbox images on that machine, and then
+invokes `nemoclaw gateway start` with explicit flags such as `--recreate`,
+`--plaintext`, or `--disable-gateway-auth` only when requested.
+
 ## Local Task Flows (`mise`)
 
 Development task entrypoints split bootstrap behavior:

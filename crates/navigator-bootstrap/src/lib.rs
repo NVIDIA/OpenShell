@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub mod build;
+pub mod edge_token;
 pub mod image;
 
 mod constants;
@@ -112,6 +113,11 @@ pub struct DeployOptions {
     /// When `None`, the control plane port (6443) is not exposed on the host,
     /// allowing multiple clusters to run simultaneously without port conflicts.
     pub kube_port: Option<u16>,
+    /// Disable TLS entirely — the server listens on plaintext HTTP.
+    pub disable_tls: bool,
+    /// Disable gateway authentication (mTLS client certificate requirement).
+    /// Ignored when `disable_tls` is true.
+    pub disable_gateway_auth: bool,
 }
 
 impl DeployOptions {
@@ -123,6 +129,8 @@ impl DeployOptions {
             port: DEFAULT_GATEWAY_PORT,
             gateway_host: None,
             kube_port: None,
+            disable_tls: false,
+            disable_gateway_auth: false,
         }
     }
 
@@ -152,6 +160,20 @@ impl DeployOptions {
     #[must_use]
     pub fn with_kube_port(mut self, kube_port: u16) -> Self {
         self.kube_port = Some(kube_port);
+        self
+    }
+
+    /// Disable TLS entirely — the server listens on plaintext HTTP.
+    #[must_use]
+    pub fn with_disable_tls(mut self, disable: bool) -> Self {
+        self.disable_tls = disable;
+        self
+    }
+
+    /// Disable gateway authentication (mTLS client certificate requirement).
+    #[must_use]
+    pub fn with_disable_gateway_auth(mut self, disable: bool) -> Self {
+        self.disable_gateway_auth = disable;
         self
     }
 }
@@ -216,6 +238,8 @@ where
     let port = options.port;
     let gateway_host = options.gateway_host;
     let kube_port = options.kube_port;
+    let disable_tls = options.disable_tls;
+    let disable_gateway_auth = options.disable_gateway_auth;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -307,6 +331,8 @@ where
         ssh_gateway_host.as_deref(),
         port,
         kube_port,
+        disable_tls,
+        disable_gateway_auth,
     )
     .await?;
     log("[status] Starting gateway".to_string());
@@ -412,7 +438,7 @@ where
         wait_for_cluster_ready(&target_docker, &name, &mut cluster_log).await?;
     }
 
-    // Create and store cluster metadata
+    // Create and store cluster metadata.
     log("[progress] Persisting gateway metadata".to_string());
     let metadata = create_cluster_metadata_with_host(
         &name,
@@ -420,6 +446,7 @@ where
         port,
         kube_port,
         ssh_gateway_host.as_deref(),
+        disable_tls,
     );
     store_cluster_metadata(&name, &metadata)?;
 

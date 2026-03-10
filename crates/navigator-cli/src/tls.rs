@@ -8,10 +8,21 @@ use rustls::{
     RootCertStore,
     pki_types::{CertificateDer, PrivateKeyDer},
 };
+use std::collections::HashMap;
 use std::io::Cursor;
+use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::time::Duration;
+use tokio::sync::Mutex;
+use tonic::service::interceptor::InterceptedService;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
+use tracing::debug;
+
+/// Concrete gRPC client type used by all commands.
+pub type GrpcClient = NavigatorClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
+/// Concrete inference client type.
+pub type GrpcInferenceClient = InferenceClient<InterceptedService<Channel, EdgeAuthInterceptor>>;
 
 #[derive(Clone, Debug, Default)]
 pub struct TlsOptions {
@@ -20,6 +31,9 @@ pub struct TlsOptions {
     key: Option<PathBuf>,
     /// Cluster name for resolving default cert directory.
     cluster_name: Option<String>,
+    /// Edge auth bearer token — when set, disables mTLS client certs and
+    /// injects authentication headers on every gRPC request instead.
+    pub edge_token: Option<String>,
 }
 
 impl TlsOptions {
@@ -29,6 +43,7 @@ impl TlsOptions {
             cert,
             key,
             cluster_name: None,
+            edge_token: None,
         }
     }
 
@@ -45,10 +60,8 @@ impl TlsOptions {
     #[must_use]
     pub fn with_cluster_name(&self, name: &str) -> Self {
         Self {
-            ca: self.ca.clone(),
-            cert: self.cert.clone(),
-            key: self.key.clone(),
             cluster_name: Some(name.to_string()),
+            ..self.clone()
         }
     }
 
@@ -73,7 +86,13 @@ impl TlsOptions {
                 .clone()
                 .or_else(|| base.as_ref().map(|dir| dir.join("tls.key"))),
             cluster_name: self.cluster_name.clone(),
+            ..self.clone()
         }
+    }
+
+    /// Returns `true` when using edge token auth (no mTLS client certs).
+    pub fn is_bearer_auth(&self) -> bool {
+        self.edge_token.is_some()
     }
 }
 
@@ -207,35 +226,139 @@ pub fn build_tonic_tls_config(materials: &TlsMaterials) -> ClientTlsConfig {
         .identity(identity)
 }
 
+/// Tunnel proxy addresses keyed by upstream endpoint + token.
+///
+/// Each distinct edge-authenticated gateway gets its own local proxy instead of
+/// reusing the first gateway touched in the current process.
+static EDGE_TUNNEL_ADDRS: OnceLock<Mutex<HashMap<(String, String), SocketAddr>>> = OnceLock::new();
+
+async fn edge_tunnel_addr(server: &str, token: &str) -> Result<SocketAddr> {
+    let key = (server.to_string(), token.to_string());
+    let registry = EDGE_TUNNEL_ADDRS.get_or_init(|| Mutex::new(HashMap::new()));
+
+    {
+        let addrs = registry.lock().await;
+        if let Some(addr) = addrs.get(&key).copied() {
+            return Ok(addr);
+        }
+    }
+
+    let proxy = crate::edge_tunnel::start_tunnel_proxy(server, token).await?;
+    debug!(
+        local_addr = %proxy.local_addr,
+        server,
+        "edge tunnel proxy started, routing gRPC through local proxy"
+    );
+
+    let mut addrs = registry.lock().await;
+    Ok(*addrs.entry(key).or_insert(proxy.local_addr))
+}
+
 pub async fn build_channel(server: &str, tls: &TlsOptions) -> Result<Channel> {
+    // When edge bearer auth is active and the server is HTTPS,
+    // route traffic through a local WebSocket tunnel proxy instead.
+    if tls.is_bearer_auth() && server.starts_with("https://") {
+        let token = tls
+            .edge_token
+            .as_deref()
+            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
+        let local_addr = edge_tunnel_addr(server, token).await?;
+
+        // Connect to the local tunnel proxy over plaintext HTTP/2.
+        let local_url = format!("http://{local_addr}");
+        let endpoint = Endpoint::from_shared(local_url)
+            .into_diagnostic()?
+            .connect_timeout(Duration::from_secs(10))
+            .http2_keep_alive_interval(Duration::from_secs(10))
+            .keep_alive_while_idle(true);
+        return endpoint.connect().await.into_diagnostic();
+    }
+
     let mut endpoint = Endpoint::from_shared(server.to_string())
         .into_diagnostic()?
         .connect_timeout(Duration::from_secs(10))
         .http2_keep_alive_interval(Duration::from_secs(10))
         .keep_alive_while_idle(true);
-    let materials = require_tls_materials(server, tls)?;
-    let tls_config = build_tonic_tls_config(&materials);
+
+    let tls_config = if tls.is_bearer_auth() {
+        // Bearer mode without HTTPS (e.g. http:// direct) — no tunnel needed,
+        // but also no TLS config to set. This branch shouldn't normally happen
+        // (edge endpoints are always HTTPS) but handle gracefully.
+        return endpoint.connect().await.into_diagnostic();
+    } else {
+        // Standard mTLS: private CA + client cert.
+        let materials = require_tls_materials(server, tls)?;
+        build_tonic_tls_config(&materials)
+    };
     endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
     endpoint.connect().await.into_diagnostic()
 }
 
-pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<NavigatorClient<Channel>> {
+/// Build a gRPC [`NavigatorClient`].
+///
+/// When `tls.edge_token` is set, the returned client is wrapped with an
+/// interceptor that injects authentication headers on every request.
+/// Otherwise, standard mTLS is used (interceptor is a no-op).
+pub async fn grpc_client(server: &str, tls: &TlsOptions) -> Result<GrpcClient> {
     let channel = build_channel(server, tls).await?;
-    Ok(NavigatorClient::new(channel))
+    let interceptor = EdgeAuthInterceptor::maybe_from(tls)?;
+    Ok(NavigatorClient::with_interceptor(channel, interceptor))
 }
 
-pub async fn grpc_inference_client(
-    server: &str,
-    tls: &TlsOptions,
-) -> Result<InferenceClient<Channel>> {
-    let mut endpoint = Endpoint::from_shared(server.to_string())
-        .into_diagnostic()?
-        .connect_timeout(Duration::from_secs(10))
-        .http2_keep_alive_interval(Duration::from_secs(10))
-        .keep_alive_while_idle(true);
-    let materials = require_tls_materials(server, tls)?;
-    let tls_config = build_tonic_tls_config(&materials);
-    endpoint = endpoint.tls_config(tls_config).into_diagnostic()?;
-    let channel = endpoint.connect().await.into_diagnostic()?;
-    Ok(InferenceClient::new(channel))
+/// Interceptor that injects edge authentication headers into every outgoing
+/// gRPC request. When no token is set, acts as a no-op.
+///
+/// Currently sends Cloudflare Access headers for compatibility:
+/// - `Cf-Access-Jwt-Assertion` header
+/// - `CF_Authorization` cookie
+#[derive(Clone)]
+pub struct EdgeAuthInterceptor {
+    header_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+    cookie_value: Option<tonic::metadata::MetadataValue<tonic::metadata::Ascii>>,
+}
+
+impl EdgeAuthInterceptor {
+    /// Create an interceptor from [`TlsOptions`].  Returns a no-op interceptor
+    /// when no edge token is configured.
+    pub fn maybe_from(tls: &TlsOptions) -> Result<Self> {
+        let (header_value, cookie_value) = match tls.edge_token.as_deref() {
+            Some(t) => {
+                let hv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> = t
+                    .parse()
+                    .map_err(|_| miette::miette!("invalid edge token value"))?;
+                let cv: tonic::metadata::MetadataValue<tonic::metadata::Ascii> =
+                    format!("CF_Authorization={t}")
+                        .parse()
+                        .map_err(|_| miette::miette!("invalid edge token value for cookie"))?;
+                (Some(hv), Some(cv))
+            }
+            None => (None, None),
+        };
+        Ok(Self {
+            header_value,
+            cookie_value,
+        })
+    }
+}
+
+impl tonic::service::Interceptor for EdgeAuthInterceptor {
+    fn call(
+        &mut self,
+        mut req: tonic::Request<()>,
+    ) -> std::result::Result<tonic::Request<()>, tonic::Status> {
+        if let Some(ref val) = self.header_value {
+            req.metadata_mut()
+                .insert("cf-access-jwt-assertion", val.clone());
+        }
+        if let Some(ref val) = self.cookie_value {
+            req.metadata_mut().insert("cookie", val.clone());
+        }
+        Ok(req)
+    }
+}
+
+pub async fn grpc_inference_client(server: &str, tls: &TlsOptions) -> Result<GrpcInferenceClient> {
+    let channel = build_channel(server, tls).await?;
+    let interceptor = EdgeAuthInterceptor::maybe_from(tls)?;
+    Ok(InferenceClient::with_interceptor(channel, interceptor))
 }

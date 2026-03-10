@@ -29,7 +29,7 @@ prost-types = { workspace = true }
 tokio = { workspace = true }
 
 # gRPC client
-tonic = { workspace = true, features = ["tls"] }
+tonic = { workspace = true, features = ["tls", "tls-native-roots"] }
 
 # CLI
 clap = { workspace = true }
@@ -57,6 +57,9 @@ anyhow = { workspace = true }
 
 # File archiving (tar-over-SSH sync)
 tar = "0.4"
+
+# WebSocket (Cloudflare tunnel proxy)
+tokio-tungstenite = { workspace = true }
 
 # Streams
 futures = { workspace = true }

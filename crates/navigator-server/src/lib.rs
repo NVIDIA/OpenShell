@@ -9,6 +9,7 @@
 //! - Protocol multiplexing (gRPC + HTTP on same port)
 //! - mTLS support
 
+mod auth;
 mod grpc;
 mod http;
 mod inference;
@@ -20,6 +21,7 @@ mod sandbox_watch;
 mod ssh_tunnel;
 mod tls;
 pub mod tracing_bus;
+mod ws_tunnel;
 
 use navigator_core::{Config, Error, Result};
 use std::collections::HashMap;
@@ -159,11 +161,19 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
 
     info!(address = %config.bind_address, "Server listening");
 
-    let tls_acceptor = TlsAcceptor::from_files(
-        &config.tls.cert_path,
-        &config.tls.key_path,
-        &config.tls.client_ca_path,
-    )?;
+    // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
+    let tls_acceptor = match &config.tls {
+        Some(tls) => Some(TlsAcceptor::from_files(
+            &tls.cert_path,
+            &tls.key_path,
+            &tls.client_ca_path,
+            tls.allow_unauthenticated,
+        )?),
+        None => {
+            info!("TLS disabled — accepting plaintext connections");
+            None
+        }
+    };
 
     // Accept connections
     loop {
@@ -176,19 +186,27 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         };
 
         let service = service.clone();
-        let tls_acceptor = tls_acceptor.clone();
 
-        tokio::spawn(async move {
-            match tls_acceptor.inner().accept(stream).await {
-                Ok(tls_stream) => {
-                    if let Err(e) = service.serve(tls_stream).await {
-                        error!(error = %e, client = %addr, "Connection error");
+        if let Some(ref acceptor) = tls_acceptor {
+            let tls_acceptor = acceptor.clone();
+            tokio::spawn(async move {
+                match tls_acceptor.inner().accept(stream).await {
+                    Ok(tls_stream) => {
+                        if let Err(e) = service.serve(tls_stream).await {
+                            error!(error = %e, client = %addr, "Connection error");
+                        }
+                    }
+                    Err(e) => {
+                        error!(error = %e, client = %addr, "TLS handshake failed");
                     }
                 }
-                Err(e) => {
-                    error!(error = %e, client = %addr, "TLS handshake failed");
+            });
+        } else {
+            tokio::spawn(async move {
+                if let Err(e) = service.serve(stream).await {
+                    error!(error = %e, client = %addr, "Connection error");
                 }
-            }
-        });
+            });
+        }
     }
 }

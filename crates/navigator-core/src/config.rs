@@ -18,8 +18,8 @@ pub struct Config {
     #[serde(default = "default_log_level")]
     pub log_level: String,
 
-    /// TLS configuration (mTLS is always enforced).
-    pub tls: TlsConfig,
+    /// TLS configuration.  When `None`, the server listens on plaintext HTTP.
+    pub tls: Option<TlsConfig>,
 
     /// Database URL for persistence.
     pub database_url: String,
@@ -74,8 +74,10 @@ pub struct Config {
 
 /// TLS configuration.
 ///
-/// mTLS is always enforced — all clients must present a certificate signed
-/// by the given CA.
+/// By default mTLS is enforced — all clients must present a certificate
+/// signed by the given CA.  When `allow_unauthenticated` is `true`, the
+/// TLS handshake also accepts connections without a client certificate
+/// (needed for reverse-proxy deployments like Cloudflare Tunnel).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsConfig {
     /// Path to the TLS certificate file.
@@ -88,11 +90,17 @@ pub struct TlsConfig {
     /// The server requires all clients to present a valid certificate signed by
     /// this CA.
     pub client_ca_path: PathBuf,
+
+    /// When `true`, the TLS handshake succeeds even without a client
+    /// certificate.  Application-layer middleware must then enforce auth
+    /// (e.g. via a CF JWT header).
+    #[serde(default)]
+    pub allow_unauthenticated: bool,
 }
 
 impl Config {
-    /// Create a new config with the required TLS paths.
-    pub fn new(tls: TlsConfig) -> Self {
+    /// Create a new config with optional TLS.
+    pub fn new(tls: Option<TlsConfig>) -> Self {
         Self {
             bind_address: default_bind_address(),
             log_level: default_log_level(),
