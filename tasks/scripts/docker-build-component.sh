@@ -128,6 +128,9 @@ fi
 OUTPUT_FLAG="--load"
 if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
   OUTPUT_FLAG="--push"
+elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
+  # Multi-platform builds cannot use --load; push is required.
+  OUTPUT_FLAG="--push"
 fi
 
 SCCACHE_ARGS=()
