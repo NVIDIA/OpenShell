@@ -1,99 +1,57 @@
 name: docs-preview-pr
 
 on:
-    workflow_run:
-        workflows: [Docs]
-        types: [completed]
-        branches-ignore: [main]
+    pull_request:
+        branches: [main]
+        types: [opened, reopened, synchronize, closed]
+        paths:
+            - "docs/**"
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.event.workflow_run.id }}
+    group: preview-${{ github.ref }}
     cancel-in-progress: true
 
 permissions:
     contents: write
     pull-requests: write
-    actions: read
+
+defaults:
+    run:
+        shell: bash
+
+env:
+    MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 jobs:
     preview:
-        if: github.event.workflow_run.conclusion == 'success'
-        runs-on: ubuntu-latest
+        runs-on: build-arm64
+        container:
+            image: ghcr.io/nvidia/nemoclaw/ci:latest
+            credentials:
+                username: ${{ github.actor }}
+                password: ${{ secrets.GITHUB_TOKEN }}
         steps:
-            - name: Download HTML artifact
-              uses: actions/download-artifact@v4
-              with:
-                  name: html-build-artifact
-                  path: html
-                  run-id: ${{ github.event.workflow_run.id }}
-                  github-token: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Download PR info
-              uses: actions/download-artifact@v4
-              with:
-                  name: pr
-                  path: pr
-                  run-id: ${{ github.event.workflow_run.id }}
-                  github-token: ${{ secrets.GITHUB_TOKEN }}
-
-            - name: Read PR number
-              id: pr-info
-              run: echo "pr_number=$(cat pr/pr.txt | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
-
-            - name: Checkout gh-pages
+            - name: Checkout
               uses: actions/checkout@v4
+
+            - name: Install tools
+              if: github.event.action != 'closed'
+              run: mise install
+
+            - name: Build documentation
+              if: github.event.action != 'closed'
+              run: mise run docs:build:strict
+
+            - name: Delete unnecessary files
+              if: github.event.action != 'closed'
+              run: |
+                  find _build -name .doctrees -prune -exec rm -rf {} \;
+                  find _build -name .buildinfo -exec rm {} \;
+
+            - name: Deploy preview
+              uses: rossjrw/pr-preview-action@v1
               with:
-                  ref: gh-pages
-                  path: gh-pages
-
-            - name: Copy preview HTML
-              run: |
-                  PR_DIR="gh-pages/review/pr-${{ steps.pr-info.outputs.pr_number }}"
-                  rm -rf "$PR_DIR"
-                  mkdir -p "$PR_DIR"
-                  cp -r html/* "$PR_DIR/"
-
-            - name: Push to gh-pages
-              run: |
-                  cd gh-pages
-                  git config user.name "github-actions[bot]"
-                  git config user.email "github-actions[bot]@users.noreply.github.com"
-                  git add -A
-                  if git diff --cached --quiet; then
-                    echo "No changes to commit"
-                  else
-                    git commit -m "docs preview for PR #${{ steps.pr-info.outputs.pr_number }}"
-                    git push
-                  fi
-
-            - name: Get GitHub Pages URL
-              id: pages-url
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              run: |
-                  url=$(gh api "repos/${{ github.repository }}/pages" --jq '.html_url' 2>/dev/null || echo "")
-                  if [ -z "$url" ]; then
-                    url="https://${{ github.repository_owner }}.github.io/$(echo '${{ github.repository }}' | cut -d/ -f2)/"
-                  fi
-                  echo "url=${url}" >> "$GITHUB_OUTPUT"
-
-            - name: Comment on PR
-              env:
-                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-              run: |
-                  PR_NUM="${{ steps.pr-info.outputs.pr_number }}"
-                  PREVIEW_URL="${{ steps.pages-url.outputs.url }}review/pr-${PR_NUM}/"
-                  COMMENT_BODY="📖 **Docs preview ready:** ${PREVIEW_URL}"
-
-                  # Check for existing comment to update instead of creating duplicate
-                  EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
-                    --jq '.[] | select(.user.login == "github-actions[bot]") | select(.body | contains("Docs preview ready")) | .id' \
-                    | head -1)
-
-                  if [ -n "$EXISTING" ]; then
-                    gh api "repos/${{ github.repository }}/issues/comments/${EXISTING}" \
-                      -X PATCH -f body="${COMMENT_BODY}"
-                  else
-                    gh api "repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
-                      -f body="${COMMENT_BODY}"
-                  fi
+                  source-dir: ./_build/docs/
+                  preview-branch: gh-pages
+                  umbrella-dir: pr-preview
+                  action: auto
