@@ -160,7 +160,7 @@ The `deploy_gateway_with_logs` variant accepts an `FnMut(String)` callback for p
 
 Image ref resolution in `default_gateway_image_ref()`:
 
-1. If `OPENSHELL_GATEWAY_IMAGE` is set and non-empty, use it verbatim.
+1. If `OPENSHELL_CLUSTER_IMAGE` is set and non-empty, use it verbatim.
 2. Otherwise, use the published distribution image base (`<distribution-registry>/openshell/cluster`) with its default tag behavior.
 
 - **Local deploy**: `ensure_image()` inspects the image on the local daemon and pulls from the configured registry if missing (using built-in distribution credentials when pulling from the default distribution host).
@@ -415,8 +415,8 @@ Environment variables that affect bootstrap behavior when set on the host:
 
 | Variable | Effect |
 |---|---|
-| `OPENSHELL_GATEWAY_IMAGE` | Overrides entire image ref if set and non-empty |
-| `IMAGE_TAG` | Sets image tag (default: `"dev"`) when `OPENSHELL_GATEWAY_IMAGE` is not set |
+| `OPENSHELL_CLUSTER_IMAGE` | Overrides entire image ref if set and non-empty |
+| `IMAGE_TAG` | Sets image tag (default: `"dev"`) when `OPENSHELL_CLUSTER_IMAGE` is not set |
 | `NAV_GATEWAY_TLS_ENABLED` | Overrides HelmChart manifest for TLS enabled check (`true`/`1`/`yes`/`false`/`0`/`no`) |
 | `XDG_CONFIG_HOME` | Base config directory (default: `$HOME/.config`) |
 | `KUBECONFIG` | Target kubeconfig path for merge (first colon-separated path; default: `$HOME/.kube/config`) |

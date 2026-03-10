@@ -508,7 +508,7 @@ pub async fn ensure_gateway_image(version: &str, registry_token: Option<&str>) -
 }
 
 fn default_gateway_image_ref() -> String {
-    if let Ok(image) = std::env::var("OPENSHELL_GATEWAY_IMAGE")
+    if let Ok(image) = std::env::var("OPENSHELL_CLUSTER_IMAGE")
         && !image.trim().is_empty()
     {
         return image;
