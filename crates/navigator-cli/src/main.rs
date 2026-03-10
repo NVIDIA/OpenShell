@@ -273,6 +273,7 @@ const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
 #[command(propagate_version = true)]
 #[command(help_template = HELP_TEMPLATE)]
 #[command(disable_help_subcommand = true)]
+#[command(disable_help_flag = true, disable_version_flag = true)]
 struct Cli {
     /// Gateway name to operate on (resolved from stored metadata).
     #[arg(
@@ -297,6 +298,14 @@ struct Cli {
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "Global Options")]
     verbose: u8,
+
+    /// Print help.
+    #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true, help_heading = "Global Options")]
+    help: (),
+
+    /// Print version.
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, global = true, help_heading = "Global Options")]
+    version: (),
 
     #[command(subcommand)]
     command: Option<Commands>,
