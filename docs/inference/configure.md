@@ -5,16 +5,14 @@
 
 # Configure Inference Routing
 
-OpenShell exposes one managed inference backend behind `https://inference.local`
-for the active gateway.
+This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — see [Network Access Rules](/sandboxes/index.md#network-access-rules) for details.
 
-External inference endpoints still go through sandbox `network_policies`. This
-page covers the special local inference endpoint only.
+The configuration consists of two values:
 
-That configuration consists of two values:
-
-- a provider record name
-- a model ID
+| Value | Description |
+|---|---|
+| Provider record | The credential backend OpenShell uses to authenticate with the upstream model host. |
+| Model ID | The model to use for generation requests. |
 
 ## Step 1: Create a Provider
 
@@ -24,7 +22,7 @@ Create a provider that holds the backend credentials you want OpenShell to use.
 $ nemoclaw provider create --name nvidia-prod --type nvidia --from-existing
 ```
 
-You can also use `openai` or `anthropic` providers types.
+You can also use `openai` or `anthropic` provider types.
 
 ## Step 2: Set Inference Routing
 
@@ -35,8 +33,6 @@ $ nemoclaw inference set \
     --provider nvidia-prod \
     --model nvidia/nemotron-3-nano-30b-a3b
 ```
-
-This sets the managed inference configuration.
 
 ## Step 3: Verify the Active Config
 
@@ -55,7 +51,7 @@ Use `update` when you want to change only one field:
 $ nemoclaw inference update --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
-Or switch providers without repeating the current model manually:
+Or switch providers without repeating the current model:
 
 ```console
 $ nemoclaw inference update --provider openai-prod
@@ -63,8 +59,7 @@ $ nemoclaw inference update --provider openai-prod
 
 ## Use It from a Sandbox
 
-Once inference is configured, userland code inside any sandbox can call
-`https://inference.local` directly:
+Once inference is configured, code inside any sandbox can call `https://inference.local` directly:
 
 ```python
 from openai import OpenAI
@@ -77,24 +72,18 @@ response = client.chat.completions.create(
 )
 ```
 
-The client-supplied model is ignored for generation requests. OpenShell
-rewrites it to the configured model before forwarding upstream.
+The client-supplied model is ignored for generation requests. OpenShell rewrites it to the configured model before forwarding upstream.
 
-Use this endpoint when inference should stay local to the host for privacy and
-security reasons. External providers that should be reached directly belong in
-`network_policies` instead.
+Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
 
-## Good to Know
-
-- Gateway-scoped: every sandbox on the active gateway sees the same
-  `inference.local` backend.
-- HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
+:::{note}
+- **Gateway-scoped** — every sandbox on the active gateway sees the same `inference.local` backend.
+- **HTTPS only** — `inference.local` is intercepted only for HTTPS traffic.
+:::
 
 ## Next Steps
 
-- {doc}`index`: understand the interception flow and supported API patterns.
-- [Network Access Rules](/sandboxes/index.md#network-access-rules):
-  configure direct access to external inference endpoints.
-- {doc}`../sandboxes/providers`: create and manage provider records.
-- {doc}`../reference/cli`: see the CLI reference for `nemoclaw inference`
-  commands.
+- **How does inference routing work?** See {doc}`index` for the interception flow and supported API patterns.
+- **Need to control external endpoints?** See [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- **Managing provider records?** See {doc}`../sandboxes/providers`.
+- **CLI reference?** See {doc}`../reference/cli` for `nemoclaw inference` commands.
