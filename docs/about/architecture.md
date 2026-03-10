@@ -21,68 +21,9 @@ content:
 
 OpenShell runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated Kubernetes pod managed through the gateway. Four components work together to keep agents secure.
 
-```{mermaid}
-graph TB
-    subgraph docker["Docker Container"]
-        subgraph k3s["k3s Cluster"]
-            gw["Gateway"]
-            pr["Privacy Router"]
-
-            subgraph pod1["Sandbox"]
-                sup1["Supervisor"]
-                proxy1["Proxy"]
-                pe1["Policy Engine"]
-                agent1["Agent"]
-
-                sup1 --> proxy1
-                sup1 --> agent1
-                proxy1 --> pe1
-            end
-
-            subgraph pod2["Sandbox"]
-                sup2["Supervisor"]
-                proxy2["Proxy"]
-                pe2["Policy Engine"]
-                agent2["Agent"]
-
-                sup2 --> proxy2
-                sup2 --> agent2
-                proxy2 --> pe2
-            end
-
-            gw -- "credentials,<br/>policies" --> sup1
-            gw -- "credentials,<br/>policies" --> sup2
-        end
-    end
-
-    cli["nemoclaw CLI"] -- "gRPC" --> gw
-    agent1 -- "all outbound<br/>traffic" --> proxy1
-    agent2 -- "all outbound<br/>traffic" --> proxy2
-    proxy1 -- "policy-approved<br/>traffic" --> internet["External Services"]
-    proxy2 -- "policy-approved<br/>traffic" --> internet
-    proxy1 -- "inference traffic" --> pr
-    proxy2 -- "inference traffic" --> pr
-    pr -- "routed requests" --> backend["LLM Backend"]
-
-    style cli fill:#ffffff,stroke:#000000,color:#000000
-    style gw fill:#76b900,stroke:#000000,color:#000000
-    style pr fill:#76b900,stroke:#000000,color:#000000
-    style sup1 fill:#76b900,stroke:#000000,color:#000000
-    style proxy1 fill:#76b900,stroke:#000000,color:#000000
-    style pe1 fill:#76b900,stroke:#000000,color:#000000
-    style agent1 fill:#ffffff,stroke:#000000,color:#000000
-    style sup2 fill:#76b900,stroke:#000000,color:#000000
-    style proxy2 fill:#76b900,stroke:#000000,color:#000000
-    style pe2 fill:#76b900,stroke:#000000,color:#000000
-    style agent2 fill:#ffffff,stroke:#000000,color:#000000
-    style internet fill:#ffffff,stroke:#000000,color:#000000
-    style backend fill:#ffffff,stroke:#000000,color:#000000
-    style docker fill:#f5f5f5,stroke:#000000,color:#000000
-    style k3s fill:#e8e8e8,stroke:#000000,color:#000000
-    style pod1 fill:#f5f5f5,stroke:#000000,color:#000000
-    style pod2 fill:#f5f5f5,stroke:#000000,color:#000000
-
-    linkStyle default stroke:#76b900,stroke-width:2px
+```{image} architecture.svg
+:alt: OpenShell architecture diagram showing the NemoClaw component layout
+:align: center
 ```
 
 ## Components
