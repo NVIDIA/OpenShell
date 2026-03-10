@@ -25,9 +25,9 @@
 
 ## Key Patterns
 - OPA baked-in rules: `include_str!("../data/sandbox-policy.rego")` in opa.rs
-- Policy loading: gRPC mode (NEMOCLAW_SANDBOX_ID + NEMOCLAW_ENDPOINT) or file mode (--policy-rules + --policy-data)
-- Env vars: sandbox uses NEMOCLAW_* prefix (e.g., NEMOCLAW_SANDBOX_ID, NEMOCLAW_ENDPOINT, NEMOCLAW_POLICY_RULES)
-- CLI flag: `--navigator-endpoint` (NOT `--nemoclaw-endpoint`)
+- Policy loading: gRPC mode (OPENSHELL_SANDBOX_ID + OPENSHELL_ENDPOINT) or file mode (--policy-rules + --policy-data)
+- Env vars: sandbox uses OPENSHELL_* prefix (e.g., OPENSHELL_SANDBOX_ID, OPENSHELL_ENDPOINT, OPENSHELL_POLICY_RULES)
+- CLI flag: `--navigator-endpoint` (NOT `--openshell-endpoint`)
 - Provider env injection: both entrypoint process (tokio Command) and SSH shell (std Command)
 - Cluster bootstrap: `sandbox_create_with_bootstrap()` auto-deploys when no cluster exists (main.rs ~line 632)
 - CLI cluster resolution: --cluster flag > NAVIGATOR_CLUSTER env > active cluster file
@@ -90,7 +90,7 @@
 - Dynamic domains: network_policies only (inference removed from policy). Static domains: filesystem, landlock, process (pre_exec, immutable)
 - Server-side: `UpdateSandboxPolicy` RPC rejects changes to static fields or network mode changes
 - Server-side validation: `validate_static_fields_unchanged()` + `validate_network_mode_unchanged()` in grpc.rs
-- Poll interval: `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` env var (default 30), no CLI flag
+- Poll interval: `OPENSHELL_POLICY_POLL_INTERVAL_SECS` env var (default 30), no CLI flag
 - Version tracking: monotonic i64 per sandbox, `GetSandboxPolicyResponse` has version + policy_hash
 - Version 1 backfill: lazy on first `GetSandboxPolicy` from spec.policy if no policy_revisions row exists
 - `supersede_pending_policies()`: marks older pending revisions as superseded when new version persisted

@@ -3,13 +3,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Cross-compile the nemoclaw CLI binary for macOS aarch64 (Apple Silicon)
+# Cross-compile the openshell CLI binary for macOS aarch64 (Apple Silicon)
 # using the osxcross toolchain.  Produces a standalone binary — no Python
 # wheel wrapping.
 #
 # Usage:
 #   docker buildx build -f deploy/docker/Dockerfile.cli-macos \
-#     --build-arg NEMOCLAW_CARGO_VERSION=0.6.0 \
+#     --build-arg OPENSHELL_CARGO_VERSION=0.6.0 \
 #     --output type=local,dest=out/ .
 
 ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
@@ -18,7 +18,7 @@ FROM ${OSXCROSS_IMAGE} AS osxcross
 
 FROM python:3.12-slim AS builder
 
-ARG NEMOCLAW_CARGO_VERSION
+ARG OPENSHELL_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
@@ -107,11 +107,11 @@ RUN touch crates/navigator-cli/src/main.rs \
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    if [ -n "${NEMOCLAW_CARGO_VERSION:-}" ]; then \
-      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${NEMOCLAW_CARGO_VERSION}"'"/}' Cargo.toml; \
+    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
     cargo build --release --target aarch64-apple-darwin -p navigator-cli && \
-    cp target/aarch64-apple-darwin/release/nemoclaw /nemoclaw
+    cp target/aarch64-apple-darwin/release/openshell /openshell
 
 FROM scratch AS binary
-COPY --from=builder /nemoclaw /nemoclaw
+COPY --from=builder /openshell /openshell

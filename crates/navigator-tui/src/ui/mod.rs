@@ -98,7 +98,7 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
 
     let mut parts: Vec<Span<'_>> = vec![
-        Span::styled(" NemoClaw", styles::ACCENT_BOLD),
+        Span::styled(" OpenShell", styles::ACCENT_BOLD),
         Span::styled(" | ", styles::MUTED),
         Span::styled("Current Cluster: ", styles::TEXT),
         Span::styled(&app.cluster_name, styles::HEADING),

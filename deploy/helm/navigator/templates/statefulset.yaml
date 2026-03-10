@@ -44,36 +44,36 @@ spec:
             - --db-url
             - {{ .Values.server.dbUrl | quote }}
           env:
-            - name: NEMOCLAW_SANDBOX_NAMESPACE
+            - name: OPENSHELL_SANDBOX_NAMESPACE
               value: {{ .Values.server.sandboxNamespace | quote }}
-            - name: NEMOCLAW_SANDBOX_IMAGE
+            - name: OPENSHELL_SANDBOX_IMAGE
               value: {{ .Values.server.sandboxImage | quote }}
-            - name: NEMOCLAW_GRPC_ENDPOINT
+            - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
             {{- if .Values.server.sshGatewayHost }}
-            - name: NEMOCLAW_SSH_GATEWAY_HOST
+            - name: OPENSHELL_SSH_GATEWAY_HOST
               value: {{ .Values.server.sshGatewayHost | quote }}
             {{- end }}
             {{- if .Values.server.sshGatewayPort }}
-            - name: NEMOCLAW_SSH_GATEWAY_PORT
+            - name: OPENSHELL_SSH_GATEWAY_PORT
               value: {{ .Values.server.sshGatewayPort | quote }}
             {{- end }}
-            - name: NEMOCLAW_SSH_HANDSHAKE_SECRET
+            - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               value: {{ required "server.sshHandshakeSecret is required" .Values.server.sshHandshakeSecret | quote }}
             {{- if .Values.server.disableTls }}
-            - name: NEMOCLAW_DISABLE_TLS
+            - name: OPENSHELL_DISABLE_TLS
               value: "true"
             {{- else }}
-            - name: NEMOCLAW_TLS_CERT
+            - name: OPENSHELL_TLS_CERT
               value: /etc/navigator-tls/server/tls.crt
-            - name: NEMOCLAW_TLS_KEY
+            - name: OPENSHELL_TLS_KEY
               value: /etc/navigator-tls/server/tls.key
-            - name: NEMOCLAW_TLS_CLIENT_CA
+            - name: OPENSHELL_TLS_CLIENT_CA
               value: /etc/navigator-tls/client-ca/ca.crt
-            - name: NEMOCLAW_CLIENT_TLS_SECRET_NAME
+            - name: OPENSHELL_CLIENT_TLS_SECRET_NAME
               value: {{ .Values.server.tls.clientTlsSecretName | quote }}
             {{- if .Values.server.disableGatewayAuth }}
-            - name: NEMOCLAW_DISABLE_GATEWAY_AUTH
+            - name: OPENSHELL_DISABLE_GATEWAY_AUTH
               value: "true"
             {{- end }}
             {{- end }}

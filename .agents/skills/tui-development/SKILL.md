@@ -1,22 +1,22 @@
 ---
 name: tui-development
-description: Guide for developing the NemoClaw TUI — a ratatui-based terminal UI for the NemoClaw platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, navigator-tui, tui development, tui feature, tui bug.
+description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, navigator-tui, tui development, tui feature, tui bug.
 ---
 
-# NemoClaw TUI Development Guide
+# OpenShell TUI Development Guide
 
-Comprehensive reference for any agent working on the NemoClaw TUI.
+Comprehensive reference for any agent working on the OpenShell TUI.
 
 ## 1. Overview
 
-The NemoClaw TUI is a ratatui-based terminal UI for the NemoClaw platform. It provides a keyboard-driven interface for managing gateways, sandboxes, and logs — the same operations available via the `nemoclaw` CLI, but with a live, interactive dashboard.
+The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It provides a keyboard-driven interface for managing gateways, sandboxes, and logs — the same operations available via the `openshell` CLI, but with a live, interactive dashboard.
 
-- **Launched via:** `nemoclaw term` or `mise run term`
+- **Launched via:** `openshell term` or `mise run term`
 - **Crate:** `crates/navigator-tui/`
 - **Key dependencies:**
   - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
   - `crossterm` (workspace version) — terminal backend and event polling
-  - `tonic` with TLS — gRPC client for the NemoClaw gateway
+  - `tonic` with TLS — gRPC client for the OpenShell gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
   - `navigator-core` — proto-generated types (`NavigatorClient`, request/response structs)
   - `navigator-bootstrap` — cluster discovery (`list_clusters()`)
@@ -39,7 +39,7 @@ Cluster (discovered via navigator_bootstrap::list_clusters())
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- NemoClaw │ Current Cluster: <name> (<status>) │ <screen/context>
+ OpenShell │ Current Cluster: <name> (<status>) │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -104,8 +104,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` NemoClaw │ Current Cluster: nemoclaw (Healthy) │ Dashboard`
-- Sandbox detail: ` NemoClaw │ Current Cluster: nemoclaw (Healthy) │ Sandbox: my-sandbox`
+- Dashboard: ` OpenShell │ Current Cluster: openshell (Healthy) │ Dashboard`
+- Sandbox detail: ` OpenShell │ Current Cluster: openshell (Healthy) │ Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -193,7 +193,7 @@ All colors and styles are defined in `crates/navigator-tui/src/theme.rs`.
 | `MUTED` | White + DIM modifier | Secondary info, separators (`│`), unfocused items |
 | `HEADING` | White + BOLD | Panel titles, sandbox/cluster names when active |
 | `ACCENT` | NVIDIA_GREEN foreground | Selected row marker (`▌`), sandbox source labels |
-| `ACCENT_BOLD` | NVIDIA_GREEN + BOLD | "NemoClaw" brand text, command prompt `:` |
+| `ACCENT_BOLD` | NVIDIA_GREEN + BOLD | "OpenShell" brand text, command prompt `:` |
 | `SELECTED` | BOLD modifier only | Selected row text emphasis |
 | `BORDER` | EVERGLADE foreground | Unfocused panel borders |
 | `BORDER_FOCUSED` | NVIDIA_GREEN foreground | Focused panel borders |
@@ -225,14 +225,14 @@ The `confirm_delete` flag in `App` gates destructive key handling — while true
 
 ### CLI parity
 
-TUI actions should parallel `nemoclaw` CLI commands so users have familiar mental models:
+TUI actions should parallel `openshell` CLI commands so users have familiar mental models:
 
 | CLI Command | TUI Equivalent |
 | --- | --- |
-| `nemoclaw sandbox list` | Sandbox table on Dashboard |
-| `nemoclaw sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
-| `nemoclaw logs <name>` | `[l]` on sandbox detail to open log viewer |
-| `nemoclaw status` | Status in title bar + cluster list |
+| `openshell sandbox list` | Sandbox table on Dashboard |
+| `openshell sandbox delete <name>` | `[d]` on sandbox detail, then `[y]` to confirm |
+| `openshell logs <name>` | `[l]` on sandbox detail to open log viewer |
+| `openshell status` | Status in title bar + cluster list |
 
 When adding new TUI features, check what the CLI offers and maintain consistency.
 
@@ -337,7 +337,7 @@ lib.rs (event loop, gRPC, async tasks)
 ### Dependency constraints
 
 - **`navigator-tui` cannot depend on `navigator-cli`** — this would create a circular dependency. TLS channel building for cluster switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
-- mTLS certs are read from `~/.config/nemoclaw/clusters/<name>/mtls/` (ca.crt, tls.crt, tls.key).
+- mTLS certs are read from `~/.config/openshell/clusters/<name>/mtls/` (ca.crt, tls.crt, tls.key).
 
 ### Proto generated code
 

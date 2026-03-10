@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! NemoClaw CLI library.
+//! OpenShell CLI library.
 //!
-//! This crate provides the CLI implementation for NemoClaw.
+//! This crate provides the CLI implementation for OpenShell.
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

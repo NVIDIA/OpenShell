@@ -24,8 +24,8 @@ navigator-sandbox \
 
 | Flag             | Environment Variable     | Description                                      |
 | ---------------- | ------------------------ | ------------------------------------------------ |
-| `--policy-rules` | `NEMOCLAW_POLICY_RULES` | Path to `.rego` file containing evaluation rules |
-| `--policy-data`  | `NEMOCLAW_POLICY_DATA`  | Path to YAML file containing policy data         |
+| `--policy-rules` | `OPENSHELL_POLICY_RULES` | Path to `.rego` file containing evaluation rules |
+| `--policy-data`  | `OPENSHELL_POLICY_DATA`  | Path to YAML file containing policy data         |
 
 The YAML data file is preprocessed before loading into the OPA engine: L7 policies are validated, and `access` presets are expanded into explicit `rules` arrays. See `crates/navigator-sandbox/src/opa.rs` -- `preprocess_yaml_data()`.
 
@@ -42,8 +42,8 @@ navigator-sandbox \
 
 | Flag                     | Environment Variable   | Description                  |
 | ------------------------ | ---------------------- | ---------------------------- |
-| `--sandbox-id`           | `NEMOCLAW_SANDBOX_ID` | Sandbox ID for policy lookup |
-| `--navigator-endpoint`   | `NEMOCLAW_ENDPOINT`   | Gateway gRPC endpoint        |
+| `--sandbox-id`           | `OPENSHELL_SANDBOX_ID` | Sandbox ID for policy lookup |
+| `--navigator-endpoint`   | `OPENSHELL_ENDPOINT`   | Gateway gRPC endpoint        |
 
 The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
 
@@ -53,9 +53,9 @@ The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbo
 flowchart TD
     START[Sandbox Startup] --> CHECK{File mode?<br/>--policy-rules +<br/>--policy-data}
     CHECK -->|Yes| FILE[Read .rego + .yaml from disk]
-    CHECK -->|No| NEMOCLAW{gRPC mode?<br/>--sandbox-id +<br/>--navigator-endpoint}
-    NEMOCLAW -->|Yes| FETCH[Fetch SandboxPolicy proto via gRPC]
-    NEMOCLAW -->|No| ERR[Error: no policy source]
+    CHECK -->|No| OPENSHELL{gRPC mode?<br/>--sandbox-id +<br/>--navigator-endpoint}
+    OPENSHELL -->|Yes| FETCH[Fetch SandboxPolicy proto via gRPC]
+    OPENSHELL -->|No| ERR[Error: no policy source]
 
     FILE --> PREPROCESS[Preprocess YAML:<br/>validate L7, expand presets]
     FETCH --> PROTO2JSON[Convert proto to JSON<br/>validate L7, expand presets]
@@ -84,7 +84,7 @@ Policy fields fall into two categories based on when they are enforced:
 | Category | Fields | Enforcement Point | Updatable? |
 |----------|--------|-------------------|------------|
 | **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
-| **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `nemoclaw policy set` |
+| **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `openshell policy set` |
 
 Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/navigator-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
 
@@ -181,7 +181,7 @@ In gRPC mode, the sandbox spawns a background task that periodically polls the g
 
 | Parameter | Default | Override |
 |-----------|---------|----------|
-| Poll interval | 30 seconds | `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` environment variable |
+| Poll interval | 30 seconds | `OPENSHELL_POLICY_POLL_INTERVAL_SECS` environment variable |
 
 The poll loop:
 

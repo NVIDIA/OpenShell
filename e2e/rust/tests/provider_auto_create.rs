@@ -13,19 +13,19 @@
 //! credential made it all the way through to the sandbox process environment.
 //!
 //! Prerequisites:
-//! - A running nemoclaw gateway (`nemoclaw gateway start`)
-//! - The `nemoclaw` binary (built automatically from the workspace)
+//! - A running openshell gateway (`openshell gateway start`)
+//! - The `openshell` binary (built automatically from the workspace)
 
 use std::process::Stdio;
 
-use nemoclaw_e2e::harness::binary::nemoclaw_cmd;
-use nemoclaw_e2e::harness::output::{extract_field, strip_ansi};
+use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::output::{extract_field, strip_ansi};
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
 
 /// Helper: delete a provider by name, ignoring errors.
 async fn delete_provider(name: &str) {
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.arg("provider")
         .arg("delete")
         .arg(name)
@@ -36,7 +36,7 @@ async fn delete_provider(name: &str) {
 
 /// Helper: delete a sandbox by name, ignoring errors.
 async fn delete_sandbox(name: &str) {
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.arg("sandbox")
         .arg("delete")
         .arg(name)
@@ -54,7 +54,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
 
     // Create a sandbox that prints the ANTHROPIC_API_KEY env var.
     // --auto-providers skips the interactive prompt.
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.arg("sandbox")
         .arg("create")
         .arg("--provider")
@@ -71,7 +71,7 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     let output = cmd
         .output()
         .await
-        .expect("failed to spawn nemoclaw sandbox create");
+        .expect("failed to spawn openshell sandbox create");
 
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();

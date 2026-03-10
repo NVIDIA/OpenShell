@@ -863,7 +863,7 @@ fn sandbox_template_to_k8s(
         container.insert("image".to_string(), serde_json::json!(image));
     }
 
-    // Build environment variables - start with NemoClaw-required vars
+    // Build environment variables - start with OpenShell-required vars
     let env = build_env_list(
         None,
         &template.environment,
@@ -1119,29 +1119,33 @@ fn apply_required_env(
     ssh_handshake_skew_secs: u64,
     tls_enabled: bool,
 ) {
-    upsert_env(env, "NEMOCLAW_SANDBOX_ID", sandbox_id);
-    upsert_env(env, "NEMOCLAW_SANDBOX", sandbox_name);
-    upsert_env(env, "NEMOCLAW_ENDPOINT", grpc_endpoint);
-    upsert_env(env, "NEMOCLAW_SANDBOX_COMMAND", "sleep infinity");
+    upsert_env(env, "OPENSHELL_SANDBOX_ID", sandbox_id);
+    upsert_env(env, "OPENSHELL_SANDBOX", sandbox_name);
+    upsert_env(env, "OPENSHELL_ENDPOINT", grpc_endpoint);
+    upsert_env(env, "OPENSHELL_SANDBOX_COMMAND", "sleep infinity");
     if !ssh_listen_addr.is_empty() {
-        upsert_env(env, "NEMOCLAW_SSH_LISTEN_ADDR", ssh_listen_addr);
+        upsert_env(env, "OPENSHELL_SSH_LISTEN_ADDR", ssh_listen_addr);
     }
-    upsert_env(env, "NEMOCLAW_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
+    upsert_env(env, "OPENSHELL_SSH_HANDSHAKE_SECRET", ssh_handshake_secret);
     upsert_env(
         env,
-        "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS",
+        "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS",
         &ssh_handshake_skew_secs.to_string(),
     );
     // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
     // and the client TLS secret is mounted into the sandbox pod.
     if tls_enabled {
-        upsert_env(env, "NEMOCLAW_TLS_CA", "/etc/navigator-tls/client/ca.crt");
+        upsert_env(env, "OPENSHELL_TLS_CA", "/etc/navigator-tls/client/ca.crt");
         upsert_env(
             env,
-            "NEMOCLAW_TLS_CERT",
+            "OPENSHELL_TLS_CERT",
             "/etc/navigator-tls/client/tls.crt",
         );
-        upsert_env(env, "NEMOCLAW_TLS_KEY", "/etc/navigator-tls/client/tls.key");
+        upsert_env(
+            env,
+            "OPENSHELL_TLS_KEY",
+            "/etc/navigator-tls/client/tls.key",
+        );
     }
 }
 
@@ -1447,9 +1451,9 @@ mod tests {
         let secret_entry = env
             .iter()
             .find(|e| {
-                e.get("name").and_then(|v| v.as_str()) == Some("NEMOCLAW_SSH_HANDSHAKE_SECRET")
+                e.get("name").and_then(|v| v.as_str()) == Some("OPENSHELL_SSH_HANDSHAKE_SECRET")
             })
-            .expect("NEMOCLAW_SSH_HANDSHAKE_SECRET must be present in env");
+            .expect("OPENSHELL_SSH_HANDSHAKE_SECRET must be present in env");
         assert_eq!(
             secret_entry.get("value").and_then(|v| v.as_str()),
             Some("my-secret-value")

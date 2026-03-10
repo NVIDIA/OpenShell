@@ -3,8 +3,8 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-BINARY="$PROJECT_ROOT/target/debug/nemoclaw"
-STATE_FILE="$PROJECT_ROOT/.cache/nemoclaw-build.state"
+BINARY="$PROJECT_ROOT/target/debug/openshell"
+STATE_FILE="$PROJECT_ROOT/.cache/openshell-build.state"
 
 # ---------------------------------------------------------------------------
 # Fingerprint-based rebuild check

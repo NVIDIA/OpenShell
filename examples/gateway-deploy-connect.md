@@ -1,20 +1,20 @@
 # Deploying and Connecting to a Gateway
 
-Deploy a NemoClaw gateway, verify it is reachable, and run your first
+Deploy a OpenShell gateway, verify it is reachable, and run your first
 sandbox. This example covers local, remote, and Cloudflare-fronted
 deployments.
 
 ## Prerequisites
 
 - Docker daemon running
-- NemoClaw CLI installed (`nemoclaw`)
+- OpenShell CLI installed (`openshell`)
 
 ## Local deployment
 
 ### 1. Deploy the gateway
 
 ```bash
-nemoclaw gateway start
+openshell gateway start
 ```
 
 This provisions a single-node k3s cluster inside a Docker container,
@@ -25,7 +25,7 @@ connection artifacts locally. The gateway becomes reachable at
 ### 2. Verify the gateway is running
 
 ```bash
-nemoclaw status
+openshell status
 ```
 
 Expected output:
@@ -39,14 +39,14 @@ Version: <version>
 ### 3. Create a sandbox
 
 ```bash
-nemoclaw sandbox create --name hello -- echo "it works"
+openshell sandbox create --name hello -- echo "it works"
 ```
 
 ### 4. Clean up
 
 ```bash
-nemoclaw sandbox delete hello
-nemoclaw gateway destroy
+openshell sandbox delete hello
+openshell gateway destroy
 ```
 
 ## Remote deployment
@@ -57,7 +57,7 @@ dependency on the remote host is Docker.
 ### 1. Deploy
 
 ```bash
-nemoclaw gateway start --remote user@hostname
+openshell gateway start --remote user@hostname
 ```
 
 The CLI creates an SSH-based Docker client, pulls the cluster image on
@@ -67,9 +67,9 @@ reachable at `https://<hostname>:8080`.
 ### 2. Verify and use
 
 ```bash
-nemoclaw status
-nemoclaw sandbox create --name remote-test -- echo "running on remote host"
-nemoclaw sandbox connect remote-test
+openshell status
+openshell sandbox create --name remote-test -- echo "running on remote host"
+openshell sandbox connect remote-test
 ```
 
 ### 3. Access the Kubernetes API (optional)
@@ -79,7 +79,7 @@ SSH tunnel:
 
 ```bash
 # Start a tunnel in the background
-nemoclaw gateway tunnel
+openshell gateway tunnel
 
 # In another terminal
 kubectl get pods -n navigator
@@ -88,8 +88,8 @@ kubectl get pods -n navigator
 ### 4. Clean up
 
 ```bash
-nemoclaw sandbox delete remote-test
-nemoclaw gateway destroy
+openshell sandbox delete remote-test
+openshell gateway destroy
 ```
 
 ## Custom port
@@ -97,7 +97,7 @@ nemoclaw gateway destroy
 If port 8080 is in use, specify a different host port:
 
 ```bash
-nemoclaw gateway start --port 9090
+openshell gateway start --port 9090
 ```
 
 The CLI stores the port in cluster metadata, so subsequent commands
@@ -110,7 +110,7 @@ authentication (e.g. Cloudflare Access), no deployment is needed --
 register the endpoint and authenticate via browser:
 
 ```bash
-nemoclaw gateway add https://gateway.example.com
+openshell gateway add https://gateway.example.com
 ```
 
 This opens your browser for the proxy's login flow. After
@@ -120,7 +120,7 @@ active.
 To re-authenticate after token expiry:
 
 ```bash
-nemoclaw gateway login
+openshell gateway login
 ```
 
 ### How edge-authenticated connections differ
@@ -145,26 +145,26 @@ regardless of whether the gateway uses mTLS or edge authentication.
 List all registered gateways:
 
 ```bash
-nemoclaw gateway select
+openshell gateway select
 ```
 
 Switch the active gateway:
 
 ```bash
-nemoclaw gateway select my-other-cluster
+openshell gateway select my-other-cluster
 ```
 
 Override the active gateway for a single command:
 
 ```bash
-nemoclaw status -g my-other-cluster
+openshell status -g my-other-cluster
 ```
 
 ## How it works
 
 The `gateway start` command:
 
-1. Pulls the NemoClaw cluster image and provisions a container.
+1. Pulls the OpenShell cluster image and provisions a container.
 2. Waits for the gateway to become healthy.
 3. Generates mTLS certificates for secure communication.
 4. Stores connection credentials and metadata locally.
@@ -184,13 +184,13 @@ above).
 Check gateway deployment details:
 
 ```bash
-nemoclaw gateway info
+openshell gateway info
 ```
 
 If the gateway is unreachable, inspect the container:
 
 ```bash
-docker logs navigator-cluster-nemoclaw
+docker logs navigator-cluster-openshell
 ```
 
 Re-running `gateway start` is idempotent -- it reuses existing

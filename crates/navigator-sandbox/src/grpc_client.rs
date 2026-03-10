@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! gRPC client for fetching sandbox policy, provider environment, and inference
-//! route bundles from NemoClaw server.
+//! route bundles from OpenShell server.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -17,12 +17,12 @@ use navigator_core::proto::{
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
 
-/// Create a channel to the NemoClaw server.
+/// Create a channel to the OpenShell server.
 ///
 /// When the endpoint uses `https://`, mTLS is configured using these env vars:
-/// - `NEMOCLAW_TLS_CA` -- path to the CA certificate
-/// - `NEMOCLAW_TLS_CERT` -- path to the client certificate
-/// - `NEMOCLAW_TLS_KEY` -- path to the client private key
+/// - `OPENSHELL_TLS_CA` -- path to the CA certificate
+/// - `OPENSHELL_TLS_CERT` -- path to the client certificate
+/// - `OPENSHELL_TLS_KEY` -- path to the client private key
 ///
 /// When the endpoint uses `http://`, a plaintext connection is used (for
 /// deployments where TLS is disabled, e.g. behind a Cloudflare Tunnel).
@@ -38,15 +38,15 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
     let tls_enabled = endpoint.starts_with("https://");
 
     if tls_enabled {
-        let ca_path = std::env::var("NEMOCLAW_TLS_CA")
+        let ca_path = std::env::var("OPENSHELL_TLS_CA")
             .into_diagnostic()
-            .wrap_err("NEMOCLAW_TLS_CA is required")?;
-        let cert_path = std::env::var("NEMOCLAW_TLS_CERT")
+            .wrap_err("OPENSHELL_TLS_CA is required")?;
+        let cert_path = std::env::var("OPENSHELL_TLS_CERT")
             .into_diagnostic()
-            .wrap_err("NEMOCLAW_TLS_CERT is required")?;
-        let key_path = std::env::var("NEMOCLAW_TLS_KEY")
+            .wrap_err("OPENSHELL_TLS_CERT is required")?;
+        let key_path = std::env::var("OPENSHELL_TLS_KEY")
             .into_diagnostic()
-            .wrap_err("NEMOCLAW_TLS_KEY is required")?;
+            .wrap_err("OPENSHELL_TLS_KEY is required")?;
 
         let ca_pem = std::fs::read(&ca_path)
             .into_diagnostic()
@@ -71,22 +71,22 @@ async fn connect_channel(endpoint: &str) -> Result<Channel> {
     ep.connect()
         .await
         .into_diagnostic()
-        .wrap_err("failed to connect to NemoClaw server")
+        .wrap_err("failed to connect to OpenShell server")
 }
 
-/// Connect to the NemoClaw server (mTLS or plaintext based on endpoint scheme).
+/// Connect to the OpenShell server (mTLS or plaintext based on endpoint scheme).
 async fn connect(endpoint: &str) -> Result<NavigatorClient<Channel>> {
     let channel = connect_channel(endpoint).await?;
     Ok(NavigatorClient::new(channel))
 }
 
-/// Fetch sandbox policy from NemoClaw server via gRPC.
+/// Fetch sandbox policy from OpenShell server via gRPC.
 ///
 /// Returns `Ok(Some(policy))` when the server has a policy configured,
 /// or `Ok(None)` when the sandbox was created without a policy (the sandbox
 /// should discover one from disk or use the restrictive default).
 pub async fn fetch_policy(endpoint: &str, sandbox_id: &str) -> Result<Option<ProtoSandboxPolicy>> {
-    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to NemoClaw server");
+    debug!(endpoint = %endpoint, sandbox_id = %sandbox_id, "Connecting to OpenShell server");
 
     let mut client = connect(endpoint).await?;
 
@@ -170,14 +170,14 @@ pub async fn discover_and_sync_policy(
 /// Sync an enriched policy back to the gateway.
 ///
 /// Used by the supervisor to push baseline-path-enriched policies so the
-/// gateway stores the effective policy users see via `nemoclaw sandbox get`.
+/// gateway stores the effective policy users see via `openshell sandbox get`.
 pub async fn sync_policy(endpoint: &str, sandbox: &str, policy: &ProtoSandboxPolicy) -> Result<()> {
     debug!(endpoint = %endpoint, sandbox = %sandbox, "Syncing enriched policy to gateway");
     let mut client = connect(endpoint).await?;
     sync_policy_with_client(&mut client, sandbox, policy).await
 }
 
-/// Fetch provider environment variables for a sandbox from NemoClaw server via gRPC.
+/// Fetch provider environment variables for a sandbox from OpenShell server via gRPC.
 ///
 /// Returns a map of environment variable names to values derived from provider
 /// credentials configured on the sandbox. Returns an empty map if the sandbox
@@ -200,7 +200,7 @@ pub async fn fetch_provider_environment(
     Ok(response.into_inner().environment)
 }
 
-/// A reusable gRPC client for the NemoClaw service.
+/// A reusable gRPC client for the OpenShell service.
 ///
 /// Wraps a tonic channel connected once and reused for policy polling
 /// and status reporting, avoiding per-request TLS handshake overhead.

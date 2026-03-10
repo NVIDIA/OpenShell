@@ -4,7 +4,7 @@
 //! Edge authentication token storage.
 //!
 //! Stores the bearer token for edge-authenticated gateways at
-//! `$XDG_CONFIG_HOME/nemoclaw/clusters/<name>/edge_token`.
+//! `$XDG_CONFIG_HOME/openshell/clusters/<name>/edge_token`.
 //! The token is a plain-text JWT string with `0600` permissions.
 
 use crate::paths::clusters_dir;

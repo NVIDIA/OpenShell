@@ -24,7 +24,7 @@ This tutorial walks you through the path to running Claude Code inside a OpenShe
 Run the following command:
 
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
 This single command performs four actions:
@@ -62,13 +62,13 @@ Open a second terminal on your host machine to inspect the sandbox from outside.
 1. In the second terminal, list all sandboxes:
 
     ```console
-    $ nemoclaw sandbox list
+    $ openshell sandbox list
     ```
 
 2. Launch the OpenShell Terminal for a live dashboard that shows sandbox status, active network connections, and policy decisions in real time:
 
     ```console
-    $ nemoclaw term
+    $ openshell term
     ```
 
 ## Connect from VS Code (Optional)
@@ -78,13 +78,13 @@ If you prefer a graphical editor, connect to the sandbox with VS Code Remote-SSH
 Export the sandbox SSH configuration:
 
 ```console
-$ nemoclaw sandbox ssh-config <sandbox-name> >> ~/.ssh/config
+$ openshell sandbox ssh-config <sandbox-name> >> ~/.ssh/config
 ```
 
 Then open VS Code, install the Remote - SSH extension if needed, and connect to the host named after your sandbox. VS Code opens a full editor session inside the isolated environment.
 
 :::{tip}
-Replace `<sandbox-name>` with your sandbox name. Run `nemoclaw sandbox list` to find it if you did not specify one at creation time.
+Replace `<sandbox-name>` with your sandbox name. Run `openshell sandbox list` to find it if you did not specify one at creation time.
 :::
 
 ## Clean Up
@@ -98,14 +98,14 @@ $ exit
 Delete the sandbox:
 
 ```console
-$ nemoclaw sandbox delete <name>
+$ openshell sandbox delete <name>
 ```
 
 :::{tip}
 If you want the sandbox to persist after you disconnect, add the `--keep` flag at creation time:
 
 ```console
-$ nemoclaw sandbox create --keep -- claude
+$ openshell sandbox create --keep -- claude
 ```
 
 This is useful when you plan to reconnect later or iterate on the policy while the sandbox runs.

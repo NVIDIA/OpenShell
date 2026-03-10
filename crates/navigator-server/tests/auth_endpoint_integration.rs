@@ -107,10 +107,10 @@ fn render_connect_page(
     format!(
         r#"<!DOCTYPE html>
 <html lang="en">
-<head><title>NemoClaw — Connect to Gateway</title></head>
+<head><title>OpenShell — Connect to Gateway</title></head>
 <body>
     <div class="card">
-        <div class="logo">NemoClaw</div>
+        <div class="logo">OpenShell</div>
         <div class="gateway">{gateway_addr}</div>
         <div class="code">{escaped_code}</div>
         <button id="connectBtn" onclick="connect()">Connect to Gateway</button>
@@ -147,11 +147,11 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
 <html lang="en">
 <head>
     <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;code={code}">
-    <title>NemoClaw — Authenticating</title>
+    <title>OpenShell — Authenticating</title>
 </head>
 <body>
     <div class="card">
-        <div class="logo">NemoClaw</div>
+        <div class="logo">OpenShell</div>
         <div class="message">Authenticating with Cloudflare Access...</div>
     </div>
 </body>
@@ -248,8 +248,8 @@ async fn auth_connect_serves_page_with_cf_cookie() {
         "response should show the Host header as gateway display:\n{body}"
     );
     assert!(
-        body.contains("NemoClaw"),
-        "response should contain the NemoClaw branding:\n{body}"
+        body.contains("OpenShell"),
+        "response should contain the OpenShell branding:\n{body}"
     );
     assert!(
         body.contains("connect()"),

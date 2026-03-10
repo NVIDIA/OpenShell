@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Default values for NemoClaw
+# Default values for OpenShell
 
 replicaCount: 1
 
@@ -67,8 +67,8 @@ server:
   logLevel: info
   sandboxNamespace: navigator
   dbUrl: "sqlite:/var/navigator/navigator.db"
-  sandboxImage: "ghcr.io/nvidia/nemoclaw/sandbox:latest"
-  # gRPC endpoint for sandboxes to callback to NemoClaw (must be reachable from pods)
+  sandboxImage: "d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest"
+  # gRPC endpoint for sandboxes to callback to OpenShell (must be reachable from pods)
   grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
   # For local clusters the default 127.0.0.1:8080 is correct; for remote

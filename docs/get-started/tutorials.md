@@ -1,9 +1,9 @@
 ---
 title:
-  page: "NemoClaw Tutorials"
+  page: "OpenShell Tutorials"
   nav: "Tutorials"
 description: "Step-by-step tutorials for running AI agents inside OpenShell sandboxes."
-keywords: ["nemoclaw tutorials", "claude code sandbox", "opencode sandbox", "openclaw sandbox"]
+keywords: ["openshell tutorials", "claude code sandbox", "opencode sandbox", "openclaw sandbox"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "tutorial"]
 content:

@@ -15,7 +15,7 @@ Every sandbox moves through a defined set of phases:
 |---|---|
 | Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
 | Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw logs` for details. |
+| Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
 ## The OpenShell Runtime
@@ -25,7 +25,7 @@ you. The cluster runs as a [k3s](https://k3s.io/) Kubernetes distribution
 inside a Docker container on your machine.
 
 You do not need to set this up manually. The first time you run a command
-that needs a cluster (such as `nemoclaw sandbox create`), the CLI provisions
+that needs a cluster (such as `openshell sandbox create`), the CLI provisions
 one automatically.
 
 ## Next Steps

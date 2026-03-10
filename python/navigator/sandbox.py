@@ -150,7 +150,7 @@ class SandboxClient:
         cluster_name = cluster or _resolve_active_cluster()
         metadata_path = (
             _xdg_config_home()
-            / "nemoclaw"
+            / "openshell"
             / "clusters"
             / f"{cluster_name}_metadata.json"
         )
@@ -161,7 +161,7 @@ class SandboxClient:
         endpoint = f"{host}:{port}"
         if parsed.scheme == "https":
             mtls_dir = (
-                _xdg_config_home() / "nemoclaw" / "clusters" / cluster_name / "mtls"
+                _xdg_config_home() / "openshell" / "clusters" / cluster_name / "mtls"
             )
             tls = TlsConfig(
                 ca_path=mtls_dir / "ca.crt",
@@ -359,7 +359,7 @@ class SandboxClient:
         timeout_seconds: int | None = None,
     ) -> ExecResult:
         exec_env = dict(env or {})
-        exec_env["NEMOCLAW_PYFUNC_B64"] = _serialize_python_callable(
+        exec_env["OPENSHELL_PYFUNC_B64"] = _serialize_python_callable(
             function,
             args=args,
             kwargs=kwargs,
@@ -549,7 +549,7 @@ class Sandbox:
 
 _PYTHON_CLOUDPICKLE_BOOTSTRAP = (
     "import base64,cloudpickle,os;"
-    "payload=base64.b64decode(os.environ['NEMOCLAW_PYFUNC_B64']);"
+    "payload=base64.b64decode(os.environ['OPENSHELL_PYFUNC_B64']);"
     "func,args,kwargs=cloudpickle.loads(payload);"
     "result=func(*args,**kwargs);"
     "print(result) if result is not None else None"
@@ -599,10 +599,10 @@ def _xdg_config_home() -> pathlib.Path:
 
 
 def _resolve_active_cluster() -> str:
-    env_cluster = os.environ.get("NEMOCLAW_CLUSTER")
+    env_cluster = os.environ.get("OPENSHELL_CLUSTER")
     if env_cluster:
         return env_cluster
-    active_file = _xdg_config_home() / "nemoclaw" / "active_cluster"
+    active_file = _xdg_config_home() / "openshell" / "active_cluster"
     value = active_file.read_text().strip()
     if value == "":
         raise SandboxError("no active cluster configured")

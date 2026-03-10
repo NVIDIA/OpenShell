@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Configuration management for NemoClaw components.
+//! Configuration management for OpenShell components.
 
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -32,7 +32,7 @@ pub struct Config {
     #[serde(default)]
     pub sandbox_image: String,
 
-    /// gRPC endpoint for sandboxes to connect back to NemoClaw.
+    /// gRPC endpoint for sandboxes to connect back to OpenShell.
     /// Used by sandbox pods to fetch their policy at startup.
     #[serde(default)]
     pub grpc_endpoint: String,

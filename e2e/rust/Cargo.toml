@@ -7,8 +7,8 @@
 [workspace]
 
 [package]
-name = "nemoclaw-e2e"
-description = "End-to-end tests for the NemoClaw CLI"
+name = "openshell-e2e"
+description = "End-to-end tests for the OpenShell CLI"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"

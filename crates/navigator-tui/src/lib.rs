@@ -25,9 +25,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use app::{App, ClusterEntry, Focus, LogLine, Screen};
 use event::{Event, EventHandler};
 
-/// Launch the NemoClaw TUI.
+/// Launch the OpenShell TUI.
 ///
-/// `channel` must be a connected gRPC channel to the NemoClaw gateway.
+/// `channel` must be a connected gRPC channel to the OpenShell gateway.
 pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result<()> {
     let client = NavigatorClient::new(channel);
     let mut app = App::new(client, cluster_name.to_string(), endpoint.to_string());
@@ -413,7 +413,7 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
         .ok()?;
     Some(
         config_dir
-            .join("nemoclaw")
+            .join("openshell")
             .join("clusters")
             .join(name)
             .join("mtls"),
@@ -647,7 +647,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
 /// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
 ///
-/// This replicates the `nemoclaw sandbox connect` flow but uses `Command::status()`
+/// This replicates the `openshell sandbox connect` flow but uses `Command::status()`
 /// instead of `exec()` so the TUI process survives.
 async fn handle_shell_connect(
     app: &mut App,

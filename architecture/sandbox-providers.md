@@ -2,7 +2,7 @@
 
 ## Overview
 
-NemoClaw uses a first-class `Provider` entity to represent external tool credentials and
+OpenShell uses a first-class `Provider` entity to represent external tool credentials and
 configuration (for example `claude`, `gitlab`, `github`, `outlook`, `generic`, `nvidia`).
 
 Providers exist as an abstraction layer for configuring tools that rely on third-party
@@ -49,7 +49,7 @@ The gRPC surface is defined in `proto/navigator.proto`:
   - provider registry and per-provider discovery plugins,
   - shared discovery engine and context abstraction for testability.
 - `crates/navigator-cli`
-  - `nemoclaw provider ...` command handlers,
+  - `openshell provider ...` command handlers,
   - sandbox provider requirement resolution in `sandbox create`.
 - `crates/navigator-server` (gateway)
   - provider CRUD gRPC handlers,
@@ -158,7 +158,7 @@ This keeps provider tests isolated from host environment and filesystem.
 
 ### Provider CRUD
 
-`nemoclaw provider create --type <type> --name <name> [--from-existing] [--credential k=v]... [--config k=v]...`
+`openshell provider create --type <type> --name <name> [--from-existing] [--credential k=v]... [--config k=v]...`
 
 - `--credential` supports `KEY=VALUE` and `KEY` forms.
   - `KEY=VALUE` sets an explicit credential value.
@@ -169,14 +169,14 @@ This keeps provider tests isolated from host environment and filesystem.
 
 Also supported:
 
-- `nemoclaw provider get <name>`
-- `nemoclaw provider list`
-- `nemoclaw provider update <name> ...`
-- `nemoclaw provider delete <name> [<name>...]`
+- `openshell provider get <name>`
+- `openshell provider list`
+- `openshell provider update <name> ...`
+- `openshell provider delete <name> [<name>...]`
 
 ### Sandbox Create
 
-`nemoclaw sandbox create --provider gitlab -- claude`
+`openshell sandbox create --provider gitlab -- claude`
 
 Resolution logic (CLI side, `crates/navigator-cli/src/run.rs`):
 
@@ -233,7 +233,7 @@ Key behaviors:
 ### Sandbox Supervisor: Fetching Credentials
 
 The sandbox pod runs `navigator-sandbox` (`crates/navigator-sandbox/src/main.rs`). On
-startup it receives `NEMOCLAW_SANDBOX_ID` and `NEMOCLAW_ENDPOINT` as environment
+startup it receives `OPENSHELL_SANDBOX_ID` and `OPENSHELL_ENDPOINT` as environment
 variables (injected into the pod spec by the gateway's Kubernetes sandbox creation code).
 
 In `run_sandbox()` (`crates/navigator-sandbox/src/lib.rs`):
@@ -255,7 +255,7 @@ process spawning paths inside the sandbox:
 ```rust
 let mut cmd = Command::new(program);
 cmd.args(args)
-    .env("NEMOCLAW_SANDBOX", "1");
+    .env("OPENSHELL_SANDBOX", "1");
 
 // Set provider environment variables (credentials fetched at runtime).
 for (key, value) in provider_env {
@@ -272,11 +272,11 @@ isolation, privilege dropping, seccomp, and Landlock restrictions via `pre_exec`
 
 **2. SSH shell sessions** (`crates/navigator-sandbox/src/ssh.rs`):
 
-When a user connects via `nemoclaw sandbox connect`, a PTY shell is spawned:
+When a user connects via `openshell sandbox connect`, a PTY shell is spawned:
 
 ```rust
 let mut cmd = Command::new(shell);
-cmd.env("NEMOCLAW_SANDBOX", "1")
+cmd.env("OPENSHELL_SANDBOX", "1")
     .env("HOME", "/sandbox")
     .env("USER", "sandbox")
     .env("TERM", term);
@@ -293,7 +293,7 @@ passes it to `spawn_pty_shell()` for each new shell or exec request.
 ### End-to-End Flow
 
 ```
-CLI: nemoclaw sandbox create -- claude
+CLI: openshell sandbox create -- claude
   |
   +-- detect_provider_from_command(["claude"]) -> "claude"
   +-- ensure_required_providers() -> discovers local ANTHROPIC_API_KEY
@@ -307,7 +307,7 @@ CLI: nemoclaw sandbox create -- claude
           +-- Creates K8s Sandbox CRD (no credentials in pod spec)
                 |
                 K8s: pod starts navigator-sandbox binary
-                  +-- NEMOCLAW_SANDBOX_ID and NEMOCLAW_ENDPOINT set in pod env
+                  +-- OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT set in pod env
                   |
                   Sandbox supervisor: run_sandbox()
                     +-- Fetches policy via gRPC

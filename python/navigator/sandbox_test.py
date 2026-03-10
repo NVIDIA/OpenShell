@@ -63,5 +63,5 @@ def test_exec_python_serializes_callable_payload() -> None:
         "-c",
         _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     ]
-    assert stub.request.environment["NEMOCLAW_PYFUNC_B64"]
+    assert stub.request.environment["OPENSHELL_PYFUNC_B64"]
     assert stub.request.stdin == b""

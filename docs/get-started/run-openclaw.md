@@ -5,7 +5,7 @@
 
 # Run OpenClaw Safely
 
-This tutorial shows you how to launch a sandbox with OpenClaw from the [NemoClaw Community catalog](https://github.com/NVIDIA/NemoClaw-Community) using the `--from` flag. This is a pre-built sandbox configuration that includes a container image, a tailored policy, and optional skills.
+This tutorial shows you how to launch a sandbox with OpenClaw from the [OpenShell Community catalog](https://github.com/NVIDIA/OpenShell-Community) using the `--from` flag. This is a pre-built sandbox configuration that includes a container image, a tailored policy, and optional skills.
 
 ## What You Will Learn
 
@@ -23,7 +23,7 @@ This tutorial shows you how to launch a sandbox with OpenClaw from the [NemoClaw
 Run the following command:
 
 ```console
-$ nemoclaw sandbox create --from openclaw --keep
+$ openshell sandbox create --from openclaw --keep
 ```
 
 The `--from` flag tells the CLI to pull a sandbox definition from the OpenShell Community catalog. Here is what happens behind the scenes:
@@ -42,10 +42,10 @@ The first build takes longer because Docker needs to pull base layers and instal
 After creation completes, connect to the running sandbox:
 
 ```console
-$ nemoclaw sandbox connect <name>
+$ openshell sandbox connect <name>
 ```
 
-Replace `<name>` with the sandbox name shown in the creation output. If you did not specify a name with `--name`, the CLI assigns one automatically. Run `nemoclaw sandbox list` to find it.
+Replace `<name>` with the sandbox name shown in the creation output. If you did not specify a name with `--name`, the CLI assigns one automatically. Run `openshell sandbox list` to find it.
 
 ## Explore the Environment
 
@@ -56,7 +56,7 @@ The sandbox comes pre-configured for the OpenClaw workload. The tools, runtimes,
 To see exactly what the sandbox is allowed to do, pull the full policy:
 
 ```console
-$ nemoclaw policy get <sandbox-name> --full
+$ openshell policy get <sandbox-name> --full
 ```
 
 This outputs the complete policy YAML. Review it to understand the sandbox's permissions:
@@ -72,7 +72,7 @@ Reviewing the bundled policy is a good practice before you use a community sandb
 Save the policy to a file for reference or as a starting point for customization:
 
 ```console
-$ nemoclaw policy get <name> --full > openclaw-policy.yaml
+$ openshell policy get <name> --full > openclaw-policy.yaml
 ```
 :::
 
@@ -87,11 +87,11 @@ $ exit
 Delete the sandbox:
 
 ```console
-$ nemoclaw sandbox delete <name>
+$ openshell sandbox delete <name>
 ```
 
 :::{note}
-The OpenShell Community repository accepts contributions. If you build a sandbox configuration that would be useful to others, submit it to the [NemoClaw-Community](https://github.com/NVIDIA/NemoClaw-Community) repository.
+The OpenShell Community repository accepts contributions. If you build a sandbox configuration that would be useful to others, submit it to the [OpenShell-Community](https://github.com/NVIDIA/OpenShell-Community) repository.
 :::
 
 ## Next Steps

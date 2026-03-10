@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! NemoClaw CLI - command-line interface for NemoClaw.
+//! OpenShell CLI - command-line interface for OpenShell.
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
@@ -31,8 +31,8 @@ struct GatewayContext {
 /// Resolution priority:
 /// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
 /// 2. `--cluster` flag (explicit name)
-/// 3. `NEMOCLAW_CLUSTER` environment variable
-/// 4. Active cluster from `~/.config/nemoclaw/active_cluster`
+/// 3. `OPENSHELL_CLUSTER` environment variable
+/// 4. Active cluster from `~/.config/openshell/active_cluster`
 ///
 /// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
 /// If stored metadata can still identify the gateway, the stored cluster name
@@ -76,7 +76,7 @@ fn resolve_gateway(
     let name = cluster_flag
         .clone()
         .or_else(|| {
-            std::env::var("NEMOCLAW_CLUSTER")
+            std::env::var("OPENSHELL_CLUSTER")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
@@ -84,16 +84,16 @@ fn resolve_gateway(
         .ok_or_else(|| {
             miette::miette!(
                 "No active gateway.\n\
-                 Set one with: nemoclaw gateway select <name>\n\
-                 Or deploy a new gateway: nemoclaw gateway start"
+                 Set one with: openshell gateway select <name>\n\
+                 Or deploy a new gateway: openshell gateway start"
             )
         })?;
 
     let metadata = load_cluster_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
-             Deploy it first: nemoclaw gateway start --name {name}\n\
-             Or list available gateways: nemoclaw gateway select"
+             Deploy it first: openshell gateway start --name {name}\n\
+             Or list available gateways: openshell gateway select"
         )
     })?;
 
@@ -111,7 +111,7 @@ fn resolve_gateway_name(cluster_flag: &Option<String>) -> Option<String> {
     cluster_flag
         .clone()
         .or_else(|| {
-            std::env::var("NEMOCLAW_CLUSTER")
+            std::env::var("OPENSHELL_CLUSTER")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
@@ -156,7 +156,7 @@ fn resolve_sandbox_name(name: Option<String>, cluster: &str) -> Result<String> {
 const HELP_TEMPLATE: &str = "\
 {about-with-newline}
 \x1b[1mUSAGE\x1b[0m
-  nemoclaw <command> <subcommand> [flags]
+  openshell <command> <subcommand> [flags]
 
 \x1b[1mSANDBOX COMMANDS\x1b[0m
   sandbox:     Manage sandboxes
@@ -171,7 +171,7 @@ const HELP_TEMPLATE: &str = "\
   inference:   Manage inference configuration
 
 \x1b[1mADDITIONAL COMMANDS\x1b[0m
-  term:        Launch the NemoClaw interactive TUI
+  term:        Launch the OpenShell interactive TUI
   completions: Generate shell completions
   ssh-proxy:   SSH proxy (used by ProxyCommand)
   help:        Print this message or the help of the given subcommand(s)
@@ -180,12 +180,12 @@ const HELP_TEMPLATE: &str = "\
 {options}
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw sandbox create
-  $ nemoclaw gateway start
-  $ nemoclaw logs my-sandbox
+  $ openshell sandbox create
+  $ openshell gateway start
+  $ openshell logs my-sandbox
 
 \x1b[1mLEARN MORE\x1b[0m
-  Use `nemoclaw <command> --help` for more information about a command.
+  Use `openshell <command> --help` for more information about a command.
 ";
 
 // Help template for subcommands (sandbox, gateway, etc.)
@@ -205,70 +205,70 @@ const SANDBOX_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   sb
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw sandbox create
-  $ nemoclaw sandbox create --from python
-  $ nemoclaw sandbox connect my-sandbox
-  $ nemoclaw sandbox list
-  $ nemoclaw sandbox delete my-sandbox
+  $ openshell sandbox create
+  $ openshell sandbox create --from python
+  $ openshell sandbox connect my-sandbox
+  $ openshell sandbox list
+  $ openshell sandbox delete my-sandbox
 ";
 
 const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   fwd
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw forward start 8080
-  $ nemoclaw forward start 3000 my-sandbox
-  $ nemoclaw forward stop 8080
-  $ nemoclaw forward list
+  $ openshell forward start 8080
+  $ openshell forward start 3000 my-sandbox
+  $ openshell forward stop 8080
+  $ openshell forward list
 ";
 
 const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   lg
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw logs my-sandbox
-  $ nemoclaw logs my-sandbox --tail
-  $ nemoclaw logs --since 5m
-  $ nemoclaw logs --source sandbox --level debug
+  $ openshell logs my-sandbox
+  $ openshell logs my-sandbox --tail
+  $ openshell logs --since 5m
+  $ openshell logs --source sandbox --level debug
 ";
 
 const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   pol
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw policy get my-sandbox
-  $ nemoclaw policy set my-sandbox --policy policy.yaml
-  $ nemoclaw policy list my-sandbox
+  $ openshell policy get my-sandbox
+  $ openshell policy set my-sandbox --policy policy.yaml
+  $ openshell policy list my-sandbox
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw provider create --name openai --type openai --credential OPENAI_API_KEY
-  $ nemoclaw provider create --name anthropic --type anthropic --from-existing
-  $ nemoclaw provider list
-  $ nemoclaw provider get openai
-  $ nemoclaw provider delete openai
+  $ openshell provider create --name openai --type openai --credential OPENAI_API_KEY
+  $ openshell provider create --name anthropic --type anthropic --from-existing
+  $ openshell provider list
+  $ openshell provider get openai
+  $ openshell provider delete openai
 ";
 
 const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   gw
 
 \x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw gateway start
-  $ nemoclaw gateway start --name my-gateway --port 9090
-  $ nemoclaw gateway stop
-  $ nemoclaw gateway select my-gateway
-  $ nemoclaw gateway info
+  $ openshell gateway start
+  $ openshell gateway start --name my-gateway --port 9090
+  $ openshell gateway stop
+  $ openshell gateway select my-gateway
+  $ openshell gateway info
 ";
 
 const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
-  $ nemoclaw inference set --provider openai --model gpt-4
-  $ nemoclaw inference get
-  $ nemoclaw inference update --model gpt-4-turbo
+  $ openshell inference set --provider openai --model gpt-4
+  $ openshell inference get
+  $ openshell inference update --model gpt-4-turbo
 ";
 
-/// NemoClaw CLI - agent execution and management.
+/// OpenShell CLI - agent execution and management.
 #[derive(Parser, Debug)]
-#[command(name = "nemoclaw")]
+#[command(name = "openshell")]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
 #[command(help_template = HELP_TEMPLATE)]
@@ -279,12 +279,12 @@ struct Cli {
     verbose: u8,
 
     /// Cluster name to operate on (resolved from stored metadata).
-    #[arg(long, short, global = true, env = "NEMOCLAW_CLUSTER")]
+    #[arg(long, short, global = true, env = "OPENSHELL_CLUSTER")]
     cluster: Option<String>,
 
     /// Gateway endpoint URL (e.g. https://gateway.example.com).
     /// Connects directly without looking up cluster metadata.
-    #[arg(long, global = true, env = "NEMOCLAW_GATEWAY_ENDPOINT")]
+    #[arg(long, global = true, env = "OPENSHELL_GATEWAY_ENDPOINT")]
     gateway_endpoint: Option<String>,
 
     #[command(subcommand)]
@@ -376,7 +376,7 @@ enum Commands {
     // ===================================================================
     // ADDITIONAL COMMANDS
     // ===================================================================
-    /// Launch the `NemoClaw` interactive TUI.
+    /// Launch the OpenShell interactive TUI.
     #[command(hide = true)]
     Term,
 
@@ -392,10 +392,10 @@ enum Commands {
     /// Two mutually exclusive modes:
     ///
     /// **Token mode** (used internally by `sandbox connect`):
-    ///   `nemoclaw ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
+    ///   `openshell ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `openshell ssh-proxy --cluster <name> --name <sandbox-name>`
     #[command(hide = true)]
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
@@ -452,7 +452,7 @@ impl std::fmt::Display for CompletionShell {
 }
 
 const COMPLETIONS_HELP: &str = "\
-Generate shell completion scripts for NemoClaw CLI.
+Generate shell completion scripts for OpenShell CLI.
 
 Supported shells: bash, fish, zsh, powershell.
 
@@ -466,22 +466,22 @@ shell before testing whether completions are working.
 First, ensure that you install `bash-completion` using your package manager.
 
   mkdir -p ~/.local/share/bash-completion/completions
-  nemoclaw completions bash > ~/.local/share/bash-completion/completions/nemoclaw
+  openshell completions bash > ~/.local/share/bash-completion/completions/openshell
 
 On macOS with Homebrew (install bash-completion first):
 
   mkdir -p $(brew --prefix)/etc/bash_completion.d
-  nemoclaw completions bash > $(brew --prefix)/etc/bash_completion.d/nemoclaw.bash-completion
+  openshell completions bash > $(brew --prefix)/etc/bash_completion.d/openshell.bash-completion
 
 ## fish
 
   mkdir -p ~/.config/fish/completions
-  nemoclaw completions fish > ~/.config/fish/completions/nemoclaw.fish
+  openshell completions fish > ~/.config/fish/completions/openshell.fish
 
 ## zsh
 
   mkdir -p ~/.zfunc
-  nemoclaw completions zsh > ~/.zfunc/_nemoclaw
+  openshell completions zsh > ~/.zfunc/_openshell
 
 Then add the following to your .zshrc before compinit:
 
@@ -489,7 +489,7 @@ Then add the following to your .zshrc before compinit:
 
 ## powershell
 
-   nemoclaw completions powershell >> $PROFILE
+   openshell completions powershell >> $PROFILE
 
 If no profile exists yet, create one first:
 
@@ -619,7 +619,7 @@ enum GatewayCommands {
     /// Deploy/start the gateway.
     Start {
         /// Gateway name.
-        #[arg(long, default_value = "nemoclaw", env = "NEMOCLAW_CLUSTER")]
+        #[arg(long, default_value = "openshell", env = "OPENSHELL_CLUSTER")]
         name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
@@ -687,14 +687,14 @@ enum GatewayCommands {
         /// Used to pull the cluster bootstrap image and passed into the k3s
         /// cluster so it can pull server, sandbox, and community images at
         /// runtime.
-        #[arg(long, env = "NEMOCLAW_REGISTRY_TOKEN")]
+        #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
         registry_token: Option<String>,
     },
 
     /// Stop the gateway (preserves state).
     Stop {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "NEMOCLAW_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_CLUSTER")]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from cluster metadata).
@@ -709,7 +709,7 @@ enum GatewayCommands {
     /// Destroy the gateway and its state.
     Destroy {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "NEMOCLAW_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_CLUSTER")]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from cluster metadata).
@@ -726,7 +726,7 @@ enum GatewayCommands {
     /// Registers an external gateway endpoint that is fronted by an
     /// edge proxy (e.g., Cloudflare Access). Opens a browser for
     /// authentication and stores the token locally. After adding, the
-    /// gateway appears in `nemoclaw gateway select`.
+    /// gateway appears in `openshell gateway select`.
     Add {
         /// Gateway endpoint URL (e.g., `https://8080-3vdegyusg.brevlab.com`).
         endpoint: String,
@@ -763,14 +763,14 @@ enum GatewayCommands {
     /// Show gateway deployment details.
     Info {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "NEMOCLAW_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_CLUSTER")]
         name: Option<String>,
     },
 
     /// Print or start an SSH tunnel for kubectl access to a remote gateway.
     Tunnel {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "NEMOCLAW_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_CLUSTER")]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from cluster metadata).
@@ -841,7 +841,7 @@ enum ClusterAdminCommands {
     /// Deprecated: use `gateway start`.
     Deploy {
         /// Cluster name.
-        #[arg(long, default_value = "nemoclaw", env = "NEMOCLAW_CLUSTER")]
+        #[arg(long, default_value = "openshell", env = "OPENSHELL_CLUSTER")]
         name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
@@ -877,7 +877,7 @@ enum ClusterAdminCommands {
         recreate: bool,
 
         /// Authentication token for pulling container images from ghcr.io.
-        #[arg(long, env = "NEMOCLAW_REGISTRY_TOKEN")]
+        #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
         registry_token: Option<String>,
     },
 }
@@ -895,8 +895,8 @@ enum SandboxCommands {
         /// image reference (e.g., `myregistry.com/img:tag`).
         ///
         /// Community names are resolved to
-        /// `ghcr.io/nvidia/nemoclaw-community/sandboxes/<name>:latest`
-        /// (override the prefix with `NEMOCLAW_COMMUNITY_REGISTRY`).
+        /// `ghcr.io/nvidia/openshell-community/sandboxes/<name>:latest`
+        /// (override the prefix with `OPENSHELL_COMMUNITY_REGISTRY`).
         ///
         /// When given a Dockerfile or directory, the image is built and pushed
         /// into the cluster automatically before creating the sandbox.
@@ -936,7 +936,7 @@ enum SandboxCommands {
         providers: Vec<String>,
 
         /// Path to a custom sandbox policy YAML file.
-        /// Overrides the built-in default and the `NEMOCLAW_SANDBOX_POLICY` env var.
+        /// Overrides the built-in default and the `OPENSHELL_SANDBOX_POLICY` env var.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
@@ -1213,7 +1213,7 @@ async fn main() -> Result<()> {
             } => {
                 let name = name
                     .or_else(|| resolve_gateway_name(&cli.cluster))
-                    .unwrap_or_else(|| "nemoclaw".to_string());
+                    .unwrap_or_else(|| "openshell".to_string());
                 run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
             GatewayCommands::Destroy {
@@ -1223,7 +1223,7 @@ async fn main() -> Result<()> {
             } => {
                 let name = name
                     .or_else(|| resolve_gateway_name(&cli.cluster))
-                    .unwrap_or_else(|| "nemoclaw".to_string());
+                    .unwrap_or_else(|| "openshell".to_string());
                 run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
             GatewayCommands::Add {
@@ -1239,8 +1239,8 @@ async fn main() -> Result<()> {
                     .ok_or_else(|| {
                         miette::miette!(
                             "No active gateway.\n\
-                             Specify a gateway name: nemoclaw gateway login <name>\n\
-                             Or set one with: nemoclaw gateway select <name>"
+                             Specify a gateway name: openshell gateway login <name>\n\
+                             Or set one with: openshell gateway select <name>"
                         )
                     })?;
                 run::gateway_login(&name).await?;
@@ -1254,14 +1254,14 @@ async fn main() -> Result<()> {
                     eprintln!();
                     eprintln!(
                         "Select a gateway with: {}",
-                        "nemoclaw gateway select <name>".dimmed()
+                        "openshell gateway select <name>".dimmed()
                     );
                 }
             }
             GatewayCommands::Info { name } => {
                 let name = name
                     .or_else(|| resolve_gateway_name(&cli.cluster))
-                    .unwrap_or_else(|| "nemoclaw".to_string());
+                    .unwrap_or_else(|| "openshell".to_string());
                 run::cluster_admin_info(&name)?;
             }
             GatewayCommands::Tunnel {
@@ -1272,7 +1272,7 @@ async fn main() -> Result<()> {
             } => {
                 let name = name
                     .or_else(|| resolve_gateway_name(&cli.cluster))
-                    .unwrap_or_else(|| "nemoclaw".to_string());
+                    .unwrap_or_else(|| "openshell".to_string());
                 run::cluster_admin_tunnel(
                     &name,
                     remote.as_deref(),
@@ -1297,7 +1297,7 @@ async fn main() -> Result<()> {
                 println!();
                 println!(
                     "Deploy a gateway with: {}",
-                    "nemoclaw gateway start".dimmed()
+                    "openshell gateway start".dimmed()
                 );
             }
         }
@@ -1374,7 +1374,7 @@ async fn main() -> Result<()> {
                         "✓".green().bold(),
                     );
                     eprintln!("  Access at: http://127.0.0.1:{port}/");
-                    eprintln!("  Stop with: nemoclaw forward stop {port} {name}");
+                    eprintln!("  Stop with: openshell forward stop {port} {name}");
                 }
             }
         },
@@ -1533,7 +1533,7 @@ async fn main() -> Result<()> {
                             if remote.is_some() {
                                 eprintln!(
                                     "{} --remote ignored: gateway '{}' is already active. \
-                                     To redeploy, use: nemoclaw gateway start",
+                                     To redeploy, use: openshell gateway start",
                                     "!".yellow(),
                                     ctx.name,
                                 );
@@ -1779,8 +1779,8 @@ async fn main() -> Result<()> {
                         let meta = load_cluster_metadata(&c).map_err(|_| {
                             miette::miette!(
                                 "Unknown gateway '{c}'.\n\
-                                  Deploy it first: nemoclaw gateway start --name {c}\n\
-                                  Or list available gateways: nemoclaw gateway select"
+                                  Deploy it first: openshell gateway start --name {c}\n\
+                                  Or list available gateways: openshell gateway select"
                             )
                         })?;
                         meta.gateway_endpoint
@@ -1819,8 +1819,8 @@ async fn main() -> Result<()> {
                     registry_token,
                 } => {
                     eprintln!(
-                        "{} `nemoclaw cluster admin deploy` is deprecated. \
-                         Use `nemoclaw gateway start` instead.",
+                        "{} `openshell cluster admin deploy` is deprecated. \
+                         Use `openshell gateway start` instead.",
                         "warning:".yellow().bold(),
                     );
                     run::cluster_admin_deploy(
@@ -1990,7 +1990,7 @@ mod tests {
     #[test]
     fn completions_engine_returns_candidates() {
         let mut cmd = Cli::command();
-        let args: Vec<OsString> = vec!["nemoclaw".into(), "".into()];
+        let args: Vec<OsString> = vec!["openshell".into(), "".into()];
         let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
             .expect("completion engine failed");
         assert!(
@@ -2002,7 +2002,7 @@ mod tests {
     #[test]
     fn completions_subcommand_appears_in_candidates() {
         let mut cmd = Cli::command();
-        let args: Vec<OsString> = vec!["nemoclaw".into(), "comp".into()];
+        let args: Vec<OsString> = vec!["openshell".into(), "comp".into()];
         let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
             .expect("completion engine failed");
         let names: Vec<String> = candidates
@@ -2023,7 +2023,7 @@ mod tests {
 
         let mut cmd = Cli::command();
         let args: Vec<OsString> = vec![
-            "nemoclaw".into(),
+            "openshell".into(),
             "sandbox".into(),
             "create".into(),
             "--policy".into(),
@@ -2052,17 +2052,17 @@ mod tests {
 
         let cases: Vec<(Vec<&str>, usize, &str)> = vec![
             (
-                vec!["nemoclaw", "gateway", "start", "--ssh-key", "id"],
+                vec!["openshell", "gateway", "start", "--ssh-key", "id"],
                 4,
                 "id_rsa",
             ),
             (
-                vec!["nemoclaw", "sandbox", "create", "--ssh-key", "id"],
+                vec!["openshell", "sandbox", "create", "--ssh-key", "id"],
                 4,
                 "id_rsa",
             ),
             (
-                vec!["nemoclaw", "sandbox", "upload", "demo", "Do"],
+                vec!["openshell", "sandbox", "upload", "demo", "Do"],
                 4,
                 "Dockerfile",
             ),
@@ -2112,7 +2112,7 @@ mod tests {
 
         let mut cmd = Cli::command();
         let args: Vec<OsString> = vec![
-            "nemoclaw".into(),
+            "openshell".into(),
             "sandbox".into(),
             "upload".into(),
             "demo".into(),

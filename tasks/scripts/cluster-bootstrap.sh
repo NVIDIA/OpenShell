@@ -29,8 +29,8 @@ else
   IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/navigator
 fi
 
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NEMOCLAW_REGISTRY:-${IMAGE_REPO_BASE_DEFAULT}}}
-REGISTRY_HOST=${NEMOCLAW_REGISTRY_HOST:-${IMAGE_REPO_BASE%%/*}}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-${IMAGE_REPO_BASE_DEFAULT}}}
+REGISTRY_HOST=${OPENSHELL_REGISTRY_HOST:-${IMAGE_REPO_BASE%%/*}}
 REGISTRY_NAMESPACE_DEFAULT=${IMAGE_REPO_BASE#*/}
 
 if [ "${REGISTRY_NAMESPACE_DEFAULT}" = "${IMAGE_REPO_BASE}" ]; then
@@ -99,16 +99,16 @@ else
   RESOLVED_GATEWAY_PORT=8080
 fi
 
-NEMOCLAW_CLUSTER=${NEMOCLAW_CLUSTER:-${CLUSTER_NAME}}
+OPENSHELL_CLUSTER=${OPENSHELL_CLUSTER:-${CLUSTER_NAME}}
 GATEWAY_PORT=${RESOLVED_GATEWAY_PORT}
 
 append_env_if_missing "CLUSTER_NAME" "${CLUSTER_NAME}"
 append_env_if_missing "GATEWAY_PORT" "${GATEWAY_PORT}"
-append_env_if_missing "NEMOCLAW_CLUSTER" "${NEMOCLAW_CLUSTER}"
+append_env_if_missing "OPENSHELL_CLUSTER" "${OPENSHELL_CLUSTER}"
 
 export CLUSTER_NAME
 export GATEWAY_PORT
-export NEMOCLAW_CLUSTER
+export OPENSHELL_CLUSTER
 
 is_local_registry_host() {
   [ "${REGISTRY_HOST}" = "127.0.0.1:5000" ] || [ "${REGISTRY_HOST}" = "localhost:5000" ]
@@ -186,17 +186,17 @@ if is_local_registry_host; then
   REGISTRY_INSECURE_DEFAULT=true
 fi
 
-export NEMOCLAW_REGISTRY_HOST=${NEMOCLAW_REGISTRY_HOST:-${REGISTRY_HOST}}
-export NEMOCLAW_REGISTRY_ENDPOINT=${NEMOCLAW_REGISTRY_ENDPOINT:-${REGISTRY_ENDPOINT_DEFAULT}}
-export NEMOCLAW_REGISTRY_NAMESPACE=${NEMOCLAW_REGISTRY_NAMESPACE:-${REGISTRY_NAMESPACE_DEFAULT}}
-export NEMOCLAW_REGISTRY_INSECURE=${NEMOCLAW_REGISTRY_INSECURE:-${REGISTRY_INSECURE_DEFAULT}}
+export OPENSHELL_REGISTRY_HOST=${OPENSHELL_REGISTRY_HOST:-${REGISTRY_HOST}}
+export OPENSHELL_REGISTRY_ENDPOINT=${OPENSHELL_REGISTRY_ENDPOINT:-${REGISTRY_ENDPOINT_DEFAULT}}
+export OPENSHELL_REGISTRY_NAMESPACE=${OPENSHELL_REGISTRY_NAMESPACE:-${REGISTRY_NAMESPACE_DEFAULT}}
+export OPENSHELL_REGISTRY_INSECURE=${OPENSHELL_REGISTRY_INSECURE:-${REGISTRY_INSECURE_DEFAULT}}
 export IMAGE_REPO_BASE
 export IMAGE_TAG
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY:-}" ] && [ -n "${CI_REGISTRY_USER:-}" ] && [ -n "${CI_REGISTRY_PASSWORD:-}" ]; then
   printf '%s' "${CI_REGISTRY_PASSWORD}" | docker login -u "${CI_REGISTRY_USER}" --password-stdin "${CI_REGISTRY}"
-  export NEMOCLAW_REGISTRY_USERNAME=${NEMOCLAW_REGISTRY_USERNAME:-${CI_REGISTRY_USER}}
-  export NEMOCLAW_REGISTRY_PASSWORD=${NEMOCLAW_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD}}
+  export OPENSHELL_REGISTRY_USERNAME=${OPENSHELL_REGISTRY_USERNAME:-${CI_REGISTRY_USER}}
+  export OPENSHELL_REGISTRY_PASSWORD=${OPENSHELL_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD}}
 fi
 
 if is_local_registry_host; then
@@ -209,7 +209,7 @@ VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
 if [ "${MODE}" = "fast" ]; then
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then
     echo "Recreating cluster '${CLUSTER_NAME}' from scratch..."
-    nemoclaw gateway destroy --name "${CLUSTER_NAME}"
+    openshell gateway destroy --name "${CLUSTER_NAME}"
   fi
 fi
 
@@ -232,11 +232,11 @@ fi
 # remote distribution registry image.  The local image is built by
 # `docker-build-cluster.sh` and contains the bundled Helm chart and
 # manifests from the current working tree.
-if [ -z "${NEMOCLAW_CLUSTER_IMAGE:-}" ]; then
-  export NEMOCLAW_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
+if [ -z "${OPENSHELL_CLUSTER_IMAGE:-}" ]; then
+  export OPENSHELL_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
 fi
 
-DEPLOY_CMD=(nemoclaw gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
+DEPLOY_CMD=(openshell gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
 
 if [ -n "${GATEWAY_HOST:-}" ]; then
   DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")

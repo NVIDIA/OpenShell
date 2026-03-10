@@ -2,7 +2,7 @@
 
 ## Overview
 
-By default, communication with the NemoClaw gateway is secured by mutual TLS (mTLS). The CLI, SDK, and sandbox pods present certificates signed by the cluster CA before they reach any application handler. The PKI is bootstrapped automatically during cluster deployment, and certificates are distributed to Kubernetes secrets and the local filesystem without manual configuration.
+By default, communication with the OpenShell gateway is secured by mutual TLS (mTLS). The CLI, SDK, and sandbox pods present certificates signed by the cluster CA before they reach any application handler. The PKI is bootstrapped automatically during cluster deployment, and certificates are distributed to Kubernetes secrets and the local filesystem without manual configuration.
 
 The gateway also supports Cloudflare-fronted deployments where the edge, not the gateway, is the first authentication boundary. In that mode the gateway either keeps TLS enabled but allows no-certificate client handshakes (`allow_unauthenticated=true`) and relies on application-layer Cloudflare JWTs, or disables gateway TLS entirely and serves plaintext behind a trusted reverse proxy or tunnel.
 
@@ -30,7 +30,7 @@ graph TD
 
     subgraph HOST["User's Machine"]
         CLI["CLI"]
-        MTLS_DIR["~/.config/nemoclaw/<br/>clusters/&lt;name&gt;/mtls/"]
+        MTLS_DIR["~/.config/openshell/<br/>clusters/&lt;name&gt;/mtls/"]
     end
 
     SERVER_CERT --> S1
@@ -95,9 +95,9 @@ The Helm StatefulSet (`deploy/helm/navigator/templates/statefulset.yaml`) mounts
 Environment variables point the gateway binary to these paths:
 
 ```
-NEMOCLAW_TLS_CERT=/etc/navigator-tls/server/tls.crt
-NEMOCLAW_TLS_KEY=/etc/navigator-tls/server/tls.key
-NEMOCLAW_TLS_CLIENT_CA=/etc/navigator-tls/client-ca/ca.crt
+OPENSHELL_TLS_CERT=/etc/navigator-tls/server/tls.crt
+OPENSHELL_TLS_KEY=/etc/navigator-tls/server/tls.key
+OPENSHELL_TLS_CLIENT_CA=/etc/navigator-tls/client-ca/ca.crt
 ```
 
 ### Sandbox Pod Mounts
@@ -109,10 +109,10 @@ When the gateway creates a sandbox pod (`crates/navigator-server/src/sandbox/mod
 - Environment variables for the sandbox gRPC client:
 
 ```
-NEMOCLAW_TLS_CA=/etc/navigator-tls/client/ca.crt
-NEMOCLAW_TLS_CERT=/etc/navigator-tls/client/tls.crt
-NEMOCLAW_TLS_KEY=/etc/navigator-tls/client/tls.key
-NEMOCLAW_ENDPOINT=https://navigator.navigator.svc.cluster.local:8080
+OPENSHELL_TLS_CA=/etc/navigator-tls/client/ca.crt
+OPENSHELL_TLS_CERT=/etc/navigator-tls/client/tls.crt
+OPENSHELL_TLS_KEY=/etc/navigator-tls/client/tls.key
+OPENSHELL_ENDPOINT=https://navigator.navigator.svc.cluster.local:8080
 ```
 
 ### CLI Local Storage
@@ -120,7 +120,7 @@ NEMOCLAW_ENDPOINT=https://navigator.navigator.svc.cluster.local:8080
 The CLI's copy of the client certificate bundle is written to:
 
 ```
-$XDG_CONFIG_HOME/nemoclaw/clusters/<cluster-name>/mtls/
+$XDG_CONFIG_HOME/openshell/clusters/<cluster-name>/mtls/
 ├── ca.crt
 ├── tls.crt
 └── tls.key
@@ -221,9 +221,9 @@ Sandbox pods connect back to the gateway at startup to fetch their policy and pr
 
 | Env Var | Value |
 |---|---|
-| `NEMOCLAW_TLS_CA` | `/etc/navigator-tls/client/ca.crt` |
-| `NEMOCLAW_TLS_CERT` | `/etc/navigator-tls/client/tls.crt` |
-| `NEMOCLAW_TLS_KEY` | `/etc/navigator-tls/client/tls.key` |
+| `OPENSHELL_TLS_CA` | `/etc/navigator-tls/client/ca.crt` |
+| `OPENSHELL_TLS_CERT` | `/etc/navigator-tls/client/tls.crt` |
+| `OPENSHELL_TLS_KEY` | `/etc/navigator-tls/client/tls.key` |
 
 These are used to build a `tonic::transport::ClientTlsConfig` with:
 - `ca_certificate()` -- verifies the server's certificate against the cluster CA.
@@ -279,8 +279,8 @@ NSSH1 <token> <timestamp> <nonce> <hmac_signature>\n
 ```
 
 - **HMAC**: `HMAC-SHA256(secret, "{token}|{timestamp}|{nonce}")`, hex-encoded.
-- **Secret**: shared via `NEMOCLAW_SSH_HANDSHAKE_SECRET` env var, set on both the gateway and sandbox.
-- **Clock skew tolerance**: configurable via `NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS` (default 300 seconds).
+- **Secret**: shared via `OPENSHELL_SSH_HANDSHAKE_SECRET` env var, set on both the gateway and sandbox.
+- **Clock skew tolerance**: configurable via `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` (default 300 seconds).
 - **Expected response**: `OK\n` from the sandbox.
 
 This handshake prevents direct connections to sandbox SSH ports from within the cluster, even from pods that share the network.
@@ -295,7 +295,7 @@ Traffic flows through several layers from the host to the gateway process:
 | Container | `30051` | Hardcoded in `crates/navigator-bootstrap/src/docker.rs` |
 | k3s NodePort | `30051` | `deploy/helm/navigator/values.yaml` (`service.nodePort`) |
 | k3s Service | `8080` | `deploy/helm/navigator/values.yaml` (`service.port`) |
-| Server bind | `8080` | `--port` flag / `NEMOCLAW_SERVER_PORT` env var |
+| Server bind | `8080` | `--port` flag / `OPENSHELL_SERVER_PORT` env var |
 
 Docker maps `host_port → 30051/tcp`. Inside k3s, the NodePort service maps `30051 → 8080 (pod port)`. The server binds `0.0.0.0:8080`.
 

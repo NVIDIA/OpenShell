@@ -100,7 +100,7 @@ Files:
 - `crates/navigator-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/navigator-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
-In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes.
+In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes.
 
 ### Interception flow
 
@@ -229,8 +229,8 @@ Validation at load time requires either `api_key` or `api_key_env` to resolve, a
 
 Cluster inference commands:
 
-- `nemoclaw cluster inference set --provider <name> --model <id>` -- configures cluster inference by referencing a provider record name
-- `nemoclaw cluster inference get` -- displays current cluster inference configuration
+- `openshell cluster inference set --provider <name> --model <id>` -- configures cluster inference by referencing a provider record name
+- `openshell cluster inference get` -- displays current cluster inference configuration
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
 

@@ -21,7 +21,7 @@ case "${component}" in
 esac
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${NEMOCLAW_REGISTRY:-127.0.0.1:5000/navigator}}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/navigator}}
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
 SOURCE_IMAGE="navigator/${component}:${IMAGE_TAG}"

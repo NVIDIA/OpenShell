@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! NemoClaw Sandbox library.
+//! OpenShell Sandbox library.
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
@@ -42,7 +42,7 @@ pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
 /// the gateway in cluster mode. Override at runtime with the
-/// `NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS` environment variable.
+/// `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` environment variable.
 /// File-based routes (`--inference-routes`) are loaded once at startup and never
 /// refreshed.
 const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
@@ -73,7 +73,7 @@ fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
 }
 
 fn route_refresh_interval_secs() -> u64 {
-    match std::env::var("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS") {
+    match std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") {
         Ok(value) => match value.parse::<u64>() {
             Ok(interval) if interval > 0 => interval,
             Ok(_) => {
@@ -434,8 +434,8 @@ pub async fn run_sandbox(
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 miette::miette!(
-                    "NEMOCLAW_SSH_HANDSHAKE_SECRET is required when SSH is enabled.\n\
-                     Set --ssh-handshake-secret or the NEMOCLAW_SSH_HANDSHAKE_SECRET env var."
+                    "OPENSHELL_SSH_HANDSHAKE_SECRET is required when SSH is enabled.\n\
+                     Set --ssh-handshake-secret or the OPENSHELL_SSH_HANDSHAKE_SECRET env var."
                 )
             })?;
         let proxy_url = ssh_proxy_url;
@@ -521,7 +521,7 @@ pub async fn run_sandbox(
         let poll_id = id.clone();
         let poll_endpoint = endpoint.clone();
         let poll_engine = engine.clone();
-        let poll_interval_secs: u64 = std::env::var("NEMOCLAW_POLICY_POLL_INTERVAL_SECS")
+        let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(30);
@@ -886,7 +886,7 @@ async fn load_policy(
                 let sandbox = sandbox.as_deref().ok_or_else(|| {
                     miette::miette!(
                         "Cannot sync discovered policy: sandbox not available.\n\
-                         Set NEMOCLAW_SANDBOX or --sandbox to enable policy sync."
+                         Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
                     )
                 })?;
 
@@ -926,8 +926,8 @@ async fn load_policy(
     // No policy source available
     Err(miette::miette!(
         "Sandbox policy required. Provide one of:\n\
-         - --policy-rules and --policy-data (or NEMOCLAW_POLICY_RULES and NEMOCLAW_POLICY_DATA env vars)\n\
-         - --sandbox-id and --navigator-endpoint (or NEMOCLAW_SANDBOX_ID and NEMOCLAW_ENDPOINT env vars)"
+         - --policy-rules and --policy-data (or OPENSHELL_POLICY_RULES and OPENSHELL_POLICY_DATA env vars)\n\
+         - --sandbox-id and --navigator-endpoint (or OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT env vars)"
     ))
 }
 
@@ -998,7 +998,7 @@ fn discover_policy_from_path(path: &std::path::Path) -> navigator_core::proto::S
 /// root — undermining the image author's security intent.
 ///
 /// Detection strategy: look for a `sandbox` user in `/etc/passwd`. This is
-/// the conventional non-root user in NemoClaw sandbox images.
+/// the conventional non-root user in OpenShell sandbox images.
 #[cfg(unix)]
 fn maybe_infer_sandbox_user(policy: &mut SandboxPolicy) {
     use nix::unistd::{Uid, User};
@@ -1490,7 +1490,7 @@ filesystem_policy:
     fn route_refresh_interval_uses_env_override() {
         let _guard = ENV_LOCK.lock().unwrap();
         with_vars(
-            [("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS", Some("9"))],
+            [("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS", Some("9"))],
             || {
                 assert_eq!(route_refresh_interval_secs(), 9);
             },
@@ -1501,7 +1501,7 @@ filesystem_policy:
     fn route_refresh_interval_rejects_zero() {
         let _guard = ENV_LOCK.lock().unwrap();
         with_vars(
-            [("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS", Some("0"))],
+            [("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS", Some("0"))],
             || {
                 assert_eq!(
                     route_refresh_interval_secs(),
@@ -1515,7 +1515,7 @@ filesystem_policy:
     fn route_refresh_interval_rejects_invalid_values() {
         let _guard = ENV_LOCK.lock().unwrap();
         with_vars(
-            [("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS", Some("abc"))],
+            [("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS", Some("abc"))],
             || {
                 assert_eq!(
                     route_refresh_interval_secs(),

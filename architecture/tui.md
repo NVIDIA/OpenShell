@@ -1,23 +1,23 @@
-# NemoClaw TUI
+# OpenShell TUI
 
-The NemoClaw TUI is a terminal user interface for NemoClaw, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, the TUI gives you a real-time, keyboard-driven dashboard — everything updates automatically and you navigate with a few keystrokes.
+The OpenShell TUI is a terminal user interface for OpenShell, inspired by [k9s](https://k9scli.io/). Instead of typing individual CLI commands to check cluster health, list sandboxes, and manage resources, the TUI gives you a real-time, keyboard-driven dashboard — everything updates automatically and you navigate with a few keystrokes.
 
 ## Launching the TUI
 
-The TUI is a subcommand of the NemoClaw CLI, so it inherits all your existing configuration — cluster selection, TLS settings, and verbosity flags all work the same way.
+The TUI is a subcommand of the OpenShell CLI, so it inherits all your existing configuration — cluster selection, TLS settings, and verbosity flags all work the same way.
 
 ```bash
-nemoclaw term                   # launch against the active gateway
+openshell term                   # launch against the active gateway
 nav term                         # dev alias (builds from source)
 nav term --gateway prod          # target a specific gateway
-NEMOCLAW_CLUSTER=prod nav term  # same thing, via environment variable
+OPENSHELL_CLUSTER=prod nav term  # same thing, via environment variable
 ```
 
 Gateway resolution follows the same priority as the rest of the CLI:
 
 1. `--gateway` flag (if provided)
-2. `NEMOCLAW_CLUSTER` environment variable
-3. Active gateway from `~/.config/nemoclaw/active_cluster`
+2. `OPENSHELL_CLUSTER` environment variable
+3. Active gateway from `~/.config/openshell/active_cluster`
 
 No separate configuration files or authentication are needed.
 
@@ -27,7 +27,7 @@ The TUI divides the terminal into four horizontal regions:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  NemoClaw ─ my-cluster ─ Dashboard  ● Healthy                   │  ← title bar
+│  OpenShell ─ my-cluster ─ Dashboard  ● Healthy                   │  ← title bar
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                 │
 │  (view content — Dashboard or Sandboxes)                        │  ← main area
@@ -39,7 +39,7 @@ The TUI divides the terminal into four horizontal regions:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-- **Title bar** — shows the NemoClaw logo, cluster name, current view, and live cluster health status.
+- **Title bar** — shows the OpenShell logo, cluster name, current view, and live cluster health status.
 - **Main area** — the active view (Dashboard or Sandboxes).
 - **Navigation bar** — lists available views with their shortcut keys, plus Help and Quit.
 - **Command bar** — appears when you press `:` to type a command (like vim).
@@ -137,7 +137,7 @@ Forwarded ports are displayed in the **NOTES** column of the sandbox table as `f
 Port forwarding lifecycle:
 - **On create**: The TUI polls for sandbox readiness (up to 30 attempts at 2-second intervals), then spawns SSH tunnels.
 - **On delete**: Any active forwards for the sandbox are automatically stopped before deletion.
-- **PID tracking**: Forward PIDs are stored in `~/.config/nemoclaw/forwards/<name>-<port>.pid`, shared with the CLI.
+- **PID tracking**: Forward PIDs are stored in `~/.config/openshell/forwards/<name>-<port>.pid`, shared with the CLI.
 
 The forwarding implementation lives in `navigator-core::forward`, shared between the CLI and TUI.
 

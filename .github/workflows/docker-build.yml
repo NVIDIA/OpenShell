@@ -32,7 +32,7 @@ jobs:
     runs-on: build-amd64
     timeout-minutes: ${{ inputs.timeout-minutes }}
     container:
-      image: ghcr.io/nvidia/nemoclaw/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -41,7 +41,7 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       IMAGE_TAG: ${{ github.sha }}
-      IMAGE_REGISTRY: ghcr.io/nvidia/nemoclaw
+      IMAGE_REGISTRY: ghcr.io/nvidia/openshell
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
       DOCKER_PLATFORM: linux/amd64,linux/arm64
     steps:
@@ -70,5 +70,5 @@ jobs:
       - name: Build ${{ inputs.component }} image
         env:
           DOCKER_BUILDER: navigator
-          NEMOCLAW_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
+          OPENSHELL_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
         run: mise run --no-prepare docker:build:${{ inputs.component }}
