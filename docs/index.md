@@ -212,7 +212,7 @@ sandboxes/community-sandboxes
 :hidden:
 
 safety-and-privacy/index
-safety-and-privacy/security-model
+safety-and-privacy/default-policies
 safety-and-privacy/policies
 ```
 

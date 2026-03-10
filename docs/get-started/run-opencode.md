@@ -255,4 +255,4 @@ $ nemoclaw sandbox delete opencode-sandbox
 - {doc}`../safety-and-privacy/policies`: How the proxy evaluates network rules and policy enforcement.
 - {doc}`../inference/index`: Inference route configuration, protocol detection, and transparent rerouting.
 - {doc}`../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation.
-- {doc}`../safety-and-privacy/security-model`: The four protection layers and how they interact.
+- {doc}`../safety-and-privacy/index`: The four protection layers and how they interact.

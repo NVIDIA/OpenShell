@@ -115,5 +115,5 @@ This is useful when you plan to reconnect later or iterate on the policy while t
 
 - {doc}`../sandboxes/create-and-manage`: Learn the isolation model and sandbox lifecycle.
 - {doc}`../sandboxes/providers`: Understand how credentials are injected without exposing them to agent code.
-- {doc}`../safety-and-privacy/policies`: Customize the default policy or write your own.
-- {doc}`../safety-and-privacy/policies`: Explore network policies and per-endpoint rules.
+- {doc}`../safety-and-privacy/default-policies`: What the built-in default policy allows and denies.
+- {doc}`../safety-and-privacy/policies`: Write custom policies and configure network rules.

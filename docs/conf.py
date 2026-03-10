@@ -6,6 +6,7 @@ from datetime import date
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+sys.path.insert(0, str(Path(__file__).parent / "_ext"))
 
 project = "NVIDIA OpenShell Developer Guide"
 this_year = date.today().year
@@ -23,6 +24,7 @@ extensions = [
     "sphinx_copybutton",
     "sphinx_design",
     "sphinxcontrib.mermaid",
+    "policy_table",
 ]
 
 autodoc_default_options = {

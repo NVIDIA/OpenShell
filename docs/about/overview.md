@@ -77,4 +77,4 @@ Use pre-built sandbox images from the [NemoClaw Community](https://github.com/NV
 
 - [Architecture Overview](architecture.md): Understand the components that make up the OpenShell runtime.
 - [Get Started](../index.md): Install the CLI and create your first sandbox.
-- [Security Model](../safety-and-privacy/security-model.md): Learn how OpenShell enforces isolation across all protection layers.
+- [Safety and Privacy](../safety-and-privacy/index.md): Learn how OpenShell enforces isolation across all protection layers.
