@@ -629,24 +629,33 @@ async fn build_inference_context(
     let router =
         Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
     let patterns = l7::inference::default_patterns();
-    let ctx = Arc::new(proxy::InferenceContext::new(patterns, router, routes));
 
-    // Spawn background route cache refresh for cluster mode
-    if matches!(source, InferenceRouteSource::Cluster)
+    // Build optional refresh config — the background loop is spawned lazily on
+    // the first inference request so sandboxes that never call inference.local
+    // never poll the gateway.
+    let refresh_config = if matches!(source, InferenceRouteSource::Cluster)
         && let (Some(_id), Some(endpoint)) = (sandbox_id, navigator_endpoint)
     {
-        let refresh_interval_secs: u64 = std::env::var("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS")
+        let interval_secs: u64 = std::env::var("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
             .unwrap_or(DEFAULT_ROUTE_REFRESH_INTERVAL_SECS);
 
-        spawn_route_refresh(
-            ctx.route_cache(),
-            endpoint.to_string(),
-            refresh_interval_secs,
+        Some(proxy::RouteRefreshConfig {
+            endpoint: endpoint.to_string(),
+            interval_secs,
             initial_revision,
-        );
-    }
+        })
+    } else {
+        None
+    };
+
+    let ctx = Arc::new(proxy::InferenceContext::new(
+        patterns,
+        router,
+        routes,
+        refresh_config,
+    ));
 
     Ok(Some(ctx))
 }
@@ -679,7 +688,7 @@ fn bundle_to_resolved_routes(
 /// when routes haven't changed. `initial_revision` is the revision captured
 /// during the first fetch in [`build_inference_context`] so the very first tick
 /// can already skip a no-op update.
-fn spawn_route_refresh(
+pub(crate) fn spawn_route_refresh(
     cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
     endpoint: String,
     interval_secs: u64,
