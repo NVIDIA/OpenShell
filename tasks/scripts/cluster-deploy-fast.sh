@@ -157,7 +157,7 @@ matches_sandbox() {
     crates/navigator-core/*|crates/navigator-providers/*)
       return 0
       ;;
-    crates/navigator-policy/*|crates/navigator-sandbox/*|deploy/docker/sandbox/*|deploy/docker/openclaw-start.sh|python/*|pyproject.toml|uv.lock)
+    crates/navigator-policy/*|crates/navigator-sandbox/*|deploy/docker/sandbox/*|python/*|pyproject.toml|uv.lock)
       return 0
       ;;
     *)
@@ -193,7 +193,7 @@ compute_fingerprint() {
       committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-router/ crates/navigator-server/ deploy/docker/Dockerfile.server 2>/dev/null || true)
       ;;
     sandbox)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-providers/ crates/navigator-sandbox/ deploy/docker/sandbox/ deploy/docker/openclaw-start.sh python/ pyproject.toml uv.lock 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-providers/ crates/navigator-sandbox/ deploy/docker/sandbox/ python/ pyproject.toml uv.lock 2>/dev/null || true)
       ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/navigator/ 2>/dev/null || true)

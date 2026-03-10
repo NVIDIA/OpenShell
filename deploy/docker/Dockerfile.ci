@@ -32,6 +32,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     socat \
     unzip \
     xz-utils \
+    jq \
+    rsync \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Docker CLI and buildx plugin used by CI jobs

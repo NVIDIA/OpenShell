@@ -85,7 +85,7 @@ The gateway container runs the control plane / orchestration service.
    - Second pass copies real source, touches source files and `.proto` definitions to force rebuilding, and compiles in release mode.
    - Uses `deploy/docker/cross-build.sh` for multi-arch cross-compilation.
    - Proto files are copied and `build.rs` is touched to ensure proto code regeneration when the cache mount retains stale `OUT_DIR` artifacts.
-2. **runtime** -- Debian bookworm-slim with `ca-certificates`. Runs as non-root user `navigator` (created with `useradd --create-home`). SQLx migrations are copied to `/build/crates/navigator-server/migrations` (the path expected by `sqlx` at build time).
+2. **runtime** -- Debian bookworm-slim (pinned to a specific point release) with `ca-certificates`. Runs as non-root user `navigator` (created with `useradd --create-home`). SQLx migrations are copied to `/build/crates/navigator-server/migrations` (the path expected by `sqlx` at build time).
 
 **Key details:**
 
@@ -338,7 +338,7 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 | `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway + sandbox rebuild |
 | `crates/navigator-router/*` | Gateway rebuild |
 | `crates/navigator-server/*`, `deploy/docker/Dockerfile.server` | Gateway rebuild |
-| `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `deploy/docker/openclaw-start.sh`, `python/*`, `pyproject.toml`, `uv.lock`, `crates/navigator-sandbox/data/sandbox-policy.rego` | Sandbox rebuild |
+| `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `python/*`, `pyproject.toml`, `uv.lock`, `crates/navigator-sandbox/data/sandbox-policy.rego` | Sandbox rebuild |
 | `deploy/helm/navigator/*` | Helm upgrade |
 
 **Explicit target mode** (arguments: `server`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.

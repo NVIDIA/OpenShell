@@ -15,6 +15,14 @@
 # The helm charts are built by the docker:build:cluster mise task
 # and placed in deploy/docker/.build/ before this Dockerfile is built.
 
+# Tracked upstream vulns in rancher/k3s:v1.35.2-k3s1 (bundled Go dependencies):
+#   GHSA-pwhc-rpq9-4c8w  containerd v2.1.5-k3s1 (local privesc via CRI dir perms;
+#                         upstream patched in 2.1.5 -- may be scanner false positive
+#                         from the -k3s1 suffix)
+#   GHSA-p436-gjf2-799p  docker/cli v28.3.2 (Windows-only plugin path hijack; N/A)
+#   GHSA-9h8m-3fm2-qjrq  otel/sdk v1.39.0 (macOS-only PATH hijack; N/A for Linux)
+#   CVE-2024-36623       docker/docker v25.0.8 (streamformatter race condition)
+# Bump K3S_VERSION when a release with updated dependencies ships.
 ARG K3S_VERSION=v1.35.2-k3s1
 FROM rancher/k3s:${K3S_VERSION}
 
