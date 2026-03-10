@@ -93,7 +93,7 @@ fi
 # Generate k3s private registry configuration
 # ---------------------------------------------------------------------------
 # Write registries.yaml so k3s/containerd can authenticate when pulling
-# component images from the distribution registry at runtime.
+# component and community sandbox images from the registry at runtime.
 # Credentials are passed as environment variables by the bootstrap code.
 REGISTRIES_YAML="/etc/rancher/k3s/registries.yaml"
 if [ -n "${REGISTRY_HOST:-}" ]; then
@@ -113,15 +113,15 @@ mirrors:
 
 REGEOF
 
-    # If the distribution registry is a separate host (e.g. we're using a
+    # If the community registry is a separate host (e.g. we're using a
     # local registry for component images), add it as an additional mirror
     # so community sandbox images can be pulled at runtime.
-    if [ -n "${DIST_REGISTRY_HOST:-}" ] && [ "${DIST_REGISTRY_HOST}" != "${REGISTRY_HOST}" ]; then
-        echo "Adding distribution registry mirror for ${DIST_REGISTRY_HOST}"
+    if [ -n "${COMMUNITY_REGISTRY_HOST:-}" ] && [ "${COMMUNITY_REGISTRY_HOST}" != "${REGISTRY_HOST}" ]; then
+        echo "Adding community registry mirror for ${COMMUNITY_REGISTRY_HOST}"
         cat >> "$REGISTRIES_YAML" <<REGEOF
-  "${DIST_REGISTRY_HOST}":
+  "${COMMUNITY_REGISTRY_HOST}":
     endpoint:
-      - "https://${DIST_REGISTRY_HOST}"
+      - "https://${COMMUNITY_REGISTRY_HOST}"
 REGEOF
     fi
 
@@ -136,27 +136,27 @@ configs:
 REGEOF
     fi
 
-    # Add auth for the distribution registry when it differs from the
+    # Add auth for the community registry when it differs from the
     # primary registry (community sandbox images live there).
-    if [ -n "${DIST_REGISTRY_HOST:-}" ] && [ "${DIST_REGISTRY_HOST}" != "${REGISTRY_HOST}" ] \
-       && [ -n "${DIST_REGISTRY_USERNAME:-}" ] && [ -n "${DIST_REGISTRY_PASSWORD:-}" ]; then
+    if [ -n "${COMMUNITY_REGISTRY_HOST:-}" ] && [ "${COMMUNITY_REGISTRY_HOST}" != "${REGISTRY_HOST}" ] \
+       && [ -n "${COMMUNITY_REGISTRY_USERNAME:-}" ] && [ -n "${COMMUNITY_REGISTRY_PASSWORD:-}" ]; then
         # Append to existing configs block or start a new one.
         if [ -n "${REGISTRY_USERNAME:-}" ] && [ -n "${REGISTRY_PASSWORD:-}" ]; then
             # configs: block already started above — just append the entry.
             cat >> "$REGISTRIES_YAML" <<REGEOF
-  "${DIST_REGISTRY_HOST}":
+  "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${DIST_REGISTRY_USERNAME}
-      password: ${DIST_REGISTRY_PASSWORD}
+      username: ${COMMUNITY_REGISTRY_USERNAME}
+      password: ${COMMUNITY_REGISTRY_PASSWORD}
 REGEOF
         else
             cat >> "$REGISTRIES_YAML" <<REGEOF
 
 configs:
-  "${DIST_REGISTRY_HOST}":
+  "${COMMUNITY_REGISTRY_HOST}":
     auth:
-      username: ${DIST_REGISTRY_USERNAME}
-      password: ${DIST_REGISTRY_PASSWORD}
+      username: ${COMMUNITY_REGISTRY_USERNAME}
+      password: ${COMMUNITY_REGISTRY_PASSWORD}
 REGEOF
         fi
     fi

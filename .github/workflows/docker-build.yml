@@ -43,6 +43,7 @@ jobs:
       IMAGE_TAG: ${{ github.sha }}
       IMAGE_REGISTRY: ghcr.io/nvidia/nemoclaw
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
+      DOCKER_PLATFORM: linux/amd64,linux/arm64
     steps:
       - uses: actions/checkout@v4
         with:

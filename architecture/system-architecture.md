@@ -85,7 +85,7 @@ graph TB
     end
 
     subgraph ContainerRegistry["Container Registry"]
-        CDN["CloudFront CDN<br/>d1i0nduu2f6qxk.cloudfront.net"]
+        GHCR["GitHub Container Registry<br/>ghcr.io"]
     end
 
     %% ============================================================
@@ -142,7 +142,7 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: Cluster bootstrap
     %% ============================================================
-    K3s -- "pulls images<br/>at runtime" --> CDN
+    K3s -- "pulls images<br/>at runtime" --> GHCR
 
     %% ============================================================
     %% FILE SYNC
@@ -168,7 +168,7 @@ graph TB
     class SSHServer,Proxy,OPA,InferenceRouter,CertCache sandbox
     class Agent,Landlock,Seccomp,NetNS agent
     class SQLite datastore
-    class Anthropic,OpenAI,NVIDIA_API,GitHub,GitLab,PyPI,NPM,LMStudio,VLLM,CDN external
+    class Anthropic,OpenAI,NVIDIA_API,GitHub,GitLab,PyPI,NPM,LMStudio,VLLM,GHCR external
     class KubeAPI,HelmController,LocalPathProv,CRDController k8s
     class LocalConfig config
 ```

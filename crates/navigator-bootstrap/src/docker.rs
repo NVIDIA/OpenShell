@@ -4,11 +4,10 @@
 use crate::RemoteOptions;
 use crate::constants::{NETWORK_NAME, container_name, volume_name};
 use crate::image::{
-    parse_image_ref, pull_registry, pull_registry_password, pull_registry_username,
+    self, DEFAULT_IMAGE_REPO_BASE, DEFAULT_REGISTRY, DEFAULT_REGISTRY_USERNAME, parse_image_ref,
 };
 use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
-use bollard::auth::DockerCredentials;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
@@ -187,7 +186,11 @@ pub async fn ensure_volume(docker: &Docker, name: &str) -> Result<()> {
     Ok(())
 }
 
-pub async fn ensure_image(docker: &Docker, image_ref: &str) -> Result<()> {
+pub async fn ensure_image(
+    docker: &Docker,
+    image_ref: &str,
+    registry_token: Option<&str>,
+) -> Result<()> {
     match docker.inspect_image(image_ref).await {
         Ok(_) => return Ok(()),
         Err(err) if is_not_found(&err) => {}
@@ -196,7 +199,7 @@ pub async fn ensure_image(docker: &Docker, image_ref: &str) -> Result<()> {
 
     // For local-only images (no registry prefix), give a clear error instead
     // of attempting a pull from Docker Hub that will always fail.
-    if crate::image::is_local_image_ref(image_ref) {
+    if image::is_local_image_ref(image_ref) {
         return Err(miette::miette!(
             "Image '{}' not found locally. This looks like a locally-built image \
              (no registry prefix). Build it first with `mise run docker:build:cluster`.",
@@ -205,22 +208,18 @@ pub async fn ensure_image(docker: &Docker, image_ref: &str) -> Result<()> {
     }
 
     let (repo, tag) = parse_image_ref(image_ref);
+
+    // Use GHCR credentials (explicit or built-in default) for ghcr.io images.
+    let credentials = if repo.starts_with("ghcr.io/") {
+        image::ghcr_credentials(registry_token)
+    } else {
+        None
+    };
+
     let options = CreateImageOptions {
         from_image: Some(repo.clone()),
         tag: if tag.is_empty() { None } else { Some(tag) },
         ..Default::default()
-    };
-
-    let registry = pull_registry();
-    let credentials = if repo.starts_with(&(registry.clone() + "/")) {
-        Some(DockerCredentials {
-            username: Some(pull_registry_username()),
-            password: Some(pull_registry_password()),
-            serveraddress: Some(registry),
-            ..Default::default()
-        })
-    } else {
-        None
     };
 
     let mut stream = docker.create_image(Some(options), None, credentials);
@@ -230,6 +229,7 @@ pub async fn ensure_image(docker: &Docker, image_ref: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn ensure_container(
     docker: &Docker,
     name: &str,
@@ -240,6 +240,7 @@ pub async fn ensure_container(
     kube_port: Option<u16>,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    registry_token: Option<&str>,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -344,28 +345,34 @@ pub async fn ensure_container(
     // Pass extra SANs, SSH gateway config, and registry credentials to the
     // entrypoint so they can be injected into the HelmChart manifest and
     // k3s registries.yaml.
-    let registry_host = env_non_empty("NEMOCLAW_REGISTRY_HOST").unwrap_or_else(pull_registry);
+    let registry_host =
+        env_non_empty("NEMOCLAW_REGISTRY_HOST").unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
     let registry_namespace = env_non_empty("NEMOCLAW_REGISTRY_NAMESPACE")
         .unwrap_or_else(|| REGISTRY_NAMESPACE_DEFAULT.to_string());
     let image_repo_base = env_non_empty("IMAGE_REPO_BASE")
         .or_else(|| env_non_empty("NEMOCLAW_IMAGE_REPO_BASE"))
-        .unwrap_or_else(|| format!("{registry_host}/{registry_namespace}"));
+        .unwrap_or_else(|| {
+            if registry_host == DEFAULT_REGISTRY {
+                // For ghcr.io the default namespace is the full org path.
+                DEFAULT_IMAGE_REPO_BASE.to_string()
+            } else {
+                format!("{registry_host}/{registry_namespace}")
+            }
+        });
     let registry_insecure = env_bool("NEMOCLAW_REGISTRY_INSECURE").unwrap_or(false);
     let registry_endpoint = env_non_empty("NEMOCLAW_REGISTRY_ENDPOINT");
 
-    let registry_username = env_non_empty("NEMOCLAW_REGISTRY_USERNAME").or_else(|| {
-        if registry_host == pull_registry() {
-            Some(pull_registry_username())
-        } else {
-            None
-        }
-    });
+    // Credential priority:
+    // 1. NEMOCLAW_REGISTRY_USERNAME/PASSWORD env vars (power-user override)
+    // 2. registry_token from --registry-token / NEMOCLAW_REGISTRY_TOKEN
+    // 3. Built-in default XOR-decoded token
+    let registry_username = env_non_empty("NEMOCLAW_REGISTRY_USERNAME")
+        .or_else(|| Some(DEFAULT_REGISTRY_USERNAME.to_string()));
     let registry_password = env_non_empty("NEMOCLAW_REGISTRY_PASSWORD").or_else(|| {
-        if registry_host == pull_registry() {
-            Some(pull_registry_password())
-        } else {
-            None
-        }
+        registry_token
+            .filter(|t| !t.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| Some(image::default_registry_token()))
     });
 
     let mut env_vars: Vec<String> = vec![
@@ -382,22 +389,21 @@ pub async fn ensure_container(
         env_vars.push(format!("REGISTRY_PASSWORD={password}"));
     }
 
-    // When the primary registry is NOT the distribution registry (e.g. a
-    // local registry in push-mode), we still need containerd credentials for
-    // the distribution registry so that community sandbox images
-    // (d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes/*) can be
-    // pulled at runtime.  Pass the distribution registry credentials as a
-    // separate set of env vars so the entrypoint can add a second block to
-    // registries.yaml.
-    if registry_host != pull_registry() {
-        env_vars.push(format!("DIST_REGISTRY_HOST={}", pull_registry()));
+    // When the primary registry is NOT ghcr.io (e.g. a local registry in
+    // push-mode), we still need containerd credentials for the community
+    // registry so that community sandbox images
+    // (ghcr.io/nvidia/nemoclaw-community/sandboxes/*) can be pulled at
+    // runtime.  Pass community registry credentials as a separate set of
+    // env vars so the entrypoint can add a second block to registries.yaml.
+    if registry_host != DEFAULT_REGISTRY {
+        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={}", DEFAULT_REGISTRY));
         env_vars.push(format!(
-            "DIST_REGISTRY_USERNAME={}",
-            pull_registry_username()
+            "COMMUNITY_REGISTRY_USERNAME={}",
+            DEFAULT_REGISTRY_USERNAME
         ));
         env_vars.push(format!(
-            "DIST_REGISTRY_PASSWORD={}",
-            pull_registry_password()
+            "COMMUNITY_REGISTRY_PASSWORD={}",
+            image::default_registry_token()
         ));
     }
 

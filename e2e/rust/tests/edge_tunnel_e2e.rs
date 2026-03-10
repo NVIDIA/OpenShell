@@ -116,10 +116,11 @@ async fn plaintext_cluster_status_reports_healthy() {
         "nemoclaw status should exit 0 against plaintext cluster:\n{clean}"
     );
 
-    // The status output should show the gateway as healthy.
+    // The status output should show the gateway as healthy/connected.
     assert!(
         clean.to_lowercase().contains("healthy")
             || clean.to_lowercase().contains("running")
+            || clean.to_lowercase().contains("connected")
             || clean.contains("✓"),
         "status should report healthy gateway:\n{clean}"
     );
@@ -150,6 +151,7 @@ async fn ws_tunnel_status_through_edge_proxy() {
     // Only run this test if we have a healthy cluster to test against.
     if !clean_status.to_lowercase().contains("healthy")
         && !clean_status.to_lowercase().contains("running")
+        && !clean_status.to_lowercase().contains("connected")
         && !clean_status.contains("✓")
     {
         eprintln!("Skipping ws_tunnel test: no healthy cluster available");
@@ -216,6 +218,7 @@ async fn ws_tunnel_status_through_edge_proxy() {
     assert!(
         clean.to_lowercase().contains("healthy")
             || clean.to_lowercase().contains("running")
+            || clean.to_lowercase().contains("connected")
             || clean.contains("✓"),
         "status through WS tunnel should report healthy:\n{clean}"
     );

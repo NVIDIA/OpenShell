@@ -973,6 +973,7 @@ pub async fn cluster_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    registry_token: Option<&str>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -997,6 +998,9 @@ pub async fn cluster_admin_deploy(
     }
     if let Some(host) = gateway_host {
         options = options.with_gateway_host(host);
+    }
+    if let Some(token) = registry_token {
+        options = options.with_registry_token(token);
     }
 
     let interactive = std::io::stderr().is_terminal();
@@ -1786,8 +1790,7 @@ pub async fn sandbox_create(
 /// Bare sandbox names (e.g., `openclaw`) are expanded to
 /// `{prefix}/{name}:latest` using this value.  Override with the
 /// `NEMOCLAW_COMMUNITY_REGISTRY` environment variable.
-const DEFAULT_COMMUNITY_REGISTRY: &str =
-    "d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes";
+const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/nemoclaw-community/sandboxes";
 
 /// Resolved source for the `--from` flag on `sandbox create`.
 enum ResolvedSource {

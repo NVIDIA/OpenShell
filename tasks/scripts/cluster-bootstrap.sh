@@ -17,7 +17,7 @@ else
   IMAGE_TAG=dev
 fi
 ENV_FILE=.env
-PUBLISHED_IMAGE_REPO_BASE_DEFAULT=d1i0nduu2f6qxk.cloudfront.net/navigator
+PUBLISHED_IMAGE_REPO_BASE_DEFAULT=ghcr.io/nvidia/nemoclaw
 LOCAL_REGISTRY_CONTAINER=navigator-local-registry
 LOCAL_REGISTRY_ADDR=127.0.0.1:5000
 

@@ -60,6 +60,9 @@ echo "Building cluster image..."
 OUTPUT_FLAG="--load"
 if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
   OUTPUT_FLAG="--push"
+elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
+  # Multi-platform builds cannot use --load; push is required.
+  OUTPUT_FLAG="--push"
 fi
 
 docker buildx build \
@@ -69,6 +72,7 @@ docker buildx build \
   -f deploy/docker/Dockerfile.cluster \
   -t ${IMAGE_NAME}:${IMAGE_TAG} \
   ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
+  --provenance=false \
   ${OUTPUT_FLAG} \
   .
 

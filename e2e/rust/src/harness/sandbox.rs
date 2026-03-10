@@ -15,6 +15,15 @@ use tokio::time::timeout;
 use super::binary::nemoclaw_cmd;
 use super::output::{extract_field, strip_ansi};
 
+/// Extract the sandbox name from CLI create output.
+///
+/// The CLI prints `Created sandbox: <name>` (current format). Falls back to
+/// `Name: <name>` for compatibility with older output formats.
+fn extract_sandbox_name(output: &str) -> Option<String> {
+    extract_field(output, "Created sandbox")
+        .or_else(|| extract_field(output, "Name"))
+}
+
 /// Default timeout for waiting for a sandbox to become ready.
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -77,7 +86,7 @@ impl SandboxGuard {
             ));
         }
 
-        let name = extract_field(&combined, "Name").ok_or_else(|| {
+        let name = extract_sandbox_name(&combined).ok_or_else(|| {
             format!("could not parse sandbox name from create output:\n{combined}")
         })?;
 
@@ -139,7 +148,7 @@ impl SandboxGuard {
 
                 // Try to extract the sandbox name from the header.
                 if name.is_none() {
-                    if let Some(n) = extract_field(&accumulated, "Name") {
+                    if let Some(n) = extract_sandbox_name(&accumulated) {
                         name = Some(n);
                     }
                 }
@@ -229,7 +238,7 @@ impl SandboxGuard {
             ));
         }
 
-        let name = extract_field(&combined, "Name").ok_or_else(|| {
+        let name = extract_sandbox_name(&combined).ok_or_else(|| {
             format!("could not parse sandbox name from create output:\n{combined}")
         })?;
 
