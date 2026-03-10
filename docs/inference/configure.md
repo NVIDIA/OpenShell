@@ -24,7 +24,7 @@ Create a provider that holds the backend credentials you want OpenShell to use.
 $ nemoclaw provider create --name nvidia-prod --type nvidia --from-existing
 ```
 
-You can also use `openai` or `anthropic` providers.
+You can also use `openai` or `anthropic` providers types.
 
 ## Step 2: Set Inference Routing
 
@@ -93,7 +93,7 @@ security reasons. External providers that should be reached directly belong in
 ## Next Steps
 
 - {doc}`index`: understand the interception flow and supported API patterns.
-- [Network Access Rules](/sandboxes/policies.md#network-access-rules):
+- [Network Access Rules](/sandboxes/index.md#network-access-rules):
   configure direct access to external inference endpoints.
 - {doc}`../sandboxes/providers`: create and manage provider records.
 - {doc}`../reference/cli`: see the CLI reference for `nemoclaw inference`

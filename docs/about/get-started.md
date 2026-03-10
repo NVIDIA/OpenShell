@@ -1,7 +1,7 @@
 ---
 title:
-  page: "Get Started"
-  nav: "Get Started"
+  page: "Quickstart"
+  nav: "Quickstart"
 description: "Install the OpenShell CLI and create your first sandboxed AI agent in two commands."
 keywords: ["nemoclaw install", "quickstart", "sandbox create", "getting started"]
 topics: ["generative_ai", "cybersecurity"]
@@ -17,7 +17,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Get Started
+# Quickstart
 
 This page gets you from zero to a running, policy-enforced sandbox in two commands.
 
@@ -71,5 +71,6 @@ The `--from` flag pulls a pre-built sandbox definition from the [NemoClaw Commun
 
 You now have a working sandbox! From here, you can:
 
-- Learn how sandboxes work in [Sandboxes](../sandboxes/create-and-manage.md).
-- Write your own policies in [Customize Sandbox Policies](../sandboxes/policies.md).
+- **Follow a guided tutorial** — set up scoped GitHub repo access in {doc}`/tutorials/github-sandbox`.
+- **Learn how sandboxes work** — see {doc}`/sandboxes/create-and-manage` for the full lifecycle.
+- **Write your own policies** — see {doc}`/sandboxes/policies` for custom access rules.

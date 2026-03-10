@@ -47,6 +47,23 @@ This is especially useful when you are iterating on a policy or want to
 reconnect later from another terminal or VS Code.
 :::
 
+## Create from a Community Sandbox or Custom Image
+
+Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
+
+```console
+$ nemoclaw sandbox create --from openclaw
+```
+
+The CLI resolves the name against the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
+
+You can also point `--from` at a local directory or a container image reference:
+
+```console
+$ nemoclaw sandbox create --from ./my-sandbox-dir
+$ nemoclaw sandbox create --from my-registry.example.com/my-image:latest
+```
+
 ## List and Inspect Sandboxes
 
 Check the status of your sandboxes and retrieve detailed information about individual ones.
@@ -143,6 +160,7 @@ $ nemoclaw sandbox delete my-sandbox
 
 ## Next Steps
 
-- {doc}`community-sandboxes`: Use pre-built sandboxes from the community catalog
-- {doc}`providers`: Create and attach credential providers
-- {doc}`policies`: Control what the agent can access
+- **Want a complete end-to-end example?** Follow the {doc}`/tutorials/github-sandbox` tutorial.
+- **Need to supply API keys or tokens?** Set up {doc}`providers` for credential management.
+- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
+- **Want a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.

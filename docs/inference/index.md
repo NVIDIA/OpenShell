@@ -18,7 +18,7 @@ If sandbox code calls an external inference API like `api.openai.com` or
 request. It is allowed or denied by `network_policies`.
 
 Refer to {doc}`/sandboxes/policies` and the
-[Network Access Rules](/sandboxes/policies.md#network-access-rules)
+[Network Access Rules](/sandboxes/index.md#network-access-rules)
 section for details.
 
 ## `inference.local`
@@ -32,7 +32,7 @@ privacy and security reasons.
 
 ## Using `inference.local`
 
-When code inside a sandbox calls `https://inference.local`, OpenShell routes the
+When code inside a sandbox calls `https://inference.local`, the {doc}`privacy router </about/architecture>` routes the
 request to the configured backend for that gateway.
 
 The configured model is applied to generation requests, and provider
@@ -80,5 +80,5 @@ supported patterns are denied.
 ## Next Steps
 
 - {doc}`configure`: configure the backend behind `inference.local`.
-- [Network Access Rules](/sandboxes/policies.md#network-access-rules):
+- [Network Access Rules](/sandboxes/index.md#network-access-rules):
   understand how external endpoints are controlled.

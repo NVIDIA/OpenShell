@@ -91,59 +91,6 @@ When triaging denied requests, check:
 
 Then push the updated policy as described above.
 
-## Policy Structure
-
-A policy has static sections (`filesystem_policy`, `landlock`, `process`) that are locked at sandbox creation, and dynamic sections (`network_policies`, `inference`) that are hot-reloadable on a running sandbox.
-
-```yaml
-version: 1
-
-# Static: locked at sandbox creation. Paths the agent can read vs read/write.
-filesystem_policy:
-  read_only: [/usr, /lib, /etc]
-  read_write: [/sandbox, /tmp]
-
-# Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
-landlock:
-  compatibility: best_effort
-
-# Static: Unprivileged user/group the agent process runs as.
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
-# Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
-network_policies:
-  my_api:
-    name: my-api
-    endpoints:
-      - host: api.example.com
-        port: 443
-        protocol: rest
-        tls: terminate
-        enforcement: enforce
-        access: full
-    binaries:
-      - path: /usr/bin/curl
-
-# Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).
-inference:
-  allowed_routes: [local]
-```
-
-For the complete structure and every field, see the [Policy Schema Reference](../reference/policy-schema.md).
-
-## Network Access Rules
-
-Network access is controlled by policy blocks under `network_policies`. Each block has a **name**, a list of **endpoints** (host, port, protocol, and optional rules), and a list of **binaries** that are allowed to use those endpoints.
-
-Every outbound connection from the sandbox goes through the proxy:
-
-- The proxy matches the **destination** (host and port) and the **calling binary** to an endpoint in one of your policy blocks. A connection is allowed only when both match.
-- For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is checked against that endpoint's `rules` (method and path).
-- If no endpoint matches and inference routes are configured, the request may be rerouted for inference.
-- Otherwise the connection is denied. Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads.
-
 ## Examples
 
 Add these blocks to the `network_policies` section of your sandbox policy. Apply with `openshell policy set <name> --policy <file> --wait`.
@@ -172,6 +119,10 @@ Endpoints without `protocol` or `tls` use TCP passthrough — the proxy allows t
 
 ::::{tab-item} Granular rules
 Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
+
+:::{tip}
+For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, see {doc}`/tutorials/github-sandbox`.
+:::
 
 ```yaml
   github_repos:
@@ -216,5 +167,6 @@ Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspect
 
 ## Next Steps
 
-- {doc}`index`: The built-in policy that ships with OpenShell and what each block allows.
-- [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.
+- **New to policies?** Read about {doc}`policy structure and network access rules <index>` first.
+- **Need the full field reference?** See the [Policy Schema Reference](../reference/policy-schema.md).
+- **Looking for the default policy breakdown?** See {doc}`../reference/default-policy`.

@@ -61,5 +61,5 @@ For details, refer to [Built-in Default Policy](../sandboxes/index.md#built-in-d
 ## Next Steps
 
 - [Architecture Overview](architecture.md): Understand the components that make up the OpenShell runtime.
-- [Get Started](../index.md): Install the CLI and create your first sandbox.
+- [Quickstart](get-started.md): Install the CLI and create your first sandbox.
 - [Sandboxes](../sandboxes/index.md): Learn how OpenShell enforces isolation across all protection layers.

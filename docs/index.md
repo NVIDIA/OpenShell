@@ -103,7 +103,7 @@ Install the CLI and create your first sandbox in two commands.
 </div>
 ```
 
-Refer to the [Get Started](about/get-started.md) for more details.
+Refer to the [Quickstart](about/get-started.md) for more details.
 
 ---
 
@@ -122,11 +122,21 @@ Learn about OpenShell and its capabilities.
 {bdg-secondary}`Concept`
 :::
 
-:::{grid-item-card} Get Started
+:::{grid-item-card} Quickstart
 :link: about/get-started
 :link-type: doc
 
-Quickstart guide for creating an OpenShell sandbox with Claude Code, OpenClaw, and OpenCode.
+Install the CLI and create your first sandbox in two commands.
+
++++
+{bdg-secondary}`Tutorial`
+:::
+
+:::{grid-item-card} Tutorials
+:link: tutorials/index
+:link-type: doc
+
+End-to-end guides: GitHub repo access, custom policies, and more.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -136,20 +146,10 @@ Quickstart guide for creating an OpenShell sandbox with Claude Code, OpenClaw, a
 :link: sandboxes/index
 :link-type: doc
 
-Create, manage, and customize sandboxes. Use community images or bring your own container.
+Create, manage, and customize sandboxes. Configure policies, providers, and community images.
 
 +++
 {bdg-secondary}`Concept`
-:::
-
-:::{grid-item-card} Sandbox Policies
-:link: sandboxes/policies
-:link-type: doc
-
-Customize sandbox policies and configure network access rules.
-
-+++
-{bdg-secondary}`How-To`
 :::
 
 :::{grid-item-card} Inference Routing
@@ -186,8 +186,15 @@ Home <self>
 
 Overview <about/overview>
 How It Works <about/architecture>
-Get Started <about/get-started>
 Release Notes <about/release-notes>
+```
+
+```{toctree}
+:caption: Get Started
+:hidden:
+
+Quickstart <about/get-started>
+tutorials/index
 ```
 
 ```{toctree}
@@ -196,8 +203,8 @@ Release Notes <about/release-notes>
 
 sandboxes/index
 sandboxes/create-and-manage
-sandboxes/policies
 sandboxes/providers
+sandboxes/policies
 sandboxes/community-sandboxes
 ```
 
