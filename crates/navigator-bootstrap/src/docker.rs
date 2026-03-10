@@ -22,7 +22,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
 use std::path::Path;
 
-const REGISTRY_NAMESPACE_DEFAULT: &str = "navigator";
+const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 
 const REGISTRY_MODE_EXTERNAL: &str = "external";
 

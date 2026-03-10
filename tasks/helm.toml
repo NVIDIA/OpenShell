@@ -5,5 +5,5 @@
 
 ["helm:lint"]
 description = "Lint the openshell helm chart"
-run = "helm lint deploy/helm/navigator"
+run = "helm lint deploy/helm/openshell"
 hide = true

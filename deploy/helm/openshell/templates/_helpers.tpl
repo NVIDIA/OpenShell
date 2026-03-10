@@ -1,14 +1,14 @@
 {{/*
 Expand the name of the chart.
 */}}
-{{- define "navigator.name" -}}
+{{- define "openshell.name" -}}
 {{- default .Chart.Name .Values.nameOverride | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Create a default fully qualified app name.
 */}}
-{{- define "navigator.fullname" -}}
+{{- define "openshell.fullname" -}}
 {{- if .Values.fullnameOverride }}
 {{- .Values.fullnameOverride | trunc 63 | trimSuffix "-" }}
 {{- else }}
@@ -24,16 +24,16 @@ Create a default fully qualified app name.
 {{/*
 Create chart name and version as used by the chart label.
 */}}
-{{- define "navigator.chart" -}}
+{{- define "openshell.chart" -}}
 {{- printf "%s-%s" .Chart.Name .Chart.Version | replace "+" "_" | trunc 63 | trimSuffix "-" }}
 {{- end }}
 
 {{/*
 Common labels
 */}}
-{{- define "navigator.labels" -}}
-helm.sh/chart: {{ include "navigator.chart" . }}
-{{ include "navigator.selectorLabels" . }}
+{{- define "openshell.labels" -}}
+helm.sh/chart: {{ include "openshell.chart" . }}
+{{ include "openshell.selectorLabels" . }}
 {{- if .Chart.AppVersion }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
@@ -43,17 +43,17 @@ app.kubernetes.io/managed-by: {{ .Release.Service }}
 {{/*
 Selector labels
 */}}
-{{- define "navigator.selectorLabels" -}}
-app.kubernetes.io/name: {{ include "navigator.name" . }}
+{{- define "openshell.selectorLabels" -}}
+app.kubernetes.io/name: {{ include "openshell.name" . }}
 app.kubernetes.io/instance: {{ .Release.Name }}
 {{- end }}
 
 {{/*
 Create the name of the service account to use
 */}}
-{{- define "navigator.serviceAccountName" -}}
+{{- define "openshell.serviceAccountName" -}}
 {{- if .Values.serviceAccount.create }}
-{{- default (include "navigator.fullname" .) .Values.serviceAccount.name }}
+{{- default (include "openshell.fullname" .) .Values.serviceAccount.name }}
 {{- else }}
 {{- default "default" .Values.serviceAccount.name }}
 {{- end }}

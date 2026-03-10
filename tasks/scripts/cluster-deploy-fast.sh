@@ -175,7 +175,7 @@ matches_sandbox() {
 matches_helm() {
   local path=$1
   case "${path}" in
-    deploy/helm/navigator/*)
+    deploy/helm/openshell/*)
       return 0
       ;;
     *)
@@ -202,7 +202,7 @@ compute_fingerprint() {
       committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-providers/ crates/navigator-sandbox/ deploy/docker/sandbox/ python/ pyproject.toml uv.lock 2>/dev/null || true)
       ;;
     helm)
-      committed_trees=$(git ls-tree HEAD deploy/helm/navigator/ 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
       ;;
   esac
   if [[ -n "${committed_trees}" ]]; then
@@ -387,21 +387,21 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   # sandbox callbacks to plaintext.
   # Retrieve the existing handshake secret from the running release, or generate
   # a new one if this is the first deploy with the mandatory secret.
-  EXISTING_SECRET=$(helm get values navigator -n navigator -o json 2>/dev/null \
+  EXISTING_SECRET=$(helm get values openshell -n openshell -o json 2>/dev/null \
     | grep -o '"sshHandshakeSecret":"[^"]*"' \
     | cut -d'"' -f4) || true
   SSH_HANDSHAKE_SECRET="${EXISTING_SECRET:-$(openssl rand -hex 32)}"
 
-  helm upgrade navigator deploy/helm/navigator \
-    --namespace navigator \
+  helm upgrade openshell deploy/helm/openshell \
+    --namespace openshell \
     --set image.repository=${IMAGE_REPO_BASE}/server \
     --set image.tag=${IMAGE_TAG} \
     --set image.pullPolicy=Always \
-    --set-string server.grpcEndpoint=https://navigator.navigator.svc.cluster.local:8080 \
+    --set-string server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
     --set server.sandboxImage=${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG} \
-    --set server.tls.certSecretName=navigator-server-tls \
-    --set server.tls.clientCaSecretName=navigator-server-client-ca \
-    --set server.tls.clientTlsSecretName=navigator-client-tls \
+    --set server.tls.certSecretName=openshell-server-tls \
+    --set server.tls.clientCaSecretName=openshell-server-client-ca \
+    --set server.tls.clientTlsSecretName=openshell-client-tls \
     --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
     "${helm_wait_args[@]}"
   helm_end=$(date +%s)
@@ -411,14 +411,14 @@ fi
 if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   rollout_start=$(date +%s)
   echo "Restarting deployment to pick up updated images..."
-  if kubectl get statefulset/navigator -n navigator >/dev/null 2>&1; then
-    kubectl rollout restart statefulset/navigator -n navigator
-    kubectl rollout status statefulset/navigator -n navigator
-  elif kubectl get deployment/navigator -n navigator >/dev/null 2>&1; then
-    kubectl rollout restart deployment/navigator -n navigator
-    kubectl rollout status deployment/navigator -n navigator
+  if kubectl get statefulset/openshell -n openshell >/dev/null 2>&1; then
+    kubectl rollout restart statefulset/openshell -n openshell
+    kubectl rollout status statefulset/openshell -n openshell
+  elif kubectl get deployment/openshell -n openshell >/dev/null 2>&1; then
+    kubectl rollout restart deployment/openshell -n openshell
+    kubectl rollout status deployment/openshell -n openshell
   else
-    echo "Warning: no navigator workload found to roll out in namespace 'navigator'."
+    echo "Warning: no openshell workload found to roll out in namespace 'openshell'."
   fi
   rollout_end=$(date +%s)
   log_duration "Rollout" "${rollout_start}" "${rollout_end}"

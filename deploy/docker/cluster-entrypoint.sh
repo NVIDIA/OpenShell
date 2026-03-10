@@ -27,6 +27,36 @@ set -e
 
 RESOLV_CONF="/etc/rancher/k3s/resolv.conf"
 
+has_default_route() {
+    ip -4 route show default 2>/dev/null | grep -q '^default ' \
+        || ip -6 route show default 2>/dev/null | grep -q '^default '
+}
+
+wait_for_default_route() {
+    attempts=${1:-30}
+    delay_s=${2:-1}
+    i=1
+
+    while [ "$i" -le "$attempts" ]; do
+        if has_default_route; then
+            return 0
+        fi
+        sleep "$delay_s"
+        i=$((i + 1))
+    done
+
+    echo "Error: no default route present before starting k3s"
+    echo "IPv4 routes:"
+    ip -4 route show 2>/dev/null || true
+    echo "IPv6 routes:"
+    ip -6 route show 2>/dev/null || true
+    echo "/proc/net/route:"
+    cat /proc/net/route 2>/dev/null || true
+    echo "/proc/net/ipv6_route:"
+    cat /proc/net/ipv6_route 2>/dev/null || true
+    return 1
+}
+
 # ---------------------------------------------------------------------------
 # Configure DNS proxy via iptables
 # ---------------------------------------------------------------------------
@@ -165,12 +195,12 @@ else
 fi
 
 # Copy bundled Helm chart tarballs to the k3s static charts directory.
-# These are stored in /opt/navigator/charts/ because the volume mount
+# These are stored in /opt/openshell/charts/ because the volume mount
 # on /var/lib/rancher/k3s overwrites any files baked into that path.
 # Without this, a persistent volume from a previous deploy would keep
 # serving stale chart tarballs.
 K3S_CHARTS="/var/lib/rancher/k3s/server/static/charts"
-BUNDLED_CHARTS="/opt/navigator/charts"
+BUNDLED_CHARTS="/opt/openshell/charts"
 CHART_CHECKSUM=""
 
 if [ -d "$BUNDLED_CHARTS" ]; then
@@ -179,30 +209,30 @@ if [ -d "$BUNDLED_CHARTS" ]; then
         [ ! -f "$chart" ] && continue
         cp "$chart" "$K3S_CHARTS/"
     done
-    # Compute a checksum of the navigator chart so we can inject it into the
+    # Compute a checksum of the openshell chart so we can inject it into the
     # HelmChart manifest below. When the chart content changes between image
     # versions the checksum changes, which modifies the HelmChart CR spec and
     # forces the k3s Helm controller to re-install.
-    NAV_CHART="$BUNDLED_CHARTS/navigator-0.1.0.tgz"
-    if [ -f "$NAV_CHART" ]; then
+    OPENSHELL_CHART="$BUNDLED_CHARTS/openshell-0.1.0.tgz"
+    if [ -f "$OPENSHELL_CHART" ]; then
         if command -v sha256sum >/dev/null 2>&1; then
-            CHART_CHECKSUM=$(sha256sum "$NAV_CHART" | cut -d ' ' -f 1)
+            CHART_CHECKSUM=$(sha256sum "$OPENSHELL_CHART" | cut -d ' ' -f 1)
         elif command -v shasum >/dev/null 2>&1; then
-            CHART_CHECKSUM=$(shasum -a 256 "$NAV_CHART" | cut -d ' ' -f 1)
+            CHART_CHECKSUM=$(shasum -a 256 "$OPENSHELL_CHART" | cut -d ' ' -f 1)
         fi
     fi
 fi
 
 # Copy bundled manifests to k3s manifests directory.
-# These are stored in /opt/navigator/manifests/ because the volume mount
+# These are stored in /opt/openshell/manifests/ because the volume mount
 # on /var/lib/rancher/k3s overwrites any files baked into that path.
 #
 # When reusing a persistent volume from a previous deploy, stale manifests
 # (e.g. envoy-gateway-helmchart.yaml from an older image) may linger.
-# We remove any navigator-managed manifests that no longer exist in the
+# We remove any openshell-managed manifests that no longer exist in the
 # bundled set so k3s does not keep installing removed components.
 K3S_MANIFESTS="/var/lib/rancher/k3s/server/manifests"
-BUNDLED_MANIFESTS="/opt/navigator/manifests"
+BUNDLED_MANIFESTS="/opt/openshell/manifests"
 
 if [ -d "$BUNDLED_MANIFESTS" ]; then
     echo "Copying bundled manifests to k3s..."
@@ -211,10 +241,11 @@ if [ -d "$BUNDLED_MANIFESTS" ]; then
         cp "$manifest" "$K3S_MANIFESTS/"
     done
 
-    # Remove navigator-managed manifests that are no longer bundled.
-    # Only clean up files that look like navigator manifests (navigator-* or
+    # Remove openshell-managed manifests that are no longer bundled.
+    # Only clean up files that look like openshell manifests (openshell-* or
     # envoy-gateway-* or agent-*) to avoid removing built-in k3s manifests.
-    for existing in "$K3S_MANIFESTS"/navigator-*.yaml \
+    for existing in "$K3S_MANIFESTS"/openshell-*.yaml \
+                    "$K3S_MANIFESTS"/navigator-*.yaml \
                     "$K3S_MANIFESTS"/envoy-gateway-*.yaml \
                     "$K3S_MANIFESTS"/agent-*.yaml; do
         [ ! -f "$existing" ] && continue
@@ -233,7 +264,7 @@ fi
 # images in the HelmChart manifest so k3s deploys the locally-pushed versions.
 # When IMAGE_PULL_POLICY is set, override the default "Always" so k3s uses
 # images already present in containerd instead of pulling from the registry.
-HELMCHART="/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml"
+HELMCHART="/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 
 if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
     target_tag="${IMAGE_TAG:-latest}"
@@ -342,6 +373,11 @@ else
     # Remove the placeholder line entirely so invalid YAML isn't left behind
     sed -i '/__CHART_CHECKSUM__/d' "$HELMCHART"
 fi
+
+# Docker Desktop can briefly start the container before its bridge default route
+# is fully installed. k3s exits immediately in that state, so wait briefly for
+# routing to settle first.
+wait_for_default_route
 
 # Execute k3s with explicit resolv-conf.
 exec /bin/k3s "$@" --resolv-conf="$RESOLV_CONF"

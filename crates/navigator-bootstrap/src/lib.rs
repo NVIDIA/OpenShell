@@ -519,9 +519,9 @@ fn default_gateway_image_ref() -> String {
 /// Create the three TLS K8s secrets required by the `OpenShell` server and sandbox pods.
 ///
 /// Secrets are created via `kubectl` exec'd inside the cluster container:
-/// - `navigator-server-tls` (kubernetes.io/tls): server cert + key
-/// - `navigator-server-client-ca` (Opaque): CA cert for verifying client certs
-/// - `navigator-client-tls` (Opaque): client cert + key + CA cert (shared by CLI & sandboxes)
+/// - `openshell-server-tls` (kubernetes.io/tls): server cert + key
+/// - `openshell-server-client-ca` (Opaque): CA cert for verifying client certs
+/// - `openshell-client-tls` (Opaque): client cert + key + CA cert (shared by CLI & sandboxes)
 async fn create_k8s_tls_secrets(
     docker: &Docker,
     name: &str,
@@ -560,13 +560,13 @@ async fn create_k8s_tls_secrets(
         }
     };
 
-    // 1. navigator-server-tls (kubernetes.io/tls)
+    // 1. openshell-server-tls (kubernetes.io/tls)
     let server_tls_manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": SERVER_TLS_SECRET_NAME,
-            "namespace": "navigator"
+            "namespace": "openshell"
         },
         "type": "kubernetes.io/tls",
         "data": {
@@ -576,15 +576,15 @@ async fn create_k8s_tls_secrets(
     });
     apply_secret(server_tls_manifest.to_string())
         .await
-        .wrap_err("failed to create navigator-server-tls secret")?;
+        .wrap_err("failed to create openshell-server-tls secret")?;
 
-    // 2. navigator-server-client-ca (Opaque)
+    // 2. openshell-server-client-ca (Opaque)
     let client_ca_manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": SERVER_CLIENT_CA_SECRET_NAME,
-            "namespace": "navigator"
+            "namespace": "openshell"
         },
         "type": "Opaque",
         "data": {
@@ -593,15 +593,15 @@ async fn create_k8s_tls_secrets(
     });
     apply_secret(client_ca_manifest.to_string())
         .await
-        .wrap_err("failed to create navigator-server-client-ca secret")?;
+        .wrap_err("failed to create openshell-server-client-ca secret")?;
 
-    // 3. navigator-client-tls (Opaque) — shared by CLI and sandbox pods
+    // 3. openshell-client-tls (Opaque) — shared by CLI and sandbox pods
     let client_tls_manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": CLIENT_TLS_SECRET_NAME,
-            "namespace": "navigator"
+            "namespace": "openshell"
         },
         "type": "Opaque",
         "data": {
@@ -612,7 +612,7 @@ async fn create_k8s_tls_secrets(
     });
     apply_secret(client_tls_manifest.to_string())
         .await
-        .wrap_err("failed to create navigator-client-tls secret")?;
+        .wrap_err("failed to create openshell-client-tls secret")?;
 
     Ok(())
 }
@@ -651,8 +651,8 @@ where
     // Generate fresh PKI and apply to cluster.
     // Namespace may still be creating on first bootstrap, so wait here only
     // when rotation is actually needed.
-    log("[progress] Waiting for navigator namespace".to_string());
-    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
+    log("[progress] Waiting for openshell namespace".to_string());
+    wait_for_namespace(docker, &cname, kubeconfig, "openshell").await?;
     log("[progress] Generating TLS certificates".to_string());
     let bundle = generate_pki(extra_sans)?;
     log("[progress] Applying TLS secrets to gateway".to_string());

@@ -51,7 +51,7 @@ mkdir -p deploy/docker/.build/charts
 
 # Package helm chart
 echo "Packaging helm chart..."
-helm package deploy/helm/navigator -d deploy/docker/.build/charts/
+helm package deploy/helm/openshell -d deploy/docker/.build/charts/
 
 # Build cluster image (no bundled component images — they are pulled at runtime
 # from the distribution registry; credentials are injected at deploy time)

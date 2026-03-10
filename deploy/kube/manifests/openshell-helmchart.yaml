@@ -6,7 +6,7 @@
 # automatically installed when the k3s cluster starts.
 #
 # The chart tarball is served from the k3s static file server at:
-# https://<k8s-api>/static/charts/navigator-0.1.0.tgz
+# https://<k8s-api>/static/charts/openshell-0.1.0.tgz
 #
 # Component images are pulled at runtime from ghcr.io.
 # Authentication is configured via /etc/rancher/k3s/registries.yaml
@@ -16,27 +16,27 @@
 apiVersion: helm.cattle.io/v1
 kind: HelmChart
 metadata:
-  name: navigator
+  name: openshell
   namespace: kube-system
 spec:
-  chart: https://%{KUBERNETES_API}%/static/charts/navigator-0.1.0.tgz
-  targetNamespace: navigator
+  chart: https://%{KUBERNETES_API}%/static/charts/openshell-0.1.0.tgz
+  targetNamespace: openshell
   createNamespace: true
   valuesContent: |-
     chartChecksum: __CHART_CHECKSUM__
     image:
-      repository: ghcr.io/nvidia/nemoclaw/server
+      repository: ghcr.io/nvidia/openshell/server
       tag: latest
       pullPolicy: Always
     server:
-      sandboxImage: ghcr.io/nvidia/nemoclaw/sandbox:latest
+      sandboxImage: ghcr.io/nvidia/openshell/sandbox:latest
       sshGatewayHost: __SSH_GATEWAY_HOST__
       sshGatewayPort: __SSH_GATEWAY_PORT__
       sshHandshakeSecret: __SSH_HANDSHAKE_SECRET__
-      grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
+      grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
       disableGatewayAuth: __DISABLE_GATEWAY_AUTH__
       disableTls: __DISABLE_TLS__
       tls:
-        certSecretName: navigator-server-tls
-        clientCaSecretName: navigator-server-client-ca
-        clientTlsSecretName: navigator-client-tls
+        certSecretName: openshell-server-tls
+        clientCaSecretName: openshell-server-client-ca
+        clientTlsSecretName: openshell-client-tls
