@@ -438,8 +438,8 @@ Brev</label><div class="sd-tab-content docutils">
 <p class="admonition-title">Note</p>
 <p>Deploy an OpenShell gateway on Brev by hitting <strong>Deploy</strong> on the <a class="reference external" href="https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT" rel="noreferer noopener" target="_blank">OpenShell Launchable</a>.</p>
 </div>
-<p>Once the instance is running, connect to it:</p>
-<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>nemoclaw<span class="w"> </span>gateway<span class="w"> </span>add<span class="w"> </span>&lt;your-brev-instance-url&gt;
+<p>Once the instance is running, find the gateway URL in the Brev console under <strong>Using Secure Links</strong>. Copy the shareable URL for <strong>port 8080</strong> — this is the gateway endpoint.</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>nemoclaw<span class="w"> </span>gateway<span class="w"> </span>add<span class="w"> </span>https://&lt;your-port-8080-url&gt;.brevlab.com
 <span class="gp">$ </span>nemoclaw<span class="w"> </span>status
 </pre></div>
 </div>
