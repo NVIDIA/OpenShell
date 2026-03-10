@@ -1,12 +1,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2e tests for provider credential injection into sandboxes.
+"""E2E tests for supervisor-managed provider placeholders in sandboxes.
 
 Provider credentials are fetched at runtime by the sandbox supervisor via the
-GetSandboxProviderEnvironment gRPC call.  They should appear as environment
-variables inside the sandbox process, but must NOT be present in the persisted
-sandbox spec's environment map (they are never baked into the K8s pod spec).
+GetSandboxProviderEnvironment gRPC call. Sandboxed child processes should see
+placeholder values, while the supervisor proxy resolves those placeholders back
+to the real credentials on outbound requests. Credentials must still never be
+present in the persisted sandbox spec environment map.
 """
 
 from __future__ import annotations
@@ -77,18 +78,96 @@ def _delete_provider(stub: object, name: str) -> None:
             raise
 
 
-# TODO: Once the sandbox supervisor sets provider credentials (rather than the
-# server injecting them via exec environment), these tests will no longer be
-# able to read credential values directly.  Update the assertions to verify
-# that the env vars are *present* (e.g. non-empty) without checking exact
-# values, since the supervisor will be the sole source of truth.
+_SANDBOX_IP = "10.200.0.2"
+_FORWARD_PROXY_PORT = 19879
+
+
+def _proxy_policy() -> sandbox_pb2.SandboxPolicy:
+    return sandbox_pb2.SandboxPolicy(
+        version=1,
+        filesystem=sandbox_pb2.FilesystemPolicy(
+            include_workdir=True,
+            read_only=["/usr", "/lib", "/etc", "/app"],
+            read_write=["/sandbox", "/tmp"],
+        ),
+        landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+        process=sandbox_pb2.ProcessPolicy(
+            run_as_user="sandbox", run_as_group="sandbox"
+        ),
+        network_policies={
+            "internal_http": sandbox_pb2.NetworkPolicyRule(
+                name="internal_http",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    )
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            )
+        },
+    )
+
+
+def _forward_proxy_reads_env_and_returns_auth_header():
+    def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
+        import os
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                auth = self.headers.get("Authorization", "MISSING")
+                body = auth.encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        time.sleep(0.5)
+
+        token = os.environ["ANTHROPIC_API_KEY"]
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            request = (
+                f"GET http://{target_host}:{target_port}/ HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                f"Authorization: Bearer {token}\r\n"
+                "Connection: close\r\n\r\n"
+            )
+            conn.sendall(request.encode())
+            data = b""
+            conn.settimeout(5)
+            while True:
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode("latin1")
+        finally:
+            conn.close()
+            server.server_close()
+
+    return fn
 
 
 def test_provider_credentials_available_as_env_vars(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Sandbox process can read provider credentials as environment variables."""
+    """Sandbox child processes see provider env vars as placeholders."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-env",
@@ -108,14 +187,16 @@ def test_provider_credentials_available_as_env_vars(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_env_var)
             assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "sk-e2e-test-key-12345"
+            value = result.stdout.strip()
+            assert value == "nemo-placeholder:env:ANTHROPIC_API_KEY"
+            assert value != "sk-e2e-test-key-12345"
 
 
 def test_generic_provider_credentials_available_as_env_vars(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Generic provider credentials are injected as arbitrary sandbox env vars."""
+    """Generic provider env vars are placeholders, not raw secrets."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-generic-provider-env",
@@ -142,7 +223,7 @@ def test_generic_provider_credentials_available_as_env_vars(
             assert result.exit_code == 0, result.stderr
             assert (
                 result.stdout.strip()
-                == "token-generic-123|https://internal.example.test/api"
+                == "nemo-placeholder:env:CUSTOM_SERVICE_TOKEN|nemo-placeholder:env:CUSTOM_SERVICE_URL"
             )
 
 
@@ -150,7 +231,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """NVIDIA provider projects NVIDIA_API_KEY into sandbox process env."""
+    """NVIDIA provider projects a placeholder env value into child processes."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-nvidia-provider-env",
@@ -170,7 +251,47 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "nvapi-e2e-test-key"
+            assert result.stdout.strip() == "nemo-placeholder:env:NVIDIA_API_KEY"
+
+
+def test_provider_placeholder_is_resolved_by_proxy_on_outbound_request(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-provider-proxy-rewrite",
+        provider_type="claude",
+        credentials={"ANTHROPIC_API_KEY": "sk-proxy-rewrite-12345"},
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_proxy_policy(),
+            providers=[provider_name],
+        )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(
+                _forward_proxy_reads_env_and_returns_auth_header(),
+                args=("10.200.0.1", 3128, _SANDBOX_IP, _FORWARD_PROXY_PORT),
+            )
+            assert result.exit_code == 0, result.stderr
+            assert "200 OK" in result.stdout
+            assert "Bearer sk-proxy-rewrite-12345" in result.stdout
+            assert "nemo-placeholder:env:ANTHROPIC_API_KEY" not in result.stdout
+
+
+def test_ssh_handshake_secret_not_visible_in_exec_environment(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    def read_handshake_secret() -> str:
+        import os
+
+        return os.environ.get("NEMOCLAW_SSH_HANDSHAKE_SECRET", "NOT_SET")
+
+    with sandbox(delete_on_exit=True) as sb:
+        result = sb.exec_python(read_handshake_secret)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.strip() == "NOT_SET"
 
 
 def test_create_sandbox_rejects_unknown_provider(
@@ -185,7 +306,7 @@ def test_create_sandbox_rejects_unknown_provider(
         sandbox_client.create(spec=spec)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-    assert "nonexistent-provider-xyz" in exc_info.value.details()
+    assert "nonexistent-provider-xyz" in (exc_info.value.details() or "")
 
 
 def test_credentials_not_in_persisted_spec_environment(

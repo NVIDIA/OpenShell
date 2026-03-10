@@ -8,6 +8,7 @@
 //! and chunked transfer encoding for body framing.
 
 use crate::l7::provider::{BodyLength, L7Provider, L7Request};
+use crate::secrets::rewrite_http_header_block;
 use miette::{IntoDiagnostic, Result, miette};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::debug;
@@ -121,27 +122,38 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    // Find the actual header end in raw_header
+    relay_http_request_with_resolver(req, client, upstream, None).await
+}
+
+pub(crate) async fn relay_http_request_with_resolver<C, U>(
+    req: &L7Request,
+    client: &mut C,
+    upstream: &mut U,
+    resolver: Option<&crate::secrets::SecretResolver>,
+) -> Result<bool>
+where
+    C: AsyncRead + AsyncWrite + Unpin,
+    U: AsyncRead + AsyncWrite + Unpin,
+{
     let header_end = req
         .raw_header
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
         .map_or(req.raw_header.len(), |p| p + 4);
 
-    // Forward request headers to upstream
+    let rewritten_header = rewrite_http_header_block(&req.raw_header[..header_end], resolver);
+
     upstream
-        .write_all(&req.raw_header[..header_end])
+        .write_all(&rewritten_header)
         .await
         .into_diagnostic()?;
 
-    // Forward any overflow body bytes that were read with headers
     let overflow = &req.raw_header[header_end..];
     if !overflow.is_empty() {
         upstream.write_all(overflow).await.into_diagnostic()?;
     }
     let overflow_len = overflow.len() as u64;
 
-    // Forward remaining request body
     match req.body_length {
         BodyLength::ContentLength(len) => {
             let remaining = len.saturating_sub(overflow_len);
@@ -155,8 +167,6 @@ where
         BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
-
-    // Read and forward response from upstream back to client
     relay_response(&req.action, upstream, client).await
 }
 
@@ -580,6 +590,7 @@ fn is_benign_close(err: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::secrets::SecretResolver;
 
     #[test]
     fn parse_content_length() {
@@ -929,5 +940,21 @@ mod tests {
         let mut received = Vec::new();
         client_read.read_to_end(&mut received).await.unwrap();
         assert!(String::from_utf8_lossy(&received).contains("hello"));
+    }
+
+    #[test]
+    fn rewrite_header_block_resolves_placeholder_auth_headers() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let raw = b"GET /v1/messages HTTP/1.1\r\nAuthorization: Bearer nemo-placeholder:env:ANTHROPIC_API_KEY\r\nHost: example.com\r\n\r\n";
+
+        let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
+        let rewritten = String::from_utf8(rewritten).expect("utf8");
+
+        assert!(rewritten.contains("Authorization: Bearer sk-test\r\n"));
+        assert!(!rewritten.contains("nemo-placeholder:env:ANTHROPIC_API_KEY"));
     }
 }

@@ -15,6 +15,7 @@ mod process;
 pub mod procfs;
 pub mod proxy;
 mod sandbox;
+mod secrets;
 mod ssh;
 
 use miette::{IntoDiagnostic, Result};
@@ -38,6 +39,7 @@ use crate::policy::{NetworkMode, NetworkPolicy, ProxyPolicy, SandboxPolicy};
 use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
+use crate::secrets::SecretResolver;
 pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
@@ -195,6 +197,9 @@ pub async fn run_sandbox(
         std::collections::HashMap::new()
     };
 
+    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    let secret_resolver = secret_resolver.map(Arc::new);
+
     // Create identity cache for SHA256 TOFU when OPA is active
     let identity_cache = opa_engine
         .as_ref()
@@ -311,6 +316,7 @@ pub async fn run_sandbox(
                 entrypoint_pid.clone(),
                 tls_state,
                 inference_ctx,
+                secret_resolver.clone(),
             )
             .await?,
         )
