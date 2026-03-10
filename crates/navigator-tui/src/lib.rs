@@ -25,9 +25,12 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use app::{App, ClusterEntry, Focus, LogLine, Screen};
 use event::{Event, EventHandler};
 
-/// Launch the NemoClaw TUI.
+/// Duration to show the splash screen before auto-dismissing.
+const SPLASH_DURATION: Duration = Duration::from_secs(3);
+
+/// Launch the OpenShell TUI.
 ///
-/// `channel` must be a connected gRPC channel to the NemoClaw gateway.
+/// `channel` must be a connected gRPC channel to the OpenShell gateway.
 pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result<()> {
     let client = NavigatorClient::new(channel);
     let mut app = App::new(client, cluster_name.to_string(), endpoint.to_string());
@@ -187,6 +190,15 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                 _ => {}
             },
             Some(Event::Tick) => {
+                // Auto-dismiss splash after SPLASH_DURATION.
+                if app.screen == Screen::Splash {
+                    if let Some(start) = app.splash_start {
+                        if start.elapsed() >= SPLASH_DURATION {
+                            app.dismiss_splash();
+                        }
+                    }
+                }
+
                 refresh_cluster_list(&mut app);
                 refresh_data(&mut app).await;
 

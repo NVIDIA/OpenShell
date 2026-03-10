@@ -15,6 +15,8 @@ use tonic::transport::Channel;
 /// Top-level screen (each is a full-screen layout with its own nav bar).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Screen {
+    /// Splash / boot screen shown on startup.
+    Splash,
     /// Cluster list + provider list + sandbox table.
     Dashboard,
     /// Single-sandbox view (detail + logs).
@@ -271,6 +273,9 @@ pub struct App {
     pub focus: Focus,
     pub command_input: String,
 
+    /// When the splash screen was shown (for auto-dismiss timing).
+    pub splash_start: Option<Instant>,
+
     // Active cluster connection
     pub cluster_name: String,
     pub endpoint: String,
@@ -354,10 +359,11 @@ impl App {
     pub fn new(client: NavigatorClient<Channel>, cluster_name: String, endpoint: String) -> Self {
         Self {
             running: true,
-            screen: Screen::Dashboard,
+            screen: Screen::Splash,
             input_mode: InputMode::Normal,
             focus: Focus::Clusters,
             command_input: String::new(),
+            splash_start: Some(Instant::now()),
             cluster_name,
             endpoint,
             client,
@@ -433,9 +439,23 @@ impl App {
     // Key handling
     // ------------------------------------------------------------------
 
+    /// Dismiss the splash screen and transition to the dashboard.
+    pub fn dismiss_splash(&mut self) {
+        if self.screen == Screen::Splash {
+            self.screen = Screen::Dashboard;
+            self.splash_start = None;
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.running = false;
+            return;
+        }
+
+        // Splash screen: any key dismisses.
+        if self.screen == Screen::Splash {
+            self.dismiss_splash();
             return;
         }
 
