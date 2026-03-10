@@ -875,11 +875,11 @@ enum SandboxCommands {
         /// working directory (`/sandbox`).
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
-        #[arg(long, value_hint = ValueHint::AnyPath)]
+        #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "Upload Options")]
         upload: Option<String>,
 
         /// Disable `.gitignore` filtering for `--upload`.
-        #[arg(long, requires = "upload")]
+        #[arg(long, requires = "upload", help_heading = "Upload Options")]
         no_git_ignore: bool,
 
         /// Keep the sandbox alive after non-interactive commands.
@@ -889,11 +889,11 @@ enum SandboxCommands {
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
-        #[arg(long)]
+        #[arg(long, help_heading = "Bootstrap Options")]
         remote: Option<String>,
 
         /// Path to SSH private key for remote bootstrap.
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long, value_hint = ValueHint::FilePath, help_heading = "Bootstrap Options")]
         ssh_key: Option<String>,
 
         /// Provider names to attach to this sandbox.
@@ -925,11 +925,15 @@ enum SandboxCommands {
         ///
         /// Without this flag, an interactive prompt asks whether to bootstrap;
         /// in non-interactive mode the command errors.
-        #[arg(long, overrides_with = "no_bootstrap")]
+        #[arg(
+            long,
+            overrides_with = "no_bootstrap",
+            help_heading = "Bootstrap Options"
+        )]
         bootstrap: bool,
 
         /// Never bootstrap a gateway automatically; error if none is available.
-        #[arg(long, overrides_with = "bootstrap")]
+        #[arg(long, overrides_with = "bootstrap", help_heading = "Bootstrap Options")]
         no_bootstrap: bool,
 
         /// Auto-create missing providers from local credentials.
