@@ -21,11 +21,9 @@ If you run a non-Claude agent without a custom policy, the agent's API calls are
 
 ## What the Default Policy Allows
 
-The default policy defines six network policy blocks, filesystem isolation, Landlock enforcement, and process identity. To view the default policy, check the [`deploy/docker/sandbox/dev-sandbox-policy.yaml`](https://github.com/NVIDIA/NemoClaw/blob/main/deploy/docker/sandbox/dev-sandbox-policy.yaml) file.
+The default policy defines six network policy blocks, filesystem isolation, Landlock enforcement, and process identity.
 
-<!-- On hold until devs confirm this is the correct policy 
-
-The tables below are generated from [`deploy/docker/sandbox/dev-sandbox-policy.yaml`](https://github.com/NVIDIA/NemoClaw/blob/main/deploy/docker/sandbox/dev-sandbox-policy.yaml).
+The following tables show the default policy blocks that are generated from [`deploy/docker/sandbox/dev-sandbox-policy.yaml`](https://github.com/NVIDIA/NemoClaw/blob/main/deploy/docker/sandbox/dev-sandbox-policy.yaml).
 
 ```{policy-table} deploy/docker/sandbox/dev-sandbox-policy.yaml
 ```
