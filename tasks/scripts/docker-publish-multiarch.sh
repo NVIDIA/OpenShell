@@ -151,61 +151,99 @@ resolve_dockerfile() {
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: Build and push component images as multi-arch manifests.
-# These use cross-compilation in the Dockerfile (BUILDPLATFORM != TARGETPLATFORM)
-# so Rust compiles natively and only the final stage runs on the target arch.
+# Step 1: Build and push all images in parallel.
+#
+# sandbox, server, and cluster are independent builds. The cluster image
+# requires the helm chart to be packaged first (it COPYs from
+# deploy/docker/.build/charts/), so we package the chart before launching
+# the cluster build. All three docker buildx builds then run concurrently
+# as background jobs.
 # ---------------------------------------------------------------------------
-echo "Building multi-arch component images..."
-LOCK_HASH=$(sha256_16 Cargo.lock)
-for component in sandbox server; do
-  echo "Building ${IMAGE_PREFIX}${component} for ${PLATFORMS}..."
-  BUILD_ARGS=""
-  if [ "$component" = "sandbox" ]; then
-    BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
-  fi
-  BUILD_ARGS="${BUILD_ARGS} --build-arg NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}"
-  if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
-    BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
-  fi
-  DOCKERFILE=$(resolve_dockerfile "${component}")
-  RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
-  CACHE_SCOPE_INPUT="v1|${component}|base|${LOCK_HASH}|${RUST_SCOPE}"
-  CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
-  BUILD_ARGS="${BUILD_ARGS} --build-arg CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
-  FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
-  docker buildx build \
-    --platform "${PLATFORMS}" \
-    -f "${DOCKERFILE}" \
-    -t "${FULL_IMAGE}:${IMAGE_TAG}" \
-    ${EXTRA_BUILD_FLAGS} \
-    ${BUILD_ARGS} \
-    --push \
-    .
-done
 
-# ---------------------------------------------------------------------------
-# Step 2: Package helm charts (architecture-independent)
-# ---------------------------------------------------------------------------
+# Package helm charts first (needed by cluster Dockerfile).
 mkdir -p deploy/docker/.build/charts
 echo "Packaging navigator helm chart..."
 helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 
-# ---------------------------------------------------------------------------
-# Step 3: Build and push multi-arch cluster image.
-# Component images are no longer bundled — they are pulled at runtime via
-# the distribution registry; credentials are injected at deploy time.
-# ---------------------------------------------------------------------------
 echo ""
-echo "Building multi-arch cluster image..."
-CLUSTER_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster"
-docker buildx build \
-  --platform "${PLATFORMS}" \
-  -f deploy/docker/Dockerfile.cluster \
-  -t "${CLUSTER_IMAGE}:${IMAGE_TAG}" \
-  ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
-  ${EXTRA_BUILD_FLAGS} \
-  --push \
-  .
+echo "Building all multi-arch images in parallel..."
+
+LOCK_HASH=$(sha256_16 Cargo.lock)
+BUILD_PIDS=()
+BUILD_COMPONENTS=()
+BUILD_LOGS_DIR=$(mktemp -d)
+
+# Launch component image builds (sandbox, server) in parallel.
+for component in sandbox server; do
+  (
+    echo "Building ${IMAGE_PREFIX}${component} for ${PLATFORMS}..."
+    BUILD_ARGS=""
+    if [ "$component" = "sandbox" ]; then
+      BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
+    fi
+    BUILD_ARGS="${BUILD_ARGS} --build-arg NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}"
+    if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
+      BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
+    fi
+    DOCKERFILE=$(resolve_dockerfile "${component}")
+    RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
+    CACHE_SCOPE_INPUT="v1|${component}|base|${LOCK_HASH}|${RUST_SCOPE}"
+    CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
+    BUILD_ARGS="${BUILD_ARGS} --build-arg CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
+    FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
+    docker buildx build \
+      --platform "${PLATFORMS}" \
+      -f "${DOCKERFILE}" \
+      -t "${FULL_IMAGE}:${IMAGE_TAG}" \
+      ${EXTRA_BUILD_FLAGS} \
+      ${BUILD_ARGS} \
+      --push \
+      .
+  ) > "${BUILD_LOGS_DIR}/${component}.log" 2>&1 &
+  BUILD_PIDS+=($!)
+  BUILD_COMPONENTS+=("${component}")
+done
+
+# Launch cluster image build in parallel with the component builds.
+(
+  echo "Building multi-arch cluster image..."
+  CLUSTER_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster"
+  docker buildx build \
+    --platform "${PLATFORMS}" \
+    -f deploy/docker/Dockerfile.cluster \
+    -t "${CLUSTER_IMAGE}:${IMAGE_TAG}" \
+    ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
+    ${EXTRA_BUILD_FLAGS} \
+    --push \
+    .
+) > "${BUILD_LOGS_DIR}/cluster.log" 2>&1 &
+BUILD_PIDS+=($!)
+BUILD_COMPONENTS+=("cluster")
+
+# Wait for all builds and collect results.
+FAILED=0
+for i in "${!BUILD_PIDS[@]}"; do
+  pid=${BUILD_PIDS[$i]}
+  comp=${BUILD_COMPONENTS[$i]}
+  if wait "$pid"; then
+    echo "✓ ${comp} build succeeded"
+  else
+    echo "✗ ${comp} build FAILED"
+    FAILED=1
+  fi
+  # Stream the build log regardless of success/failure.
+  echo "--- ${comp} build log ---"
+  cat "${BUILD_LOGS_DIR}/${comp}.log"
+  echo "--- end ${comp} ---"
+  echo ""
+done
+
+rm -rf "${BUILD_LOGS_DIR}"
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "One or more builds failed!" >&2
+  exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Step 4: Apply additional tags by copying manifests.
