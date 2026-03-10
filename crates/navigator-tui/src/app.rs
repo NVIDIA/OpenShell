@@ -307,6 +307,7 @@ pub struct App {
     pub sandbox_created: Vec<String>,
     pub sandbox_images: Vec<String>,
     pub sandbox_notes: Vec<String>,
+    pub sandbox_policy_versions: Vec<u32>,
     pub sandbox_selected: usize,
     pub sandbox_count: usize,
 
@@ -384,6 +385,7 @@ impl App {
             sandbox_created: Vec::new(),
             sandbox_images: Vec::new(),
             sandbox_notes: Vec::new(),
+            sandbox_policy_versions: Vec::new(),
             sandbox_selected: 0,
             sandbox_count: 0,
             confirm_delete: false,
@@ -1297,6 +1299,7 @@ impl App {
         self.sandbox_created.clear();
         self.sandbox_images.clear();
         self.sandbox_notes.clear();
+        self.sandbox_policy_versions.clear();
         self.sandbox_selected = 0;
         self.sandbox_count = 0;
         self.sandbox_log_lines.clear();

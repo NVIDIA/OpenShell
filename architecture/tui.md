@@ -114,6 +114,8 @@ Press `Esc` to cancel and return to Normal mode. `Backspace` deletes characters 
 
 The TUI automatically polls the cluster every **2 seconds**. Both cluster health and the sandbox list update on each tick, so the display stays current without manual refreshing. This uses the same gRPC calls as the CLI — no additional server-side setup is required.
 
+When viewing a sandbox, the policy pane auto-refreshes when a new policy version is detected. The sandbox list response includes `current_policy_version` for each sandbox; on every tick the TUI compares this against the currently displayed policy version and re-fetches the full policy only when they differ. This avoids extra RPCs during normal operation while ensuring policy updates appear within the polling interval. The user's scroll position is preserved across auto-refreshes.
+
 ## Theme
 
 The TUI uses a dark terminal theme based on the NVIDIA brand palette:
