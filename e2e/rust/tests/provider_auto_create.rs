@@ -7,10 +7,11 @@
 //!
 //! When `--provider claude` is passed and no provider named "claude" exists,
 //! the CLI should discover `ANTHROPIC_API_KEY` from the local environment,
-//! auto-create a provider, and inject its credentials into the sandbox.
+//! auto-create a provider, and inject a supervisor-managed placeholder into the
+//! sandbox child process environment.
 //!
 //! The sandbox command (`printenv ANTHROPIC_API_KEY`) verifies that the
-//! credential made it all the way through to the sandbox process environment.
+//! placeholder made it all the way through to the sandbox process environment.
 //!
 //! Prerequisites:
 //! - A running openshell gateway (`openshell gateway start`)
@@ -22,6 +23,7 @@ use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
+const TEST_API_KEY_PLACEHOLDER: &str = "nemo-placeholder:env:ANTHROPIC_API_KEY";
 
 /// Helper: delete a provider by name, ignoring errors.
 async fn delete_provider(name: &str) {
@@ -46,7 +48,7 @@ async fn delete_sandbox(name: &str) {
 }
 
 /// `--provider claude --auto-providers` with `ANTHROPIC_API_KEY` set should
-/// auto-create a "claude" provider and inject the credential into the sandbox.
+/// auto-create a "claude" provider and inject a placeholder into the sandbox.
 #[tokio::test]
 async fn auto_created_provider_credential_available_in_sandbox() {
     // Clean up any leftover from a previous run.
@@ -100,7 +102,12 @@ async fn auto_created_provider_credential_available_in_sandbox() {
     );
 
     assert!(
-        clean.contains(TEST_API_KEY),
-        "sandbox should have ANTHROPIC_API_KEY in its environment:\n{clean}"
+        clean.contains(TEST_API_KEY_PLACEHOLDER),
+        "sandbox should have placeholder ANTHROPIC_API_KEY in its environment:\n{clean}"
+    );
+
+    assert!(
+        !clean.contains(TEST_API_KEY),
+        "sandbox should not expose the raw ANTHROPIC_API_KEY secret:\n{clean}"
     );
 }
