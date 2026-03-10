@@ -44,31 +44,13 @@ enum InferenceOutcome {
     Denied { reason: String },
 }
 
-/// Configuration for the background route-refresh loop.
-///
-/// Stored on [`InferenceContext`] so the refresh task can be spawned lazily on
-/// the first inference request instead of unconditionally at startup.
-pub struct RouteRefreshConfig {
-    pub endpoint: String,
-    pub interval_secs: u64,
-    pub initial_revision: Option<String>,
-}
-
 /// Inference routing context for sandbox-local execution.
 ///
 /// Holds a `Router` (HTTP client) and a cached set of resolved routes.
-/// In cluster mode the background refresh loop is spawned lazily on the first
-/// inference request (see [`ensure_refresh_started`]) so sandboxes that never
-/// use inference never poll.
 pub struct InferenceContext {
     pub patterns: Vec<crate::l7::inference::InferenceApiPattern>,
     router: navigator_router::Router,
     routes: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
-    /// Set once the background refresh task has been spawned. `None` for
-    /// file-based routes (no refresh needed).
-    refresh_started: tokio::sync::OnceCell<()>,
-    /// Configuration consumed by the first call to [`ensure_refresh_started`].
-    refresh_config: std::sync::Mutex<Option<RouteRefreshConfig>>,
 }
 
 impl InferenceContext {
@@ -76,68 +58,19 @@ impl InferenceContext {
         patterns: Vec<crate::l7::inference::InferenceApiPattern>,
         router: navigator_router::Router,
         routes: Vec<navigator_router::config::ResolvedRoute>,
-        refresh_config: Option<RouteRefreshConfig>,
     ) -> Self {
         Self {
             patterns,
             router,
             routes: Arc::new(tokio::sync::RwLock::new(routes)),
-            refresh_started: tokio::sync::OnceCell::new(),
-            refresh_config: std::sync::Mutex::new(refresh_config),
         }
     }
 
-    /// Get a handle to the route cache (used in tests to inspect cached routes).
-    #[cfg(test)]
+    /// Get a handle to the route cache for background refresh.
     pub fn route_cache(
         &self,
     ) -> Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>> {
         self.routes.clone()
-    }
-
-    /// Ensure the route cache is fresh and the background refresh loop is
-    /// running. On the first call this fetches the latest bundle from the
-    /// gateway (so callers never see stale startup-time routes) and then
-    /// spawns the periodic refresh task. Subsequent calls are a no-op
-    /// (single atomic load via `OnceCell`).
-    pub async fn ensure_refresh_started(&self) {
-        self.refresh_started
-            .get_or_init(|| async {
-                let config = self.refresh_config.lock().expect("lock poisoned").take();
-                if let Some(cfg) = config {
-                    // Fetch fresh routes so the very first inference call never
-                    // uses stale startup-time data.
-                    let initial_revision =
-                        match crate::grpc_client::fetch_inference_bundle(&cfg.endpoint).await {
-                            Ok(bundle) => {
-                                let revision = bundle.revision.clone();
-                                let routes = crate::bundle_to_resolved_routes(&bundle);
-                                info!(
-                                    route_count = routes.len(),
-                                    revision = %revision,
-                                    "Refreshed inference routes on first call"
-                                );
-                                *self.routes.write().await = routes;
-                                Some(revision)
-                            }
-                            Err(e) => {
-                                warn!(
-                                    error = %e,
-                                    "Failed to refresh routes on first call, using startup routes"
-                                );
-                                cfg.initial_revision
-                            }
-                        };
-
-                    crate::spawn_route_refresh(
-                        self.routes.clone(),
-                        cfg.endpoint,
-                        cfg.interval_secs,
-                        initial_revision,
-                    );
-                }
-            })
-            .await;
     }
 }
 
@@ -835,10 +768,6 @@ async fn route_inference_request(
             kind = %pattern.kind,
             "Intercepted inference request, routing locally"
         );
-
-        // Lazily start the background route-refresh loop on the first
-        // inference call so sandboxes that never use inference never poll.
-        ctx.ensure_refresh_started().await;
 
         // Strip credential + framing/hop-by-hop headers.
         let filtered_headers = sanitize_inference_request_headers(&request.headers);
