@@ -46,11 +46,16 @@ enum InferenceOutcome {
 
 /// Inference routing context for sandbox-local execution.
 ///
-/// Holds a `Router` (HTTP client) and a cached set of resolved routes.
+/// Holds a `Router` (HTTP client) and cached sets of resolved routes.
+/// User routes serve `inference.local` traffic; system routes are consumed
+/// in-process by the supervisor for platform functions (e.g. agent harness).
 pub struct InferenceContext {
     pub patterns: Vec<crate::l7::inference::InferenceApiPattern>,
     router: navigator_router::Router,
+    /// Routes for the user-facing `inference.local` endpoint.
     routes: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
+    /// Routes for supervisor-only system inference (`sandbox-system`).
+    system_routes: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
 }
 
 impl InferenceContext {
@@ -58,19 +63,47 @@ impl InferenceContext {
         patterns: Vec<crate::l7::inference::InferenceApiPattern>,
         router: navigator_router::Router,
         routes: Vec<navigator_router::config::ResolvedRoute>,
+        system_routes: Vec<navigator_router::config::ResolvedRoute>,
     ) -> Self {
         Self {
             patterns,
             router,
             routes: Arc::new(tokio::sync::RwLock::new(routes)),
+            system_routes: Arc::new(tokio::sync::RwLock::new(system_routes)),
         }
     }
 
-    /// Get a handle to the route cache for background refresh.
+    /// Get a handle to the user route cache for background refresh.
     pub fn route_cache(
         &self,
     ) -> Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>> {
         self.routes.clone()
+    }
+
+    /// Get a handle to the system route cache for background refresh.
+    pub fn system_route_cache(
+        &self,
+    ) -> Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>> {
+        self.system_routes.clone()
+    }
+
+    /// Make an inference call using system routes (supervisor-only).
+    ///
+    /// This is the in-process API for platform functions. It bypasses the
+    /// CONNECT proxy entirely — the supervisor calls the router directly
+    /// from the host network namespace.
+    pub async fn system_inference(
+        &self,
+        protocol: &str,
+        method: &str,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: bytes::Bytes,
+    ) -> Result<navigator_router::ProxyResponse, navigator_router::RouterError> {
+        let routes = self.system_routes.read().await;
+        self.router
+            .proxy_with_candidates(protocol, method, path, headers, body, &routes)
+            .await
     }
 }
 

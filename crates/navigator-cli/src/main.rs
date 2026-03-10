@@ -819,6 +819,12 @@ enum ClusterInferenceCommands {
         /// Model identifier to force for generation calls.
         #[arg(long)]
         model: String,
+
+        /// Configure the sandbox system inference route instead of the
+        /// user-facing route. System inference is used by platform functions
+        /// (e.g. the agent harness) and is not accessible to user code.
+        #[arg(long)]
+        sandbox: bool,
     },
 
     /// Update cluster-level inference configuration (partial update).
@@ -830,10 +836,19 @@ enum ClusterInferenceCommands {
         /// Model identifier (unchanged if omitted).
         #[arg(long)]
         model: Option<String>,
+
+        /// Target the sandbox system inference route.
+        #[arg(long)]
+        sandbox: bool,
     },
 
     /// Get cluster-level inference provider and model.
-    Get,
+    Get {
+        /// Show the sandbox system inference route instead of the user-facing route.
+        /// When omitted, both routes are displayed.
+        #[arg(long)]
+        sandbox: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1449,20 +1464,37 @@ async fn main() -> Result<()> {
             let mut tls = tls.with_cluster_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             match command {
-                ClusterInferenceCommands::Set { provider, model } => {
-                    run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                ClusterInferenceCommands::Set {
+                    provider,
+                    model,
+                    sandbox,
+                } => {
+                    let route_name = if sandbox { "sandbox-system" } else { "" };
+                    run::cluster_inference_set(endpoint, &provider, &model, route_name, &tls)
+                        .await?;
                 }
-                ClusterInferenceCommands::Update { provider, model } => {
+                ClusterInferenceCommands::Update {
+                    provider,
+                    model,
+                    sandbox,
+                } => {
+                    let route_name = if sandbox { "sandbox-system" } else { "" };
                     run::cluster_inference_update(
                         endpoint,
                         provider.as_deref(),
                         model.as_deref(),
+                        route_name,
                         &tls,
                     )
                     .await?;
                 }
-                ClusterInferenceCommands::Get => {
-                    run::cluster_inference_get(endpoint, &tls).await?;
+                ClusterInferenceCommands::Get { sandbox } => {
+                    let route_name = if sandbox {
+                        Some("sandbox-system")
+                    } else {
+                        None
+                    };
+                    run::cluster_inference_get(endpoint, route_name, &tls).await?;
                 }
             }
         }
@@ -1846,20 +1878,37 @@ async fn main() -> Result<()> {
                 let mut tls = tls.with_cluster_name(&ctx.name);
                 apply_edge_auth(&mut tls, &ctx.name);
                 match command {
-                    ClusterInferenceCommands::Set { provider, model } => {
-                        run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                    ClusterInferenceCommands::Set {
+                        provider,
+                        model,
+                        sandbox,
+                    } => {
+                        let route_name = if sandbox { "sandbox-system" } else { "" };
+                        run::cluster_inference_set(endpoint, &provider, &model, route_name, &tls)
+                            .await?;
                     }
-                    ClusterInferenceCommands::Update { provider, model } => {
+                    ClusterInferenceCommands::Update {
+                        provider,
+                        model,
+                        sandbox,
+                    } => {
+                        let route_name = if sandbox { "sandbox-system" } else { "" };
                         run::cluster_inference_update(
                             endpoint,
                             provider.as_deref(),
                             model.as_deref(),
+                            route_name,
                             &tls,
                         )
                         .await?;
                     }
-                    ClusterInferenceCommands::Get => {
-                        run::cluster_inference_get(endpoint, &tls).await?;
+                    ClusterInferenceCommands::Get { sandbox } => {
+                        let route_name = if sandbox {
+                            Some("sandbox-system")
+                        } else {
+                            None
+                        };
+                        run::cluster_inference_get(endpoint, route_name, &tls).await?;
                     }
                 }
             }

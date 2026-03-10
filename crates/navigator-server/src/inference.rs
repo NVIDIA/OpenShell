@@ -26,6 +26,20 @@ impl InferenceService {
 }
 
 const CLUSTER_INFERENCE_ROUTE_NAME: &str = "inference.local";
+const SANDBOX_SYSTEM_ROUTE_NAME: &str = "sandbox-system";
+
+/// Map a request `route_name` to the canonical store key.
+///
+/// Empty string defaults to `CLUSTER_INFERENCE_ROUTE_NAME` for backward compat.
+fn effective_route_name(name: &str) -> Result<&str, Status> {
+    match name.trim() {
+        "" | "inference.local" => Ok(CLUSTER_INFERENCE_ROUTE_NAME),
+        "sandbox-system" => Ok(SANDBOX_SYSTEM_ROUTE_NAME),
+        other => Err(Status::invalid_argument(format!(
+            "unknown route_name '{other}'; expected 'inference.local' or 'sandbox-system'"
+        ))),
+    }
+}
 
 impl ObjectType for InferenceRoute {
     fn object_type() -> &'static str {
@@ -61,8 +75,10 @@ impl Inference for InferenceService {
         request: Request<SetClusterInferenceRequest>,
     ) -> Result<Response<SetClusterInferenceResponse>, Status> {
         let req = request.into_inner();
+        let route_name = effective_route_name(&req.route_name)?;
         let route = upsert_cluster_inference_route(
             self.state.store.as_ref(),
+            route_name,
             &req.provider_name,
             &req.model_id,
         )
@@ -77,23 +93,26 @@ impl Inference for InferenceService {
             provider_name: config.provider_name.clone(),
             model_id: config.model_id.clone(),
             version: route.version,
+            route_name: route_name.to_string(),
         }))
     }
 
     async fn get_cluster_inference(
         &self,
-        _request: Request<GetClusterInferenceRequest>,
+        request: Request<GetClusterInferenceRequest>,
     ) -> Result<Response<GetClusterInferenceResponse>, Status> {
+        let req = request.into_inner();
+        let route_name = effective_route_name(&req.route_name)?;
         let route = self
             .state
             .store
-            .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
+            .get_message_by_name::<InferenceRoute>(route_name)
             .await
             .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?
             .ok_or_else(|| {
-                Status::not_found(
-                    "cluster inference is not configured; run 'openshell cluster inference set --provider <name> --model <id>'",
-                )
+                Status::not_found(format!(
+                    "inference route '{route_name}' is not configured; run 'openshell cluster inference set --provider <name> --model <id>'"
+                ))
             })?;
 
         let config = route
@@ -111,12 +130,14 @@ impl Inference for InferenceService {
             provider_name: config.provider_name.clone(),
             model_id: config.model_id.clone(),
             version: route.version,
+            route_name: route_name.to_string(),
         }))
     }
 }
 
 async fn upsert_cluster_inference_route(
     store: &Store,
+    route_name: &str,
     provider_name: &str,
     model_id: &str,
 ) -> Result<InferenceRoute, Status> {
@@ -142,7 +163,7 @@ async fn upsert_cluster_inference_route(
     let config = build_cluster_inference_config(&provider, model_id);
 
     let existing = store
-        .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
+        .get_message_by_name::<InferenceRoute>(route_name)
         .await
         .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
 
@@ -156,7 +177,7 @@ async fn upsert_cluster_inference_route(
     } else {
         InferenceRoute {
             id: uuid::Uuid::new_v4().to_string(),
-            name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
+            name: route_name.to_string(),
             config: Some(config),
             version: 1,
         }
@@ -256,12 +277,15 @@ fn find_provider_config_value(provider: &Provider, preferred_keys: &[&str]) -> O
     None
 }
 
-/// Resolve the inference bundle (managed cluster route + revision hash).
+/// Resolve the inference bundle (all managed routes + revision hash).
 async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleResponse, Status> {
-    let routes = resolve_managed_cluster_route(store)
-        .await?
-        .into_iter()
-        .collect::<Vec<_>>();
+    let mut routes = Vec::new();
+    if let Some(r) = resolve_route_by_name(store, CLUSTER_INFERENCE_ROUTE_NAME).await? {
+        routes.push(r);
+    }
+    if let Some(r) = resolve_route_by_name(store, SANDBOX_SYSTEM_ROUTE_NAME).await? {
+        routes.push(r);
+    }
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -290,9 +314,12 @@ async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleRes
     })
 }
 
-async fn resolve_managed_cluster_route(store: &Store) -> Result<Option<ResolvedRoute>, Status> {
+async fn resolve_route_by_name(
+    store: &Store,
+    route_name: &str,
+) -> Result<Option<ResolvedRoute>, Status> {
     let route = store
-        .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
+        .get_message_by_name::<InferenceRoute>(route_name)
         .await
         .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
 
@@ -305,15 +332,15 @@ async fn resolve_managed_cluster_route(store: &Store) -> Result<Option<ResolvedR
     };
 
     if config.provider_name.trim().is_empty() {
-        return Err(Status::failed_precondition(
-            "managed route is missing provider_name",
-        ));
+        return Err(Status::failed_precondition(format!(
+            "route '{route_name}' is missing provider_name"
+        )));
     }
 
     if config.model_id.trim().is_empty() {
-        return Err(Status::failed_precondition(
-            "managed route is missing model_id",
-        ));
+        return Err(Status::failed_precondition(format!(
+            "route '{route_name}' is missing model_id"
+        )));
     }
 
     let provider = store
@@ -330,7 +357,7 @@ async fn resolve_managed_cluster_route(store: &Store) -> Result<Option<ResolvedR
     let resolved = resolve_provider_route(&provider)?;
 
     Ok(Some(ResolvedRoute {
-        name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
+        name: route_name.to_string(),
         base_url: resolved.base_url,
         model_id: config.model_id.clone(),
         api_key: resolved.api_key,
@@ -377,15 +404,25 @@ mod tests {
             .await
             .expect("provider should persist");
 
-        let first = upsert_cluster_inference_route(&store, "openai-dev", "gpt-4o")
-            .await
-            .expect("first set should succeed");
+        let first = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4o",
+        )
+        .await
+        .expect("first set should succeed");
         assert_eq!(first.name, CLUSTER_INFERENCE_ROUTE_NAME);
         assert_eq!(first.version, 1);
 
-        let second = upsert_cluster_inference_route(&store, "openai-dev", "gpt-4.1")
-            .await
-            .expect("second set should succeed");
+        let second = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4.1",
+        )
+        .await
+        .expect("second set should succeed");
         assert_eq!(second.version, 2);
         assert_eq!(second.id, first.id);
 
@@ -400,7 +437,7 @@ mod tests {
             .await
             .expect("store should connect");
 
-        let route = resolve_managed_cluster_route(&store)
+        let route = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("resolution should not fail");
         assert!(route.is_none());
@@ -516,7 +553,7 @@ mod tests {
             .await
             .expect("route should persist");
 
-        let managed = resolve_managed_cluster_route(&store)
+        let managed = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
             .expect("managed route should exist");
@@ -553,7 +590,7 @@ mod tests {
             .await
             .expect("route should persist");
 
-        let first = resolve_managed_cluster_route(&store)
+        let first = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
             .expect("managed route should exist");
@@ -572,10 +609,154 @@ mod tests {
             .await
             .expect("provider rotation should persist");
 
-        let second = resolve_managed_cluster_route(&store)
+        let second = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
             .expect("managed route should exist");
         assert_eq!(second.api_key, "sk-rotated");
+    }
+
+    #[tokio::test]
+    async fn upsert_system_route_creates_with_correct_name() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let provider = make_provider("anthropic-dev", "anthropic", "ANTHROPIC_API_KEY", "sk-ant");
+        store.put_message(&provider).await.expect("persist");
+
+        let route = upsert_cluster_inference_route(
+            &store,
+            SANDBOX_SYSTEM_ROUTE_NAME,
+            "anthropic-dev",
+            "claude-sonnet-4-20250514",
+        )
+        .await
+        .expect("should succeed");
+
+        assert_eq!(route.name, SANDBOX_SYSTEM_ROUTE_NAME);
+        assert_eq!(route.version, 1);
+        let config = route.config.as_ref().expect("config");
+        assert_eq!(config.provider_name, "anthropic-dev");
+        assert_eq!(config.model_id, "claude-sonnet-4-20250514");
+    }
+
+    #[tokio::test]
+    async fn bundle_includes_both_user_and_system_routes() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-oai");
+        store.put_message(&openai).await.expect("persist openai");
+        let anthropic = make_provider("anthropic-dev", "anthropic", "ANTHROPIC_API_KEY", "sk-ant");
+        store
+            .put_message(&anthropic)
+            .await
+            .expect("persist anthropic");
+
+        let user_route = make_route(CLUSTER_INFERENCE_ROUTE_NAME, "openai-dev", "gpt-4o");
+        store
+            .put_message(&user_route)
+            .await
+            .expect("persist user route");
+        let system_route = make_route(
+            SANDBOX_SYSTEM_ROUTE_NAME,
+            "anthropic-dev",
+            "claude-sonnet-4-20250514",
+        );
+        store
+            .put_message(&system_route)
+            .await
+            .expect("persist system route");
+
+        let resp = resolve_inference_bundle(&store)
+            .await
+            .expect("bundle should resolve");
+
+        assert_eq!(resp.routes.len(), 2);
+        assert_eq!(resp.routes[0].name, CLUSTER_INFERENCE_ROUTE_NAME);
+        assert_eq!(resp.routes[0].model_id, "gpt-4o");
+        assert_eq!(resp.routes[1].name, SANDBOX_SYSTEM_ROUTE_NAME);
+        assert_eq!(resp.routes[1].model_id, "claude-sonnet-4-20250514");
+    }
+
+    #[tokio::test]
+    async fn bundle_with_only_system_route() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
+        store.put_message(&provider).await.expect("persist");
+        let system_route = make_route(SANDBOX_SYSTEM_ROUTE_NAME, "openai-dev", "gpt-4o-mini");
+        store.put_message(&system_route).await.expect("persist");
+
+        let resp = resolve_inference_bundle(&store)
+            .await
+            .expect("bundle should resolve");
+
+        assert_eq!(resp.routes.len(), 1);
+        assert_eq!(resp.routes[0].name, SANDBOX_SYSTEM_ROUTE_NAME);
+        assert_eq!(resp.routes[0].model_id, "gpt-4o-mini");
+    }
+
+    #[tokio::test]
+    async fn get_returns_system_route_when_requested() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let provider = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-test");
+        store.put_message(&provider).await.expect("persist");
+
+        upsert_cluster_inference_route(
+            &store,
+            SANDBOX_SYSTEM_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4o-mini",
+        )
+        .await
+        .expect("upsert should succeed");
+
+        let route = store
+            .get_message_by_name::<InferenceRoute>(SANDBOX_SYSTEM_ROUTE_NAME)
+            .await
+            .expect("fetch should succeed")
+            .expect("route should exist");
+
+        assert_eq!(route.name, SANDBOX_SYSTEM_ROUTE_NAME);
+        let config = route.config.as_ref().expect("config");
+        assert_eq!(config.model_id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn effective_route_name_defaults_empty_to_inference_local() {
+        assert_eq!(
+            effective_route_name("").unwrap(),
+            CLUSTER_INFERENCE_ROUTE_NAME
+        );
+        assert_eq!(
+            effective_route_name("  ").unwrap(),
+            CLUSTER_INFERENCE_ROUTE_NAME
+        );
+        assert_eq!(
+            effective_route_name("inference.local").unwrap(),
+            CLUSTER_INFERENCE_ROUTE_NAME
+        );
+    }
+
+    #[test]
+    fn effective_route_name_accepts_sandbox_system() {
+        assert_eq!(
+            effective_route_name("sandbox-system").unwrap(),
+            SANDBOX_SYSTEM_ROUTE_NAME
+        );
+    }
+
+    #[test]
+    fn effective_route_name_rejects_unknown_name() {
+        let err = effective_route_name("unknown-route").unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

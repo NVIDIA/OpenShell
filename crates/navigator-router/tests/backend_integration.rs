@@ -8,6 +8,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn mock_candidates(base_url: &str) -> Vec<ResolvedRoute> {
     vec![ResolvedRoute {
+        name: "inference.local".to_string(),
         endpoint: base_url.to_string(),
         model: "meta/llama-3.1-8b-instruct".to_string(),
         api_key: "test-api-key".to_string(),
@@ -109,6 +110,7 @@ async fn proxy_upstream_401_returns_error() {
 async fn proxy_no_compatible_route_returns_error() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
         endpoint: "http://localhost:1234".to_string(),
         model: "test".to_string(),
         api_key: "key".to_string(),
@@ -169,6 +171,7 @@ async fn proxy_strips_auth_header() {
 async fn proxy_mock_route_returns_canned_response() {
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
         endpoint: "mock://test".to_string(),
         model: "mock/test-model".to_string(),
         api_key: "unused".to_string(),
@@ -302,6 +305,7 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
 
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
         endpoint: mock_server.uri(),
         model: "claude-sonnet-4-20250514".to_string(),
         api_key: "test-anthropic-key".to_string(),
@@ -359,6 +363,7 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
 
     let router = Router::new().unwrap();
     let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
         endpoint: mock_server.uri(),
         model: "claude-sonnet-4-20250514".to_string(),
         api_key: "anthropic-key".to_string(),
