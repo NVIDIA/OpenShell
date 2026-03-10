@@ -24,7 +24,7 @@ Create a provider that holds the backend credentials you want OpenShell to use.
 $ nemoclaw provider create --name nvidia-prod --type nvidia --from-existing
 ```
 
-You can also use `openai` or `claude` providers.
+You can also use `openai` or `anthropic` providers.
 
 ## Step 2: Set Inference Routing
 
@@ -33,7 +33,7 @@ Point `inference.local` at that provider and choose the model to use:
 ```console
 $ nemoclaw inference set \
     --provider nvidia-prod \
-    --model meta/llama-3.1-8b-instruct
+    --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
 This sets the managed inference configuration.
@@ -43,7 +43,7 @@ This sets the managed inference configuration.
 ```console
 $ nemoclaw inference get
 provider: nvidia-prod
-model:    meta/llama-3.1-8b-instruct
+model:    nvidia/nemotron-3-nano-30b-a3b
 version:  1
 ```
 
@@ -52,7 +52,7 @@ version:  1
 Use `update` when you want to change only one field:
 
 ```console
-$ nemoclaw inference update --model meta/llama-3.3-70b-instruct
+$ nemoclaw inference update --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
 Or switch providers without repeating the current model manually:

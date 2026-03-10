@@ -68,7 +68,7 @@ Then configure the cluster-managed `inference.local` route:
 # Example: use an existing provider record
 nemoclaw cluster inference set \
   --provider openai-prod \
-  --model gpt-4o-mini
+  --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
 Verify the active config:
