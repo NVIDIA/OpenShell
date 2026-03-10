@@ -23,7 +23,7 @@ Create a provider that holds the backend credentials you want OpenShell to use.
 ::::{tab-item} NVIDIA API Catalog
 
 ```console
-$ nemoclaw provider create --name nvidia-prod --type nvidia --from-existing
+$ openshell provider create --name nvidia-prod --type nvidia --from-existing
 ```
 
 This reads `NVIDIA_API_KEY` from your environment.
@@ -33,7 +33,7 @@ This reads `NVIDIA_API_KEY` from your environment.
 ::::{tab-item} Local / self-hosted endpoint
 
 ```console
-$ nemoclaw provider create \
+$ openshell provider create \
     --name my-local-model \
     --type openai \
     --credential OPENAI_API_KEY=empty-if-not-required \
@@ -47,7 +47,7 @@ Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running 
 ::::{tab-item} Anthropic
 
 ```console
-$ nemoclaw provider create --name anthropic-prod --type anthropic --from-existing
+$ openshell provider create --name anthropic-prod --type anthropic --from-existing
 ```
 
 This reads `ANTHROPIC_API_KEY` from your environment.
@@ -61,7 +61,7 @@ This reads `ANTHROPIC_API_KEY` from your environment.
 Point `inference.local` at that provider and choose the model to use:
 
 ```console
-$ nemoclaw inference set \
+$ openshell inference set \
     --provider nvidia-prod \
     --model nvidia/nemotron-3-nano-30b-a3b
 ```
@@ -69,7 +69,7 @@ $ nemoclaw inference set \
 ## Step 3: Verify the Active Config
 
 ```console
-$ nemoclaw inference get
+$ openshell inference get
 provider: nvidia-prod
 model:    nvidia/nemotron-3-nano-30b-a3b
 version:  1
@@ -80,13 +80,13 @@ version:  1
 Use `update` when you want to change only one field:
 
 ```console
-$ nemoclaw inference update --model nvidia/nemotron-3-nano-30b-a3b
+$ openshell inference update --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
 Or switch providers without repeating the current model:
 
 ```console
-$ nemoclaw inference update --provider openai-prod
+$ openshell inference update --provider openai-prod
 ```
 
 ## Use It from a Sandbox
@@ -110,7 +110,7 @@ Use this endpoint when inference should stay local to the host for privacy and s
 
 ### Verify the Endpoint from a Sandbox
 
-`nemoclaw inference get` confirms the configuration was saved, but does not verify the upstream endpoint is reachable. To confirm end-to-end connectivity, connect to a sandbox and run:
+`openshell inference get` confirms the configuration was saved, but does not verify the upstream endpoint is reachable. To confirm end-to-end connectivity, connect to a sandbox and run:
 
 ```bash
 curl https://inference.local/v1/responses \
@@ -133,4 +133,4 @@ A successful response confirms the privacy router can reach the configured backe
 - **How does inference routing work?** See {doc}`index` for the interception flow and supported API patterns.
 - **Need to control external endpoints?** See [Network Access Rules](/sandboxes/index.md#network-access-rules).
 - **Managing provider records?** See {doc}`../sandboxes/providers`.
-- **CLI reference?** See {doc}`../reference/cli` for `nemoclaw inference` commands.
+- **CLI reference?** See {doc}`../reference/cli` for `openshell inference` commands.

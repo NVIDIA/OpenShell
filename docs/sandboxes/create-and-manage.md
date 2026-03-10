@@ -16,7 +16,7 @@ the cause. Start Docker and try again.
 ## Create a Sandbox
 
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
 If you have an existing gateway, a sandbox will be created within that gateway or if you don't have one, one will be created for you.
@@ -25,7 +25,7 @@ If you have an existing gateway, a sandbox will be created within that gateway o
 A fully specified creation command might look like:
 
 ```console
-$ nemoclaw sandbox create \
+$ openshell sandbox create \
     --name dev \
     --provider my-claude \
     --policy policy.yaml \
@@ -45,16 +45,16 @@ reconnect later from another terminal or VS Code.
 Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
 
 ```console
-$ nemoclaw sandbox create --from openclaw
+$ openshell sandbox create --from openclaw
 ```
 
-The CLI resolves the name against the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
+The CLI resolves the name against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
 
 You can also point `--from` at a local directory or a container image reference:
 
 ```console
-$ nemoclaw sandbox create --from ./my-sandbox-dir
-$ nemoclaw sandbox create --from my-registry.example.com/my-image:latest
+$ openshell sandbox create --from ./my-sandbox-dir
+$ openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
 
 ## List and Inspect Sandboxes
@@ -64,13 +64,13 @@ Check the status of your sandboxes and retrieve detailed information about indiv
 List all sandboxes:
 
 ```console
-$ nemoclaw sandbox list
+$ openshell sandbox list
 ```
 
 Get detailed information about a specific sandbox:
 
 ```console
-$ nemoclaw sandbox get my-sandbox
+$ openshell sandbox get my-sandbox
 ```
 
 ## Connect to a Sandbox
@@ -82,7 +82,7 @@ Access a running sandbox through an interactive SSH session or VS Code Remote-SS
 Open an SSH session into a running sandbox:
 
 ```console
-$ nemoclaw sandbox connect my-sandbox
+$ openshell sandbox connect my-sandbox
 ```
 
 ## View Logs
@@ -92,24 +92,24 @@ Stream and filter sandbox logs to monitor agent activity and diagnose policy dec
 Stream sandbox logs:
 
 ```console
-$ nemoclaw logs my-sandbox
+$ openshell logs my-sandbox
 ```
 
 Use flags to filter and follow output:
 
 | Flag | Purpose | Example |
 |---|---|---|
-| `--tail` | Stream logs in real time | `nemoclaw logs my-sandbox --tail` |
+| `--tail` | Stream logs in real time | `openshell logs my-sandbox --tail` |
 | `--source` | Filter by log source | `--source sandbox` |
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
 
 ## Monitor your Sandbox
 
-NemoClaw Terminal is a real-time dashboard that combines sandbox status and live logs in a single view.
+OpenShell Terminal is a real-time dashboard that combines sandbox status and live logs in a single view.
 
 ```console
-$ nemoclaw term
+$ openshell term
 ```
 
 The dashboard shows:
@@ -127,18 +127,18 @@ Transfer files between your host machine and a running sandbox.
 Upload files from your host into the sandbox:
 
 ```console
-$ nemoclaw sandbox upload my-sandbox ./src /sandbox/src
+$ openshell sandbox upload my-sandbox ./src /sandbox/src
 ```
 
 Download files from the sandbox to your host:
 
 ```console
-$ nemoclaw sandbox download my-sandbox /sandbox/output ./local
+$ openshell sandbox download my-sandbox /sandbox/output ./local
 ```
 
 :::{note}
 You can also upload files at creation time with the `--upload` flag on
-`nemoclaw sandbox create`.
+`openshell sandbox create`.
 :::
 
 ## Delete Sandboxes
@@ -148,7 +148,7 @@ Remove sandboxes when they are no longer needed. Deleting a sandbox stops all pr
 Delete a sandbox by name:
 
 ```console
-$ nemoclaw sandbox delete my-sandbox
+$ openshell sandbox delete my-sandbox
 ```
 
 ## Next Steps

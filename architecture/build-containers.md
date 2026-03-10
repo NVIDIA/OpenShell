@@ -228,7 +228,7 @@ The Helm chart at `deploy/helm/navigator/` deploys the gateway to Kubernetes as 
 replicaCount: 1
 
 image:
-  repository: ghcr.io/nvidia/nemoclaw/server
+  repository: ghcr.io/nvidia/openshell/server
   pullPolicy: Always
   tag: "latest"
 
@@ -236,7 +236,7 @@ server:
   logLevel: info
   sandboxNamespace: navigator
   dbUrl: "sqlite:/var/navigator/navigator.db"
-  sandboxImage: "ghcr.io/nvidia/nemoclaw/sandbox:latest"
+  sandboxImage: "ghcr.io/nvidia/openshell/sandbox:latest"
   grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
   sshGatewayHost: ""     # Public host for SSH proxy CONNECT (default: 127.0.0.1)
   sshGatewayPort: 0      # Public port for SSH proxy CONNECT (default: 8080)

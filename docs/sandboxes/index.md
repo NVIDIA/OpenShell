@@ -15,7 +15,7 @@ Every sandbox moves through a defined set of phases:
 |---|---|
 | Provisioning | The runtime is setting up the sandbox environment, injecting credentials, and applying your policy. |
 | Ready | The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs. |
-| Error | Something went wrong during provisioning or execution. Check logs with `nemoclaw logs` for details. |
+| Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
 ## Built-in Default Policy

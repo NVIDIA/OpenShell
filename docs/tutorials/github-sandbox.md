@@ -36,13 +36,13 @@ Before you begin, make sure you have:
 If you followed the Quickstart and already have a sandbox without a GitHub provider, you have two options:
 
 1. **Add a provider to a new sandbox** — delete the existing sandbox, create the provider below, and recreate the sandbox with `--provider my-github` in Step 3.
-2. **Set the token inside the sandbox** — connect with `nemoclaw sandbox connect <name>` and run `export GITHUB_TOKEN=<your-token>`. This skips the provider workflow but the token is not persisted across sandbox recreations.
+2. **Set the token inside the sandbox** — connect with `openshell sandbox connect <name>` and run `export GITHUB_TOKEN=<your-token>`. This skips the provider workflow but the token is not persisted across sandbox recreations.
 :::
 
 Create a provider that reads your GitHub token from the environment:
 
 ```console
-$ nemoclaw provider create --name my-github --type github --from-existing
+$ openshell provider create --name my-github --type github --from-existing
 ```
 
 This reads `GITHUB_TOKEN` (and `GH_TOKEN` if set) from your shell and stores them in the provider. The sandbox receives these as environment variables at runtime.
@@ -229,7 +229,7 @@ For background on how network policy blocks work, see [Network Access Rules](/sa
 Create the sandbox with both the GitHub provider and your policy:
 
 ```console
-$ nemoclaw sandbox create \
+$ openshell sandbox create \
     --provider my-github \
     --policy github-policy.yaml \
     --keep \
@@ -261,7 +261,7 @@ README, commit, and push.
 Claude clones successfully (read is allowed), but the push fails. The proxy denies `git-receive-pack` for `bravo-repo` and Claude reports the error. You can confirm in the logs:
 
 ```console
-$ nemoclaw logs <sandbox-name> --tail --source sandbox
+$ openshell logs <sandbox-name> --tail --source sandbox
 ```
 
 Look for an `action=deny` entry showing `host=github.com` and `path=/<org>/bravo-repo.git/git-receive-pack`.
@@ -280,7 +280,7 @@ The first issue is created. The second is denied — the policy only allows GET/
 To grant access to additional repos or change access levels, edit `github-policy.yaml` and push the update to the running sandbox:
 
 ```console
-$ nemoclaw policy set <sandbox-name> --policy github-policy.yaml --wait
+$ openshell policy set <sandbox-name> --policy github-policy.yaml --wait
 ```
 
 For example, to grant write access to `bravo-repo` as well, add another rule under `github_api`:

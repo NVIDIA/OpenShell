@@ -3,7 +3,7 @@ title:
   page: "How OpenShell Works"
   nav: "How It Works"
 description: "OpenShell architecture: gateway, sandbox, policy engine, and privacy router."
-keywords: ["nemoclaw architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
+keywords: ["openshell architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "security", "architecture"]
 content:
@@ -22,7 +22,7 @@ content:
 OpenShell runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated Kubernetes pod managed through the gateway. Four components work together to keep agents secure.
 
 ```{image} architecture.svg
-:alt: OpenShell architecture diagram showing the NemoClaw component layout
+:alt: OpenShell architecture diagram showing the OpenShell component layout
 :align: center
 ```
 
@@ -54,10 +54,10 @@ For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and
 OpenShell can run locally or on a remote host. The architecture is identical in both cases — only the Docker container location changes.
 
 - **Local**: the k3s cluster runs inside Docker on your workstation. The CLI provisions it automatically on first use.
-- **Remote**: the cluster runs on a remote host. Deploy with `nemoclaw gateway start --remote user@host`. For example, connect to your DGX Spark
+- **Remote**: the cluster runs on a remote host. Deploy with `openshell gateway start --remote user@host`. For example, connect to your DGX Spark
   ```console
-  $ nemoclaw gateway start --remote <username>@<spark-SSID>.local
-  $ nemoclaw status
+  $ openshell gateway start --remote <username>@<spark-SSID>.local
+  $ openshell status
   ```
 
 ## Next Steps

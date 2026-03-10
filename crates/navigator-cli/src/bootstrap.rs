@@ -145,7 +145,7 @@ pub async fn run_bootstrap(
     // Read registry token from environment for the auto-bootstrap path.
     // The explicit `--registry-token` flag is only on `gateway start`;
     // when bootstrapping via `sandbox create`, the env var is the mechanism.
-    if let Ok(token) = std::env::var("NEMOCLAW_REGISTRY_TOKEN")
+    if let Ok(token) = std::env::var("OPENSHELL_REGISTRY_TOKEN")
         && !token.trim().is_empty()
     {
         options = options.with_registry_token(token);
