@@ -160,11 +160,9 @@ RUN npm install -g npm@11.11.0
 # reproducible builds. Force-upgrade tar and @hono/node-server afterward to
 # resolve transitive dependency vulnerabilities (GHSA-wc8c-qw6v-h7f6,
 # GHSA-r6q2-hw4h-h46w, GHSA-qffp-2rhf-9h96, GHSA-8qq5-rm4j-mr97,
-# GHSA-83g3-92jg-28cx, GHSA-34x7-hfp2-rc4v). Dedupe removes nested copies of
-# the old versions that scanners may still detect.
+# GHSA-83g3-92jg-28cx, GHSA-34x7-hfp2-rc4v).
 RUN npm install -g opencode-ai@1.2.18 @openai/codex@0.111.0 && \
-    npm install -g tar@7.5.11 @hono/node-server@1.19.11 && \
-    npm dedupe -g
+    npm install -g tar@7.5.11 @hono/node-server@1.19.11
 
 # Install ai-pim-utils (NVIDIA PIM CLI tools: outlook, calendar, transcripts, etc.)
 # The install script auto-detects Debian and installs via .deb package to /usr/bin.
