@@ -42,8 +42,8 @@ use crate::metadata::{
 use crate::mtls::store_pki_bundle;
 use crate::pki::generate_pki;
 use crate::runtime::{
-    clean_stale_nodes, exec_capture_with_exit, fetch_recent_logs, navigator_workload_exists,
-    restart_navigator_deployment, wait_for_gateway_ready, wait_for_kubeconfig,
+    clean_stale_nodes, exec_capture_with_exit, fetch_recent_logs, openshell_workload_exists,
+    restart_openshell_deployment, wait_for_gateway_ready, wait_for_kubeconfig,
 };
 
 pub use crate::docker::ExistingGatewayInfo;
@@ -390,17 +390,17 @@ where
     // We check workload presence before reconciliation. On a fresh/recreated
     // cluster, secrets are always newly generated and a restart is unnecessary.
     // Restarting only when workload pre-existed avoids extra rollout latency.
-    let workload_existed_before_pki = navigator_workload_exists(&target_docker, &name).await?;
+    let workload_existed_before_pki = openshell_workload_exists(&target_docker, &name).await?;
     log("[progress] Reconciling TLS certificates".to_string());
     let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
 
     if rotated && workload_existed_before_pki {
-        // If a navigator workload is already running, it must be restarted so
+        // If an openshell workload is already running, it must be restarted so
         // it picks up the new TLS secrets before we write CLI-side certs.
         // A failed rollout is a hard error — CLI certs must not be persisted
         // if the server cannot come up with the new PKI.
-        log("[progress] PKI rotated — restarting navigator workload".to_string());
-        restart_navigator_deployment(&target_docker, &name).await?;
+        log("[progress] PKI rotated — restarting openshell workload".to_string());
+        restart_openshell_deployment(&target_docker, &name).await?;
     }
 
     log("[progress] Storing CLI mTLS credentials".to_string());
@@ -440,8 +440,8 @@ where
             )
             .await?;
 
-            log("[progress] Restarting navigator deployment".to_string());
-            restart_navigator_deployment(&target_docker, &name).await?;
+            log("[progress] Restarting openshell deployment".to_string());
+            restart_openshell_deployment(&target_docker, &name).await?;
         }
     }
 
@@ -683,7 +683,7 @@ async fn load_existing_pki_bundle(
         async move {
             let jsonpath = format!("{{.data.{}}}", key.replace('.', "\\."));
             let cmd = format!(
-                "KUBECONFIG={kubeconfig} kubectl get secret {secret} -n navigator -o jsonpath='{jsonpath}' 2>/dev/null"
+                "KUBECONFIG={kubeconfig} kubectl get secret {secret} -n openshell -o jsonpath='{jsonpath}' 2>/dev/null"
             );
             let (output, exit_code) = exec_capture_with_exit(
                 &docker,
