@@ -212,7 +212,7 @@ sandboxes/community-sandboxes
 :hidden:
 
 safety-and-privacy/index
-safety-and-privacy/security-model
+safety-and-privacy/default-policies
 safety-and-privacy/policies
 ```
 
@@ -229,6 +229,7 @@ inference/configure-routes
 :hidden:
 
 reference/cli
+reference/default-policy
 reference/policy-schema
 reference/architecture
 ```

@@ -3,21 +3,13 @@
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Write Sandbox Policies
+# Policy Configuration
 
-This guide covers how to author, iterate, and manage sandbox policies that control what an agent can do inside a OpenShell sandbox. You will learn to create sandboxes with custom policies, monitor denied traffic to discover missing rules, and push policy updates without restarting the sandbox.
+A policy is a single YAML document that controls what a sandbox can do: filesystem access, process identity, network access, and inference routing. You attach it when creating a sandbox; the network and inference sections can be updated on a running sandbox without restarting.
 
-## What is a policy
+## Policy Structure
 
-A policy is a single YAML document that controls what a sandbox can do: filesystem access, process identity, network access, and inference routing. You attach it when creating a sandbox; the network and inference parts can be updated on a running sandbox without restarting. OpenShell's four protection layers (filesystem, network, process, inference) are all configured through this one policy.
-
-## How is it evaluated
-
-For **network** traffic, the proxy matches destination (host and port) and calling binary to a policy block and optionally applies per-endpoint rules; see [Network access rules](#network-access-rules) below. For filesystem and process, the policy is applied at sandbox start (and for static fields, at creation only). For the full endpoint schema and binary matching, see the [Policy Schema Reference](../reference/policy-schema.md).
-
-## How is it structured
-
-A policy is a YAML document with five top-level sections: `version`, `filesystem_policy`, `landlock`, `process`, `network_policies`, and `inference`. Static fields (`filesystem_policy`, `landlock`, `process`) are locked at sandbox creation and require recreation to change. Dynamic fields (`network_policies`, `inference`) are hot-reloadable on a running sandbox. The `landlock` section configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforcement at the kernel level.
+A policy has five top-level sections: `version`, `filesystem_policy`, `landlock`, `process`, `network_policies`, and `inference`. Static sections (`filesystem_policy`, `landlock`, `process`) are locked at sandbox creation and require recreation to change. Dynamic sections (`network_policies`, `inference`) are hot-reloadable on a running sandbox. The `landlock` section configures [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforcement at the kernel level.
 
 ```yaml
 version: 1
@@ -55,21 +47,24 @@ inference:
   allowed_routes: [local]
 ```
 
-For the complete structure and every field, see the [Policy Schema Reference](../reference/policy-schema.md).
+For the complete field reference, see the [Policy Schema Reference](../reference/policy-schema.md).
 
-## Network access rules
+## Network Policy Evaluation
 
-Network access is controlled by policy blocks under `network_policies`. Each block has a **name**, a list of **endpoints** (host, port, protocol, and optional rules), and a list of **binaries** that are allowed to use those endpoints. The example below shows a full policy block.
+Every outbound connection from the sandbox goes through the proxy. The proxy matches the destination such as host and port and the calling binary to an endpoint in one of the `network_policies` blocks.
 
-### How network access is evaluated
+- If an endpoint matches the destination and the binary is listed in that block's `binaries`, the connection is allowed.
+- For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path).
+- If no endpoint matches and inference routes are configured, the request may be rerouted for inference.
+- Otherwise the connection is denied.
 
-Every outbound connection from the sandbox goes through the proxy. The proxy matches the **destination** (host and port) and the **calling binary** to an endpoint in one of your policy blocks. If an endpoint matches the destination and the binary is listed in that block's `binaries`, the connection is **allowed**. For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). If no endpoint matches and inference routes are configured, the request may be **rerouted for inference**. Otherwise the connection is **denied**. Endpoints without `protocol` or `tls` (L4-only) allow the TCP stream through without inspecting payloads. For the full endpoint schema, access presets, and binary matching, see the [Policy Schema Reference](../reference/policy-schema.md).
+Endpoints without `protocol` or `tls` (L4-only) allow the TCP stream through without inspecting payloads. For the full endpoint schema, access presets, and binary matching, see the [Policy Schema Reference](../reference/policy-schema.md).
 
-### Enable GitHub push
+## Example Policy for GitHub Repository Access
 
-The following policy block allows the listed binaries (Claude and the GitHub CLI) to reach `api.github.com` with the given rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
+The following policy block allows Claude and the GitHub CLI to reach `api.github.com` with granular per-endpoint rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
 
-Add this to your existing sandbox policy if you want to apply this GitHub permission set.
+Add this block to the `network_policies` section of your sandbox policy.
 
 ```yaml
   github_repos:
@@ -111,27 +106,13 @@ Add this to your existing sandbox policy if you want to apply this GitHub permis
       - { path: /usr/bin/gh }
 ```
 
-Then run `openshell policy set <name> --policy <file> --wait` to apply.
+Apply with `openshell policy set <name> --policy <file> --wait`.
 
-### If something is blocked
+## Debug Denied Requests
 
-Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary. Add or adjust the matching endpoint or rules in the relevant policy block (e.g. add a new `allow` rule for the method and path, or add the binary to that block's `binaries` list). See [How do I edit it](#how-do-i-edit-it) for the full iteration workflow.
+Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary. Add or adjust the matching endpoint or rules in the relevant policy block (for example, add a new `allow` rule for the method and path, or add the binary to that block's `binaries` list). See [Hot-Reload Policy Updates](#hot-reload-policy-updates) for the full iteration workflow.
 
-## Default Policy
-
-OpenShell ships a built-in default policy designed for Claude Code. It covers Claude's API endpoints, telemetry hosts, GitHub access, and VS Code marketplace traffic out of the box.
-
-| Agent | Default policy coverage | What you need to do |
-|---|---|---|
-| Claude Code | Full | Nothing: works out of the box |
-| OpenCode | Partial | Add `opencode.ai` endpoint and OpenCode binary paths. |
-| Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
-
-:::{important}
-If you run a non-Claude agent without a custom policy, the agent's API calls will be denied by the proxy. You must provide a policy that declares the agent's endpoints and binaries.
-:::
-
-## Create a Sandbox with a Custom Policy
+## Apply a Custom Policy
 
 Pass a policy YAML file when creating the sandbox:
 
@@ -150,9 +131,9 @@ $ openshell sandbox create --keep -- claude
 
 The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.
 
-## How do I edit it
+## Hot-Reload Policy Updates
 
-To change what the sandbox can access, you pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.
+To change what the sandbox can access, pull the current policy, edit the YAML, and push the update. The workflow is iterative: create the sandbox, monitor logs for denied actions, pull the policy, modify it, push, and verify.
 
 ```{mermaid}
 flowchart TD
@@ -173,35 +154,35 @@ flowchart TD
     linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
-**Steps**
+The following steps outline the hot-reload policy update workflow.
 
-1. **Create** the sandbox with your initial policy (or set `OPENSHELL_SANDBOX_POLICY`).
+1. Create the sandbox with your initial policy (or set `OPENSHELL_SANDBOX_POLICY`).
 
    ```console
    $ openshell sandbox create --policy ./my-policy.yaml --keep -- claude
    ```
 
-2. **Monitor** denials — each log entry shows host, port, binary, and reason. Alternatively use `openshell term` for a live dashboard.
+2. Monitor denials — each log entry shows host, port, binary, and reason. Alternatively use `openshell term` for a live dashboard.
 
    ```console
    $ openshell logs <name> --tail --source sandbox
    ```
 
-3. **Pull** the current policy. Strip the metadata header (Version, Hash, Status) before reusing the file.
+3. Pull the current policy. Strip the metadata header (Version, Hash, Status) before reusing the file.
 
    ```console
    $ openshell policy get <name> --full > current-policy.yaml
    ```
 
-4. **Edit** the YAML: add or adjust `network_policies` entries, binaries, `access` or `rules`, or `inference.allowed_routes`.
+4. Edit the YAML: add or adjust `network_policies` entries, binaries, `access` or `rules`, or `inference.allowed_routes`.
 
-5. **Push** the updated policy. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
+5. Push the updated policy. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 
    ```console
    $ openshell policy set <name> --policy current-policy.yaml --wait
    ```
 
-6. **Verify** the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
+6. Verify the new revision. If status is `loaded`, repeat from step 2 as needed; if `failed`, fix the policy and repeat from step 4.
 
    ```console
    $ openshell policy list <name>
@@ -209,5 +190,6 @@ flowchart TD
 
 ## Next Steps
 
+- {doc}`default-policies`: The built-in policy that ships with OpenShell and what each block allows.
 - [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.
-- [Security Model](security-model.md): Threat scenarios and protection layers.
+- [Safety and Privacy](index.md): Threat scenarios and protection layers.
