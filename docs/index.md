@@ -28,7 +28,7 @@ content:
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 
-OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
+NVIDIA OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
 uncontrolled network activity.
@@ -103,7 +103,7 @@ Install the CLI and create your first sandbox in two commands.
 </div>
 ```
 
-Refer to the [Quickstart](about/get-started.md) for more details.
+Refer to the [Quickstart](get-started/quickstart.md) for more details.
 
 ---
 
@@ -123,7 +123,7 @@ Learn about OpenShell and its capabilities.
 :::
 
 :::{grid-item-card} Quickstart
-:link: about/get-started
+:link: get-started/quickstart
 :link-type: doc
 
 Install the CLI and create your first sandbox in two commands.
@@ -132,8 +132,8 @@ Install the CLI and create your first sandbox in two commands.
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Tutorials
-:link: tutorials/index
+:::{grid-item-card} Set Up a Sandbox with GitHub Repo Access
+:link: tutorials/github-sandbox
 :link-type: doc
 
 End-to-end guides: GitHub repo access, custom policies, and more.
@@ -193,8 +193,8 @@ Release Notes <about/release-notes>
 :caption: Get Started
 :hidden:
 
-Quickstart <about/get-started>
-tutorials/index
+Quickstart <get-started/quickstart>
+GitHub Sandbox <tutorials/github-sandbox>
 ```
 
 ```{toctree}
@@ -223,6 +223,7 @@ inference/configure
 reference/cli
 reference/default-policy
 reference/policy-schema
+reference/support-matrix
 ```
 
 ```{toctree}
@@ -231,4 +232,3 @@ reference/policy-schema
 
 resources/eula
 ```
-

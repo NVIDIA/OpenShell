@@ -9,7 +9,7 @@ OpenShell handles inference in two ways:
 
 | Path | How It Works |
 |---|---|
-| **External endpoints** | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request — allowed or denied by `network_policies`. See [Network Access Rules](/sandboxes/index.md#network-access-rules). |
+| **External endpoints** | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request — allowed or denied by `network_policies`. Refer to [Network Access Rules](/sandboxes/index.md#network-access-rules). |
 | **`inference.local`** | A special endpoint exposed inside every sandbox for inference that should stay local to the host for privacy and security. The {doc}`privacy router </about/architecture>` strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint. |
 
 ## How `inference.local` Works
@@ -57,5 +57,7 @@ Requests to `inference.local` that do not match the configured provider's suppor
 
 ## Next Steps
 
+Continue with one of the following:
+
 - **Ready to configure?** Set up the backend behind `inference.local` in {doc}`configure`.
-- **Need to control external endpoints?** See [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- **Need to control external endpoints?** Refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).

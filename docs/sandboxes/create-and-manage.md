@@ -8,18 +8,20 @@
 This page walks you through the full sandbox lifecycle: creating, inspecting, connecting to, monitoring, and deleting sandboxes. For background on what sandboxes are and how the runtime works, refer to [About Sandboxes](index.md).
 
 :::{warning}
-Docker must be running before you create a sandbox. If it isn't, the CLI
+Docker must be running before you create a sandbox. If it is not, the CLI
 returns a connection-refused error (`os error 61`) without explaining
 the cause. Start Docker and try again.
 :::
 
 ## Create a Sandbox
 
+Run a single command to create a sandbox and launch your agent:
+
 ```console
 $ openshell sandbox create -- claude
 ```
 
-If you have an existing gateway, a sandbox will be created within that gateway or if you don't have one, one will be created for you.
+If you have an existing gateway, the sandbox is created in it. Otherwise, a gateway is created automatically.
 
 
 A fully specified creation command might look like:
@@ -104,7 +106,7 @@ Use flags to filter and follow output:
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
 
-## Monitor your Sandbox
+## Monitor Your Sandbox
 
 OpenShell Terminal is a real-time dashboard that combines sandbox status and live logs in a single view.
 
@@ -152,6 +154,8 @@ $ openshell sandbox delete my-sandbox
 ```
 
 ## Next Steps
+
+Explore related topics:
 
 - **Want a complete end-to-end example?** Follow the {doc}`/tutorials/github-sandbox` tutorial.
 - **Need to supply API keys or tokens?** Set up {doc}`providers` for credential management.

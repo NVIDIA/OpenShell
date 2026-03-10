@@ -27,9 +27,11 @@ Before you begin, make sure you have:
 
 - Python 3.12 or later
 - [uv](https://docs.astral.sh/uv/) installed
-- Docker Desktop running on your machine <!-- TODO: add compatible version -->
+- Docker Desktop running on your machine
 
 ## Install the OpenShell CLI
+
+Install the `openshell` package into a virtual environment.
 
 Activate your virtual environment:
 
@@ -45,7 +47,7 @@ uv pip install openshell
 
 ## Connect to a Remote Gateway (Optional)
 
-If you're running locally, skip this step — the CLI creates a gateway automatically when you create your first sandbox.
+If you're running locally, skip this step. The OpenShell CLI creates a gateway automatically when you create your first sandbox.
 
 :::::{tab-set}
 
@@ -55,7 +57,7 @@ If you're running locally, skip this step — the CLI creates a gateway automati
 Deploy an OpenShell gateway on Brev by hitting **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT).
 :::
 
-Once the instance is running, find the gateway URL in the Brev console under **Using Secure Links**. Copy the shareable URL for **port 8080** — this is the gateway endpoint.
+After the instance is running, find the gateway URL in the Brev console under **Using Secure Links**. Copy the shareable URL for **port 8080** — this is the gateway endpoint.
 
 ```console
 $ openshell gateway add https://<your-port-8080-url>.brevlab.com
@@ -67,7 +69,7 @@ $ openshell status
 ::::{tab-item} DGX Spark
 
 :::{note}
-Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured (e.g., SSH keys added to the host).
+Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured (such as SSH keys added to the host).
 :::
 
 Deploy to a DGX Spark machine over SSH:
@@ -77,7 +79,7 @@ $ openshell gateway start --remote <username>@<spark-ssid>.local
 $ openshell status
 ```
 
-Once `openshell status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
+After `openshell status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
 
 ::::
 
@@ -128,5 +130,5 @@ The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Commu
 You now have a working sandbox! From here, you can:
 
 - **Follow a guided tutorial** — set up scoped GitHub repo access in {doc}`/tutorials/github-sandbox`.
-- **Learn how sandboxes work** — see {doc}`/sandboxes/create-and-manage` for the full lifecycle.
-- **Write your own policies** — see {doc}`/sandboxes/policies` for custom access rules.
+- **Learn how sandboxes work** — refer to {doc}`/sandboxes/create-and-manage` for the full lifecycle.
+- **Write your own policies** — refer to {doc}`/sandboxes/policies` for custom access rules.
