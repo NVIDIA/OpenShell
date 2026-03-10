@@ -195,7 +195,7 @@ ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
 # To add a skill, create a subdirectory under deploy/docker/sandbox/skills/
 # with a SKILL.md file (and any supporting files). It will be installed into
 # both ~/.claude/skills/ and ~/.agents/skills/ for agent discovery.
-COPY deploy/docker/sandbox/skills/ /sandbox/.navigator/skills/
+COPY deploy/docker/sandbox/skills/ /sandbox/.agents/skills/
 
 # Bake the default sandbox policy into the image so that sandboxes without an
 # explicit policy from the gateway can discover it on disk.
@@ -230,6 +230,6 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     ln -sf "$skill" "/sandbox/.agents/skills/$(basename "$skill")"; \
     done; \
     done && \
-    chown -R sandbox:sandbox /sandbox/.navigator /sandbox/.claude /sandbox/.agents
+    chown -R sandbox:sandbox /sandbox/.claude /sandbox/.agents
 
 ENTRYPOINT ["navigator-sandbox"]
