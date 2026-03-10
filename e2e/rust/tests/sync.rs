@@ -6,8 +6,8 @@
 //! E2E test: bidirectional file upload/download with a sandbox.
 //!
 //! Prerequisites:
-//! - A running nemoclaw gateway (`nemoclaw gateway start`)
-//! - The `nemoclaw` binary (built automatically from the workspace)
+//! - A running openshell gateway (`openshell gateway start`)
+//! - The `openshell` binary (built automatically from the workspace)
 
 use std::fs;
 use std::io::Write;
@@ -15,7 +15,7 @@ use std::process::Stdio;
 
 use sha2::{Digest, Sha256};
 
-use nemoclaw_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::sandbox::SandboxGuard;
 
 /// Create a long-running sandbox, upload and download files, and verify
 /// contents.

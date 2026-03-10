@@ -1,4 +1,4 @@
-# Contributing to NemoClaw
+# Contributing to OpenShell
 
 ## Prerequisites
 
@@ -37,18 +37,18 @@ mise trust
 mise run sandbox
 ```
 
-## Building the `nemoclaw` CLI
+## Building the `openshell` CLI
 
-Inside this repository, `nemoclaw` is a local shortcut script at `scripts/bin/nemoclaw`. The script will
+Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
 
 1. Build `navigator-cli` if needed.
-2. Run the local debug CLI binary under `target/debug/nemoclaw`.
+2. Run the local debug CLI binary under `target/debug/openshell`.
 
-Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `nemoclaw` directly from the repo.
+Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `openshell` directly from the repo.
 
 ```bash
-nemoclaw --help
-nemoclaw sandbox create -- codex
+openshell --help
+openshell sandbox create -- codex
 ```
 
 ## Main Tasks
@@ -109,7 +109,7 @@ This project uses [Conventional Commits](https://www.conventionalcommits.org/). 
 **Examples:**
 
 ```
-feat(cli): add --verbose flag to nemoclaw run
+feat(cli): add --verbose flag to openshell run
 fix(sandbox): handle timeout errors gracefully
 docs: update installation instructions
 chore(deps): bump tokio to 1.40

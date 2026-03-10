@@ -101,7 +101,7 @@ impl ProcessHandle {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env("NEMOCLAW_SANDBOX", "1");
+            .env("OPENSHELL_SANDBOX", "1");
 
         // Set provider environment variables (credentials fetched at runtime).
         for (key, value) in provider_env {
@@ -213,7 +213,7 @@ impl ProcessHandle {
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
             .kill_on_drop(true)
-            .env("NEMOCLAW_SANDBOX", "1");
+            .env("OPENSHELL_SANDBOX", "1");
 
         // Set provider environment variables (credentials fetched at runtime).
         for (key, value) in provider_env {

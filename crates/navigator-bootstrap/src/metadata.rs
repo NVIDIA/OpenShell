@@ -148,7 +148,7 @@ pub fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> 
 fn stored_metadata_path(name: &str) -> Result<PathBuf> {
     let base = xdg_config_dir()?;
     Ok(base
-        .join("nemoclaw")
+        .join("openshell")
         .join("clusters")
         .join(format!("{name}_metadata.json")))
 }

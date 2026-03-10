@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(scope="session")
 def cluster_name() -> str | None:
-    return os.environ.get("NEMOCLAW_CLUSTER")
+    return os.environ.get("OPENSHELL_CLUSTER")
 
 
 @pytest.fixture(scope="session")

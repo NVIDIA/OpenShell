@@ -92,7 +92,7 @@ impl Inference for InferenceService {
             .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?
             .ok_or_else(|| {
                 Status::not_found(
-                    "cluster inference is not configured; run 'nemoclaw cluster inference set --provider <name> --model <id>'",
+                    "cluster inference is not configured; run 'openshell cluster inference set --provider <name> --model <id>'",
                 )
             })?;
 

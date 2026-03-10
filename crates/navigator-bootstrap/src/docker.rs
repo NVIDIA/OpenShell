@@ -346,11 +346,11 @@ pub async fn ensure_container(
     // entrypoint so they can be injected into the HelmChart manifest and
     // k3s registries.yaml.
     let registry_host =
-        env_non_empty("NEMOCLAW_REGISTRY_HOST").unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
-    let registry_namespace = env_non_empty("NEMOCLAW_REGISTRY_NAMESPACE")
+        env_non_empty("OPENSHELL_REGISTRY_HOST").unwrap_or_else(|| DEFAULT_REGISTRY.to_string());
+    let registry_namespace = env_non_empty("OPENSHELL_REGISTRY_NAMESPACE")
         .unwrap_or_else(|| REGISTRY_NAMESPACE_DEFAULT.to_string());
     let image_repo_base = env_non_empty("IMAGE_REPO_BASE")
-        .or_else(|| env_non_empty("NEMOCLAW_IMAGE_REPO_BASE"))
+        .or_else(|| env_non_empty("OPENSHELL_IMAGE_REPO_BASE"))
         .unwrap_or_else(|| {
             if registry_host == DEFAULT_REGISTRY {
                 // For ghcr.io the default namespace is the full org path.
@@ -359,16 +359,16 @@ pub async fn ensure_container(
                 format!("{registry_host}/{registry_namespace}")
             }
         });
-    let registry_insecure = env_bool("NEMOCLAW_REGISTRY_INSECURE").unwrap_or(false);
-    let registry_endpoint = env_non_empty("NEMOCLAW_REGISTRY_ENDPOINT");
+    let registry_insecure = env_bool("OPENSHELL_REGISTRY_INSECURE").unwrap_or(false);
+    let registry_endpoint = env_non_empty("OPENSHELL_REGISTRY_ENDPOINT");
 
     // Credential priority:
-    // 1. NEMOCLAW_REGISTRY_USERNAME/PASSWORD env vars (power-user override)
-    // 2. registry_token from --registry-token / NEMOCLAW_REGISTRY_TOKEN
+    // 1. OPENSHELL_REGISTRY_USERNAME/PASSWORD env vars (power-user override)
+    // 2. registry_token from --registry-token / OPENSHELL_REGISTRY_TOKEN
     // 3. Built-in default XOR-decoded token
-    let registry_username = env_non_empty("NEMOCLAW_REGISTRY_USERNAME")
+    let registry_username = env_non_empty("OPENSHELL_REGISTRY_USERNAME")
         .or_else(|| Some(DEFAULT_REGISTRY_USERNAME.to_string()));
-    let registry_password = env_non_empty("NEMOCLAW_REGISTRY_PASSWORD").or_else(|| {
+    let registry_password = env_non_empty("OPENSHELL_REGISTRY_PASSWORD").or_else(|| {
         registry_token
             .filter(|t| !t.is_empty())
             .map(ToString::to_string)
@@ -392,7 +392,7 @@ pub async fn ensure_container(
     // When the primary registry is NOT ghcr.io (e.g. a local registry in
     // push-mode), we still need containerd credentials for the community
     // registry so that community sandbox images
-    // (ghcr.io/nvidia/nemoclaw-community/sandboxes/*) can be pulled at
+    // (ghcr.io/nvidia/openshell-community/sandboxes/*) can be pulled at
     // runtime.  Pass community registry credentials as a separate set of
     // env vars so the entrypoint can add a second block to registries.yaml.
     if registry_host != DEFAULT_REGISTRY {
@@ -418,10 +418,10 @@ pub async fn ensure_container(
     }
 
     // Pass image configuration for local development.
-    // When NEMOCLAW_PUSH_IMAGES is set the entrypoint overrides the baked-in
+    // When OPENSHELL_PUSH_IMAGES is set the entrypoint overrides the baked-in
     // HelmChart manifest so k3s uses the locally-pushed images with
     // IfNotPresent pull policy instead of pulling from the remote registry.
-    let push_mode = std::env::var("NEMOCLAW_PUSH_IMAGES")
+    let push_mode = std::env::var("OPENSHELL_PUSH_IMAGES")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .is_some();
@@ -430,7 +430,7 @@ pub async fn ensure_container(
             .ok()
             .filter(|v| !v.trim().is_empty())
             .unwrap_or_else(|| "dev".to_string());
-        if let Ok(images) = std::env::var("NEMOCLAW_PUSH_IMAGES")
+        if let Ok(images) = std::env::var("OPENSHELL_PUSH_IMAGES")
             && !images.trim().is_empty()
         {
             env_vars.push(format!("PUSH_IMAGE_REFS={images}"));

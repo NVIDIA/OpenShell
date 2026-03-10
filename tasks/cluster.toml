@@ -8,7 +8,7 @@ description = "Bootstrap or incremental deploy (creates cluster if needed, rebui
 run = "tasks/scripts/cluster.sh"
 
 ["cluster:build:full"]
-description = "Build and deploy local k3s cluster with NemoClaw"
+description = "Build and deploy local k3s cluster with OpenShell"
 depends = [
   "docker:build:server",
   "docker:build:sandbox",

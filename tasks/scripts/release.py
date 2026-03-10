@@ -70,7 +70,7 @@ def _compute_versions() -> Versions:
 
 
 def python_publish(
-    version: str | None = None, wheel_glob: str = "nemoclaw-*.whl"
+    version: str | None = None, wheel_glob: str = "openshell-*.whl"
 ) -> None:
     if version is None:
         version = _compute_versions().python
@@ -155,8 +155,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     python_publish_parser.add_argument(
         "--wheel-glob",
-        default="nemoclaw-*.whl",
-        help="Filename glob for wheels to publish (defaults to all nemoclaw wheels).",
+        default="openshell-*.whl",
+        help="Filename glob for wheels to publish (defaults to all openshell wheels).",
     )
 
     return parser

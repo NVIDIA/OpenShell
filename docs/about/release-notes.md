@@ -6,7 +6,7 @@
 # Release Notes
 
 This page covers the highlights of each OpenShell release.
-For more details, refer to the [NemoClaw GitHub Releases](https://github.com/NVIDIA/NemoClaw/releases).
+For more details, refer to the [OpenShell GitHub Releases](https://github.com/NVIDIA/OpenShell/releases).
 
 ## 0.1.0
 

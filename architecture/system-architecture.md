@@ -1,4 +1,4 @@
-# NemoClaw System Architecture
+# OpenShell System Architecture
 
 ```mermaid
 graph TB
@@ -6,16 +6,16 @@ graph TB
     %% USER'S MACHINE
     %% ============================================================
     subgraph UserMachine["User's Machine"]
-        CLI["NemoClaw CLI<br/>(nemoclaw)"]
-        TUI["NemoClaw TUI<br/>(nemoclaw term)"]
-        SDK["Python SDK<br/>(nemoclaw)"]
-        LocalConfig["~/.config/nemoclaw/<br/>clusters, mTLS certs,<br/>active_cluster"]
+        CLI["OpenShell CLI<br/>(openshell)"]
+        TUI["OpenShell TUI<br/>(openshell term)"]
+        SDK["Python SDK<br/>(openshell)"]
+        LocalConfig["~/.config/openshell/<br/>clusters, mTLS certs,<br/>active_cluster"]
     end
 
     %% ============================================================
     %% KUBERNETES CLUSTER (single Docker container)
     %% ============================================================
-    subgraph Cluster["NemoClaw Cluster Container (Docker)"]
+    subgraph Cluster["OpenShell Cluster Container (Docker)"]
 
         subgraph K3s["k3s (v1.35.2-k3s1)"]
             KubeAPI["Kubernetes API<br/>:6443"]
@@ -177,7 +177,7 @@ graph TB
 
 | Color | Category | Examples |
 |-------|----------|---------|
-| Blue | User-side components | NemoClaw CLI, NemoClaw TUI, Python SDK |
+| Blue | User-side components | OpenShell CLI, OpenShell TUI, Python SDK |
 | Orange | Gateway / Control plane | navigator-server, watch bus, log bus |
 | Green | Sandbox supervisor | SSH server, HTTP CONNECT proxy, OPA engine, inference router |
 | Purple | Agent process & isolation | AI agent, Landlock, Seccomp, network namespace |

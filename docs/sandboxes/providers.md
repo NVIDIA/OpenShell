@@ -19,7 +19,7 @@ The fastest way to create a provider is to let the CLI discover credentials from
 your shell environment:
 
 ```console
-$ nemoclaw provider create --name my-claude --type claude --from-existing
+$ openshell provider create --name my-claude --type claude --from-existing
 ```
 
 This reads `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` from your current environment
@@ -30,7 +30,7 @@ and stores them in the provider.
 Supply a credential value directly:
 
 ```console
-$ nemoclaw provider create --name my-api --type generic --credential API_KEY=sk-abc123
+$ openshell provider create --name my-api --type generic --credential API_KEY=sk-abc123
 ```
 
 ### Bare Key Form
@@ -39,7 +39,7 @@ Pass a key name without a value to read the value from the environment variable
 of that name:
 
 ```console
-$ nemoclaw provider create --name my-api --type generic --credential API_KEY
+$ openshell provider create --name my-api --type generic --credential API_KEY
 ```
 
 This looks up the current value of `$API_KEY` in your shell and stores it.
@@ -51,25 +51,25 @@ List, inspect, update, and delete providers from the active cluster.
 List all providers:
 
 ```console
-$ nemoclaw provider list
+$ openshell provider list
 ```
 
 Inspect a provider:
 
 ```console
-$ nemoclaw provider get my-claude
+$ openshell provider get my-claude
 ```
 
 Update a provider's credentials:
 
 ```console
-$ nemoclaw provider update my-claude --type claude --from-existing
+$ openshell provider update my-claude --type claude --from-existing
 ```
 
 Delete a provider:
 
 ```console
-$ nemoclaw provider delete my-claude
+$ openshell provider delete my-claude
 ```
 
 ## Attach Providers to Sandboxes
@@ -77,7 +77,7 @@ $ nemoclaw provider delete my-claude
 Pass one or more `--provider` flags when creating a sandbox:
 
 ```console
-$ nemoclaw sandbox create --provider my-claude --provider my-github -- claude
+$ openshell sandbox create --provider my-claude --provider my-github -- claude
 ```
 
 Each `--provider` flag attaches one provider. The sandbox receives all
@@ -91,12 +91,12 @@ providers specified.
 
 ### Auto-Discovery Shortcut
 
-When the trailing command in `nemoclaw sandbox create` is a recognized tool name (`claude`, `codex`, or `opencode`), the CLI auto-creates the required
+When the trailing command in `openshell sandbox create` is a recognized tool name (`claude`, `codex`, or `opencode`), the CLI auto-creates the required
 provider from your local credentials if one does not already exist. You do not
 need to create the provider separately:
 
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
 This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
@@ -111,7 +111,7 @@ The following provider types are supported.
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — see {doc}`/tutorials/github-sandbox` |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `generic` | User-defined | Any service with custom credentials |
@@ -124,5 +124,6 @@ environment variable names and values yourself with `--credential`.
 
 ## Next Steps
 
-- {doc}`create-and-manage`: Full sandbox lifecycle management
-- {doc}`../safety-and-privacy/index`: Why credential isolation matters
+- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
+- **Looking for a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
+- [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.

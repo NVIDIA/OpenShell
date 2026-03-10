@@ -4,11 +4,11 @@
 # TUI tasks
 
 [term]
-description = "Launch the NemoClaw TUI"
-run = "nemoclaw term"
+description = "Launch the OpenShell TUI"
+run = "openshell term"
 hide = true
 
 ["term:dev"]
-description = "Launch the NemoClaw TUI with hot-reload on file changes"
-run = "cargo watch -s 'nemoclaw term'"
+description = "Launch the OpenShell TUI with hot-reload on file changes"
+run = "cargo watch -s 'openshell term'"
 hide = true

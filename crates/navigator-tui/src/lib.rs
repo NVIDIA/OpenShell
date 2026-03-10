@@ -425,7 +425,7 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
         .ok()?;
     Some(
         config_dir
-            .join("nemoclaw")
+            .join("openshell")
             .join("clusters")
             .join(name)
             .join("mtls"),
@@ -659,7 +659,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
 /// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
 ///
-/// This replicates the `nemoclaw sandbox connect` flow but uses `Command::status()`
+/// This replicates the `openshell sandbox connect` flow but uses `Command::status()`
 /// instead of `exec()` so the TUI process survives.
 async fn handle_shell_connect(
     app: &mut App,

@@ -6,31 +6,31 @@
 //! E2E tests for edge tunnel auth flow against a running cluster.
 //!
 //! Prerequisites:
-//! - A running nemoclaw gateway deployed with `--plaintext`
+//! - A running openshell gateway deployed with `--plaintext`
 //! - The gateway's HTTP endpoint accessible (no TLS)
-//! - The `nemoclaw` binary (built automatically from the workspace)
+//! - The `openshell` binary (built automatically from the workspace)
 //!
 //! These tests exercise the full CLI → WS tunnel → gRPC flow.
 //!
 //! Environment variables:
-//! - `NEMOCLAW_CLUSTER`: Name of the active cluster (standard e2e var)
+//! - `OPENSHELL_CLUSTER`: Name of the active cluster (standard e2e var)
 //!
-//! The cluster must have been deployed with `nemoclaw gateway start --plaintext`
+//! The cluster must have been deployed with `openshell gateway start --plaintext`
 //! so that the server accepts plaintext HTTP connections.
 
 use std::process::Stdio;
 
-use nemoclaw_e2e::harness::binary::nemoclaw_cmd;
-use nemoclaw_e2e::harness::output::strip_ansi;
+use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::output::strip_ansi;
 
-/// Run `nemoclaw <args>` using the system's configured gateway.
+/// Run `openshell <args>` using the system's configured gateway.
 async fn run_cli(args: &[&str]) -> (String, i32) {
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.args(args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn nemoclaw");
+    let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -38,18 +38,18 @@ async fn run_cli(args: &[&str]) -> (String, i32) {
     (combined, code)
 }
 
-/// Run `nemoclaw <args>` with a custom config directory so the CLI reads
+/// Run `openshell <args>` with a custom config directory so the CLI reads
 /// our seeded cluster metadata and edge token instead of the real config.
 async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (String, i32) {
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("HOME", config_dir)
-        .env_remove("NEMOCLAW_CLUSTER")
+        .env_remove("OPENSHELL_CLUSTER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn nemoclaw");
+    let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -66,12 +66,12 @@ fn seed_edge_cluster_config(
     gateway_endpoint: &str,
     edge_token: &str,
 ) {
-    let nemoclaw_dir = config_dir.join("nemoclaw");
-    let clusters_dir = nemoclaw_dir.join("clusters");
+    let openshell_dir = config_dir.join("openshell");
+    let clusters_dir = openshell_dir.join("clusters");
 
     // Write active_cluster file.
-    std::fs::create_dir_all(&nemoclaw_dir).expect("create nemoclaw config dir");
-    std::fs::write(nemoclaw_dir.join("active_cluster"), cluster_name)
+    std::fs::create_dir_all(&openshell_dir).expect("create openshell config dir");
+    std::fs::write(openshell_dir.join("active_cluster"), cluster_name)
         .expect("write active_cluster");
 
     // Write cluster metadata JSON.
@@ -99,7 +99,7 @@ fn seed_edge_cluster_config(
 // Test 12: gRPC health check against a plaintext cluster
 // -------------------------------------------------------------------
 
-/// `nemoclaw status` should report a healthy gateway when connected to a
+/// `openshell status` should report a healthy gateway when connected to a
 /// plaintext cluster (deployed with `--plaintext`/`--disable-tls`).
 ///
 /// This test verifies the entire plaintext path:
@@ -113,7 +113,7 @@ async fn plaintext_cluster_status_reports_healthy() {
 
     assert_eq!(
         code, 0,
-        "nemoclaw status should exit 0 against plaintext cluster:\n{clean}"
+        "openshell status should exit 0 against plaintext cluster:\n{clean}"
     );
 
     // The status output should show the gateway as healthy/connected.
@@ -137,7 +137,7 @@ async fn plaintext_cluster_status_reports_healthy() {
 /// CLI → local TCP proxy → WebSocket → /_ws_tunnel → loopback TCP → gRPC
 ///
 /// The test seeds a temporary config directory with edge auth metadata and a
-/// dummy token, then runs `nemoclaw status` against the live plaintext
+/// dummy token, then runs `openshell status` against the live plaintext
 /// gateway.
 ///
 /// Note: The dummy token won't be validated (no edge auth middleware on
@@ -192,7 +192,7 @@ async fn ws_tunnel_status_through_edge_proxy() {
     if !endpoint.starts_with("http://") {
         eprintln!(
             "Skipping ws_tunnel test: gateway endpoint is not plaintext HTTP: {endpoint}\n\
-             Deploy with `nemoclaw gateway start --plaintext` for this test."
+             Deploy with `openshell gateway start --plaintext` for this test."
         );
         return;
     }
@@ -213,7 +213,7 @@ async fn ws_tunnel_status_through_edge_proxy() {
     let clean = strip_ansi(&output);
     assert_eq!(
         code, 0,
-        "nemoclaw status through WS tunnel should exit 0:\n{clean}"
+        "openshell status through WS tunnel should exit 0:\n{clean}"
     );
     assert!(
         clean.to_lowercase().contains("healthy")

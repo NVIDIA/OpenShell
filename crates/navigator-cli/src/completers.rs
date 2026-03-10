@@ -71,7 +71,7 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
 }
 
 fn resolve_active_cluster() -> Option<(String, String)> {
-    let name = std::env::var("NEMOCLAW_CLUSTER")
+    let name = std::env::var("OPENSHELL_CLUSTER")
         .ok()
         .filter(|v| !v.trim().is_empty())
         .or_else(load_active_cluster)?;
@@ -131,7 +131,7 @@ mod tests {
         with_vars(
             [
                 ("XDG_CONFIG_HOME", Some(tmp.as_str())),
-                ("NEMOCLAW_CLUSTER", None::<&str>),
+                ("OPENSHELL_CLUSTER", None::<&str>),
             ],
             f,
         );

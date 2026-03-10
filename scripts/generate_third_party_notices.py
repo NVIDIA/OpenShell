@@ -167,7 +167,7 @@ def format_notices(rust_deps: list[dict], python_deps: list[dict]) -> str:
     lines = [
         "THIRD-PARTY SOFTWARE NOTICES",
         "",
-        "This file lists the third-party software packages used by NemoClaw,",
+        "This file lists the third-party software packages used by OpenShell,",
         "along with their respective licenses.",
         "",
         "To regenerate: uv run python scripts/generate_third_party_notices.py",

@@ -7,7 +7,7 @@
 #
 # The script syncs the local source tree to a remote host, bootstraps the toolchain
 # there, builds the CLI and Docker images from the synced checkout, then starts or
-# updates a gateway using `nemoclaw gateway start`.
+# updates a gateway using `openshell gateway start`.
 
 set -euo pipefail
 
@@ -17,8 +17,8 @@ Usage:
   ./scripts/remote-deploy.sh <user@host> [options]
 
 Options:
-  --remote-dir DIR            Remote checkout directory (default: nemoclaw)
-  --name NAME                 Cluster name (default: nemoclaw)
+  --remote-dir DIR            Remote checkout directory (default: openshell)
+  --name NAME                 Cluster name (default: openshell)
   --port PORT                 Gateway port (default: 8080)
   --kube-port [PORT]          Expose kube-apiserver on a host port; omit value to auto-pick
   --ssh-key PATH              SSH private key for ssh/rsync
@@ -27,14 +27,14 @@ Options:
   --plaintext                 Listen on plaintext HTTP instead of mTLS
   --disable-gateway-auth      Keep TLS but disable client certificate enforcement
   --image-tag TAG             Docker image tag to build/deploy (default: dev)
-  --cargo-version VERSION     Override NEMOCLAW_CARGO_VERSION for remote Docker builds
+  --cargo-version VERSION     Override OPENSHELL_CARGO_VERSION for remote Docker builds
   --help                      Show this help
 
 Examples:
   ./scripts/remote-deploy.sh ubuntu@devbox
   ./scripts/remote-deploy.sh ubuntu@devbox --recreate --port 18080
   ./scripts/remote-deploy.sh ubuntu@devbox --plaintext --ssh-key ~/.ssh/devbox
-  ./scripts/remote-deploy.sh my-sandbox -./scripts/remote-deploy.sh my-sandbox --remote-dir --name nemoclaw --port 8080 --recreate --plaintext
+  ./scripts/remote-deploy.sh my-sandbox -./scripts/remote-deploy.sh my-sandbox --remote-dir --name openshell --port 8080 --recreate --plaintext
 EOF
 }
 
@@ -51,13 +51,13 @@ require_value() {
 }
 
 REMOTE_HOST=""
-REMOTE_DIR=${REMOTE_DIR:-nemoclaw}
-CLUSTER_NAME=${CLUSTER_NAME:-nemoclaw}
+REMOTE_DIR=${REMOTE_DIR:-openshell}
+CLUSTER_NAME=${CLUSTER_NAME:-openshell}
 GATEWAY_PORT=${GATEWAY_PORT:-8080}
 KUBE_PORT="${KUBE_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
 IMAGE_TAG=${IMAGE_TAG:-dev}
-CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-0.0.0-dev}
+CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-0.0.0-dev}
 SKIP_SYNC=false
 RECREATE=false
 PLAINTEXT=false
@@ -233,27 +233,27 @@ if ! command -v docker >/dev/null 2>&1; then
   exit 1
 fi
 
-echo "==> Building nemoclaw CLI..."
+echo "==> Building openshell CLI..."
 mise exec -- cargo build --release -p navigator-cli
 mkdir -p "$HOME/.local/bin"
-install -m 0755 target/release/nemoclaw "$HOME/.local/bin/nemoclaw"
+install -m 0755 target/release/openshell "$HOME/.local/bin/openshell"
 
-# Ensure `mise exec -- nemoclaw` uses the release binary rather than the local
+# Ensure `mise exec -- openshell` uses the release binary rather than the local
 # development shim, which expects git metadata that is not synced to the VM.
-install -m 0755 target/release/nemoclaw scripts/bin/nemoclaw
+install -m 0755 target/release/openshell scripts/bin/openshell
 
 # Prevent a stale repo-local .env from changing the deployment unexpectedly.
 rm -f .env
 
 echo "==> Building Docker images (tag=${IMAGE_TAG})..."
-export NEMOCLAW_CARGO_VERSION="${CARGO_VERSION}"
+export OPENSHELL_CARGO_VERSION="${CARGO_VERSION}"
 export IMAGE_TAG
 mise exec -- tasks/scripts/docker-build-cluster.sh
 mise exec -- tasks/scripts/docker-build-component.sh server
 mise exec -- tasks/scripts/docker-build-component.sh sandbox
 
-export NEMOCLAW_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
-export NEMOCLAW_PUSH_IMAGES="navigator/server:${IMAGE_TAG},navigator/sandbox:${IMAGE_TAG}"
+export OPENSHELL_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
+export OPENSHELL_PUSH_IMAGES="navigator/server:${IMAGE_TAG},navigator/sandbox:${IMAGE_TAG}"
 
 start_args=(
   gateway
@@ -280,7 +280,7 @@ if [[ -n "${KUBE_PORT}" ]]; then
 fi
 
 echo "==> Starting gateway..."
-mise exec -- nemoclaw "${start_args[@]}"
+mise exec -- openshell "${start_args[@]}"
 
 echo ""
 echo "============================================"

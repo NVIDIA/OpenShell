@@ -41,7 +41,7 @@ jobs:
       - name: Tag images as latest
         run: |
           set -euo pipefail
-          REGISTRY="ghcr.io/nvidia/nemoclaw"
+          REGISTRY="ghcr.io/nvidia/openshell"
           for component in server sandbox cluster; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as latest..."
             docker buildx imagetools create \
@@ -49,61 +49,6 @@ jobs:
               -t "${REGISTRY}/${component}:latest" \
               "${REGISTRY}/${component}:${{ github.sha }}"
           done
-
-  publish-containers:
-    name: Publish Containers
-    needs: [build-server, build-sandbox, build-cluster]
-    runs-on: build-amd64
-    timeout-minutes: 120
-    container:
-      image: ghcr.io/nvidia/nemoclaw/ci:latest
-      credentials:
-        username: ${{ github.actor }}
-        password: ${{ secrets.GITHUB_TOKEN }}
-      options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-west-2
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Mark workspace safe for git
-        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
-
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Compute image versions
-        id: version
-        run: |
-          set -euo pipefail
-          echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          echo "docker_version=$(uv run python tasks/scripts/release.py get-version --docker)" >> "$GITHUB_OUTPUT"
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Log in to ECR
-        run: aws ecr get-login-password --region us-west-2 | docker login --username AWS --password-stdin 524473328983.dkr.ecr.us-west-2.amazonaws.com
-
-      - name: Set up Docker Buildx
-        uses: ./.github/actions/setup-buildx
-
-      - name: Build and push multi-arch images to ECR
-        env:
-          DOCKER_BUILDER: navigator
-          IMAGE_TAG: dev
-          TAG_LATEST: "true"
-          EXTRA_DOCKER_TAGS: ${{ steps.version.outputs.docker_version }}
-          NEMOCLAW_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
-        run: mise run --no-prepare docker:publish:cluster:multiarch
 
   build-python-wheels:
     name: Stage Python Wheels
@@ -114,7 +59,7 @@ jobs:
       wheel_version: ${{ steps.version.outputs.wheel_version }}
       s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
     container:
-      image: ghcr.io/nvidia/nemoclaw/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -157,8 +102,8 @@ jobs:
           set -euo pipefail
           WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
           CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-          NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-          NEMOCLAW_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+          OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
+          OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
           ls -la target/wheels/*.whl
 
       - name: Upload wheels to S3
@@ -166,7 +111,7 @@ jobs:
         run: |
           set -euo pipefail
           WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
-          S3_PREFIX="nemoclaw/${WHEEL_VERSION}"
+          S3_PREFIX="openshell/${WHEEL_VERSION}"
           aws s3 cp target/wheels/ "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" --recursive --exclude "*" --include "*.whl"
           aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
           echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
@@ -261,7 +206,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 60
     container:
-      image: ghcr.io/nvidia/nemoclaw/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -332,8 +277,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          tar -czf artifacts/nemoclaw-${{ matrix.target }}.tar.gz \
-            -C target/${{ matrix.target }}/release nemoclaw
+          tar -czf artifacts/openshell-${{ matrix.target }}.tar.gz \
+            -C target/${{ matrix.target }}/release openshell
           ls -lh artifacts/
 
       - name: Upload artifact
@@ -351,7 +296,7 @@ jobs:
     runs-on: build-amd64
     timeout-minutes: 60
     container:
-      image: ghcr.io/nvidia/nemoclaw/ci:latest
+      image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
@@ -390,7 +335,7 @@ jobs:
           set -euo pipefail
           docker buildx build \
             --file deploy/docker/Dockerfile.cli-macos \
-            --build-arg NEMOCLAW_CARGO_VERSION="${{ steps.version.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ steps.version.outputs.cargo_version }}" \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
             --target binary \
             --output type=local,dest=out/ \
@@ -400,8 +345,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          tar -czf artifacts/nemoclaw-aarch64-apple-darwin.tar.gz \
-            -C out nemoclaw
+          tar -czf artifacts/openshell-aarch64-apple-darwin.tar.gz \
+            -C out openshell
           ls -lh artifacts/
 
       - name: Upload artifact
@@ -436,8 +381,8 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          sha256sum *.tar.gz > nemoclaw-checksums-sha256.txt
-          cat nemoclaw-checksums-sha256.txt
+          sha256sum *.tar.gz > openshell-checksums-sha256.txt
+          cat openshell-checksums-sha256.txt
 
       - name: Move devel tag
         run: |
@@ -449,7 +394,7 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: NemoClaw Latest Devel
+          name: OpenShell Latest Devel
           prerelease: true
           tag_name: devel
           target_commitish: ${{ github.sha }}
@@ -461,37 +406,37 @@ jobs:
             ### Quick install
 
             ```bash
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/install.sh | sh
+            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/install.sh | sh
             ```
 
             ### Assets
 
             | File | Platform | Install |
             |------|----------|---------|
-            | `nemoclaw-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/nemoclaw-x86_64-unknown-linux-musl.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
-            | `nemoclaw-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/nemoclaw-aarch64-unknown-linux-musl.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
-            | `nemoclaw-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/nemoclaw-aarch64-apple-darwin.tar.gz \| tar xz && sudo mv nemoclaw /usr/local/bin/` |
-            | `install.sh` | All platforms | `curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/install.sh \| sh` |
-            | `nemoclaw-checksums-sha256.txt` | — | SHA256 checksums for all archives |
+            | `openshell-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-x86_64-unknown-linux-musl.tar.gz \| tar xz && sudo mv openshell /usr/local/bin/` |
+            | `openshell-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-unknown-linux-musl.tar.gz \| tar xz && sudo mv openshell /usr/local/bin/` |
+            | `openshell-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-apple-darwin.tar.gz \| tar xz && sudo mv openshell /usr/local/bin/` |
+            | `install.sh` | All platforms | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/install.sh \| sh` |
+            | `openshell-checksums-sha256.txt` | — | SHA256 checksums for all archives |
 
             ### Manual install
 
             ```bash
             # Linux x86_64
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/nemoclaw-x86_64-unknown-linux-musl.tar.gz | tar xz
-            sudo mv nemoclaw /usr/local/bin/
+            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-x86_64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv openshell /usr/local/bin/
 
             # Linux aarch64
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/nemoclaw-aarch64-unknown-linux-musl.tar.gz | tar xz
-            sudo mv nemoclaw /usr/local/bin/
+            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-unknown-linux-musl.tar.gz | tar xz
+            sudo mv openshell /usr/local/bin/
 
             # macOS (Apple Silicon)
-            curl -fsSL https://github.com/NVIDIA/NemoClaw/releases/download/devel/nemoclaw-aarch64-apple-darwin.tar.gz | tar xz
-            sudo mv nemoclaw /usr/local/bin/
+            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-apple-darwin.tar.gz | tar xz
+            sudo mv openshell /usr/local/bin/
             ```
           files: |
-            release/nemoclaw-x86_64-unknown-linux-musl.tar.gz
-            release/nemoclaw-aarch64-unknown-linux-musl.tar.gz
-            release/nemoclaw-aarch64-apple-darwin.tar.gz
-            release/nemoclaw-checksums-sha256.txt
+            release/openshell-x86_64-unknown-linux-musl.tar.gz
+            release/openshell-aarch64-unknown-linux-musl.tar.gz
+            release/openshell-aarch64-apple-darwin.tar.gz
+            release/openshell-checksums-sha256.txt
             release/install.sh

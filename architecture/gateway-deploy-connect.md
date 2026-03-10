@@ -12,8 +12,8 @@ When any CLI command needs to talk to the gateway, it resolves the target throug
 
 1. `--gateway-endpoint <URL>` flag (direct URL, reusing stored metadata when the gateway is known).
 2. `--cluster <NAME>` / `-g <NAME>` flag.
-3. `NEMOCLAW_CLUSTER` environment variable.
-4. Active cluster from `~/.config/nemoclaw/active_cluster`.
+3. `OPENSHELL_CLUSTER` environment variable.
+4. Active cluster from `~/.config/openshell/active_cluster`.
 
 Resolution loads `ClusterMetadata` from disk to get the `gateway_endpoint` URL and `auth_mode`. When `--gateway-endpoint` is used, the CLI still tries to match the URL to stored metadata so edge auth tokens and TLS bundles continue to resolve by cluster name.
 
@@ -47,7 +47,7 @@ graph TD
 
 **File**: `crates/navigator-cli/src/tls.rs` -- `build_channel()`
 
-The default mode for self-deployed gateways. The CLI loads three PEM files from `~/.config/nemoclaw/clusters/<name>/mtls/`:
+The default mode for self-deployed gateways. The CLI loads three PEM files from `~/.config/openshell/clusters/<name>/mtls/`:
 
 | File      | Purpose                                                        |
 | --------- | -------------------------------------------------------------- |
@@ -81,7 +81,7 @@ For gateways behind an edge proxy (e.g., Cloudflare Access), the CLI routes traf
 3. The gateway's `ws_tunnel.rs` handler upgrades the WebSocket and bridges it to an in-memory `MultiplexService` instance.
 4. The gRPC channel connects to `http://127.0.0.1:<local_port>` (plaintext HTTP/2 over the tunnel).
 
-Authentication uses a browser-based flow: `gateway add` opens the user's browser to the gateway's `/auth/connect` endpoint, which reads the `CF_Authorization` cookie and relays it back to a localhost callback server. The token is stored at `~/.config/nemoclaw/clusters/<name>/edge_token`.
+Authentication uses a browser-based flow: `gateway add` opens the user's browser to the gateway's `/auth/connect` endpoint, which reads the `CF_Authorization` cookie and relays it back to a localhost callback server. The token is stored at `~/.config/openshell/clusters/<name>/edge_token`.
 
 ### Plaintext connection
 
@@ -89,10 +89,10 @@ When the gateway is deployed with `--plaintext`, TLS is disabled entirely. The C
 
 ## File System Layout
 
-All connection artifacts are stored under `$XDG_CONFIG_HOME/nemoclaw/` (default `~/.config/nemoclaw/`):
+All connection artifacts are stored under `$XDG_CONFIG_HOME/openshell/` (default `~/.config/openshell/`):
 
 ```
-nemoclaw/
+openshell/
   active_cluster                          # plain text: active cluster name
   clusters/
     <name>_metadata.json                  # ClusterMetadata JSON
@@ -119,7 +119,7 @@ sequenceDiagram
     participant Edge as Edge Proxy
     participant GW as Gateway
 
-    U->>CLI: nemoclaw gateway add https://gw.example.com
+    U->>CLI: openshell gateway add https://gw.example.com
     CLI->>CLI: Store metadata (auth_mode: cloudflare_jwt)
     CLI->>Browser: Open https://gw.example.com/auth/connect
     Browser->>Edge: Edge proxy login

@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-providers"
-description = "Provider discovery and registry for NemoClaw"
+description = "Provider discovery and registry for OpenShell"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

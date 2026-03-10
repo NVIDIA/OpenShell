@@ -42,7 +42,7 @@ pytestmark = pytest.mark.xdist_group("inference-routing")
 
 _MANAGED_OPENAI_MODEL_ID = "mock/e2e-openai-model"
 _MANAGED_OPENAI_PROVIDER_NAME = "e2e-managed-openai"
-_INFERENCE_CONFIG_LOCK = "/tmp/nemoclaw-e2e-inference-config.lock"
+_INFERENCE_CONFIG_LOCK = "/tmp/openshell-e2e-inference-config.lock"
 
 
 def _baseline_policy() -> sandbox_pb2.SandboxPolicy:
@@ -190,7 +190,7 @@ def test_model_discovery_call_routed_to_backend(
         result = sb.exec_python(call_models, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        assert "Hello from nemoclaw mock backend" in output
+        assert "Hello from openshell mock backend" in output
         assert managed_openai_route in output
 
 
@@ -234,7 +234,7 @@ def test_inference_call_routed_to_backend(
         result = sb.exec_python(call_chat_completions, timeout_seconds=60)
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
-        assert "Hello from nemoclaw mock backend" in output
+        assert "Hello from openshell mock backend" in output
         assert managed_openai_route in output
 
 
