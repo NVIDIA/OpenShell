@@ -129,17 +129,44 @@ pub async fn ensure_network(docker: &Docker) -> Result<()> {
     // container to fail with "no default routes found".
     force_remove_network(docker).await?;
 
-    docker
-        .create_network(NetworkCreateRequest {
-            name: NETWORK_NAME.to_string(),
-            driver: Some("bridge".to_string()),
-            attachable: Some(true),
-            ..Default::default()
-        })
-        .await
+    // Docker may return a 409 conflict if the previous network teardown has
+    // not fully completed in the daemon.  Retry a few times with back-off,
+    // re-attempting the removal before each create.
+    let mut last_err = None;
+    for attempt in 0u64..5 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+            // Re-attempt removal in case the previous teardown has now settled.
+            force_remove_network(docker).await?;
+        }
+        match docker
+            .create_network(NetworkCreateRequest {
+                name: NETWORK_NAME.to_string(),
+                driver: Some("bridge".to_string()),
+                attachable: Some(true),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) if is_conflict(&err) => {
+                tracing::debug!(
+                    "Network create conflict (attempt {}/5), retrying: {}",
+                    attempt + 1,
+                    err,
+                );
+                last_err = Some(err);
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err("failed to create Docker network");
+            }
+        }
+    }
+    Err(last_err.expect("at least one retry attempt"))
         .into_diagnostic()
-        .wrap_err("failed to create Docker network")?;
-    Ok(())
+        .wrap_err("failed to create Docker network after retries (network still in use)")
 }
 
 pub async fn ensure_volume(docker: &Docker, name: &str) -> Result<()> {
@@ -211,6 +238,8 @@ pub async fn ensure_container(
     ssh_gateway_host: Option<&str>,
     gateway_port: u16,
     kube_port: Option<u16>,
+    disable_tls: bool,
+    disable_gateway_auth: bool,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -406,6 +435,18 @@ pub async fn ensure_container(
         && !tag.trim().is_empty()
     {
         env_vars.push(format!("IMAGE_TAG={tag}"));
+    }
+
+    // Disable TLS: pass through to the entrypoint so the HelmChart manifest
+    // configures the server pod for plaintext HTTP.
+    if disable_tls {
+        env_vars.push("DISABLE_TLS=true".to_string());
+    }
+
+    // Disable gateway auth: pass through to the entrypoint so the HelmChart
+    // manifest sets the flag on the server pod.
+    if disable_gateway_auth {
+        env_vars.push("DISABLE_GATEWAY_AUTH=true".to_string());
     }
 
     let env = Some(env_vars);

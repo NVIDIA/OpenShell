@@ -100,6 +100,8 @@ Files:
 - `crates/navigator-sandbox/src/lib.rs` -- inference context initialization, route refresh
 - `crates/navigator-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
+In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes.
+
 ### Interception flow
 
 The proxy handles only `CONNECT` requests to `inference.local`. Non-CONNECT requests (any method, any host) are rejected with `403`.

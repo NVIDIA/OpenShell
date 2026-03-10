@@ -1,0 +1,255 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+//! CLI smoke tests for Cloudflare tunnel auth commands.
+//!
+//! These tests do NOT require a running gateway — they exercise the CLI binary
+//! directly, validating that the new Cloudflare-related commands and flags
+//! parse correctly and behave as expected.
+
+use std::process::Stdio;
+
+use nemoclaw_e2e::harness::binary::nemoclaw_cmd;
+use nemoclaw_e2e::harness::output::strip_ansi;
+
+/// Run `nemoclaw <args>` with an isolated (empty) config directory so it
+/// cannot discover any real gateway.  Returns (combined stdout+stderr, exit code).
+async fn run_isolated(args: &[&str]) -> (String, i32) {
+    let tmpdir = tempfile::tempdir().expect("create isolated config dir");
+    let mut cmd = nemoclaw_cmd();
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("HOME", tmpdir.path())
+        .env_remove("NEMOCLAW_CLUSTER")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn nemoclaw");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let code = output.status.code().unwrap_or(-1);
+    (combined, code)
+}
+
+/// Run `nemoclaw <args>` with a given tmpdir as config (for persisting state
+/// across multiple commands).  Returns (combined stdout+stderr, exit code).
+async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i32) {
+    let mut cmd = nemoclaw_cmd();
+    cmd.args(args)
+        .env("XDG_CONFIG_HOME", tmpdir)
+        .env("HOME", tmpdir)
+        .env_remove("NEMOCLAW_CLUSTER")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn nemoclaw");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let code = output.status.code().unwrap_or(-1);
+    (combined, code)
+}
+
+// -------------------------------------------------------------------
+// Test 8: `--plaintext` flag is recognized
+// -------------------------------------------------------------------
+
+/// `nemoclaw gateway start --help` must show `--plaintext`.
+#[tokio::test]
+async fn gateway_start_help_shows_plaintext() {
+    let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
+    assert_eq!(code, 0, "gateway start --help should exit 0:\n{output}");
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("--plaintext"),
+        "expected '--plaintext' in gateway start --help output:\n{clean}"
+    );
+}
+
+// -------------------------------------------------------------------
+// Test 9: `gateway add` and `gateway login` are recognized
+// -------------------------------------------------------------------
+
+/// `nemoclaw gateway --help` must list `add` and `login` subcommands.
+#[tokio::test]
+async fn gateway_help_shows_add_and_login() {
+    let (output, code) = run_isolated(&["gateway", "--help"]).await;
+    assert_eq!(code, 0, "gateway --help should exit 0:\n{output}");
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("add"),
+        "expected 'add' in gateway --help output:\n{clean}"
+    );
+    assert!(
+        clean.contains("login"),
+        "expected 'login' in gateway --help output:\n{clean}"
+    );
+}
+
+/// `nemoclaw gateway add --help` must show the endpoint arg and `--no-auth` flag.
+#[tokio::test]
+async fn gateway_add_help_shows_flags() {
+    let (output, code) = run_isolated(&["gateway", "add", "--help"]).await;
+    assert_eq!(code, 0, "gateway add --help should exit 0:\n{output}");
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("--no-auth"),
+        "expected '--no-auth' in gateway add --help:\n{clean}"
+    );
+    assert!(
+        clean.contains("--name"),
+        "expected '--name' in gateway add --help:\n{clean}"
+    );
+    assert!(
+        // The positional argument for the endpoint
+        clean.contains("endpoint") || clean.contains("<ENDPOINT>"),
+        "expected endpoint argument in gateway add --help:\n{clean}"
+    );
+}
+
+/// `nemoclaw gateway login --help` is recognized.
+#[tokio::test]
+async fn gateway_login_help_is_recognized() {
+    let (output, code) = run_isolated(&["gateway", "login", "--help"]).await;
+    assert_eq!(code, 0, "gateway login --help should exit 0:\n{output}");
+
+    let clean = strip_ansi(&output);
+    // Should mention authenticating or Cloudflare
+    assert!(
+        clean.to_lowercase().contains("authenticat") || clean.to_lowercase().contains("cloudflare")
+            || clean.to_lowercase().contains("login") || clean.to_lowercase().contains("browser"),
+        "expected auth-related text in gateway login --help:\n{clean}"
+    );
+}
+
+// -------------------------------------------------------------------
+// Test 10: `gateway add --no-auth` creates metadata with cloudflare_jwt
+// -------------------------------------------------------------------
+
+/// `nemoclaw gateway add <endpoint> --no-auth` should:
+/// - Create cluster metadata with auth_mode = "cloudflare_jwt"
+/// - Set the gateway as active
+/// - Not attempt browser authentication
+#[tokio::test]
+async fn gateway_add_creates_cf_metadata() {
+    let tmpdir = tempfile::tempdir().expect("create config dir");
+
+    let (output, code) = run_with_config(
+        tmpdir.path(),
+        &[
+            "gateway",
+            "add",
+            "https://my-gateway.example.com",
+            "--name",
+            "test-cf-gw",
+            "--no-auth",
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        code, 0,
+        "gateway add --no-auth should exit 0:\n{output}"
+    );
+
+    // Verify the metadata file was written.
+    let metadata_path = tmpdir
+        .path()
+        .join("nemoclaw")
+        .join("clusters")
+        .join("test-cf-gw_metadata.json");
+    assert!(
+        metadata_path.exists(),
+        "metadata file should exist at {}",
+        metadata_path.display()
+    );
+
+    let metadata_content = std::fs::read_to_string(&metadata_path).expect("read metadata");
+    let metadata: serde_json::Value =
+        serde_json::from_str(&metadata_content).expect("parse metadata JSON");
+
+    assert_eq!(
+        metadata["auth_mode"].as_str(),
+        Some("cloudflare_jwt"),
+        "auth_mode should be 'cloudflare_jwt', got: {metadata_content}"
+    );
+    assert_eq!(
+        metadata["gateway_endpoint"].as_str(),
+        Some("https://my-gateway.example.com"),
+        "gateway_endpoint should match the provided URL"
+    );
+    assert_eq!(
+        metadata["name"].as_str(),
+        Some("test-cf-gw"),
+        "name should match --name flag"
+    );
+    assert_eq!(
+        metadata["is_remote"].as_bool(),
+        Some(true),
+        "CF gateway should be marked as remote"
+    );
+
+    // Verify the gateway was set as active.
+    let active_path = tmpdir
+        .path()
+        .join("nemoclaw")
+        .join("active_cluster");
+    assert!(
+        active_path.exists(),
+        "active_cluster file should exist at {}",
+        active_path.display()
+    );
+    let active = std::fs::read_to_string(&active_path).expect("read active_cluster");
+    assert_eq!(
+        active.trim(),
+        "test-cf-gw",
+        "active cluster should be 'test-cf-gw'"
+    );
+
+    // Verify the output mentions the gateway was added.
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("test-cf-gw") && clean.contains("added"),
+        "output should confirm gateway was added:\n{clean}"
+    );
+}
+
+/// `gateway add` without `--name` should derive a name from the hostname.
+#[tokio::test]
+async fn gateway_add_derives_name_from_hostname() {
+    let tmpdir = tempfile::tempdir().expect("create config dir");
+
+    let (output, code) = run_with_config(
+        tmpdir.path(),
+        &[
+            "gateway",
+            "add",
+            "https://my-special-gateway.brevlab.com",
+            "--no-auth",
+        ],
+    )
+    .await;
+
+    assert_eq!(
+        code, 0,
+        "gateway add --no-auth should exit 0:\n{output}"
+    );
+
+    // The derived name should be the hostname.
+    let metadata_path = tmpdir
+        .path()
+        .join("nemoclaw")
+        .join("clusters")
+        .join("my-special-gateway.brevlab.com_metadata.json");
+    assert!(
+        metadata_path.exists(),
+        "metadata file should exist with hostname-derived name at {}",
+        metadata_path.display()
+    );
+}
+
+

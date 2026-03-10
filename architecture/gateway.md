@@ -63,7 +63,9 @@ graph TD
 | gRPC: Navigator | `crates/navigator-server/src/grpc.rs` | `NavigatorService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
 | gRPC: Inference | `crates/navigator-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
 | HTTP | `crates/navigator-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
+| Browser auth | `crates/navigator-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
 | SSH tunnel | `crates/navigator-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
+| WS tunnel | `crates/navigator-server/src/ws_tunnel.rs` | WebSocket tunnel handler at `/_ws_tunnel` for Cloudflare-fronted clients |
 | TLS | `crates/navigator-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
 | Persistence | `crates/navigator-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
 | Persistence: SQLite | `crates/navigator-server/src/persistence/sqlite.rs` | `SqliteStore` with sqlx |
@@ -113,6 +115,8 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--tls-cert` | `NEMOCLAW_TLS_CERT` | None | Path to PEM certificate file |
 | `--tls-key` | `NEMOCLAW_TLS_KEY` | None | Path to PEM private key file |
 | `--tls-client-ca` | `NEMOCLAW_TLS_CLIENT_CA` | None | Path to PEM CA cert for mTLS client verification |
+| `--disable-tls` | `NEMOCLAW_DISABLE_TLS` | `false` | Listen on plaintext HTTP behind a trusted reverse proxy or tunnel |
+| `--disable-gateway-auth` | `NEMOCLAW_DISABLE_GATEWAY_AUTH` | `false` | Keep TLS enabled but allow no-certificate clients and rely on application-layer auth |
 | `--client-tls-secret-name` | `NEMOCLAW_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
 | `--db-url` | `NEMOCLAW_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/navigator/navigator.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
 | `--sandbox-namespace` | `NEMOCLAW_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
@@ -176,7 +180,8 @@ Both gRPC and HTTP handlers produce different response body types. `MultiplexedS
 When TLS is enabled (`crates/navigator-server/src/tls.rs`):
 
 - `TlsAcceptor::from_files()` loads PEM certificates and keys via `rustls_pemfile`, builds a `rustls::ServerConfig`, and configures ALPN to advertise `h2` and `http/1.1`.
-- When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` -- all clients must present a certificate signed by the cluster CA. Without a client CA path, the server falls back to `with_no_client_auth()` (for local dev).
+- When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` by default. In Cloudflare-fronted deployments, `--disable-gateway-auth` keeps TLS enabled but allows no-certificate clients so the edge can forward a JWT instead.
+- `--disable-tls` removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
 - Supports PKCS#1, PKCS#8, and SEC1 private key formats.
 - The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
 - Certificates are generated at cluster bootstrap time by the `navigator-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `navigator-server-tls` (server cert+key), `navigator-server-client-ca` (CA cert), and `navigator-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
@@ -293,6 +298,13 @@ The HTTP router (`crates/navigator-server/src/http.rs`) merges two sub-routers:
 | `/connect/ssh` | CONNECT | Upgrades the connection to a bidirectional TCP tunnel to a sandbox pod's SSH port |
 
 See [SSH Tunnel Gateway](#ssh-tunnel-gateway) for details.
+
+### Cloudflare Endpoints
+
+| Path | Method | Response |
+|------|--------|----------|
+| `/auth/connect` | GET | Browser login relay page that reads `CF_Authorization` and POSTs it back to the CLI localhost callback |
+| `/_ws_tunnel` | GET upgrade | WebSocket tunnel that bridges bytes directly into `MultiplexedService` over an in-memory duplex stream |
 
 ## Watch Sandbox Stream
 

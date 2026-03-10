@@ -76,6 +76,8 @@ petname = "2"
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }
 tempfile = "3"
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
 
 [lints]
 workspace = true

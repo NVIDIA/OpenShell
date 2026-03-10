@@ -171,7 +171,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 **How it works end-to-end:**
 
 1. An operator configures cluster-level inference via `nemoclaw cluster inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
-2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle every 30 seconds.
+2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS`).
 3. The agent sends requests to `https://inference.local` using standard OpenAI or Anthropic SDK calls.
 4. The sandbox proxy intercepts the HTTPS CONNECT to `inference.local` (bypassing OPA policy evaluation), TLS-terminates the connection using the sandbox's ephemeral CA, and parses the HTTP request.
 5. Known inference API patterns are detected (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic, `GET /v1/models` for model discovery). Matching requests are forwarded to the first compatible route by the `navigator-router`, which rewrites the auth header, injects provider-specific default headers (e.g., `anthropic-version` for Anthropic), and overrides the model field in the request body.
@@ -266,6 +266,13 @@ nemoclaw sandbox create --remote user@hostname -- claude
 
 This performs the same bootstrap flow on the remote host via SSH.
 
+For development and testing against the current checkout, use
+`scripts/remote-deploy.sh` instead. That helper syncs the local repository to
+an SSH-reachable machine, builds the CLI and Docker images on the remote host,
+and then runs `nemoclaw gateway start` there. It defaults to secure gateway
+startup and only enables `--plaintext`, `--disable-gateway-auth`, or
+`--recreate` when explicitly requested.
+
 **Step 3: Connect to a running sandbox.**
 
 ```bash
@@ -280,6 +287,7 @@ This opens an interactive SSH session into the sandbox, with all provider creden
 |---|---|
 | [Cluster Bootstrap](cluster-single-node.md) | How the platform bootstraps a Kubernetes cluster from a single Docker container, for local and remote targets. |
 | [Gateway Architecture](gateway.md) | The control plane gateway: API multiplexing, gRPC services, persistence, TLS, and sandbox orchestration. |
+| [Gateway Communication](gateway-deploy-connect.md) | How the CLI resolves a gateway and communicates with it over mTLS, plaintext HTTP/2, or an edge-authenticated WebSocket tunnel. |
 | [Gateway Security](gateway-security.md) | mTLS enforcement, PKI bootstrap, certificate hierarchy, and the gateway trust model. |
 | [Sandbox Architecture](sandbox.md) | The sandbox execution environment: policy enforcement, Landlock, seccomp, network namespaces, and the network proxy. |
 | [Container Management](build-containers.md) | Container images, Dockerfiles, Helm charts, build tasks, and CI/CD. |

@@ -17,7 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -59,23 +59,30 @@ async fn ssh_session_config(
         .wrap_err("failed to resolve NemoClaw executable")?;
     let exe_command = shell_escape(&exe.to_string_lossy());
 
-    // If the server returned a loopback gateway address, override it with the
-    // cluster endpoint's host. This handles the case where the server defaults
-    // to 127.0.0.1 but the cluster is actually running on a remote host.
-    #[allow(clippy::cast_possible_truncation)]
-    let gateway_port_u16 = session.gateway_port as u16;
-    let (gateway_host, gateway_port) =
-        resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
-
-    let gateway_url = format!(
-        "{}://{}:{}{}",
-        session.gateway_scheme, gateway_host, gateway_port, session.connect_path
-    );
+    // When using Cloudflare bearer auth, the SSH CONNECT must go through the
+    // external tunnel endpoint (the cluster URL), not the server's internal
+    // scheme/host/port which may be plaintext HTTP on 127.0.0.1.
+    let gateway_url = if tls.is_bearer_auth() {
+        let base = server.trim_end_matches('/');
+        format!("{base}{}", session.connect_path)
+    } else {
+        // If the server returned a loopback gateway address, override it with the
+        // cluster endpoint's host. This handles the case where the server defaults
+        // to 127.0.0.1 but the cluster is actually running on a remote host.
+        #[allow(clippy::cast_possible_truncation)]
+        let gateway_port_u16 = session.gateway_port as u16;
+        let (gateway_host, gateway_port) =
+            resolve_ssh_gateway(&session.gateway_host, gateway_port_u16, server);
+        format!(
+            "{}://{}:{}{}",
+            session.gateway_scheme, gateway_host, gateway_port, session.connect_path
+        )
+    };
     let cluster_name = tls
         .cluster_name()
         .ok_or_else(|| miette::miette!("cluster name is required to build SSH proxy command"))?;
     let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway-endpoint {} --sandbox-id {} --token {} --gateway {}",
+        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --cluster {}",
         gateway_url,
         session.sandbox_id,
         session.token,
@@ -515,14 +522,22 @@ pub async fn sandbox_ssh_proxy(
         .await
         .into_diagnostic()?;
 
-    let status = read_connect_status(&mut stream).await?;
+    // Wrap in a BufReader **before** reading the HTTP response.  The gateway
+    // may send the 200 OK response and the first SSH protocol bytes in the
+    // same TCP segment / WebSocket frame.  A plain `read()` would consume
+    // those SSH bytes into our buffer and discard them, causing SSH to see a
+    // truncated protocol banner and exit with code 255.  BufReader ensures
+    // any bytes read past the `\r\n\r\n` header boundary stay buffered and
+    // are returned by subsequent reads during the bidirectional copy phase.
+    let mut buf_stream = BufReader::new(stream);
+    let status = read_connect_status(&mut buf_stream).await?;
     if status != 200 {
         return Err(miette::miette!(
             "gateway CONNECT failed with status {status}"
         ));
     }
 
-    let (reader, writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(buf_stream);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -565,14 +580,14 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
 /// The output is suitable for appending to `~/.ssh/config` so that tools like
 /// `VSCode` Remote-SSH can connect to the sandbox by host alias.
 ///
-/// The `ProxyCommand` uses `--gateway` so that `ssh-proxy` resolves the
+/// The `ProxyCommand` uses `--cluster` so that `ssh-proxy` resolves the
 /// gateway endpoint and TLS certificates from the gateway metadata directory
 /// (`~/.config/nemoclaw/clusters/<name>/mtls/`).
 pub fn print_ssh_config(cluster: &str, name: &str) {
     let exe = std::env::current_exe().expect("failed to resolve NemoClaw executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
-    let proxy_cmd = format!("{exe} ssh-proxy --gateway {cluster} --name {name}");
+    let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
 
     println!("Host nemoclaw-{name}");
     println!("    User sandbox");
@@ -602,6 +617,24 @@ async fn connect_gateway(
     port: u16,
     tls: &TlsOptions,
 ) -> Result<Box<dyn ProxyStream>> {
+    // When using edge bearer auth, route through the WebSocket tunnel proxy
+    // regardless of the origin scheme. The proxy handles edge auth headers
+    // and TLS termination at the edge; the origin may be plaintext HTTP
+    // behind the tunnel.
+    if tls.is_bearer_auth() {
+        let token = tls
+            .edge_token
+            .as_deref()
+            .ok_or_else(|| miette::miette!("edge token required for tunnel"))?;
+        let gateway_url = format!("https://{host}:{port}");
+        let proxy = crate::edge_tunnel::start_tunnel_proxy(&gateway_url, token).await?;
+        let tcp = TcpStream::connect(proxy.local_addr)
+            .await
+            .into_diagnostic()?;
+        tcp.set_nodelay(true).into_diagnostic()?;
+        return Ok(Box::new(tcp));
+    }
+
     let tcp = TcpStream::connect((host, port)).await.into_diagnostic()?;
     tcp.set_nodelay(true).into_diagnostic()?;
     if scheme.eq_ignore_ascii_case("https") {
@@ -620,16 +653,21 @@ async fn connect_gateway(
     }
 }
 
-async fn read_connect_status(stream: &mut dyn ProxyStream) -> Result<u16> {
+/// Read exactly the HTTP response status line and headers up to `\r\n\r\n`.
+///
+/// Uses byte-at-a-time reads so that the caller's `BufReader` retains any
+/// bytes that arrived after the header boundary (e.g. the SSH protocol
+/// banner that the gateway may send in the same TCP segment).
+async fn read_connect_status<R: AsyncRead + Unpin>(stream: &mut R) -> Result<u16> {
     let mut buf = Vec::new();
-    let mut temp = [0u8; 1024];
+    let mut byte = [0u8; 1];
     loop {
-        let n = stream.read(&mut temp).await.into_diagnostic()?;
+        let n = stream.read(&mut byte).await.into_diagnostic()?;
         if n == 0 {
             break;
         }
-        buf.extend_from_slice(&temp[..n]);
-        if buf.windows(4).any(|win| win == b"\r\n\r\n") {
+        buf.push(byte[0]);
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
             break;
         }
         if buf.len() > 8192 {

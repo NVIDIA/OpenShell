@@ -44,10 +44,9 @@ nemoclaw
 │   ├── update <name>
 │   └── delete <name>
 ├── inference
-│   ├── create
-│   ├── update <name>
-│   ├── delete <name>
-│   └── list
+│   ├── set
+│   ├── update
+│   └── get
 ├── term
 └── completions <shell>
 ```
@@ -133,25 +132,30 @@ Manage credential providers that inject secrets into sandboxes.
 
 ## Inference Commands
 
-Manage inference routes that intercept and reroute LLM API calls from userland code.
+Configure the backend used by `https://inference.local`.
 
-| Command | Description |
-|---|---|
-| `nemoclaw inference create` | Create a new inference route. See flag reference below. |
-| `nemoclaw inference update <name>` | Update an existing route's configuration. |
-| `nemoclaw inference delete <name>` | Delete an inference route. |
-| `nemoclaw inference list` | List all inference routes in the active cluster. |
+### `nemoclaw inference set`
 
-### Inference Create Flags
+Set the provider and model for managed inference. Both flags are required.
 
 | Flag | Description |
 |---|---|
-| `--routing-hint` | Short label that identifies this route (for example, `local`, `nvidia`, `staging`). Referenced by `allowed_routes` in sandbox policies. |
-| `--base-url` | Base URL of the inference backend (for example, `https://vllm.internal:8000`). |
-| `--model-id` | Model identifier to send to the backend (for example, `meta/llama-3.1-8b`). |
-| `--api-key` | API key for authenticating with the backend. |
-| `--protocol` | API protocol: `openai` or `anthropic`. Defaults to `openai`. |
-| `--disabled` | Create the route in a disabled state. |
+| `--provider` | Provider record name to use for injected credentials. |
+| `--model` | Model identifier to force on generation requests. |
+
+### `nemoclaw inference update`
+
+Update only the fields you specify.
+
+| Flag | Description |
+|---|---|
+| `--provider` | Replace the current provider record. |
+| `--model` | Replace the current model ID. |
+
+### `nemoclaw inference get`
+
+Show the current inference configuration, including provider, model, and
+version.
 
 ## OpenShell Terminal
 

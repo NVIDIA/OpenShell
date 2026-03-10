@@ -310,6 +310,26 @@ if [ -f "$HELMCHART" ]; then
     fi
     echo "Setting SSH handshake secret"
     sed -i "s|__SSH_HANDSHAKE_SECRET__|${SSH_HANDSHAKE_SECRET}|g" "$HELMCHART"
+
+    # Disable gateway auth: when set, the server accepts connections without
+    # client certificates (for reverse-proxy / Cloudflare Tunnel deployments).
+    if [ "${DISABLE_GATEWAY_AUTH:-}" = "true" ]; then
+        echo "Disabling gateway auth (mTLS client cert not required)"
+        sed -i "s|__DISABLE_GATEWAY_AUTH__|true|g" "$HELMCHART"
+    else
+        sed -i "s|__DISABLE_GATEWAY_AUTH__|false|g" "$HELMCHART"
+    fi
+
+    # Disable TLS entirely: the server listens on plaintext HTTP.
+    # Used when a reverse proxy / tunnel terminates TLS at the edge.
+    if [ "${DISABLE_TLS:-}" = "true" ]; then
+        echo "Disabling TLS (plaintext HTTP)"
+        sed -i "s|__DISABLE_TLS__|true|g" "$HELMCHART"
+        # The Helm template automatically rewrites https:// to http:// in
+        # NEMOCLAW_GRPC_ENDPOINT when disableTls is true, so no sed needed here.
+    else
+        sed -i "s|__DISABLE_TLS__|false|g" "$HELMCHART"
+    fi
 fi
 
 # Inject chart checksum into the HelmChart manifest so that a changed chart

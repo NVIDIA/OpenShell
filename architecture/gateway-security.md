@@ -2,9 +2,11 @@
 
 ## Overview
 
-All communication with the NemoClaw gateway is secured by mutual TLS (mTLS). Every client -- the CLI, SDK, and sandbox pods -- must present a valid certificate signed by the cluster CA to reach any gateway endpoint. There is no unauthenticated path; even health check endpoints are behind mTLS. The PKI is bootstrapped automatically during cluster deployment, and certificates are distributed to Kubernetes secrets and the local filesystem without manual configuration.
+By default, communication with the NemoClaw gateway is secured by mutual TLS (mTLS). The CLI, SDK, and sandbox pods present certificates signed by the cluster CA before they reach any application handler. The PKI is bootstrapped automatically during cluster deployment, and certificates are distributed to Kubernetes secrets and the local filesystem without manual configuration.
 
-This document covers the certificate hierarchy, the bootstrap process, how mTLS is enforced at the gateway, how sandboxes and the CLI consume their certificates, and the broader security model of the gateway.
+The gateway also supports Cloudflare-fronted deployments where the edge, not the gateway, is the first authentication boundary. In that mode the gateway either keeps TLS enabled but allows no-certificate client handshakes (`allow_unauthenticated=true`) and relies on application-layer Cloudflare JWTs, or disables gateway TLS entirely and serves plaintext behind a trusted reverse proxy or tunnel.
+
+This document covers the certificate hierarchy, the bootstrap process, how gateway transport security modes are enforced, how sandboxes and the CLI consume their certificates, and the broader security model of the gateway.
 
 ## Architecture Diagram
 
@@ -166,28 +168,41 @@ sequenceDiagram
 
 ## Gateway TLS Enforcement
 
-The gateway uses `tokio-rustls` to terminate TLS with mandatory client certificate verification. There is no plaintext fallback when TLS is configured.
+The gateway supports three transport modes:
+
+1. **mTLS (default)** -- TLS is enabled and client certificates are required.
+2. **Dual-auth TLS** -- TLS is enabled, but the handshake also accepts clients without certificates (`allow_unauthenticated=true`). This is used for Cloudflare Tunnel deployments where the edge authenticates the user and forwards a Cloudflare JWT to the gateway.
+3. **Plaintext behind edge** -- TLS is disabled at the gateway and the service listens on HTTP behind a trusted reverse proxy or tunnel.
 
 ### Server Configuration
 
 `TlsAcceptor::from_files()` (`crates/navigator-server/src/tls.rs:27`) constructs the `rustls::ServerConfig`:
 
 1. **Server identity**: loads the server certificate and private key from PEM files (supports PKCS#1, PKCS#8, and SEC1 key formats).
-2. **Client verification**: builds a `WebPkiClientVerifier` from the CA certificate. This always requires clients to present a valid certificate; there is no optional-auth mode.
+2. **Client verification**: builds a `WebPkiClientVerifier` from the CA certificate. In the default mode it requires a valid client certificate; in dual-auth mode it also accepts no-certificate clients and defers authentication to the HTTP/gRPC layer.
 3. **ALPN**: advertises `h2` and `http/1.1` for protocol negotiation.
 
 ### Connection Flow
 
 ```
 TCP accept
-  → TLS handshake (client must present cert signed by cluster CA)
+  → TLS handshake (mandatory client cert in mTLS mode, optional in dual-auth mode)
   → hyper auto-negotiates HTTP/1.1 or HTTP/2 via ALPN
   → MultiplexedService routes by content-type:
       ├── application/grpc → GrpcRouter
       └── other → Axum HTTP Router
 ```
 
-All traffic shares a single port. The TLS handshake occurs before any HTTP parsing, so a client that fails mTLS verification never reaches any application handler.
+All traffic shares a single port. When TLS is enabled, the TLS handshake occurs before any HTTP parsing. In plaintext mode, the gateway expects an upstream reverse proxy or tunnel to be the outer security boundary.
+
+### Cloudflare-Specific HTTP Endpoints
+
+Cloudflare-fronted gateways add two HTTP endpoints on the same multiplexed port:
+
+- `/auth/connect` -- browser login relay that reads the `CF_Authorization` cookie server-side and POSTs the token back to the CLI's localhost callback server.
+- `/_ws_tunnel` -- WebSocket upgrade endpoint used to carry gRPC and SSH bytes through Cloudflare Access.
+
+The WebSocket tunnel bridges directly into the gateway's `MultiplexedService` over an in-memory duplex stream. It does not re-enter the public listener, so it behaves the same whether the public listener is plaintext or TLS-backed.
 
 ### What Gets Rejected
 
@@ -320,7 +335,7 @@ graph LR
 
 | Boundary | Mechanism |
 |---|---|
-| External → Gateway | mTLS with cluster CA (`WebPkiClientVerifier`) |
+| External → Gateway | mTLS with cluster CA by default, or trusted reverse-proxy/Cloudflare boundary in edge mode |
 | Sandbox → Gateway | mTLS with shared client cert |
 | Gateway → Sandbox (SSH) | Session token + HMAC-SHA256 handshake (NSSH1) |
 | Sandbox → External (network) | OPA policy + process identity binding via `/proc` |
@@ -328,7 +343,7 @@ graph LR
 ### What Is Not Authenticated (by Design)
 
 - **Individual sandbox identity at the TLS layer**: all sandboxes share one client certificate (`CN=navigator-client`). Post-TLS identification uses the `x-sandbox-id` gRPC metadata header, which is trusted because it arrives over an mTLS-authenticated channel.
-- **Health endpoints**: `/health`, `/healthz`, and `/readyz` are behind mTLS like all other endpoints. There is no unauthenticated health check path.
+- **Health endpoints in reverse-proxy mode**: when the gateway is deployed behind Cloudflare or another trusted edge, `/health`, `/healthz`, and `/readyz` are protected by that upstream boundary rather than by direct mTLS at the gateway.
 
 ### Gateway Security Context
 
@@ -371,8 +386,8 @@ This section defines the primary attacker profiles, what the current design prot
 
 | Threat | Existing Defense | Notes |
 |---|---|---|
-| MITM or passive interception of gateway traffic | Mandatory mTLS with cluster CA | Handshake fails without trusted cert chain |
-| Unauthenticated API/health access | No plaintext or unauthenticated endpoint path | `/health*` endpoints remain behind mTLS |
+| MITM or passive interception of gateway traffic | Mandatory mTLS with cluster CA, or trusted reverse-proxy boundary in Cloudflare mode | Default mode is direct mTLS; reverse-proxy mode shifts the outer trust boundary upstream |
+| Unauthenticated API/health access | mTLS by default, or Cloudflare/reverse-proxy auth in edge mode | `/health*` are direct-mTLS only in the default deployment mode |
 | Forged SSH tunnel connection to sandbox | Session token validation + NSSH1 HMAC handshake | Requires token and shared handshake secret |
 | Direct access to sandbox SSH port from cluster peers | NSSH1 challenge-response | Connection denied without valid signature |
 | Unauthorized outbound internet access from sandbox | OPA policy + process identity checks | Applies to sandbox egress policy layer |

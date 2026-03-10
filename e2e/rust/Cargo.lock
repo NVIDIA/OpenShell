@@ -234,6 +234,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "rand",
+ "serde_json",
  "sha2",
  "tempfile",
  "tokio",
