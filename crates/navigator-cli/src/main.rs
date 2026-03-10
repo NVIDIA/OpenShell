@@ -1489,11 +1489,7 @@ async fn main() -> Result<()> {
                     .await?;
                 }
                 ClusterInferenceCommands::Get { system } => {
-                    let route_name = if system {
-                        Some("sandbox-system")
-                    } else {
-                        None
-                    };
+                    let route_name = if system { Some("sandbox-system") } else { None };
                     run::cluster_inference_get(endpoint, route_name, &tls).await?;
                 }
             }
@@ -1903,11 +1899,7 @@ async fn main() -> Result<()> {
                         .await?;
                     }
                     ClusterInferenceCommands::Get { system } => {
-                        let route_name = if system {
-                            Some("sandbox-system")
-                        } else {
-                            None
-                        };
+                        let route_name = if system { Some("sandbox-system") } else { None };
                         run::cluster_inference_get(endpoint, route_name, &tls).await?;
                     }
                 }
