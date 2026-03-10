@@ -22,10 +22,10 @@ const PULL_REGISTRY_DEFAULT_TAG: &str = "latest";
 pub const DEFAULT_REGISTRY: &str = "ghcr.io";
 
 /// Default image repository base on GHCR (without component name or tag).
-pub const DEFAULT_IMAGE_REPO_BASE: &str = "ghcr.io/nvidia/nemoclaw";
+pub const DEFAULT_IMAGE_REPO_BASE: &str = "ghcr.io/nvidia/openshell";
 
 /// Default full gateway image path on GHCR (without tag).
-pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/nvidia/nemoclaw/cluster";
+pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/nvidia/openshell/cluster";
 
 /// Default username for token-based GHCR authentication.
 ///
@@ -39,7 +39,7 @@ pub const DEFAULT_REGISTRY_USERNAME: &str = "__token__";
 // A read-only GHCR PAT is XOR-encoded so it doesn't appear as plaintext in
 // the compiled binary. This is a lightweight deterrent against casual
 // inspection — it is NOT a security boundary. The `--registry-token` flag
-// (or `NEMOCLAW_REGISTRY_TOKEN` env var) overrides this default.
+// (or `OPENSHELL_REGISTRY_TOKEN` env var) overrides this default.
 
 /// XOR key used to decode the default registry token.
 const XOR_KEY: [u8; 32] = [
@@ -234,7 +234,7 @@ pub async fn pull_remote_image(
 
     // Tag the pulled image to the expected local image ref so downstream code
     // (container creation, image ID checks) works unchanged.
-    // e.g., tag "ghcr.io/nvidia/nemoclaw/cluster:latest" as "openshell/cluster:dev"
+    // e.g., tag "ghcr.io/nvidia/openshell/cluster:latest" as "openshell/cluster:dev"
     let (target_repo, target_tag) = parse_image_ref(image_ref);
     info!(
         "Tagging {} as {}:{}",

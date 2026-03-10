@@ -3,7 +3,7 @@ title:
   page: "Quickstart"
   nav: "Quickstart"
 description: "Install the OpenShell CLI and create your first sandboxed AI agent in two commands."
-keywords: ["nemoclaw install", "quickstart", "sandbox create", "getting started"]
+keywords: ["openshell install", "quickstart", "sandbox create", "getting started"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "installation", "quickstart"]
 content:
@@ -40,7 +40,7 @@ uv venv && source .venv/bin/activate
 Install the CLI:
 
 ```bash
-uv pip install nemoclaw
+uv pip install openshell
 ```
 
 ## Connect to a Remote Gateway (Optional)
@@ -58,8 +58,8 @@ Deploy an OpenShell gateway on Brev by hitting **Deploy** on the [OpenShell Laun
 Once the instance is running, find the gateway URL in the Brev console under **Using Secure Links**. Copy the shareable URL for **port 8080** — this is the gateway endpoint.
 
 ```console
-$ nemoclaw gateway add https://<your-port-8080-url>.brevlab.com
-$ nemoclaw status
+$ openshell gateway add https://<your-port-8080-url>.brevlab.com
+$ openshell status
 ```
 
 ::::
@@ -73,11 +73,11 @@ Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured 
 Deploy to a DGX Spark machine over SSH:
 
 ```console
-$ nemoclaw gateway start --remote <username>@<spark-ssid>.local
-$ nemoclaw status
+$ openshell gateway start --remote <username>@<spark-ssid>.local
+$ openshell status
 ```
 
-Once `nemoclaw status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
+Once `openshell status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
 
 ::::
 
@@ -91,7 +91,7 @@ Choose the tab that matches your agent:
 
 :::{tab-item} Claude Code
 ```console
-$ nemoclaw sandbox create -- claude
+$ openshell sandbox create -- claude
 ```
 
 The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `ANTHROPIC_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
@@ -99,7 +99,7 @@ The CLI prompts you to create a provider from local credentials — type `yes` t
 
 :::{tab-item} OpenCode
 ```console
-$ nemoclaw sandbox create -- opencode
+$ openshell sandbox create -- opencode
 ```
 
 The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
@@ -107,7 +107,7 @@ The CLI prompts you to create a provider from local credentials — type `yes` t
 
 :::{tab-item} Codex
 ```console
-$ nemoclaw sandbox create -- codex
+$ openshell sandbox create -- codex
 ```
 
 The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `OPENAI_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
@@ -115,10 +115,10 @@ The CLI prompts you to create a provider from local credentials — type `yes` t
 
 :::{tab-item} Community Sandbox
 ```console
-$ nemoclaw sandbox create --from openclaw
+$ openshell sandbox create --from openclaw
 ```
 
-The `--from` flag pulls a pre-built sandbox definition from the [NemoClaw Community](https://github.com/NVIDIA/NemoClaw-Community) catalog. Each definition bundles a container image, a tailored policy, and optional skills into a single package.
+The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog. Each definition bundles a container image, a tailored policy, and optional skills into a single package.
 :::
 
 ::::

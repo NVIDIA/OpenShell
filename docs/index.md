@@ -24,9 +24,9 @@ content:
 
 # NVIDIA OpenShell
 
-[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/NemoClaw)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/NemoClaw/blob/main/LICENSE)
-[![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
+[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/OpenShell)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
@@ -97,8 +97,8 @@ Install the CLI and create your first sandbox in two commands.
     <span class="nc-term-dot nc-term-dot-g"></span>
   </div>
   <div class="nc-term-body">
-    <div><span class="nc-ps">$ </span>uv pip install nemoclaw</div>
-    <div><span class="nc-ps">$ </span>nemoclaw sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
+    <div><span class="nc-ps">$ </span>uv pip install openshell</div>
+    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```

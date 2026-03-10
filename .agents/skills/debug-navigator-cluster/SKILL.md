@@ -152,7 +152,7 @@ docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yam
 
 Common issues:
 
-- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 6). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/nemoclaw/`. Ensure a valid `--registry-token` (or `NEMOCLAW_REGISTRY_TOKEN`) was provided during deploy.
+- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 6). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/`. Ensure a valid `--registry-token` (or `OPENSHELL_REGISTRY_TOKEN`) was provided during deploy.
 - **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
 - **Pending**: Insufficient resources or scheduling constraints.
 
@@ -215,7 +215,7 @@ docker save <image-ref> | docker exec -i openshell-cluster-<name> ctr -a /run/k3
 docker exec openshell-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 
 # Test pulling an image manually from inside the cluster
-docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/nemoclaw/server:latest'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/openshell/server:latest'
 ```
 
 If `registries.yaml` is missing or has wrong values, verify env wiring (`OPENSHELL_REGISTRY_HOST`, `OPENSHELL_REGISTRY_INSECURE`, username/password for authenticated registries).
