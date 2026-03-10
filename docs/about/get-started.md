@@ -26,12 +26,24 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 Before you begin, make sure you have:
 
 - Python 3.12 or later
+- [uv](https://docs.astral.sh/uv/) installed
 - Docker Desktop running on your machine <!-- TODO: add compatible version -->
 
 ## Install the OpenShell CLI
 
+Activate your virtual environment:
+
 ```bash
-pip install nemoclaw
+uv venv && source .venv/bin/activate
+```
+
+Install the CLI:
+
+```bash
+uv pip install nemoclaw \
+  --upgrade \
+  --pre \
+  --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
 ## Create Your First OpenShell Sandbox
@@ -45,16 +57,7 @@ Choose the tab that matches your agent:
 $ nemoclaw sandbox create -- claude
 ```
 
-```text
-✓ Runtime ready
-✓ Discovered Claude credentials (ANTHROPIC_API_KEY)
-✓ Created sandbox: keen-fox
-✓ Policy loaded (4 protection layers active)
-
-Connecting to keen-fox...
-```
-
-The CLI detects your `ANTHROPIC_API_KEY`, creates a provider, builds the sandbox, applies a default policy, and drops you into an interactive session. No additional configuration is required.
+The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `ANTHROPIC_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
 :::
 
 :::{tab-item} Community Sandbox

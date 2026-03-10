@@ -7,13 +7,6 @@
 
 This page walks you through the full sandbox lifecycle: creating, inspecting, connecting to, monitoring, and deleting sandboxes. For background on what sandboxes are and how the runtime works, refer to [About Sandboxes](index.md).
 
-## Prerequisites
-
-Ensure the following are ready before creating sandboxes.
-
-- OpenShell CLI installed (`pip install nemoclaw`)
-- Docker running on your machine
-
 :::{warning}
 Docker must be running before you create a sandbox. If it isn't, the CLI
 returns a connection-refused error (`os error 61`) without explaining

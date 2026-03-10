@@ -24,8 +24,7 @@ By the end you will have:
 
 Before you begin, make sure you have:
 
-- OpenShell CLI installed (`pip install nemoclaw`)
-- Docker running on your machine
+- Completed the {doc}`Quickstart </about/get-started>` (CLI installed, Docker running)
 - A GitHub personal access token (PAT) with `repo` scope, exported as `GITHUB_TOKEN`
 - Your agent's API key set (e.g., `ANTHROPIC_API_KEY` for Claude Code)
 
