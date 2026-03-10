@@ -317,6 +317,72 @@ mod tests {
         // Should not panic
         bus.remove("nonexistent");
     }
+
+    #[test]
+    fn platform_event_bus_tail_returns_buffered_events() {
+        use navigator_core::proto::{PlatformEvent, sandbox_stream_event};
+
+        let bus = PlatformEventBus::new();
+        let sandbox_id = "sb-6";
+
+        // Publish some events
+        for i in 0..5 {
+            let evt = SandboxStreamEvent {
+                payload: Some(sandbox_stream_event::Payload::Event(PlatformEvent {
+                    timestamp_ms: i,
+                    source: "test".to_string(),
+                    r#type: "Normal".to_string(),
+                    reason: format!("Event{i}"),
+                    message: format!("Message {i}"),
+                    metadata: HashMap::new(),
+                })),
+            };
+            bus.publish(sandbox_id, evt);
+        }
+
+        // Tail should return all events in order
+        let events = bus.tail(sandbox_id, 10);
+        assert_eq!(events.len(), 5);
+
+        // Verify order (oldest first)
+        for (i, evt) in events.iter().enumerate() {
+            if let Some(sandbox_stream_event::Payload::Event(ref e)) = evt.payload {
+                assert_eq!(e.reason, format!("Event{i}"));
+            } else {
+                panic!("expected Event payload");
+            }
+        }
+
+        // Tail with smaller max should return most recent events
+        let events = bus.tail(sandbox_id, 2);
+        assert_eq!(events.len(), 2);
+        if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[0].payload {
+            assert_eq!(e.reason, "Event3");
+        }
+        if let Some(sandbox_stream_event::Payload::Event(ref e)) = events[1].payload {
+            assert_eq!(e.reason, "Event4");
+        }
+    }
+
+    #[test]
+    fn platform_event_bus_tail_empty_sandbox() {
+        let bus = PlatformEventBus::new();
+        let events = bus.tail("nonexistent", 10);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn platform_event_bus_remove_clears_tail() {
+        let bus = PlatformEventBus::new();
+        let sandbox_id = "sb-7";
+
+        let evt = SandboxStreamEvent { payload: None };
+        bus.publish(sandbox_id, evt);
+        assert_eq!(bus.tail(sandbox_id, 10).len(), 1);
+
+        bus.remove(sandbox_id);
+        assert!(bus.tail(sandbox_id, 10).is_empty());
+    }
 }
 
 /// Separate bus for platform event stream events.
@@ -324,19 +390,33 @@ mod tests {
 /// This keeps platform events isolated from tracing capture.
 #[derive(Debug, Clone)]
 pub(crate) struct PlatformEventBus {
-    inner: Arc<Mutex<HashMap<String, broadcast::Sender<SandboxStreamEvent>>>>,
+    inner: Arc<Mutex<PlatformEventBusInner>>,
+}
+
+#[derive(Debug)]
+struct PlatformEventBusInner {
+    senders: HashMap<String, broadcast::Sender<SandboxStreamEvent>>,
+    tails: HashMap<String, VecDeque<SandboxStreamEvent>>,
 }
 
 impl PlatformEventBus {
+    /// Default tail buffer capacity (events per sandbox).
+    /// Platform events are infrequent (typically 5-10 per sandbox lifecycle).
+    const DEFAULT_TAIL: usize = 50;
+
     fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(HashMap::new())),
+            inner: Arc::new(Mutex::new(PlatformEventBusInner {
+                senders: HashMap::new(),
+                tails: HashMap::new(),
+            })),
         }
     }
 
     fn sender_for(&self, sandbox_id: &str) -> broadcast::Sender<SandboxStreamEvent> {
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
         inner
+            .senders
             .entry(sandbox_id.to_string())
             .or_insert_with(|| {
                 let (tx, _rx) = broadcast::channel(1024);
@@ -351,14 +431,36 @@ impl PlatformEventBus {
 
     pub(crate) fn publish(&self, sandbox_id: &str, event: SandboxStreamEvent) {
         let tx = self.sender_for(sandbox_id);
-        let _ = tx.send(event);
+        let _ = tx.send(event.clone());
+
+        let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
+        let deque = inner.tails.entry(sandbox_id.to_string()).or_default();
+        deque.push_back(event);
+        while deque.len() > Self::DEFAULT_TAIL {
+            deque.pop_front();
+        }
+    }
+
+    /// Return buffered platform events for replay to late subscribers.
+    pub(crate) fn tail(&self, sandbox_id: &str, max: usize) -> Vec<SandboxStreamEvent> {
+        let inner = self.inner.lock().expect("platform event bus lock poisoned");
+        inner
+            .tails
+            .get(sandbox_id)
+            .map(|d| d.iter().rev().take(max).cloned().collect::<Vec<_>>())
+            .unwrap_or_default()
+            .into_iter()
+            .rev()
+            .collect()
     }
 
     /// Remove the bus entry for the given sandbox id.
     ///
-    /// This drops the broadcast sender, closing any active receivers.
+    /// This drops the broadcast sender, closing any active receivers,
+    /// and frees the tail buffer.
     pub(crate) fn remove(&self, sandbox_id: &str) {
         let mut inner = self.inner.lock().expect("platform event bus lock poisoned");
-        inner.remove(sandbox_id);
+        inner.senders.remove(sandbox_id);
+        inner.tails.remove(sandbox_id);
     }
 }

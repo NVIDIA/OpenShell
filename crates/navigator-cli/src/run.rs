@@ -108,11 +108,19 @@ fn civil_from_days(days: u64) -> (i64, u64, u64) {
 /// Known provisioning steps derived from Kubernetes events and sandbox lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProvisioningStep {
+    /// Sandbox CRD created, waiting for compute resources (node scheduling).
+    RequestingCompute,
+    /// Pod scheduled on a node.
     Scheduled,
+    /// Pulling container image.
     Pulling,
+    /// Container image pulled.
     Pulled,
+    /// Container created (not yet started).
     ContainerCreated,
+    /// Container started, waiting for sandbox to become ready.
     ContainerStarted,
+    /// Sandbox is ready to accept connections.
     SandboxReady,
 }
 
@@ -120,6 +128,7 @@ impl ProvisioningStep {
     /// Human-readable label for a completed step.
     fn completed_label(self) -> &'static str {
         match self {
+            Self::RequestingCompute => "Compute allocated",
             Self::Scheduled => "Scheduled on node",
             Self::Pulling => "Image pulled",
             Self::Pulled => "Image pulled",
@@ -132,6 +141,7 @@ impl ProvisioningStep {
     /// Human-readable label for an in-progress step (shown on the spinner).
     fn active_label(self) -> &'static str {
         match self {
+            Self::RequestingCompute => "Requesting compute...",
             Self::Scheduled => "Scheduling on node...",
             Self::Pulling => "Pulling image...",
             Self::Pulled => "Pulling image...",
@@ -177,7 +187,7 @@ impl ProvisioningDisplay {
 
         let spinner = mp.add(ProgressBar::new_spinner());
         spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}\n")
+            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
                 .unwrap_or_else(|_| ProgressStyle::default_spinner()),
         );
         spinner.enable_steady_tick(Duration::from_millis(120));
@@ -187,7 +197,9 @@ impl ProvisioningDisplay {
             mp,
             spinner,
             completed_steps: Vec::new(),
-            active_label: "Provisioning...".to_string(),
+            active_label: ProvisioningStep::RequestingCompute
+                .active_label()
+                .to_string(),
             active_detail: String::new(),
             step_start: now,
         }
@@ -220,6 +232,7 @@ impl ProvisioningDisplay {
 
         // Reset step timer for the next step.
         self.step_start = Instant::now();
+        self.spinner.reset_elapsed();
         self.active_detail.clear();
     }
 
@@ -227,6 +240,9 @@ impl ProvisioningDisplay {
     fn set_active(&mut self, label: &str) {
         self.active_label = label.to_string();
         self.active_detail.clear();
+        // Reset the spinner's elapsed time for the new step.
+        self.spinner.reset_elapsed();
+        self.step_start = Instant::now();
         self.update_spinner();
     }
 
@@ -242,17 +258,10 @@ impl ProvisioningDisplay {
     }
 
     fn update_spinner(&self) {
-        let elapsed = self.step_start.elapsed();
-        let elapsed_str = format_elapsed(elapsed);
         let msg = if self.active_detail.is_empty() {
-            format!("{} {}", self.active_label, elapsed_str.dimmed())
+            self.active_label.clone()
         } else {
-            format!(
-                "{} {} {}",
-                self.active_label,
-                self.active_detail.dimmed(),
-                elapsed_str.dimmed()
-            )
+            format!("{} {}", self.active_label, self.active_detail.dimmed())
         };
         self.spinner.set_message(msg);
     }
@@ -1473,10 +1482,10 @@ pub async fn sandbox_create(
 
     // Set initial active step on the spinner.
     if let Some(d) = display.as_mut() {
-        d.set_active("Provisioning...");
+        d.set_active_step(ProvisioningStep::RequestingCompute);
     } else {
         let ts = format_timestamp(Duration::ZERO);
-        println!("  {} Created sandbox {}", ts.dimmed(), sandbox_name);
+        println!("  {} Requesting compute...", ts.dimmed());
     }
 
     // Non-interactive mode: track start time for timestamps.
@@ -1579,11 +1588,15 @@ pub async fn sandbox_create(
                     match step {
                         ProvisioningStep::Scheduled => {
                             if let Some(d) = display.as_mut() {
-                                d.complete_step(ProvisioningStep::Scheduled);
+                                // Complete "Requesting compute" step, then show "Pulling image"
+                                d.complete_step_with_label(
+                                    ProvisioningStep::RequestingCompute,
+                                    "Compute allocated",
+                                );
                                 d.set_active_step(ProvisioningStep::Pulling);
                             } else {
                                 let ts = format_timestamp(provision_start.elapsed());
-                                println!("  {} Scheduled on node", ts.dimmed());
+                                println!("  {} Compute allocated", ts.dimmed());
                             }
                         }
                         ProvisioningStep::Pulling => {
