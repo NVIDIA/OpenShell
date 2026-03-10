@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path, xdg_config_dir};
+use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -146,11 +146,7 @@ pub fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> 
 }
 
 fn stored_metadata_path(name: &str) -> Result<PathBuf> {
-    let base = xdg_config_dir()?;
-    Ok(base
-        .join("openshell")
-        .join("gateways")
-        .join(format!("{name}_metadata.json")))
+    Ok(gateways_dir()?.join(name).join("metadata.json"))
 }
 
 /// Extract the hostname from an SSH destination string.
@@ -296,8 +292,8 @@ pub fn load_last_sandbox(gateway: &str) -> Option<String> {
 
 /// List all gateways that have stored metadata.
 ///
-/// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for `*_metadata.json` files
-/// and returns the parsed metadata for each.
+/// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for subdirectories containing
+/// `metadata.json` and returns the parsed metadata for each.
 pub fn list_gateways() -> Result<Vec<GatewayMetadata>> {
     let dir = gateways_dir()?;
     if !dir.exists() {
@@ -311,12 +307,13 @@ pub fn list_gateways() -> Result<Vec<GatewayMetadata>> {
 
     for entry in entries {
         let entry = entry.into_diagnostic()?;
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if let Some(gateway_name) = name_str.strip_suffix("_metadata.json")
-            && let Ok(metadata) = load_gateway_metadata(gateway_name)
-        {
-            gateways.push(metadata);
+        let path = entry.path();
+        // Only consider directories that contain a metadata.json file
+        if path.is_dir() {
+            let gateway_name = entry.file_name().to_string_lossy().to_string();
+            if let Ok(metadata) = load_gateway_metadata(&gateway_name) {
+                gateways.push(metadata);
+            }
         }
     }
 

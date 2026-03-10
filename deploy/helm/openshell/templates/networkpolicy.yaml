@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 {{- if .Values.networkPolicy.enabled }}
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway pod.
 # Sandbox pods are dynamically created by the server and labelled with
