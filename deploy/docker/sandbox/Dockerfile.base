@@ -86,7 +86,10 @@ RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,ta
     cp "$(cross_output_dir "$RUST_BUILD_PROFILE")/navigator-sandbox" /build/out/
 
 # Stage 2: Python base (uses target platform)
-FROM python:3.12-slim AS base
+# Pin to specific Python patch + Debian release for reproducible builds.
+# CVE-2025-13836 (stdlib urllib Content-Length OOM) affects Python <= 3.12.13;
+# update to python:3.12.14-slim-bookworm (or later) when released.
+FROM python:3.12.13-slim-bookworm AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -124,12 +127,15 @@ RUN uv pip install --python /app/.venv/bin/python --no-cache-dir cloudpickle grp
 # Stage 4: Coding agents layer
 FROM base AS coding-agents
 
-# Install Node.js 22 via NodeSource (required by OpenClaw and other agents)
-# build-essential & python3 are needed for npm packages with native addons (node-gyp)
+# Install Node.js 22 via NodeSource (required by coding agents).
+# build-essential & python3 are needed for npm packages with native addons (node-gyp).
 # Include a minimal native toolchain so npm can compile optional native
 # dependencies on platforms where prebuilt artifacts are unavailable.
+# Pin to a specific patch version for reproducible builds.
+# CVE-2026-21637, CVE-2025-59466, CVE-2025-59465, CVE-2025-55131 affect
+# Node.js <= 22.22.1. Update to 22.23.0+ when a patched release ships.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends build-essential git nodejs python3 nano && \
+    apt-get install -y --no-install-recommends build-essential git nodejs=22.22.1-1nodesource1 python3 nano && \
     rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) from the official apt repository
@@ -145,11 +151,20 @@ RUN curl -fsSL https://claude.ai/install.sh | bash \
     && cp /root/.local/bin/claude /usr/local/bin/claude \
     && chmod 755 /usr/local/bin/claude
 
-# Install OpenCode CLI, Codex CLI (OpenAI), and OpenClaw with pinned versions
-# for reproducible builds. Force-upgrade tar afterward to resolve transitive
-# dependency vulnerabilities (GHSA-r6q2-hw4h-h46w, GHSA-qffp-2rhf-9h96, etc.)
-RUN npm install -g opencode-ai@1.2.18 @openai/codex@0.111.0 openclaw@2026.3.2 && \
-    npm install -g tar@7.5.10
+# Upgrade npm to v11 which ships tar@^7.5.9 (fixes tar@6.2.1 vulns bundled in
+# npm 10: GHSA-r6q2-hw4h-h46w, GHSA-8qq5-rm4j-mr97, GHSA-83g3-92jg-28cx,
+# GHSA-34x7-hfp2-rc4v, GHSA-qffp-2rhf-9h96).
+RUN npm install -g npm@11.11.0
+
+# Install OpenCode CLI and Codex CLI (OpenAI) with pinned versions for
+# reproducible builds. Force-upgrade tar and @hono/node-server afterward to
+# resolve transitive dependency vulnerabilities (GHSA-wc8c-qw6v-h7f6,
+# GHSA-r6q2-hw4h-h46w, GHSA-qffp-2rhf-9h96, GHSA-8qq5-rm4j-mr97,
+# GHSA-83g3-92jg-28cx, GHSA-34x7-hfp2-rc4v). Dedupe removes nested copies of
+# the old versions that scanners may still detect.
+RUN npm install -g opencode-ai@1.2.18 @openai/codex@0.111.0 && \
+    npm install -g tar@7.5.11 @hono/node-server@1.19.11 && \
+    npm dedupe -g
 
 # Install ai-pim-utils (NVIDIA PIM CLI tools: outlook, calendar, transcripts, etc.)
 # The install script auto-detects Debian and installs via .deb package to /usr/bin.
@@ -180,7 +195,7 @@ ENV PATH="/sandbox/.venv/bin:/app/.venv/bin:/usr/local/bin:/usr/bin:/bin" \
 # To add a skill, create a subdirectory under deploy/docker/sandbox/skills/
 # with a SKILL.md file (and any supporting files). It will be installed into
 # both ~/.claude/skills/ and ~/.agents/skills/ for agent discovery.
-COPY deploy/docker/sandbox/skills/ /sandbox/.openclaw/skills/
+COPY deploy/docker/sandbox/skills/ /sandbox/.agents/skills/
 
 # Bake the default sandbox policy into the image so that sandboxes without an
 # explicit policy from the gateway can discover it on disk.
@@ -215,11 +230,6 @@ RUN mkdir -p /var/navigator /sandbox /var/log && \
     ln -sf "$skill" "/sandbox/.agents/skills/$(basename "$skill")"; \
     done; \
     done && \
-    chown -R sandbox:sandbox /sandbox/.openclaw /sandbox/.claude /sandbox/.agents
-
-# OpenClaw startup helper for environments without systemd (e.g. sandboxes).
-# Usage: nav sandbox create --forward 18789 -- openclaw-start
-COPY deploy/docker/openclaw-start.sh /usr/local/bin/openclaw-start
-RUN chmod +x /usr/local/bin/openclaw-start
+    chown -R sandbox:sandbox /sandbox/.claude /sandbox/.agents
 
 ENTRYPOINT ["navigator-sandbox"]

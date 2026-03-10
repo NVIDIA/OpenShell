@@ -79,7 +79,8 @@ RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,tar
     cp "$(cross_output_dir release)/navigator-server" /build/navigator-server
 
 # Stage 2: Runtime (uses target platform)
-FROM debian:bookworm-slim AS runtime
+# Pin to specific Debian point release for reproducible builds.
+FROM debian:bookworm-20260223-slim AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/*
