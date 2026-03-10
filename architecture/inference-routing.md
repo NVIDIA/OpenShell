@@ -269,9 +269,9 @@ The system route is stored as a separate `InferenceRoute` record in the gateway 
 Cluster inference commands:
 
 - `openshell cluster inference set --provider <name> --model <id>` -- configures user-facing cluster inference
-- `openshell cluster inference set --sandbox --provider <name> --model <id>` -- configures sandbox system inference
+- `openshell cluster inference set --system --provider <name> --model <id>` -- configures system inference
 - `openshell cluster inference get` -- displays both user and system inference configuration
-- `openshell cluster inference get --sandbox` -- displays only the system inference configuration
+- `openshell cluster inference get --system` -- displays only the system inference configuration
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
 

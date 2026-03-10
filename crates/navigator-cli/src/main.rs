@@ -820,11 +820,11 @@ enum ClusterInferenceCommands {
         #[arg(long)]
         model: String,
 
-        /// Configure the sandbox system inference route instead of the
-        /// user-facing route. System inference is used by platform functions
-        /// (e.g. the agent harness) and is not accessible to user code.
+        /// Configure the system inference route instead of the user-facing
+        /// route. System inference is used by platform functions (e.g. the
+        /// agent harness) and is not accessible to user code.
         #[arg(long)]
-        sandbox: bool,
+        system: bool,
     },
 
     /// Update cluster-level inference configuration (partial update).
@@ -837,17 +837,17 @@ enum ClusterInferenceCommands {
         #[arg(long)]
         model: Option<String>,
 
-        /// Target the sandbox system inference route.
+        /// Target the system inference route.
         #[arg(long)]
-        sandbox: bool,
+        system: bool,
     },
 
     /// Get cluster-level inference provider and model.
     Get {
-        /// Show the sandbox system inference route instead of the user-facing route.
+        /// Show the system inference route instead of the user-facing route.
         /// When omitted, both routes are displayed.
         #[arg(long)]
-        sandbox: bool,
+        system: bool,
     },
 }
 
@@ -1467,18 +1467,18 @@ async fn main() -> Result<()> {
                 ClusterInferenceCommands::Set {
                     provider,
                     model,
-                    sandbox,
+                    system,
                 } => {
-                    let route_name = if sandbox { "sandbox-system" } else { "" };
+                    let route_name = if system { "sandbox-system" } else { "" };
                     run::cluster_inference_set(endpoint, &provider, &model, route_name, &tls)
                         .await?;
                 }
                 ClusterInferenceCommands::Update {
                     provider,
                     model,
-                    sandbox,
+                    system,
                 } => {
-                    let route_name = if sandbox { "sandbox-system" } else { "" };
+                    let route_name = if system { "sandbox-system" } else { "" };
                     run::cluster_inference_update(
                         endpoint,
                         provider.as_deref(),
@@ -1488,8 +1488,8 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                ClusterInferenceCommands::Get { sandbox } => {
-                    let route_name = if sandbox {
+                ClusterInferenceCommands::Get { system } => {
+                    let route_name = if system {
                         Some("sandbox-system")
                     } else {
                         None
@@ -1881,18 +1881,18 @@ async fn main() -> Result<()> {
                     ClusterInferenceCommands::Set {
                         provider,
                         model,
-                        sandbox,
+                        system,
                     } => {
-                        let route_name = if sandbox { "sandbox-system" } else { "" };
+                        let route_name = if system { "sandbox-system" } else { "" };
                         run::cluster_inference_set(endpoint, &provider, &model, route_name, &tls)
                             .await?;
                     }
                     ClusterInferenceCommands::Update {
                         provider,
                         model,
-                        sandbox,
+                        system,
                     } => {
-                        let route_name = if sandbox { "sandbox-system" } else { "" };
+                        let route_name = if system { "sandbox-system" } else { "" };
                         run::cluster_inference_update(
                             endpoint,
                             provider.as_deref(),
@@ -1902,8 +1902,8 @@ async fn main() -> Result<()> {
                         )
                         .await?;
                     }
-                    ClusterInferenceCommands::Get { sandbox } => {
-                        let route_name = if sandbox {
+                    ClusterInferenceCommands::Get { system } => {
+                        let route_name = if system {
                             Some("sandbox-system")
                         } else {
                             None
