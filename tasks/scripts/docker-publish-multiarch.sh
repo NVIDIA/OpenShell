@@ -104,7 +104,7 @@ fi
 case "$MODE" in
   registry)
     REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
-    IMAGE_PREFIX="navigator-"
+    IMAGE_PREFIX=""
     ;;
   ecr)
     AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-524473328983}
