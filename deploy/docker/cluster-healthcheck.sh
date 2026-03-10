@@ -9,12 +9,12 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 
 kubectl get --raw='/readyz' >/dev/null 2>&1 || exit 1
 
-kubectl -n navigator get statefulset/navigator >/dev/null 2>&1 || exit 1
-kubectl -n navigator wait --for=jsonpath='{.status.readyReplicas}'=1 statefulset/navigator --timeout=1s >/dev/null 2>&1 || exit 1
+kubectl -n openshell get statefulset/openshell >/dev/null 2>&1 || exit 1
+kubectl -n openshell wait --for=jsonpath='{.status.readyReplicas}'=1 statefulset/openshell --timeout=1s >/dev/null 2>&1 || exit 1
 
-# Verify TLS secrets exist (created by navigator-bootstrap before the StatefulSet starts)
+# Verify TLS secrets exist (created by openshell-bootstrap before the StatefulSet starts)
 # Skip when TLS is disabled — secrets are not required.
 if [ "${DISABLE_TLS:-}" != "true" ]; then
-    kubectl -n navigator get secret navigator-server-tls >/dev/null 2>&1 || exit 1
-    kubectl -n navigator get secret navigator-client-tls >/dev/null 2>&1 || exit 1
+    kubectl -n openshell get secret openshell-server-tls >/dev/null 2>&1 || exit 1
+    kubectl -n openshell get secret openshell-client-tls >/dev/null 2>&1 || exit 1
 fi

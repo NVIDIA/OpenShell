@@ -9,13 +9,13 @@ Quick-reference for the `openshell` command-line interface. For workflow guidanc
 | Flag | Description |
 |------|-------------|
 | `-v`, `--verbose` | Increase verbosity (`-v` = info, `-vv` = debug, `-vvv` = trace) |
-| `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `OPENSHELL_CLUSTER` env var. Falls back to active gateway in `~/.config/openshell/active_cluster`. |
+| `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `OPENSHELL_GATEWAY` env var. Falls back to active gateway in `~/.config/openshell/active_gateway`. |
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `OPENSHELL_CLUSTER` | Override active gateway name (same as `--gateway`) |
+| `OPENSHELL_GATEWAY` | Override active gateway name (same as `--gateway`) |
 | `OPENSHELL_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
 
 ---
@@ -122,7 +122,7 @@ Print or start an SSH tunnel for kubectl access to a remote cluster.
 
 ### `openshell gateway select [name]`
 
-Set the active gateway. Writes to `~/.config/openshell/active_cluster`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
+Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
 
 ---
 
@@ -319,29 +319,29 @@ Delete one or more providers by name.
 
 ---
 
-## Cluster Inference Commands
+## Inference Commands
 
-### `openshell cluster inference set`
+### `openshell inference set`
 
-Configure the managed cluster inference route used by `inference.local`. Both flags are required.
+Configure the managed gateway inference route used by `inference.local`. Both flags are required.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--provider <NAME>` | -- | Provider record name (required) |
 | `--model <ID>` | -- | Model identifier to use for generation requests (required) |
 
-### `openshell cluster inference update`
+### `openshell inference update`
 
-Partially update the cluster inference configuration. Fetches the current config and applies only the provided overrides. At least one flag is required.
+Partially update the gateway inference configuration. Fetches the current config and applies only the provided overrides. At least one flag is required.
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--provider <NAME>` | unchanged | Provider record name |
 | `--model <ID>` | unchanged | Model identifier |
 
-### `openshell cluster inference get`
+### `openshell inference get`
 
-Show the current cluster inference configuration.
+Show the current gateway inference configuration.
 
 ---
 

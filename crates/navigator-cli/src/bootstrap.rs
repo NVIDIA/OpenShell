@@ -3,8 +3,8 @@
 
 //! Auto-bootstrap helpers for sandbox creation.
 //!
-//! When `sandbox create` cannot reach a cluster, these helpers determine whether
-//! to offer cluster bootstrap, prompt the user for confirmation, and execute the
+//! When `sandbox create` cannot reach a gateway, these helpers determine whether
+//! to offer gateway bootstrap, prompt the user for confirmation, and execute the
 //! local or remote bootstrap flow.
 
 use crate::tls::TlsOptions;
@@ -13,28 +13,28 @@ use miette::Result;
 use owo_colors::OwoColorize;
 use std::io::IsTerminal;
 
-use crate::run::{deploy_cluster_with_panel, print_deploy_summary};
+use crate::run::{deploy_gateway_with_panel, print_deploy_summary};
 
-/// Default cluster name used during auto-bootstrap.
-const DEFAULT_CLUSTER_NAME: &str = "openshell";
+/// Default gateway name used during auto-bootstrap.
+const DEFAULT_GATEWAY_NAME: &str = "openshell";
 
-/// Determines if a gRPC connection error indicates the cluster is unreachable
+/// Determines if a gRPC connection error indicates the gateway is unreachable
 /// and bootstrap should be offered.
 ///
 /// Returns `true` for connectivity errors (connection refused, timeout, DNS failure)
-/// and for missing default TLS materials (which implies no cluster has been deployed).
+/// and for missing default TLS materials (which implies no gateway has been deployed).
 ///
 /// Returns `false` for explicit TLS configuration errors, auth failures, and other
 /// non-connectivity issues.
 pub fn should_attempt_bootstrap(error: &miette::Report, tls: &TlsOptions) -> bool {
     // If TLS paths were explicitly provided (e.g. in tests) and they failed,
-    // that's a configuration error, not a missing-cluster situation.
+    // that's a configuration error, not a missing-gateway situation.
     if tls.has_any() {
         return is_connectivity_error(error);
     }
 
     // With no explicit TLS options, missing default cert files strongly implies
-    // no cluster has been bootstrapped yet.
+    // no gateway has been bootstrapped yet.
     let msg = format!("{error:?}");
     if is_missing_tls_material(&msg) {
         return true;
@@ -95,7 +95,7 @@ fn is_connectivity_error(error: &miette::Report) -> bool {
     connectivity_patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Prompt the user to confirm cluster bootstrap.
+/// Prompt the user to confirm gateway bootstrap.
 ///
 /// When `override_value` is `Some(true)` or `Some(false)`, the decision is
 /// made immediately (from `--bootstrap` / `--no-bootstrap`). Otherwise,
@@ -126,7 +126,7 @@ pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
     Ok(confirmed)
 }
 
-/// Bootstrap a local cluster and return refreshed TLS options that pick up the
+/// Bootstrap a local gateway and return refreshed TLS options that pick up the
 /// newly-written mTLS certificates.
 pub async fn run_bootstrap(
     remote: Option<&str>,
@@ -134,7 +134,7 @@ pub async fn run_bootstrap(
 ) -> Result<(TlsOptions, String)> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
-    let mut options = navigator_bootstrap::DeployOptions::new(DEFAULT_CLUSTER_NAME);
+    let mut options = navigator_bootstrap::DeployOptions::new(DEFAULT_GATEWAY_NAME);
     if let Some(dest) = remote {
         let mut remote_opts = navigator_bootstrap::RemoteOptions::new(dest);
         if let Some(key) = ssh_key {
@@ -143,7 +143,7 @@ pub async fn run_bootstrap(
         options = options.with_remote(remote_opts);
     }
     // Read registry token from environment for the auto-bootstrap path.
-    // The explicit `--registry-token` flag is only on `cluster admin deploy`;
+    // The explicit `--registry-token` flag is only on `gateway start`;
     // when bootstrapping via `sandbox create`, the env var is the mechanism.
     if let Ok(token) = std::env::var("NEMOCLAW_REGISTRY_TOKEN")
         && !token.trim().is_empty()
@@ -151,20 +151,20 @@ pub async fn run_bootstrap(
         options = options.with_registry_token(token);
     }
 
-    let handle = deploy_cluster_with_panel(options, DEFAULT_CLUSTER_NAME, location).await?;
+    let handle = deploy_gateway_with_panel(options, DEFAULT_GATEWAY_NAME, location).await?;
     let server = handle.gateway_endpoint().to_string();
 
-    print_deploy_summary(DEFAULT_CLUSTER_NAME, &handle);
+    print_deploy_summary(DEFAULT_GATEWAY_NAME, &handle);
 
-    // Auto-activate the bootstrapped cluster.
-    if let Err(err) = navigator_bootstrap::save_active_cluster(DEFAULT_CLUSTER_NAME) {
-        tracing::debug!("failed to set active cluster after bootstrap: {err}");
+    // Auto-activate the bootstrapped gateway.
+    if let Err(err) = navigator_bootstrap::save_active_gateway(DEFAULT_GATEWAY_NAME) {
+        tracing::debug!("failed to set active gateway after bootstrap: {err}");
     }
 
     // Build fresh TLS options that resolve the newly-written mTLS certs from
-    // the default XDG path for this cluster, using the cluster name directly.
+    // the default XDG path for this gateway, using the gateway name directly.
     let tls = TlsOptions::default()
-        .with_cluster_name(DEFAULT_CLUSTER_NAME)
+        .with_gateway_name(DEFAULT_GATEWAY_NAME)
         .with_default_paths(&server);
 
     Ok((tls, server))

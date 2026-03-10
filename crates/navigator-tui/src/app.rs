@@ -33,7 +33,7 @@ pub enum InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     // Dashboard screen
-    Clusters,
+    Gateways,
     Providers,
     Sandboxes,
     // Sandbox screen — metadata pane is always visible (non-interactive);
@@ -84,10 +84,10 @@ impl LogSourceFilter {
 }
 
 // ---------------------------------------------------------------------------
-// Cluster entry
+// Gateway entry
 // ---------------------------------------------------------------------------
 
-pub struct ClusterEntry {
+pub struct GatewayEntry {
     pub name: String,
     pub endpoint: String,
     pub is_remote: bool,
@@ -276,16 +276,16 @@ pub struct App {
     /// When the splash screen was shown (for auto-dismiss timing).
     pub splash_start: Option<Instant>,
 
-    // Active cluster connection
-    pub cluster_name: String,
+    // Active gateway connection
+    pub gateway_name: String,
     pub endpoint: String,
     pub client: NavigatorClient<Channel>,
     pub status_text: String,
 
-    // Cluster list
-    pub clusters: Vec<ClusterEntry>,
-    pub cluster_selected: usize,
-    pub pending_cluster_switch: Option<String>,
+    // Gateway list
+    pub gateways: Vec<GatewayEntry>,
+    pub gateway_selected: usize,
+    pub pending_gateway_switch: Option<String>,
 
     // Provider list
     pub provider_names: Vec<String>,
@@ -356,21 +356,21 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: NavigatorClient<Channel>, cluster_name: String, endpoint: String) -> Self {
+    pub fn new(client: NavigatorClient<Channel>, gateway_name: String, endpoint: String) -> Self {
         Self {
             running: true,
             screen: Screen::Splash,
             input_mode: InputMode::Normal,
-            focus: Focus::Clusters,
+            focus: Focus::Gateways,
             command_input: String::new(),
             splash_start: Some(Instant::now()),
-            cluster_name,
+            gateway_name,
             endpoint,
             client,
             status_text: String::from("connecting..."),
-            clusters: Vec::new(),
-            cluster_selected: 0,
-            pending_cluster_switch: None,
+            gateways: Vec::new(),
+            gateway_selected: 0,
+            pending_gateway_switch: None,
             provider_names: Vec::new(),
             provider_types: Vec::new(),
             provider_cred_keys: Vec::new(),
@@ -485,7 +485,7 @@ impl App {
 
     fn handle_normal_key(&mut self, key: KeyEvent) {
         match self.focus {
-            Focus::Clusters => self.handle_clusters_key(key),
+            Focus::Gateways => self.handle_gateways_key(key),
             Focus::Providers => self.handle_providers_key(key),
             Focus::Sandboxes => self.handle_sandboxes_key(key),
             Focus::SandboxPolicy => self.handle_policy_key(key),
@@ -493,7 +493,7 @@ impl App {
         }
     }
 
-    fn handle_clusters_key(&mut self, key: KeyEvent) {
+    fn handle_gateways_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Tab => self.focus = Focus::Providers,
@@ -503,18 +503,18 @@ impl App {
                 self.command_input.clear();
             }
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.clusters.is_empty() {
-                    self.cluster_selected =
-                        (self.cluster_selected + 1).min(self.clusters.len() - 1);
+                if !self.gateways.is_empty() {
+                    self.gateway_selected =
+                        (self.gateway_selected + 1).min(self.gateways.len() - 1);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.cluster_selected = self.cluster_selected.saturating_sub(1);
+                self.gateway_selected = self.gateway_selected.saturating_sub(1);
             }
             KeyCode::Enter => {
-                if let Some(entry) = self.clusters.get(self.cluster_selected) {
-                    if entry.name != self.cluster_name {
-                        self.pending_cluster_switch = Some(entry.name.clone());
+                if let Some(entry) = self.gateways.get(self.gateway_selected) {
+                    if entry.name != self.gateway_name {
+                        self.pending_gateway_switch = Some(entry.name.clone());
                     }
                     self.focus = Focus::Providers;
                 }
@@ -541,7 +541,7 @@ impl App {
         match key.code {
             KeyCode::Char('q') => self.running = false,
             KeyCode::Tab => self.focus = Focus::Sandboxes,
-            KeyCode::BackTab => self.focus = Focus::Clusters,
+            KeyCode::BackTab => self.focus = Focus::Gateways,
             KeyCode::Char(':') => {
                 self.input_mode = InputMode::Command;
                 self.command_input.clear();
@@ -582,7 +582,7 @@ impl App {
     fn handle_sandboxes_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Tab => self.focus = Focus::Clusters,
+            KeyCode::Tab => self.focus = Focus::Gateways,
             KeyCode::BackTab => self.focus = Focus::Providers,
             KeyCode::Char(':') => {
                 self.input_mode = InputMode::Command;
@@ -1308,7 +1308,7 @@ impl App {
         }
     }
 
-    /// Reset sandbox and provider state after switching clusters.
+    /// Reset sandbox and provider state after switching gateways.
     pub fn reset_sandbox_state(&mut self) {
         self.stop_anim();
         self.cancel_log_stream();

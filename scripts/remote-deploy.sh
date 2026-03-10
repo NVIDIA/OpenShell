@@ -252,8 +252,8 @@ mise exec -- tasks/scripts/docker-build-cluster.sh
 mise exec -- tasks/scripts/docker-build-component.sh server
 mise exec -- tasks/scripts/docker-build-component.sh sandbox
 
-export OPENSHELL_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
-export OPENSHELL_PUSH_IMAGES="navigator/server:${IMAGE_TAG},navigator/sandbox:${IMAGE_TAG}"
+export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"
+export OPENSHELL_PUSH_IMAGES="openshell/server:${IMAGE_TAG},openshell/sandbox:${IMAGE_TAG}"
 
 start_args=(
   gateway

@@ -8,7 +8,13 @@
 
 set -euo pipefail
 
+# Normalize cluster name: lowercase, replace invalid chars with hyphens
+normalize_name() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
+CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
 
 if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then

@@ -23,7 +23,7 @@ pub async fn wait_for_kubeconfig(docker: &Docker, name: &str) -> Result<String> 
         {
             let logs = fetch_recent_logs(docker, &container_name, 20).await;
             return Err(miette::miette!(
-                "cluster container is not running while waiting for kubeconfig: {status_err}\n{logs}"
+                "gateway container is not running while waiting for kubeconfig: {status_err}\n{logs}"
             ));
         }
 
@@ -51,7 +51,7 @@ pub async fn wait_for_kubeconfig(docker: &Docker, name: &str) -> Result<String> 
     Err(miette::miette!("timed out waiting for kubeconfig\n{logs}"))
 }
 
-pub async fn wait_for_cluster_ready<F>(docker: &Docker, name: &str, mut on_log: F) -> Result<()>
+pub async fn wait_for_gateway_ready<F>(docker: &Docker, name: &str, mut on_log: F) -> Result<()>
 where
     F: FnMut(String) + Send,
 {
@@ -94,7 +94,7 @@ where
                 .and_then(|s| s.error.as_deref())
                 .unwrap_or("");
             let mut detail =
-                format!("cluster container exited unexpectedly (exit_code={exit_code})");
+                format!("gateway container exited unexpectedly (exit_code={exit_code})");
             if !error_msg.is_empty() {
                 use std::fmt::Write;
                 let _ = write!(detail, ", error={error_msg}");
@@ -118,14 +118,14 @@ where
             }
             Some(HealthStatusEnum::UNHEALTHY) if attempt + 1 == attempts => {
                 result = Some(Err(miette::miette!(
-                    "cluster health check reported unhealthy\n{}",
+                    "gateway health check reported unhealthy\n{}",
                     format_recent_logs(&recent_logs)
                 )));
                 break;
             }
             Some(HealthStatusEnum::NONE | HealthStatusEnum::EMPTY) | None if attempt == 0 => {
                 result = Some(Err(miette::miette!(
-                    "cluster container does not expose a health check\n{}",
+                    "gateway container does not expose a health check\n{}",
                     format_recent_logs(&recent_logs)
                 )));
                 break;
@@ -139,14 +139,14 @@ where
     if result.is_none() {
         drain_logs(&mut log_rx, &mut recent_logs, &mut on_log);
         result = Some(Err(miette::miette!(
-            "timed out waiting for cluster health check\n{}",
+            "timed out waiting for gateway health check\n{}",
             format_recent_logs(&recent_logs)
         )));
     }
 
     log_task.abort();
 
-    result.unwrap_or_else(|| Err(miette::miette!("cluster health status unavailable")))
+    result.unwrap_or_else(|| Err(miette::miette!("gateway health status unavailable")))
 }
 
 async fn stream_container_logs(

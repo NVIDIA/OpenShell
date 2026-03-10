@@ -24,22 +24,22 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
 
 ## 2. Domain Object Hierarchy
 
-The data model follows a strict hierarchy: **Cluster > Sandboxes > Logs**.
+The data model follows a strict hierarchy: **Gateway > Sandboxes > Logs**.
 
 ```
-Cluster (discovered via navigator_bootstrap::list_clusters())
+Gateway (discovered via navigator_bootstrap::list_gateways())
   └── Sandboxes (fetched via gRPC ListSandboxes)
         └── Logs (fetched via GetSandboxLogs + streamed via WatchSandbox)
 ```
 
-- **Clusters** are discovered from on-disk config via `navigator_bootstrap::list_clusters()`. Each cluster has a name, gateway endpoint, and local/remote flag.
+- **Gateways** are discovered from on-disk config via `navigator_bootstrap::list_gateways()`. Each gateway has a name, endpoint, and local/remote flag.
 - **Sandboxes** belong to the active cluster. Fetched via `ListSandboxes` gRPC call with a periodic tick refresh. Each sandbox has: `id`, `name`, `phase`, `created_at_ms`, and `spec.template.image`.
 - **Logs** belong to a single sandbox. Initial batch fetched via `GetSandboxLogs` (500 lines), then live-tailed via `WatchSandbox` with `follow_logs: true`.
 
 The **title bar** always reflects this hierarchy, reading left-to-right from general to specific:
 
 ```
- OpenShell │ Current Cluster: <name> (<status>) │ <screen/context>
+ OpenShell │ Current Gateway: <name> (<status>) │ <screen/context>
 ```
 
 ## 3. Navigation & Screen Architecture
@@ -50,7 +50,7 @@ Top-level layouts that own the full content area. Each has its own nav bar hints
 
 | Screen | Description | Module |
 | --- | --- | --- |
-| `Dashboard` | Cluster list (top) + sandbox table (bottom) | `ui/dashboard.rs` |
+| `Dashboard` | Gateway list (top) + sandbox table (bottom) | `ui/dashboard.rs` |
 | `Sandbox` | Single-sandbox view — detail or logs depending on `Focus` | `ui/sandbox_detail.rs`, `ui/sandbox_logs.rs` |
 
 ### Focus (`Focus` enum)
@@ -59,7 +59,7 @@ Tracks which panel currently receives keyboard input.
 
 | Focus | Screen | Description |
 | --- | --- | --- |
-| `Clusters` | Dashboard | Cluster list panel has input focus |
+| `Gateways` | Dashboard | Gateway list panel has input focus |
 | `Sandboxes` | Dashboard | Sandbox table panel has input focus |
 | `SandboxDetail` | Sandbox | Sandbox detail view (name, status, image, age) |
 | `SandboxLogs` | Sandbox | Log viewer with structured rendering |
@@ -104,8 +104,8 @@ Every frame renders four vertical regions:
 
 ### Title bar examples
 
-- Dashboard: ` OpenShell │ Current Cluster: openshell (Healthy) │ Dashboard`
-- Sandbox detail: ` OpenShell │ Current Cluster: openshell (Healthy) │ Sandbox: my-sandbox`
+- Dashboard: ` OpenShell │ Current Gateway: openshell (Healthy) │ Dashboard`
+- Sandbox detail: ` OpenShell │ Current Gateway: openshell (Healthy) │ Sandbox: my-sandbox`
 
 ### Adding a new screen
 
@@ -205,7 +205,7 @@ All colors and styles are defined in `crates/navigator-tui/src/theme.rs`.
 
 #### Visual conventions
 
-- **Selected row**: Green `▌` left-border marker on the selected row. Active cluster also gets a green `●` dot.
+- **Selected row**: Green `▌` left-border marker on the selected row. Active gateway also gets a green `●` dot.
 - **Focused panel**: Border changes from `EVERGLADE` to `NVIDIA_GREEN`.
 - **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/warn, red for unhealthy/error.
 - **Separators**: Muted `│` characters between title bar segments and nav bar sections.
@@ -290,7 +290,7 @@ All actions are accessible via keyboard shortcuts displayed in the nav bar. The 
 
 ### Screen-specific key hints
 
-**Dashboard (Clusters focus):**
+**Dashboard (Gateways focus):**
 `[Tab] Switch Panel  [Enter] Select  [j/k] Navigate  │  [:] Command  [q] Quit`
 
 **Dashboard (Sandboxes focus):**
@@ -307,12 +307,12 @@ Same as above.
 | File | Purpose |
 | --- | --- |
 | `crates/navigator-tui/Cargo.toml` | Crate manifest — dependencies on `navigator-core`, `navigator-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/navigator-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_health`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), cluster switching, mTLS channel building |
-| `crates/navigator-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter` enums, `LogLine` struct, `ClusterEntry`, all key handling logic |
+| `crates/navigator-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_health`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building |
+| `crates/navigator-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter` enums, `LogLine` struct, `GatewayEntry`, all key handling logic |
 | `crates/navigator-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Resize`, `LogLines`), `EventHandler` with mpsc channels and crossterm polling |
 | `crates/navigator-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
 | `crates/navigator-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar`, `draw_nav_bar`, `draw_command_bar`, screen routing |
-| `crates/navigator-tui/src/ui/dashboard.rs` | Dashboard screen — cluster list table (top) + sandbox table (bottom) |
+| `crates/navigator-tui/src/ui/dashboard.rs` | Dashboard screen — gateway list table (top) + sandbox table (bottom) |
 | `crates/navigator-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image |
 | `crates/navigator-tui/src/ui/sandbox_detail.rs` | Sandbox detail view — name, status, image, created, age, delete confirmation dialog |
 | `crates/navigator-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter |
@@ -336,8 +336,8 @@ lib.rs (event loop, gRPC, async tasks)
 
 ### Dependency constraints
 
-- **`navigator-tui` cannot depend on `navigator-cli`** — this would create a circular dependency. TLS channel building for cluster switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
-- mTLS certs are read from `~/.config/openshell/clusters/<name>/mtls/` (ca.crt, tls.crt, tls.key).
+- **`navigator-tui` cannot depend on `navigator-cli`** — this would create a circular dependency. TLS channel building for gateway switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
+- mTLS certs are read from `~/.config/openshell/gateways/<name>/mtls/` (ca.crt, tls.crt, tls.key).
 
 ### Proto generated code
 
@@ -389,12 +389,12 @@ The connect timeout for cluster switching is 10 seconds with HTTP/2 keepalive at
 6. Auto-scroll kicks in if the user is near the bottom (within 5 lines)
 7. Stream is cancelled when user presses `Esc` or navigates away (handle is `.abort()`ed)
 
-### Cluster switching lifecycle
+### Gateway switching lifecycle
 
-1. User selects a different cluster and presses `Enter` → `pending_cluster_switch = Some(name)`
-2. Event loop calls `handle_cluster_switch()`
-3. New mTLS channel is built via `connect_to_cluster()`
-4. On success: `app.client` is replaced, `reset_sandbox_state()` clears all sandbox data, `refresh_data()` fetches health + sandboxes for the new cluster
+1. User selects a different gateway and presses `Enter` → `pending_gateway_switch = Some(name)`
+2. Event loop calls `handle_gateway_switch()`
+3. New mTLS channel is built via `connect_to_gateway()`
+4. On success: `app.client` is replaced, `reset_sandbox_state()` clears all sandbox data, `refresh_data()` fetches health + sandboxes for the new gateway
 5. On failure: `status_text` shows the error
 
 ## 9. Development Workflow
@@ -426,9 +426,9 @@ Always run before committing:
 mise run pre-commit
 ```
 
-### Cluster changes
+### Gateway changes
 
-If you change sandbox or server code that affects the backend, redeploy the cluster:
+If you change sandbox or server code that affects the backend, redeploy the gateway:
 
 ```bash
 mise run cluster:deploy all

@@ -5,9 +5,15 @@
 
 set -euo pipefail
 
+# Normalize cluster name: lowercase, replace invalid chars with hyphens
+normalize_name() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
+CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
 CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
-IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/navigator}}
+IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/openshell}}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}
 DEPLOY_FAST_MODE=${DEPLOY_FAST_MODE:-auto}
@@ -341,7 +347,7 @@ for component in server sandbox; do
   if [[ "${!var}" == "1" ]]; then
     # Tag may fail with AlreadyExists when the image digest hasn't changed;
     # this is harmless — the registry already has the correct image.
-    docker tag "navigator/${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" 2>/dev/null || true
+    docker tag "openshell/${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" 2>/dev/null || true
     pushed_images+=("${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}")
     built_components+=("${component}")
   fi

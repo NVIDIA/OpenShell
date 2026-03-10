@@ -19,13 +19,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ])
         .split(area);
 
-    draw_cluster_list(frame, app, chunks[0]);
+    draw_gateway_list(frame, app, chunks[0]);
     super::providers::draw(frame, app, chunks[1], app.focus == Focus::Providers);
     super::sandboxes::draw(frame, app, chunks[2], app.focus == Focus::Sandboxes);
 }
 
-fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
-    let focused = app.focus == Focus::Clusters;
+fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let focused = app.focus == Focus::Gateways;
 
     let header = Row::new(vec![
         Cell::from(Span::styled("  NAME", styles::MUTED)),
@@ -35,12 +35,12 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     .bottom_margin(1);
 
     let rows: Vec<Row<'_>> = app
-        .clusters
+        .gateways
         .iter()
         .enumerate()
         .map(|(i, entry)| {
-            let is_active = entry.name == app.cluster_name;
-            let is_cursor = focused && i == app.cluster_selected;
+            let is_active = entry.name == app.gateway_name;
+            let is_cursor = focused && i == app.gateway_selected;
 
             let cursor = if is_cursor { ">" } else { " " };
             let dot = if is_active { "* " } else { "  " };
@@ -92,7 +92,7 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
 
     let block = Block::default()
-        .title(Span::styled(" Clusters ", styles::HEADING))
+        .title(Span::styled(" Gateways ", styles::HEADING))
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1));
@@ -107,14 +107,14 @@ fn draw_cluster_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     frame.render_widget(table, area);
 
-    if app.clusters.is_empty() {
+    if app.gateways.is_empty() {
         let inner = Rect {
             x: area.x + 2,
             y: area.y + 2,
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(3),
         };
-        let msg = Paragraph::new(Span::styled(" No clusters found.", styles::MUTED));
+        let msg = Paragraph::new(Span::styled(" No gateways found.", styles::MUTED));
         frame.render_widget(msg, inner);
     }
 }

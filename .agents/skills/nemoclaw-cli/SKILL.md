@@ -436,11 +436,11 @@ openshell sandbox delete work-session
 
 ---
 
-## Workflow 7: Cluster Inference
+## Workflow 7: Gateway Inference
 
-Configure the cluster's managed inference route for `inference.local`.
+Configure the gateway's managed inference route for `inference.local`.
 
-### Set cluster inference
+### Set gateway inference
 
 First ensure the provider record exists:
 
@@ -448,20 +448,20 @@ First ensure the provider record exists:
 openshell provider list
 ```
 
-Then point cluster inference at that provider and model:
+Then point gateway inference at that provider and model:
 
 ```bash
-openshell cluster inference set \
+openshell inference set \
   --provider nvidia \
   --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
-This updates the cluster-managed `inference.local` route. There is no per-route create/list/update/delete workflow for sandbox inference.
+This updates the gateway-managed `inference.local` route. There is no per-route create/list/update/delete workflow for sandbox inference.
 
 ### Inspect current inference config
 
 ```bash
-openshell cluster inference get
+openshell inference get
 ```
 
 ### How sandboxes use it
@@ -549,8 +549,8 @@ $ openshell sandbox upload --help
 | Download files from sandbox | `openshell sandbox download <name> <path>` |
 | Create provider | `openshell provider create --name N --type T --from-existing` |
 | List providers | `openshell provider list` |
-| Configure cluster inference | `openshell cluster inference set --provider P --model M` |
-| View cluster inference | `openshell cluster inference get` |
+| Configure gateway inference | `openshell inference set --provider P --model M` |
+| View gateway inference | `openshell inference get` |
 | Delete sandbox | `openshell sandbox delete <name>` |
 | Destroy cluster | `openshell gateway destroy` |
 | Self-teach any command | `openshell <group> <cmd> --help` |

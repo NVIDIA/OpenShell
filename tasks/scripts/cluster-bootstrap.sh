@@ -5,6 +5,11 @@
 
 set -euo pipefail
 
+# Normalize cluster name: lowercase, replace invalid chars with hyphens
+normalize_name() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
+}
+
 MODE=${1:-build}
 if [ "${MODE}" != "build" ] && [ "${MODE}" != "fast" ]; then
   echo "usage: $0 [build|fast]" >&2
@@ -24,9 +29,9 @@ LOCAL_REGISTRY_ADDR=127.0.0.1:5000
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then
   IMAGE_REPO_BASE_DEFAULT=${CI_REGISTRY_IMAGE}
 elif [ "${MODE}" = "fast" ]; then
-  IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/navigator
+  IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/openshell
 else
-  IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/navigator
+  IMAGE_REPO_BASE_DEFAULT=${LOCAL_REGISTRY_ADDR}/openshell
 fi
 
 IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-${IMAGE_REPO_BASE_DEFAULT}}}
@@ -34,7 +39,7 @@ REGISTRY_HOST=${OPENSHELL_REGISTRY_HOST:-${IMAGE_REPO_BASE%%/*}}
 REGISTRY_NAMESPACE_DEFAULT=${IMAGE_REPO_BASE#*/}
 
 if [ "${REGISTRY_NAMESPACE_DEFAULT}" = "${IMAGE_REPO_BASE}" ]; then
-  REGISTRY_NAMESPACE_DEFAULT=navigator
+  REGISTRY_NAMESPACE_DEFAULT=openshell
 fi
 
 has_env_key() {
@@ -90,6 +95,7 @@ pick_random_port() {
 }
 
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
+CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
 
 if [ -n "${GATEWAY_PORT:-}" ]; then
   RESOLVED_GATEWAY_PORT=${GATEWAY_PORT}
@@ -233,7 +239,7 @@ fi
 # `docker-build-cluster.sh` and contains the bundled Helm chart and
 # manifests from the current working tree.
 if [ -z "${OPENSHELL_CLUSTER_IMAGE:-}" ]; then
-  export OPENSHELL_CLUSTER_IMAGE="navigator/cluster:${IMAGE_TAG}"
+  export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"
 fi
 
 DEPLOY_CMD=(openshell gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)

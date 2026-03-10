@@ -78,15 +78,15 @@ async fn ssh_session_config(
             session.gateway_scheme, gateway_host, gateway_port, session.connect_path
         )
     };
-    let cluster_name = tls
-        .cluster_name()
-        .ok_or_else(|| miette::miette!("cluster name is required to build SSH proxy command"))?;
+    let gateway_name = tls
+        .gateway_name()
+        .ok_or_else(|| miette::miette!("gateway name is required to build SSH proxy command"))?;
     let proxy_command = format!(
-        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --cluster {}",
+        "{exe_command} ssh-proxy --gateway {} --sandbox-id {} --token {} --gateway-name {}",
         gateway_url,
         session.sandbox_id,
         session.token,
-        shell_escape(cluster_name),
+        shell_escape(gateway_name),
     );
 
     Ok(SshSessionConfig {
@@ -580,14 +580,14 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
 /// The output is suitable for appending to `~/.ssh/config` so that tools like
 /// `VSCode` Remote-SSH can connect to the sandbox by host alias.
 ///
-/// The `ProxyCommand` uses `--cluster` so that `ssh-proxy` resolves the
+/// The `ProxyCommand` uses `--gateway-name` so that `ssh-proxy` resolves the
 /// gateway endpoint and TLS certificates from the gateway metadata directory
-/// (`~/.config/openshell/clusters/<name>/mtls/`).
-pub fn print_ssh_config(cluster: &str, name: &str) {
+/// (`~/.config/openshell/gateways/<name>/mtls/`).
+pub fn print_ssh_config(gateway: &str, name: &str) {
     let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
-    let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
+    let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
 
     println!("Host openshell-{name}");
     println!("    User sandbox");

@@ -84,7 +84,7 @@ If the container does not exist:
 
 ```bash
 # Check if the image is available
-docker images 'navigator/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+docker images 'openshell/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 ```
 
 If the image is missing, re-deploy so bootstrap can pull the published cluster image (or set `OPENSHELL_CLUSTER_IMAGE` explicitly).
