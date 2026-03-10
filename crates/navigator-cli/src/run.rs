@@ -1129,6 +1129,9 @@ fn remove_gateway_registration(name: &str) {
 }
 
 fn cleanup_cluster_metadata(name: &str) {
+    if let Err(err) = navigator_bootstrap::edge_token::remove_edge_token(name) {
+        tracing::debug!("failed to remove edge token: {err}");
+    }
     if let Err(err) = remove_cluster_metadata(name) {
         tracing::debug!("failed to remove cluster metadata: {err}");
     }

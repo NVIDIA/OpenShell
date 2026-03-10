@@ -40,7 +40,7 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// Length of the confirmation code (alphanumeric characters).
 const CODE_LENGTH: usize = 7;
 
-/// Generate a random alphanumeric confirmation code (e.g. "A7X-3KP").
+/// Generate a random alphanumeric confirmation code (e.g. "A7X-3KPX").
 ///
 /// Uses a dash separator in the middle for readability.
 fn generate_confirmation_code() -> String {
