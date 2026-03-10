@@ -202,12 +202,28 @@ impl Navigator for TestNavigator {
             .get(&provider.name)
             .cloned()
             .ok_or_else(|| Status::not_found("provider not found"))?;
+        // Merge semantics: empty map = no change, empty value = delete key.
+        let merge = |mut base: std::collections::HashMap<String, String>,
+                     incoming: std::collections::HashMap<String, String>|
+         -> std::collections::HashMap<String, String> {
+            if incoming.is_empty() {
+                return base;
+            }
+            for (k, v) in incoming {
+                if v.is_empty() {
+                    base.remove(&k);
+                } else {
+                    base.insert(k, v);
+                }
+            }
+            base
+        };
         let updated = Provider {
             id: existing.id,
             name: provider.name,
-            r#type: provider.r#type,
-            credentials: provider.credentials,
-            config: provider.config,
+            r#type: existing.r#type,
+            credentials: merge(existing.credentials, provider.credentials),
+            config: merge(existing.config, provider.config),
         };
         providers.insert(updated.name.clone(), updated.clone());
         Ok(Response::new(ProviderResponse {
@@ -398,7 +414,6 @@ async fn provider_cli_run_functions_support_full_crud_flow() {
     run::provider_update(
         &ts.endpoint,
         "my-claude",
-        "claude",
         false,
         &["API_KEY=rotated".to_string()],
         &["profile=prod".to_string()],
