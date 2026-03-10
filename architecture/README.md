@@ -122,7 +122,7 @@ The target onboarding experience is two commands:
 
 ```bash
 pip install <package>
-nemoclaw sandbox create --remote user@host -- claude
+openshell sandbox create --remote user@host -- claude
 ```
 
 The first command installs the CLI. The second command bootstraps the cluster on the remote host (if needed) and launches a sandbox running the specified agent.
@@ -170,8 +170,8 @@ The inference routing system transparently intercepts AI inference API calls fro
 
 **How it works end-to-end:**
 
-1. An operator configures cluster-level inference via `nemoclaw cluster inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
-2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS`).
+1. An operator configures cluster-level inference via `openshell cluster inference set --provider <name> --model <id>`. This stores a reference to the named provider and model on the gateway.
+2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`).
 3. The agent sends requests to `https://inference.local` using standard OpenAI or Anthropic SDK calls.
 4. The sandbox proxy intercepts the HTTPS CONNECT to `inference.local` (bypassing OPA policy evaluation), TLS-terminates the connection using the sandbox's ephemeral CA, and parses the HTTP request.
 5. Known inference API patterns are detected (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic, `GET /v1/models` for model discovery). Matching requests are forwarded to the first compatible route by the `navigator-router`, which rewrites the auth header, injects provider-specific default headers (e.g., `anthropic-version` for Anthropic), and overrides the model field in the request body.
@@ -183,7 +183,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 - The sandbox never sees the real API key for the backend -- credential isolation is maintained through the gateway's bundle resolution.
 - Routing is explicit via `inference.local`; OPA network policy is not involved in inference routing.
 - Provider-specific behavior (auth header style, default headers, supported protocols) is centralized in `InferenceProviderProfile` definitions in `navigator-core`. Supported inference provider types are openai, anthropic, and nvidia.
-- Cluster inference is managed via CLI (`nemoclaw cluster inference set/get`).
+- Cluster inference is managed via CLI (`openshell cluster inference set/get`).
 
 **Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Cluster inference uses a managed singleton route entry keyed by `inference.local` and configured from provider + model settings. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
 
@@ -232,13 +232,13 @@ For more detail, see [Policy Language](security-policy.md).
 
 The CLI is the primary way users interact with the platform. It provides commands organized into four groups:
 
-- **Gateway management** (`nemoclaw gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
-- **Sandbox management** (`nemoclaw sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
-- **Top-level commands**: `nemoclaw status` (cluster health), `nemoclaw logs` (sandbox logs), `nemoclaw forward` (port forwarding), `nemoclaw policy` (sandbox policy management).
-- **Provider management** (`nemoclaw provider`): Create, update, list, and delete external service credentials.
-- **Inference management** (`nemoclaw cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
+- **Gateway management** (`openshell gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
+- **Sandbox management** (`openshell sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
+- **Top-level commands**: `openshell status` (cluster health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management).
+- **Provider management** (`openshell provider`): Create, update, list, and delete external service credentials.
+- **Inference management** (`openshell cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
 
-The CLI resolves which cluster to operate on through a priority chain: explicit `--gateway` flag, then the `NEMOCLAW_CLUSTER` environment variable, then the active cluster set by `nemoclaw gateway select`. It supports TLS client certificates for mutual authentication with the gateway.
+The CLI resolves which cluster to operate on through a priority chain: explicit `--gateway` flag, then the `OPENSHELL_CLUSTER` environment variable, then the active cluster set by `openshell gateway select`. It supports TLS client certificates for mutual authentication with the gateway.
 
 ## How Users Get Started
 
@@ -253,7 +253,7 @@ pip install <package>
 **Step 2: Create a sandbox.**
 
 ```bash
-nemoclaw sandbox create -- claude
+openshell sandbox create -- claude
 ```
 
 If no cluster exists, the CLI automatically bootstraps one. It provisions a local Kubernetes cluster inside a Docker container, waits for it to become healthy, discovers the user's AI provider credentials from local configuration files, uploads them to the gateway, and launches a sandbox running the specified agent -- all from a single command.
@@ -261,7 +261,7 @@ If no cluster exists, the CLI automatically bootstraps one. It provisions a loca
 For remote deployment (running the sandbox on a different machine):
 
 ```bash
-nemoclaw sandbox create --remote user@hostname -- claude
+openshell sandbox create --remote user@hostname -- claude
 ```
 
 This performs the same bootstrap flow on the remote host via SSH.
@@ -269,14 +269,14 @@ This performs the same bootstrap flow on the remote host via SSH.
 For development and testing against the current checkout, use
 `scripts/remote-deploy.sh` instead. That helper syncs the local repository to
 an SSH-reachable machine, builds the CLI and Docker images on the remote host,
-and then runs `nemoclaw gateway start` there. It defaults to secure gateway
+and then runs `openshell gateway start` there. It defaults to secure gateway
 startup and only enables `--plaintext`, `--disable-gateway-auth`, or
 `--recreate` when explicitly requested.
 
 **Step 3: Connect to a running sandbox.**
 
 ```bash
-nemoclaw sandbox connect <sandbox-name>
+openshell sandbox connect <sandbox-name>
 ```
 
 This opens an interactive SSH session into the sandbox, with all provider credentials available as environment variables.

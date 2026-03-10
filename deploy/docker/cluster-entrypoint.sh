@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Entrypoint script for NemoClaw cluster image.
+# Entrypoint script for OpenShell cluster image.
 #
 # This script configures DNS resolution for k3s when running in Docker.
 #
@@ -326,7 +326,7 @@ if [ -f "$HELMCHART" ]; then
         echo "Disabling TLS (plaintext HTTP)"
         sed -i "s|__DISABLE_TLS__|true|g" "$HELMCHART"
         # The Helm template automatically rewrites https:// to http:// in
-        # NEMOCLAW_GRPC_ENDPOINT when disableTls is true, so no sed needed here.
+        # OPENSHELL_GRPC_ENDPOINT when disableTls is true, so no sed needed here.
     else
         sed -i "s|__DISABLE_TLS__|false|g" "$HELMCHART"
     fi

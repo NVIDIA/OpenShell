@@ -1,31 +1,31 @@
 ---
-name: nemoclaw-cli
-description: Guide agents through using the NemoClaw CLI (nemoclaw) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - nemoclaw, sandbox create, sandbox connect, logs, provider create, policy set, policy get, image push, forward, port forward, BYOC, bring your own container, use nemoclaw, run nemoclaw, CLI usage, manage sandbox, manage provider, gateway start, gateway select.
+name: openshell-cli
+description: Guide agents through using the OpenShell CLI (openshell) for sandbox management, provider configuration, policy iteration, BYOC workflows, and inference routing. Covers basic through advanced multi-step workflows. Trigger keywords - openshell, sandbox create, sandbox connect, logs, provider create, policy set, policy get, image push, forward, port forward, BYOC, bring your own container, use openshell, run openshell, CLI usage, manage sandbox, manage provider, gateway start, gateway select.
 ---
 
-# NemoClaw CLI
+# OpenShell CLI
 
-Guide agents through using the `nemoclaw` CLI for sandbox and platform management -- from basic operations to advanced multi-step workflows.
+Guide agents through using the `openshell` CLI for sandbox and platform management -- from basic operations to advanced multi-step workflows.
 
 ## Overview
 
-The NemoClaw CLI (`nemoclaw`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateways. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
+The OpenShell CLI (`openshell`) is the primary interface for managing sandboxes, providers, policies, inference routes, and gateways. This skill teaches agents how to orchestrate CLI commands for common and complex workflows.
 
 **Companion skill**: For creating or modifying sandbox policy YAML content (network rules, L7 inspection, access presets), use the `generate-sandbox-policy` skill. This skill covers the CLI *commands* for the policy lifecycle; `generate-sandbox-policy` covers policy *content authoring*.
 
 **Self-teaching**: The CLI has comprehensive built-in help. When you encounter a command or option not covered in this skill, walk the help tree:
 
 ```bash
-nemoclaw --help                    # Top-level commands
-nemoclaw <group> --help            # Subcommands in a group
-nemoclaw <group> <cmd> --help      # Flags for a specific command
+openshell --help                    # Top-level commands
+openshell <group> --help            # Subcommands in a group
+openshell <group> <cmd> --help      # Flags for a specific command
 ```
 
 This is your primary fallback. Use it freely -- the CLI's help output is authoritative and always up-to-date.
 
 ## Prerequisites
 
-- `nemoclaw` is on the PATH (install via `cargo install --path crates/navigator-cli`)
+- `openshell` is on the PATH (install via `cargo install --path crates/navigator-cli`)
 - Docker is running (required for gateway operations and BYOC)
 - For remote clusters: SSH access to the target host
 
@@ -42,7 +42,7 @@ Use this workflow when no cluster exists yet and the user wants to get a sandbox
 ### Step 1: Bootstrap a cluster
 
 ```bash
-nemoclaw gateway start
+openshell gateway start
 ```
 
 This provisions a local k3s cluster in Docker. The CLI will prompt interactively if a cluster already exists. The cluster is automatically set as the active gateway.
@@ -50,13 +50,13 @@ This provisions a local k3s cluster in Docker. The CLI will prompt interactively
 For remote deployment:
 
 ```bash
-nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
+openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 ### Step 2: Verify the cluster
 
 ```bash
-nemoclaw status
+openshell status
 ```
 
 Confirm the cluster is reachable and shows a version.
@@ -66,7 +66,7 @@ Confirm the cluster is reachable and shows a version.
 The simplest way to get a sandbox running:
 
 ```bash
-nemoclaw sandbox create
+openshell sandbox create
 ```
 
 This creates a sandbox with defaults and drops you into an interactive shell. The CLI auto-bootstraps a cluster if none exists.
@@ -74,8 +74,8 @@ This creates a sandbox with defaults and drops you into an interactive shell. Th
 **Shortcut for known tools**: When the trailing command is a recognized tool, the CLI auto-creates the required provider from local credentials:
 
 ```bash
-nemoclaw sandbox create -- claude        # Auto-creates claude provider
-nemoclaw sandbox create -- codex         # Auto-creates codex provider
+openshell sandbox create -- claude        # Auto-creates claude provider
+openshell sandbox create -- codex         # Auto-creates codex provider
 ```
 
 The agent will be prompted interactively if credentials are missing.
@@ -85,7 +85,7 @@ The agent will be prompted interactively if credentials are missing.
 Exit the sandbox shell (`exit` or Ctrl-D), then:
 
 ```bash
-nemoclaw sandbox delete <name>
+openshell sandbox delete <name>
 ```
 
 ---
@@ -99,7 +99,7 @@ Supported types: `claude`, `opencode`, `codex`, `generic`, `nvidia`, `gitlab`, `
 ### Create a provider from local credentials
 
 ```bash
-nemoclaw provider create --name my-github --type github --from-existing
+openshell provider create --name my-github --type github --from-existing
 ```
 
 The `--from-existing` flag discovers credentials from local state (e.g., `gh auth` tokens, Claude config files).
@@ -107,7 +107,7 @@ The `--from-existing` flag discovers credentials from local state (e.g., `gh aut
 ### Create a provider with explicit credentials
 
 ```bash
-nemoclaw provider create --name my-api --type generic \
+openshell provider create --name my-api --type generic \
   --credential API_KEY=sk-abc123 \
   --config base_url=https://api.example.com
 ```
@@ -115,16 +115,16 @@ nemoclaw provider create --name my-api --type generic \
 Bare `KEY` (without `=VALUE`) reads the value from the environment variable of that name:
 
 ```bash
-nemoclaw provider create --name my-api --type generic --credential API_KEY
+openshell provider create --name my-api --type generic --credential API_KEY
 ```
 
 ### List, inspect, update, delete
 
 ```bash
-nemoclaw provider list
-nemoclaw provider get my-github
-nemoclaw provider update my-github --type github --from-existing
-nemoclaw provider delete my-github
+openshell provider list
+openshell provider get my-github
+openshell provider update my-github --type github --from-existing
+openshell provider delete my-github
 ```
 
 ---
@@ -134,7 +134,7 @@ nemoclaw provider delete my-github
 ### Create with options
 
 ```bash
-nemoclaw sandbox create \
+openshell sandbox create \
   --name my-sandbox \
   --provider my-github \
   --provider my-claude \
@@ -145,7 +145,7 @@ nemoclaw sandbox create \
 
 Key flags:
 - `--provider`: Attach one or more providers (repeatable)
-- `--policy`: Custom policy YAML (otherwise uses built-in default or `NEMOCLAW_SANDBOX_POLICY` env var)
+- `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--upload <PATH>[:<DEST>]`: Upload local files into the sandbox (default dest: `/sandbox`)
 - `--keep`: Keep sandbox alive after the command exits (useful for non-interactive commands)
 - `--forward <PORT>`: Forward a local port (implies `--keep`)
@@ -153,53 +153,53 @@ Key flags:
 ### List and inspect sandboxes
 
 ```bash
-nemoclaw sandbox list
-nemoclaw sandbox get my-sandbox
+openshell sandbox list
+openshell sandbox get my-sandbox
 ```
 
 ### Connect to a running sandbox
 
 ```bash
-nemoclaw sandbox connect my-sandbox
+openshell sandbox connect my-sandbox
 ```
 
 Opens an interactive SSH shell. To configure VS Code Remote-SSH:
 
 ```bash
-nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
+openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
 ### Upload and download files
 
 ```bash
 # Upload local files to sandbox
-nemoclaw sandbox upload my-sandbox ./src /sandbox/src
+openshell sandbox upload my-sandbox ./src /sandbox/src
 
 # Download files from sandbox
-nemoclaw sandbox download my-sandbox /sandbox/output ./local-output
+openshell sandbox download my-sandbox /sandbox/output ./local-output
 ```
 
 ### View logs
 
 ```bash
 # Recent logs
-nemoclaw logs my-sandbox
+openshell logs my-sandbox
 
 # Stream live logs
-nemoclaw logs my-sandbox --tail
+openshell logs my-sandbox --tail
 
 # Filter by source and level
-nemoclaw logs my-sandbox --tail --source sandbox --level warn
+openshell logs my-sandbox --tail --source sandbox --level warn
 
 # Logs from the last 5 minutes
-nemoclaw logs my-sandbox --since 5m
+openshell logs my-sandbox --since 5m
 ```
 
 ### Delete sandboxes
 
 ```bash
-nemoclaw sandbox delete my-sandbox
-nemoclaw sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
+openshell sandbox delete my-sandbox
+openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 ```
 
 ---
@@ -236,7 +236,7 @@ Create sandbox with initial policy
 ### Step 1: Create sandbox with initial policy
 
 ```bash
-nemoclaw sandbox create --name dev --policy ./initial-policy.yaml --keep -- claude
+openshell sandbox create --name dev --policy ./initial-policy.yaml --keep -- claude
 ```
 
 Use `--keep` so the sandbox stays alive for iteration. The user can work in the sandbox via a separate shell.
@@ -246,7 +246,7 @@ Use `--keep` so the sandbox stays alive for iteration. The user can work in the 
 In a separate terminal or as the agent:
 
 ```bash
-nemoclaw logs dev --tail --source sandbox
+openshell logs dev --tail --source sandbox
 ```
 
 Look for log lines with `action: deny` -- these indicate blocked network requests. The logs include:
@@ -257,7 +257,7 @@ Look for log lines with `action: deny` -- these indicate blocked network request
 ### Step 3: Pull the current policy
 
 ```bash
-nemoclaw policy get dev --full > current-policy.yaml
+openshell policy get dev --full > current-policy.yaml
 ```
 
 The `--full` flag outputs valid YAML that can be directly re-submitted. This is the round-trip format.
@@ -277,7 +277,7 @@ Only `network_policies` and `inference` sections can be modified at runtime. If 
 ### Step 5: Push the updated policy
 
 ```bash
-nemoclaw policy set dev --policy current-policy.yaml --wait
+openshell policy set dev --policy current-policy.yaml --wait
 ```
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls every second). Exit codes:
@@ -288,7 +288,7 @@ The `--wait` flag blocks until the sandbox confirms the policy is loaded (polls 
 ### Step 6: Verify the update
 
 ```bash
-nemoclaw policy list dev
+openshell policy list dev
 ```
 
 Check that the latest revision shows status `loaded`. If `failed`, check the error column for details.
@@ -302,13 +302,13 @@ Return to Step 2. Continue monitoring logs and refining the policy until all req
 View all revisions to understand how the policy evolved:
 
 ```bash
-nemoclaw policy list dev --limit 50
+openshell policy list dev --limit 50
 ```
 
 Fetch a specific historical revision:
 
 ```bash
-nemoclaw policy get dev --rev 3 --full
+openshell policy get dev --rev 3 --full
 ```
 
 ---
@@ -320,7 +320,7 @@ Build a custom container image and run it as a sandbox.
 ### Step 1: Create a sandbox from a Dockerfile
 
 ```bash
-nemoclaw sandbox create --from ./Dockerfile --keep --name my-app
+openshell sandbox create --from ./Dockerfile --keep --name my-app
 ```
 
 The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference (e.g. `myregistry.com/img:tag`), or a community sandbox name (e.g. `openclaw`).
@@ -335,10 +335,10 @@ When `--from` is specified, the CLI:
 
 ```bash
 # Foreground (blocks)
-nemoclaw forward start 8080 my-app
+openshell forward start 8080 my-app
 
 # Background (returns immediately)
-nemoclaw forward start 8080 my-app -d
+openshell forward start 8080 my-app -d
 ```
 
 The service is now reachable at `localhost:8080`.
@@ -347,10 +347,10 @@ The service is now reachable at `localhost:8080`.
 
 ```bash
 # List active forwards
-nemoclaw forward list
+openshell forward list
 
 # Stop a forward
-nemoclaw forward stop 8080 my-app
+openshell forward stop 8080 my-app
 ```
 
 ### Step 4: Iterate
@@ -358,14 +358,14 @@ nemoclaw forward stop 8080 my-app
 To update the container:
 
 ```bash
-nemoclaw sandbox delete my-app
-nemoclaw sandbox create --from ./Dockerfile --keep --name my-app --forward 8080
+openshell sandbox delete my-app
+openshell sandbox create --from ./Dockerfile --keep --name my-app --forward 8080
 ```
 
 ### Shortcut: Create with port forward in one command
 
 ```bash
-nemoclaw sandbox create --from ./Dockerfile --forward 8080 --keep -- ./start-server.sh
+openshell sandbox create --from ./Dockerfile --forward 8080 --keep -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs, so the service is reachable immediately.
@@ -384,7 +384,7 @@ This workflow supports a human working in a sandbox while an agent monitors acti
 ### Step 1: Create sandbox with providers and keep alive
 
 ```bash
-nemoclaw sandbox create \
+openshell sandbox create \
   --name work-session \
   --provider github \
   --provider claude \
@@ -397,13 +397,13 @@ nemoclaw sandbox create \
 Tell the user to run:
 
 ```bash
-nemoclaw sandbox connect work-session
+openshell sandbox connect work-session
 ```
 
 Or for VS Code:
 
 ```bash
-nemoclaw sandbox ssh-config work-session >> ~/.ssh/config
+openshell sandbox ssh-config work-session >> ~/.ssh/config
 # Then connect via VS Code Remote-SSH to the host "work-session"
 ```
 
@@ -412,7 +412,7 @@ nemoclaw sandbox ssh-config work-session >> ~/.ssh/config
 While the user works, monitor the sandbox logs:
 
 ```bash
-nemoclaw logs work-session --tail --source sandbox --level warn
+openshell logs work-session --tail --source sandbox --level warn
 ```
 
 Watch for `deny` actions that indicate the user's work is being blocked by policy.
@@ -421,17 +421,17 @@ Watch for `deny` actions that indicate the user's work is being blocked by polic
 
 When denied actions are observed:
 
-1. Pull current policy: `nemoclaw policy get work-session --full > policy.yaml`
+1. Pull current policy: `openshell policy get work-session --full > policy.yaml`
 2. Modify the policy to allow the blocked actions (use `generate-sandbox-policy` skill for content)
-3. Push the update: `nemoclaw policy set work-session --policy policy.yaml --wait`
-4. Verify: `nemoclaw policy list work-session`
+3. Push the update: `openshell policy set work-session --policy policy.yaml --wait`
+4. Verify: `openshell policy list work-session`
 
 The user does not need to disconnect -- policy updates are hot-reloaded within ~30 seconds (or immediately when using `--wait`, which polls for confirmation).
 
 ### Step 5: Clean up when done
 
 ```bash
-nemoclaw sandbox delete work-session
+openshell sandbox delete work-session
 ```
 
 ---
@@ -445,13 +445,13 @@ Configure the cluster's managed inference route for `inference.local`.
 First ensure the provider record exists:
 
 ```bash
-nemoclaw provider list
+openshell provider list
 ```
 
 Then point cluster inference at that provider and model:
 
 ```bash
-nemoclaw cluster inference set \
+openshell cluster inference set \
   --provider nvidia \
   --model nvidia/nemotron-3-nano-30b-a3b
 ```
@@ -461,7 +461,7 @@ This updates the cluster-managed `inference.local` route. There is no per-route 
 ### Inspect current inference config
 
 ```bash
-nemoclaw cluster inference get
+openshell cluster inference get
 ```
 
 ### How sandboxes use it
@@ -477,31 +477,31 @@ nemoclaw cluster inference get
 ### List and switch gateways
 
 ```bash
-nemoclaw gateway select            # See all gateways (no args shows list)
-nemoclaw gateway select my-cluster # Switch active gateway
-nemoclaw status                    # Verify connectivity
+openshell gateway select            # See all gateways (no args shows list)
+openshell gateway select my-cluster # Switch active gateway
+openshell status                    # Verify connectivity
 ```
 
 ### Lifecycle
 
 ```bash
-nemoclaw gateway start                                 # Start local cluster
-nemoclaw gateway stop                                  # Stop (preserves state)
-nemoclaw gateway start                                 # Restart (reuses state)
-nemoclaw gateway destroy                               # Destroy permanently
+openshell gateway start                                 # Start local cluster
+openshell gateway stop                                  # Stop (preserves state)
+openshell gateway start                                 # Restart (reuses state)
+openshell gateway destroy                               # Destroy permanently
 ```
 
 ### Remote clusters
 
 ```bash
 # Deploy to remote host
-nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
+openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
 
 # Set up kubectl access
-nemoclaw gateway tunnel --name remote-cluster
+openshell gateway tunnel --name remote-cluster
 
 # Get cluster info
-nemoclaw gateway info --name remote-cluster
+openshell gateway info --name remote-cluster
 ```
 
 ---
@@ -510,19 +510,19 @@ nemoclaw gateway info --name remote-cluster
 
 When you encounter a command or option not covered in this skill:
 
-1. **Start broad**: `nemoclaw --help` to see all command groups.
-2. **Narrow down**: `nemoclaw <group> --help` to see subcommands (e.g., `nemoclaw sandbox --help`).
-3. **Get specific**: `nemoclaw <group> <cmd> --help` for flags and usage (e.g., `nemoclaw sandbox create --help`).
+1. **Start broad**: `openshell --help` to see all command groups.
+2. **Narrow down**: `openshell <group> --help` to see subcommands (e.g., `openshell sandbox --help`).
+3. **Get specific**: `openshell <group> <cmd> --help` for flags and usage (e.g., `openshell sandbox create --help`).
 
 The CLI help is always authoritative. If the help output contradicts this skill, follow the help output -- the CLI may have been updated since this skill was written.
 
 ### Example: discovering an unfamiliar command
 
 ```bash
-$ nemoclaw sandbox --help
+$ openshell sandbox --help
 # Shows: create, get, list, delete, connect, upload, download, ssh-config, image
 
-$ nemoclaw sandbox upload --help
+$ openshell sandbox upload --help
 # Shows: positional arguments (name, path, dest), usage examples
 ```
 
@@ -532,28 +532,28 @@ $ nemoclaw sandbox upload --help
 
 | Task | Command |
 |------|---------|
-| Deploy local cluster | `nemoclaw gateway start` |
-| Check cluster health | `nemoclaw status` |
-| List/switch gateways | `nemoclaw gateway select [name]` |
-| Create sandbox (interactive) | `nemoclaw sandbox create` |
-| Create sandbox with tool | `nemoclaw sandbox create -- claude` |
-| Create with custom policy | `nemoclaw sandbox create --policy ./p.yaml --keep` |
-| Connect to sandbox | `nemoclaw sandbox connect <name>` |
-| Stream live logs | `nemoclaw logs <name> --tail` |
-| Pull current policy | `nemoclaw policy get <name> --full > p.yaml` |
-| Push updated policy | `nemoclaw policy set <name> --policy p.yaml --wait` |
-| Policy revision history | `nemoclaw policy list <name>` |
-| Create sandbox from Dockerfile | `nemoclaw sandbox create --from ./Dockerfile --keep` |
-| Forward a port | `nemoclaw forward start <port> <name> -d` |
-| Upload files to sandbox | `nemoclaw sandbox upload <name> <path>` |
-| Download files from sandbox | `nemoclaw sandbox download <name> <path>` |
-| Create provider | `nemoclaw provider create --name N --type T --from-existing` |
-| List providers | `nemoclaw provider list` |
-| Configure cluster inference | `nemoclaw cluster inference set --provider P --model M` |
-| View cluster inference | `nemoclaw cluster inference get` |
-| Delete sandbox | `nemoclaw sandbox delete <name>` |
-| Destroy cluster | `nemoclaw gateway destroy` |
-| Self-teach any command | `nemoclaw <group> <cmd> --help` |
+| Deploy local cluster | `openshell gateway start` |
+| Check cluster health | `openshell status` |
+| List/switch gateways | `openshell gateway select [name]` |
+| Create sandbox (interactive) | `openshell sandbox create` |
+| Create sandbox with tool | `openshell sandbox create -- claude` |
+| Create with custom policy | `openshell sandbox create --policy ./p.yaml --keep` |
+| Connect to sandbox | `openshell sandbox connect <name>` |
+| Stream live logs | `openshell logs <name> --tail` |
+| Pull current policy | `openshell policy get <name> --full > p.yaml` |
+| Push updated policy | `openshell policy set <name> --policy p.yaml --wait` |
+| Policy revision history | `openshell policy list <name>` |
+| Create sandbox from Dockerfile | `openshell sandbox create --from ./Dockerfile --keep` |
+| Forward a port | `openshell forward start <port> <name> -d` |
+| Upload files to sandbox | `openshell sandbox upload <name> <path>` |
+| Download files from sandbox | `openshell sandbox download <name> <path>` |
+| Create provider | `openshell provider create --name N --type T --from-existing` |
+| List providers | `openshell provider list` |
+| Configure cluster inference | `openshell cluster inference set --provider P --model M` |
+| View cluster inference | `openshell cluster inference get` |
+| Delete sandbox | `openshell sandbox delete <name>` |
+| Destroy cluster | `openshell gateway destroy` |
+| Self-teach any command | `openshell <group> <cmd> --help` |
 
 ## Companion Skills
 
@@ -561,4 +561,4 @@ $ nemoclaw sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
 | `debug-navigator-cluster` | Diagnosing cluster startup or health failures |
-| `tui-development` | Developing features for the NemoClaw TUI (`nemoclaw term`) |
+| `tui-development` | Developing features for the OpenShell TUI (`openshell term`) |

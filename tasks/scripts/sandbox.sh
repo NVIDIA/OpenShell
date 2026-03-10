@@ -44,7 +44,7 @@ fi
 # -------------------------------------------------------------------
 need_create=1
 
-if nemoclaw sandbox get "${SANDBOX_NAME}" >/dev/null 2>&1; then
+if openshell sandbox get "${SANDBOX_NAME}" >/dev/null 2>&1; then
   # Sandbox exists — only recreate if the cluster has been redeployed.
   # The command passed via `-- <cmd>` only affects the SSH exec session,
   # not the sandbox pod itself (which always runs `sleep infinity`), so
@@ -62,7 +62,7 @@ if nemoclaw sandbox get "${SANDBOX_NAME}" >/dev/null 2>&1; then
     need_create=0
   else
     echo "Cluster has been redeployed since sandbox '${SANDBOX_NAME}' was created. Recreating..."
-    nemoclaw sandbox delete "${SANDBOX_NAME}" || true
+    openshell sandbox delete "${SANDBOX_NAME}" || true
   fi
 fi
 
@@ -74,13 +74,13 @@ ensure_anthropic_provider() {
     return
   fi
 
-  if nemoclaw provider get anthropic >/dev/null 2>&1; then
+  if openshell provider get anthropic >/dev/null 2>&1; then
     # Provider already registered — nothing to do.
     return
   fi
 
   echo "Registering anthropic provider..."
-  nemoclaw provider create \
+  openshell provider create \
     --name anthropic \
     --type claude \
     --credential "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}"
@@ -92,16 +92,16 @@ ensure_anthropic_provider
 # 4. Create or connect to the sandbox
 # -------------------------------------------------------------------
 PROVIDER_ARGS=()
-if nemoclaw provider get anthropic >/dev/null 2>&1; then
+if openshell provider get anthropic >/dev/null 2>&1; then
   PROVIDER_ARGS+=(--provider anthropic)
 fi
 
 if [[ "${need_create}" == "1" ]]; then
   echo "Creating sandbox '${SANDBOX_NAME}'..."
-  nemoclaw sandbox create --name "${SANDBOX_NAME}" "${PROVIDER_ARGS[@]}" --tty -- "${CMD[@]}"
+  openshell sandbox create --name "${SANDBOX_NAME}" "${PROVIDER_ARGS[@]}" --tty -- "${CMD[@]}"
 else
   echo "Connecting to existing sandbox '${SANDBOX_NAME}'..."
-  nemoclaw sandbox connect "${SANDBOX_NAME}"
+  openshell sandbox connect "${SANDBOX_NAME}"
 fi
 
 # Record state so we know this sandbox matches the current deploy.

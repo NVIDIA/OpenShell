@@ -182,7 +182,7 @@ pub async fn pull_remote_image(
         platform_str
     );
 
-    // Determine the registry tag to pull.  If NEMOCLAW_CLUSTER_IMAGE is set
+    // Determine the registry tag to pull.  If OPENSHELL_CLUSTER_IMAGE is set
     // and already points at a registry image, honour its tag.  Otherwise use
     // the distribution registry default tag — the local build tag (e.g. "dev")
     // is a build-time convention that doesn't exist in the registry.

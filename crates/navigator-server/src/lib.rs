@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! NemoClaw Server library.
+//! OpenShell Server library.
 //!
-//! This crate provides the server implementation for NemoClaw, including:
+//! This crate provides the server implementation for OpenShell, including:
 //! - gRPC service implementation
 //! - HTTP health endpoints
 //! - Protocol multiplexing (gRPC + HTTP on same port)
@@ -91,7 +91,7 @@ impl ServerState {
     }
 }
 
-/// Run the NemoClaw server.
+/// Run the OpenShell server.
 ///
 /// This starts a multiplexed gRPC/HTTP server on the configured bind address.
 ///
@@ -105,7 +105,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     }
     if config.ssh_handshake_secret.is_empty() {
         return Err(Error::config(
-            "ssh_handshake_secret is required. Set --ssh-handshake-secret or NEMOCLAW_SSH_HANDSHAKE_SECRET",
+            "ssh_handshake_secret is required. Set --ssh-handshake-secret or OPENSHELL_SSH_HANDSHAKE_SECRET",
         ));
     }
 

@@ -2,27 +2,27 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
-# Install the NemoClaw CLI binary.
+# Install the OpenShell CLI binary.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/NVIDIA/NemoClaw/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 #
 # Environment variables:
-#   NEMOCLAW_VERSION    - Release tag to install (default: "devel")
-#   NEMOCLAW_INSTALL_DIR - Directory to install into (default: /usr/local/bin)
+#   OPENSHELL_VERSION    - Release tag to install (default: "devel")
+#   OPENSHELL_INSTALL_DIR - Directory to install into (default: /usr/local/bin)
 #
 set -eu
 
-REPO="NVIDIA/NemoClaw"
-VERSION="${NEMOCLAW_VERSION:-devel}"
-INSTALL_DIR="${NEMOCLAW_INSTALL_DIR:-/usr/local/bin}"
+REPO="NVIDIA/OpenShell"
+VERSION="${OPENSHELL_VERSION:-devel}"
+INSTALL_DIR="${OPENSHELL_INSTALL_DIR:-/usr/local/bin}"
 
 info() {
-  echo "nemoclaw: $*" >&2
+  echo "openshell: $*" >&2
 }
 
 error() {
-  echo "nemoclaw: error: $*" >&2
+  echo "openshell: error: $*" >&2
   exit 1
 }
 
@@ -83,7 +83,7 @@ verify_checksum() {
 
 main() {
   target="$(get_target)"
-  filename="nemoclaw-${target}.tar.gz"
+  filename="openshell-${target}.tar.gz"
   base_url="https://github.com/${REPO}/releases/download/${VERSION}"
 
   tmpdir="$(mktemp -d)"
@@ -93,7 +93,7 @@ main() {
   download "${base_url}/${filename}" "${tmpdir}/${filename}"
 
   info "verifying checksum..."
-  download "${base_url}/nemoclaw-checksums-sha256.txt" "${tmpdir}/checksums.txt"
+  download "${base_url}/openshell-checksums-sha256.txt" "${tmpdir}/checksums.txt"
   if ! verify_checksum "${tmpdir}/${filename}" "${tmpdir}/checksums.txt" "$filename"; then
     error "checksum verification failed"
   fi
@@ -101,15 +101,15 @@ main() {
   info "extracting..."
   tar -xzf "${tmpdir}/${filename}" -C "${tmpdir}"
 
-  info "installing to ${INSTALL_DIR}/nemoclaw..."
+  info "installing to ${INSTALL_DIR}/openshell..."
   if [ -w "$INSTALL_DIR" ]; then
-    mv "${tmpdir}/nemoclaw" "${INSTALL_DIR}/nemoclaw"
+    mv "${tmpdir}/openshell" "${INSTALL_DIR}/openshell"
   else
-    sudo mv "${tmpdir}/nemoclaw" "${INSTALL_DIR}/nemoclaw"
+    sudo mv "${tmpdir}/openshell" "${INSTALL_DIR}/openshell"
   fi
-  chmod +x "${INSTALL_DIR}/nemoclaw"
+  chmod +x "${INSTALL_DIR}/openshell"
 
-  info "installed nemoclaw $(${INSTALL_DIR}/nemoclaw --version 2>/dev/null || echo "${VERSION}") to ${INSTALL_DIR}/nemoclaw"
+  info "installed openshell $(${INSTALL_DIR}/openshell --version 2>/dev/null || echo "${VERSION}") to ${INSTALL_DIR}/openshell"
 }
 
 main

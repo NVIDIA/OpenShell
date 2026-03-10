@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Unified multi-arch build and push for all NemoClaw images.
+# Unified multi-arch build and push for all OpenShell images.
 #
 # Usage:
 #   docker-publish-multiarch.sh --mode registry   # Push to DOCKER_REGISTRY
@@ -80,7 +80,7 @@ fi
 # ---------------------------------------------------------------------------
 IMAGE_TAG=${IMAGE_TAG:-dev}
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
-CARGO_VERSION=${NEMOCLAW_CARGO_VERSION:-}
+CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-}
 if [[ -z "${CARGO_VERSION}" ]]; then
   CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 fi
@@ -163,7 +163,7 @@ for component in sandbox server; do
   if [ "$component" = "sandbox" ]; then
     BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
   fi
-  BUILD_ARGS="${BUILD_ARGS} --build-arg NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}"
+  BUILD_ARGS="${BUILD_ARGS} --build-arg OPENSHELL_CARGO_VERSION=${CARGO_VERSION}"
   if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
     BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
   fi

@@ -513,7 +513,7 @@ wheels = [
 ]
 
 [[package]]
-name = "nemoclaw"
+name = "openshell"
 source = { virtual = "." }
 dependencies = [
     { name = "cloudpickle" },

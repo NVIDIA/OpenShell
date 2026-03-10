@@ -1,6 +1,6 @@
 # Sandbox Custom Containers
 
-Users can run `nemoclaw sandbox create --from <source>` to launch a sandbox with a custom container image while keeping the `navigator-sandbox` process supervisor in control.
+Users can run `openshell sandbox create --from <source>` to launch a sandbox with a custom container image while keeping the `navigator-sandbox` process supervisor in control.
 
 ## The `--from` Flag
 
@@ -8,7 +8,7 @@ The `--from` flag accepts four kinds of input:
 
 | Input | Example | Behavior |
 |-------|---------|----------|
-| **Community sandbox name** | `--from openclaw` | Resolves to `ghcr.io/nvidia/nemoclaw-community/sandboxes/openclaw:latest` |
+| **Community sandbox name** | `--from openclaw` | Resolves to `d1i0nduu2f6qxk.cloudfront.net/openshell-community/sandboxes/openclaw:latest` |
 | **Dockerfile path** | `--from ./Dockerfile` | Builds the image, pushes it into the cluster, then creates the sandbox |
 | **Directory with Dockerfile** | `--from ./my-sandbox/` | Uses the directory as the build context |
 | **Full image reference** | `--from myregistry.com/img:tag` | Uses the image directly |
@@ -20,9 +20,9 @@ The CLI classifies the value in this order:
 1. **Existing file** whose name contains "Dockerfile" (case-insensitive) — treated as a Dockerfile to build.
 2. **Existing directory** containing a `Dockerfile` — treated as a build context directory.
 3. **Contains `/`, `:`, or `.`** — treated as a full container image reference.
-4. **Otherwise** — treated as a community sandbox name, expanded to `{NEMOCLAW_COMMUNITY_REGISTRY}/{name}:latest`.
+4. **Otherwise** — treated as a community sandbox name, expanded to `{OPENSHELL_COMMUNITY_REGISTRY}/{name}:latest`.
 
-The community registry prefix defaults to `ghcr.io/nvidia/nemoclaw-community/sandboxes` and can be overridden with the `NEMOCLAW_COMMUNITY_REGISTRY` environment variable.
+The community registry prefix defaults to `d1i0nduu2f6qxk.cloudfront.net/openshell-community/sandboxes` and can be overridden with the `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
 
 ### Dockerfile build flow
 
@@ -51,7 +51,7 @@ flowchart TB
             agent_desc["Image: user-selected workload image
             Command: /opt/navigator/bin/navigator-sandbox
             Mounts shared volume read-only at /opt/navigator/bin/
-            Env: NEMOCLAW_SANDBOX_ID, NEMOCLAW_ENDPOINT, ...
+            Env: OPENSHELL_SANDBOX_ID, OPENSHELL_ENDPOINT, ...
             Caps: SYS_ADMIN, NET_ADMIN, SYS_PTRACE"]
         end
     end
@@ -70,13 +70,13 @@ These transforms apply to both generated templates and user-provided `pod_templa
 ### Creating a sandbox from a community image
 
 ```bash
-nemoclaw sandbox create --from openclaw
+openshell sandbox create --from openclaw
 ```
 
 ### Creating a sandbox with a custom image
 
 ```bash
-nemoclaw sandbox create --from myimage:latest -- echo "hello from custom container"
+openshell sandbox create --from myimage:latest -- echo "hello from custom container"
 ```
 
 When `--from` is set the CLI clears the default `run_as_user`/`run_as_group` policy (which expects a `sandbox` user) so that arbitrary images that lack that user can start without error.
@@ -84,8 +84,8 @@ When `--from` is set the CLI clears the default `run_as_user`/`run_as_group` pol
 ### Building from a Dockerfile in one step
 
 ```bash
-nemoclaw sandbox create --from ./Dockerfile -- echo "built and running"
-nemoclaw sandbox create --from ./my-sandbox/  # directory with Dockerfile
+openshell sandbox create --from ./Dockerfile -- echo "built and running"
+openshell sandbox create --from ./my-sandbox/  # directory with Dockerfile
 ```
 
 ## Supervisor Behavior in Custom Images
@@ -93,7 +93,7 @@ nemoclaw sandbox create --from ./my-sandbox/  # directory with Dockerfile
 The `navigator-sandbox` supervisor adapts to arbitrary environments:
 
 - **Log file fallback**: Attempts to open `/var/log/navigator.log` for append; silently falls back to stdout-only logging if the path is not writable.
-- **Command resolution**: Executes the command from CLI args, then the `NEMOCLAW_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
+- **Command resolution**: Executes the command from CLI args, then the `OPENSHELL_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
 - **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable.
 
 ## Design Decisions
@@ -103,7 +103,7 @@ The `navigator-sandbox` supervisor adapts to arbitrary environments:
 | Unified `--from` flag | Single entry point for community names, Dockerfiles, directories, and image refs — removes the need to know registry paths |
 | Community name resolution | Bare names like `openclaw` expand to the GHCR community registry, making the common case simple |
 | Auto build+push for Dockerfiles | Eliminates the two-step `image push` + `create` workflow for local development |
-| `NEMOCLAW_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
+| `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
 | Init container side-load | Avoids rebuilding every workload image with the supervisor binary baked in |
 | `emptyDir` shared volume | Zero-config, no PVC needed, ephemeral by design |
 | Read-only mount in agent | Supervisor binary cannot be tampered with by the workload |

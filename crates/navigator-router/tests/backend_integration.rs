@@ -200,7 +200,7 @@ async fn proxy_mock_route_returns_canned_response() {
     assert_eq!(resp_body["model"], "mock/test-model");
     assert_eq!(
         resp_body["choices"][0]["message"]["content"],
-        "Hello from nemoclaw mock backend"
+        "Hello from openshell mock backend"
     );
 }
 

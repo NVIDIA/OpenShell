@@ -35,14 +35,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           path-to-signatures: "dco-signatures.json"
-          path-to-document: "https://github.com/NVIDIA/NemoClaw/blob/main/DCO"
+          path-to-document: "https://github.com/NVIDIA/OpenShell/blob/main/DCO"
           branch: "signatures"
           allowlist: dependabot
           create-file-commit-message: "chore: create file to store dco signatures"
           signed-commit-message: "chore: $contributorName has signed the dco in #$pullRequestNo"
           custom-notsigned-prcomment: >-
             Thank you for your submission! We ask that $you sign our
-            [Developer Certificate of Origin](https://github.com/NVIDIA/NemoClaw/blob/main/DCO)
+            [Developer Certificate of Origin](https://github.com/NVIDIA/OpenShell/blob/main/DCO)
             before we can accept your contribution. You can sign the DCO by
             adding a comment below using this text:
           custom-pr-sign-comment: "I have read the DCO document and I hereby sign the DCO."

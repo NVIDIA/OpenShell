@@ -229,7 +229,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "nemoclaw-e2e"
+name = "openshell-e2e"
 version = "0.1.0"
 dependencies = [
  "hex",

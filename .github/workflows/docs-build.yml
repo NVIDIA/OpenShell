@@ -22,7 +22,7 @@ jobs:
     build:
         runs-on: build-arm64
         container:
-            image: ghcr.io/nvidia/nemoclaw/ci:latest
+            image: ghcr.io/nvidia/openshell/ci:latest
             credentials:
                 username: ${{ github.actor }}
                 password: ${{ secrets.GITHUB_TOKEN }}
@@ -54,7 +54,7 @@ jobs:
         needs: [build]
         runs-on: build-arm64
         container:
-            image: ghcr.io/nvidia/nemoclaw/ci:latest
+            image: ghcr.io/nvidia/openshell/ci:latest
             credentials:
                 username: ${{ github.actor }}
                 password: ${{ secrets.GITHUB_TOKEN }}

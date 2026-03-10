@@ -25,7 +25,7 @@ This tutorial walks you through a realistic setup where you run [OpenCode](https
 In the Claude Code tutorial, the CLI auto-discovers credentials. Here you create a provider explicitly, which gives you control over the provider name and type.
 
 ```console
-$ nemoclaw provider create --name nvidia --type nvidia --from-existing
+$ openshell provider create --name nvidia --type nvidia --from-existing
 ```
 
 The `--from-existing` flag tells the CLI to discover credentials from your local environment. It finds `NVIDIA_API_KEY` and stores it securely. The provider is now available to attach to any sandbox.
@@ -33,7 +33,7 @@ The `--from-existing` flag tells the CLI to discover credentials from your local
 Verify the provider exists:
 
 ```console
-$ nemoclaw provider list
+$ openshell provider list
 ```
 
 ## Create the Sandbox
@@ -41,7 +41,7 @@ $ nemoclaw provider list
 Create a sandbox with the NVIDIA provider attached and OpenCode as the startup command:
 
 ```console
-$ nemoclaw sandbox create --name opencode-sandbox --provider nvidia --keep -- opencode
+$ openshell sandbox create --name opencode-sandbox --provider nvidia --keep -- opencode
 ```
 
 The `--keep` flag keeps the sandbox alive after you exit, which you need for the iteration steps ahead. The CLI creates the sandbox with the default policy, injects the NVIDIA credentials, and starts OpenCode.
@@ -53,13 +53,13 @@ Try using OpenCode inside the sandbox. You will find that calls to NVIDIA infere
 Open a second terminal and check the logs:
 
 ```console
-$ nemoclaw logs opencode-sandbox --tail
+$ openshell logs opencode-sandbox --tail
 ```
 
 Alternatively, launch the OpenShell Terminal for a live view:
 
 ```console
-$ nemoclaw term
+$ openshell term
 ```
 
 Look for lines like these:
@@ -191,7 +191,7 @@ The `filesystem_policy`, `landlock`, and `process` sections are static. They are
 Push your custom policy to the running sandbox:
 
 ```console
-$ nemoclaw policy set opencode-sandbox --policy opencode-policy.yaml --wait
+$ openshell policy set opencode-sandbox --policy opencode-policy.yaml --wait
 ```
 
 The `--wait` flag blocks until the sandbox confirms the policy is loaded.
@@ -199,7 +199,7 @@ The `--wait` flag blocks until the sandbox confirms the policy is loaded.
 Verify the policy revision was accepted:
 
 ```console
-$ nemoclaw policy list opencode-sandbox
+$ openshell policy list opencode-sandbox
 ```
 
 The latest revision should show status `loaded`.
@@ -211,7 +211,7 @@ So far, you have allowed the OpenCode *agent* to reach `integrate.api.nvidia.com
 Configure inference so `inference.local` routes to your NVIDIA provider:
 
 ```console
-$ nemoclaw inference set \
+$ openshell inference set \
   --provider nvidia \
   --model z-ai/glm5
 ```
@@ -219,7 +219,7 @@ $ nemoclaw inference set \
 Verify the active configuration:
 
 ```console
-$ nemoclaw inference get
+$ openshell inference get
 ```
 
 :::{note}
@@ -231,21 +231,21 @@ $ nemoclaw inference get
 Tail the logs again:
 
 ```console
-$ nemoclaw logs opencode-sandbox --tail
+$ openshell logs opencode-sandbox --tail
 ```
 
 You should see `action=allow` lines for the endpoints you added. Connections to `opencode.ai`, `integrate.api.nvidia.com`, and GitHub should show `action=allow`.
 
 To verify userland inference, run code inside the sandbox that targets `https://inference.local/v1`.
 
-If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `nemoclaw policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in OpenShell.
+If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `openshell policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in OpenShell.
 
 ## Clean Up
 
 When you are finished, delete the sandbox:
 
 ```console
-$ nemoclaw sandbox delete opencode-sandbox
+$ openshell sandbox delete opencode-sandbox
 ```
 
 ## Next Steps

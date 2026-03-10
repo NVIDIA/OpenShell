@@ -412,7 +412,7 @@ network_policies:
   # <generated policies go here>
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Cluster inference is configured separately through `nemoclaw cluster inference set/get`. The generated `network_policies` block is the primary output.
+The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Cluster inference is configured separately through `openshell cluster inference set/get`. The generated `network_policies` block is the primary output.
 
 If the user provides a file path, write to it. Otherwise, suggest `deploy/docker/sandbox/dev-sandbox-policy.yaml` for local development or ask where to place it.
 

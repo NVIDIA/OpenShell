@@ -132,8 +132,8 @@ def test_multiply(sandbox):
 
 ### Rust CLI E2E (`e2e/rust/`)
 
-Rust-based e2e tests that exercise the `nemoclaw` CLI binary as a subprocess.
-They live in the `nemoclaw-e2e` crate and use a shared harness for sandbox
+Rust-based e2e tests that exercise the `openshell` CLI binary as a subprocess.
+They live in the `openshell-e2e` crate and use a shared harness for sandbox
 lifecycle management, output parsing, and cleanup.
 
 Tests:
@@ -158,7 +158,7 @@ The harness (`e2e/rust/src/harness/`) provides:
 
 | Module | Purpose |
 |---|---|
-| `binary` | Builds and resolves the `nemoclaw` binary from the workspace |
+| `binary` | Builds and resolves the `openshell` binary from the workspace |
 | `sandbox` | `SandboxGuard` RAII type — creates sandboxes and deletes them on drop |
 | `output` | ANSI stripping and field extraction from CLI output |
 | `port` | `wait_for_port()` and `find_free_port()` for TCP testing |
@@ -167,4 +167,4 @@ The harness (`e2e/rust/src/harness/`) provides:
 
 | Variable | Purpose |
 |---|---|
-| `NEMOCLAW_CLUSTER` | Override active cluster name for E2E tests |
+| `OPENSHELL_CLUSTER` | Override active cluster name for E2E tests |

@@ -7,7 +7,7 @@ Run with:
     python app.py
 
 Endpoints:
-    GET /hello         -> {"message": "hello from NemoClaw sandbox!"}
+    GET /hello         -> {"message": "hello from OpenShell sandbox!"}
     GET /hello/<name>  -> {"message": "hello, <name>!"}
     GET /health        -> {"status": "ok"}
 """
@@ -23,7 +23,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._json(200, {"status": "ok"})
         elif self.path == "/hello":
-            self._json(200, {"message": "hello from NemoClaw sandbox!"})
+            self._json(200, {"message": "hello from OpenShell sandbox!"})
         elif self.path.startswith("/hello/"):
             name = self.path[len("/hello/") :]
             self._json(200, {"message": f"hello, {name}!"})

@@ -3,7 +3,7 @@ title:
   page: "Architecture Reference"
   nav: "Architecture"
 description: "Detailed reference for OpenShell architecture: gateway, sandbox internals, policy engine, privacy router, and remote deployment."
-keywords: ["nemoclaw architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
+keywords: ["openshell architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "security", "architecture"]
 content:
@@ -58,7 +58,7 @@ graph TB
         end
     end
 
-    cli["nemoclaw CLI"] -- "gRPC" --> gw
+    cli["openshell CLI"] -- "gRPC" --> gw
     agent1 -- "all outbound<br/>traffic" --> proxy1
     agent2 -- "all outbound<br/>traffic" --> proxy2
     proxy1 -- "policy-approved<br/>traffic" --> internet["External Services"]
@@ -170,22 +170,22 @@ inference, the privacy router:
 6. Forwards the request to the route's backend URL.
 
 The router refreshes its route list periodically from the gateway, so routes
-created with `nemoclaw inference create` become available without restarting
+created with `openshell inference create` become available without restarting
 sandboxes.
 
 ## Remote Deployment
 
-NemoClaw can deploy the cluster to a remote host via SSH. This is useful for
+OpenShell can deploy the cluster to a remote host via SSH. This is useful for
 shared team environments or running sandboxes on machines with more resources.
 
 ### Deploy
 
 ```console
-$ nemoclaw gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
+$ openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa
 ```
 
 The CLI connects to the remote machine over SSH, installs k3s, deploys the
-NemoClaw control plane, and registers the cluster locally. The remote machine
+OpenShell control plane, and registers the cluster locally. The remote machine
 needs Docker installed.
 
 ### Tunnel
@@ -193,7 +193,7 @@ needs Docker installed.
 After deploying to a remote host, set up a tunnel for CLI access:
 
 ```console
-$ nemoclaw gateway tunnel
+$ openshell gateway tunnel
 ```
 
 This establishes an SSH tunnel from your local machine to the remote cluster's

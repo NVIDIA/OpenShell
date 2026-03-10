@@ -6,9 +6,9 @@ requires = ["maturin>=1.5,<2.0"]
 build-backend = "maturin"
 
 [project]
-name = "nemoclaw"
+name = "openshell"
 dynamic = ["version"]
-description = "NemoClaw is the runtime environment for autonomous agents"
+description = "OpenShell is the runtime environment for autonomous agents"
 license = "Apache-2.0"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -52,7 +52,7 @@ docs = [
 # Don't try to install the root package with uv sync - use uv pip install . instead
 # This is needed because maturin bin packages don't install the binary with editable installs
 # (both `uv pip install -e .` and `maturin develop` skip binary installation)
-# Use `uv pip install .` (without -e) to install the nemoclaw CLI binary
+# Use `uv pip install .` (without -e) to install the openshell CLI binary
 package = false
 
 [tool.maturin]

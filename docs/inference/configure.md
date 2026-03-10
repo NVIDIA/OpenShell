@@ -21,7 +21,7 @@ That configuration consists of two values:
 Create a provider that holds the backend credentials you want OpenShell to use.
 
 ```console
-$ nemoclaw provider create --name nvidia-prod --type nvidia --from-existing
+$ openshell provider create --name nvidia-prod --type nvidia --from-existing
 ```
 
 You can also use `openai` or `anthropic` providers.
@@ -31,7 +31,7 @@ You can also use `openai` or `anthropic` providers.
 Point `inference.local` at that provider and choose the model to use:
 
 ```console
-$ nemoclaw inference set \
+$ openshell inference set \
     --provider nvidia-prod \
     --model nvidia/nemotron-3-nano-30b-a3b
 ```
@@ -41,7 +41,7 @@ This sets the managed inference configuration.
 ## Step 3: Verify the Active Config
 
 ```console
-$ nemoclaw inference get
+$ openshell inference get
 provider: nvidia-prod
 model:    nvidia/nemotron-3-nano-30b-a3b
 version:  1
@@ -52,13 +52,13 @@ version:  1
 Use `update` when you want to change only one field:
 
 ```console
-$ nemoclaw inference update --model nvidia/nemotron-3-nano-30b-a3b
+$ openshell inference update --model nvidia/nemotron-3-nano-30b-a3b
 ```
 
 Or switch providers without repeating the current model manually:
 
 ```console
-$ nemoclaw inference update --provider openai-prod
+$ openshell inference update --provider openai-prod
 ```
 
 ## Use It from a Sandbox
@@ -96,5 +96,5 @@ security reasons. External providers that should be reached directly belong in
 - [Network policy evaluation](/safety-and-privacy/policies.md#network-policy-evaluation):
   configure direct access to external inference endpoints.
 - {doc}`../sandboxes/providers`: create and manage provider records.
-- {doc}`../reference/cli`: see the CLI reference for `nemoclaw inference`
+- {doc}`../reference/cli`: see the CLI reference for `openshell inference`
   commands.

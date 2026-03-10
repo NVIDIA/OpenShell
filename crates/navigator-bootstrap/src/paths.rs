@@ -16,21 +16,21 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
 
 /// Path to the file that stores the active cluster name.
 ///
-/// Location: `$XDG_CONFIG_HOME/nemoclaw/active_cluster`
+/// Location: `$XDG_CONFIG_HOME/openshell/active_cluster`
 pub fn active_cluster_path() -> Result<PathBuf> {
-    Ok(xdg_config_dir()?.join("nemoclaw").join("active_cluster"))
+    Ok(xdg_config_dir()?.join("openshell").join("active_cluster"))
 }
 
 /// Base directory for all cluster metadata files.
 ///
-/// Location: `$XDG_CONFIG_HOME/nemoclaw/clusters/`
+/// Location: `$XDG_CONFIG_HOME/openshell/clusters/`
 pub fn clusters_dir() -> Result<PathBuf> {
-    Ok(xdg_config_dir()?.join("nemoclaw").join("clusters"))
+    Ok(xdg_config_dir()?.join("openshell").join("clusters"))
 }
 
 /// Path to the file that stores the last-used sandbox name for a cluster.
 ///
-/// Location: `$XDG_CONFIG_HOME/nemoclaw/clusters/<cluster>/last_sandbox`
+/// Location: `$XDG_CONFIG_HOME/openshell/clusters/<cluster>/last_sandbox`
 pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
     Ok(clusters_dir()?.join(cluster).join("last_sandbox"))
 }
@@ -52,7 +52,7 @@ mod tests {
         }
         let path = last_sandbox_path("my-cluster").unwrap();
         assert!(
-            path.ends_with("nemoclaw/clusters/my-cluster/last_sandbox"),
+            path.ends_with("openshell/clusters/my-cluster/last_sandbox"),
             "unexpected path: {path:?}"
         );
         unsafe {

@@ -4,6 +4,6 @@
 # Helm chart tasks
 
 ["helm:lint"]
-description = "Lint the nemoclaw helm chart"
+description = "Lint the openshell helm chart"
 run = "helm lint deploy/helm/navigator"
 hide = true

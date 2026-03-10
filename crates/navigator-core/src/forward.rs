@@ -24,7 +24,7 @@ pub fn forward_pid_dir() -> Result<PathBuf> {
             .wrap_err("HOME is not set")?;
         PathBuf::from(home).join(".config")
     };
-    Ok(base.join("nemoclaw").join("forwards"))
+    Ok(base.join("openshell").join("forwards"))
 }
 
 /// PID file path for a specific sandbox + port forward.

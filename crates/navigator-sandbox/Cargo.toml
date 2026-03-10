@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-sandbox"
-description = "NemoClaw process sandbox and monitor"
+description = "OpenShell process sandbox and monitor"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

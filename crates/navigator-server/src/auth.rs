@@ -130,7 +130,7 @@ fn render_connect_page(
 <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>NemoClaw — Connect to Gateway</title>
+    <title>OpenShell — Connect to Gateway</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -247,7 +247,7 @@ fn render_connect_page(
 </head>
 <body>
     <div class="card">
-        <div class="logo">NemoClaw</div>
+        <div class="logo">OpenShell</div>
         <div class="subtitle">Connect to Gateway</div>
         <div class="code-box">
             <div class="code-label">Confirmation Code</div>
@@ -268,7 +268,7 @@ fn render_connect_page(
             Connect to Gateway
         </button>
         <div class="hint">
-            This will authorize the NemoClaw CLI to connect to this gateway.
+            This will authorize the OpenShell CLI to connect to this gateway.
         </div>
         <div class="status" id="status"></div>
     </div>
@@ -306,7 +306,7 @@ fn render_connect_page(
                 btn.disabled = false;
                 btn.textContent = 'Connect to Gateway';
                 status.className = 'status status-err';
-                status.textContent = 'Could not reach the CLI. Is nemoclaw still running?';
+                status.textContent = 'Could not reach the CLI. Is openshell still running?';
             }});
         }}
     </script>
@@ -353,7 +353,7 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <meta http-equiv="refresh" content="2;url=/auth/connect?callback_port={callback_port}&amp;code={safe_code}">
-    <title>NemoClaw — Authenticating</title>
+    <title>OpenShell — Authenticating</title>
     <style>
         * {{ margin: 0; padding: 0; box-sizing: border-box; }}
         body {{
@@ -402,7 +402,7 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
 </head>
 <body>
     <div class="card">
-        <div class="logo">NemoClaw</div>
+        <div class="logo">OpenShell</div>
         <div class="spinner"></div>
         <div class="message">Authenticating...</div>
     </div>
@@ -452,7 +452,7 @@ mod tests {
         assert!(html.contains("test-jwt-token"));
         assert!(html.contains("12345"));
         assert!(html.contains("gateway.example.com:8080"));
-        assert!(html.contains("NemoClaw"));
+        assert!(html.contains("OpenShell"));
         assert!(html.contains("ABC-1234"));
         // Should use fetch(), not window.location.href
         assert!(html.contains("fetch("));
