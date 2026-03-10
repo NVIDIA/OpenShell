@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Generic Docker image builder for NemoClaw components.
+# Generic Docker image builder for OpenShell components.
 # Usage: docker-build-component.sh <component> [variant] [extra docker build args...]
 #
 # Components with a subdirectory layout (e.g. deploy/docker/sandbox/) support
@@ -128,6 +128,9 @@ fi
 OUTPUT_FLAG="--load"
 if [[ "${DOCKER_PUSH:-}" == "1" ]]; then
   OUTPUT_FLAG="--push"
+elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
+  # Multi-platform builds cannot use --load; push is required.
+  OUTPUT_FLAG="--push"
 fi
 
 SCCACHE_ARGS=()
@@ -136,11 +139,11 @@ if [[ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]]; then
 fi
 
 VERSION_ARGS=()
-if [[ -n "${NEMOCLAW_CARGO_VERSION:-}" ]]; then
-  VERSION_ARGS=(--build-arg "NEMOCLAW_CARGO_VERSION=${NEMOCLAW_CARGO_VERSION}")
+if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
+  VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${OPENSHELL_CARGO_VERSION}")
 elif [[ "${COMPONENT}" == "server" ]]; then
   CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-  VERSION_ARGS=(--build-arg "NEMOCLAW_CARGO_VERSION=${CARGO_VERSION}")
+  VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}")
 fi
 
 LOCK_HASH=$(sha256_16 Cargo.lock)

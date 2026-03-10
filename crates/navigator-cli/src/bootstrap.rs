@@ -16,7 +16,7 @@ use std::io::IsTerminal;
 use crate::run::{deploy_cluster_with_panel, print_deploy_summary};
 
 /// Default cluster name used during auto-bootstrap.
-const DEFAULT_CLUSTER_NAME: &str = "nemoclaw";
+const DEFAULT_CLUSTER_NAME: &str = "openshell";
 
 /// Determines if a gRPC connection error indicates the cluster is unreachable
 /// and bootstrap should be offered.
@@ -110,7 +110,7 @@ pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
     if !std::io::stdin().is_terminal() {
         return Err(miette::miette!(
             "Gateway not reachable and bootstrap requires confirmation from an interactive terminal.\n\
-              Pass --bootstrap to auto-confirm, or run 'nemoclaw gateway start' first."
+              Pass --bootstrap to auto-confirm, or run 'openshell gateway start' first."
         ));
     }
 
@@ -141,6 +141,14 @@ pub async fn run_bootstrap(
             remote_opts = remote_opts.with_ssh_key(key);
         }
         options = options.with_remote(remote_opts);
+    }
+    // Read registry token from environment for the auto-bootstrap path.
+    // The explicit `--registry-token` flag is only on `cluster admin deploy`;
+    // when bootstrapping via `sandbox create`, the env var is the mechanism.
+    if let Ok(token) = std::env::var("NEMOCLAW_REGISTRY_TOKEN")
+        && !token.trim().is_empty()
+    {
+        options = options.with_registry_token(token);
     }
 
     let handle = deploy_cluster_with_panel(options, DEFAULT_CLUSTER_NAME, location).await?;
@@ -205,7 +213,7 @@ mod tests {
     #[test]
     fn missing_default_tls_files_triggers_bootstrap() {
         let err = report(
-            "failed to read TLS CA from /home/user/.config/nemoclaw/clusters/nemoclaw/mtls/ca.crt: No such file or directory",
+            "failed to read TLS CA from /home/user/.config/openshell/clusters/openshell/mtls/ca.crt: No such file or directory",
         );
         assert!(should_attempt_bootstrap(&err, &TlsOptions::default()));
     }

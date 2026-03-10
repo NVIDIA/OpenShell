@@ -106,7 +106,7 @@ flowchart TD
 
 9. **Child process spawning** (`ProcessHandle::spawn()`):
    - Build `tokio::process::Command` with inherited stdio and `kill_on_drop(true)`
-   - Set environment variables: `NEMOCLAW_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
+   - Set environment variables: `OPENSHELL_SANDBOX=1`, provider credentials, proxy URLs, TLS trust store paths
    - Pre-exec closure (async-signal-safe): `setpgid` (if non-interactive) -> `setns` (enter netns) -> `drop_privileges` -> `sandbox::apply` (Landlock + seccomp)
 
 10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
@@ -176,8 +176,8 @@ flowchart LR
         D --> E[SandboxPolicy]
     end
     subgraph "gRPC mode (production)"
-        F[NEMOCLAW_SANDBOX_ID] --> H[grpc_client::fetch_policy]
-        G[NEMOCLAW_ENDPOINT] --> H
+        F[OPENSHELL_SANDBOX_ID] --> H[grpc_client::fetch_policy]
+        G[OPENSHELL_ENDPOINT] --> H
         H --> I[ProtoSandboxPolicy]
         I --> J[OpaEngine::from_proto]
         I --> K[SandboxPolicy::try_from]
@@ -319,7 +319,7 @@ sequenceDiagram
     GW-->>PL: policy + version + hash
     PL->>PL: Store initial version
 
-    loop Every NEMOCLAW_POLICY_POLL_INTERVAL_SECS (default 30)
+    loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 30)
         PL->>GW: GetSandboxPolicy(sandbox_id)
         GW-->>PL: policy + version + hash
         alt version > current_version
@@ -696,7 +696,7 @@ The sandbox is designed to operate both as part of a cluster and as a standalone
 
 #### Route sources (priority order)
 
-1. **Route file (standalone mode)**: `--inference-routes` / `NEMOCLAW_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
+1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
 
 2. **Cluster bundle (cluster mode)**: When `navigator_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `navigator_core::inference::auth_for_provider_type()`.
 
@@ -925,7 +925,7 @@ Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are c
 Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegate to `spawn_impl()`.
 
 **Environment setup** (both Linux and non-Linux):
-- `NEMOCLAW_SANDBOX=1` (always set)
+- `OPENSHELL_SANDBOX=1` (always set)
 - Provider credentials (from `GetSandboxProviderEnvironment` RPC)
 - Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
@@ -1002,7 +1002,7 @@ The `SshHandler` implements `russh::server::Handler`:
 `spawn_pty_shell()`:
 1. `openpty()` to create a master/slave PTY pair
 2. Build `std::process::Command` (not tokio) with slave FDs for stdin/stdout/stderr
-3. Set environment: `NEMOCLAW_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM={negotiated}`, proxy URLs, TLS trust store paths, provider credentials
+3. Set environment: `OPENSHELL_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM={negotiated}`, proxy URLs, TLS trust store paths, provider credentials
 4. Install pre-exec closure (via `unsafe_pty::install_pre_exec()`):
    - `setsid()` to create a new session
    - `TIOCSCTTY` ioctl to set the controlling terminal
@@ -1035,24 +1035,24 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 
 | Variable | CLI flag | Default | Purpose |
 |----------|----------|---------|---------|
-| `NEMOCLAW_SANDBOX_COMMAND` | (trailing args) | `/bin/bash` | Command to execute inside sandbox |
-| `NEMOCLAW_SANDBOX_ID` | `--sandbox-id` | | Sandbox ID for gRPC policy fetch |
-| `NEMOCLAW_ENDPOINT` | `--navigator-endpoint` | | Gateway gRPC endpoint |
-| `NEMOCLAW_POLICY_RULES` | `--policy-rules` | | Path to Rego policy file |
-| `NEMOCLAW_POLICY_DATA` | `--policy-data` | | Path to YAML data file |
-| `NEMOCLAW_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
-| `NEMOCLAW_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
-| `NEMOCLAW_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
-| `NEMOCLAW_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
-| `NEMOCLAW_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
-| `NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
-| `NEMOCLAW_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
+| `OPENSHELL_SANDBOX_COMMAND` | (trailing args) | `/bin/bash` | Command to execute inside sandbox |
+| `OPENSHELL_SANDBOX_ID` | `--sandbox-id` | | Sandbox ID for gRPC policy fetch |
+| `OPENSHELL_ENDPOINT` | `--navigator-endpoint` | | Gateway gRPC endpoint |
+| `OPENSHELL_POLICY_RULES` | `--policy-rules` | | Path to Rego policy file |
+| `OPENSHELL_POLICY_DATA` | `--policy-data` | | Path to YAML data file |
+| `OPENSHELL_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
+| `OPENSHELL_POLICY_POLL_INTERVAL_SECS` | | `30` | Poll interval for gRPC policy updates (seconds). Only active in gRPC mode. |
+| `OPENSHELL_LOG_PUSH_LEVEL` | | `info` | Maximum tracing level for log push to gateway. Events above this level are not streamed. Only active in gRPC mode. |
+| `OPENSHELL_SSH_LISTEN_ADDR` | `--ssh-listen-addr` | | SSH server bind address |
+| `OPENSHELL_SSH_HANDSHAKE_SECRET` | `--ssh-handshake-secret` | | HMAC secret for SSH handshake |
+| `OPENSHELL_SSH_HANDSHAKE_SKEW_SECS` | `--ssh-handshake-skew-secs` | `300` | Allowed clock skew for handshake |
+| `OPENSHELL_INFERENCE_ROUTES` | `--inference-routes` | | Path to YAML inference routes file for standalone routing |
 
 ### Injected into child process
 
 | Variable | Purpose |
 |----------|---------|
-| `NEMOCLAW_SANDBOX` | Always `"1"` -- signals the process is sandboxed |
+| `OPENSHELL_SANDBOX` | Always `"1"` -- signals the process is sandboxed |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | Proxy URL (uppercase, for curl/wget) |
 | `http_proxy` / `https_proxy` / `grpc_proxy` | Proxy URL (lowercase, for gRPC C-core) |
 | `NODE_EXTRA_CA_CERTS` | Path to sandbox CA cert PEM (Node.js, additive) |
@@ -1171,7 +1171,7 @@ pub struct LogPushLayer {
 ```
 
 Key behaviors:
-- **Level filtering**: Defaults to `INFO`. Configurable via the `NEMOCLAW_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
+- **Level filtering**: Defaults to `INFO`. Configurable via the `OPENSHELL_LOG_PUSH_LEVEL` environment variable (accepts `trace`, `debug`, `info`, `warn`, `error`). Events above the configured level are silently discarded.
 - **Best-effort delivery**: Uses `try_send()` on the mpsc channel. If the channel is full (1024 lines buffered), the event is dropped. Logging never blocks the sandbox supervisor.
 - **Structured fields**: Implements a `LogVisitor` that collects all tracing key-value fields (e.g., `dst_host`, `action`, `policy`) into a `HashMap<String, String>`. The `message` field is extracted separately; all other fields go into `SandboxLogLine.fields`.
 - **Source tagging**: Sets `source: "sandbox"` on every log line at construction time.
@@ -1186,7 +1186,7 @@ The log push layer is set up in `main()` before calling `run_sandbox()`, only in
 2. `LogPushLayer::new(sandbox_id, tx)` wraps the sender in a tracing layer.
 3. The layer is added to the `tracing_subscriber::registry()` alongside the stdout and file layers.
 
-This means the push layer captures all tracing events the sandbox supervisor generates, filtered by `NEMOCLAW_LOG_PUSH_LEVEL` (default INFO).
+This means the push layer captures all tracing events the sandbox supervisor generates, filtered by `OPENSHELL_LOG_PUSH_LEVEL` (default INFO).
 
 ### Background push task
 
@@ -1322,7 +1322,7 @@ sequenceDiagram
     participant CL as CLI (nav logs)
 
     SB->>LP: tracing event (info!(...))
-    LP->>LP: Check level >= NEMOCLAW_LOG_PUSH_LEVEL
+    LP->>LP: Check level >= OPENSHELL_LOG_PUSH_LEVEL
     LP->>CH: try_send(SandboxLogLine)
     Note over CH: Drops if full (best-effort)
     CH->>BG: recv()
@@ -1345,7 +1345,7 @@ sequenceDiagram
 | mpsc channel full (1024 lines buffered) | `try_send()` drops the event silently; logging never blocks |
 | gRPC stream breaks mid-session | Push loop detects send error, breaks, flushes remaining batch |
 | Push batch exceeds 100 lines | Server caps at 100 lines per batch; excess lines in the batch are ignored |
-| `NEMOCLAW_LOG_PUSH_LEVEL` unparseable | Falls back to INFO |
+| `OPENSHELL_LOG_PUSH_LEVEL` unparseable | Falls back to INFO |
 
 ## Platform Support
 

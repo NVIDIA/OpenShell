@@ -56,7 +56,7 @@ async fn ssh_session_config(
 
     let exe = std::env::current_exe()
         .into_diagnostic()
-        .wrap_err("failed to resolve NemoClaw executable")?;
+        .wrap_err("failed to resolve OpenShell executable")?;
     let exe_command = shell_escape(&exe.to_string_lossy());
 
     // When using Cloudflare bearer auth, the SSH CONNECT must go through the
@@ -243,7 +243,7 @@ pub async fn sandbox_exec(
         .stderr(std::process::Stdio::inherit());
 
     // For interactive TTY sessions, replace this process with SSH via exec()
-    // to avoid signal handling issues (e.g. Ctrl+C killing the parent nemoclaw
+    // to avoid signal handling issues (e.g. Ctrl+C killing the parent openshell
     // process and orphaning the SSH child).
     if tty && std::io::stdin().is_terminal() {
         #[cfg(unix)]
@@ -582,14 +582,14 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
 ///
 /// The `ProxyCommand` uses `--cluster` so that `ssh-proxy` resolves the
 /// gateway endpoint and TLS certificates from the gateway metadata directory
-/// (`~/.config/nemoclaw/clusters/<name>/mtls/`).
+/// (`~/.config/openshell/clusters/<name>/mtls/`).
 pub fn print_ssh_config(cluster: &str, name: &str) {
-    let exe = std::env::current_exe().expect("failed to resolve NemoClaw executable");
+    let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
     let exe = shell_escape(&exe.to_string_lossy());
 
     let proxy_cmd = format!("{exe} ssh-proxy --cluster {cluster} --name {name}");
 
-    println!("Host nemoclaw-{name}");
+    println!("Host openshell-{name}");
     println!("    User sandbox");
     println!("    StrictHostKeyChecking no");
     println!("    UserKnownHostsFile /dev/null");

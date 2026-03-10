@@ -777,7 +777,7 @@ async fn route_inference_request(
         if routes.is_empty() {
             let body = serde_json::json!({
                 "error": "cluster inference is not configured",
-                "hint": "run: nemoclaw cluster inference set --help"
+                "hint": "run: openshell cluster inference set --help"
             });
             let body_bytes = body.to_string();
             let response = format_http_response(

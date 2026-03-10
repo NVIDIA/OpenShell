@@ -6,14 +6,14 @@
 //! E2E test: build a custom container image and run a sandbox with it.
 //!
 //! Prerequisites:
-//! - A running nemoclaw gateway (`nemoclaw gateway start`)
+//! - A running openshell gateway (`openshell gateway start`)
 //! - Docker daemon running (for image build)
-//! - The `nemoclaw` binary (built automatically from the workspace)
+//! - The `openshell` binary (built automatically from the workspace)
 
 use std::io::Write;
 
-use nemoclaw_e2e::harness::output::strip_ansi;
-use nemoclaw_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::output::strip_ansi;
+use openshell_e2e::harness::sandbox::SandboxGuard;
 
 const DOCKERFILE_CONTENT: &str = r#"FROM python:3.12-slim
 

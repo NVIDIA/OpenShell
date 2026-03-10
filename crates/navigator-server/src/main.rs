@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! NemoClaw Server - gRPC/HTTP server with protocol multiplexing.
+//! OpenShell Server - gRPC/HTTP server with protocol multiplexing.
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -12,90 +12,90 @@ use tracing_subscriber::EnvFilter;
 
 use navigator_server::{run_server, tracing_bus::TracingLogBus};
 
-/// NemoClaw Server - gRPC and HTTP server with protocol multiplexing.
+/// OpenShell Server - gRPC and HTTP server with protocol multiplexing.
 #[derive(Parser, Debug)]
 #[command(name = "navigator-server")]
-#[command(about = "NemoClaw gRPC/HTTP server", long_about = None)]
+#[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
     /// Port to bind the server to (all interfaces).
-    #[arg(long, default_value_t = 8080, env = "NEMOCLAW_SERVER_PORT")]
+    #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
     port: u16,
 
     /// Log level (trace, debug, info, warn, error).
-    #[arg(long, default_value = "info", env = "NEMOCLAW_LOG_LEVEL")]
+    #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
     log_level: String,
 
     /// Path to TLS certificate file (required unless --disable-tls).
-    #[arg(long, env = "NEMOCLAW_TLS_CERT")]
+    #[arg(long, env = "OPENSHELL_TLS_CERT")]
     tls_cert: Option<PathBuf>,
 
     /// Path to TLS private key file (required unless --disable-tls).
-    #[arg(long, env = "NEMOCLAW_TLS_KEY")]
+    #[arg(long, env = "OPENSHELL_TLS_KEY")]
     tls_key: Option<PathBuf>,
 
     /// Path to CA certificate for client certificate verification (mTLS).
-    #[arg(long, env = "NEMOCLAW_TLS_CLIENT_CA")]
+    #[arg(long, env = "OPENSHELL_TLS_CLIENT_CA")]
     tls_client_ca: Option<PathBuf>,
 
     /// Database URL for persistence.
-    #[arg(long, env = "NEMOCLAW_DB_URL", required = true)]
+    #[arg(long, env = "OPENSHELL_DB_URL", required = true)]
     db_url: String,
 
     /// Kubernetes namespace for sandboxes.
-    #[arg(long, env = "NEMOCLAW_SANDBOX_NAMESPACE", default_value = "default")]
+    #[arg(long, env = "OPENSHELL_SANDBOX_NAMESPACE", default_value = "default")]
     sandbox_namespace: String,
 
     /// Default container image for sandboxes.
-    #[arg(long, env = "NEMOCLAW_SANDBOX_IMAGE")]
+    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
-    /// gRPC endpoint for sandboxes to callback to NemoClaw.
+    /// gRPC endpoint for sandboxes to callback to OpenShell.
     /// This should be reachable from within the Kubernetes cluster.
-    #[arg(long, env = "NEMOCLAW_GRPC_ENDPOINT")]
+    #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
 
     /// Public host for the SSH gateway.
-    #[arg(long, env = "NEMOCLAW_SSH_GATEWAY_HOST", default_value = "127.0.0.1")]
+    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_HOST", default_value = "127.0.0.1")]
     ssh_gateway_host: String,
 
     /// Public port for the SSH gateway.
-    #[arg(long, env = "NEMOCLAW_SSH_GATEWAY_PORT", default_value_t = 8080)]
+    #[arg(long, env = "OPENSHELL_SSH_GATEWAY_PORT", default_value_t = 8080)]
     ssh_gateway_port: u16,
 
     /// HTTP path for SSH CONNECT/upgrade.
     #[arg(
         long,
-        env = "NEMOCLAW_SSH_CONNECT_PATH",
+        env = "OPENSHELL_SSH_CONNECT_PATH",
         default_value = "/connect/ssh"
     )]
     ssh_connect_path: String,
 
     /// SSH port inside sandbox pods.
-    #[arg(long, env = "NEMOCLAW_SANDBOX_SSH_PORT", default_value_t = 2222)]
+    #[arg(long, env = "OPENSHELL_SANDBOX_SSH_PORT", default_value_t = 2222)]
     sandbox_ssh_port: u16,
 
     /// Shared secret for gateway-to-sandbox SSH handshake.
-    #[arg(long, env = "NEMOCLAW_SSH_HANDSHAKE_SECRET")]
+    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SECRET")]
     ssh_handshake_secret: Option<String>,
 
     /// Allowed clock skew in seconds for SSH handshake.
-    #[arg(long, env = "NEMOCLAW_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
+    #[arg(long, env = "OPENSHELL_SSH_HANDSHAKE_SKEW_SECS", default_value_t = 300)]
     ssh_handshake_skew_secs: u64,
 
     /// Kubernetes secret name containing client TLS materials for sandbox pods.
-    #[arg(long, env = "NEMOCLAW_CLIENT_TLS_SECRET_NAME")]
+    #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
 
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
-    #[arg(long, env = "NEMOCLAW_DISABLE_TLS")]
+    #[arg(long, env = "OPENSHELL_DISABLE_TLS")]
     disable_tls: bool,
 
     /// Disable gateway authentication (mTLS client certificate requirement).
     /// When set, the TLS handshake accepts connections without a client
     /// certificate. Ignored when --disable-tls is set.
-    #[arg(long, env = "NEMOCLAW_DISABLE_GATEWAY_AUTH")]
+    #[arg(long, env = "OPENSHELL_DISABLE_GATEWAY_AUTH")]
     disable_gateway_auth: bool,
 }
 
@@ -175,7 +175,7 @@ async fn main() -> Result<()> {
         info!("Gateway auth disabled — accepting connections without client certificates");
     }
 
-    info!(bind = %config.bind_address, "Starting NemoClaw server");
+    info!(bind = %config.bind_address, "Starting OpenShell server");
 
     run_server(config, tracing_log_bus).await.into_diagnostic()
 }

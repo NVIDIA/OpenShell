@@ -1,26 +1,26 @@
 # Syncing Files To and From a Sandbox
 
-Move code, data, and artifacts between your local machine and a NemoClaw
-sandbox using `nemoclaw sandbox upload` and `nemoclaw sandbox download`.
+Move code, data, and artifacts between your local machine and a OpenShell
+sandbox using `openshell sandbox upload` and `openshell sandbox download`.
 
 ## Push local files into a sandbox
 
 Upload your current project directory into `/sandbox` on the sandbox:
 
 ```bash
-nemoclaw sandbox upload my-sandbox .
+openshell sandbox upload my-sandbox .
 ```
 
 Push a specific directory to a custom destination:
 
 ```bash
-nemoclaw sandbox upload my-sandbox ./src /sandbox/src
+openshell sandbox upload my-sandbox ./src /sandbox/src
 ```
 
 Push a single file:
 
 ```bash
-nemoclaw sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
+openshell sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
 ```
 
 ## Pull files from a sandbox
@@ -28,13 +28,13 @@ nemoclaw sandbox upload my-sandbox ./config.yaml /sandbox/config.yaml
 Download sandbox output to your local machine:
 
 ```bash
-nemoclaw sandbox download my-sandbox /sandbox/output ./output
+openshell sandbox download my-sandbox /sandbox/output ./output
 ```
 
 Pull results to the current directory:
 
 ```bash
-nemoclaw sandbox download my-sandbox /sandbox/results
+openshell sandbox download my-sandbox /sandbox/results
 ```
 
 ## Sync on create
@@ -42,7 +42,7 @@ nemoclaw sandbox download my-sandbox /sandbox/results
 Push all git-tracked files into a new sandbox automatically:
 
 ```bash
-nemoclaw sandbox create --sync -- python main.py
+openshell sandbox create --sync -- python main.py
 ```
 
 This collects tracked and untracked (non-ignored) files via
@@ -52,17 +52,17 @@ This collects tracked and untracked (non-ignored) files via
 
 ```bash
 # Create a sandbox and sync your repo
-nemoclaw sandbox create --name dev --sync --keep
+openshell sandbox create --name dev --sync --keep
 
 # Make local changes, then push them
-nemoclaw sandbox upload dev ./src /sandbox/src
+openshell sandbox upload dev ./src /sandbox/src
 
 # Run tests inside the sandbox
-nemoclaw sandbox connect dev
+openshell sandbox connect dev
 # (inside sandbox) pytest
 
 # Pull test artifacts back
-nemoclaw sandbox download dev /sandbox/coverage ./coverage
+openshell sandbox download dev /sandbox/coverage ./coverage
 ```
 
 ## How it works

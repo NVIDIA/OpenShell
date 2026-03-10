@@ -1,29 +1,29 @@
-# NemoClaw CLI Reference
+# OpenShell CLI Reference
 
-Quick-reference for the `nemoclaw` command-line interface. For workflow guidance, see [SKILL.md](SKILL.md).
+Quick-reference for the `openshell` command-line interface. For workflow guidance, see [SKILL.md](SKILL.md).
 
-> **Self-teaching**: If a command or flag is not listed here, use `nemoclaw <command> --help` to discover it. The CLI has comprehensive built-in help at every level.
+> **Self-teaching**: If a command or flag is not listed here, use `openshell <command> --help` to discover it. The CLI has comprehensive built-in help at every level.
 
 ## Global Options
 
 | Flag | Description |
 |------|-------------|
 | `-v`, `--verbose` | Increase verbosity (`-v` = info, `-vv` = debug, `-vvv` = trace) |
-| `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `NEMOCLAW_CLUSTER` env var. Falls back to active gateway in `~/.config/nemoclaw/active_cluster`. |
+| `-g`, `--gateway <NAME>` | Gateway to operate on. Also settable via `OPENSHELL_CLUSTER` env var. Falls back to active gateway in `~/.config/openshell/active_cluster`. |
 
 ## Environment Variables
 
 | Variable | Description |
 |----------|-------------|
-| `NEMOCLAW_CLUSTER` | Override active gateway name (same as `--gateway`) |
-| `NEMOCLAW_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
+| `OPENSHELL_CLUSTER` | Override active gateway name (same as `--gateway`) |
+| `OPENSHELL_SANDBOX_POLICY` | Path to default sandbox policy YAML (fallback when `--policy` is not provided) |
 
 ---
 
 ## Complete Command Tree
 
 ```
-nemoclaw
+openshell
 ├── gateway
 │   ├── start [opts]
 │   ├── stop [opts]
@@ -71,13 +71,13 @@ nemoclaw
 
 ## Gateway Commands
 
-### `nemoclaw gateway start`
+### `openshell gateway start`
 
 Provision or start a cluster (local or remote).
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--name <NAME>` | `nemoclaw` | Cluster name |
+| `--name <NAME>` | `openshell` | Cluster name |
 | `--remote <USER@HOST>` | none | SSH destination for remote deployment |
 | `--ssh-key <PATH>` | none | SSH private key for remote deployment |
 | `--port <PORT>` | 8080 | Host port mapped to gateway |
@@ -87,7 +87,7 @@ Provision or start a cluster (local or remote).
 | `--get-kubeconfig` | false | Print kubeconfig to stdout |
 | `--recreate` | false | Destroy and recreate from scratch if a gateway already exists (skips interactive prompt) |
 
-### `nemoclaw gateway stop`
+### `openshell gateway stop`
 
 Stop a cluster (preserves state for later restart).
 
@@ -97,11 +97,11 @@ Stop a cluster (preserves state for later restart).
 | `--remote <USER@HOST>` | SSH destination |
 | `--ssh-key <PATH>` | SSH private key |
 
-### `nemoclaw gateway destroy`
+### `openshell gateway destroy`
 
 Destroy a cluster and all its state. Same flags as `stop`.
 
-### `nemoclaw gateway info`
+### `openshell gateway info`
 
 Show deployment details: endpoint, kubeconfig path, kube port, remote host.
 
@@ -109,7 +109,7 @@ Show deployment details: endpoint, kubeconfig path, kube port, remote host.
 |------|-------------|
 | `--name <NAME>` | Cluster name (defaults to active) |
 
-### `nemoclaw gateway tunnel`
+### `openshell gateway tunnel`
 
 Print or start an SSH tunnel for kubectl access to a remote cluster.
 
@@ -120,15 +120,15 @@ Print or start an SSH tunnel for kubectl access to a remote cluster.
 | `--ssh-key <PATH>` | SSH private key |
 | `--print-command` | Only print the SSH command, don't execute |
 
-### `nemoclaw gateway select [name]`
+### `openshell gateway select [name]`
 
-Set the active gateway. Writes to `~/.config/nemoclaw/active_cluster`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
+Set the active gateway. Writes to `~/.config/openshell/active_cluster`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
 
 ---
 
 ## Status Command
 
-### `nemoclaw status`
+### `openshell status`
 
 Show server connectivity and version for the active gateway.
 
@@ -136,7 +136,7 @@ Show server connectivity and version for the active gateway.
 
 ## Sandbox Commands
 
-### `nemoclaw sandbox create [OPTIONS] [-- COMMAND...]`
+### `openshell sandbox create [OPTIONS] [-- COMMAND...]`
 
 Create a sandbox, wait for readiness, then connect or execute the trailing command. Auto-bootstraps a cluster if none exists.
 
@@ -159,11 +159,11 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 | `--no-auto-providers` | Never auto-create providers; skip missing providers silently |
 | `[-- COMMAND...]` | Command to execute (defaults to interactive shell) |
 
-### `nemoclaw sandbox get <name>`
+### `openshell sandbox get <name>`
 
 Show sandbox details (id, name, namespace, phase, policy).
 
-### `nemoclaw sandbox list`
+### `openshell sandbox list`
 
 List sandboxes in a table.
 
@@ -174,15 +174,15 @@ List sandboxes in a table.
 | `--ids` | false | Print only sandbox IDs |
 | `--names` | false | Print only sandbox names |
 
-### `nemoclaw sandbox delete <NAME>...`
+### `openshell sandbox delete <NAME>...`
 
 Delete one or more sandboxes by name. Stops any background port forwards.
 
-### `nemoclaw sandbox connect <name>`
+### `openshell sandbox connect <name>`
 
 Open an interactive SSH shell to a sandbox.
 
-### `nemoclaw sandbox upload <name> <path> [dest]`
+### `openshell sandbox upload <name> <path> [dest]`
 
 Upload local files to a sandbox using tar-over-SSH.
 
@@ -192,7 +192,7 @@ Upload local files to a sandbox using tar-over-SSH.
 | `<path>` | -- | Local path to upload (required) |
 | `[dest]` | `/sandbox` | Destination path in sandbox |
 
-### `nemoclaw sandbox download <name> <path> [dest]`
+### `openshell sandbox download <name> <path> [dest]`
 
 Download files from a sandbox using tar-over-SSH.
 
@@ -202,7 +202,7 @@ Download files from a sandbox using tar-over-SSH.
 | `<path>` | -- | Sandbox path to download (required) |
 | `[dest]` | `.` | Local destination path |
 
-### `nemoclaw sandbox ssh-config <name>`
+### `openshell sandbox ssh-config <name>`
 
 Print an SSH config `Host` block for a sandbox. Useful for VS Code Remote-SSH.
 
@@ -210,7 +210,7 @@ Print an SSH config `Host` block for a sandbox. Useful for VS Code Remote-SSH.
 
 ## Port Forwarding Commands
 
-### `nemoclaw forward start <port> <name>`
+### `openshell forward start <port> <name>`
 
 Start forwarding a local port to a sandbox.
 
@@ -220,11 +220,11 @@ Start forwarding a local port to a sandbox.
 | `<name>` | Sandbox name |
 | `-d`, `--background` | Run in background |
 
-### `nemoclaw forward stop <port> <name>`
+### `openshell forward stop <port> <name>`
 
 Stop a background port forward.
 
-### `nemoclaw forward list`
+### `openshell forward list`
 
 List all active port forwards (sandbox, port, PID, status).
 
@@ -232,7 +232,7 @@ List all active port forwards (sandbox, port, PID, status).
 
 ## Logs Command
 
-### `nemoclaw logs <name>`
+### `openshell logs <name>`
 
 View sandbox logs. Supports one-shot and streaming.
 
@@ -248,7 +248,7 @@ View sandbox logs. Supports one-shot and streaming.
 
 ## Policy Commands
 
-### `nemoclaw policy set <name> --policy <PATH>`
+### `openshell policy set <name> --policy <PATH>`
 
 Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `inference`) can be changed at runtime.
 
@@ -260,7 +260,7 @@ Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `i
 
 Exit codes with `--wait`: 0 = loaded, 1 = failed, 124 = timeout.
 
-### `nemoclaw policy get <name>`
+### `openshell policy get <name>`
 
 Show current active policy for a sandbox.
 
@@ -269,7 +269,7 @@ Show current active policy for a sandbox.
 | `--rev <VERSION>` | 0 (latest) | Show a specific revision |
 | `--full` | false | Print the full policy as YAML (round-trips with `--policy` input) |
 
-### `nemoclaw policy list <name>`
+### `openshell policy list <name>`
 
 List policy revision history (version, hash, status, created, error).
 
@@ -283,7 +283,7 @@ List policy revision history (version, hash, status, created, error).
 
 Supported provider types: `claude`, `opencode`, `codex`, `generic`, `nvidia`, `gitlab`, `github`, `outlook`.
 
-### `nemoclaw provider create --name <NAME> --type <TYPE>`
+### `openshell provider create --name <NAME> --type <TYPE>`
 
 Create a provider configuration.
 
@@ -295,11 +295,11 @@ Create a provider configuration.
 | `--credential KEY[=VALUE]` | Credential pair. Bare `KEY` reads from env var. Repeatable. |
 | `--config KEY=VALUE` | Config key/value pair. Repeatable. |
 
-### `nemoclaw provider get <name>`
+### `openshell provider get <name>`
 
 Show provider details (id, name, type, credential keys, config keys).
 
-### `nemoclaw provider list`
+### `openshell provider list`
 
 List providers in a table.
 
@@ -309,11 +309,11 @@ List providers in a table.
 | `--offset <N>` | 0 | Pagination offset |
 | `--names` | false | Print only names |
 
-### `nemoclaw provider update <name> --type <TYPE>`
+### `openshell provider update <name> --type <TYPE>`
 
 Update an existing provider. Same flags as `create`.
 
-### `nemoclaw provider delete <NAME>...`
+### `openshell provider delete <NAME>...`
 
 Delete one or more providers by name.
 
@@ -321,7 +321,7 @@ Delete one or more providers by name.
 
 ## Cluster Inference Commands
 
-### `nemoclaw cluster inference set`
+### `openshell cluster inference set`
 
 Configure the managed cluster inference route used by `inference.local`. Both flags are required.
 
@@ -330,7 +330,7 @@ Configure the managed cluster inference route used by `inference.local`. Both fl
 | `--provider <NAME>` | -- | Provider record name (required) |
 | `--model <ID>` | -- | Model identifier to use for generation requests (required) |
 
-### `nemoclaw cluster inference update`
+### `openshell cluster inference update`
 
 Partially update the cluster inference configuration. Fetches the current config and applies only the provided overrides. At least one flag is required.
 
@@ -339,7 +339,7 @@ Partially update the cluster inference configuration. Fetches the current config
 | `--provider <NAME>` | unchanged | Provider record name |
 | `--model <ID>` | unchanged | Model identifier |
 
-### `nemoclaw cluster inference get`
+### `openshell cluster inference get`
 
 Show the current cluster inference configuration.
 
@@ -347,14 +347,14 @@ Show the current cluster inference configuration.
 
 ## Other Commands
 
-### `nemoclaw term`
+### `openshell term`
 
-Launch the NemoClaw interactive TUI.
+Launch the OpenShell interactive TUI.
 
-### `nemoclaw completions <shell>`
+### `openshell completions <shell>`
 
 Generate shell completion scripts. Supported shells: `bash`, `fish`, `zsh`, `powershell`.
 
-### `nemoclaw ssh-proxy`
+### `openshell ssh-proxy`
 
 SSH proxy used as a `ProxyCommand`. Not typically invoked directly.

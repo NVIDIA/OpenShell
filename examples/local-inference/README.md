@@ -1,8 +1,8 @@
 # Inference Routing Example
 
-This example demonstrates NemoClaw's inference interception and routing.
+This example demonstrates OpenShell's inference interception and routing.
 A sandbox process sends inference traffic to `inference.local`, and
-NemoClaw intercepts and reroutes it to the configured backend.
+OpenShell intercepts and reroutes it to the configured backend.
 
 ## How It Works
 
@@ -28,7 +28,7 @@ routes, multi-sandbox) or **standalone** (single sandbox, routes from a file).
 
 ### Standalone (no cluster)
 
-Run the sandbox binary directly with a route file — no NemoClaw cluster needed:
+Run the sandbox binary directly with a route file — no OpenShell cluster needed:
 
 ```bash
 # 1. Edit routes.yaml to point at your local LLM (e.g. LM Studio on :1234)
@@ -47,11 +47,11 @@ requests locally — no gRPC server or cluster required.
 
 ### With a cluster
 
-#### 1. Start a NemoClaw cluster
+#### 1. Start a OpenShell cluster
 
 ```bash
 mise run cluster
-nemoclaw status
+openshell status
 ```
 
 #### 2. Configure cluster inference
@@ -59,14 +59,14 @@ nemoclaw status
 First make sure a provider record exists for the backend you want to use:
 
 ```bash
-nemoclaw provider list
+openshell provider list
 ```
 
 Then configure the cluster-managed `inference.local` route:
 
 ```bash
 # Example: use an existing provider record
-nemoclaw cluster inference set \
+openshell cluster inference set \
   --provider openai-prod \
   --model nvidia/nemotron-3-nano-30b-a3b
 ```
@@ -74,20 +74,20 @@ nemoclaw cluster inference set \
 Verify the active config:
 
 ```bash
-nemoclaw cluster inference get
+openshell cluster inference get
 ```
 
 #### 3. Run the example inside a sandbox
 
 ```bash
-nemoclaw sandbox create \
+openshell sandbox create \
   --policy examples/inference/sandbox-policy.yaml \
   --keep \
   --name inference-demo \
   -- python examples/inference/inference.py
 ```
 
-The script targets `https://inference.local/v1` directly. NemoClaw
+The script targets `https://inference.local/v1` directly. OpenShell
 intercepts that connection and routes it to whatever backend cluster
 inference is configured to use.
 
@@ -101,7 +101,7 @@ content=NAV_OK
 #### 4. (Optional) Interactive session
 
 ```bash
-nemoclaw sandbox connect inference-demo
+openshell sandbox connect inference-demo
 # Inside the sandbox:
 python examples/inference/inference.py
 ```
@@ -109,17 +109,17 @@ python examples/inference/inference.py
 #### 5. Cleanup
 
 ```bash
-nemoclaw sandbox delete inference-demo
+openshell sandbox delete inference-demo
 ```
 
 ## Customizing Routes
 
 Edit `routes.yaml` to change which backend endpoint/model standalone mode uses.
-In cluster mode, use `nemoclaw cluster inference set` instead.
+In cluster mode, use `openshell cluster inference set` instead.
 
 ## Supported Protocols
 
-NemoClaw detects and routes the following inference API patterns:
+OpenShell detects and routes the following inference API patterns:
 
 | Pattern | Protocol | Kind |
 |---|---|---|

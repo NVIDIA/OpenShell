@@ -25,7 +25,7 @@ network_policies: { ... }
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
 
-Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw policy set` and take effect without restarting.
+Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy set` and take effect without restarting.
 
 ## Version
 

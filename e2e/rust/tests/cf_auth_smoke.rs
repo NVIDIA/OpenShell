@@ -9,22 +9,22 @@
 
 use std::process::Stdio;
 
-use nemoclaw_e2e::harness::binary::nemoclaw_cmd;
-use nemoclaw_e2e::harness::output::strip_ansi;
+use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::output::strip_ansi;
 
-/// Run `nemoclaw <args>` with an isolated (empty) config directory so it
+/// Run `openshell <args>` with an isolated (empty) config directory so it
 /// cannot discover any real gateway.  Returns (combined stdout+stderr, exit code).
 async fn run_isolated(args: &[&str]) -> (String, i32) {
     let tmpdir = tempfile::tempdir().expect("create isolated config dir");
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
-        .env_remove("NEMOCLAW_CLUSTER")
+        .env_remove("OPENSHELL_CLUSTER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn nemoclaw");
+    let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -32,18 +32,18 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
     (combined, code)
 }
 
-/// Run `nemoclaw <args>` with a given tmpdir as config (for persisting state
+/// Run `openshell <args>` with a given tmpdir as config (for persisting state
 /// across multiple commands).  Returns (combined stdout+stderr, exit code).
 async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i32) {
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir)
         .env("HOME", tmpdir)
-        .env_remove("NEMOCLAW_CLUSTER")
+        .env_remove("OPENSHELL_CLUSTER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn nemoclaw");
+    let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -55,7 +55,7 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
 // Test 8: `--plaintext` flag is recognized
 // -------------------------------------------------------------------
 
-/// `nemoclaw gateway start --help` must show `--plaintext`.
+/// `openshell gateway start --help` must show `--plaintext`.
 #[tokio::test]
 async fn gateway_start_help_shows_plaintext() {
     let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
@@ -72,7 +72,7 @@ async fn gateway_start_help_shows_plaintext() {
 // Test 9: `gateway add` and `gateway login` are recognized
 // -------------------------------------------------------------------
 
-/// `nemoclaw gateway --help` must list `add` and `login` subcommands.
+/// `openshell gateway --help` must list `add` and `login` subcommands.
 #[tokio::test]
 async fn gateway_help_shows_add_and_login() {
     let (output, code) = run_isolated(&["gateway", "--help"]).await;
@@ -89,7 +89,7 @@ async fn gateway_help_shows_add_and_login() {
     );
 }
 
-/// `nemoclaw gateway add --help` must show the endpoint arg and `--no-auth` flag.
+/// `openshell gateway add --help` must show the endpoint arg and `--no-auth` flag.
 #[tokio::test]
 async fn gateway_add_help_shows_flags() {
     let (output, code) = run_isolated(&["gateway", "add", "--help"]).await;
@@ -111,7 +111,7 @@ async fn gateway_add_help_shows_flags() {
     );
 }
 
-/// `nemoclaw gateway login --help` is recognized.
+/// `openshell gateway login --help` is recognized.
 #[tokio::test]
 async fn gateway_login_help_is_recognized() {
     let (output, code) = run_isolated(&["gateway", "login", "--help"]).await;
@@ -130,7 +130,7 @@ async fn gateway_login_help_is_recognized() {
 // Test 10: `gateway add --no-auth` creates metadata with cloudflare_jwt
 // -------------------------------------------------------------------
 
-/// `nemoclaw gateway add <endpoint> --no-auth` should:
+/// `openshell gateway add <endpoint> --no-auth` should:
 /// - Create cluster metadata with auth_mode = "cloudflare_jwt"
 /// - Set the gateway as active
 /// - Not attempt browser authentication
@@ -159,7 +159,7 @@ async fn gateway_add_creates_cf_metadata() {
     // Verify the metadata file was written.
     let metadata_path = tmpdir
         .path()
-        .join("nemoclaw")
+        .join("openshell")
         .join("clusters")
         .join("test-cf-gw_metadata.json");
     assert!(
@@ -196,7 +196,7 @@ async fn gateway_add_creates_cf_metadata() {
     // Verify the gateway was set as active.
     let active_path = tmpdir
         .path()
-        .join("nemoclaw")
+        .join("openshell")
         .join("active_cluster");
     assert!(
         active_path.exists(),
@@ -242,7 +242,7 @@ async fn gateway_add_derives_name_from_hostname() {
     // The derived name should be the hostname.
     let metadata_path = tmpdir
         .path()
-        .join("nemoclaw")
+        .join("openshell")
         .join("clusters")
         .join("my-special-gateway.brevlab.com_metadata.json");
     assert!(

@@ -9,22 +9,22 @@
 
 use std::process::Stdio;
 
-use nemoclaw_e2e::harness::binary::nemoclaw_cmd;
-use nemoclaw_e2e::harness::output::strip_ansi;
+use openshell_e2e::harness::binary::openshell_cmd;
+use openshell_e2e::harness::output::strip_ansi;
 
-/// Run `nemoclaw <args>` with an isolated (empty) config directory so it
+/// Run `openshell <args>` with an isolated (empty) config directory so it
 /// cannot discover any real gateway.
 async fn run_isolated(args: &[&str]) -> (String, i32) {
     let tmpdir = tempfile::tempdir().expect("create isolated config dir");
-    let mut cmd = nemoclaw_cmd();
+    let mut cmd = openshell_cmd();
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
-        .env_remove("NEMOCLAW_CLUSTER")
+        .env_remove("OPENSHELL_CLUSTER")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    let output = cmd.output().await.expect("spawn nemoclaw");
+    let output = cmd.output().await.expect("spawn openshell");
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
     let combined = format!("{stdout}{stderr}");
@@ -36,12 +36,12 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
 // Top-level --help shows the restructured command tree
 // -------------------------------------------------------------------
 
-/// `nemoclaw --help` must list the new top-level commands: gateway, status,
+/// `openshell --help` must list the new top-level commands: gateway, status,
 /// forward, logs, policy.
 #[tokio::test]
 async fn help_shows_restructured_commands() {
     let (output, code) = run_isolated(&["--help"]).await;
-    assert_eq!(code, 0, "nemoclaw --help should exit 0");
+    assert_eq!(code, 0, "openshell --help should exit 0");
 
     let clean = strip_ansi(&output);
     for cmd in ["gateway", "status", "sandbox", "forward", "logs", "policy"] {
@@ -52,11 +52,11 @@ async fn help_shows_restructured_commands() {
     }
 }
 
-/// `nemoclaw gateway --help` must list start, stop, destroy, select, info.
+/// `openshell gateway --help` must list start, stop, destroy, select, info.
 #[tokio::test]
 async fn gateway_help_shows_subcommands() {
     let (output, code) = run_isolated(&["gateway", "--help"]).await;
-    assert_eq!(code, 0, "nemoclaw gateway --help should exit 0");
+    assert_eq!(code, 0, "openshell gateway --help should exit 0");
 
     let clean = strip_ansi(&output);
     for sub in ["start", "stop", "destroy", "select", "info"] {
@@ -67,12 +67,12 @@ async fn gateway_help_shows_subcommands() {
     }
 }
 
-/// `nemoclaw sandbox --help` must list upload and download alongside create,
+/// `openshell sandbox --help` must list upload and download alongside create,
 /// get, list, delete, connect.
 #[tokio::test]
 async fn sandbox_help_shows_upload_download() {
     let (output, code) = run_isolated(&["sandbox", "--help"]).await;
-    assert_eq!(code, 0, "nemoclaw sandbox --help should exit 0");
+    assert_eq!(code, 0, "openshell sandbox --help should exit 0");
 
     let clean = strip_ansi(&output);
     for sub in ["upload", "download", "create", "get", "list", "delete", "connect"] {
@@ -83,12 +83,12 @@ async fn sandbox_help_shows_upload_download() {
     }
 }
 
-/// `nemoclaw sandbox create --help` must show `--upload`, `--no-git-ignore`,
+/// `openshell sandbox create --help` must show `--upload`, `--no-git-ignore`,
 /// `--bootstrap`/`--no-bootstrap`, and `--auto-providers`/`--no-auto-providers`.
 #[tokio::test]
 async fn sandbox_create_help_shows_new_flags() {
     let (output, code) = run_isolated(&["sandbox", "create", "--help"]).await;
-    assert_eq!(code, 0, "nemoclaw sandbox create --help should exit 0");
+    assert_eq!(code, 0, "openshell sandbox create --help should exit 0");
 
     let clean = strip_ansi(&output);
     for flag in [
@@ -106,11 +106,11 @@ async fn sandbox_create_help_shows_new_flags() {
     }
 }
 
-/// `nemoclaw gateway start --help` must show `--recreate`.
+/// `openshell gateway start --help` must show `--recreate`.
 #[tokio::test]
 async fn gateway_start_help_shows_recreate() {
     let (output, code) = run_isolated(&["gateway", "start", "--help"]).await;
-    assert_eq!(code, 0, "nemoclaw gateway start --help should exit 0");
+    assert_eq!(code, 0, "openshell gateway start --help should exit 0");
 
     let clean = strip_ansi(&output);
     assert!(
@@ -120,17 +120,17 @@ async fn gateway_start_help_shows_recreate() {
 }
 
 // -------------------------------------------------------------------
-// Graceful handling: `nemoclaw status` without a gateway
+// Graceful handling: `openshell status` without a gateway
 // -------------------------------------------------------------------
 
-/// `nemoclaw status` with no gateway configured should exit 0 and print a
+/// `openshell status` with no gateway configured should exit 0 and print a
 /// friendly message instead of erroring.
 #[tokio::test]
 async fn status_without_gateway_prints_friendly_message() {
     let (output, code) = run_isolated(&["status"]).await;
     assert_eq!(
         code, 0,
-        "nemoclaw status should exit 0 even without a gateway, got output:\n{output}"
+        "openshell status should exit 0 even without a gateway, got output:\n{output}"
     );
 
     let clean = strip_ansi(&output);
@@ -139,8 +139,8 @@ async fn status_without_gateway_prints_friendly_message() {
         "expected 'No gateway configured' in status output:\n{clean}"
     );
     assert!(
-        clean.contains("nemoclaw gateway start"),
-        "expected hint to run 'nemoclaw gateway start':\n{clean}"
+        clean.contains("openshell gateway start"),
+        "expected hint to run 'openshell gateway start':\n{clean}"
     );
 }
 
@@ -148,7 +148,7 @@ async fn status_without_gateway_prints_friendly_message() {
 // Hidden backwards-compat: `cluster admin deploy` is still parseable
 // -------------------------------------------------------------------
 
-/// `nemoclaw cluster admin deploy --help` should still work (hidden alias).
+/// `openshell cluster admin deploy --help` should still work (hidden alias).
 #[tokio::test]
 async fn cluster_admin_deploy_help_is_accessible() {
     let (output, code) = run_isolated(&["cluster", "admin", "deploy", "--help"]).await;

@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-tui"
-description = "NemoClaw interactive TUI"
+description = "OpenShell interactive TUI"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

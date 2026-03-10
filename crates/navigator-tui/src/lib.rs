@@ -25,9 +25,9 @@ use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity
 use app::{App, ClusterEntry, Focus, LogLine, Screen};
 use event::{Event, EventHandler};
 
-/// Launch the NemoClaw TUI.
+/// Launch the OpenShell TUI.
 ///
-/// `channel` must be a connected gRPC channel to the NemoClaw gateway.
+/// `channel` must be a connected gRPC channel to the OpenShell gateway.
 pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result<()> {
     let client = NavigatorClient::new(channel);
     let mut app = App::new(client, cluster_name.to_string(), endpoint.to_string());
@@ -189,6 +189,19 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
             Some(Event::Tick) => {
                 refresh_cluster_list(&mut app);
                 refresh_data(&mut app).await;
+
+                // Auto-refresh the policy view when a new version is detected.
+                if app.screen == Screen::Sandbox {
+                    let displayed = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
+                    let listed = app
+                        .sandbox_policy_versions
+                        .get(app.sandbox_selected)
+                        .copied()
+                        .unwrap_or(0);
+                    if listed > 0 && listed != displayed {
+                        refresh_sandbox_policy(&mut app).await;
+                    }
+                }
             }
             Some(Event::Redraw) => {
                 // Check if a buffered sandbox CreateResult is ready to finalize.
@@ -400,7 +413,7 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
         .ok()?;
     Some(
         config_dir
-            .join("nemoclaw")
+            .join("openshell")
             .join("clusters")
             .join(name)
             .join("mtls"),
@@ -634,7 +647,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
 /// Suspend the TUI, launch an interactive SSH shell to the sandbox, resume on exit.
 ///
-/// This replicates the `nemoclaw sandbox connect` flow but uses `Command::status()`
+/// This replicates the `openshell sandbox connect` flow but uses `Command::status()`
 /// instead of `exec()` so the TUI process survives.
 async fn handle_shell_connect(
     app: &mut App,
@@ -1640,6 +1653,9 @@ async fn refresh_sandboxes(app: &mut App) {
                 .map(|s| format_timestamp(s.created_at_ms))
                 .collect();
 
+            app.sandbox_policy_versions =
+                sandboxes.iter().map(|s| s.current_policy_version).collect();
+
             // Build NOTES column from active port forwards.
             let forwards = navigator_core::forward::list_forwards().unwrap_or_default();
             app.sandbox_notes = sandboxes
@@ -1650,6 +1666,43 @@ async fn refresh_sandboxes(app: &mut App) {
             if app.sandbox_selected >= app.sandbox_count && app.sandbox_count > 0 {
                 app.sandbox_selected = app.sandbox_count - 1;
             }
+        }
+    }
+}
+
+/// Re-fetch only the sandbox policy when a version change is detected.
+///
+/// Unlike `fetch_sandbox_detail()`, this skips the `GetSandbox` metadata call
+/// and preserves the current scroll position so the user isn't disrupted.
+async fn refresh_sandbox_policy(app: &mut App) {
+    let sandbox_id = match app.selected_sandbox_id() {
+        Some(id) => id.to_string(),
+        None => return,
+    };
+
+    let policy_req = navigator_core::proto::GetSandboxPolicyRequest { sandbox_id };
+
+    match tokio::time::timeout(
+        Duration::from_secs(5),
+        app.client.get_sandbox_policy(policy_req),
+    )
+    .await
+    {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            if let Some(mut policy) = inner.policy {
+                // Use the version from the policy history, not from the
+                // policy proto's own version field (which is always 1).
+                policy.version = inner.version;
+                app.policy_lines = render_policy_lines(&policy);
+                app.sandbox_policy = Some(policy);
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("failed to refresh sandbox policy: {}", e.message());
+        }
+        Err(_) => {
+            tracing::warn!("sandbox policy refresh timed out");
         }
     }
 }

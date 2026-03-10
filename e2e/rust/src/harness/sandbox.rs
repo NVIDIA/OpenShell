@@ -12,8 +12,17 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::time::timeout;
 
-use super::binary::nemoclaw_cmd;
+use super::binary::openshell_cmd;
 use super::output::{extract_field, strip_ansi};
+
+/// Extract the sandbox name from CLI create output.
+///
+/// The CLI prints `Created sandbox: <name>` (current format). Falls back to
+/// `Name: <name>` for compatibility with older output formats.
+fn extract_sandbox_name(output: &str) -> Option<String> {
+    extract_field(output, "Created sandbox")
+        .or_else(|| extract_field(output, "Name"))
+}
 
 /// Default timeout for waiting for a sandbox to become ready.
 const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
@@ -46,7 +55,7 @@ impl SandboxGuard {
     ///
     /// # Arguments
     ///
-    /// * `args` — Extra arguments to `nemoclaw sandbox create`, including
+    /// * `args` — Extra arguments to `openshell sandbox create`, including
     ///   `-- <command>` if needed.
     ///
     /// # Errors
@@ -54,7 +63,7 @@ impl SandboxGuard {
     /// Returns an error if the CLI exits with a non-zero status or the sandbox
     /// name cannot be parsed from the output.
     pub async fn create(args: &[&str]) -> Result<Self, String> {
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("create");
         for arg in args {
             cmd.arg(arg);
@@ -64,7 +73,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn nemoclaw: {e}"))?;
+            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -77,7 +86,7 @@ impl SandboxGuard {
             ));
         }
 
-        let name = extract_field(&combined, "Name").ok_or_else(|| {
+        let name = extract_sandbox_name(&combined).ok_or_else(|| {
             format!("could not parse sandbox name from create output:\n{combined}")
         })?;
 
@@ -112,7 +121,7 @@ impl SandboxGuard {
         command: &[&str],
         ready_marker: &str,
     ) -> Result<Self, String> {
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("create")
             .arg("--keep")
@@ -122,7 +131,7 @@ impl SandboxGuard {
 
         let mut child = cmd
             .spawn()
-            .map_err(|e| format!("failed to spawn nemoclaw: {e}"))?;
+            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = child.stdout.take().expect("stdout must be piped");
         let mut reader = BufReader::new(stdout).lines();
@@ -139,7 +148,7 @@ impl SandboxGuard {
 
                 // Try to extract the sandbox name from the header.
                 if name.is_none() {
-                    if let Some(n) = extract_field(&accumulated, "Name") {
+                    if let Some(n) = extract_sandbox_name(&accumulated) {
                         name = Some(n);
                     }
                 }
@@ -187,7 +196,7 @@ impl SandboxGuard {
     ///
     /// Equivalent to:
     /// ```text
-    /// nemoclaw sandbox create --upload <local>:<dest> [extra_args...] -- <command>
+    /// openshell sandbox create --upload <local>:<dest> [extra_args...] -- <command>
     /// ```
     ///
     /// The `--no-git-ignore` flag is passed to avoid needing a git repository.
@@ -203,7 +212,7 @@ impl SandboxGuard {
     ) -> Result<Self, String> {
         let upload_spec = format!("{upload_local}:{upload_dest}");
 
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("create")
             .arg("--upload")
@@ -216,7 +225,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn nemoclaw: {e}"))?;
+            .map_err(|e| format!("failed to spawn openshell: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -229,7 +238,7 @@ impl SandboxGuard {
             ));
         }
 
-        let name = extract_field(&combined, "Name").ok_or_else(|| {
+        let name = extract_sandbox_name(&combined).ok_or_else(|| {
             format!("could not parse sandbox name from create output:\n{combined}")
         })?;
 
@@ -241,7 +250,7 @@ impl SandboxGuard {
         })
     }
 
-    /// Upload local files to the sandbox via `nemoclaw sandbox upload`.
+    /// Upload local files to the sandbox via `openshell sandbox upload`.
     ///
     /// # Arguments
     ///
@@ -252,7 +261,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the upload command fails.
     pub async fn upload(&self, local_path: &str, dest: &str) -> Result<String, String> {
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("upload")
             .arg(&self.name)
@@ -264,7 +273,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn nemoclaw upload: {e}"))?;
+            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -302,7 +311,7 @@ impl SandboxGuard {
         dest: &str,
         cwd: &std::path::Path,
     ) -> Result<String, String> {
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("upload")
             .arg(&self.name)
@@ -314,7 +323,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn nemoclaw upload: {e}"))?;
+            .map_err(|e| format!("failed to spawn openshell upload: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -330,7 +339,7 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Download files from the sandbox via `nemoclaw sandbox download`.
+    /// Download files from the sandbox via `openshell sandbox download`.
     ///
     /// # Arguments
     ///
@@ -345,7 +354,7 @@ impl SandboxGuard {
         sandbox_path: &str,
         local_dest: &str,
     ) -> Result<String, String> {
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox")
             .arg("download")
             .arg(&self.name)
@@ -356,7 +365,7 @@ impl SandboxGuard {
         let output = cmd
             .output()
             .await
-            .map_err(|e| format!("failed to spawn nemoclaw download: {e}"))?;
+            .map_err(|e| format!("failed to spawn openshell download: {e}"))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -372,7 +381,7 @@ impl SandboxGuard {
         Ok(combined)
     }
 
-    /// Spawn `nemoclaw forward start` as a background process.
+    /// Spawn `openshell forward start` as a background process.
     ///
     /// Returns the child process handle. The caller is responsible for killing
     /// it (or it will be killed on drop since `kill_on_drop(true)` is set).
@@ -381,7 +390,7 @@ impl SandboxGuard {
     ///
     /// Returns an error if the process cannot be spawned.
     pub fn spawn_forward(&self, port: u16) -> Result<tokio::process::Child, String> {
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("forward")
             .arg("start")
             .arg(port.to_string())
@@ -409,7 +418,7 @@ impl SandboxGuard {
         }
 
         // Delete the sandbox.
-        let mut cmd = nemoclaw_cmd();
+        let mut cmd = openshell_cmd();
         cmd.arg("sandbox").arg("delete").arg(&self.name);
         cmd.stdout(Stdio::null()).stderr(Stdio::null());
 
@@ -438,7 +447,7 @@ impl Drop for SandboxGuard {
                     let _ = child.wait().await;
                 }
 
-                let mut cmd = nemoclaw_cmd();
+                let mut cmd = openshell_cmd();
                 cmd.arg("sandbox").arg("delete").arg(&name);
                 cmd.stdout(Stdio::null()).stderr(Stdio::null());
                 let _ = cmd.status().await;

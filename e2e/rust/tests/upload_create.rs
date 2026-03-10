@@ -10,13 +10,13 @@
 //! so the command can read the uploaded content.
 //!
 //! Prerequisites:
-//! - A running nemoclaw gateway (`nemoclaw gateway start`)
-//! - The `nemoclaw` binary (built automatically from the workspace)
+//! - A running openshell gateway (`openshell gateway start`)
+//! - The `openshell` binary (built automatically from the workspace)
 
 use std::fs;
 
-use nemoclaw_e2e::harness::output::strip_ansi;
-use nemoclaw_e2e::harness::sandbox::SandboxGuard;
+use openshell_e2e::harness::output::strip_ansi;
+use openshell_e2e::harness::sandbox::SandboxGuard;
 
 /// Create a sandbox with `--upload dir:/sandbox/data` and run a command that
 /// reads the uploaded files, verifying the content appears in stdout.

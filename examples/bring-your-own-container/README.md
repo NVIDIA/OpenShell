@@ -6,7 +6,7 @@ your local machine through port forwarding.
 
 ## Prerequisites
 
-- A running NemoClaw gateway (`nemoclaw gateway start`)
+- A running OpenShell gateway (`openshell gateway start`)
 - Docker daemon running
 
 ## What's in this example
@@ -21,7 +21,7 @@ your local machine through port forwarding.
 ### 1. Create a sandbox from the Dockerfile with port forwarding
 
 ```bash
-nemoclaw sandbox create \
+openshell sandbox create \
     --from examples/bring-your-own-container/Dockerfile \
     --forward 8080 \
     -- python /sandbox/app.py
@@ -34,7 +34,7 @@ The `--forward 8080` flag opens an SSH tunnel so `localhost:8080` on your
 machine reaches the REST API inside the sandbox.
 
 **Important:** The image's `CMD` / `ENTRYPOINT` does not run automatically.
-NemoClaw replaces it with the sandbox supervisor (which manages SSH access,
+OpenShell replaces it with the sandbox supervisor (which manages SSH access,
 network policy, etc.).  You must pass your application's start command
 after `--` so it is executed via SSH once the sandbox is ready.
 
@@ -42,7 +42,7 @@ after `--` so it is executed via SSH once the sandbox is ready.
 
 ```bash
 curl http://localhost:8080/hello
-# {"message": "hello from NemoClaw sandbox!"}
+# {"message": "hello from OpenShell sandbox!"}
 
 curl http://localhost:8080/hello/world
 # {"message": "hello, world!"}
@@ -68,10 +68,10 @@ TODO(#70): Remove the sandbox user note once custom images are secure by default
 
 ## How it works
 
-NemoClaw handles all the wiring automatically.  You build a standard
-Linux container image — no NemoClaw-specific dependencies or
+OpenShell handles all the wiring automatically.  You build a standard
+Linux container image — no OpenShell-specific dependencies or
 configuration required.  When you create a sandbox with `--from`,
-NemoClaw ensures that sandboxing (network policy, filesystem isolation,
+OpenShell ensures that sandboxing (network policy, filesystem isolation,
 SSH access) works the same as with the default image.
 
 Port forwarding is entirely client-side: the CLI spawns a background
@@ -83,5 +83,5 @@ bridges the tunnel to `127.0.0.1:<port>` inside the container.
 Delete the sandbox when you're done (this also stops port forwards):
 
 ```bash
-nemoclaw sandbox delete <sandbox-name>
+openshell sandbox delete <sandbox-name>
 ```

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Example: a minimal Python REST API that runs inside a NemoClaw sandbox.
+# Example: a minimal Python REST API that runs inside a OpenShell sandbox.
 # The image exposes port 8080 with a /hello endpoint.  Use port forwarding
 # (--forward 8080 on the CLI) to reach it from your local machine.
 
@@ -22,5 +22,5 @@ COPY app.py .
 EXPOSE 8080
 
 # NOTE: The sandbox supervisor replaces CMD at runtime.  Pass the start
-# command explicitly:  nemoclaw sandbox create ... -- python /sandbox/app.py
+# command explicitly:  openshell sandbox create ... -- python /sandbox/app.py
 CMD ["python", "app.py"]

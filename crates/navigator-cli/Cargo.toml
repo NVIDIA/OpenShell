@@ -3,7 +3,7 @@
 
 [package]
 name = "navigator-cli"
-description = "NemoClaw CLI tool"
+description = "OpenShell CLI tool"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,7 +11,7 @@ license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "nemoclaw"
+name = "openshell"
 path = "src/main.rs"
 
 [dependencies]

@@ -6,18 +6,18 @@ extension so you get a full IDE experience inside the sandbox environment.
 
 ## Prerequisites
 
-- A running nemoclaw gateway (`nemoclaw gateway start`)
+- A running openshell gateway (`openshell gateway start`)
 - [VSCode](https://code.visualstudio.com/) with the
   [Remote - SSH](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-ssh)
   extension installed
-- The `nemoclaw` CLI on your `PATH`
+- The `openshell` CLI on your `PATH`
 
 ## Quick start
 
 ### 1. Create a sandbox
 
 ```bash
-nemoclaw sandbox create --keep --name my-sandbox
+openshell sandbox create --keep --name my-sandbox
 ```
 
 `--keep` prevents the sandbox from being cleaned up when the shell exits so
@@ -26,31 +26,31 @@ VSCode can reconnect to it later.
 ### 2. Generate an SSH config entry
 
 ```bash
-nemoclaw sandbox ssh-config my-sandbox >> ~/.ssh/config
+openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
 ```
 
 This will append a block like:
 
 ```text
-Host nemoclaw-my-sandbox
+Host openshell-my-sandbox
     User sandbox
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     GlobalKnownHostsFile /dev/null
     LogLevel ERROR
-    ProxyCommand nemoclaw ssh-proxy --gateway <gateway-name> --name my-sandbox
+    ProxyCommand openshell ssh-proxy --gateway <gateway-name> --name my-sandbox
 ```
 
 ### 3. Open VSCode
 
 Open VSCode and run **Remote-SSH: Connect to Host...** from the command
-palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `nemoclaw-my-sandbox` from the
+palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `openshell-my-sandbox` from the
 list. VSCode will open a remote window connected to the sandbox.
 
 Alternatively, from the terminal:
 
 ```bash
-code --remote ssh-remote+nemoclaw-my-sandbox /sandbox
+code --remote ssh-remote+openshell-my-sandbox /sandbox
 ```
 
 ### 4. Clean up
@@ -58,7 +58,7 @@ code --remote ssh-remote+nemoclaw-my-sandbox /sandbox
 When you are done, delete the sandbox:
 
 ```bash
-nemoclaw sandbox delete my-sandbox
+openshell sandbox delete my-sandbox
 ```
 
 This also removes any active port forwards.

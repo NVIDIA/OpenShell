@@ -135,7 +135,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
         _ = tokio::time::sleep(AUTH_TIMEOUT) => {
             return Err(miette::miette!(
                 "authentication timed out after {} seconds.\n\
-                 Try again with: nemoclaw gateway login",
+                 Try again with: openshell gateway login",
                 AUTH_TIMEOUT.as_secs()
             ));
         }

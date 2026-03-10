@@ -108,11 +108,19 @@ fn civil_from_days(days: u64) -> (i64, u64, u64) {
 /// Known provisioning steps derived from Kubernetes events and sandbox lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProvisioningStep {
+    /// Sandbox CRD created, waiting for compute resources (node scheduling).
+    RequestingCompute,
+    /// Pod scheduled on a node.
     Scheduled,
+    /// Pulling container image.
     Pulling,
+    /// Container image pulled.
     Pulled,
+    /// Container created (not yet started).
     ContainerCreated,
+    /// Container started, waiting for sandbox to become ready.
     ContainerStarted,
+    /// Sandbox is ready to accept connections.
     SandboxReady,
 }
 
@@ -120,6 +128,7 @@ impl ProvisioningStep {
     /// Human-readable label for a completed step.
     fn completed_label(self) -> &'static str {
         match self {
+            Self::RequestingCompute => "Compute allocated",
             Self::Scheduled => "Scheduled on node",
             Self::Pulling => "Image pulled",
             Self::Pulled => "Image pulled",
@@ -132,6 +141,7 @@ impl ProvisioningStep {
     /// Human-readable label for an in-progress step (shown on the spinner).
     fn active_label(self) -> &'static str {
         match self {
+            Self::RequestingCompute => "Requesting compute...",
             Self::Scheduled => "Scheduling on node...",
             Self::Pulling => "Pulling image...",
             Self::Pulled => "Pulling image...",
@@ -177,7 +187,7 @@ impl ProvisioningDisplay {
 
         let spinner = mp.add(ProgressBar::new_spinner());
         spinner.set_style(
-            ProgressStyle::with_template("{spinner:.cyan} {msg}\n")
+            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
                 .unwrap_or_else(|_| ProgressStyle::default_spinner()),
         );
         spinner.enable_steady_tick(Duration::from_millis(120));
@@ -187,7 +197,9 @@ impl ProvisioningDisplay {
             mp,
             spinner,
             completed_steps: Vec::new(),
-            active_label: "Provisioning...".to_string(),
+            active_label: ProvisioningStep::RequestingCompute
+                .active_label()
+                .to_string(),
             active_detail: String::new(),
             step_start: now,
         }
@@ -220,6 +232,7 @@ impl ProvisioningDisplay {
 
         // Reset step timer for the next step.
         self.step_start = Instant::now();
+        self.spinner.reset_elapsed();
         self.active_detail.clear();
     }
 
@@ -227,6 +240,9 @@ impl ProvisioningDisplay {
     fn set_active(&mut self, label: &str) {
         self.active_label = label.to_string();
         self.active_detail.clear();
+        // Reset the spinner's elapsed time for the new step.
+        self.spinner.reset_elapsed();
+        self.step_start = Instant::now();
         self.update_spinner();
     }
 
@@ -242,17 +258,10 @@ impl ProvisioningDisplay {
     }
 
     fn update_spinner(&self) {
-        let elapsed = self.step_start.elapsed();
-        let elapsed_str = format_elapsed(elapsed);
         let msg = if self.active_detail.is_empty() {
-            format!("{} {}", self.active_label, elapsed_str.dimmed())
+            self.active_label.clone()
         } else {
-            format!(
-                "{} {} {}",
-                self.active_label,
-                self.active_detail.dimmed(),
-                elapsed_str.dimmed()
-            )
+            format!("{} {}", self.active_label, self.active_detail.dimmed())
         };
         self.spinner.set_message(msg);
     }
@@ -638,8 +647,8 @@ pub fn cluster_use(name: &str) -> Result<()> {
     get_cluster_metadata(name).ok_or_else(|| {
         miette::miette!(
             "No gateway metadata found for '{name}'.\n\
-              Deploy a gateway first with: nemoclaw gateway start --name {name}\n\
-              Or list available gateways: nemoclaw gateway select"
+              Deploy a gateway first with: openshell gateway start --name {name}\n\
+              Or list available gateways: openshell gateway select"
         )
     })?;
 
@@ -700,7 +709,7 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         );
         eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
         eprintln!();
-        eprintln!("Authenticate with: {}", "nemoclaw gateway login".dimmed(),);
+        eprintln!("Authenticate with: {}", "openshell gateway login".dimmed(),);
         return Ok(());
     }
 
@@ -722,7 +731,7 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
             eprintln!("{} Authentication skipped: {e}", "!".yellow(),);
             eprintln!(
                 "  Authenticate later with: {}",
-                "nemoclaw gateway login".dimmed(),
+                "openshell gateway login".dimmed(),
             );
         }
     }
@@ -737,7 +746,7 @@ pub async fn gateway_login(name: &str) -> Result<()> {
     let metadata = navigator_bootstrap::load_cluster_metadata(name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
-             List available gateways: nemoclaw gateway select"
+             List available gateways: openshell gateway select"
         )
     })?;
 
@@ -766,7 +775,7 @@ pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
         println!();
         println!(
             "Deploy a gateway with: {}",
-            "nemoclaw gateway start".dimmed()
+            "openshell gateway start".dimmed()
         );
         return Ok(());
     }
@@ -973,6 +982,7 @@ pub async fn cluster_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    registry_token: Option<&str>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -997,6 +1007,9 @@ pub async fn cluster_admin_deploy(
     }
     if let Some(host) = gateway_host {
         options = options.with_gateway_host(host);
+    }
+    if let Some(token) = registry_token {
+        options = options.with_registry_token(token);
     }
 
     let interactive = std::io::stderr().is_terminal();
@@ -1109,7 +1122,7 @@ fn cluster_control_target_options(
         }
         ClusterControlTarget::ExternalRegistration => Err(miette::miette!(
             "Gateway '{name}' is an external registration, not a managed Docker cluster.\n\
-             `nemoclaw gateway stop` is only supported for local or SSH-managed gateways."
+             `openshell gateway stop` is only supported for local or SSH-managed gateways."
         )),
     }
 }
@@ -1200,7 +1213,7 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
     let metadata = get_cluster_metadata(name).ok_or_else(|| {
         miette::miette!(
             "No gateway metadata found for '{name}'.\n\
-              Deploy a gateway first with: nemoclaw gateway start --name {name}"
+              Deploy a gateway first with: openshell gateway start --name {name}"
         )
     })?;
 
@@ -1237,7 +1250,7 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
         if let (Some(host), Some(kube_port)) = (&metadata.remote_host, metadata.kube_port) {
             println!();
             println!("{}", "SSH tunnel for kubectl access:".dimmed());
-            println!("  nemoclaw gateway tunnel --name {name}");
+            println!("  openshell gateway tunnel --name {name}");
             println!("Or manually:");
             println!("  ssh -L {kube_port}:127.0.0.1:6443 {host}");
         }
@@ -1319,13 +1332,13 @@ pub async fn sandbox_create_with_bootstrap(
     if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
         return Err(miette::miette!(
             "No active gateway.\n\
-             Set one with: nemoclaw gateway select <name>\n\
-             Or deploy a new gateway: nemoclaw gateway start"
+             Set one with: openshell gateway select <name>\n\
+             Or deploy a new gateway: openshell gateway start"
         ));
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
-    // The bootstrap flow always creates a cluster named "nemoclaw".
-    let cluster_name = "nemoclaw";
+    // The bootstrap flow always creates a cluster named "openshell".
+    let cluster_name = "openshell";
     sandbox_create(
         &server,
         name,
@@ -1469,10 +1482,10 @@ pub async fn sandbox_create(
 
     // Set initial active step on the spinner.
     if let Some(d) = display.as_mut() {
-        d.set_active("Provisioning...");
+        d.set_active_step(ProvisioningStep::RequestingCompute);
     } else {
         let ts = format_timestamp(Duration::ZERO);
-        println!("  {} Created sandbox {}", ts.dimmed(), sandbox_name);
+        println!("  {} Requesting compute...", ts.dimmed());
     }
 
     // Non-interactive mode: track start time for timestamps.
@@ -1575,11 +1588,15 @@ pub async fn sandbox_create(
                     match step {
                         ProvisioningStep::Scheduled => {
                             if let Some(d) = display.as_mut() {
-                                d.complete_step(ProvisioningStep::Scheduled);
+                                // Complete "Requesting compute" step, then show "Pulling image"
+                                d.complete_step_with_label(
+                                    ProvisioningStep::RequestingCompute,
+                                    "Compute allocated",
+                                );
                                 d.set_active_step(ProvisioningStep::Pulling);
                             } else {
                                 let ts = format_timestamp(provision_start.elapsed());
-                                println!("  {} Scheduled on node", ts.dimmed());
+                                println!("  {} Compute allocated", ts.dimmed());
                             }
                         }
                         ProvisioningStep::Pulling => {
@@ -1720,7 +1737,7 @@ pub async fn sandbox_create(
                     "\u{2713}".green().bold(),
                 );
                 eprintln!("  Access at: http://127.0.0.1:{port}/");
-                eprintln!("  Stop with: nemoclaw forward stop {port} {sandbox_name}",);
+                eprintln!("  Stop with: openshell forward stop {port} {sandbox_name}",);
             }
 
             if command.is_empty() {
@@ -1785,9 +1802,9 @@ pub async fn sandbox_create(
 ///
 /// Bare sandbox names (e.g., `openclaw`) are expanded to
 /// `{prefix}/{name}:latest` using this value.  Override with the
-/// `NEMOCLAW_COMMUNITY_REGISTRY` environment variable.
+/// `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
 const DEFAULT_COMMUNITY_REGISTRY: &str =
-    "d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes";
+    "d1i0nduu2f6qxk.cloudfront.net/openshell-community/sandboxes";
 
 /// Resolved source for the `--from` flag on `sandbox create`.
 enum ResolvedSource {
@@ -1860,7 +1877,7 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
     }
 
     // 4. Community sandbox name.
-    let prefix = std::env::var("NEMOCLAW_COMMUNITY_REGISTRY")
+    let prefix = std::env::var("OPENSHELL_COMMUNITY_REGISTRY")
         .unwrap_or_else(|_| DEFAULT_COMMUNITY_REGISTRY.to_string());
     let prefix = prefix.trim_end_matches('/');
     Ok(ResolvedSource::Image(format!("{prefix}/{value}:latest")))
@@ -1917,7 +1934,7 @@ async fn build_from_dockerfile(
 
 /// Load sandbox policy YAML.
 ///
-/// Resolution order: `--policy` flag > `NEMOCLAW_SANDBOX_POLICY` env var.
+/// Resolution order: `--policy` flag > `OPENSHELL_SANDBOX_POLICY` env var.
 /// Returns `None` when no policy source is configured, allowing the server
 /// to apply its own default.
 fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolicy>> {
@@ -2257,7 +2274,7 @@ pub async fn ensure_required_providers(
         } else {
             return Err(miette::miette!(
                 "provider '{name}' not found and '{name}' is not a recognized provider type. \
-                 Create it first with `nemoclaw provider create --type <type> --name {name}`"
+                 Create it first with `openshell provider create --type <type> --name {name}`"
             ));
         }
     }
@@ -2325,7 +2342,7 @@ async fn auto_create_provider(
     if auto_providers_override.is_none() && !std::io::stdin().is_terminal() {
         return Err(miette::miette!(
             "missing required provider '{provider_type}'. Create it first with \
-             `nemoclaw provider create --type {provider_type} --name {provider_type} --from-existing`, \
+             `openshell provider create --type {provider_type} --name {provider_type} --from-existing`, \
              pass --auto-providers to auto-create, or set it up manually from inside the sandbox"
         ));
     }
@@ -2683,7 +2700,6 @@ pub async fn provider_list(
 pub async fn provider_update(
     server: &str,
     name: &str,
-    provider_type: &str,
     from_existing: bool,
     credentials: &[String],
     config: &[String],
@@ -2697,14 +2713,22 @@ pub async fn provider_update(
 
     let mut client = grpc_client(server, tls).await?;
 
-    let provider_type = normalize_provider_type(provider_type)
-        .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
-        .to_string();
-
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
+        // Fetch the existing provider to discover its type for credential lookup.
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+
+        let provider_type = existing.r#type;
         let registry = ProviderRegistry::new();
         let discovered = registry
             .discover_existing(&provider_type)
@@ -2728,7 +2752,7 @@ pub async fn provider_update(
             provider: Some(Provider {
                 id: String::new(),
                 name: name.to_string(),
-                r#type: provider_type,
+                r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
             }),

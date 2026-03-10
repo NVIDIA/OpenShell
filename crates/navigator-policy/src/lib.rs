@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Shared sandbox policy parsing and defaults for NemoClaw.
+//! Shared sandbox policy parsing and defaults for OpenShell.
 //!
 //! Provides bidirectional YAML↔proto conversion for sandbox policies.
 //!
@@ -302,7 +302,7 @@ pub fn serialize_sandbox_policy(policy: &SandboxPolicy) -> Result<String> {
 ///
 /// Resolution order:
 /// 1. `cli_path` argument (e.g. from a `--policy` flag)
-/// 2. `NEMOCLAW_SANDBOX_POLICY` environment variable
+/// 2. `OPENSHELL_SANDBOX_POLICY` environment variable
 ///
 /// Returns `Ok(None)` when no policy source is configured, allowing the
 /// caller to omit the policy and let the server / sandbox apply its own
@@ -313,7 +313,7 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
         std::fs::read_to_string(path)
             .into_diagnostic()
             .wrap_err_with(|| format!("failed to read sandbox policy from {}", path.display()))?
-    } else if let Ok(policy_path) = std::env::var("NEMOCLAW_SANDBOX_POLICY") {
+    } else if let Ok(policy_path) = std::env::var("OPENSHELL_SANDBOX_POLICY") {
         let path = Path::new(&policy_path);
         std::fs::read_to_string(path)
             .into_diagnostic()
