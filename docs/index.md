@@ -103,7 +103,7 @@ Install the CLI and create your first sandbox in two commands.
 </div>
 ```
 
-Refer to the [Quickstart](get-started/quickstart.md) for more details.
+Refer to the [Get Started](about/get-started.md) for more details.
 
 ---
 
@@ -123,10 +123,10 @@ Learn about OpenShell and its capabilities.
 :::
 
 :::{grid-item-card} Get Started
-:link: get-started/quickstart
+:link: about/get-started
 :link-type: doc
 
-Quickstart guide and tutorials for creating a OpenShell sandbox with Claude Code, OpenClaw, and OpenCode.
+Quickstart guide for creating an OpenShell sandbox with Claude Code, OpenClaw, and OpenCode.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -186,15 +186,8 @@ Home <self>
 
 Overview <about/overview>
 How It Works <about/architecture>
+Get Started <about/get-started>
 Release Notes <about/release-notes>
-```
-
-```{toctree}
-:caption: Get Started
-:hidden:
-
-get-started/quickstart
-get-started/tutorials
 ```
 
 ```{toctree}
