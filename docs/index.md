@@ -221,7 +221,7 @@ safety-and-privacy/policies
 :hidden:
 
 inference/index
-inference/configure-routes
+inference/configure
 ```
 
 ```{toctree}

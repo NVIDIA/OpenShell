@@ -5,15 +5,15 @@
 
 # Run OpenCode with NVIDIA Inference
 
-This tutorial walks you through a realistic setup where you run [OpenCode](https://opencode.ai) inside a OpenShell sandbox with inference routed to NVIDIA API endpoints. Along the way, you will hit a policy denial, diagnose it from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop that you will use whenever you onboard a new tool.
+This tutorial walks you through a realistic setup where you run [OpenCode](https://opencode.ai) inside an OpenShell sandbox and configure private inference through `inference.local`. Along the way, you will hit a policy denial, diagnose it from logs, write a custom policy, and configure inference routing. This is the full policy iteration loop that you will use whenever you onboard a new tool.
 
 ## What You Will Learn
 
 - Create a provider manually using the `--from-existing` flag.
 - Write a custom policy to replace the default policy.
 - Read sandbox logs to diagnose denied actions.
-- Distinguish between agent traffic and userland inference.
-- Set up inference routes for code running inside the sandbox.
+- Distinguish between agent traffic and sandbox inference traffic.
+- Configure inference routing for code running inside the sandbox.
 
 ## Prerequisites
 
@@ -22,7 +22,7 @@ This tutorial walks you through a realistic setup where you run [OpenCode](https
 
 ## Create the Provider
 
-In the Claude Code tutorial, the CLI auto-discovered credentials. Here you create a provider explicitly, which gives you control over the provider name and type.
+In the Claude Code tutorial, the CLI auto-discovers credentials. Here you create a provider explicitly, which gives you control over the provider name and type.
 
 ```console
 $ nemoclaw provider create --name nvidia --type nvidia --from-existing
@@ -64,17 +64,16 @@ $ nemoclaw term
 
 Look for lines like these:
 
-```
+```text
 action=deny  host=integrate.api.nvidia.com  binary=/usr/local/bin/opencode  reason="no matching network policy"
 action=deny  host=opencode.ai               binary=/usr/bin/node            reason="no matching network policy"
-action=inspect_for_inference  host=integrate.api.nvidia.com  binary=/bin/bash
 ```
 
 Each log entry tells you the exact host, binary, and reason for the denial.
 
 ## Understand the Denial
 
-The default policy contains a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries — typically `/usr/local/bin/claude` and `/usr/bin/node`. When OpenCode makes HTTP calls through its own binary, `curl`, or a shell subprocess, those connections do not match any policy rule and get denied.
+The default policy contains a `nvidia_inference` network policy entry, but it is configured for a narrow set of binaries - typically `/usr/local/bin/claude` and `/usr/bin/node`. When OpenCode makes HTTP calls through its own binary, `curl`, or a shell subprocess, those connections do not match any policy rule and get denied.
 
 Two separate problems are at play:
 
@@ -89,9 +88,6 @@ Create a file called `opencode-policy.yaml` with the following content:
 
 ```yaml
 version: 1
-inference:
-  allowed_routes:
-    - nvidia
 filesystem_policy:
   include_workdir: true
   read_only:
@@ -180,15 +176,14 @@ network_policies:
       - path: /usr/bin/git
 ```
 
-This policy differs from the default in four key ways:
+This policy differs from the default in three key ways:
 
 - `opencode_api`: Allows OpenCode and Node.js to reach `opencode.ai:443`.
 - Broader `nvidia_inference` binaries: Adds `/usr/local/bin/opencode`, `/usr/bin/curl`, and `/bin/bash` so OpenCode's subprocesses can reach the NVIDIA endpoint.
-- `inference.allowed_routes`: Includes `nvidia` so inference routing works for userland code.
 - GitHub access: Scoped to support OpenCode's git operations.
 
 :::{warning}
-The `filesystem_policy`, `landlock`, and `process` sections are static. They are set at sandbox creation time and cannot be changed on a running sandbox. To modify these, delete and recreate the sandbox. The `network_policies` and `inference` sections are dynamic and can be hot-reloaded.
+The `filesystem_policy`, `landlock`, and `process` sections are static. They are set at sandbox creation time and cannot be changed on a running sandbox. To modify these, delete and recreate the sandbox. The `network_policies` section is dynamic and can be hot-reloaded.
 :::
 
 ## Apply the Policy
@@ -209,24 +204,26 @@ $ nemoclaw policy list opencode-sandbox
 
 The latest revision should show status `loaded`.
 
-## Set Up Inference Routing
+## Configure Inference Routing
 
-So far, you have allowed the OpenCode *agent* to reach `integrate.api.nvidia.com` directly through network policy. But code that OpenCode writes and runs inside the sandbox — scripts, notebooks, applications — uses a separate mechanism called the privacy router.
+So far, you have allowed the OpenCode *agent* to reach `integrate.api.nvidia.com` directly through network policy. But code that OpenCode writes and runs inside the sandbox should use `https://inference.local`.
 
-Create an inference route so userland code can access NVIDIA models:
+Configure inference so `inference.local` routes to your NVIDIA provider:
 
 ```console
-$ nemoclaw inference create \
-  --routing-hint nvidia \
-  --base-url https://integrate.api.nvidia.com \
-  --model-id z-ai/glm5 \
-  --api-key $NVIDIA_API_KEY
+$ nemoclaw inference set \
+  --provider nvidia \
+  --model z-ai/glm5
 ```
 
-The policy you wrote earlier already includes `nvidia` in `inference.allowed_routes`, so no policy update is needed. If you had omitted it, you would add the route to the policy and push again.
+Verify the active configuration:
+
+```console
+$ nemoclaw inference get
+```
 
 :::{note}
-*Network policies* and *inference routes* are two separate enforcement points. Network policies control which hosts the agent binary can reach directly. Inference routes control where LLM API calls from userland code get routed through the privacy proxy.
+*Network policies* and managed inference are two separate enforcement points. Network policies control which external hosts the agent binary can reach directly. Inference configuration controls where userland calls to `https://inference.local` are routed.
 :::
 
 ## Verify the Policy
@@ -237,7 +234,9 @@ Tail the logs again:
 $ nemoclaw logs opencode-sandbox --tail
 ```
 
-You should no longer see `action=deny` lines for the endpoints you added. Connections to `opencode.ai`, `integrate.api.nvidia.com`, and GitHub should show `action=allow`.
+You should see `action=allow` lines for the endpoints you added. Connections to `opencode.ai`, `integrate.api.nvidia.com`, and GitHub should show `action=allow`.
+
+To verify userland inference, run code inside the sandbox that targets `https://inference.local/v1`.
 
 If you still see denials, read the log line carefully. It tells you the exact host, port, and binary that was blocked. Add the missing entry to your policy and push again with `nemoclaw policy set`. This observe-modify-push cycle is the normal workflow for onboarding any new tool in OpenShell.
 
@@ -252,7 +251,7 @@ $ nemoclaw sandbox delete opencode-sandbox
 ## Next Steps
 
 - {doc}`../safety-and-privacy/policies`: Full reference on policy YAML structure, static and dynamic fields, and enforcement modes.
-- {doc}`../safety-and-privacy/policies`: How the proxy evaluates network rules and policy enforcement.
-- {doc}`../inference/index`: Inference route configuration, protocol detection, and transparent rerouting.
+- {doc}`../safety-and-privacy/policies`: How network policy fits into the sandbox iteration workflow.
+- {doc}`../inference/index`: `inference.local`, supported API patterns, and request routing.
 - {doc}`../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation.
 - {doc}`../safety-and-privacy/index`: The four protection layers and how they interact.

@@ -15,7 +15,6 @@ filesystem_policy: { ... }
 landlock: { ... }
 process: { ... }
 network_policies: { ... }
-inference: { ... }
 ```
 
 | Field | Type | Required | Category | Description |
@@ -25,7 +24,6 @@ inference: { ... }
 | `landlock` | object | No | Static | Configures Landlock LSM enforcement behavior. |
 | `process` | object | No | Static | Sets the user and group the agent process runs as. |
 | `network_policies` | map | No | Dynamic | Declares which binaries can reach which network endpoints. |
-| `inference` | object | No | Dynamic | Controls which inference routing backends are available. |
 
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `nemoclaw policy set` and take effect without restarting.
 
@@ -137,7 +135,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `protocol` | string | No | Set to `rest` to enable L7 (HTTP) inspection. Omit for L4-only (TCP passthrough). |
 | `tls` | string | No | TLS handling mode. `terminate` decrypts TLS at the proxy for inspection. `passthrough` forwards encrypted traffic without inspection. Only relevant when `protocol` is `rest`. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
-| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Refer to table below. Mutually exclusive with `rules`. |
+| `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
 
 #### Access Levels
@@ -202,23 +200,4 @@ network_policies:
     binaries:
       - path: /usr/bin/npm
       - path: /usr/bin/node
-```
-
-## Inference
-
-**Category:** Dynamic
-
-Controls which inference routing backends userland code can access. The `allowed_routes` list names route types that the privacy router will accept. Traffic matching an inference API pattern that targets a route type not in this list is denied.
-
-| Field | Type | Required | Description |
-|---|---|---|---|
-| `allowed_routes` | list of strings | No | Routing hint labels (e.g., `local`, `nvidia`, `staging`) that this sandbox can use. Must match the `routing_hint` of inference routes created with `nemoclaw inference create`. |
-
-Example:
-
-```yaml
-inference:
-  allowed_routes:
-    - local
-    - nvidia
 ```
