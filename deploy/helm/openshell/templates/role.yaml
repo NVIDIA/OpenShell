@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: {{ include "navigator.fullname" . }}-sandbox
+  name: {{ include "openshell.fullname" . }}-sandbox
   labels:
-    {{- include "navigator.labels" . | nindent 4 }}
+    {{- include "openshell.labels" . | nindent 4 }}
 rules:
   - apiGroups:
       - agents.x-k8s.io

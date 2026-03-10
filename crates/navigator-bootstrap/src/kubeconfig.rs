@@ -11,7 +11,7 @@ pub fn stored_kubeconfig_path(name: &str) -> Result<PathBuf> {
     let base = xdg_config_dir()?;
     Ok(base
         .join("openshell")
-        .join("clusters")
+        .join("gateways")
         .join(name)
         .join("kubeconfig"))
 }
@@ -100,14 +100,14 @@ pub fn store_kubeconfig(path: &Path, contents: &str) -> Result<()> {
 /// The kubeconfig points to `127.0.0.1:<kube_port>`, which works with an SSH tunnel:
 /// `ssh -L <kube_port>:127.0.0.1:6443 user@host`
 ///
-/// The cluster name includes "-remote" suffix to distinguish from local clusters.
+/// The gateway name includes "-remote" suffix to distinguish from local gateways.
 pub fn rewrite_kubeconfig_remote(
     contents: &str,
-    cluster_name: &str,
+    gateway_name: &str,
     _destination: &str,
     kube_port: Option<u16>,
 ) -> String {
-    let remote_name = format!("{cluster_name}-remote");
+    let remote_name = format!("{gateway_name}-remote");
     rewrite_kubeconfig(contents, &remote_name, kube_port)
 }
 
@@ -116,7 +116,7 @@ pub fn rewrite_kubeconfig_remote(
 /// When `kube_port` is `Some`, the server URL is rewritten to
 /// `https://127.0.0.1:<kube_port>`. When `None`, the original server URL
 /// is left intact (the control plane is not exposed on the host).
-pub fn rewrite_kubeconfig(contents: &str, cluster_name: &str, kube_port: Option<u16>) -> String {
+pub fn rewrite_kubeconfig(contents: &str, gateway_name: &str, kube_port: Option<u16>) -> String {
     let mut replaced = Vec::new();
     for line in contents.lines() {
         let trimmed = line.trim_start();
@@ -128,24 +128,24 @@ pub fn rewrite_kubeconfig(contents: &str, cluster_name: &str, kube_port: Option<
             replaced.push(format!("{indent}server: https://127.0.0.1:{kp}"));
             continue;
         }
-        // Rename default cluster/context/user to the cluster name
+        // Rename default cluster/context/user to the gateway name
         // Handle both "name: default" and "- name: default" (YAML list item)
         if trimmed == "name: default" || trimmed == "- name: default" {
             let indent_len = line.len() - trimmed.len();
             let indent = &line[..indent_len];
             let prefix = if trimmed.starts_with("- ") { "- " } else { "" };
-            replaced.push(format!("{indent}{prefix}name: {cluster_name}"));
+            replaced.push(format!("{indent}{prefix}name: {gateway_name}"));
             continue;
         }
         if trimmed == "cluster: default" || trimmed == "user: default" {
             let indent_len = line.len() - trimmed.len();
             let indent = &line[..indent_len];
             let key = trimmed.split(':').next().unwrap_or("cluster");
-            replaced.push(format!("{indent}{key}: {cluster_name}"));
+            replaced.push(format!("{indent}{key}: {gateway_name}"));
             continue;
         }
         if trimmed == "current-context: default" {
-            replaced.push(format!("current-context: {cluster_name}"));
+            replaced.push(format!("current-context: {gateway_name}"));
             continue;
         }
         replaced.push(line.to_string());

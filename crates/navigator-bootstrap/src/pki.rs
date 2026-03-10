@@ -19,9 +19,9 @@ pub struct PkiBundle {
 
 /// Default SANs always included on the server certificate.
 const DEFAULT_SERVER_SANS: &[&str] = &[
-    "navigator",
-    "navigator.navigator.svc",
-    "navigator.navigator.svc.cluster.local",
+    "openshell",
+    "openshell.openshell.svc",
+    "openshell.openshell.svc.cluster.local",
     "localhost",
     "host.docker.internal",
     "127.0.0.1",
@@ -46,10 +46,10 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
     ca_params
         .distinguished_name
-        .push(DnType::OrganizationName, "navigator");
+        .push(DnType::OrganizationName, "openshell");
     ca_params
         .distinguished_name
-        .push(DnType::CommonName, "navigator-ca");
+        .push(DnType::CommonName, "openshell-ca");
 
     let ca_cert = ca_params
         .self_signed(&ca_key)
@@ -67,7 +67,7 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
     server_params.subject_alt_names = server_sans;
     server_params
         .distinguished_name
-        .push(DnType::CommonName, "navigator-server");
+        .push(DnType::CommonName, "openshell-server");
 
     let server_cert = server_params
         .signed_by(&server_key, &ca_cert, &ca_key)

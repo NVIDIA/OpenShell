@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::paths::{active_cluster_path, clusters_dir, last_sandbox_path, xdg_config_dir};
+use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Cluster metadata stored alongside the kubeconfig.
+/// Gateway metadata stored alongside the kubeconfig.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClusterMetadata {
-    /// The cluster name.
+pub struct GatewayMetadata {
+    /// The gateway name.
     pub name: String,
     /// Gateway endpoint URL (e.g., `https://127.0.0.1:8080`).
     pub gateway_endpoint: String,
-    /// Whether this is a remote cluster.
+    /// Whether this is a remote gateway.
     pub is_remote: bool,
     /// Host port mapped to the gateway `NodePort`.
     pub gateway_port: u16,
@@ -23,10 +23,10 @@ pub struct ClusterMetadata {
     /// Old metadata files without this field are deserialized as `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kube_port: Option<u16>,
-    /// For remote clusters, the SSH destination (e.g., `user@hostname`).
+    /// For remote gateways, the SSH destination (e.g., `user@hostname`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_host: Option<String>,
-    /// For remote clusters, the resolved hostname/IP from SSH config.
+    /// For remote gateways, the resolved hostname/IP from SSH config.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub resolved_host: Option<String>,
 
@@ -51,32 +51,32 @@ pub struct ClusterMetadata {
     pub edge_auth_url: Option<String>,
 }
 
-pub fn create_cluster_metadata(
+pub fn create_gateway_metadata(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
     kube_port: Option<u16>,
-) -> ClusterMetadata {
-    create_cluster_metadata_with_host(name, remote, port, kube_port, None, false)
+) -> GatewayMetadata {
+    create_gateway_metadata_with_host(name, remote, port, kube_port, None, false)
 }
 
-/// Create cluster metadata, optionally overriding the gateway host.
+/// Create gateway metadata, optionally overriding the gateway host.
 ///
 /// When `gateway_host` is `Some`, that value is used as the host portion of
-/// `gateway_endpoint` instead of the default (`127.0.0.1` for local clusters,
-/// or the resolved SSH host for remote clusters).
+/// `gateway_endpoint` instead of the default (`127.0.0.1` for local gateways,
+/// or the resolved SSH host for remote gateways).
 ///
 /// When `disable_tls` is `true`, the gateway endpoint uses the `http://`
 /// scheme instead of `https://`.  This must match the server configuration
 /// so that the CLI connects with the correct protocol.
-pub fn create_cluster_metadata_with_host(
+pub fn create_gateway_metadata_with_host(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
     kube_port: Option<u16>,
     gateway_host: Option<&str>,
     disable_tls: bool,
-) -> ClusterMetadata {
+) -> GatewayMetadata {
     let scheme = if disable_tls { "http" } else { "https" };
 
     let (gateway_endpoint, is_remote, remote_host, resolved_host) = remote.map_or_else(
@@ -103,7 +103,7 @@ pub fn create_cluster_metadata_with_host(
         },
     );
 
-    ClusterMetadata {
+    GatewayMetadata {
         name: name.to_string(),
         gateway_endpoint,
         is_remote,
@@ -146,11 +146,7 @@ pub fn local_gateway_host_from_docker_host(docker_host: &str) -> Option<String> 
 }
 
 fn stored_metadata_path(name: &str) -> Result<PathBuf> {
-    let base = xdg_config_dir()?;
-    Ok(base
-        .join("openshell")
-        .join("clusters")
-        .join(format!("{name}_metadata.json")))
+    Ok(gateways_dir()?.join(name).join("metadata.json"))
 }
 
 /// Extract the hostname from an SSH destination string.
@@ -215,7 +211,7 @@ pub fn resolve_ssh_hostname(host: &str) -> String {
     }
 }
 
-pub fn store_cluster_metadata(name: &str, metadata: &ClusterMetadata) -> Result<()> {
+pub fn store_gateway_metadata(name: &str, metadata: &GatewayMetadata) -> Result<()> {
     let path = stored_metadata_path(name)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -224,31 +220,31 @@ pub fn store_cluster_metadata(name: &str, metadata: &ClusterMetadata) -> Result<
     }
     let contents = serde_json::to_string_pretty(metadata)
         .into_diagnostic()
-        .wrap_err("failed to serialize cluster metadata")?;
+        .wrap_err("failed to serialize gateway metadata")?;
     std::fs::write(&path, contents)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write metadata to {}", path.display()))?;
     Ok(())
 }
 
-pub fn load_cluster_metadata(name: &str) -> Result<ClusterMetadata> {
+pub fn load_gateway_metadata(name: &str) -> Result<GatewayMetadata> {
     let path = stored_metadata_path(name)?;
     let contents = std::fs::read_to_string(&path)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read metadata from {}", path.display()))?;
     serde_json::from_str(&contents)
         .into_diagnostic()
-        .wrap_err("failed to parse cluster metadata")
+        .wrap_err("failed to parse gateway metadata")
 }
 
-/// Load cluster metadata if available.
-pub fn get_cluster_metadata(name: &str) -> Option<ClusterMetadata> {
-    load_cluster_metadata(name).ok()
+/// Load gateway metadata if available.
+pub fn get_gateway_metadata(name: &str) -> Option<GatewayMetadata> {
+    load_gateway_metadata(name).ok()
 }
 
-/// Save the active cluster name to persistent storage.
-pub fn save_active_cluster(name: &str) -> Result<()> {
-    let path = active_cluster_path()?;
+/// Save the active gateway name to persistent storage.
+pub fn save_active_gateway(name: &str) -> Result<()> {
+    let path = active_gateway_path()?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()
@@ -256,23 +252,23 @@ pub fn save_active_cluster(name: &str) -> Result<()> {
     }
     std::fs::write(&path, name)
         .into_diagnostic()
-        .wrap_err_with(|| format!("failed to write active cluster to {}", path.display()))?;
+        .wrap_err_with(|| format!("failed to write active gateway to {}", path.display()))?;
     Ok(())
 }
 
-/// Load the active cluster name from persistent storage.
+/// Load the active gateway name from persistent storage.
 ///
-/// Returns `None` if no active cluster has been set.
-pub fn load_active_cluster() -> Option<String> {
-    let path = active_cluster_path().ok()?;
+/// Returns `None` if no active gateway has been set.
+pub fn load_active_gateway() -> Option<String> {
+    let path = active_gateway_path().ok()?;
     let contents = std::fs::read_to_string(&path).ok()?;
     let name = contents.trim().to_string();
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// Save the last-used sandbox name for a cluster to persistent storage.
-pub fn save_last_sandbox(cluster: &str, sandbox: &str) -> Result<()> {
-    let path = last_sandbox_path(cluster)?;
+/// Save the last-used sandbox name for a gateway to persistent storage.
+pub fn save_last_sandbox(gateway: &str, sandbox: &str) -> Result<()> {
+    let path = last_sandbox_path(gateway)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()
@@ -284,50 +280,51 @@ pub fn save_last_sandbox(cluster: &str, sandbox: &str) -> Result<()> {
     Ok(())
 }
 
-/// Load the last-used sandbox name for a cluster from persistent storage.
+/// Load the last-used sandbox name for a gateway from persistent storage.
 ///
 /// Returns `None` if no last sandbox has been set.
-pub fn load_last_sandbox(cluster: &str) -> Option<String> {
-    let path = last_sandbox_path(cluster).ok()?;
+pub fn load_last_sandbox(gateway: &str) -> Option<String> {
+    let path = last_sandbox_path(gateway).ok()?;
     let contents = std::fs::read_to_string(&path).ok()?;
     let name = contents.trim().to_string();
     if name.is_empty() { None } else { Some(name) }
 }
 
-/// List all clusters that have stored metadata.
+/// List all gateways that have stored metadata.
 ///
-/// Scans `$XDG_CONFIG_HOME/navigator/clusters/` for `*_metadata.json` files
-/// and returns the parsed metadata for each.
-pub fn list_clusters() -> Result<Vec<ClusterMetadata>> {
-    let dir = clusters_dir()?;
+/// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for subdirectories containing
+/// `metadata.json` and returns the parsed metadata for each.
+pub fn list_gateways() -> Result<Vec<GatewayMetadata>> {
+    let dir = gateways_dir()?;
     if !dir.exists() {
         return Ok(Vec::new());
     }
 
-    let mut clusters = Vec::new();
+    let mut gateways = Vec::new();
     let entries = std::fs::read_dir(&dir)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to read directory {}", dir.display()))?;
 
     for entry in entries {
         let entry = entry.into_diagnostic()?;
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-        if let Some(cluster_name) = name_str.strip_suffix("_metadata.json")
-            && let Ok(metadata) = load_cluster_metadata(cluster_name)
-        {
-            clusters.push(metadata);
+        let path = entry.path();
+        // Only consider directories that contain a metadata.json file
+        if path.is_dir() {
+            let gateway_name = entry.file_name().to_string_lossy().to_string();
+            if let Ok(metadata) = load_gateway_metadata(&gateway_name) {
+                gateways.push(metadata);
+            }
         }
     }
 
     // Sort by name for stable output
-    clusters.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(clusters)
+    gateways.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(gateways)
 }
 
-/// Remove the active cluster file (used when destroying the active cluster).
-pub fn clear_active_cluster() -> Result<()> {
-    let path = active_cluster_path()?;
+/// Remove the active gateway file (used when destroying the active gateway).
+pub fn clear_active_gateway() -> Result<()> {
+    let path = active_gateway_path()?;
     if path.exists() {
         std::fs::remove_file(&path)
             .into_diagnostic()
@@ -336,8 +333,8 @@ pub fn clear_active_cluster() -> Result<()> {
     Ok(())
 }
 
-/// Remove cluster metadata file.
-pub fn remove_cluster_metadata(name: &str) -> Result<()> {
+/// Remove gateway metadata file.
+pub fn remove_gateway_metadata(name: &str) -> Result<()> {
     let path = stored_metadata_path(name)?;
     if path.exists() {
         std::fs::remove_file(&path)
@@ -381,8 +378,8 @@ mod tests {
     }
 
     #[test]
-    fn local_cluster_metadata() {
-        let meta = create_cluster_metadata("test", None, 8080, None);
+    fn local_gateway_metadata() {
+        let meta = create_gateway_metadata("test", None, 8080, None);
         assert_eq!(meta.name, "test");
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
         assert_eq!(meta.gateway_port, 8080);
@@ -393,21 +390,21 @@ mod tests {
     }
 
     #[test]
-    fn local_cluster_metadata_custom_port() {
-        let meta = create_cluster_metadata("test", None, 9090, None);
+    fn local_gateway_metadata_custom_port() {
+        let meta = create_gateway_metadata("test", None, 9090, None);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:9090");
         assert_eq!(meta.gateway_port, 9090);
     }
 
     #[test]
-    fn local_cluster_metadata_with_kube_port() {
-        let meta = create_cluster_metadata("test", None, 8080, Some(7443));
+    fn local_gateway_metadata_with_kube_port() {
+        let meta = create_gateway_metadata("test", None, 8080, Some(7443));
         assert_eq!(meta.kube_port, Some(7443));
     }
 
     #[test]
-    fn local_cluster_metadata_without_kube_port() {
-        let meta = create_cluster_metadata("test", None, 8080, None);
+    fn local_gateway_metadata_without_kube_port() {
+        let meta = create_gateway_metadata("test", None, 8080, None);
         assert!(meta.kube_port.is_none());
     }
 
@@ -430,9 +427,9 @@ mod tests {
     }
 
     #[test]
-    fn remote_cluster_metadata_has_resolved_host() {
+    fn remote_gateway_metadata_has_resolved_host() {
         let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta = create_cluster_metadata("test", Some(&opts), 8080, Some(6443));
+        let meta = create_gateway_metadata("test", Some(&opts), 8080, Some(6443));
         assert!(meta.is_remote);
         assert_eq!(meta.remote_host.as_deref(), Some("user@10.0.0.5"));
         // When the host is a plain IP, ssh -G should resolve it to itself
@@ -447,7 +444,7 @@ mod tests {
 
     #[test]
     fn metadata_roundtrip_with_kube_port() {
-        let meta = ClusterMetadata {
+        let meta = GatewayMetadata {
             name: "test".to_string(),
             gateway_endpoint: "https://10.0.0.5:8080".to_string(),
             is_remote: true,
@@ -460,7 +457,7 @@ mod tests {
             edge_auth_url: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
-        let parsed: ClusterMetadata = serde_json::from_str(&json).unwrap();
+        let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.resolved_host.as_deref(), Some("10.0.0.5"));
         assert_eq!(parsed.gateway_endpoint, "https://10.0.0.5:8080");
         assert_eq!(parsed.gateway_port, 8080);
@@ -469,7 +466,7 @@ mod tests {
 
     #[test]
     fn metadata_roundtrip_without_kube_port() {
-        let meta = ClusterMetadata {
+        let meta = GatewayMetadata {
             name: "test".to_string(),
             gateway_endpoint: "https://10.0.0.5:8080".to_string(),
             is_remote: true,
@@ -486,7 +483,7 @@ mod tests {
             !json.contains("kube_port"),
             "None should be omitted from JSON"
         );
-        let parsed: ClusterMetadata = serde_json::from_str(&json).unwrap();
+        let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
         assert!(parsed.kube_port.is_none());
     }
 
@@ -501,15 +498,15 @@ mod tests {
             "gateway_port": 8080,
             "remote_host": "user@myserver"
         }"#;
-        let parsed: ClusterMetadata = serde_json::from_str(json).unwrap();
+        let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
         // kube_port should default to None when not present in JSON
         assert!(parsed.kube_port.is_none());
     }
 
     #[test]
-    fn local_cluster_metadata_with_gateway_host_override() {
-        let meta = create_cluster_metadata_with_host(
+    fn local_gateway_metadata_with_gateway_host_override() {
+        let meta = create_gateway_metadata_with_host(
             "test",
             None,
             8080,
@@ -526,21 +523,21 @@ mod tests {
     }
 
     #[test]
-    fn local_cluster_metadata_with_no_gateway_host_override() {
-        // When gateway_host is None, behaviour matches create_cluster_metadata.
-        let meta = create_cluster_metadata_with_host("test", None, 8080, None, None, false);
+    fn local_gateway_metadata_with_no_gateway_host_override() {
+        // When gateway_host is None, behaviour matches create_gateway_metadata.
+        let meta = create_gateway_metadata_with_host("test", None, 8080, None, None, false);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
     }
 
     #[test]
-    fn local_cluster_metadata_with_tls_disabled() {
-        let meta = create_cluster_metadata_with_host("test", None, 8080, None, None, true);
+    fn local_gateway_metadata_with_tls_disabled() {
+        let meta = create_gateway_metadata_with_host("test", None, 8080, None, None, true);
         assert_eq!(meta.gateway_endpoint, "http://127.0.0.1:8080");
     }
 
     #[test]
-    fn local_cluster_metadata_with_tls_disabled_and_gateway_host() {
-        let meta = create_cluster_metadata_with_host(
+    fn local_gateway_metadata_with_tls_disabled_and_gateway_host() {
+        let meta = create_gateway_metadata_with_host(
             "test",
             None,
             8080,
@@ -552,10 +549,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_cluster_metadata_with_tls_disabled() {
+    fn remote_gateway_metadata_with_tls_disabled() {
         let opts = RemoteOptions::new("user@10.0.0.5");
         let meta =
-            create_cluster_metadata_with_host("test", Some(&opts), 8080, Some(6443), None, true);
+            create_gateway_metadata_with_host("test", Some(&opts), 8080, Some(6443), None, true);
         assert!(meta.is_remote);
         assert!(meta.gateway_endpoint.starts_with("http://"));
         assert!(!meta.gateway_endpoint.starts_with("https://"));
@@ -587,8 +584,8 @@ mod tests {
     fn save_and_load_last_sandbox_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("mycluster", "dev-box").unwrap();
-            assert_eq!(load_last_sandbox("mycluster"), Some("dev-box".to_string()));
+            save_last_sandbox("mygateway", "dev-box").unwrap();
+            assert_eq!(load_last_sandbox("mygateway"), Some("dev-box".to_string()));
         });
     }
 
@@ -596,7 +593,7 @@ mod tests {
     fn load_last_sandbox_returns_none_when_not_set() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            assert_eq!(load_last_sandbox("no-such-cluster"), None);
+            assert_eq!(load_last_sandbox("no-such-gateway"), None);
         });
     }
 
@@ -604,9 +601,9 @@ mod tests {
     fn save_last_sandbox_overwrites_previous() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("c1", "first").unwrap();
-            save_last_sandbox("c1", "second").unwrap();
-            assert_eq!(load_last_sandbox("c1"), Some("second".to_string()));
+            save_last_sandbox("g1", "first").unwrap();
+            save_last_sandbox("g1", "second").unwrap();
+            assert_eq!(load_last_sandbox("g1"), Some("second".to_string()));
         });
     }
 
@@ -614,10 +611,10 @@ mod tests {
     fn save_last_sandbox_creates_parent_dirs() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            // The cluster subdir doesn't exist yet — save should create it.
-            save_last_sandbox("brand-new-cluster", "sb1").unwrap();
+            // The gateway subdir doesn't exist yet — save should create it.
+            save_last_sandbox("brand-new-gateway", "sb1").unwrap();
             assert_eq!(
-                load_last_sandbox("brand-new-cluster"),
+                load_last_sandbox("brand-new-gateway"),
                 Some("sb1".to_string())
             );
         });
@@ -628,10 +625,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
             // Write the file manually with surrounding whitespace.
-            let path = last_sandbox_path("ws-cluster").unwrap();
+            let path = last_sandbox_path("ws-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "  my-sb \n").unwrap();
-            assert_eq!(load_last_sandbox("ws-cluster"), Some("my-sb".to_string()));
+            assert_eq!(load_last_sandbox("ws-gateway"), Some("my-sb".to_string()));
         });
     }
 
@@ -639,25 +636,25 @@ mod tests {
     fn load_last_sandbox_returns_none_for_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            let path = last_sandbox_path("empty-cluster").unwrap();
+            let path = last_sandbox_path("empty-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "   \n").unwrap();
-            assert_eq!(load_last_sandbox("empty-cluster"), None);
+            assert_eq!(load_last_sandbox("empty-gateway"), None);
         });
     }
 
     #[test]
-    fn last_sandbox_is_per_cluster() {
+    fn last_sandbox_is_per_gateway() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("cluster-a", "sandbox-a").unwrap();
-            save_last_sandbox("cluster-b", "sandbox-b").unwrap();
+            save_last_sandbox("gateway-a", "sandbox-a").unwrap();
+            save_last_sandbox("gateway-b", "sandbox-b").unwrap();
             assert_eq!(
-                load_last_sandbox("cluster-a"),
+                load_last_sandbox("gateway-a"),
                 Some("sandbox-a".to_string())
             );
             assert_eq!(
-                load_last_sandbox("cluster-b"),
+                load_last_sandbox("gateway-b"),
                 Some("sandbox-b".to_string())
             );
         });

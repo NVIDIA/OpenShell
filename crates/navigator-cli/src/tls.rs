@@ -29,8 +29,8 @@ pub struct TlsOptions {
     ca: Option<PathBuf>,
     cert: Option<PathBuf>,
     key: Option<PathBuf>,
-    /// Cluster name for resolving default cert directory.
-    cluster_name: Option<String>,
+    /// Gateway name for resolving default cert directory.
+    gateway_name: Option<String>,
     /// Edge auth bearer token — when set, disables mTLS client certs and
     /// injects authentication headers on every gRPC request instead.
     pub edge_token: Option<String>,
@@ -42,7 +42,7 @@ impl TlsOptions {
             ca,
             cert,
             key,
-            cluster_name: None,
+            gateway_name: None,
             edge_token: None,
         }
     }
@@ -51,16 +51,16 @@ impl TlsOptions {
         self.ca.is_some() || self.cert.is_some() || self.key.is_some()
     }
 
-    /// Return the cluster name, if set.
-    pub fn cluster_name(&self) -> Option<&str> {
-        self.cluster_name.as_deref()
+    /// Return the gateway name, if set.
+    pub fn gateway_name(&self) -> Option<&str> {
+        self.gateway_name.as_deref()
     }
 
-    /// Set the cluster name for cert directory resolution.
+    /// Set the gateway name for cert directory resolution.
     #[must_use]
-    pub fn with_cluster_name(&self, name: &str) -> Self {
+    pub fn with_gateway_name(&self, name: &str) -> Self {
         Self {
-            cluster_name: Some(name.to_string()),
+            gateway_name: Some(name.to_string()),
             ..self.clone()
         }
     }
@@ -68,9 +68,9 @@ impl TlsOptions {
     #[must_use]
     pub fn with_default_paths(&self, server: &str) -> Self {
         let base = self
-            .cluster_name
+            .gateway_name
             .as_deref()
-            .and_then(tls_dir_for_cluster)
+            .and_then(tls_dir_for_gateway)
             .or_else(|| default_tls_dir(server));
         Self {
             ca: self
@@ -85,7 +85,7 @@ impl TlsOptions {
                 .key
                 .clone()
                 .or_else(|| base.as_ref().map(|dir| dir.join("tls.key"))),
-            cluster_name: self.cluster_name.clone(),
+            gateway_name: self.gateway_name.clone(),
             ..self.clone()
         }
     }
@@ -102,18 +102,18 @@ pub struct TlsMaterials {
     key: Vec<u8>,
 }
 
-/// Resolve the TLS cert directory for a known cluster name.
-fn tls_dir_for_cluster(name: &str) -> Option<PathBuf> {
+/// Resolve the TLS cert directory for a known gateway name.
+fn tls_dir_for_gateway(name: &str) -> Option<PathBuf> {
     let safe_name = sanitize_name(name);
-    let base = xdg_config_dir().ok()?.join("openshell").join("clusters");
+    let base = xdg_config_dir().ok()?.join("openshell").join("gateways");
     Some(base.join(safe_name).join("mtls"))
 }
 
 /// Fallback TLS directory resolution from a server URL.
 ///
-/// Used when no cluster name is set (e.g., `SshProxy` which receives a raw URL).
+/// Used when no gateway name is set (e.g., `SshProxy` which receives a raw URL).
 fn default_tls_dir(server: &str) -> Option<PathBuf> {
-    let mut name = std::env::var("OPENSHELL_CLUSTER_NAME")
+    let mut name = std::env::var("OPENSHELL_GATEWAY_NAME")
         .ok()
         .filter(|value| !value.trim().is_empty());
 
@@ -132,7 +132,7 @@ fn default_tls_dir(server: &str) -> Option<PathBuf> {
 
     let name = name.unwrap_or_else(|| "openshell".to_string());
     let safe_name = sanitize_name(&name);
-    let base = xdg_config_dir().ok()?.join("openshell").join("clusters");
+    let base = xdg_config_dir().ok()?.join("openshell").join("gateways");
     Some(base.join(safe_name).join("mtls"))
 }
 

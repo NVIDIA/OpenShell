@@ -1,9 +1,12 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "navigator.fullname" . }}
+  name: {{ include "openshell.fullname" . }}
   labels:
-    {{- include "navigator.labels" . | nindent 4 }}
+    {{- include "openshell.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type }}
   ports:
@@ -16,4 +19,4 @@ spec:
       nodePort: {{ .Values.service.nodePort }}
       {{- end }}
   selector:
-    {{- include "navigator.selectorLabels" . | nindent 4 }}
+    {{- include "openshell.selectorLabels" . | nindent 4 }}

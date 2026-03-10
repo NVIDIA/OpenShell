@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Push locally-built images into a k3s cluster's containerd runtime.
+//! Push locally-built images into a k3s gateway's containerd runtime.
 //!
 //! This module implements the "push" path for local development: images are
 //! exported from the local Docker daemon (equivalent to `docker save`),
-//! uploaded into the cluster container as a tar file via the Docker
+//! uploaded into the gateway container as a tar file via the Docker
 //! `put_archive` API, and then imported into containerd via `ctr images import`.
 //!
 //! The standalone `ctr` binary is used (not `k3s ctr` which may not work in
@@ -26,14 +26,14 @@ const CONTAINERD_SOCK: &str = "/run/k3s/containerd/containerd.sock";
 /// Path inside the container where the image tar is staged.
 const IMPORT_TAR_PATH: &str = "/tmp/navigator-images.tar";
 
-/// Push a list of images from the local Docker daemon into a k3s cluster's
+/// Push a list of images from the local Docker daemon into a k3s gateway's
 /// containerd runtime.
 ///
 /// All images are exported as a single tar (shared layers are deduplicated),
 /// uploaded to the container filesystem, and imported into containerd.
 pub async fn push_local_images(
     local_docker: &Docker,
-    cluster_docker: &Docker,
+    gateway_docker: &Docker,
     container_name: &str,
     images: &[&str],
     on_log: &mut impl FnMut(String),
@@ -43,7 +43,7 @@ pub async fn push_local_images(
     }
 
     on_log(format!(
-        "[status] Importing {} component image(s) into cluster",
+        "[status] Importing {} component image(s) into gateway",
         images.len()
     ));
     for img in images {
@@ -60,14 +60,14 @@ pub async fn push_local_images(
 
     // 2. Wrap the image tar as a file inside an outer tar archive and upload
     //    it into the container filesystem via the Docker put_archive API.
-    on_log("[status] Uploading images into cluster container".to_string());
+    on_log("[status] Uploading images into gateway container".to_string());
     let outer_tar = wrap_in_tar(IMPORT_TAR_PATH, &image_tar)?;
-    upload_archive(cluster_docker, container_name, &outer_tar).await?;
+    upload_archive(gateway_docker, container_name, &outer_tar).await?;
 
     // 3. Import the tar into containerd via ctr.
     on_log("[status] Running ctr images import".to_string());
     let (output, exit_code) = exec_capture_with_exit(
-        cluster_docker,
+        gateway_docker,
         container_name,
         vec![
             "ctr".to_string(),
@@ -90,7 +90,7 @@ pub async fn push_local_images(
 
     // 4. Clean up the staged tar file.
     let _ = exec_capture_with_exit(
-        cluster_docker,
+        gateway_docker,
         container_name,
         vec![
             "rm".to_string(),
@@ -100,7 +100,7 @@ pub async fn push_local_images(
     )
     .await;
 
-    on_log("[status] All component images imported into cluster".to_string());
+    on_log("[status] All component images imported into gateway".to_string());
     Ok(())
 }
 

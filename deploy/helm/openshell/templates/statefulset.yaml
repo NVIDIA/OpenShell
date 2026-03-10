@@ -1,15 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ include "navigator.fullname" . }}
+  name: {{ include "openshell.fullname" . }}
   labels:
-    {{- include "navigator.labels" . | nindent 4 }}
+    {{- include "openshell.labels" . | nindent 4 }}
 spec:
-  serviceName: {{ include "navigator.fullname" . }}
+  serviceName: {{ include "openshell.fullname" . }}
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      {{- include "navigator.selectorLabels" . | nindent 6 }}
+      {{- include "openshell.selectorLabels" . | nindent 6 }}
   template:
     metadata:
       {{- with .Values.podAnnotations }}
@@ -17,7 +20,7 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       labels:
-        {{- include "navigator.labels" . | nindent 8 }}
+        {{- include "openshell.labels" . | nindent 8 }}
         {{- with .Values.podLabels }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
@@ -27,7 +30,7 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
-      serviceAccountName: {{ include "navigator.serviceAccountName" . }}
+      serviceAccountName: {{ include "openshell.serviceAccountName" . }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -65,11 +68,11 @@ spec:
               value: "true"
             {{- else }}
             - name: OPENSHELL_TLS_CERT
-              value: /etc/navigator-tls/server/tls.crt
+              value: /etc/openshell-tls/server/tls.crt
             - name: OPENSHELL_TLS_KEY
-              value: /etc/navigator-tls/server/tls.key
+              value: /etc/openshell-tls/server/tls.key
             - name: OPENSHELL_TLS_CLIENT_CA
-              value: /etc/navigator-tls/client-ca/ca.crt
+              value: /etc/openshell-tls/client-ca/ca.crt
             - name: OPENSHELL_CLIENT_TLS_SECRET_NAME
               value: {{ .Values.server.tls.clientTlsSecretName | quote }}
             {{- if .Values.server.disableGatewayAuth }}
@@ -78,14 +81,14 @@ spec:
             {{- end }}
             {{- end }}
           volumeMounts:
-            - name: navigator-data
-              mountPath: /var/navigator
+            - name: openshell-data
+              mountPath: /var/openshell
             {{- if not .Values.server.disableTls }}
             - name: tls-cert
-              mountPath: /etc/navigator-tls/server
+              mountPath: /etc/openshell-tls/server
               readOnly: true
             - name: tls-client-ca
-              mountPath: /etc/navigator-tls/client-ca
+              mountPath: /etc/openshell-tls/client-ca
               readOnly: true
             {{- end }}
           ports:
@@ -131,7 +134,7 @@ spec:
       {{- end }}
   volumeClaimTemplates:
     - metadata:
-        name: navigator-data
+        name: openshell-data
       spec:
         accessModes: ["ReadWriteOnce"]
         resources:

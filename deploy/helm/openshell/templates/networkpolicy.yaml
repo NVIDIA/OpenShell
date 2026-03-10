@@ -1,20 +1,23 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 {{- if .Values.networkPolicy.enabled }}
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway pod.
 # Sandbox pods are dynamically created by the server and labelled with
-# navigator.ai/managed-by=navigator. This policy ensures only the gateway
-# (navigator server) pod can reach the sandbox SSH port (2222), blocking
+# openshell.ai/managed-by=openshell. This policy ensures only the gateway
+# (openshell server) pod can reach the sandbox SSH port (2222), blocking
 # lateral movement from other in-cluster workloads.
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
-  name: {{ include "navigator.fullname" . }}-sandbox-ssh
+  name: {{ include "openshell.fullname" . }}-sandbox-ssh
   namespace: {{ .Values.server.sandboxNamespace }}
   labels:
-    {{- include "navigator.labels" . | nindent 4 }}
+    {{- include "openshell.labels" . | nindent 4 }}
 spec:
   podSelector:
     matchLabels:
-      navigator.ai/managed-by: navigator
+      openshell.ai/managed-by: openshell
   policyTypes:
     - Ingress
   ingress:
@@ -24,7 +27,7 @@ spec:
               kubernetes.io/metadata.name: {{ .Release.Namespace }}
           podSelector:
             matchLabels:
-              app.kubernetes.io/name: {{ include "navigator.name" . }}
+              app.kubernetes.io/name: {{ include "openshell.name" . }}
               app.kubernetes.io/instance: {{ .Release.Name }}
       ports:
         - protocol: TCP
