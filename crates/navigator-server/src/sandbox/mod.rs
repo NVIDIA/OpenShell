@@ -1141,7 +1141,11 @@ fn apply_required_env(
             "OPENSHELL_TLS_CERT",
             "/etc/navigator-tls/client/tls.crt",
         );
-        upsert_env(env, "OPENSHELL_TLS_KEY", "/etc/navigator-tls/client/tls.key");
+        upsert_env(
+            env,
+            "OPENSHELL_TLS_KEY",
+            "/etc/navigator-tls/client/tls.key",
+        );
     }
 }
 
