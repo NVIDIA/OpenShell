@@ -43,26 +43,41 @@ Install the CLI:
 uv pip install nemoclaw
 ```
 
-## Connect to a Gateway
+## Connect to a Remote Gateway (Optional)
+
+If you're running locally, skip this step — the CLI creates a gateway automatically when you create your first sandbox.
 
 :::::{tab-set}
 
-::::{tab-item} Local (Docker)
+::::{tab-item} Brev
 
-If Docker is running on your machine, the CLI creates a local gateway automatically when you create your first sandbox. No additional setup is needed — skip to the next step.
+:::{note}
+Deploy an OpenShell gateway on Brev by hitting **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT).
+:::
 
-::::
-
-::::{tab-item} Remote (Brev)
-
-Deploy an OpenShell gateway on Brev with the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT), then connect to it:
+Once the instance is running, connect to it:
 
 ```console
 $ nemoclaw gateway add <your-brev-instance-url>
 $ nemoclaw status
 ```
 
-Once `nemoclaw status` shows the gateway as healthy, all subsequent commands target that remote instance.
+::::
+
+::::{tab-item} DGX Spark
+
+:::{note}
+Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured (e.g., SSH keys added to the host).
+:::
+
+Deploy to a DGX Spark machine over SSH:
+
+```console
+$ nemoclaw gateway start --remote <username>@<spark-ssid>.local
+$ nemoclaw status
+```
+
+Once `nemoclaw status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
 
 ::::
 
@@ -80,6 +95,22 @@ $ nemoclaw sandbox create -- claude
 ```
 
 The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `ANTHROPIC_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+:::
+
+:::{tab-item} OpenCode
+```console
+$ nemoclaw sandbox create -- opencode
+```
+
+The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+:::
+
+:::{tab-item} Codex
+```console
+$ nemoclaw sandbox create -- codex
+```
+
+The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `OPENAI_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
 :::
 
 :::{tab-item} Community Sandbox
