@@ -32,6 +32,10 @@ jobs:
                 username: ${{ github.actor }}
                 password: ${{ secrets.GITHUB_TOKEN }}
         steps:
+            - name: Install jq
+              run: |
+                  apt-get update && apt-get install -y jq
+
             - name: Checkout
               uses: actions/checkout@v4
 
