@@ -373,6 +373,20 @@ impl Navigator for NavigatorService {
                 }
             }
 
+            // Replay buffered platform events (best-effort) so late subscribers
+            // see Kubernetes events (Scheduled, Pulling, etc.) that already fired.
+            if follow_events {
+                for evt in state
+                    .tracing_log_bus
+                    .platform_event_bus
+                    .tail(&sandbox_id, 50)
+                {
+                    if tx.send(Ok(evt)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+
             loop {
                 tokio::select! {
                     res = async {
