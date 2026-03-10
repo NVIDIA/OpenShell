@@ -708,11 +708,11 @@ async fn handle_shell_connect(
         }
     };
     let exe_str = shell_escape(&exe.to_string_lossy());
+    let cluster = shell_escape(&app.cluster_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {}",
+        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway {cluster}",
         session.sandbox_id, session.token,
     );
-
     // Step 5: Build the SSH command.
     let mut command = std::process::Command::new("ssh");
     command
@@ -850,8 +850,9 @@ async fn handle_exec_command(
         }
     };
     let exe_str = shell_escape(&exe.to_string_lossy());
+    let cluster = shell_escape(&app.cluster_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {}",
+        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway {cluster}",
         session.sandbox_id, session.token,
     );
 
