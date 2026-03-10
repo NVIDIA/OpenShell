@@ -2259,15 +2259,34 @@ async fn list_provider_records(
     Ok(providers)
 }
 
+/// Merge an incoming map into an existing map.
+///
+/// - If `incoming` is empty, return `existing` unchanged (no-op).
+/// - Otherwise, upsert all incoming entries into `existing`.
+/// - Entries with an empty-string value are removed (delete semantics).
+fn merge_map(
+    mut existing: std::collections::HashMap<String, String>,
+    incoming: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    if incoming.is_empty() {
+        return existing;
+    }
+    for (key, value) in incoming {
+        if value.is_empty() {
+            existing.remove(&key);
+        } else {
+            existing.insert(key, value);
+        }
+    }
+    existing
+}
+
 async fn update_provider_record(
     store: &crate::persistence::Store,
     provider: Provider,
 ) -> Result<Provider, Status> {
     if provider.name.is_empty() {
         return Err(Status::invalid_argument("provider.name is required"));
-    }
-    if provider.r#type.trim().is_empty() {
-        return Err(Status::invalid_argument("provider.type is required"));
     }
 
     let existing = store
@@ -2279,13 +2298,26 @@ async fn update_provider_record(
         return Err(Status::not_found("provider not found"));
     };
 
+    // Provider type is immutable after creation. Reject if the caller
+    // sends a non-empty type that differs from the existing one.
+    let incoming_type = provider.r#type.trim();
+    if !incoming_type.is_empty()
+        && incoming_type.to_ascii_lowercase() != existing.r#type.trim().to_ascii_lowercase()
+    {
+        return Err(Status::invalid_argument(
+            "provider type cannot be changed; delete and recreate the provider",
+        ));
+    }
+
     let updated = Provider {
         id: existing.id,
         name: existing.name,
-        r#type: provider.r#type,
-        credentials: provider.credentials,
-        config: provider.config,
+        r#type: existing.r#type,
+        credentials: merge_map(existing.credentials, provider.credentials),
+        config: merge_map(existing.config, provider.config),
     };
+
+    validate_provider_fields(&updated)?;
 
     store
         .put_message(&updated)
@@ -2450,10 +2482,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(updated.id, provider_id);
+        // Updated credential has new value.
         assert_eq!(
             updated.credentials.get("API_TOKEN"),
             Some(&"rotated-token".to_string())
         );
+        // Non-updated credential is preserved (not clobbered).
+        assert_eq!(
+            updated.credentials.get("SECONDARY"),
+            Some(&"secondary-token".to_string())
+        );
+        // Updated config has new value.
+        assert_eq!(
+            updated.config.get("endpoint"),
+            Some(&"https://gitlab.com".to_string())
+        );
+        // Non-updated config is preserved (not clobbered).
+        assert_eq!(updated.config.get("region"), Some(&"us-west".to_string()));
 
         let deleted = delete_provider_record(&store, "gitlab-local")
             .await
@@ -2502,7 +2547,7 @@ mod tests {
             Provider {
                 id: String::new(),
                 name: "missing".to_string(),
-                r#type: "gitlab".to_string(),
+                r#type: String::new(),
                 credentials: HashMap::new(),
                 config: HashMap::new(),
             },
@@ -2510,6 +2555,163 @@ mod tests {
         .await
         .unwrap_err();
         assert_eq!(update_missing_err.code(), Code::NotFound);
+    }
+
+    #[tokio::test]
+    async fn update_provider_empty_maps_is_noop() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let created = provider_with_values("noop-test", "nvidia");
+        let persisted = create_provider_record(&store, created).await.unwrap();
+
+        // Update with empty type, empty credentials, empty config = no changes.
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "noop-test".to_string(),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.id, persisted.id);
+        assert_eq!(updated.r#type, "nvidia");
+        assert_eq!(updated.credentials.len(), 2);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"token-123".to_string())
+        );
+        assert_eq!(
+            updated.credentials.get("SECONDARY"),
+            Some(&"secondary-token".to_string())
+        );
+        assert_eq!(updated.config.len(), 2);
+        assert_eq!(
+            updated.config.get("endpoint"),
+            Some(&"https://example.com".to_string())
+        );
+        assert_eq!(updated.config.get("region"), Some(&"us-west".to_string()));
+    }
+
+    #[tokio::test]
+    async fn update_provider_empty_value_deletes_key() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let created = provider_with_values("delete-key-test", "openai");
+        create_provider_record(&store, created).await.unwrap();
+
+        // Send SECONDARY with empty value to delete it; API_TOKEN untouched.
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "delete-key-test".to_string(),
+                r#type: String::new(),
+                credentials: std::iter::once(("SECONDARY".to_string(), String::new())).collect(),
+                config: std::iter::once(("region".to_string(), String::new())).collect(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.credentials.len(), 1);
+        assert_eq!(
+            updated.credentials.get("API_TOKEN"),
+            Some(&"token-123".to_string())
+        );
+        assert!(updated.credentials.get("SECONDARY").is_none());
+        assert_eq!(updated.config.len(), 1);
+        assert_eq!(
+            updated.config.get("endpoint"),
+            Some(&"https://example.com".to_string())
+        );
+        assert!(updated.config.get("region").is_none());
+    }
+
+    #[tokio::test]
+    async fn update_provider_empty_type_preserves_existing() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let created = provider_with_values("type-preserve-test", "anthropic");
+        create_provider_record(&store, created).await.unwrap();
+
+        let updated = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "type-preserve-test".to_string(),
+                r#type: String::new(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(updated.r#type, "anthropic");
+    }
+
+    #[tokio::test]
+    async fn update_provider_rejects_type_change() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let created = provider_with_values("type-change-test", "nvidia");
+        create_provider_record(&store, created).await.unwrap();
+
+        let err = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "type-change-test".to_string(),
+                r#type: "openai".to_string(),
+                credentials: HashMap::new(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("type cannot be changed"));
+    }
+
+    #[tokio::test]
+    async fn update_provider_validates_merged_result() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let created = provider_with_values("validate-merge-test", "gitlab");
+        create_provider_record(&store, created).await.unwrap();
+
+        // Add credentials that exceed the max key length to trigger validation.
+        let oversized_key = "K".repeat(MAX_MAP_KEY_LEN + 1);
+        let err = update_provider_record(
+            &store,
+            Provider {
+                id: String::new(),
+                name: "validate-merge-test".to_string(),
+                r#type: String::new(),
+                credentials: std::iter::once((oversized_key, "value".to_string())).collect(),
+                config: HashMap::new(),
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.code(), Code::InvalidArgument);
     }
 
     #[tokio::test]

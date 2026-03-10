@@ -579,17 +579,13 @@ enum ProviderCommands {
         names: bool,
     },
 
-    /// Update an existing provider config.
+    /// Update an existing provider's credentials or config.
     Update {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
         name: String,
 
-        /// Provider type.
-        #[arg(long = "type", value_enum)]
-        provider_type: CliProviderType,
-
-        /// Load provider credentials/config from existing local state.
+        /// Re-discover credentials from existing local state (e.g. env vars, config files).
         #[arg(long, conflicts_with = "credentials")]
         from_existing: bool,
 
@@ -1718,7 +1714,6 @@ async fn main() -> Result<()> {
                 }
                 ProviderCommands::Update {
                     name,
-                    provider_type,
                     from_existing,
                     credentials,
                     config,
@@ -1726,7 +1721,6 @@ async fn main() -> Result<()> {
                     run::provider_update(
                         endpoint,
                         &name,
-                        provider_type.as_str(),
                         from_existing,
                         &credentials,
                         &config,

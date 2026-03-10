@@ -213,3 +213,162 @@ def test_credentials_not_in_persisted_spec_environment(
             assert "ANTHROPIC_API_KEY" not in persisted_env, (
                 "credentials should not be persisted in sandbox spec environment"
             )
+
+
+# ---------------------------------------------------------------------------
+# Provider update merge semantics
+# ---------------------------------------------------------------------------
+
+
+def test_update_provider_preserves_unset_credentials_and_config(
+    sandbox_client: SandboxClient,
+) -> None:
+    """Updating one credential must not clobber other credentials or config."""
+    stub = sandbox_client._stub
+    name = "merge-test-preserve"
+    _delete_provider(stub, name)
+
+    try:
+        stub.CreateProvider(
+            navigator_pb2.CreateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="generic",
+                    credentials={"KEY_A": "val-a", "KEY_B": "val-b"},
+                    config={"BASE_URL": "https://example.com"},
+                )
+            )
+        )
+
+        # Update only KEY_A; send empty config map (= no change).
+        stub.UpdateProvider(
+            navigator_pb2.UpdateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="",
+                    credentials={"KEY_A": "rotated-a"},
+                )
+            )
+        )
+
+        got = stub.GetProvider(navigator_pb2.GetProviderRequest(name=name))
+        p = got.provider
+        assert p.credentials["KEY_A"] == "rotated-a"
+        assert p.credentials["KEY_B"] == "val-b", "KEY_B should be preserved"
+        assert p.config["BASE_URL"] == "https://example.com", (
+            "config should be preserved"
+        )
+    finally:
+        _delete_provider(stub, name)
+
+
+def test_update_provider_empty_maps_preserves_all(
+    sandbox_client: SandboxClient,
+) -> None:
+    """Sending empty credential and config maps should be a no-op."""
+    stub = sandbox_client._stub
+    name = "merge-test-noop"
+    _delete_provider(stub, name)
+
+    try:
+        stub.CreateProvider(
+            navigator_pb2.CreateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="generic",
+                    credentials={"TOKEN": "secret"},
+                    config={"URL": "https://api.example.com"},
+                )
+            )
+        )
+
+        stub.UpdateProvider(
+            navigator_pb2.UpdateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="",
+                )
+            )
+        )
+
+        got = stub.GetProvider(navigator_pb2.GetProviderRequest(name=name))
+        p = got.provider
+        assert p.credentials["TOKEN"] == "secret"
+        assert p.config["URL"] == "https://api.example.com"
+    finally:
+        _delete_provider(stub, name)
+
+
+def test_update_provider_merges_config_preserves_credentials(
+    sandbox_client: SandboxClient,
+) -> None:
+    """Updating only config should not touch credentials."""
+    stub = sandbox_client._stub
+    name = "merge-test-config-only"
+    _delete_provider(stub, name)
+
+    try:
+        stub.CreateProvider(
+            navigator_pb2.CreateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="generic",
+                    credentials={"API_KEY": "original-key"},
+                    config={"ENDPOINT": "https://old.example.com"},
+                )
+            )
+        )
+
+        # Send only config update, empty credentials map.
+        stub.UpdateProvider(
+            navigator_pb2.UpdateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="",
+                    config={"ENDPOINT": "https://new.example.com"},
+                )
+            )
+        )
+
+        got = stub.GetProvider(navigator_pb2.GetProviderRequest(name=name))
+        p = got.provider
+        assert p.credentials["API_KEY"] == "original-key", (
+            "credentials should be untouched"
+        )
+        assert p.config["ENDPOINT"] == "https://new.example.com"
+    finally:
+        _delete_provider(stub, name)
+
+
+def test_update_provider_rejects_type_change(
+    sandbox_client: SandboxClient,
+) -> None:
+    """Attempting to change a provider's type must be rejected."""
+    stub = sandbox_client._stub
+    name = "merge-test-type-reject"
+    _delete_provider(stub, name)
+
+    try:
+        stub.CreateProvider(
+            navigator_pb2.CreateProviderRequest(
+                provider=datamodel_pb2.Provider(
+                    name=name,
+                    type="generic",
+                    credentials={"KEY": "val"},
+                )
+            )
+        )
+
+        with pytest.raises(grpc.RpcError) as exc_info:
+            stub.UpdateProvider(
+                navigator_pb2.UpdateProviderRequest(
+                    provider=datamodel_pb2.Provider(
+                        name=name,
+                        type="nvidia",
+                    )
+                )
+            )
+        assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "type cannot be changed" in exc_info.value.details()
+    finally:
+        _delete_provider(stub, name)

@@ -2699,7 +2699,6 @@ pub async fn provider_list(
 pub async fn provider_update(
     server: &str,
     name: &str,
-    provider_type: &str,
     from_existing: bool,
     credentials: &[String],
     config: &[String],
@@ -2713,14 +2712,22 @@ pub async fn provider_update(
 
     let mut client = grpc_client(server, tls).await?;
 
-    let provider_type = normalize_provider_type(provider_type)
-        .ok_or_else(|| miette::miette!("unsupported provider type: {provider_type}"))?
-        .to_string();
-
     let mut credential_map = parse_credential_pairs(credentials)?;
     let mut config_map = parse_key_value_pairs(config, "--config")?;
 
     if from_existing {
+        // Fetch the existing provider to discover its type for credential lookup.
+        let existing = client
+            .get_provider(GetProviderRequest {
+                name: name.to_string(),
+            })
+            .await
+            .into_diagnostic()?
+            .into_inner()
+            .provider
+            .ok_or_else(|| miette::miette!("provider '{name}' not found"))?;
+
+        let provider_type = existing.r#type;
         let registry = ProviderRegistry::new();
         let discovered = registry
             .discover_existing(&provider_type)
@@ -2744,7 +2751,7 @@ pub async fn provider_update(
             provider: Some(Provider {
                 id: String::new(),
                 name: name.to_string(),
-                r#type: provider_type,
+                r#type: String::new(),
                 credentials: credential_map,
                 config: config_map,
             }),
