@@ -36,7 +36,6 @@ jobs:
               uses: actions/checkout@v4
 
             - name: Install tools
-              if: github.event.action != 'closed'
               run: mise install
 
             - name: Build documentation
