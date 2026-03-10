@@ -63,9 +63,28 @@ Filesystem and process restrictions are locked at creation time. Network and
 inference rules are hot-reloadable on a running sandbox, so you can iterate on
 access rules without recreating the sandbox.
 
+## Threat Scenarios
+
+When an AI agent runs with unrestricted access, it can read any file, reach any
+network host, call any API with your credentials, and install arbitrary software.
+The table below shows how the four layers address concrete threats.
+
+| Threat | Without Protection | With OpenShell |
+|---|---|---|
+| **Data exfiltration** | Agent uploads source code to an external server via `curl`. | Network policy blocks all outbound connections except explicitly approved hosts. |
+| **Credential theft** | Agent reads `~/.ssh/id_rsa` or `~/.aws/credentials` and exfiltrates them. | [Landlock](https://docs.kernel.org/security/landlock.html) limits the agent to declared paths (`/sandbox`, `/tmp`, read-only system dirs). |
+| **Unauthorized API calls** | Agent calls `api.openai.com` with your key, sending data to a third-party provider. | Privacy router intercepts and reroutes calls to a backend you control. |
+| **Privilege escalation** | Agent runs `sudo apt install`, modifies `/etc/passwd`, or scans the internal network. | Agent runs as an unprivileged user with seccomp filters; no `sudo`, no `setuid`. |
+
+:::{important}
+All four layers work together. No single layer is sufficient on its own.
+Filesystem restrictions do not prevent network exfiltration. Network policies do
+not prevent local privilege escalation. Process restrictions do not control
+where inference traffic goes. Defense in depth means every layer covers gaps
+that the others cannot.
+:::
+
 ## Next Steps
 
-- {doc}`security-model`: Threat scenarios and how each protection layer
-  addresses them.
-- {doc}`policies`: Policy structure, evaluation order, and how to iterate on
-  rules.
+- {doc}`default-policies`: The built-in policy that ships with OpenShell and what each block allows.
+- {doc}`policies`: Write custom policies, configure network rules, and iterate on a running sandbox.
