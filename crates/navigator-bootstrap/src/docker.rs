@@ -389,20 +389,20 @@ pub async fn ensure_container(
         env_vars.push(format!("REGISTRY_PASSWORD={password}"));
     }
 
-    // When the primary registry is NOT the default distribution registry
-    // (e.g. a local registry in push-mode), we still need containerd
-    // credentials for the distribution registry so that community sandbox
-    // images (ghcr.io/nvidia/nemoclaw-community/sandboxes/*) can be pulled at
-    // runtime.  Pass the distribution registry credentials as a separate set
-    // of env vars so the entrypoint can add a second block to registries.yaml.
+    // When the primary registry is NOT ghcr.io (e.g. a local registry in
+    // push-mode), we still need containerd credentials for the community
+    // registry so that community sandbox images
+    // (ghcr.io/nvidia/nemoclaw-community/sandboxes/*) can be pulled at
+    // runtime.  Pass community registry credentials as a separate set of
+    // env vars so the entrypoint can add a second block to registries.yaml.
     if registry_host != DEFAULT_REGISTRY {
-        env_vars.push(format!("DIST_REGISTRY_HOST={}", DEFAULT_REGISTRY));
+        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={}", DEFAULT_REGISTRY));
         env_vars.push(format!(
-            "DIST_REGISTRY_USERNAME={}",
+            "COMMUNITY_REGISTRY_USERNAME={}",
             DEFAULT_REGISTRY_USERNAME
         ));
         env_vars.push(format!(
-            "DIST_REGISTRY_PASSWORD={}",
+            "COMMUNITY_REGISTRY_PASSWORD={}",
             image::default_registry_token()
         ));
     }
