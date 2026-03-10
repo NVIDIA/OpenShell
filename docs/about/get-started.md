@@ -40,10 +40,7 @@ uv venv && source .venv/bin/activate
 Install the CLI:
 
 ```bash
-uv pip install nemoclaw \
-  --upgrade \
-  --pre \
-  --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
+uv pip install nemoclaw
 ```
 
 ## Connect to a Gateway

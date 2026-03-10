@@ -54,7 +54,11 @@ For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and
 OpenShell can run locally or on a remote host. The architecture is identical in both cases — only the Docker container location changes.
 
 - **Local**: the k3s cluster runs inside Docker on your workstation. The CLI provisions it automatically on first use.
-- **Remote**: the cluster runs on a remote host. Deploy with `nemoclaw gateway start --remote user@host`, then connect with `nemoclaw gateway tunnel`. All CLI commands route through the SSH tunnel transparently.
+- **Remote**: the cluster runs on a remote host. Deploy with `nemoclaw gateway start --remote user@host`. For example, connect to your DGX Spark
+  ```console
+  $ nemoclaw gateway start --remote <username>@<spark-SSID>.local
+  $ nemoclaw status
+  ```
 
 ## Next Steps
 
