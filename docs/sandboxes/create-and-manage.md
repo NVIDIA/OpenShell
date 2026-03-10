@@ -9,10 +9,16 @@ This page walks you through the full sandbox lifecycle: creating, inspecting, co
 
 ## Prerequisites
 
-Ensure the following are installed before creating sandboxes.
+Ensure the following are ready before creating sandboxes.
 
 - OpenShell CLI installed (`pip install nemoclaw`)
 - Docker running on your machine
+
+:::{warning}
+Docker must be running before you create a sandbox. If it isn't, the CLI
+returns a connection-refused error (`os error 61`) without explaining
+the cause. Start Docker and try again.
+:::
 
 ## Create a Sandbox
 
