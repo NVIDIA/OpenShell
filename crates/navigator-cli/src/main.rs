@@ -3,7 +3,7 @@
 
 //! OpenShell CLI - command-line interface for OpenShell.
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
 use clap_complete::env::CompleteEnv;
 use miette::Result;
@@ -266,18 +266,10 @@ const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell inference update --model gpt-4-turbo
 ";
 
-/// OpenShell CLI - agent execution and management.
-#[derive(Parser, Debug)]
-#[command(name = "openshell")]
-#[command(author, version, about, long_about = None)]
-#[command(propagate_version = true)]
-#[command(help_template = HELP_TEMPLATE)]
-#[command(disable_help_subcommand = true)]
-struct Cli {
-    /// Increase verbosity (-v, -vv, -vvv).
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    verbose: u8,
-
+/// Gateway connection options shared across all commands.
+#[derive(Args, Debug)]
+#[command(next_help_heading = "Gateway Options")]
+struct GatewayArgs {
     /// Gateway name to operate on (resolved from stored metadata).
     #[arg(long, short = 'g', global = true, env = "OPENSHELL_GATEWAY")]
     gateway: Option<String>,
@@ -286,6 +278,22 @@ struct Cli {
     /// Connects directly without looking up gateway metadata.
     #[arg(long, global = true, env = "OPENSHELL_GATEWAY_ENDPOINT")]
     gateway_endpoint: Option<String>,
+}
+
+/// OpenShell CLI - agent execution and management.
+#[derive(Parser, Debug)]
+#[command(name = "openshell")]
+#[command(author, version, about, long_about = None)]
+#[command(propagate_version = true)]
+#[command(help_template = HELP_TEMPLATE)]
+#[command(disable_help_subcommand = true)]
+struct Cli {
+    #[command(flatten)]
+    gateway_args: GatewayArgs,
+
+    /// Increase verbosity (-v, -vv, -vvv).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "Global Options")]
+    verbose: u8,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -1157,7 +1165,7 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.gateway_args.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
@@ -1167,7 +1175,7 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.gateway_args.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
@@ -1180,7 +1188,7 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Login { name } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.gateway_args.gateway))
                     .ok_or_else(|| {
                         miette::miette!(
                             "No active gateway.\n\
@@ -1195,7 +1203,7 @@ async fn main() -> Result<()> {
                     run::gateway_use(&name)?;
                 } else {
                     // No name provided — show available gateways.
-                    run::gateway_list(&cli.gateway)?;
+                    run::gateway_list(&cli.gateway_args.gateway)?;
                     eprintln!();
                     eprintln!(
                         "Select a gateway with: {}",
@@ -1205,7 +1213,7 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Info { name } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.gateway_args.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
             }
@@ -1216,7 +1224,7 @@ async fn main() -> Result<()> {
                 print_command,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .or_else(|| resolve_gateway_name(&cli.gateway_args.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_tunnel(
                     &name,
@@ -1231,7 +1239,10 @@ async fn main() -> Result<()> {
         // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status) => {
-            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+            if let Ok(ctx) = resolve_gateway(
+                &cli.gateway_args.gateway,
+                &cli.gateway_args.gateway_endpoint,
+            ) {
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_edge_auth(&mut tls, &ctx.name);
                 run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
@@ -1254,7 +1265,8 @@ async fn main() -> Result<()> {
             command: Some(fwd_cmd),
         }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
-                let gateway_name = resolve_gateway_name(&cli.gateway).unwrap_or_default();
+                let gateway_name =
+                    resolve_gateway_name(&cli.gateway_args.gateway).unwrap_or_default();
                 let name = resolve_sandbox_name(name, &gateway_name)?;
                 if run::stop_forward(&name, port)? {
                     eprintln!(
@@ -1308,7 +1320,10 @@ async fn main() -> Result<()> {
                 name,
                 background,
             } => {
-                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let ctx = resolve_gateway(
+                    &cli.gateway_args.gateway,
+                    &cli.gateway_args.gateway_endpoint,
+                )?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_edge_auth(&mut tls, &ctx.name);
                 let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -1335,7 +1350,10 @@ async fn main() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(
+                &cli.gateway_args.gateway,
+                &cli.gateway_args.gateway_endpoint,
+            )?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             let name = resolve_sandbox_name(name, &ctx.name)?;
@@ -1358,7 +1376,10 @@ async fn main() -> Result<()> {
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(
+                &cli.gateway_args.gateway,
+                &cli.gateway_args.gateway_endpoint,
+            )?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             match policy_cmd {
@@ -1389,7 +1410,10 @@ async fn main() -> Result<()> {
         Some(Commands::Inference {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(
+                &cli.gateway_args.gateway,
+                &cli.gateway_args.gateway_endpoint,
+            )?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
@@ -1486,7 +1510,10 @@ async fn main() -> Result<()> {
 
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
-                    match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                    match resolve_gateway(
+                        &cli.gateway_args.gateway,
+                        &cli.gateway_args.gateway_endpoint,
+                    ) {
                         Ok(ctx) => {
                             if remote.is_some() {
                                 eprintln!(
@@ -1547,7 +1574,10 @@ async fn main() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = resolve_gateway(
+                        &cli.gateway_args.gateway,
+                        &cli.gateway_args.gateway_endpoint,
+                    )?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
@@ -1581,7 +1611,10 @@ async fn main() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = resolve_gateway(
+                        &cli.gateway_args.gateway,
+                        &cli.gateway_args.gateway_endpoint,
+                    )?;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
                     let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
@@ -1595,7 +1628,10 @@ async fn main() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let ctx = resolve_gateway(
+                        &cli.gateway_args.gateway,
+                        &cli.gateway_args.gateway_endpoint,
+                    )?;
                     let endpoint = &ctx.endpoint;
                     let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
@@ -1636,7 +1672,10 @@ async fn main() -> Result<()> {
         Some(Commands::Provider {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(
+                &cli.gateway_args.gateway,
+                &cli.gateway_args.gateway_endpoint,
+            )?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
@@ -1692,7 +1731,10 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Term) => {
-            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(
+                &cli.gateway_args.gateway,
+                &cli.gateway_args.gateway_endpoint,
+            )?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
