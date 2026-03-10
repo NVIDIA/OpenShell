@@ -55,10 +55,12 @@ append_env_if_missing() {
     return
   fi
   if [ -f "${ENV_FILE}" ] && [ -s "${ENV_FILE}" ]; then
-    printf "\n%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
-  else
-    printf "%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
+    # Ensure file ends with newline before appending, but don't add extra blank line
+    if [ "$(tail -c1 "${ENV_FILE}" | wc -l)" -eq 0 ]; then
+      printf "\n" >>"${ENV_FILE}"
+    fi
   fi
+  printf "%s=%s\n" "${key}" "${value}" >>"${ENV_FILE}"
 }
 
 port_is_in_use() {
@@ -108,7 +110,6 @@ fi
 OPENSHELL_CLUSTER=${OPENSHELL_CLUSTER:-${CLUSTER_NAME}}
 GATEWAY_PORT=${RESOLVED_GATEWAY_PORT}
 
-append_env_if_missing "CLUSTER_NAME" "${CLUSTER_NAME}"
 append_env_if_missing "GATEWAY_PORT" "${GATEWAY_PORT}"
 append_env_if_missing "OPENSHELL_CLUSTER" "${OPENSHELL_CLUSTER}"
 
@@ -209,8 +210,8 @@ if is_local_registry_host; then
   ensure_local_registry
 fi
 
-CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
-VOLUME_NAME="navigator-cluster-${CLUSTER_NAME}"
+CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
+VOLUME_NAME="openshell-cluster-${CLUSTER_NAME}"
 
 if [ "${MODE}" = "fast" ]; then
   if docker inspect "${CONTAINER_NAME}" >/dev/null 2>&1 || docker volume inspect "${VOLUME_NAME}" >/dev/null 2>&1; then

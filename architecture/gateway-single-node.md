@@ -67,7 +67,6 @@ Development task entrypoints split bootstrap behavior:
 | Task | Behavior |
 |---|---|
 | `mise run cluster` | Bootstrap or incremental deploy: creates gateway if needed (fast recreate), then detects changed files and rebuilds/pushes only impacted components |
-| `mise run cluster:build:full` | Full build path: builds cluster/server/sandbox images, pushes components, then deploys (preferred in CI) |
 
 For `mise run cluster`, `.env` acts as local source-of-truth for `GATEWAY_NAME`, `GATEWAY_PORT`, and `OPENSHELL_GATEWAY`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
 Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so the cluster task can push/pull local component images consistently.
@@ -122,7 +121,7 @@ flowchart LR
 
   subgraph HOST[Target host]
     DOCKER[Docker daemon]
-    K3S[navigator-cluster-NAME single k3s container]
+    K3S[openshell-cluster-NAME single k3s container]
     KAPI[Kubernetes API :6443]
     G8080[Gateway :port -> :30051 mTLS default 8080]
     SBX[Sandbox runtime]
@@ -171,16 +170,16 @@ Image ref resolution in `default_gateway_image_ref()`:
 
 For the target daemon (local or remote):
 
-1. **Ensure bridge network** `navigator-cluster` (attachable, bridge driver) via `ensure_network()`.
-2. **Ensure volume** `navigator-cluster-{name}` via `ensure_volume()`.
+1. **Ensure bridge network** `openshell-cluster` (attachable, bridge driver) via `ensure_network()`.
+2. **Ensure volume** `openshell-cluster-{name}` via `ensure_volume()`.
 3. **Compute extra TLS SANs**:
    - For **local deploys**: Check `DOCKER_HOST` for a non-loopback `tcp://` endpoint (e.g., `tcp://docker:2375` in CI). If found, extract the host as an extra SAN. The function `local_gateway_host_from_docker_host()` skips `localhost`, `127.0.0.1`, and `::1`.
    - For **remote deploys**: Extract the host from the SSH destination (handles `user@host`, `ssh://user@host`), resolve via `ssh -G` to get the canonical hostname/IP. Include both the resolved host and original SSH host (if different) as extra SANs.
-4. **Ensure container** `navigator-cluster-{name}` via `ensure_container()`:
+4. **Ensure container** `openshell-cluster-{name}` via `ensure_container()`:
    - k3s server command: `server --disable=traefik --tls-san=127.0.0.1 --tls-san=localhost --tls-san=host.docker.internal` plus computed extra SANs.
    - Privileged mode.
-   - Volume bind mount: `navigator-cluster-{name}:/var/lib/rancher/k3s`.
-   - Network: `navigator-cluster`.
+   - Volume bind mount: `openshell-cluster-{name}:/var/lib/rancher/k3s`.
+   - Network: `openshell-cluster`.
    - Extra host: `host.docker.internal:host-gateway`.
    - Port mappings:
 

@@ -29,7 +29,7 @@ IMAGE_TAG=${IMAGE_TAG:-dev}
 IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/openshell}}
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
-CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
 SOURCE_IMAGE="openshell/${component}:${IMAGE_TAG}"
 TARGET_IMAGE="${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}"
 

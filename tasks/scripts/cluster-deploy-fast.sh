@@ -12,7 +12,7 @@ normalize_name() {
 
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
-CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
 IMAGE_REPO_BASE=${IMAGE_REPO_BASE:-${OPENSHELL_REGISTRY:-127.0.0.1:5000/openshell}}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}

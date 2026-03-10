@@ -317,7 +317,6 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 | Task | Description |
 |---|---|
 | `mise run cluster` | Bootstrap or incremental deploy: creates cluster if needed, rebuilds changed components |
-| `mise run cluster:build:full` | Full build + deploy path (advanced/CI) |
 
 ### Other Tasks
 
@@ -425,11 +424,8 @@ In CI pipelines:
 # Bootstrap or incremental deploy (creates cluster if needed, rebuilds changed components)
 mise run cluster
 
-# Full build + deploy path (advanced/CI)
-mise run cluster:build:full
-
 # Run sandbox container interactively (for testing sandbox code)
-mise run cluster:sandbox
+mise run sandbox
 ```
 
 ### Multi-Arch Publishing

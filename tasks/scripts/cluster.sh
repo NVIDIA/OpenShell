@@ -15,7 +15,7 @@ normalize_name() {
 
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
 CLUSTER_NAME=$(normalize_name "${CLUSTER_NAME}")
-CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
 
 if ! docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
   echo "No running cluster found. Bootstrapping..."
