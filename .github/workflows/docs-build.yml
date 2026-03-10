@@ -1,13 +1,10 @@
 name: Docs
 
 on:
-    pull_request:
-        branches: [main]
-        types: [opened, synchronize]
-        paths:
-            - "docs/**"
     push:
         branches: [main]
+        paths:
+            - "docs/**"
     workflow_dispatch:
 
 defaults:
@@ -18,7 +15,7 @@ env:
     MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
 concurrency:
-    group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+    group: ${{ github.workflow }}-${{ github.ref }}
     cancel-in-progress: true
 
 jobs:
@@ -51,20 +48,6 @@ jobs:
                   path: _build/docs
                   if-no-files-found: error
                   retention-days: 1
-            - name: Store PR information
-              if: github.event_name == 'pull_request'
-              run: |
-                  mkdir ./pr
-                  echo ${{ github.event.number }}              > ./pr/pr.txt
-                  echo ${{ github.event.pull_request.merged }} > ./pr/merged.txt
-                  echo ${{ github.event.action }}              > ./pr/action.txt
-
-            - name: Upload PR information
-              if: github.event_name == 'pull_request'
-              uses: actions/upload-artifact@v4
-              with:
-                  name: pr
-                  path: pr/
 
     publish:
         if: false # disabled until GitHub Pages is configured
