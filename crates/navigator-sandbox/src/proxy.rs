@@ -95,18 +95,45 @@ impl InferenceContext {
         self.routes.clone()
     }
 
-    /// Ensure the background route-refresh loop is running. No-op after the
-    /// first call or when no refresh config was provided (file-based routes).
+    /// Ensure the route cache is fresh and the background refresh loop is
+    /// running. On the first call this fetches the latest bundle from the
+    /// gateway (so callers never see stale startup-time routes) and then
+    /// spawns the periodic refresh task. Subsequent calls are a no-op
+    /// (single atomic load via `OnceCell`).
     pub async fn ensure_refresh_started(&self) {
         self.refresh_started
             .get_or_init(|| async {
                 let config = self.refresh_config.lock().expect("lock poisoned").take();
                 if let Some(cfg) = config {
+                    // Fetch fresh routes so the very first inference call never
+                    // uses stale startup-time data.
+                    let initial_revision =
+                        match crate::grpc_client::fetch_inference_bundle(&cfg.endpoint).await {
+                            Ok(bundle) => {
+                                let revision = bundle.revision.clone();
+                                let routes = crate::bundle_to_resolved_routes(&bundle);
+                                info!(
+                                    route_count = routes.len(),
+                                    revision = %revision,
+                                    "Refreshed inference routes on first call"
+                                );
+                                *self.routes.write().await = routes;
+                                Some(revision)
+                            }
+                            Err(e) => {
+                                warn!(
+                                    error = %e,
+                                    "Failed to refresh routes on first call, using startup routes"
+                                );
+                                cfg.initial_revision
+                            }
+                        };
+
                     crate::spawn_route_refresh(
                         self.routes.clone(),
                         cfg.endpoint,
                         cfg.interval_secs,
-                        cfg.initial_revision,
+                        initial_revision,
                     );
                 }
             })

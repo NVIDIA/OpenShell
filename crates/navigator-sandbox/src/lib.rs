@@ -661,7 +661,7 @@ async fn build_inference_context(
 }
 
 /// Convert a proto bundle response into resolved routes for the router.
-fn bundle_to_resolved_routes(
+pub(crate) fn bundle_to_resolved_routes(
     bundle: &navigator_core::proto::GetInferenceBundleResponse,
 ) -> Vec<navigator_router::config::ResolvedRoute> {
     bundle
