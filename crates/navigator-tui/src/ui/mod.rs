@@ -9,6 +9,7 @@ pub(crate) mod sandbox_detail;
 pub(crate) mod sandbox_logs;
 mod sandbox_policy;
 pub(crate) mod sandboxes;
+mod splash;
 
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -19,6 +20,12 @@ use crate::app::{self, App, Focus, InputMode, Screen};
 use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    // Splash screen is a full-screen takeover — no chrome.
+    if app.screen == Screen::Splash {
+        splash::draw(frame, frame.size());
+        return;
+    }
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -32,6 +39,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_title_bar(frame, app, chunks[0]);
 
     match app.screen {
+        Screen::Splash => unreachable!(),
         Screen::Dashboard => dashboard::draw(frame, app, chunks[1]),
         Screen::Sandbox => draw_sandbox_screen(frame, app, chunks[1]),
     }
@@ -98,7 +106,14 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     };
 
     let mut parts: Vec<Span<'_>> = vec![
-        Span::styled(" OpenShell", styles::ACCENT_BOLD),
+        Span::styled(" >_ OpenShell ", styles::ACCENT_BOLD),
+        Span::styled(
+            " ALPHA ",
+            ratatui::style::Style::new()
+                .fg(crate::theme::colors::BG)
+                .bg(crate::theme::colors::NVIDIA_GREEN)
+                .add_modifier(ratatui::style::Modifier::BOLD),
+        ),
         Span::styled(" | ", styles::MUTED),
         Span::styled("Current Cluster: ", styles::TEXT),
         Span::styled(&app.cluster_name, styles::HEADING),
@@ -109,6 +124,7 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     ];
 
     match app.screen {
+        Screen::Splash => unreachable!("splash handled before draw_title_bar"),
         Screen::Dashboard => {
             parts.push(Span::styled("Dashboard", styles::TEXT));
         }
@@ -128,6 +144,7 @@ fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
 fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spans = match app.screen {
+        Screen::Splash => unreachable!("splash handled before draw_nav_bar"),
         Screen::Dashboard => match app.focus {
             Focus::Providers => vec![
                 Span::styled(" ", styles::TEXT),
