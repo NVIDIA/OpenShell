@@ -32,10 +32,6 @@ jobs:
                 username: ${{ github.actor }}
                 password: ${{ secrets.GITHUB_TOKEN }}
         steps:
-            - name: Install dependencies
-              run: |
-                  apt-get update && apt-get install -y jq rsync
-
             - name: Checkout
               uses: actions/checkout@v4
 
