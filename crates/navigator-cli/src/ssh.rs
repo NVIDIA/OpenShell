@@ -17,7 +17,7 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 
@@ -522,14 +522,22 @@ pub async fn sandbox_ssh_proxy(
         .await
         .into_diagnostic()?;
 
-    let status = read_connect_status(&mut stream).await?;
+    // Wrap in a BufReader **before** reading the HTTP response.  The gateway
+    // may send the 200 OK response and the first SSH protocol bytes in the
+    // same TCP segment / WebSocket frame.  A plain `read()` would consume
+    // those SSH bytes into our buffer and discard them, causing SSH to see a
+    // truncated protocol banner and exit with code 255.  BufReader ensures
+    // any bytes read past the `\r\n\r\n` header boundary stay buffered and
+    // are returned by subsequent reads during the bidirectional copy phase.
+    let mut buf_stream = BufReader::new(stream);
+    let status = read_connect_status(&mut buf_stream).await?;
     if status != 200 {
         return Err(miette::miette!(
             "gateway CONNECT failed with status {status}"
         ));
     }
 
-    let (reader, writer) = tokio::io::split(stream);
+    let (reader, writer) = tokio::io::split(buf_stream);
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
 
@@ -645,16 +653,21 @@ async fn connect_gateway(
     }
 }
 
-async fn read_connect_status(stream: &mut dyn ProxyStream) -> Result<u16> {
+/// Read exactly the HTTP response status line and headers up to `\r\n\r\n`.
+///
+/// Uses byte-at-a-time reads so that the caller's `BufReader` retains any
+/// bytes that arrived after the header boundary (e.g. the SSH protocol
+/// banner that the gateway may send in the same TCP segment).
+async fn read_connect_status<R: AsyncRead + Unpin>(stream: &mut R) -> Result<u16> {
     let mut buf = Vec::new();
-    let mut temp = [0u8; 1024];
+    let mut byte = [0u8; 1];
     loop {
-        let n = stream.read(&mut temp).await.into_diagnostic()?;
+        let n = stream.read(&mut byte).await.into_diagnostic()?;
         if n == 0 {
             break;
         }
-        buf.extend_from_slice(&temp[..n]);
-        if buf.windows(4).any(|win| win == b"\r\n\r\n") {
+        buf.push(byte[0]);
+        if buf.len() >= 4 && &buf[buf.len() - 4..] == b"\r\n\r\n" {
             break;
         }
         if buf.len() > 8192 {
