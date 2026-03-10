@@ -37,7 +37,7 @@ docker push 127.0.0.1:5000/demo/private-api:latest
 Deploy the pod:
 
 ```bash
-docker exec navigator-cluster-navigator \
+docker exec openshell-cluster-openshell \
   kubectl run private-api \
     --image=127.0.0.1:5000/demo/private-api:latest \
     --port=8080 \
@@ -47,7 +47,7 @@ docker exec navigator-cluster-navigator \
 Wait for it to be running and note the pod IP:
 
 ```bash
-docker exec navigator-cluster-navigator kubectl get pod private-api -o wide
+docker exec openshell-cluster-openshell kubectl get pod private-api -o wide
 ```
 
 Example output:
@@ -86,5 +86,5 @@ request returns `HTTP/1.1 403 Forbidden`.
 ## Cleanup
 
 ```bash
-docker exec navigator-cluster-navigator kubectl delete pod private-api
+docker exec openshell-cluster-openshell kubectl delete pod private-api
 ```

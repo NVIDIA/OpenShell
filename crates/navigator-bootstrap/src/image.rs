@@ -24,8 +24,8 @@ pub const DEFAULT_REGISTRY: &str = "ghcr.io";
 /// Default image repository base on GHCR (without component name or tag).
 pub const DEFAULT_IMAGE_REPO_BASE: &str = "ghcr.io/nvidia/nemoclaw";
 
-/// Default full cluster image path on GHCR (without tag).
-pub const DEFAULT_CLUSTER_IMAGE: &str = "ghcr.io/nvidia/nemoclaw/cluster";
+/// Default full gateway image path on GHCR (without tag).
+pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/nvidia/nemoclaw/cluster";
 
 /// Default username for token-based GHCR authentication.
 ///
@@ -156,11 +156,11 @@ pub(crate) fn ghcr_credentials(token: Option<&str>) -> Option<DockerCredentials>
     })
 }
 
-/// Pull the cluster image directly on a remote Docker daemon from ghcr.io,
+/// Pull the gateway image directly on a remote Docker daemon from ghcr.io,
 /// authenticating with the provided registry token.
 ///
 /// After pulling, the image is tagged to the expected local image ref (e.g.,
-/// `navigator/cluster:dev`) so that all downstream container creation logic works
+/// `openshell/cluster:dev`) so that all downstream container creation logic works
 /// without changes.
 ///
 /// The remote host's platform is queried so the correct architecture variant is
@@ -186,7 +186,7 @@ pub async fn pull_remote_image(
     // and already points at a registry image, honour its tag.  Otherwise use
     // the distribution registry default tag — the local build tag (e.g. "dev")
     // is a build-time convention that doesn't exist in the registry.
-    let registry_image_base = DEFAULT_CLUSTER_IMAGE.to_string();
+    let registry_image_base = DEFAULT_GATEWAY_IMAGE.to_string();
 
     let tag = if is_local_image_ref(image_ref) {
         PULL_REGISTRY_DEFAULT_TAG.to_string()
@@ -201,7 +201,7 @@ pub async fn pull_remote_image(
         registry_image, DEFAULT_REGISTRY
     );
     on_progress(format!(
-        "[status] Pulling navigator/cluster:{tag} ({platform_str}) on remote host"
+        "[status] Pulling openshell/cluster:{tag} ({platform_str}) on remote host"
     ));
 
     let credentials = ghcr_credentials(registry_token);
@@ -234,7 +234,7 @@ pub async fn pull_remote_image(
 
     // Tag the pulled image to the expected local image ref so downstream code
     // (container creation, image ID checks) works unchanged.
-    // e.g., tag "ghcr.io/nvidia/nemoclaw/cluster:latest" as "navigator/cluster:dev"
+    // e.g., tag "ghcr.io/nvidia/nemoclaw/cluster:latest" as "openshell/cluster:dev"
     let (target_repo, target_tag) = parse_image_ref(image_ref);
     info!(
         "Tagging {} as {}:{}",
@@ -382,8 +382,8 @@ mod tests {
     #[test]
     fn default_constants_are_consistent() {
         assert!(
-            DEFAULT_CLUSTER_IMAGE.starts_with(DEFAULT_IMAGE_REPO_BASE),
-            "cluster image should be under the default repo base"
+            DEFAULT_GATEWAY_IMAGE.starts_with(DEFAULT_IMAGE_REPO_BASE),
+            "gateway image should be under the default repo base"
         );
         assert!(
             DEFAULT_IMAGE_REPO_BASE.starts_with(DEFAULT_REGISTRY),

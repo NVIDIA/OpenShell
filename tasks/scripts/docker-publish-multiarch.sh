@@ -104,13 +104,13 @@ fi
 case "$MODE" in
   registry)
     REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
-    IMAGE_PREFIX="navigator-"
+    IMAGE_PREFIX="openshell-"
     ;;
   ecr)
     AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-524473328983}
     AWS_REGION=${AWS_REGION:-us-west-2}
     ECR_HOST="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
-    REGISTRY="${ECR_HOST}/navigator"
+    REGISTRY="${ECR_HOST}/openshell"
     IMAGE_PREFIX=""
     EXTRA_BUILD_FLAGS="--provenance=false --sbom=false"
     ;;
@@ -187,7 +187,7 @@ done
 # Step 2: Package helm charts (architecture-independent)
 # ---------------------------------------------------------------------------
 mkdir -p deploy/docker/.build/charts
-echo "Packaging navigator helm chart..."
+echo "Packaging helm chart..."
 helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 
 # ---------------------------------------------------------------------------

@@ -16,7 +16,7 @@
 set -euo pipefail
 
 IMAGE_TAG=${IMAGE_TAG:-dev}
-IMAGE_NAME="navigator/cluster"
+IMAGE_NAME="openshell/cluster"
 if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
   IMAGE_NAME="${IMAGE_REGISTRY}/cluster"
 fi
@@ -49,9 +49,9 @@ fi
 # Create build directory for charts
 mkdir -p deploy/docker/.build/charts
 
-# Package navigator helm chart
-echo "Packaging navigator helm chart..."
-helm package deploy/helm/navigator -d deploy/docker/.build/charts/
+# Package helm chart
+echo "Packaging helm chart..."
+helm package deploy/helm/openshell -d deploy/docker/.build/charts/
 
 # Build cluster image (no bundled component images — they are pulled at runtime
 # from the distribution registry; credentials are injected at deploy time)

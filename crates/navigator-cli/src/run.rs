@@ -16,10 +16,10 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
-    ClusterMetadata, DeployOptions, RemoteOptions, clear_active_cluster,
-    default_local_kubeconfig_path, get_cluster_metadata, list_clusters, load_active_cluster,
-    print_kubeconfig, remove_cluster_metadata, save_active_cluster, save_last_sandbox,
-    store_cluster_metadata, update_local_kubeconfig,
+    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway,
+    default_local_kubeconfig_path, get_gateway_metadata, list_gateways, load_active_gateway,
+    print_kubeconfig, remove_gateway_metadata, save_active_gateway, save_last_sandbox,
+    store_gateway_metadata, update_local_kubeconfig,
 };
 use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
@@ -378,7 +378,7 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
     format!("{}…", &s[..end])
 }
 
-struct ClusterDeployLogPanel {
+struct GatewayDeployLogPanel {
     mp: MultiProgress,
     status: String,
     progress: Option<String>,
@@ -391,7 +391,7 @@ struct ClusterDeployLogPanel {
     buffer: VecDeque<String>,
 }
 
-impl ClusterDeployLogPanel {
+impl GatewayDeployLogPanel {
     fn new(_name: &str, _location: &str) -> Self {
         let mp = MultiProgress::new();
 
@@ -584,12 +584,12 @@ fn is_progress_status(status: &str) -> bool {
         || status.starts_with("Extracting:")
 }
 
-/// Show cluster status.
+/// Show gateway status.
 #[allow(clippy::branches_sharing_code)]
-pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) -> Result<()> {
     println!("{}", "Server Status".cyan().bold());
     println!();
-    println!("  {} {}", "Cluster:".dimmed(), cluster_name);
+    println!("  {} {}", "Gateway:".dimmed(), gateway_name);
     println!("  {} {}", "Server:".dimmed(), server);
     if tls.is_bearer_auth() {
         println!("  {} {}", "Auth:".dimmed(), "Edge (bearer token)");
@@ -641,10 +641,10 @@ pub async fn cluster_status(cluster_name: &str, server: &str, tls: &TlsOptions) 
     Ok(())
 }
 
-/// Set the active cluster.
-pub fn cluster_use(name: &str) -> Result<()> {
-    // Verify the cluster exists
-    get_cluster_metadata(name).ok_or_else(|| {
+/// Set the active gateway.
+pub fn gateway_use(name: &str) -> Result<()> {
+    // Verify the gateway exists
+    get_gateway_metadata(name).ok_or_else(|| {
         miette::miette!(
             "No gateway metadata found for '{name}'.\n\
               Deploy a gateway first with: openshell gateway start --name {name}\n\
@@ -652,7 +652,7 @@ pub fn cluster_use(name: &str) -> Result<()> {
         )
     })?;
 
-    save_active_cluster(name)?;
+    save_active_gateway(name)?;
     eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
     Ok(())
 }
@@ -685,7 +685,7 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
     };
 
     // Build metadata for an edge-authenticated remote gateway.
-    let metadata = ClusterMetadata {
+    let metadata = GatewayMetadata {
         name: name.to_string(),
         gateway_endpoint: endpoint.clone(),
         is_remote: true,
@@ -698,8 +698,8 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         edge_auth_url: None,
     };
 
-    store_cluster_metadata(name, &metadata)?;
-    save_active_cluster(name)?;
+    store_gateway_metadata(name, &metadata)?;
+    save_active_gateway(name)?;
 
     if no_auth {
         eprintln!(
@@ -743,7 +743,7 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
 ///
 /// Opens a browser for edge proxy login and stores the updated token.
 pub async fn gateway_login(name: &str) -> Result<()> {
-    let metadata = navigator_bootstrap::load_cluster_metadata(name).map_err(|_| {
+    let metadata = navigator_bootstrap::load_gateway_metadata(name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
              List available gateways: openshell gateway select"
@@ -765,12 +765,12 @@ pub async fn gateway_login(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// List all provisioned clusters.
-pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
-    let clusters = list_clusters()?;
-    let active = gateway_flag.clone().or_else(load_active_cluster);
+/// List all provisioned gateways.
+pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
+    let gateways = list_gateways()?;
+    let active = gateway_flag.clone().or_else(load_active_gateway);
 
-    if clusters.is_empty() {
+    if gateways.is_empty() {
         println!("No gateways found.");
         println!();
         println!(
@@ -781,15 +781,15 @@ pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
     }
 
     // Calculate column widths
-    let name_width = clusters
+    let name_width = gateways
         .iter()
-        .map(|c| c.name.len())
+        .map(|g| g.name.len())
         .max()
         .unwrap_or(4)
         .max(4);
-    let endpoint_width = clusters
+    let endpoint_width = gateways
         .iter()
-        .map(|c| c.gateway_endpoint.len())
+        .map(|g| g.gateway_endpoint.len())
         .max()
         .unwrap_or(8)
         .max(8);
@@ -803,17 +803,17 @@ pub fn cluster_list(gateway_flag: &Option<String>) -> Result<()> {
     );
 
     // Print rows
-    for cluster in &clusters {
-        let is_active = active.as_deref() == Some(&cluster.name);
+    for gateway in &gateways {
+        let is_active = active.as_deref() == Some(&gateway.name);
         let marker = if is_active { "*" } else { " " };
-        let cluster_type = match cluster.auth_mode.as_deref() {
+        let gateway_type = match gateway.auth_mode.as_deref() {
             Some("cloudflare_jwt") => "edge",
-            _ if cluster.is_remote => "remote",
+            _ if gateway.is_remote => "remote",
             _ => "local",
         };
         let line = format!(
-            "{marker} {:<name_width$}  {:<endpoint_width$}  {cluster_type}",
-            cluster.name, cluster.gateway_endpoint,
+            "{marker} {:<name_width$}  {:<endpoint_width$}  {gateway_type}",
+            gateway.name, gateway.gateway_endpoint,
         );
         if is_active {
             println!("{}", line.green());
@@ -862,12 +862,12 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     Ok(Some(resp.status()))
 }
 
-/// Prompt the user to choose how to handle an existing cluster deployment.
+/// Prompt the user to choose how to handle an existing gateway deployment.
 ///
 /// Returns `true` to recreate (destroy and start fresh), `false` to reuse.
-fn prompt_existing_cluster(
+fn prompt_existing_gateway(
     name: &str,
-    info: &navigator_bootstrap::ExistingClusterInfo,
+    info: &navigator_bootstrap::ExistingGatewayInfo,
 ) -> Result<bool> {
     let status = if info.container_running {
         "running"
@@ -896,24 +896,24 @@ fn prompt_existing_cluster(
     Ok(choice == "y" || choice == "yes")
 }
 
-/// Deploy a cluster with the rich progress panel (interactive) or simple
-/// logging (non-interactive). Returns the [`ClusterHandle`] on success.
+/// Deploy a gateway with the rich progress panel (interactive) or simple
+/// logging (non-interactive). Returns the [`GatewayHandle`] on success.
 ///
 /// This is the shared deploy UX used by both `gateway start` and
 /// the auto-bootstrap path in `sandbox create`.
-pub(crate) async fn deploy_cluster_with_panel(
+pub(crate) async fn deploy_gateway_with_panel(
     options: DeployOptions,
     name: &str,
     location: &str,
-) -> Result<navigator_bootstrap::ClusterHandle> {
+) -> Result<navigator_bootstrap::GatewayHandle> {
     let interactive = std::io::stderr().is_terminal();
 
     if interactive {
-        let panel = std::sync::Arc::new(std::sync::Mutex::new(ClusterDeployLogPanel::new(
+        let panel = std::sync::Arc::new(std::sync::Mutex::new(GatewayDeployLogPanel::new(
             name, location,
         )));
         let panel_clone = std::sync::Arc::clone(&panel);
-        let result = navigator_bootstrap::deploy_cluster_with_logs(options, move |line| {
+        let result = navigator_bootstrap::deploy_gateway_with_logs(options, move |line| {
             if let Ok(mut p) = panel_clone.lock() {
                 p.push_log(line);
             }
@@ -942,7 +942,7 @@ pub(crate) async fn deploy_cluster_with_panel(
         }
     } else {
         eprintln!("Deploying {location} gateway {name}...");
-        let handle = navigator_bootstrap::deploy_cluster_with_logs(options, |line| {
+        let handle = navigator_bootstrap::deploy_gateway_with_logs(options, |line| {
             if let Some(status) = line.strip_prefix("[status] ") {
                 eprintln!("  {status}");
             } else if line.strip_prefix("[progress] ").is_some() {
@@ -957,8 +957,8 @@ pub(crate) async fn deploy_cluster_with_panel(
     }
 }
 
-/// Print post-deploy summary showing the cluster name and gateway endpoint.
-pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::ClusterHandle) {
+/// Print post-deploy summary showing the gateway name and endpoint.
+pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::GatewayHandle) {
     eprintln!();
     eprintln!("{} {} {name}", "✓".green().bold(), "Gateway ready:".green(),);
     eprintln!(
@@ -969,8 +969,8 @@ pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::Clu
     eprintln!();
 }
 
-/// Provision or start a cluster (local or remote).
-pub async fn cluster_admin_deploy(
+/// Provision or start a gateway (local or remote).
+pub async fn gateway_admin_deploy(
     name: &str,
     update_kube_config: bool,
     get_kubeconfig: bool,
@@ -1014,7 +1014,7 @@ pub async fn cluster_admin_deploy(
 
     let interactive = std::io::stderr().is_terminal();
 
-    // Check for existing cluster and prompt user if found.
+    // Check for existing gateway and prompt user if found.
     // --recreate skips the prompt and always destroys.
     {
         let remote_opts = remote.map(|dest| {
@@ -1030,7 +1030,7 @@ pub async fn cluster_admin_deploy(
             let should_recreate = if recreate {
                 true
             } else if interactive {
-                prompt_existing_cluster(name, &info)?
+                prompt_existing_gateway(name, &info)?
             } else {
                 false // non-interactive without --recreate: silently reuse
             };
@@ -1038,7 +1038,7 @@ pub async fn cluster_admin_deploy(
             if should_recreate {
                 eprintln!("• Destroying existing gateway...");
                 let handle =
-                    navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
+                    navigator_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
                 handle.destroy().await?;
                 eprintln!("{} Gateway destroyed, starting fresh.", "✓".green().bold());
                 eprintln!();
@@ -1047,7 +1047,7 @@ pub async fn cluster_admin_deploy(
         }
     }
 
-    let handle = deploy_cluster_with_panel(options, name, location).await?;
+    let handle = deploy_gateway_with_panel(options, name, location).await?;
 
     if update_kube_config {
         let target_path = default_local_kubeconfig_path()?;
@@ -1065,63 +1065,63 @@ pub async fn cluster_admin_deploy(
 
     print_deploy_summary(name, &handle);
 
-    // Auto-activate: set this cluster as the active cluster.
-    save_active_cluster(name)?;
+    // Auto-activate: set this gateway as the active gateway.
+    save_active_gateway(name)?;
     eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
 
     Ok(())
 }
 
-/// Resolve the remote SSH destination for a cluster.
+/// Resolve the remote SSH destination for a gateway.
 ///
 /// If `remote_override` is provided, use it. Otherwise, look up the remote
-/// host from stored cluster metadata.
-enum ClusterControlTarget {
+/// host from stored gateway metadata.
+enum GatewayControlTarget {
     Local,
     Remote(String),
     ExternalRegistration,
 }
 
-fn resolve_cluster_control_target(
+fn resolve_gateway_control_target(
     name: &str,
     remote_override: Option<&str>,
-) -> ClusterControlTarget {
-    resolve_cluster_control_target_from(get_cluster_metadata(name), remote_override)
+) -> GatewayControlTarget {
+    resolve_gateway_control_target_from(get_gateway_metadata(name), remote_override)
 }
 
-fn resolve_cluster_control_target_from(
-    metadata: Option<ClusterMetadata>,
+fn resolve_gateway_control_target_from(
+    metadata: Option<GatewayMetadata>,
     remote_override: Option<&str>,
-) -> ClusterControlTarget {
+) -> GatewayControlTarget {
     if let Some(r) = remote_override {
-        return ClusterControlTarget::Remote(r.to_string());
+        return GatewayControlTarget::Remote(r.to_string());
     }
 
     match metadata {
         Some(metadata) if metadata.is_remote => metadata
             .remote_host
-            .map(ClusterControlTarget::Remote)
-            .unwrap_or(ClusterControlTarget::ExternalRegistration),
-        _ => ClusterControlTarget::Local,
+            .map(GatewayControlTarget::Remote)
+            .unwrap_or(GatewayControlTarget::ExternalRegistration),
+        _ => GatewayControlTarget::Local,
     }
 }
 
-fn cluster_control_target_options(
+fn gateway_control_target_options(
     name: &str,
     remote_override: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<Option<RemoteOptions>> {
-    match resolve_cluster_control_target(name, remote_override) {
-        ClusterControlTarget::Local => Ok(None),
-        ClusterControlTarget::Remote(dest) => {
+    match resolve_gateway_control_target(name, remote_override) {
+        GatewayControlTarget::Local => Ok(None),
+        GatewayControlTarget::Remote(dest) => {
             let mut opts = RemoteOptions::new(&dest);
             if let Some(key) = ssh_key {
                 opts = opts.with_ssh_key(key);
             }
             Ok(Some(opts))
         }
-        ClusterControlTarget::ExternalRegistration => Err(miette::miette!(
-            "Gateway '{name}' is an external registration, not a managed Docker cluster.\n\
+        GatewayControlTarget::ExternalRegistration => Err(miette::miette!(
+            "Gateway '{name}' is an external registration, not a managed Docker gateway.\n\
              `openshell gateway stop` is only supported for local or SSH-managed gateways."
         )),
     }
@@ -1131,60 +1131,60 @@ fn remove_gateway_registration(name: &str) {
     if let Err(err) = navigator_bootstrap::edge_token::remove_edge_token(name) {
         tracing::debug!("failed to remove edge token: {err}");
     }
-    if let Err(err) = remove_cluster_metadata(name) {
-        tracing::debug!("failed to remove cluster metadata: {err}");
+    if let Err(err) = remove_gateway_metadata(name) {
+        tracing::debug!("failed to remove gateway metadata: {err}");
     }
-    if load_active_cluster().as_deref() == Some(name)
-        && let Err(err) = clear_active_cluster()
+    if load_active_gateway().as_deref() == Some(name)
+        && let Err(err) = clear_active_gateway()
     {
-        tracing::debug!("failed to clear active cluster: {err}");
+        tracing::debug!("failed to clear active gateway: {err}");
     }
 }
 
-fn cleanup_cluster_metadata(name: &str) {
+fn cleanup_gateway_metadata(name: &str) {
     if let Err(err) = navigator_bootstrap::edge_token::remove_edge_token(name) {
         tracing::debug!("failed to remove edge token: {err}");
     }
-    if let Err(err) = remove_cluster_metadata(name) {
-        tracing::debug!("failed to remove cluster metadata: {err}");
+    if let Err(err) = remove_gateway_metadata(name) {
+        tracing::debug!("failed to remove gateway metadata: {err}");
     }
-    if load_active_cluster().as_deref() == Some(name)
-        && let Err(err) = clear_active_cluster()
+    if load_active_gateway().as_deref() == Some(name)
+        && let Err(err) = clear_active_gateway()
     {
-        tracing::debug!("failed to clear active cluster: {err}");
+        tracing::debug!("failed to clear active gateway: {err}");
     }
 }
 
 fn resolve_remote(name: &str, remote_override: Option<&str>) -> Option<String> {
-    match resolve_cluster_control_target(name, remote_override) {
-        ClusterControlTarget::Remote(dest) => Some(dest),
-        ClusterControlTarget::Local | ClusterControlTarget::ExternalRegistration => None,
+    match resolve_gateway_control_target(name, remote_override) {
+        GatewayControlTarget::Remote(dest) => Some(dest),
+        GatewayControlTarget::Local | GatewayControlTarget::ExternalRegistration => None,
     }
 }
 
-/// Stop a cluster.
-pub async fn cluster_admin_stop(
+/// Stop a gateway.
+pub async fn gateway_admin_stop(
     name: &str,
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    let remote_opts = cluster_control_target_options(name, remote, ssh_key)?;
+    let remote_opts = gateway_control_target_options(name, remote, ssh_key)?;
 
-    eprintln!("• Stopping cluster {name}...");
-    let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
+    eprintln!("• Stopping gateway {name}...");
+    let handle = navigator_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
     handle.stop().await?;
-    eprintln!("{} Cluster {name} stopped.", "✓".green().bold());
+    eprintln!("{} Gateway {name} stopped.", "✓".green().bold());
     Ok(())
 }
 
-/// Destroy a cluster and its state.
-pub async fn cluster_admin_destroy(
+/// Destroy a gateway and its state.
+pub async fn gateway_admin_destroy(
     name: &str,
     remote: Option<&str>,
     ssh_key: Option<&str>,
 ) -> Result<()> {
-    match resolve_cluster_control_target(name, remote) {
-        ClusterControlTarget::ExternalRegistration => {
+    match resolve_gateway_control_target(name, remote) {
+        GatewayControlTarget::ExternalRegistration => {
             eprintln!("• Removing gateway registration {name}...");
             remove_gateway_registration(name);
             eprintln!(
@@ -1193,24 +1193,24 @@ pub async fn cluster_admin_destroy(
             );
             Ok(())
         }
-        ClusterControlTarget::Local | ClusterControlTarget::Remote(_) => {
-            let remote_opts = cluster_control_target_options(name, remote, ssh_key)?;
+        GatewayControlTarget::Local | GatewayControlTarget::Remote(_) => {
+            let remote_opts = gateway_control_target_options(name, remote, ssh_key)?;
 
-            eprintln!("• Destroying cluster {name}...");
-            let handle = navigator_bootstrap::cluster_handle(name, remote_opts.as_ref()).await?;
+            eprintln!("• Destroying gateway {name}...");
+            let handle = navigator_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
             handle.destroy().await?;
 
-            cleanup_cluster_metadata(name);
+            cleanup_gateway_metadata(name);
 
-            eprintln!("{} Cluster {name} destroyed.", "✓".green().bold());
+            eprintln!("{} Gateway {name} destroyed.", "✓".green().bold());
             Ok(())
         }
     }
 }
 
-/// Show cluster deployment details.
-pub fn cluster_admin_info(name: &str) -> Result<()> {
-    let metadata = get_cluster_metadata(name).ok_or_else(|| {
+/// Show gateway deployment details.
+pub fn gateway_admin_info(name: &str) -> Result<()> {
+    let metadata = get_gateway_metadata(name).ok_or_else(|| {
         miette::miette!(
             "No gateway metadata found for '{name}'.\n\
               Deploy a gateway first with: openshell gateway start --name {name}"
@@ -1219,9 +1219,9 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
 
     let kubeconfig_path = navigator_bootstrap::stored_kubeconfig_path(name)?;
 
-    println!("{}", "Cluster Info".cyan().bold());
+    println!("{}", "Gateway Info".cyan().bold());
     println!();
-    println!("  {} {}", "Cluster:".dimmed(), metadata.name);
+    println!("  {} {}", "Gateway:".dimmed(), metadata.name);
     println!(
         "  {} {}",
         "Gateway endpoint:".dimmed(),
@@ -1259,8 +1259,8 @@ pub fn cluster_admin_info(name: &str) -> Result<()> {
     Ok(())
 }
 
-/// Print or start an SSH tunnel for kubectl access to a remote cluster.
-pub fn cluster_admin_tunnel(
+/// Print or start an SSH tunnel for kubectl access to a remote gateway.
+pub fn gateway_admin_tunnel(
     name: &str,
     remote_override: Option<&str>,
     ssh_key: Option<&str>,
@@ -1268,16 +1268,16 @@ pub fn cluster_admin_tunnel(
 ) -> Result<()> {
     let remote = resolve_remote(name, remote_override).ok_or_else(|| {
         miette::miette!(
-            "Cluster '{name}' is not a remote cluster (no SSH destination found).\n\
-             SSH tunnels are only needed for remote clusters."
+            "Gateway '{name}' is not a remote gateway (no SSH destination found).\n\
+             SSH tunnels are only needed for remote gateways."
         )
     })?;
 
-    let kube_port = get_cluster_metadata(name)
+    let kube_port = get_gateway_metadata(name)
         .and_then(|m| m.kube_port)
         .ok_or_else(|| {
             miette::miette!(
-                "Cluster '{name}' was deployed without --kube-port.\n\
+                "Gateway '{name}' was deployed without --kube-port.\n\
                  Redeploy with --kube-port <port> to enable kubectl access via SSH tunnel."
             )
         })?;
@@ -1310,9 +1310,9 @@ pub fn cluster_admin_tunnel(
     Ok(())
 }
 
-/// Create a sandbox when no cluster is configured.
+/// Create a sandbox when no gateway is configured.
 ///
-/// Offers to bootstrap a new cluster first, then delegates to [`sandbox_create`].
+/// Offers to bootstrap a new gateway first, then delegates to [`sandbox_create`].
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create_with_bootstrap(
     name: Option<&str>,
@@ -1337,13 +1337,13 @@ pub async fn sandbox_create_with_bootstrap(
         ));
     }
     let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
-    // The bootstrap flow always creates a cluster named "openshell".
-    let cluster_name = "openshell";
+    // The bootstrap flow always creates a gateway named "openshell".
+    let gateway_name = "openshell";
     sandbox_create(
         &server,
         name,
         from,
-        cluster_name,
+        gateway_name,
         upload,
         keep,
         remote,
@@ -1366,7 +1366,7 @@ pub async fn sandbox_create(
     server: &str,
     name: Option<&str>,
     from: Option<&str>,
-    cluster_name: &str,
+    gateway_name: &str,
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
     remote: Option<&str>,
@@ -1380,7 +1380,7 @@ pub async fn sandbox_create(
     auto_providers_override: Option<bool>,
     tls: &TlsOptions,
 ) -> Result<()> {
-    // Try connecting to the cluster. If it fails due to an unreachable cluster,
+    // Try connecting to the gateway. If it fails due to an unreachable gateway,
     // offer to bootstrap a local one and retry.
     let (mut client, effective_server, effective_tls) = match grpc_client(server, tls).await {
         Ok(c) => (c, server.to_string(), tls.clone()),
@@ -1394,7 +1394,7 @@ pub async fn sandbox_create(
             let (new_tls, new_server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
-                .wrap_err("bootstrap succeeded but failed to connect to cluster")?;
+                .wrap_err("bootstrap succeeded but failed to connect to gateway")?;
             (c, new_server, new_tls)
         }
     };
@@ -1410,7 +1410,7 @@ pub async fn sandbox_create(
                     dockerfile,
                     context,
                 } => {
-                    let tag = build_from_dockerfile(&dockerfile, &context, cluster_name).await?;
+                    let tag = build_from_dockerfile(&dockerfile, &context, gateway_name).await?;
                     Some(tag)
                 }
             }
@@ -1464,9 +1464,9 @@ pub async fn sandbox_create(
     let interactive = std::io::stdout().is_terminal();
     let sandbox_name = sandbox.name.clone();
 
-    // Record this sandbox as the last-used for the active cluster.
-    if let Some(cluster) = effective_tls.cluster_name() {
-        let _ = save_last_sandbox(cluster, &sandbox_name);
+    // Record this sandbox as the last-used for the active gateway.
+    if let Some(gateway) = effective_tls.gateway_name() {
+        let _ = save_last_sandbox(gateway, &sandbox_name);
     }
 
     // Set up display — interactive terminals get a step-based checklist with
@@ -1883,20 +1883,20 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
     Ok(ResolvedSource::Image(format!("{prefix}/{value}:latest")))
 }
 
-/// Build a Dockerfile and push the resulting image into the cluster.
+/// Build a Dockerfile and push the resulting image into the gateway.
 ///
 /// Returns the image tag that was built so the caller can use it for sandbox
 /// creation.
 async fn build_from_dockerfile(
     dockerfile: &Path,
     context: &Path,
-    cluster_name: &str,
+    gateway_name: &str,
 ) -> Result<String> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let tag = format!("navigator/sandbox-from:{timestamp}");
+    let tag = format!("openshell/sandbox-from:{timestamp}");
 
     eprintln!(
         "Building image {} from {}",
@@ -1904,7 +1904,7 @@ async fn build_from_dockerfile(
         dockerfile.display()
     );
     eprintln!("  {} {}", "Context:".dimmed(), context.display());
-    eprintln!("  {} {}", "Cluster:".dimmed(), cluster_name);
+    eprintln!("  {} {}", "Gateway:".dimmed(), gateway_name);
     eprintln!();
 
     let mut on_log = |msg: String| {
@@ -1915,7 +1915,7 @@ async fn build_from_dockerfile(
         dockerfile,
         &tag,
         context,
-        cluster_name,
+        gateway_name,
         &HashMap::new(),
         &mut on_log,
     )
@@ -1923,7 +1923,7 @@ async fn build_from_dockerfile(
 
     eprintln!();
     eprintln!(
-        "{} Image {} is available in the cluster.",
+        "{} Image {} is available in the gateway.",
         "✓".green().bold(),
         tag.cyan(),
     );
@@ -2785,7 +2785,7 @@ pub async fn provider_delete(server: &str, names: &[String], tls: &TlsOptions) -
     Ok(())
 }
 
-pub async fn cluster_inference_set(
+pub async fn gateway_inference_set(
     server: &str,
     provider_name: &str,
     model_id: &str,
@@ -2801,7 +2801,7 @@ pub async fn cluster_inference_set(
         .into_diagnostic()?;
 
     let configured = response.into_inner();
-    println!("{}", "Cluster inference configured:".cyan().bold());
+    println!("{}", "Gateway inference configured:".cyan().bold());
     println!();
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
@@ -2809,7 +2809,7 @@ pub async fn cluster_inference_set(
     Ok(())
 }
 
-pub async fn cluster_inference_update(
+pub async fn gateway_inference_update(
     server: &str,
     provider_name: Option<&str>,
     model_id: Option<&str>,
@@ -2842,7 +2842,7 @@ pub async fn cluster_inference_update(
         .into_diagnostic()?;
 
     let configured = response.into_inner();
-    println!("{}", "Cluster inference updated:".cyan().bold());
+    println!("{}", "Gateway inference updated:".cyan().bold());
     println!();
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
@@ -2850,7 +2850,7 @@ pub async fn cluster_inference_update(
     Ok(())
 }
 
-pub async fn cluster_inference_get(server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_inference_get(server: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_inference_client(server, tls).await?;
     let response = client
         .get_cluster_inference(GetClusterInferenceRequest {})
@@ -2858,7 +2858,7 @@ pub async fn cluster_inference_get(server: &str, tls: &TlsOptions) -> Result<()>
         .into_diagnostic()?;
 
     let configured = response.into_inner();
-    println!("{}", "Cluster inference:".cyan().bold());
+    println!("{}", "Gateway inference:".cyan().bold());
     println!();
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
@@ -3369,8 +3369,8 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClusterControlTarget, TlsOptions, git_sync_files, http_health_check,
-        inferred_provider_type, parse_credential_pairs, resolve_cluster_control_target_from,
+        GatewayControlTarget, TlsOptions, git_sync_files, http_health_check,
+        inferred_provider_type, parse_credential_pairs, resolve_gateway_control_target_from,
     };
     use hyper::StatusCode;
     use std::fs;
@@ -3380,7 +3380,7 @@ mod tests {
     use std::process::Command;
     use std::thread;
 
-    use navigator_bootstrap::ClusterMetadata;
+    use navigator_bootstrap::GatewayMetadata;
 
     struct EnvVarGuard {
         key: &'static str,
@@ -3421,8 +3421,8 @@ mod tests {
         }
     }
 
-    fn edge_registration(name: &str, endpoint: &str) -> ClusterMetadata {
-        ClusterMetadata {
+    fn edge_registration(name: &str, endpoint: &str) -> GatewayMetadata {
+        GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
@@ -3562,18 +3562,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_cluster_control_target_marks_edge_registration_unmanaged() {
+    fn resolve_gateway_control_target_marks_edge_registration_unmanaged() {
         let metadata = edge_registration("edge-gateway", "https://gw.example.com");
-        let target = resolve_cluster_control_target_from(Some(metadata), None);
-        assert!(matches!(target, ClusterControlTarget::ExternalRegistration));
+        let target = resolve_gateway_control_target_from(Some(metadata), None);
+        assert!(matches!(target, GatewayControlTarget::ExternalRegistration));
     }
 
     #[test]
-    fn resolve_cluster_control_target_prefers_explicit_remote_override() {
-        let target = resolve_cluster_control_target_from(None, Some("user@host"));
+    fn resolve_gateway_control_target_prefers_explicit_remote_override() {
+        let target = resolve_gateway_control_target_from(None, Some("user@host"));
         match target {
-            ClusterControlTarget::Remote(dest) => assert_eq!(dest, "user@host"),
-            ClusterControlTarget::Local | ClusterControlTarget::ExternalRegistration => {
+            GatewayControlTarget::Remote(dest) => assert_eq!(dest, "user@host"),
+            GatewayControlTarget::Local | GatewayControlTarget::ExternalRegistration => {
                 panic!("expected remote target")
             }
         }

@@ -71,7 +71,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Line::from(vec![
             Span::styled(" Providers ", styles::HEADING),
             Span::styled("- ", styles::BORDER),
-            Span::styled(&app.cluster_name, styles::MUTED),
+            Span::styled(&app.gateway_name, styles::MUTED),
             Span::styled(" ", styles::MUTED),
         ])
     };

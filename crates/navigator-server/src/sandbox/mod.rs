@@ -28,9 +28,9 @@ const KUBE_API_TIMEOUT: Duration = Duration::from_secs(30);
 const SANDBOX_GROUP: &str = "agents.x-k8s.io";
 const SANDBOX_VERSION: &str = "v1alpha1";
 pub const SANDBOX_KIND: &str = "Sandbox";
-const SANDBOX_ID_LABEL: &str = "navigator.ai/sandbox-id";
-const SANDBOX_MANAGED_LABEL: &str = "navigator.ai/managed-by";
-const SANDBOX_MANAGED_VALUE: &str = "navigator";
+const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
+const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
+const SANDBOX_MANAGED_VALUE: &str = "openshell";
 
 #[derive(Clone)]
 pub struct SandboxClient {
@@ -898,8 +898,8 @@ fn sandbox_template_to_k8s(
         container.insert(
             "volumeMounts".to_string(),
             serde_json::json!([{
-                "name": "navigator-client-tls",
-                "mountPath": "/etc/navigator-tls/client",
+                "name": "openshell-client-tls",
+                "mountPath": "/etc/openshell-tls/client",
                 "readOnly": true
             }]),
         );
@@ -918,7 +918,7 @@ fn sandbox_template_to_k8s(
         spec.insert(
             "volumes".to_string(),
             serde_json::json!([{
-                "name": "navigator-client-tls",
+                "name": "openshell-client-tls",
                 "secret": { "secretName": client_tls_secret_name }
             }]),
         );
@@ -968,7 +968,7 @@ fn inject_pod_template(
             .or_insert_with(|| serde_json::Value::Array(Vec::new()));
         if let Some(volumes_arr) = volumes.as_array_mut() {
             volumes_arr.push(serde_json::json!({
-                "name": "navigator-client-tls",
+                "name": "openshell-client-tls",
                 "secret": { "secretName": client_tls_secret_name }
             }));
         }
@@ -1015,8 +1015,8 @@ fn inject_pod_template(
                 .or_insert_with(|| serde_json::Value::Array(Vec::new()));
             if let Some(mounts_arr) = mounts.as_array_mut() {
                 mounts_arr.push(serde_json::json!({
-                    "name": "navigator-client-tls",
-                    "mountPath": "/etc/navigator-tls/client",
+                    "name": "openshell-client-tls",
+                    "mountPath": "/etc/openshell-tls/client",
                     "readOnly": true
                 }));
             }

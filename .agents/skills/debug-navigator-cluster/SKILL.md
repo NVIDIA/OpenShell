@@ -13,8 +13,8 @@ Diagnose why a openshell cluster failed to start after `openshell gateway start`
 
 1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
-3. Create Docker network (`navigator-cluster`) and volume (`navigator-cluster-{name}`)
-4. Create and start a privileged Docker container (`navigator-cluster-{name}`)
+3. Create Docker network (`openshell-cluster`) and volume (`openshell-cluster-{name}`)
+4. Create and start a privileged Docker container (`openshell-cluster-{name}`)
 5. Wait for k3s to generate kubeconfig (up to 60s)
 6. **Clean stale nodes**: Remove any `NotReady` k3s nodes left over from previous container instances that reused the same persistent volume
 7. **Prepare local images** (if `OPENSHELL_PUSH_IMAGES` is set): In `internal` registry mode, bootstrap waits for the in-cluster registry and pushes tagged images there. In `external` mode, bootstrap uses legacy `ctr -n k8s.io images import` push-mode behavior.
@@ -35,7 +35,7 @@ The host port is configurable via `--port` on `openshell gateway start` (default
 
 The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validation succeeds.
 
-The default cluster name is `openshell`. The container is `navigator-cluster-{name}`.
+The default cluster name is `openshell`. The container is `openshell-cluster-{name}`.
 
 ## Prerequisites
 
@@ -51,7 +51,7 @@ When the user asks to debug a cluster failure, **run diagnostics automatically**
 
 Before running commands, establish:
 
-1. **Cluster name**: Default is `openshell`, giving container name `navigator-cluster-openshell`
+1. **Cluster name**: Default is `openshell`, giving container name `openshell-cluster-openshell`
 2. **Remote or local**: If the user deployed with `--remote <host>`, all Docker commands must target that host
 3. **Config directory**: `~/.config/openshell/clusters/{name}/`
 
@@ -62,14 +62,14 @@ For remote clusters, prefix Docker commands with SSH:
 ssh <host> docker <command>
 
 # Remote kubectl inside the container
-ssh <host> docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl <command>'
+ssh <host> docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl <command>'
 ```
 
 For local clusters, run Docker commands directly:
 
 ```bash
 docker <command>
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl <command>'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl <command>'
 ```
 
 ### Step 1: Check Docker Container State
@@ -77,14 +77,14 @@ docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yam
 First, determine if the container exists and its state:
 
 ```bash
-docker ps -a --filter name=navigator-cluster- --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'
+docker ps -a --filter name=openshell-cluster- --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'
 ```
 
 If the container does not exist:
 
 ```bash
 # Check if the image is available
-docker images 'navigator/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
+docker images 'openshell/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
 ```
 
 If the image is missing, re-deploy so bootstrap can pull the published cluster image (or set `OPENSHELL_CLUSTER_IMAGE` explicitly).
@@ -92,7 +92,7 @@ If the image is missing, re-deploy so bootstrap can pull the published cluster i
 If the container exists but is not running, inspect it:
 
 ```bash
-docker inspect navigator-cluster-<name> --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
+docker inspect openshell-cluster-<name> --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
 ```
 
 - **OOMKilled=true**: The host doesn't have enough memory.
@@ -103,7 +103,7 @@ docker inspect navigator-cluster-<name> --format '{{.State.Status}} exit={{.Stat
 Get recent container logs to identify startup failures:
 
 ```bash
-docker logs navigator-cluster-<name> --tail 100
+docker logs openshell-cluster-<name> --tail 100
 ```
 
 Look for:
@@ -119,13 +119,13 @@ Verify k3s itself is functional:
 
 ```bash
 # API server readiness
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get --raw="/readyz"'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get --raw="/readyz"'
 
 # Node status
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes -o wide'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes -o wide'
 
 # All pods
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -A -o wide'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -A -o wide'
 ```
 
 If `/readyz` fails, k3s is still starting or has crashed. Check container logs (Step 2).
@@ -138,16 +138,16 @@ The OpenShell server is deployed via a HelmChart CR as a StatefulSet with persis
 
 ```bash
 # StatefulSet status
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get statefulset/navigator -o wide'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get statefulset/navigator -o wide'
 
 # OpenShell pod logs
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator logs statefulset/navigator --tail=100'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator logs statefulset/navigator --tail=100'
 
 # Describe statefulset for events
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator describe statefulset/navigator'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator describe statefulset/navigator'
 
 # Helm install job logs (the job that installs the OpenShell chart)
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n kube-system logs -l job-name=helm-install-navigator --tail=200'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n kube-system logs -l job-name=helm-install-navigator --tail=200'
 ```
 
 Common issues:
@@ -162,15 +162,15 @@ The Envoy Gateway provides HTTP/gRPC ingress:
 
 ```bash
 # Gateway status
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get gateway/navigator-gateway'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get gateway/navigator-gateway'
 
 # Check port bindings on the host
-docker port navigator-cluster-<name>
+docker port openshell-cluster-<name>
 ```
 
 Expected ports: `6443/tcp`, `30051/tcp` (mapped to configurable host port, default 8080; set via `--port` on deploy).
 Only one local cluster can run on a Docker host at a time because `6443` is fixed.
-`mise run cluster` handles this by removing conflicting local `navigator-cluster-*` containers first.
+`mise run cluster` handles this by removing conflicting local `openshell-cluster-*` containers first.
 
 If ports are missing or conflicting, another process may be using them. Check with:
 
@@ -185,37 +185,37 @@ If using Docker-in-Docker (`DOCKER_HOST=tcp://docker:2375`), verify metadata poi
 
 Component images (server, sandbox, pki-job) can reach kubelet via two paths:
 
-**Local/external pull mode** (default local via `mise run cluster` / `mise run cluster:build`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/navigator/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). `cluster:build` builds then pushes images; `cluster` pushes prebuilt local tags (`navigator/*:dev`, falling back to `localhost:5000/navigator/*:dev` or `127.0.0.1:5000/navigator/*:dev`).
+**Local/external pull mode** (default local via `mise run cluster`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/openshell/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
 
 ```bash
 # Verify image refs currently used by openshell deployment
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get deploy navigator -o jsonpath="{.spec.template.spec.containers[*].image}"'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get deploy navigator -o jsonpath="{.spec.template.spec.containers[*].image}"'
 
 # Verify registry mirror/auth endpoint configuration
-docker exec navigator-cluster-<name> cat /etc/rancher/k3s/registries.yaml
+docker exec openshell-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 ```
 
-**Legacy push mode** (`mise run cluster:push`): Images are imported into the k3s containerd `k8s.io` namespace.
+**Legacy push mode**: Images are imported into the k3s containerd `k8s.io` namespace.
 
 ```bash
 # Check if images were imported into containerd (k3s default namespace is k8s.io)
-docker exec navigator-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images ls | grep navigator
+docker exec openshell-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images ls | grep navigator
 ```
 
 If images are missing, re-import with:
 
 ```bash
-docker save <image-ref> | docker exec -i navigator-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images import -
+docker save <image-ref> | docker exec -i openshell-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images import -
 ```
 
 **External pull mode** (remote deploy, or local with `OPENSHELL_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
 
 ```bash
 # Verify registries.yaml exists and has credentials
-docker exec navigator-cluster-<name> cat /etc/rancher/k3s/registries.yaml
+docker exec openshell-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 
 # Test pulling an image manually from inside the cluster
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/nemoclaw/server:latest'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/nemoclaw/server:latest'
 ```
 
 If `registries.yaml` is missing or has wrong values, verify env wiring (`OPENSHELL_REGISTRY_HOST`, `OPENSHELL_REGISTRY_INSECURE`, username/password for authenticated registries).
@@ -226,10 +226,10 @@ TLS certificates are generated by the `navigator-bootstrap` crate (using `rcgen`
 
 ```bash
 # Check if the three TLS secrets exist
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get secret navigator-server-tls navigator-server-client-ca navigator-client-tls'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get secret navigator-server-tls navigator-server-client-ca navigator-client-tls'
 
 # Inspect server cert expiry (if openssl is available in the container)
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get secret navigator-server-tls -o jsonpath="{.data.tls\.crt}" | base64 -d | openssl x509 -noout -dates 2>/dev/null || echo "openssl not available"'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl -n navigator get secret navigator-server-tls -o jsonpath="{.data.tls\.crt}" | base64 -d | openssl x509 -noout -dates 2>/dev/null || echo "openssl not available"'
 
 # Check if CLI-side mTLS files exist locally
 ls -la ~/.config/openshell/clusters/<name>/mtls/
@@ -247,7 +247,7 @@ Common mTLS issues:
 Events catch scheduling failures, image pull errors, and resource issues:
 
 ```bash
-docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get events -A --sort-by=.lastTimestamp' | tail -n 50
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get events -A --sort-by=.lastTimestamp' | tail -n 50
 ```
 
 Look for:
@@ -264,13 +264,13 @@ DNS misconfiguration is a common root cause, especially on remote/Linux hosts:
 
 ```bash
 # Check the resolv.conf k3s is using
-docker exec navigator-cluster-<name> cat /etc/rancher/k3s/resolv.conf
+docker exec openshell-cluster-<name> cat /etc/rancher/k3s/resolv.conf
 
 # Test DNS resolution from inside the container
-docker exec navigator-cluster-<name> sh -c 'nslookup google.com || wget -q -O /dev/null http://google.com && echo "network ok" || echo "network unreachable"'
+docker exec openshell-cluster-<name> sh -c 'nslookup google.com || wget -q -O /dev/null http://google.com && echo "network ok" || echo "network unreachable"'
 
 # Check the entrypoint's DNS decision (in container logs)
-docker logs navigator-cluster-<name> 2>&1 | head -20
+docker logs openshell-cluster-<name> 2>&1 | head -20
 ```
 
 The entrypoint script selects DNS resolvers in this priority:
@@ -317,15 +317,15 @@ For clusters deployed with `--remote <host>`, all commands must target the remot
 
 ```bash
 ssh <host> docker ps -a
-ssh <host> docker logs navigator-cluster-<name>
-ssh <host> docker exec navigator-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -A'
+ssh <host> docker logs openshell-cluster-<name>
+ssh <host> docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -A'
 ```
 
 **Option B: Docker SSH context**:
 
 ```bash
 docker -H ssh://<host> ps -a
-docker -H ssh://<host> logs navigator-cluster-<name>
+docker -H ssh://<host> logs openshell-cluster-<name>
 ```
 
 **Setting up kubectl access** (requires tunnel):
@@ -344,7 +344,7 @@ Run all diagnostics at once for a comprehensive report:
 ```bash
 HOST="<host>"  # leave empty for local, or set to SSH destination
 NAME="openshell"  # cluster name
-CONTAINER="navigator-cluster-${NAME}"
+CONTAINER="openshell-cluster-${NAME}"
 KCFG="KUBECONFIG=/etc/rancher/k3s/k3s.yaml"
 
 # Helper: run docker command locally or remotely

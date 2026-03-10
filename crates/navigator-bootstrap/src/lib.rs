@@ -31,30 +31,30 @@ use crate::constants::{
     volume_name,
 };
 use crate::docker::{
-    check_existing_cluster, create_ssh_docker_client, destroy_cluster_resources, ensure_container,
+    check_existing_gateway, create_ssh_docker_client, destroy_gateway_resources, ensure_container,
     ensure_image, ensure_network, ensure_volume, start_container, stop_container,
 };
 use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
 use crate::metadata::{
-    create_cluster_metadata, create_cluster_metadata_with_host, extract_host_from_ssh_destination,
+    create_gateway_metadata, create_gateway_metadata_with_host, extract_host_from_ssh_destination,
     local_gateway_host, resolve_ssh_hostname,
 };
 use crate::mtls::store_pki_bundle;
 use crate::pki::generate_pki;
 use crate::runtime::{
     clean_stale_nodes, exec_capture_with_exit, fetch_recent_logs, navigator_workload_exists,
-    restart_navigator_deployment, wait_for_cluster_ready, wait_for_kubeconfig,
+    restart_navigator_deployment, wait_for_gateway_ready, wait_for_kubeconfig,
 };
 
-pub use crate::docker::ExistingClusterInfo;
+pub use crate::docker::ExistingGatewayInfo;
 pub use crate::kubeconfig::{
     default_local_kubeconfig_path, print_kubeconfig, stored_kubeconfig_path,
     update_local_kubeconfig,
 };
 pub use crate::metadata::{
-    ClusterMetadata, clear_active_cluster, get_cluster_metadata, list_clusters,
-    load_active_cluster, load_cluster_metadata, load_last_sandbox, remove_cluster_metadata,
-    save_active_cluster, save_last_sandbox, store_cluster_metadata,
+    GatewayMetadata, clear_active_gateway, get_gateway_metadata, list_gateways,
+    load_active_gateway, load_gateway_metadata, load_last_sandbox, remove_gateway_metadata,
+    save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
 
 /// Options for remote SSH deployment.
@@ -191,20 +191,20 @@ impl DeployOptions {
 }
 
 #[derive(Debug, Clone)]
-pub struct ClusterHandle {
+pub struct GatewayHandle {
     name: String,
     kubeconfig_path: PathBuf,
-    metadata: ClusterMetadata,
+    metadata: GatewayMetadata,
     docker: Docker,
 }
 
-impl ClusterHandle {
+impl GatewayHandle {
     pub fn kubeconfig_path(&self) -> &Path {
         &self.kubeconfig_path
     }
 
-    /// Get the cluster metadata.
-    pub fn metadata(&self) -> &ClusterMetadata {
+    /// Get the gateway metadata.
+    pub fn metadata(&self) -> &GatewayMetadata {
         &self.metadata
     }
 
@@ -218,35 +218,35 @@ impl ClusterHandle {
     }
 
     pub async fn destroy(&self) -> Result<()> {
-        destroy_cluster_resources(&self.docker, &self.name, &self.kubeconfig_path).await
+        destroy_gateway_resources(&self.docker, &self.name, &self.kubeconfig_path).await
     }
 }
 
-/// Check whether a cluster with the given name already has resources deployed.
+/// Check whether a gateway with the given name already has resources deployed.
 ///
-/// Returns `None` if no existing cluster resources are found, or
-/// `Some(ExistingClusterInfo)` with details about what exists.
+/// Returns `None` if no existing gateway resources are found, or
+/// `Some(ExistingGatewayInfo)` with details about what exists.
 pub async fn check_existing_deployment(
     name: &str,
     remote: Option<&RemoteOptions>,
-) -> Result<Option<ExistingClusterInfo>> {
+) -> Result<Option<ExistingGatewayInfo>> {
     let docker = match remote {
         Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
         None => Docker::connect_with_local_defaults().into_diagnostic()?,
     };
-    check_existing_cluster(&docker, name).await
+    check_existing_gateway(&docker, name).await
 }
 
-pub async fn deploy_cluster(options: DeployOptions) -> Result<ClusterHandle> {
-    deploy_cluster_with_logs(options, |_| {}).await
+pub async fn deploy_gateway(options: DeployOptions) -> Result<GatewayHandle> {
+    deploy_gateway_with_logs(options, |_| {}).await
 }
 
-pub async fn deploy_cluster_with_logs<F>(options: DeployOptions, on_log: F) -> Result<ClusterHandle>
+pub async fn deploy_gateway_with_logs<F>(options: DeployOptions, on_log: F) -> Result<GatewayHandle>
 where
     F: FnMut(String) + Send + 'static,
 {
     let name = options.name;
-    let image_ref = options.image_ref.unwrap_or_else(default_cluster_image_ref);
+    let image_ref = options.image_ref.unwrap_or_else(default_gateway_image_ref);
     let port = options.port;
     let gateway_host = options.gateway_host;
     let kube_port = options.kube_port;
@@ -450,17 +450,17 @@ where
         // Create a short-lived closure that locks on each call rather than holding
         // the MutexGuard across await points.
         let on_log_ref = Arc::clone(&on_log);
-        let mut cluster_log = move |msg: String| {
+        let mut gateway_log = move |msg: String| {
             if let Ok(mut f) = on_log_ref.lock() {
                 f(msg);
             }
         };
-        wait_for_cluster_ready(&target_docker, &name, &mut cluster_log).await?;
+        wait_for_gateway_ready(&target_docker, &name, &mut gateway_log).await?;
     }
 
-    // Create and store cluster metadata.
+    // Create and store gateway metadata.
     log("[progress] Persisting gateway metadata".to_string());
-    let metadata = create_cluster_metadata_with_host(
+    let metadata = create_gateway_metadata_with_host(
         &name,
         remote_opts.as_ref(),
         port,
@@ -468,9 +468,9 @@ where
         ssh_gateway_host.as_deref(),
         disable_tls,
     );
-    store_cluster_metadata(&name, &metadata)?;
+    store_gateway_metadata(&name, &metadata)?;
 
-    Ok(ClusterHandle {
+    Ok(GatewayHandle {
         name,
         kubeconfig_path,
         metadata,
@@ -478,11 +478,11 @@ where
     })
 }
 
-/// Get a handle to an existing cluster.
+/// Get a handle to an existing gateway.
 ///
-/// For local clusters, pass `None` for remote options.
-/// For remote clusters, pass the same `RemoteOptions` used during deployment.
-pub async fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<ClusterHandle> {
+/// For local gateways, pass `None` for remote options.
+/// For remote gateways, pass the same `RemoteOptions` used during deployment.
+pub async fn gateway_handle(name: &str, remote: Option<&RemoteOptions>) -> Result<GatewayHandle> {
     let docker = match remote {
         Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
         None => Docker::connect_with_local_defaults().into_diagnostic()?,
@@ -490,9 +490,9 @@ pub async fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
     let kubeconfig_path = stored_kubeconfig_path(name)?;
     // Try to load existing metadata, fall back to creating new metadata
     // with the default ports (the actual ports are only known at deploy time).
-    let metadata = load_cluster_metadata(name)
-        .unwrap_or_else(|_| create_cluster_metadata(name, remote, DEFAULT_GATEWAY_PORT, None));
-    Ok(ClusterHandle {
+    let metadata = load_gateway_metadata(name)
+        .unwrap_or_else(|_| create_gateway_metadata(name, remote, DEFAULT_GATEWAY_PORT, None));
+    Ok(GatewayHandle {
         name: name.to_string(),
         kubeconfig_path,
         metadata,
@@ -500,28 +500,28 @@ pub async fn cluster_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
     })
 }
 
-pub async fn ensure_cluster_image(version: &str, registry_token: Option<&str>) -> Result<String> {
+pub async fn ensure_gateway_image(version: &str, registry_token: Option<&str>) -> Result<String> {
     let docker = Docker::connect_with_local_defaults().into_diagnostic()?;
-    let image_ref = format!("{}:{version}", image::DEFAULT_CLUSTER_IMAGE);
+    let image_ref = format!("{}:{version}", image::DEFAULT_GATEWAY_IMAGE);
     ensure_image(&docker, &image_ref, registry_token).await?;
     Ok(image_ref)
 }
 
-fn default_cluster_image_ref() -> String {
+fn default_gateway_image_ref() -> String {
     if let Ok(image) = std::env::var("OPENSHELL_CLUSTER_IMAGE")
         && !image.trim().is_empty()
     {
         return image;
     }
-    image::DEFAULT_CLUSTER_IMAGE.to_string()
+    image::DEFAULT_GATEWAY_IMAGE.to_string()
 }
 
 /// Create the three TLS K8s secrets required by the `OpenShell` server and sandbox pods.
 ///
 /// Secrets are created via `kubectl` exec'd inside the cluster container:
-/// - `navigator-server-tls` (kubernetes.io/tls): server cert + key
-/// - `navigator-server-client-ca` (Opaque): CA cert for verifying client certs
-/// - `navigator-client-tls` (Opaque): client cert + key + CA cert (shared by CLI & sandboxes)
+/// - `openshell-server-tls` (kubernetes.io/tls): server cert + key
+/// - `openshell-server-client-ca` (Opaque): CA cert for verifying client certs
+/// - `openshell-client-tls` (Opaque): client cert + key + CA cert (shared by CLI & sandboxes)
 async fn create_k8s_tls_secrets(
     docker: &Docker,
     name: &str,
@@ -560,13 +560,13 @@ async fn create_k8s_tls_secrets(
         }
     };
 
-    // 1. navigator-server-tls (kubernetes.io/tls)
+    // 1. openshell-server-tls (kubernetes.io/tls)
     let server_tls_manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": SERVER_TLS_SECRET_NAME,
-            "namespace": "navigator"
+            "namespace": "openshell"
         },
         "type": "kubernetes.io/tls",
         "data": {
@@ -576,15 +576,15 @@ async fn create_k8s_tls_secrets(
     });
     apply_secret(server_tls_manifest.to_string())
         .await
-        .wrap_err("failed to create navigator-server-tls secret")?;
+        .wrap_err("failed to create openshell-server-tls secret")?;
 
-    // 2. navigator-server-client-ca (Opaque)
+    // 2. openshell-server-client-ca (Opaque)
     let client_ca_manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": SERVER_CLIENT_CA_SECRET_NAME,
-            "namespace": "navigator"
+            "namespace": "openshell"
         },
         "type": "Opaque",
         "data": {
@@ -593,15 +593,15 @@ async fn create_k8s_tls_secrets(
     });
     apply_secret(client_ca_manifest.to_string())
         .await
-        .wrap_err("failed to create navigator-server-client-ca secret")?;
+        .wrap_err("failed to create openshell-server-client-ca secret")?;
 
-    // 3. navigator-client-tls (Opaque) — shared by CLI and sandbox pods
+    // 3. openshell-client-tls (Opaque) — shared by CLI and sandbox pods
     let client_tls_manifest = serde_json::json!({
         "apiVersion": "v1",
         "kind": "Secret",
         "metadata": {
             "name": CLIENT_TLS_SECRET_NAME,
-            "namespace": "navigator"
+            "namespace": "openshell"
         },
         "type": "Opaque",
         "data": {
@@ -612,15 +612,15 @@ async fn create_k8s_tls_secrets(
     });
     apply_secret(client_tls_manifest.to_string())
         .await
-        .wrap_err("failed to create navigator-client-tls secret")?;
+        .wrap_err("failed to create openshell-client-tls secret")?;
 
     Ok(())
 }
 
-/// Reconcile cluster TLS secrets: reuse existing PKI if valid, generate new if needed.
+/// Reconcile gateway TLS secrets: reuse existing PKI if valid, generate new if needed.
 ///
 /// Returns `(bundle, rotated)` where `rotated` is true if new PKI was generated
-/// and applied to the cluster (meaning the server needs a restart to pick it up).
+/// and applied to the gateway (meaning the server needs a restart to pick it up).
 async fn reconcile_pki<F>(
     docker: &Docker,
     name: &str,
@@ -651,8 +651,8 @@ where
     // Generate fresh PKI and apply to cluster.
     // Namespace may still be creating on first bootstrap, so wait here only
     // when rotation is actually needed.
-    log("[progress] Waiting for navigator namespace".to_string());
-    wait_for_namespace(docker, &cname, kubeconfig, "navigator").await?;
+    log("[progress] Waiting for openshell namespace".to_string());
+    wait_for_namespace(docker, &cname, kubeconfig, "openshell").await?;
     log("[progress] Generating TLS certificates".to_string());
     let bundle = generate_pki(extra_sans)?;
     log("[progress] Applying TLS secrets to gateway".to_string());
@@ -776,7 +776,7 @@ async fn wait_for_namespace(
                 {
                     let logs = fetch_recent_logs(docker, container_name, 40).await;
                     return Err(miette::miette!(
-                        "cluster container is not running while waiting for namespace '{namespace}': {status_err}\n{logs}"
+                        "gateway container is not running while waiting for namespace '{namespace}': {status_err}\n{logs}"
                     ))
                     .wrap_err("K8s namespace not ready");
                 }

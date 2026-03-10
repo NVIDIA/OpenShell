@@ -22,7 +22,7 @@ use ratatui::backend::CrosstermBackend;
 use tokio::sync::mpsc;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
-use app::{App, ClusterEntry, Focus, LogLine, Screen};
+use app::{App, Focus, GatewayEntry, LogLine, Screen};
 use event::{Event, EventHandler};
 
 /// Duration to show the splash screen before auto-dismissing.
@@ -31,9 +31,9 @@ const SPLASH_DURATION: Duration = Duration::from_secs(3);
 /// Launch the OpenShell TUI.
 ///
 /// `channel` must be a connected gRPC channel to the OpenShell gateway.
-pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result<()> {
+pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result<()> {
     let client = NavigatorClient::new(channel);
-    let mut app = App::new(client, cluster_name.to_string(), endpoint.to_string());
+    let mut app = App::new(client, gateway_name.to_string(), endpoint.to_string());
 
     enable_raw_mode().into_diagnostic()?;
     let mut stdout = io::stdout();
@@ -45,7 +45,7 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
 
     let mut events = EventHandler::new(Duration::from_secs(2));
 
-    refresh_cluster_list(&mut app);
+    refresh_gateway_list(&mut app);
     refresh_data(&mut app).await;
 
     while app.running {
@@ -57,8 +57,8 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
             Some(Event::Key(key)) => {
                 app.handle_key(key);
                 // Handle async actions triggered by key presses.
-                if app.pending_cluster_switch.is_some() {
-                    handle_cluster_switch(&mut app).await;
+                if app.pending_gateway_switch.is_some() {
+                    handle_gateway_switch(&mut app).await;
                 }
                 if app.pending_log_fetch {
                     app.pending_log_fetch = false;
@@ -199,7 +199,7 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
                     }
                 }
 
-                refresh_cluster_list(&mut app);
+                refresh_gateway_list(&mut app);
                 refresh_data(&mut app).await;
 
                 // Auto-refresh the policy view when a new version is detected.
@@ -327,15 +327,15 @@ pub async fn run(channel: Channel, cluster_name: &str, endpoint: &str) -> Result
 }
 
 // ---------------------------------------------------------------------------
-// Cluster discovery and switching
+// Gateway discovery and switching
 // ---------------------------------------------------------------------------
 
-/// Refresh the list of known clusters from disk.
-fn refresh_cluster_list(app: &mut App) {
-    if let Ok(clusters) = navigator_bootstrap::list_clusters() {
-        app.clusters = clusters
+/// Refresh the list of known gateways from disk.
+fn refresh_gateway_list(app: &mut App) {
+    if let Ok(gateways) = navigator_bootstrap::list_gateways() {
+        app.gateways = gateways
             .into_iter()
-            .map(|m| ClusterEntry {
+            .map(|m| GatewayEntry {
                 name: m.name,
                 endpoint: m.gateway_endpoint,
                 is_remote: m.is_remote,
@@ -343,39 +343,39 @@ fn refresh_cluster_list(app: &mut App) {
             .collect();
 
         // Keep selection in bounds.
-        if app.cluster_selected >= app.clusters.len() && !app.clusters.is_empty() {
-            app.cluster_selected = app.clusters.len() - 1;
+        if app.gateway_selected >= app.gateways.len() && !app.gateways.is_empty() {
+            app.gateway_selected = app.gateways.len() - 1;
         }
 
-        // If the active cluster appears in the list, move cursor to it on first load.
-        if let Some(idx) = app.clusters.iter().position(|c| c.name == app.cluster_name) {
+        // If the active gateway appears in the list, move cursor to it on first load.
+        if let Some(idx) = app.gateways.iter().position(|g| g.name == app.gateway_name) {
             // Only snap the cursor when it's still at 0 (initial state).
-            if app.cluster_selected == 0 {
-                app.cluster_selected = idx;
+            if app.gateway_selected == 0 {
+                app.gateway_selected = idx;
             }
         }
     }
 }
 
-/// Handle a pending cluster switch requested by the user.
-async fn handle_cluster_switch(app: &mut App) {
-    let Some(name) = app.pending_cluster_switch.take() else {
+/// Handle a pending gateway switch requested by the user.
+async fn handle_gateway_switch(app: &mut App) {
+    let Some(name) = app.pending_gateway_switch.take() else {
         return;
     };
 
-    // Look up the endpoint from the cluster list.
-    let endpoint = match app.clusters.iter().find(|c| c.name == name) {
-        Some(c) => c.endpoint.clone(),
+    // Look up the endpoint from the gateway list.
+    let endpoint = match app.gateways.iter().find(|g| g.name == name) {
+        Some(g) => g.endpoint.clone(),
         None => return,
     };
 
-    match connect_to_cluster(&name, &endpoint).await {
+    match connect_to_gateway(&name, &endpoint).await {
         Ok(channel) => {
             app.client = NavigatorClient::new(channel);
-            app.cluster_name = name;
+            app.gateway_name = name;
             app.endpoint = endpoint;
             app.reset_sandbox_state();
-            // Immediately refresh data for the new cluster.
+            // Immediately refresh data for the new gateway.
             refresh_data(app).await;
         }
         Err(e) => {
@@ -384,20 +384,20 @@ async fn handle_cluster_switch(app: &mut App) {
     }
 }
 
-/// Build a gRPC channel to a cluster using its mTLS certs on disk.
-async fn connect_to_cluster(name: &str, endpoint: &str) -> Result<Channel> {
-    let mtls_dir = cluster_mtls_dir(name)
-        .ok_or_else(|| miette::miette!("cannot determine config directory for cluster {name}"))?;
+/// Build a gRPC channel to a gateway using its mTLS certs on disk.
+async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
+    let mtls_dir = gateway_mtls_dir(name)
+        .ok_or_else(|| miette::miette!("cannot determine config directory for gateway {name}"))?;
 
     let ca = std::fs::read(mtls_dir.join("ca.crt"))
         .into_diagnostic()
-        .map_err(|_| miette::miette!("missing CA cert for cluster {name}"))?;
+        .map_err(|_| miette::miette!("missing CA cert for gateway {name}"))?;
     let cert = std::fs::read(mtls_dir.join("tls.crt"))
         .into_diagnostic()
-        .map_err(|_| miette::miette!("missing client cert for cluster {name}"))?;
+        .map_err(|_| miette::miette!("missing client cert for gateway {name}"))?;
     let key = std::fs::read(mtls_dir.join("tls.key"))
         .into_diagnostic()
-        .map_err(|_| miette::miette!("missing client key for cluster {name}"))?;
+        .map_err(|_| miette::miette!("missing client key for gateway {name}"))?;
 
     let tls_config = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(ca))
@@ -417,8 +417,8 @@ async fn connect_to_cluster(name: &str, endpoint: &str) -> Result<Channel> {
     Ok(channel)
 }
 
-/// Resolve the mTLS cert directory for a cluster.
-fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
+/// Resolve the mTLS cert directory for a gateway.
+fn gateway_mtls_dir(name: &str) -> Option<PathBuf> {
     let config_dir = std::env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
@@ -426,7 +426,7 @@ fn cluster_mtls_dir(name: &str) -> Option<PathBuf> {
     Some(
         config_dir
             .join("openshell")
-            .join("clusters")
+            .join("gateways")
             .join(name)
             .join("mtls"),
     )
@@ -733,9 +733,9 @@ async fn handle_shell_connect(
         }
     };
     let exe_str = shell_escape(&exe.to_string_lossy());
-    let cluster = shell_escape(&app.cluster_name);
+    let gateway = shell_escape(&app.gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway {cluster}",
+        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
     // Step 5: Build the SSH command.
@@ -875,9 +875,9 @@ async fn handle_exec_command(
         }
     };
     let exe_str = shell_escape(&exe.to_string_lossy());
-    let cluster = shell_escape(&app.cluster_name);
+    let gateway = shell_escape(&app.gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway {cluster}",
+        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
 
@@ -1149,7 +1149,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
     app.pending_forward_ports = ports.clone();
 
     let endpoint = app.endpoint.clone();
-    let cluster_name = app.cluster_name.clone();
+    let gateway_name = app.gateway_name.clone();
     let need_ready = !ports.is_empty() || !app.pending_exec_command.is_empty();
 
     tokio::spawn(async move {
@@ -1239,7 +1239,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
                 start_port_forwards(
                     &mut client,
                     &endpoint,
-                    &cluster_name,
+                    &gateway_name,
                     &sandbox_name,
                     &sandbox_id,
                     &ports,
@@ -1259,7 +1259,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
 async fn start_port_forwards(
     client: &mut NavigatorClient<Channel>,
     endpoint: &str,
-    cluster_name: &str,
+    gateway_name: &str,
     sandbox_name: &str,
     sandbox_id: &str,
     ports: &[u16],
@@ -1301,9 +1301,9 @@ async fn start_port_forwards(
         }
     };
     let exe_str = shell_escape(&exe.to_string_lossy());
-    let cluster = shell_escape(cluster_name);
+    let gateway = shell_escape(gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --cluster {cluster}",
+        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
 

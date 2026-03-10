@@ -4,26 +4,26 @@
 //! Edge authentication token storage.
 //!
 //! Stores the bearer token for edge-authenticated gateways at
-//! `$XDG_CONFIG_HOME/openshell/clusters/<name>/edge_token`.
+//! `$XDG_CONFIG_HOME/openshell/gateways/<name>/edge_token`.
 //! The token is a plain-text JWT string with `0600` permissions.
 
-use crate::paths::clusters_dir;
+use crate::paths::gateways_dir;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::path::PathBuf;
 
-/// Path to the stored edge auth token for a cluster.
-pub fn edge_token_path(cluster_name: &str) -> Result<PathBuf> {
-    Ok(clusters_dir()?.join(cluster_name).join("edge_token"))
+/// Path to the stored edge auth token for a gateway.
+pub fn edge_token_path(gateway_name: &str) -> Result<PathBuf> {
+    Ok(gateways_dir()?.join(gateway_name).join("edge_token"))
 }
 
 /// Legacy path used before the rename to `edge_token`.
-fn legacy_token_path(cluster_name: &str) -> Result<PathBuf> {
-    Ok(clusters_dir()?.join(cluster_name).join("cf_token"))
+fn legacy_token_path(gateway_name: &str) -> Result<PathBuf> {
+    Ok(gateways_dir()?.join(gateway_name).join("cf_token"))
 }
 
-/// Store an edge authentication token for a cluster.
-pub fn store_edge_token(cluster_name: &str, token: &str) -> Result<()> {
-    let path = edge_token_path(cluster_name)?;
+/// Store an edge authentication token for a gateway.
+pub fn store_edge_token(gateway_name: &str, token: &str) -> Result<()> {
+    let path = edge_token_path(gateway_name)?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .into_diagnostic()
@@ -43,27 +43,27 @@ pub fn store_edge_token(cluster_name: &str, token: &str) -> Result<()> {
     Ok(())
 }
 
-/// Load a stored edge authentication token for a cluster.
+/// Load a stored edge authentication token for a gateway.
 ///
 /// Returns `None` if no token file exists or the file is empty.
 /// Falls back to the legacy `cf_token` path for backwards compatibility.
-pub fn load_edge_token(cluster_name: &str) -> Option<String> {
+pub fn load_edge_token(gateway_name: &str) -> Option<String> {
     // Try the new path first, then fall back to legacy.
-    let path = edge_token_path(cluster_name)
+    let path = edge_token_path(gateway_name)
         .ok()
         .filter(|p| p.exists())
-        .or_else(|| legacy_token_path(cluster_name).ok().filter(|p| p.exists()))?;
+        .or_else(|| legacy_token_path(gateway_name).ok().filter(|p| p.exists()))?;
     let contents = std::fs::read_to_string(&path).ok()?;
     let token = contents.trim().to_string();
     if token.is_empty() { None } else { Some(token) }
 }
 
 /// Remove a stored edge authentication token.
-pub fn remove_edge_token(cluster_name: &str) -> Result<()> {
+pub fn remove_edge_token(gateway_name: &str) -> Result<()> {
     // Remove both new and legacy paths.
     for path in [
-        edge_token_path(cluster_name)?,
-        legacy_token_path(cluster_name)?,
+        edge_token_path(gateway_name)?,
+        legacy_token_path(gateway_name)?,
     ] {
         if path.exists() {
             std::fs::remove_file(&path)
@@ -102,9 +102,9 @@ mod tests {
     fn store_and_load_edge_token_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            store_edge_token("test-cluster", "eyJhbGciOiJSUzI1NiJ9.test.sig").unwrap();
+            store_edge_token("test-gateway", "eyJhbGciOiJSUzI1NiJ9.test.sig").unwrap();
             assert_eq!(
-                load_edge_token("test-cluster"),
+                load_edge_token("test-gateway"),
                 Some("eyJhbGciOiJSUzI1NiJ9.test.sig".to_string())
             );
         });
@@ -114,7 +114,7 @@ mod tests {
     fn load_edge_token_returns_none_when_not_set() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            assert_eq!(load_edge_token("no-such-cluster"), None);
+            assert_eq!(load_edge_token("no-such-gateway"), None);
         });
     }
 
@@ -153,10 +153,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
             // Write manually with whitespace.
-            let path = edge_token_path("ws-cluster").unwrap();
+            let path = edge_token_path("ws-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "  my-token \n").unwrap();
-            assert_eq!(load_edge_token("ws-cluster"), Some("my-token".to_string()));
+            assert_eq!(load_edge_token("ws-gateway"), Some("my-token".to_string()));
         });
     }
 
@@ -164,10 +164,10 @@ mod tests {
     fn load_edge_token_returns_none_for_empty_file() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            let path = edge_token_path("empty-cluster").unwrap();
+            let path = edge_token_path("empty-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "   \n").unwrap();
-            assert_eq!(load_edge_token("empty-cluster"), None);
+            assert_eq!(load_edge_token("empty-gateway"), None);
         });
     }
 
@@ -176,11 +176,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
             // Write to the legacy cf_token path.
-            let path = legacy_token_path("legacy-cluster").unwrap();
+            let path = legacy_token_path("legacy-gateway").unwrap();
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             std::fs::write(&path, "legacy-jwt").unwrap();
             assert_eq!(
-                load_edge_token("legacy-cluster"),
+                load_edge_token("legacy-gateway"),
                 Some("legacy-jwt".to_string())
             );
         });

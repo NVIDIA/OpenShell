@@ -14,25 +14,25 @@ pub fn xdg_config_dir() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".config"))
 }
 
-/// Path to the file that stores the active cluster name.
+/// Path to the file that stores the active gateway name.
 ///
-/// Location: `$XDG_CONFIG_HOME/openshell/active_cluster`
-pub fn active_cluster_path() -> Result<PathBuf> {
-    Ok(xdg_config_dir()?.join("openshell").join("active_cluster"))
+/// Location: `$XDG_CONFIG_HOME/openshell/active_gateway`
+pub fn active_gateway_path() -> Result<PathBuf> {
+    Ok(xdg_config_dir()?.join("openshell").join("active_gateway"))
 }
 
-/// Base directory for all cluster metadata files.
+/// Base directory for all gateway metadata files.
 ///
-/// Location: `$XDG_CONFIG_HOME/openshell/clusters/`
-pub fn clusters_dir() -> Result<PathBuf> {
-    Ok(xdg_config_dir()?.join("openshell").join("clusters"))
+/// Location: `$XDG_CONFIG_HOME/openshell/gateways/`
+pub fn gateways_dir() -> Result<PathBuf> {
+    Ok(xdg_config_dir()?.join("openshell").join("gateways"))
 }
 
-/// Path to the file that stores the last-used sandbox name for a cluster.
+/// Path to the file that stores the last-used sandbox name for a gateway.
 ///
-/// Location: `$XDG_CONFIG_HOME/openshell/clusters/<cluster>/last_sandbox`
-pub fn last_sandbox_path(cluster: &str) -> Result<PathBuf> {
-    Ok(clusters_dir()?.join(cluster).join("last_sandbox"))
+/// Location: `$XDG_CONFIG_HOME/openshell/gateways/<gateway>/last_sandbox`
+pub fn last_sandbox_path(gateway: &str) -> Result<PathBuf> {
+    Ok(gateways_dir()?.join(gateway).join("last_sandbox"))
 }
 
 #[cfg(test)]
@@ -50,9 +50,9 @@ mod tests {
         unsafe {
             std::env::set_var("XDG_CONFIG_HOME", tmp.path());
         }
-        let path = last_sandbox_path("my-cluster").unwrap();
+        let path = last_sandbox_path("my-gateway").unwrap();
         assert!(
-            path.ends_with("openshell/clusters/my-cluster/last_sandbox"),
+            path.ends_with("openshell/gateways/my-gateway/last_sandbox"),
             "unexpected path: {path:?}"
         );
         unsafe {

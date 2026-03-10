@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Build and push container images into a k3s cluster.
+//! Build and push container images into a k3s gateway.
 //!
 //! This module wraps bollard's `build_image()` API to build a container image
 //! from a Dockerfile and build context, then reuses the existing push pipeline
-//! to import the image into the cluster's containerd runtime.
+//! to import the image into the gateway's containerd runtime.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -19,19 +19,19 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use crate::constants::container_name;
 use crate::push::push_local_images;
 
-/// Build a container image from a Dockerfile and push it into the cluster.
+/// Build a container image from a Dockerfile and push it into the gateway.
 ///
 /// This is used by `openshell sandbox create --from <Dockerfile>`. It:
 /// 1. Creates a tar archive of the build context directory.
 /// 2. Sends it to the local Docker daemon via `build_image()`.
-/// 3. Pushes the resulting image into the cluster's containerd via the
+/// 3. Pushes the resulting image into the gateway's containerd via the
 ///    existing `push_local_images()` pipeline.
 #[allow(clippy::implicit_hasher)]
 pub async fn build_and_push_image(
     dockerfile_path: &Path,
     tag: &str,
     context_dir: &Path,
-    cluster_name: &str,
+    gateway_name: &str,
     build_args: &HashMap<String, String>,
     on_log: &mut impl FnMut(String),
 ) -> Result<()> {
@@ -43,18 +43,18 @@ pub async fn build_and_push_image(
     build_image(dockerfile_path, tag, context_dir, build_args, on_log).await?;
     on_log(format!("Built image {tag}"));
 
-    // 2. Push into the cluster.
+    // 2. Push into the gateway.
     on_log(format!(
-        "Pushing image {tag} into cluster \"{cluster_name}\""
+        "Pushing image {tag} into gateway \"{gateway_name}\""
     ));
     let local_docker = Docker::connect_with_local_defaults()
         .into_diagnostic()
         .wrap_err("failed to connect to local Docker daemon")?;
-    let container = container_name(cluster_name);
+    let container = container_name(gateway_name);
     let images: Vec<&str> = vec![tag];
     push_local_images(&local_docker, &local_docker, &container, &images, on_log).await?;
 
-    on_log(format!("Image {tag} is available in the cluster."));
+    on_log(format!("Image {tag} is available in the gateway."));
     Ok(())
 }
 

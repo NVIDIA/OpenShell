@@ -190,7 +190,7 @@ openshell gateway info
 If the gateway is unreachable, inspect the container:
 
 ```bash
-docker logs navigator-cluster-openshell
+docker logs openshell-cluster-openshell
 ```
 
 Re-running `gateway start` is idempotent -- it reuses existing

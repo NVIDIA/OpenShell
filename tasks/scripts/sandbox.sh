@@ -15,7 +15,7 @@ set -euo pipefail
 
 SANDBOX_NAME="dev"
 CLUSTER_NAME=${CLUSTER_NAME:-$(basename "$PWD")}
-CONTAINER_NAME="navigator-cluster-${CLUSTER_NAME}"
+CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"
 STATE_DIR=${SANDBOX_STATE_DIR:-.cache}
 SANDBOX_STATE_FILE=${STATE_DIR}/sandbox-dev.state
 DEPLOY_STATE_FILE=${DEPLOY_FAST_STATE_FILE:-${STATE_DIR}/cluster-deploy-fast.state}

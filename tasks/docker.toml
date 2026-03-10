@@ -25,7 +25,7 @@ hide = true
 ["docker:build:sandbox:nvidia"]
 description = "Build the NVIDIA GPU sandbox Docker image"
 depends = ["docker:build:sandbox"]
-run = "tasks/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=navigator/sandbox:${IMAGE_TAG:-dev}"
+run = "tasks/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=openshell/sandbox:${IMAGE_TAG:-dev}"
 hide = true
 
 ["docker:build:server"]

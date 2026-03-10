@@ -6,29 +6,29 @@ use std::future::Future;
 use std::time::Duration;
 
 use clap_complete::engine::CompletionCandidate;
-use navigator_bootstrap::{list_clusters, load_active_cluster, load_cluster_metadata};
+use navigator_bootstrap::{list_gateways, load_active_gateway, load_gateway_metadata};
 use navigator_core::proto::navigator_client::NavigatorClient;
 use navigator_core::proto::{ListProvidersRequest, ListSandboxesRequest};
 use tonic::transport::{Channel, Endpoint};
 
 use crate::tls::{TlsOptions, build_tonic_tls_config, require_tls_materials};
 
-/// Complete cluster names from local metadata files (no network call).
-pub fn complete_cluster_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
-    let Ok(clusters) = list_clusters() else {
+/// Complete gateway names from local metadata files (no network call).
+pub fn complete_gateway_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
+    let Ok(gateways) = list_gateways() else {
         return Vec::new();
     };
-    clusters
+    gateways
         .into_iter()
-        .map(|c| CompletionCandidate::new(c.name))
+        .map(|g| CompletionCandidate::new(g.name))
         .collect()
 }
 
-/// Complete sandbox names by querying the active cluster's gateway.
+/// Complete sandbox names by querying the active gateway.
 pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
     blocking_complete(async {
-        let (endpoint, cluster_name) = resolve_active_cluster()?;
-        let mut client = completion_grpc_client(&endpoint, &cluster_name).await?;
+        let (endpoint, gateway_name) = resolve_active_gateway()?;
+        let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
         let response = client
             .list_sandboxes(ListSandboxesRequest {
                 limit: 200,
@@ -47,11 +47,11 @@ pub fn complete_sandbox_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
     })
 }
 
-/// Complete provider names by querying the active cluster's gateway.
+/// Complete provider names by querying the active gateway.
 pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
     blocking_complete(async {
-        let (endpoint, cluster_name) = resolve_active_cluster()?;
-        let mut client = completion_grpc_client(&endpoint, &cluster_name).await?;
+        let (endpoint, gateway_name) = resolve_active_gateway()?;
+        let mut client = completion_grpc_client(&endpoint, &gateway_name).await?;
         let response = client
             .list_providers(ListProvidersRequest {
                 limit: 200,
@@ -70,20 +70,20 @@ pub fn complete_provider_names(_prefix: &OsStr) -> Vec<CompletionCandidate> {
     })
 }
 
-fn resolve_active_cluster() -> Option<(String, String)> {
-    let name = std::env::var("OPENSHELL_CLUSTER")
+fn resolve_active_gateway() -> Option<(String, String)> {
+    let name = std::env::var("OPENSHELL_GATEWAY")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .or_else(load_active_cluster)?;
-    let metadata = load_cluster_metadata(&name).ok()?;
+        .or_else(load_active_gateway)?;
+    let metadata = load_gateway_metadata(&name).ok()?;
     Some((metadata.gateway_endpoint, name))
 }
 
 async fn completion_grpc_client(
     server: &str,
-    cluster_name: &str,
+    gateway_name: &str,
 ) -> Option<NavigatorClient<Channel>> {
-    let tls_opts = TlsOptions::default().with_cluster_name(cluster_name);
+    let tls_opts = TlsOptions::default().with_gateway_name(gateway_name);
     let materials = require_tls_materials(server, &tls_opts).ok()?;
     let tls_config = build_tonic_tls_config(&materials);
     let endpoint = Endpoint::from_shared(server.to_string())
@@ -131,23 +131,23 @@ mod tests {
         with_vars(
             [
                 ("XDG_CONFIG_HOME", Some(tmp.as_str())),
-                ("OPENSHELL_CLUSTER", None::<&str>),
+                ("OPENSHELL_GATEWAY", None::<&str>),
             ],
             f,
         );
     }
 
     #[test]
-    fn cluster_completer_returns_empty_when_no_config() {
+    fn gateway_completer_returns_empty_when_no_config() {
         let temp = tempfile::tempdir().unwrap();
         with_isolated_cli_env(temp.path(), || {
-            let result = complete_cluster_names(OsStr::new(""));
+            let result = complete_gateway_names(OsStr::new(""));
             assert!(result.is_empty());
         });
     }
 
     #[test]
-    fn sandbox_completer_returns_empty_when_no_active_cluster() {
+    fn sandbox_completer_returns_empty_when_no_active_gateway() {
         let temp = tempfile::tempdir().unwrap();
         with_isolated_cli_env(temp.path(), || {
             let result = complete_sandbox_names(OsStr::new(""));
@@ -156,7 +156,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_completer_returns_empty_when_no_active_cluster() {
+    fn provider_completer_returns_empty_when_no_active_gateway() {
         let temp = tempfile::tempdir().unwrap();
         with_isolated_cli_env(temp.path(), || {
             let result = complete_provider_names(OsStr::new(""));

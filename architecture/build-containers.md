@@ -56,7 +56,7 @@ tasks/
 
 The project produces three runtime container images and two build-only wheel images.
 
-### Sandbox Image (`navigator/sandbox`)
+### Sandbox Image (`openshell/sandbox`)
 
 The sandbox container runs inside each sandbox pod. It contains the sandbox supervisor binary, Python runtime, AI agent tooling, and a virtual environment for the Python SDK.
 
@@ -74,7 +74,7 @@ The sandbox container runs inside each sandbox pod. It contains the sandbox supe
 - Policy files are mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data) when running in file-based policy mode.
 - The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/navigator/`.
 
-### Gateway Image (`navigator/server`)
+### Gateway Image (`openshell/server`)
 
 The gateway container runs the control plane / orchestration service.
 
@@ -93,7 +93,7 @@ The gateway container runs the control plane / orchestration service.
 - No Docker HEALTHCHECK -- health checks are handled by Kubernetes liveness/readiness probes (`tcpSocket` on the gRPC port).
 - Entrypoint: `navigator-server`, default args: `--port 8080`.
 
-### Cluster Image (`navigator/cluster`)
+### Cluster Image (`openshell/cluster`)
 
 A k3s image with bundled Helm charts and Kubernetes manifests for single-container deployment. Component images (sandbox, gateway) are **pulled at runtime** from the distribution registry -- they are not bundled as tarballs in this image.
 
@@ -317,7 +317,6 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 | Task | Description |
 |---|---|
 | `mise run cluster` | Bootstrap or incremental deploy: creates cluster if needed, rebuilds changed components |
-| `mise run cluster:build:full` | Full build + deploy path (advanced/CI) |
 
 ### Other Tasks
 
@@ -425,11 +424,8 @@ In CI pipelines:
 # Bootstrap or incremental deploy (creates cluster if needed, rebuilds changed components)
 mise run cluster
 
-# Full build + deploy path (advanced/CI)
-mise run cluster:build:full
-
 # Run sandbox container interactively (for testing sandbox code)
-mise run cluster:sandbox
+mise run sandbox
 ```
 
 ### Multi-Arch Publishing

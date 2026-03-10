@@ -22,7 +22,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
 use std::path::Path;
 
-const REGISTRY_NAMESPACE_DEFAULT: &str = "navigator";
+const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 
 const REGISTRY_MODE_EXTERNAL: &str = "external";
 
@@ -202,7 +202,7 @@ pub async fn ensure_image(
     if image::is_local_image_ref(image_ref) {
         return Err(miette::miette!(
             "Image '{}' not found locally. This looks like a locally-built image \
-             (no registry prefix). Build it first with `mise run docker:build:cluster`.",
+             (no registry prefix). Build it first with `mise run docker:build:gateway`.",
             image_ref,
         ));
     }
@@ -476,7 +476,7 @@ pub async fn ensure_container(
         )
         .await
         .into_diagnostic()
-        .wrap_err("failed to create cluster container")?;
+        .wrap_err("failed to create gateway container")?;
     Ok(())
 }
 
@@ -504,7 +504,7 @@ pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {
             Err(err) => {
                 return Err(err)
                     .into_diagnostic()
-                    .wrap_err("failed to start cluster container");
+                    .wrap_err("failed to start gateway container");
             }
         }
     }
@@ -521,7 +521,7 @@ pub async fn stop_container(docker: &Docker, container_name: &str) -> Result<()>
     }
 }
 
-pub async fn destroy_cluster_resources(
+pub async fn destroy_gateway_resources(
     docker: &Docker,
     name: &str,
     kubeconfig_path: &Path,
@@ -569,12 +569,12 @@ pub async fn destroy_cluster_resources(
         return Err(err).into_diagnostic();
     }
 
-    // Remove the cluster image so the next deploy always pulls the latest
+    // Remove the gateway image so the next deploy always pulls the latest
     // version from the registry instead of reusing a stale local copy.
     // Docker may briefly report the container as still running after a
     // force-remove, so retry a few times on conflict (409) errors.
     if let Some(ref image_id) = container_image {
-        tracing::debug!("Removing cluster image: {}", image_id);
+        tracing::debug!("Removing gateway image: {}", image_id);
         let mut last_err = None;
         for attempt in 0..5 {
             if attempt > 0 {
@@ -610,7 +610,7 @@ pub async fn destroy_cluster_resources(
             }
         }
         if let Some(err) = last_err {
-            tracing::warn!("Failed to remove cluster image {}: {}", image_id, err);
+            tracing::warn!("Failed to remove gateway image {}: {}", image_id, err);
         }
     }
 
@@ -632,7 +632,7 @@ pub async fn destroy_cluster_resources(
     Ok(())
 }
 
-/// Forcefully remove the cluster network, disconnecting any remaining
+/// Forcefully remove the gateway network, disconnecting any remaining
 /// containers first.  This ensures that stale Docker network endpoints
 /// cannot prevent port bindings from being released.
 async fn force_remove_network(docker: &Docker) -> Result<()> {
@@ -723,9 +723,9 @@ fn truncate_id(id: &str) -> &str {
     }
 }
 
-/// Information about an existing cluster deployment.
+/// Information about an existing gateway deployment.
 #[derive(Debug, Clone)]
-pub struct ExistingClusterInfo {
+pub struct ExistingGatewayInfo {
     /// Whether the container exists.
     pub container_exists: bool,
     /// Whether the container is currently running.
@@ -736,14 +736,14 @@ pub struct ExistingClusterInfo {
     pub container_image: Option<String>,
 }
 
-/// Check whether a cluster with the given name already exists.
+/// Check whether a gateway with the given name already exists.
 ///
-/// Returns `None` if no cluster resources exist, or `Some(info)` with
+/// Returns `None` if no gateway resources exist, or `Some(info)` with
 /// details about the existing deployment.
-pub async fn check_existing_cluster(
+pub async fn check_existing_gateway(
     docker: &Docker,
     name: &str,
-) -> Result<Option<ExistingClusterInfo>> {
+) -> Result<Option<ExistingGatewayInfo>> {
     let container_name = container_name(name);
     let vol_name = volume_name(name);
 
@@ -770,7 +770,7 @@ pub async fn check_existing_cluster(
         return Ok(None);
     }
 
-    Ok(Some(ExistingClusterInfo {
+    Ok(Some(ExistingGatewayInfo {
         container_exists,
         container_running,
         volume_exists,

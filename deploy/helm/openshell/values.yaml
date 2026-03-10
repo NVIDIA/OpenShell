@@ -6,7 +6,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/nvidia/nemoclaw/server
+  repository: ghcr.io/nvidia/openshell/server
   pullPolicy: Always
   tag: "latest"
 
@@ -65,11 +65,11 @@ affinity: {}
 # Server configuration
 server:
   logLevel: info
-  sandboxNamespace: navigator
-  dbUrl: "sqlite:/var/navigator/navigator.db"
-  sandboxImage: "d1i0nduu2f6qxk.cloudfront.net/navigator/sandbox:latest"
+  sandboxNamespace: openshell
+  dbUrl: "sqlite:/var/openshell/openshell.db"
+  sandboxImage: "ghcr.io/nvidia/openshell/sandbox:latest"
   # gRPC endpoint for sandboxes to callback to OpenShell (must be reachable from pods)
-  grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
+  grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.
   # For local clusters the default 127.0.0.1:8080 is correct; for remote
   # clusters these should be set to the externally reachable host and port.
@@ -90,11 +90,11 @@ server:
   disableTls: false
   tls:
     # K8s secret (type kubernetes.io/tls) with tls.crt and tls.key for the server
-    certSecretName: navigator-server-tls
+    certSecretName: openshell-server-tls
     # K8s secret with ca.crt for client certificate verification
-    clientCaSecretName: navigator-server-client-ca
+    clientCaSecretName: openshell-server-client-ca
     # K8s secret mounted into sandbox pods for mTLS to the server
-    clientTlsSecretName: navigator-client-tls
+    clientTlsSecretName: openshell-client-tls
 
 # NetworkPolicy restricting SSH ingress on sandbox pods to the gateway only.
 networkPolicy:

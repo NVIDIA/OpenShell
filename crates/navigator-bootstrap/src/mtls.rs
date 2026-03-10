@@ -72,7 +72,7 @@ pub fn store_pki_bundle(name: &str, bundle: &PkiBundle) -> Result<()> {
 fn cli_mtls_dir(name: &str) -> Result<PathBuf> {
     Ok(xdg_config_dir()?
         .join("openshell")
-        .join("clusters")
+        .join("gateways")
         .join(name)
         .join("mtls"))
 }

@@ -11,31 +11,31 @@ use owo_colors::OwoColorize;
 use std::io::Write;
 
 use navigator_bootstrap::{
-    edge_token::load_edge_token, get_cluster_metadata, list_clusters, load_active_cluster,
-    load_cluster_metadata, load_last_sandbox, save_last_sandbox,
+    edge_token::load_edge_token, get_gateway_metadata, list_gateways, load_active_gateway,
+    load_gateway_metadata, load_last_sandbox, save_last_sandbox,
 };
 use navigator_cli::completers;
 use navigator_cli::run;
 use navigator_cli::tls::TlsOptions;
 
-/// Resolved cluster context: name + gateway endpoint.
+/// Resolved gateway context: name + gateway endpoint.
 struct GatewayContext {
-    /// The cluster name (used for TLS cert directory, metadata lookup, etc.).
+    /// The gateway name (used for TLS cert directory, metadata lookup, etc.).
     name: String,
     /// The gateway endpoint URL (e.g., `https://127.0.0.1` or `https://10.0.0.5`).
     endpoint: String,
 }
 
-/// Resolve the cluster name to a [`GatewayContext`] with the gateway endpoint.
+/// Resolve the gateway name to a [`GatewayContext`] with the gateway endpoint.
 ///
 /// Resolution priority:
 /// 1. `--gateway-endpoint` flag (direct URL, preserving metadata when available)
-/// 2. `--cluster` flag (explicit name)
-/// 3. `OPENSHELL_CLUSTER` environment variable
-/// 4. Active cluster from `~/.config/openshell/active_cluster`
+/// 2. `--gateway` flag (explicit name)
+/// 3. `OPENSHELL_GATEWAY` environment variable
+/// 4. Active gateway from `~/.config/openshell/active_gateway`
 ///
 /// When `--gateway-endpoint` is provided, it is used directly as the endpoint.
-/// If stored metadata can still identify the gateway, the stored cluster name
+/// If stored metadata can still identify the gateway, the stored gateway name
 /// is preserved so auth and TLS materials continue to resolve correctly.
 fn normalize_gateway_endpoint(endpoint: &str) -> &str {
     endpoint.trim_end_matches('/')
@@ -44,27 +44,27 @@ fn normalize_gateway_endpoint(endpoint: &str) -> &str {
 fn find_gateway_by_endpoint(endpoint: &str) -> Option<String> {
     let endpoint = normalize_gateway_endpoint(endpoint);
 
-    if let Some(active_name) = load_active_cluster()
-        && let Ok(metadata) = load_cluster_metadata(&active_name)
+    if let Some(active_name) = load_active_gateway()
+        && let Ok(metadata) = load_gateway_metadata(&active_name)
         && normalize_gateway_endpoint(&metadata.gateway_endpoint) == endpoint
     {
         return Some(metadata.name);
     }
 
-    list_clusters().ok()?.into_iter().find_map(|metadata| {
+    list_gateways().ok()?.into_iter().find_map(|metadata| {
         (normalize_gateway_endpoint(&metadata.gateway_endpoint) == endpoint)
             .then_some(metadata.name)
     })
 }
 
 fn resolve_gateway(
-    cluster_flag: &Option<String>,
+    gateway_flag: &Option<String>,
     gateway_endpoint: &Option<String>,
 ) -> Result<GatewayContext> {
     if let Some(endpoint) = gateway_endpoint {
-        let name = cluster_flag
+        let name = gateway_flag
             .clone()
-            .filter(|name| get_cluster_metadata(name).is_some())
+            .filter(|name| get_gateway_metadata(name).is_some())
             .or_else(|| find_gateway_by_endpoint(endpoint))
             .unwrap_or_else(|| endpoint.clone());
         return Ok(GatewayContext {
@@ -73,14 +73,14 @@ fn resolve_gateway(
         });
     }
 
-    let name = cluster_flag
+    let name = gateway_flag
         .clone()
         .or_else(|| {
-            std::env::var("OPENSHELL_CLUSTER")
+            std::env::var("OPENSHELL_GATEWAY")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
-        .or_else(load_active_cluster)
+        .or_else(load_active_gateway)
         .ok_or_else(|| {
             miette::miette!(
                 "No active gateway.\n\
@@ -89,7 +89,7 @@ fn resolve_gateway(
             )
         })?;
 
-    let metadata = load_cluster_metadata(&name).map_err(|_| {
+    let metadata = load_gateway_metadata(&name).map_err(|_| {
         miette::miette!(
             "Unknown gateway '{name}'.\n\
              Deploy it first: openshell gateway start --name {name}\n\
@@ -103,46 +103,46 @@ fn resolve_gateway(
     })
 }
 
-/// Resolve only the cluster name (without requiring metadata to exist).
+/// Resolve only the gateway name (without requiring metadata to exist).
 ///
-/// Used by gateway commands that operate on a cluster by name but may not need
-/// the gateway endpoint (e.g., `gateway start` creates the cluster).
-fn resolve_gateway_name(cluster_flag: &Option<String>) -> Option<String> {
-    cluster_flag
+/// Used by gateway commands that operate on a gateway by name but may not need
+/// the gateway endpoint (e.g., `gateway start` creates the gateway).
+fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
+    gateway_flag
         .clone()
         .or_else(|| {
-            std::env::var("OPENSHELL_CLUSTER")
+            std::env::var("OPENSHELL_GATEWAY")
                 .ok()
                 .filter(|v| !v.trim().is_empty())
         })
-        .or_else(load_active_cluster)
+        .or_else(load_active_gateway)
 }
 
-/// Apply edge authentication token from local storage when the cluster uses edge auth.
+/// Apply edge authentication token from local storage when the gateway uses edge auth.
 ///
-/// When the resolved cluster has `auth_mode == "cloudflare_jwt"`, loads the
+/// When the resolved gateway has `auth_mode == "cloudflare_jwt"`, loads the
 /// stored edge token from disk and sets it on the `TlsOptions`. The token is
-/// always read from cluster metadata rather than supplied via a CLI flag.
-fn apply_edge_auth(tls: &mut TlsOptions, cluster_name: &str) {
-    if let Some(meta) = get_cluster_metadata(cluster_name) {
+/// always read from gateway metadata rather than supplied via a CLI flag.
+fn apply_edge_auth(tls: &mut TlsOptions, gateway_name: &str) {
+    if let Some(meta) = get_gateway_metadata(gateway_name) {
         if meta.auth_mode.as_deref() == Some("cloudflare_jwt") {
-            if let Some(token) = load_edge_token(cluster_name) {
+            if let Some(token) = load_edge_token(gateway_name) {
                 tls.edge_token = Some(token);
             }
         }
     }
 }
 
-/// Resolve a sandbox name, falling back to the last-used sandbox for the cluster.
+/// Resolve a sandbox name, falling back to the last-used sandbox for the gateway.
 ///
 /// When `name` is `None`, looks up the last sandbox recorded for the active
-/// cluster. Prints a hint when falling back so the user knows which sandbox
+/// gateway. Prints a hint when falling back so the user knows which sandbox
 /// was chosen.
-fn resolve_sandbox_name(name: Option<String>, cluster: &str) -> Result<String> {
+fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
     if let Some(n) = name {
         return Ok(n);
     }
-    let last = load_last_sandbox(cluster).ok_or_else(|| {
+    let last = load_last_sandbox(gateway).ok_or_else(|| {
         miette::miette!(
             "No sandbox name provided and no last-used sandbox.\n\
              Specify a sandbox name or connect to one first: nav sandbox connect <name>"
@@ -278,12 +278,12 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
-    /// Cluster name to operate on (resolved from stored metadata).
-    #[arg(long, short, global = true, env = "OPENSHELL_CLUSTER")]
-    cluster: Option<String>,
+    /// Gateway name to operate on (resolved from stored metadata).
+    #[arg(long, short = 'g', global = true, env = "OPENSHELL_GATEWAY")]
+    gateway: Option<String>,
 
     /// Gateway endpoint URL (e.g. https://gateway.example.com).
-    /// Connects directly without looking up cluster metadata.
+    /// Connects directly without looking up gateway metadata.
     #[arg(long, global = true, env = "OPENSHELL_GATEWAY_ENDPOINT")]
     gateway_endpoint: Option<String>,
 
@@ -370,7 +370,7 @@ enum Commands {
     #[command(hide = true, after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Inference {
         #[command(subcommand)]
-        command: Option<ClusterInferenceCommands>,
+        command: Option<InferenceCommands>,
     },
 
     // ===================================================================
@@ -395,12 +395,12 @@ enum Commands {
     ///   `openshell ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
-    ///   `openshell ssh-proxy --cluster <name> --name <sandbox-name>`
+    ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
     #[command(hide = true)]
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
-        /// Required in token mode.
-        #[arg(long)]
+        /// Required in token mode. In name mode, can be a gateway name.
+        #[arg(long, short = 'g')]
         gateway: Option<String>,
 
         /// Sandbox id. Required in token mode.
@@ -411,24 +411,17 @@ enum Commands {
         #[arg(long)]
         token: Option<String>,
 
-        /// Cluster endpoint URL. Used in name mode. Deprecated: prefer --cluster.
+        /// Gateway endpoint URL. Used in name mode. Deprecated: prefer --gateway.
         #[arg(long)]
         server: Option<String>,
 
-        /// Cluster name (resolves endpoint from stored metadata). Used in name mode.
-        #[arg(long, short)]
-        cluster: Option<String>,
+        /// Gateway name. Used with --name to resolve gateway from metadata.
+        #[arg(long)]
+        gateway_name: Option<String>,
 
         /// Sandbox name. Used in name mode.
         #[arg(long)]
         name: Option<String>,
-    },
-
-    /// Manage cluster (deprecated: use `gateway`).
-    #[command(hide = true)]
-    Cluster {
-        #[command(subcommand)]
-        command: ClusterCommands,
     },
 }
 
@@ -619,7 +612,7 @@ enum GatewayCommands {
     /// Deploy/start the gateway.
     Start {
         /// Gateway name.
-        #[arg(long, default_value = "openshell", env = "OPENSHELL_CLUSTER")]
+        #[arg(long, default_value = "openshell", env = "OPENSHELL_GATEWAY")]
         name: String,
 
         /// Write stored kubeconfig into local kubeconfig.
@@ -694,14 +687,14 @@ enum GatewayCommands {
     /// Stop the gateway (preserves state).
     Stop {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_GATEWAY")]
         name: Option<String>,
 
-        /// Override SSH destination (auto-resolved from cluster metadata).
+        /// Override SSH destination (auto-resolved from gateway metadata).
         #[arg(long)]
         remote: Option<String>,
 
-        /// Path to SSH private key for remote cluster.
+        /// Path to SSH private key for remote gateway.
         #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
     },
@@ -709,14 +702,14 @@ enum GatewayCommands {
     /// Destroy the gateway and its state.
     Destroy {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_GATEWAY")]
         name: Option<String>,
 
-        /// Override SSH destination (auto-resolved from cluster metadata).
+        /// Override SSH destination (auto-resolved from gateway metadata).
         #[arg(long)]
         remote: Option<String>,
 
-        /// Path to SSH private key for remote cluster.
+        /// Path to SSH private key for remote gateway.
         #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
     },
@@ -747,7 +740,7 @@ enum GatewayCommands {
     /// or to authenticate a gateway added with `--no-auth`.
     Login {
         /// Gateway name (defaults to the active gateway).
-        #[arg(add = ArgValueCompleter::new(completers::complete_cluster_names))]
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
 
@@ -756,24 +749,24 @@ enum GatewayCommands {
     /// When called without a name, lists available gateways to choose from.
     Select {
         /// Gateway name (omit to list available gateways).
-        #[arg(add = ArgValueCompleter::new(completers::complete_cluster_names))]
+        #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
 
     /// Show gateway deployment details.
     Info {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_GATEWAY")]
         name: Option<String>,
     },
 
     /// Print or start an SSH tunnel for kubectl access to a remote gateway.
     Tunnel {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_CLUSTER")]
+        #[arg(long, env = "OPENSHELL_GATEWAY")]
         name: Option<String>,
 
-        /// Override SSH destination (auto-resolved from cluster metadata).
+        /// Override SSH destination (auto-resolved from gateway metadata).
         #[arg(long)]
         remote: Option<String>,
 
@@ -788,29 +781,12 @@ enum GatewayCommands {
 }
 
 // -----------------------------------------------------------------------
-// Hidden backwards-compat: `cluster admin deploy` → `gateway start`
+// Inference commands
 // -----------------------------------------------------------------------
 
 #[derive(Subcommand, Debug)]
-enum ClusterCommands {
-    /// Deprecated: use `gateway start`.
-    #[command(hide = true)]
-    Admin {
-        #[command(subcommand)]
-        command: ClusterAdminCommands,
-    },
-
-    /// Manage cluster-level inference configuration.
-    #[command(hide = true)]
-    Inference {
-        #[command(subcommand)]
-        command: ClusterInferenceCommands,
-    },
-}
-
-#[derive(Subcommand, Debug)]
-enum ClusterInferenceCommands {
-    /// Set cluster-level inference provider and model.
+enum InferenceCommands {
+    /// Set gateway-level inference provider and model.
     Set {
         /// Provider name.
         #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -821,7 +797,7 @@ enum ClusterInferenceCommands {
         model: String,
     },
 
-    /// Update cluster-level inference configuration (partial update).
+    /// Update gateway-level inference configuration (partial update).
     Update {
         /// Provider name (unchanged if omitted).
         #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -832,54 +808,8 @@ enum ClusterInferenceCommands {
         model: Option<String>,
     },
 
-    /// Get cluster-level inference provider and model.
+    /// Get gateway-level inference provider and model.
     Get,
-}
-
-#[derive(Subcommand, Debug)]
-enum ClusterAdminCommands {
-    /// Deprecated: use `gateway start`.
-    Deploy {
-        /// Cluster name.
-        #[arg(long, default_value = "openshell", env = "OPENSHELL_CLUSTER")]
-        name: String,
-
-        /// Write stored kubeconfig into local kubeconfig.
-        #[arg(long)]
-        update_kube_config: bool,
-
-        /// Print stored kubeconfig to stdout.
-        #[arg(long)]
-        get_kubeconfig: bool,
-
-        /// SSH destination for remote deployment (e.g., user@hostname).
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key for remote deployment.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
-        /// Host port to map to the gateway (default: 8080).
-        #[arg(long, default_value_t = navigator_bootstrap::DEFAULT_GATEWAY_PORT)]
-        port: u16,
-
-        /// Override the gateway host written into cluster metadata.
-        #[arg(long)]
-        gateway_host: Option<String>,
-
-        /// Expose the Kubernetes control plane on a host port for kubectl access.
-        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
-        kube_port: Option<u16>,
-
-        /// Destroy and recreate from scratch if a cluster already exists.
-        #[arg(long)]
-        recreate: bool,
-
-        /// Authentication token for pulling container images from ghcr.io.
-        #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
-        registry_token: Option<String>,
-    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1190,7 +1120,7 @@ async fn main() -> Result<()> {
                 disable_gateway_auth,
                 registry_token,
             } => {
-                run::cluster_admin_deploy(
+                run::gateway_admin_deploy(
                     &name,
                     update_kube_config,
                     get_kubeconfig,
@@ -1212,9 +1142,9 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
-                run::cluster_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
+                run::gateway_admin_stop(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
             GatewayCommands::Destroy {
                 name,
@@ -1222,9 +1152,9 @@ async fn main() -> Result<()> {
                 ssh_key,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
-                run::cluster_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
+                run::gateway_admin_destroy(&name, remote.as_deref(), ssh_key.as_deref()).await?;
             }
             GatewayCommands::Add {
                 endpoint,
@@ -1235,7 +1165,7 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Login { name } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .ok_or_else(|| {
                         miette::miette!(
                             "No active gateway.\n\
@@ -1247,10 +1177,10 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Select { name } => {
                 if let Some(name) = name {
-                    run::cluster_use(&name)?;
+                    run::gateway_use(&name)?;
                 } else {
                     // No name provided — show available gateways.
-                    run::cluster_list(&cli.cluster)?;
+                    run::gateway_list(&cli.gateway)?;
                     eprintln!();
                     eprintln!(
                         "Select a gateway with: {}",
@@ -1260,9 +1190,9 @@ async fn main() -> Result<()> {
             }
             GatewayCommands::Info { name } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
-                run::cluster_admin_info(&name)?;
+                run::gateway_admin_info(&name)?;
             }
             GatewayCommands::Tunnel {
                 name,
@@ -1271,9 +1201,9 @@ async fn main() -> Result<()> {
                 print_command,
             } => {
                 let name = name
-                    .or_else(|| resolve_gateway_name(&cli.cluster))
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
-                run::cluster_admin_tunnel(
+                run::gateway_admin_tunnel(
                     &name,
                     remote.as_deref(),
                     ssh_key.as_deref(),
@@ -1283,13 +1213,13 @@ async fn main() -> Result<()> {
         },
 
         // -----------------------------------------------------------
-        // Top-level status (was `cluster status`)
+        // Top-level status
         // -----------------------------------------------------------
         Some(Commands::Status) => {
-            if let Ok(ctx) = resolve_gateway(&cli.cluster, &cli.gateway_endpoint) {
-                let mut tls = tls.with_cluster_name(&ctx.name);
+            if let Ok(ctx) = resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
+                let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_edge_auth(&mut tls, &ctx.name);
-                run::cluster_status(&ctx.name, &ctx.endpoint, &tls).await?;
+                run::gateway_status(&ctx.name, &ctx.endpoint, &tls).await?;
             } else {
                 println!("{}", "Gateway Status".cyan().bold());
                 println!();
@@ -1309,8 +1239,8 @@ async fn main() -> Result<()> {
             command: Some(fwd_cmd),
         }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
-                let cluster_name = resolve_gateway_name(&cli.cluster).unwrap_or_default();
-                let name = resolve_sandbox_name(name, &cluster_name)?;
+                let gateway_name = resolve_gateway_name(&cli.gateway).unwrap_or_default();
+                let name = resolve_sandbox_name(name, &gateway_name)?;
                 if run::stop_forward(&name, port)? {
                     eprintln!(
                         "{} Stopped forward of port {port} for sandbox {name}",
@@ -1363,8 +1293,8 @@ async fn main() -> Result<()> {
                 name,
                 background,
             } => {
-                let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-                let mut tls = tls.with_cluster_name(&ctx.name);
+                let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_edge_auth(&mut tls, &ctx.name);
                 let name = resolve_sandbox_name(name, &ctx.name)?;
                 run::sandbox_forward(&ctx.endpoint, &name, port, background, &tls).await?;
@@ -1390,8 +1320,8 @@ async fn main() -> Result<()> {
             source,
             level,
         }) => {
-            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-            let mut tls = tls.with_cluster_name(&ctx.name);
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             let name = resolve_sandbox_name(name, &ctx.name)?;
             run::sandbox_logs(
@@ -1413,8 +1343,8 @@ async fn main() -> Result<()> {
         Some(Commands::Policy {
             command: Some(policy_cmd),
         }) => {
-            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-            let mut tls = tls.with_cluster_name(&ctx.name);
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             match policy_cmd {
                 PolicyCommands::Set {
@@ -1444,16 +1374,16 @@ async fn main() -> Result<()> {
         Some(Commands::Inference {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
-            let mut tls = tls.with_cluster_name(&ctx.name);
+            let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             match command {
-                ClusterInferenceCommands::Set { provider, model } => {
-                    run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
+                InferenceCommands::Set { provider, model } => {
+                    run::gateway_inference_set(endpoint, &provider, &model, &tls).await?;
                 }
-                ClusterInferenceCommands::Update { provider, model } => {
-                    run::cluster_inference_update(
+                InferenceCommands::Update { provider, model } => {
+                    run::gateway_inference_update(
                         endpoint,
                         provider.as_deref(),
                         model.as_deref(),
@@ -1461,8 +1391,8 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                ClusterInferenceCommands::Get => {
-                    run::cluster_inference_get(endpoint, &tls).await?;
+                InferenceCommands::Get => {
+                    run::gateway_inference_get(endpoint, &tls).await?;
                 }
             }
         }
@@ -1528,7 +1458,7 @@ async fn main() -> Result<()> {
 
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
-                    match resolve_gateway(&cli.cluster, &cli.gateway_endpoint) {
+                    match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
                         Ok(ctx) => {
                             if remote.is_some() {
                                 eprintln!(
@@ -1540,7 +1470,7 @@ async fn main() -> Result<()> {
                                 return Ok(());
                             }
                             let endpoint = &ctx.endpoint;
-                            let mut tls = tls.with_cluster_name(&ctx.name);
+                            let mut tls = tls.with_gateway_name(&ctx.name);
                             apply_edge_auth(&mut tls, &ctx.name);
                             Box::pin(run::sandbox_create(
                                 endpoint,
@@ -1563,7 +1493,7 @@ async fn main() -> Result<()> {
                             .await?;
                         }
                         Err(_) => {
-                            // No cluster configured — go straight to bootstrap.
+                            // No gateway configured — go straight to bootstrap.
                             Box::pin(run::sandbox_create_with_bootstrap(
                                 name.as_deref(),
                                 from.as_deref(),
@@ -1589,8 +1519,8 @@ async fn main() -> Result<()> {
                     dest,
                     no_git_ignore,
                 } => {
-                    let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-                    let mut tls = tls.with_cluster_name(&ctx.name);
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
                     let sandbox_dest = dest.as_deref().unwrap_or("/sandbox");
                     let local = std::path::Path::new(&local_path);
@@ -1623,8 +1553,8 @@ async fn main() -> Result<()> {
                     sandbox_path,
                     dest,
                 } => {
-                    let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-                    let mut tls = tls.with_cluster_name(&ctx.name);
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+                    let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
                     let local_dest = std::path::Path::new(dest.as_deref().unwrap_or("."));
                     eprintln!(
@@ -1637,9 +1567,9 @@ async fn main() -> Result<()> {
                     eprintln!("{} Download complete", "✓".green().bold());
                 }
                 other => {
-                    let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+                    let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                     let endpoint = &ctx.endpoint;
-                    let mut tls = tls.with_cluster_name(&ctx.name);
+                    let mut tls = tls.with_gateway_name(&ctx.name);
                     apply_edge_auth(&mut tls, &ctx.name);
                     match other {
                         SandboxCommands::Create { .. }
@@ -1678,9 +1608,9 @@ async fn main() -> Result<()> {
         Some(Commands::Provider {
             command: Some(command),
         }) => {
-            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
-            let mut tls = tls.with_cluster_name(&ctx.name);
+            let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
 
             match command {
@@ -1734,8 +1664,8 @@ async fn main() -> Result<()> {
             }
         }
         Some(Commands::Term) => {
-            let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-            let mut tls = tls.with_cluster_name(&ctx.name);
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
             navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
@@ -1756,114 +1686,50 @@ async fn main() -> Result<()> {
             sandbox_id,
             token,
             server,
-            cluster,
+            gateway_name,
             name,
         }) => {
-            match (gateway, sandbox_id, token, server, cluster, name) {
+            match (gateway, sandbox_id, token, server, gateway_name, name) {
                 // Token mode (existing behavior): pre-created session credentials.
-                (Some(gw), Some(sid), Some(tok), _, cluster_opt, _) => {
-                    let mut effective_tls = match cluster_opt {
-                        Some(ref c) => tls.with_cluster_name(c),
+                (Some(gw), Some(sid), Some(tok), _, gateway_name_opt, _) => {
+                    let mut effective_tls = match gateway_name_opt {
+                        Some(ref g) => tls.with_gateway_name(g),
                         None => tls,
                     };
-                    if let Some(ref c) = cluster_opt {
-                        apply_edge_auth(&mut effective_tls, c);
+                    if let Some(ref g) = gateway_name_opt {
+                        apply_edge_auth(&mut effective_tls, g);
                     }
                     run::sandbox_ssh_proxy(&gw, &sid, &tok, &effective_tls).await?;
                 }
-                // Name mode with --cluster: resolve endpoint from metadata.
-                (_, _, _, server_override, Some(c), Some(n)) => {
+                // Name mode with --gateway-name: resolve endpoint from metadata.
+                (_, _, _, server_override, Some(g), Some(n)) => {
                     let endpoint = if let Some(srv) = server_override {
                         srv
                     } else {
-                        let meta = load_cluster_metadata(&c).map_err(|_| {
+                        let meta = load_gateway_metadata(&g).map_err(|_| {
                             miette::miette!(
-                                "Unknown gateway '{c}'.\n\
-                                  Deploy it first: openshell gateway start --name {c}\n\
+                                "Unknown gateway '{g}'.\n\
+                                  Deploy it first: openshell gateway start --name {g}\n\
                                   Or list available gateways: openshell gateway select"
                             )
                         })?;
                         meta.gateway_endpoint
                     };
-                    let mut tls = tls.with_cluster_name(&c);
-                    apply_edge_auth(&mut tls, &c);
+                    let mut tls = tls.with_gateway_name(&g);
+                    apply_edge_auth(&mut tls, &g);
                     run::sandbox_ssh_proxy_by_name(&endpoint, &n, &tls).await?;
                 }
-                // Legacy name mode with --server only (no --cluster).
+                // Legacy name mode with --server only (no --gateway-name).
                 (_, _, _, Some(srv), None, Some(n)) => {
                     run::sandbox_ssh_proxy_by_name(&srv, &n, &tls).await?;
                 }
                 _ => {
                     return Err(miette::miette!(
-                        "provide either --gateway/--sandbox-id/--token or --cluster/--name (or --server/--name)"
+                        "provide either --gateway/--sandbox-id/--token or --gateway-name/--name (or --server/--name)"
                     ));
                 }
             }
         }
-
-        // -----------------------------------------------------------
-        // Hidden backwards-compat: `cluster admin deploy`
-        // -----------------------------------------------------------
-        Some(Commands::Cluster { command }) => match command {
-            ClusterCommands::Admin { command } => match command {
-                ClusterAdminCommands::Deploy {
-                    name,
-                    update_kube_config,
-                    get_kubeconfig,
-                    remote,
-                    ssh_key,
-                    port,
-                    gateway_host,
-                    kube_port,
-                    recreate,
-                    registry_token,
-                } => {
-                    eprintln!(
-                        "{} `openshell cluster admin deploy` is deprecated. \
-                         Use `openshell gateway start` instead.",
-                        "warning:".yellow().bold(),
-                    );
-                    run::cluster_admin_deploy(
-                        &name,
-                        update_kube_config,
-                        get_kubeconfig,
-                        remote.as_deref(),
-                        ssh_key.as_deref(),
-                        port,
-                        gateway_host.as_deref(),
-                        kube_port,
-                        recreate,
-                        false, // disable_tls
-                        false, // disable_gateway_auth
-                        registry_token.as_deref(),
-                    )
-                    .await?;
-                }
-            },
-            ClusterCommands::Inference { command } => {
-                let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
-                let endpoint = &ctx.endpoint;
-                let mut tls = tls.with_cluster_name(&ctx.name);
-                apply_edge_auth(&mut tls, &ctx.name);
-                match command {
-                    ClusterInferenceCommands::Set { provider, model } => {
-                        run::cluster_inference_set(endpoint, &provider, &model, &tls).await?;
-                    }
-                    ClusterInferenceCommands::Update { provider, model } => {
-                        run::cluster_inference_update(
-                            endpoint,
-                            provider.as_deref(),
-                            model.as_deref(),
-                            &tls,
-                        )
-                        .await?;
-                    }
-                    ClusterInferenceCommands::Get => {
-                        run::cluster_inference_get(endpoint, &tls).await?;
-                    }
-                }
-            }
-        },
 
         // No subcommand provided - print help for the command
         Some(Commands::Sandbox { command: None }) => {
@@ -1937,7 +1803,7 @@ fn parse_upload_spec(spec: &str) -> (String, Option<String>) {
 mod tests {
     use super::*;
     use navigator_bootstrap::{
-        ClusterMetadata, edge_token::store_edge_token, store_cluster_metadata,
+        GatewayMetadata, edge_token::store_edge_token, store_gateway_metadata,
     };
     use std::ffi::OsString;
     use std::fs;
@@ -1967,8 +1833,8 @@ mod tests {
         }
     }
 
-    fn edge_metadata(name: &str, endpoint: &str) -> ClusterMetadata {
-        ClusterMetadata {
+    fn edge_metadata(name: &str, endpoint: &str) -> GatewayMetadata {
+        GatewayMetadata {
             name: name.to_string(),
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
@@ -2156,7 +2022,7 @@ mod tests {
     fn resolve_sandbox_name_returns_explicit_name() {
         // When a name is provided, it should be returned regardless of any
         // stored last-sandbox state.
-        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-cluster");
+        let result = resolve_sandbox_name(Some("explicit".to_string()), "any-gateway");
         assert_eq!(result.unwrap(), "explicit");
     }
 
@@ -2164,8 +2030,8 @@ mod tests {
     fn resolve_sandbox_name_falls_back_to_last_used() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            save_last_sandbox("test-cluster", "remembered-sb").unwrap();
-            let result = resolve_sandbox_name(None, "test-cluster");
+            save_last_sandbox("test-gateway", "remembered-sb").unwrap();
+            let result = resolve_sandbox_name(None, "test-gateway");
             assert_eq!(result.unwrap(), "remembered-sb");
         });
     }
@@ -2174,7 +2040,7 @@ mod tests {
     fn resolve_sandbox_name_errors_without_fallback() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            let err = resolve_sandbox_name(None, "unknown-cluster").unwrap_err();
+            let err = resolve_sandbox_name(None, "unknown-gateway").unwrap_err();
             let msg = err.to_string();
             assert!(
                 msg.contains("nav sandbox connect"),
@@ -2187,7 +2053,7 @@ mod tests {
     fn resolve_gateway_uses_stored_name_for_matching_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            store_cluster_metadata(
+            store_gateway_metadata(
                 "edge-gateway",
                 &edge_metadata("edge-gateway", "https://gw.example.com"),
             )
@@ -2200,10 +2066,10 @@ mod tests {
     }
 
     #[test]
-    fn resolve_gateway_prefers_explicit_cluster_for_direct_endpoint() {
+    fn resolve_gateway_prefers_explicit_gateway_for_direct_endpoint() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            store_cluster_metadata(
+            store_gateway_metadata(
                 "named-gateway",
                 &edge_metadata("named-gateway", "https://stored.example.com"),
             )
@@ -2224,7 +2090,7 @@ mod tests {
     fn apply_edge_auth_uses_stored_token() {
         let tmp = tempfile::tempdir().unwrap();
         with_tmp_xdg(tmp.path(), || {
-            store_cluster_metadata(
+            store_gateway_metadata(
                 "edge-gateway",
                 &edge_metadata("edge-gateway", "https://gw.example.com"),
             )
