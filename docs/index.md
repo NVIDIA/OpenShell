@@ -70,13 +70,15 @@ Install the CLI and create your first sandbox in two commands.
   grid-area: 1 / 1;
   white-space: nowrap;
   opacity: 0;
-  animation: nc-cycle 6s ease-in-out infinite;
+  animation: nc-cycle 12s ease-in-out infinite;
 }
 .nc-swap > span:nth-child(2) { animation-delay: 3s; }
+.nc-swap > span:nth-child(3) { animation-delay: 6s; }
+.nc-swap > span:nth-child(4) { animation-delay: 9s; }
 @keyframes nc-cycle {
-  0%, 5%     { opacity: 0; }
-  10%, 42%   { opacity: 1; }
-  50%, 100%  { opacity: 0; }
+  0%, 3%     { opacity: 0; }
+  5%, 20%    { opacity: 1; }
+  25%, 100%  { opacity: 0; }
 }
 .nc-hl { color: #76b900; font-weight: 600; }
 .nc-cursor {
@@ -98,7 +100,7 @@ Install the CLI and create your first sandbox in two commands.
   </div>
   <div class="nc-term-body">
     <div><span class="nc-ps">$ </span>uv pip install openshell</div>
-    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
+    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span><span>-- <span class="nc-hl">opencode</span></span><span>-- <span class="nc-hl">codex</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```
