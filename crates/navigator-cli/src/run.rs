@@ -2789,6 +2789,7 @@ pub async fn gateway_inference_set(
     server: &str,
     provider_name: &str,
     model_id: &str,
+    route_name: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_inference_client(server, tls).await?;
@@ -2796,13 +2797,20 @@ pub async fn gateway_inference_set(
         .set_cluster_inference(SetClusterInferenceRequest {
             provider_name: provider_name.to_string(),
             model_id: model_id.to_string(),
+            route_name: route_name.to_string(),
         })
         .await
         .into_diagnostic()?;
 
     let configured = response.into_inner();
-    println!("{}", "Gateway inference configured:".cyan().bold());
+    let label = if configured.route_name == "sandbox-system" {
+        "System inference configured:"
+    } else {
+        "Gateway inference configured:"
+    };
+    println!("{}", label.cyan().bold());
     println!();
+    println!("  {} {}", "Route:".dimmed(), configured.route_name);
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
@@ -2813,6 +2821,7 @@ pub async fn gateway_inference_update(
     server: &str,
     provider_name: Option<&str>,
     model_id: Option<&str>,
+    route_name: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
     if provider_name.is_none() && model_id.is_none() {
@@ -2825,7 +2834,9 @@ pub async fn gateway_inference_update(
 
     // Fetch current config to use as base for the partial update.
     let current = client
-        .get_cluster_inference(GetClusterInferenceRequest {})
+        .get_cluster_inference(GetClusterInferenceRequest {
+            route_name: route_name.to_string(),
+        })
         .await
         .into_diagnostic()?
         .into_inner();
@@ -2837,33 +2848,92 @@ pub async fn gateway_inference_update(
         .set_cluster_inference(SetClusterInferenceRequest {
             provider_name: provider.to_string(),
             model_id: model.to_string(),
+            route_name: route_name.to_string(),
         })
         .await
         .into_diagnostic()?;
 
     let configured = response.into_inner();
-    println!("{}", "Gateway inference updated:".cyan().bold());
+    let label = if configured.route_name == "sandbox-system" {
+        "System inference updated:"
+    } else {
+        "Gateway inference updated:"
+    };
+    println!("{}", label.cyan().bold());
     println!();
+    println!("  {} {}", "Route:".dimmed(), configured.route_name);
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
     Ok(())
 }
 
-pub async fn gateway_inference_get(server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_inference_get(
+    server: &str,
+    route_name: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_inference_client(server, tls).await?;
-    let response = client
-        .get_cluster_inference(GetClusterInferenceRequest {})
-        .await
-        .into_diagnostic()?;
 
-    let configured = response.into_inner();
-    println!("{}", "Gateway inference:".cyan().bold());
-    println!();
-    println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
-    println!("  {} {}", "Model:".dimmed(), configured.model_id);
-    println!("  {} {}", "Version:".dimmed(), configured.version);
+    if let Some(name) = route_name {
+        // Show a single route (--system was specified).
+        let response = client
+            .get_cluster_inference(GetClusterInferenceRequest {
+                route_name: name.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+
+        let configured = response.into_inner();
+        let label = if name == "sandbox-system" {
+            "System inference:"
+        } else {
+            "Gateway inference:"
+        };
+        println!("{}", label.cyan().bold());
+        println!();
+        println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+        println!("  {} {}", "Model:".dimmed(), configured.model_id);
+        println!("  {} {}", "Version:".dimmed(), configured.version);
+    } else {
+        // Show both routes by default.
+        print_inference_route(&mut client, "Gateway inference", "").await;
+        println!();
+        print_inference_route(&mut client, "System inference", "sandbox-system").await;
+    }
     Ok(())
+}
+
+async fn print_inference_route(
+    client: &mut crate::tls::GrpcInferenceClient,
+    label: &str,
+    route_name: &str,
+) {
+    match client
+        .get_cluster_inference(GetClusterInferenceRequest {
+            route_name: route_name.to_string(),
+        })
+        .await
+    {
+        Ok(response) => {
+            let configured = response.into_inner();
+            println!("{}", format!("{label}:").cyan().bold());
+            println!();
+            println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
+            println!("  {} {}", "Model:".dimmed(), configured.model_id);
+            println!("  {} {}", "Version:".dimmed(), configured.version);
+        }
+        Err(e) if e.code() == Code::NotFound => {
+            println!("{}", format!("{label}:").cyan().bold());
+            println!();
+            println!("  {}", "Not configured".dimmed());
+        }
+        Err(e) => {
+            println!("{}", format!("{label}:").cyan().bold());
+            println!();
+            println!("  {} {}", "Error:".red(), e.message());
+        }
+    }
 }
 
 pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {

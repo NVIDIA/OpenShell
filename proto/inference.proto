@@ -41,7 +41,8 @@ message ClusterInferenceConfig {
 message InferenceRoute {
   string id = 1;
   ClusterInferenceConfig config = 2;
-  // Object name (always "inference.local" for the managed route).
+  // Object name ("inference.local" for the user-facing route,
+  // "sandbox-system" for the sandbox system-level route).
   string name = 3;
   // Monotonic version incremented on every update.
   uint64 version = 4;
@@ -52,20 +53,31 @@ message SetClusterInferenceRequest {
   string provider_name = 1;
   // Model identifier to force on generation calls.
   string model_id = 2;
+  // Route name to target. Empty string defaults to "inference.local" (user-facing).
+  // Use "sandbox-system" for the sandbox system-level inference route.
+  string route_name = 3;
 }
 
 message SetClusterInferenceResponse {
   string provider_name = 1;
   string model_id = 2;
   uint64 version = 3;
+  // Route name that was configured.
+  string route_name = 4;
 }
 
-message GetClusterInferenceRequest {}
+message GetClusterInferenceRequest {
+  // Route name to query. Empty string defaults to "inference.local" (user-facing).
+  // Use "sandbox-system" for the sandbox system-level inference route.
+  string route_name = 1;
+}
 
 message GetClusterInferenceResponse {
   string provider_name = 1;
   string model_id = 2;
   uint64 version = 3;
+  // Route name that was queried.
+  string route_name = 4;
 }
 
 message GetInferenceBundleRequest {}

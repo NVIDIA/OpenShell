@@ -124,6 +124,7 @@ mod tests {
 
     fn make_route(endpoint: &str, protocols: &[&str], model: &str) -> ResolvedRoute {
         ResolvedRoute {
+            name: "test".to_string(),
             endpoint: endpoint.to_string(),
             model: model.to_string(),
             api_key: "key".to_string(),

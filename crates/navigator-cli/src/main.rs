@@ -795,6 +795,12 @@ enum InferenceCommands {
         /// Model identifier to force for generation calls.
         #[arg(long)]
         model: String,
+
+        /// Configure the system inference route instead of the user-facing
+        /// route. System inference is used by platform functions (e.g. the
+        /// agent harness) and is not accessible to user code.
+        #[arg(long)]
+        system: bool,
     },
 
     /// Update gateway-level inference configuration (partial update).
@@ -806,10 +812,19 @@ enum InferenceCommands {
         /// Model identifier (unchanged if omitted).
         #[arg(long)]
         model: Option<String>,
+
+        /// Target the system inference route.
+        #[arg(long)]
+        system: bool,
     },
 
     /// Get gateway-level inference provider and model.
-    Get,
+    Get {
+        /// Show the system inference route instead of the user-facing route.
+        /// When omitted, both routes are displayed.
+        #[arg(long)]
+        system: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -1379,20 +1394,33 @@ async fn main() -> Result<()> {
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             match command {
-                InferenceCommands::Set { provider, model } => {
-                    run::gateway_inference_set(endpoint, &provider, &model, &tls).await?;
+                InferenceCommands::Set {
+                    provider,
+                    model,
+                    system,
+                } => {
+                    let route_name = if system { "sandbox-system" } else { "" };
+                    run::gateway_inference_set(endpoint, &provider, &model, route_name, &tls)
+                        .await?;
                 }
-                InferenceCommands::Update { provider, model } => {
+                InferenceCommands::Update {
+                    provider,
+                    model,
+                    system,
+                } => {
+                    let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_update(
                         endpoint,
                         provider.as_deref(),
                         model.as_deref(),
+                        route_name,
                         &tls,
                     )
                     .await?;
                 }
-                InferenceCommands::Get => {
-                    run::gateway_inference_get(endpoint, &tls).await?;
+                InferenceCommands::Get { system } => {
+                    let route_name = if system { Some("sandbox-system") } else { None };
+                    run::gateway_inference_get(endpoint, route_name, &tls).await?;
                 }
             }
         }

@@ -35,6 +35,8 @@ pub struct RouteConfig {
 /// caller during resolution.
 #[derive(Clone)]
 pub struct ResolvedRoute {
+    /// Route name used for identification (e.g. "inference.local", "sandbox-system").
+    pub name: String,
     pub endpoint: String,
     pub model: String,
     pub api_key: String,
@@ -48,6 +50,7 @@ pub struct ResolvedRoute {
 impl std::fmt::Debug for ResolvedRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ResolvedRoute")
+            .field("name", &self.name)
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
             .field("api_key", &"[REDACTED]")
@@ -119,6 +122,7 @@ impl RouteConfig {
         let (auth, default_headers) = auth_from_provider_type(self.provider_type.as_deref());
 
         Ok(ResolvedRoute {
+            name: self.name.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
             api_key: self.resolve_api_key()?,
@@ -245,6 +249,7 @@ routes:
     #[test]
     fn resolved_route_debug_redacts_api_key() {
         let route = ResolvedRoute {
+            name: "test".to_string(),
             endpoint: "https://api.example.com/v1".to_string(),
             model: "test-model".to_string(),
             api_key: "sk-super-secret-key-12345".to_string(),

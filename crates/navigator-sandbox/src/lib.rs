@@ -13,7 +13,7 @@ pub mod opa;
 mod policy;
 mod process;
 pub mod procfs;
-mod proxy;
+pub mod proxy;
 mod sandbox;
 mod ssh;
 
@@ -651,11 +651,19 @@ async fn build_inference_context(
         "Inference routing enabled with local execution"
     );
 
+    // Partition routes by name into user-facing and system caches.
+    let (user_routes, system_routes) = partition_routes(routes);
+
     let router =
         Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
     let patterns = l7::inference::default_patterns();
 
-    let ctx = Arc::new(proxy::InferenceContext::new(patterns, router, routes));
+    let ctx = Arc::new(proxy::InferenceContext::new(
+        patterns,
+        router,
+        user_routes,
+        system_routes,
+    ));
 
     // Spawn background route cache refresh for cluster mode at startup so
     // request handling never depends on control-plane latency.
@@ -664,6 +672,7 @@ async fn build_inference_context(
     {
         spawn_route_refresh(
             ctx.route_cache(),
+            ctx.system_route_cache(),
             endpoint.to_string(),
             route_refresh_interval_secs(),
             initial_revision,
@@ -671,6 +680,31 @@ async fn build_inference_context(
     }
 
     Ok(Some(ctx))
+}
+
+/// Route name for the sandbox system inference route.
+const SANDBOX_SYSTEM_ROUTE_NAME: &str = "sandbox-system";
+
+/// Split resolved routes into user-facing and system caches by route name.
+///
+/// Routes named `"sandbox-system"` go to the system cache; everything else
+/// (including `"inference.local"` and empty names) goes to the user cache.
+fn partition_routes(
+    routes: Vec<navigator_router::config::ResolvedRoute>,
+) -> (
+    Vec<navigator_router::config::ResolvedRoute>,
+    Vec<navigator_router::config::ResolvedRoute>,
+) {
+    let mut user = Vec::new();
+    let mut system = Vec::new();
+    for r in routes {
+        if r.name == SANDBOX_SYSTEM_ROUTE_NAME {
+            system.push(r);
+        } else {
+            user.push(r);
+        }
+    }
+    (user, system)
 }
 
 /// Convert a proto bundle response into resolved routes for the router.
@@ -684,6 +718,7 @@ pub(crate) fn bundle_to_resolved_routes(
             let (auth, default_headers) =
                 navigator_core::inference::auth_for_provider_type(&r.provider_type);
             navigator_router::config::ResolvedRoute {
+                name: r.name.clone(),
                 endpoint: r.base_url.clone(),
                 model: r.model_id.clone(),
                 api_key: r.api_key.clone(),
@@ -695,14 +730,15 @@ pub(crate) fn bundle_to_resolved_routes(
         .collect()
 }
 
-/// Spawn a background task that periodically refreshes the route cache from the gateway.
+/// Spawn a background task that periodically refreshes both route caches from the gateway.
 ///
 /// The loop uses the bundle `revision` hash to avoid unnecessary cache writes
 /// when routes haven't changed. `initial_revision` is the revision captured
 /// during the startup fetch in [`build_inference_context`] so the first refresh
 /// cycle can already skip a no-op update.
 pub(crate) fn spawn_route_refresh(
-    cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
+    user_cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
+    system_cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
     endpoint: String,
     interval_secs: u64,
     initial_revision: Option<String>,
@@ -726,13 +762,16 @@ pub(crate) fn spawn_route_refresh(
                     }
 
                     let routes = bundle_to_resolved_routes(&bundle);
+                    let (user_routes, system_routes) = partition_routes(routes);
                     info!(
-                        route_count = routes.len(),
+                        user_route_count = user_routes.len(),
+                        system_route_count = system_routes.len(),
                         revision = %bundle.revision,
                         "Inference routes updated"
                     );
                     current_revision = Some(bundle.revision);
-                    *cache.write().await = routes;
+                    *user_cache.write().await = user_routes;
+                    *system_cache.write().await = system_routes;
                 }
                 Err(e) => {
                     warn!(error = %e, "Failed to refresh inference route cache, keeping stale routes");
@@ -1260,6 +1299,55 @@ mod tests {
         assert!(routes.is_empty());
     }
 
+    #[test]
+    fn bundle_to_resolved_routes_preserves_name_field() {
+        let bundle = navigator_core::proto::GetInferenceBundleResponse {
+            routes: vec![navigator_core::proto::ResolvedRoute {
+                name: "sandbox-system".to_string(),
+                base_url: "https://api.example.com/v1".to_string(),
+                api_key: "key".to_string(),
+                model_id: "model".to_string(),
+                protocols: vec!["openai_chat_completions".to_string()],
+                provider_type: "openai".to_string(),
+            }],
+            revision: "rev".to_string(),
+            generated_at_ms: 0,
+        };
+
+        let routes = bundle_to_resolved_routes(&bundle);
+        assert_eq!(routes[0].name, "sandbox-system");
+    }
+
+    #[test]
+    fn routes_segregated_by_name() {
+        let routes = vec![
+            navigator_router::config::ResolvedRoute {
+                name: "inference.local".to_string(),
+                endpoint: "https://api.openai.com/v1".to_string(),
+                model: "gpt-4o".to_string(),
+                api_key: "key1".to_string(),
+                protocols: vec!["openai_chat_completions".to_string()],
+                auth: navigator_core::inference::AuthHeader::Bearer,
+                default_headers: vec![],
+            },
+            navigator_router::config::ResolvedRoute {
+                name: "sandbox-system".to_string(),
+                endpoint: "https://api.anthropic.com/v1".to_string(),
+                model: "claude-sonnet-4-20250514".to_string(),
+                api_key: "key2".to_string(),
+                protocols: vec!["anthropic_messages".to_string()],
+                auth: navigator_core::inference::AuthHeader::Custom("x-api-key"),
+                default_headers: vec![],
+            },
+        ];
+
+        let (user, system) = partition_routes(routes);
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].name, "inference.local");
+        assert_eq!(system.len(), 1);
+        assert_eq!(system[0].name, "sandbox-system");
+    }
+
     // -- build_inference_context tests --
 
     #[tokio::test]
@@ -1531,6 +1619,7 @@ filesystem_policy:
         use tokio::sync::RwLock;
 
         let routes = vec![navigator_router::config::ResolvedRoute {
+            name: "inference.local".to_string(),
             endpoint: "http://original:8000/v1".to_string(),
             model: "original-model".to_string(),
             api_key: "key".to_string(),

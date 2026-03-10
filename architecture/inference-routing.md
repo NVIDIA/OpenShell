@@ -225,12 +225,53 @@ Validation at load time requires either `api_key` or `api_key_env` to resolve, a
 | `503` | Upstream unavailable (timeout or connection failure) |
 | `413` | Request body exceeds 10 MiB buffer limit |
 
+## System Inference Route
+
+In addition to the user-facing `inference.local` route, the gateway supports a second managed route named `sandbox-system` for platform system functions (e.g. an embedded agent harness for policy analysis).
+
+### Key differences from user inference
+
+| Aspect | User (`inference.local`) | System (`sandbox-system`) |
+|--------|--------------------------|---------------------------|
+| **Consumer** | Agent code inside sandbox | Supervisor binary only |
+| **Access** | Proxy-intercepted CONNECT | In-process API on `InferenceContext` |
+| **Network surface** | HTTPS to `inference.local:443` | None -- function call |
+| **Route cache** | `InferenceContext.routes` | `InferenceContext.system_routes` |
+
+### In-process API
+
+`InferenceContext::system_inference()` provides the supervisor with direct access to inference using the system routes. It calls `Router::proxy_with_candidates()` with the system route cache -- the same backend proxy logic used for user inference, but without any CONNECT/TLS overhead.
+
+```rust
+ctx.system_inference(
+    "openai_chat_completions",
+    "POST",
+    "/v1/chat/completions",
+    headers,
+    body,
+).await
+```
+
+### Access control
+
+The system route is not exposed through the CONNECT proxy. The supervisor runs in the host network namespace and calls the router directly. User processes are in an isolated sandbox network namespace and cannot reach the in-process API.
+
+### Bundle delivery
+
+Both routes are included in `GetInferenceBundleResponse.routes` (which is `repeated ResolvedRoute`). The sandbox partitions routes by `ResolvedRoute.name` during `bundle_to_resolved_routes()`: routes named `sandbox-system` go to the system cache, everything else goes to the user cache. Both caches are refreshed on the same polling interval.
+
+### Storage
+
+The system route is stored as a separate `InferenceRoute` record in the gateway store with `name = "sandbox-system"`. The `SetClusterInferenceRequest.route_name` field selects which route to target (empty string defaults to `inference.local`).
+
 ## CLI Surface
 
 Cluster inference commands:
 
-- `openshell cluster inference set --provider <name> --model <id>` -- configures cluster inference by referencing a provider record name
-- `openshell cluster inference get` -- displays current cluster inference configuration
+- `openshell cluster inference set --provider <name> --model <id>` -- configures user-facing cluster inference
+- `openshell cluster inference set --system --provider <name> --model <id>` -- configures system inference
+- `openshell cluster inference get` -- displays both user and system inference configuration
+- `openshell cluster inference get --system` -- displays only the system inference configuration
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
 
