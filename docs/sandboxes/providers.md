@@ -125,4 +125,4 @@ environment variable names and values yourself with `--credential`.
 ## Next Steps
 
 - {doc}`create-and-manage`: Full sandbox lifecycle management
-- {doc}`../safety-and-privacy/index`: Why credential isolation matters
+- {doc}`index`: Why credential isolation matters

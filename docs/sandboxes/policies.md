@@ -142,7 +142,7 @@ Every outbound connection from the sandbox goes through the proxy:
 - The proxy matches the **destination** (host and port) and the **calling binary** to an endpoint in one of your policy blocks. A connection is allowed only when both match.
 - For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is checked against that endpoint's `rules` (method and path).
 - If no endpoint matches and inference routes are configured, the request may be rerouted for inference.
-- Otherwise the connection is denied. Endpoints without `protocol` or `tls` (L4-only) allow TCP passthrough without payload inspection.
+- Otherwise the connection is denied. Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads.
 
 ## Examples
 
@@ -167,7 +167,7 @@ Allow `pip install` and `uv pip install` to reach PyPI:
       - { path: /usr/local/bin/uv }
 ```
 
-Endpoints without `protocol` or `tls` use L4 passthrough — the proxy allows the TCP stream without inspecting payloads.
+Endpoints without `protocol` or `tls` use TCP passthrough — the proxy allows the stream without inspecting payloads.
 ::::
 
 ::::{tab-item} Granular rules
@@ -209,13 +209,12 @@ Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: r
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` and `tls: terminate` enable L7 inspection — the proxy decrypts TLS and checks each HTTP request against the `rules` list.
+Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspection — the proxy decrypts TLS and checks each HTTP request against the `rules` list.
 ::::
 
 :::::
 
 ## Next Steps
 
-- {doc}`default-policies`: The built-in policy that ships with OpenShell and what each block allows.
+- {doc}`index`: The built-in policy that ships with OpenShell and what each block allows.
 - [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.
-- [Safety and Privacy](index.md): Threat scenarios and protection layers.

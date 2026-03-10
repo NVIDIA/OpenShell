@@ -97,5 +97,5 @@ The OpenShell Community repository accepts contributions. If you build a sandbox
 ## Next Steps
 
 - {doc}`../sandboxes/community-sandboxes`: Full reference on community sandbox definitions, available images, and how to contribute your own.
-- {doc}`../safety-and-privacy/policies`: Learn the policy format and how to customize what a sandbox can do.
+- {doc}`../sandboxes/policies`: Learn the policy format and how to customize what a sandbox can do.
 - {doc}`../sandboxes/create-and-manage`: Understand the isolation model and lifecycle behind every sandbox.

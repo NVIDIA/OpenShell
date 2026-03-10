@@ -250,8 +250,7 @@ $ nemoclaw sandbox delete opencode-sandbox
 
 ## Next Steps
 
-- {doc}`../safety-and-privacy/policies`: Full reference on policy YAML structure, static and dynamic fields, and enforcement modes.
-- {doc}`../safety-and-privacy/policies`: How network policy fits into the sandbox iteration workflow.
+- {doc}`../sandboxes/policies`: Policy structure, network rules, and the sandbox iteration workflow.
 - {doc}`../inference/index`: `inference.local`, supported API patterns, and request routing.
 - {doc}`../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation.
-- {doc}`../safety-and-privacy/index`: The protection layers and how they interact.
+- {doc}`../sandboxes/index`: The protection layers and how they interact.

@@ -107,7 +107,7 @@ The dashboard shows:
 - **Sandbox status** — name, phase, image, attached providers, age, and active port forwards.
 - **Live log stream** — outbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
 
-Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy — refer to {doc}`../safety-and-privacy/policies` for the workflow.
+Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy — refer to {doc}`policies` for the workflow.
 
 
 ## Transfer Files
@@ -145,4 +145,4 @@ $ nemoclaw sandbox delete my-sandbox
 
 - {doc}`community-sandboxes`: Use pre-built sandboxes from the community catalog
 - {doc}`providers`: Create and attach credential providers
-- {doc}`../safety-and-privacy/policies`: Control what the agent can access
+- {doc}`policies`: Control what the agent can access

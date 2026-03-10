@@ -17,8 +17,8 @@ If sandbox code calls an external inference API like `api.openai.com` or
 `api.anthropic.com`, that traffic is treated like any other outbound network
 request. It is allowed or denied by `network_policies`.
 
-Refer to {doc}`/safety-and-privacy/policies` and the
-[Network Access Rules](/safety-and-privacy/policies.md#network-access-rules)
+Refer to {doc}`/sandboxes/policies` and the
+[Network Access Rules](/sandboxes/policies.md#network-access-rules)
 section for details.
 
 ## `inference.local`
@@ -80,5 +80,5 @@ supported patterns are denied.
 ## Next Steps
 
 - {doc}`configure`: configure the backend behind `inference.local`.
-- [Network Access Rules](/safety-and-privacy/policies.md#network-access-rules):
+- [Network Access Rules](/sandboxes/policies.md#network-access-rules):
   understand how external endpoints are controlled.

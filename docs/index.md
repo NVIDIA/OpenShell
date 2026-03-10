@@ -142,14 +142,14 @@ Create, manage, and customize sandboxes. Use community images or bring your own 
 {bdg-secondary}`Concept`
 :::
 
-:::{grid-item-card} Safety and Privacy
-:link: safety-and-privacy/index
+:::{grid-item-card} Sandbox Policies
+:link: sandboxes/policies
 :link-type: doc
 
-Write policies that control what agents can access. Iterate on network rules in real time.
+Customize sandbox policies and configure network access rules.
 
 +++
-{bdg-secondary}`Concept`
+{bdg-secondary}`How-To`
 :::
 
 :::{grid-item-card} Inference Routing
@@ -203,17 +203,9 @@ get-started/tutorials
 
 sandboxes/index
 sandboxes/create-and-manage
+sandboxes/policies
 sandboxes/providers
 sandboxes/community-sandboxes
-```
-
-```{toctree}
-:caption: Safety and Privacy
-:hidden:
-
-safety-and-privacy/index
-safety-and-privacy/default-policies
-safety-and-privacy/policies
 ```
 
 ```{toctree}
@@ -231,7 +223,6 @@ inference/configure
 reference/cli
 reference/default-policy
 reference/policy-schema
-reference/architecture
 ```
 
 ```{toctree}

@@ -73,4 +73,4 @@ You now have a working sandbox! From here, you can:
 
 - Follow the [Tutorials](tutorials.md) for step-by-step walkthroughs with Claude Code, OpenClaw, and OpenCode.
 - Learn how sandboxes work in [Sandboxes](../sandboxes/create-and-manage.md).
-- Write your own policies in [Safety and Privacy](../safety-and-privacy/index.md).
+- Write your own policies in [Customize Sandbox Policies](../sandboxes/policies.md).
