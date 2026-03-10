@@ -47,7 +47,6 @@ enum InferenceOutcome {
 /// Inference routing context for sandbox-local execution.
 ///
 /// Holds a `Router` (HTTP client) and a cached set of resolved routes.
-/// Routes are loaded at startup and refreshed periodically by a background task.
 pub struct InferenceContext {
     pub patterns: Vec<crate::l7::inference::InferenceApiPattern>,
     router: navigator_router::Router,

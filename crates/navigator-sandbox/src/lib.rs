@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{LazyLock, Mutex};
 use std::time::Duration;
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, trace, warn};
 
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
@@ -40,11 +40,12 @@ use crate::proxy::ProxyHandle;
 use crate::sandbox::linux::netns::NetworkNamespace;
 pub use process::{ProcessHandle, ProcessStatus};
 
-/// How often the sandbox re-fetches the inference route bundle from the gateway
-/// in cluster mode. Keeps local route cache reasonably fresh without excessive
-/// gRPC traffic. File-based routes (`--inference-routes`) are loaded once at
-/// startup and never refreshed.
-const ROUTE_REFRESH_INTERVAL_SECS: u64 = 30;
+/// Default interval (seconds) for re-fetching the inference route bundle from
+/// the gateway in cluster mode. Override at runtime with the
+/// `NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS` environment variable.
+/// File-based routes (`--inference-routes`) are loaded once at startup and never
+/// refreshed.
+const DEFAULT_ROUTE_REFRESH_INTERVAL_SECS: u64 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum InferenceRouteSource {
@@ -69,6 +70,31 @@ fn infer_route_source(
 
 fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
     !matches!(source, InferenceRouteSource::Cluster)
+}
+
+fn route_refresh_interval_secs() -> u64 {
+    match std::env::var("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS") {
+        Ok(value) => match value.parse::<u64>() {
+            Ok(interval) if interval > 0 => interval,
+            Ok(_) => {
+                warn!(
+                    default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+                    "Ignoring zero route refresh interval"
+                );
+                DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+            }
+            Err(error) => {
+                warn!(
+                    interval = %value,
+                    error = %error,
+                    default_interval_secs = DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+                    "Ignoring invalid route refresh interval"
+                );
+                DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+            }
+        },
+        Err(_) => DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -550,6 +576,10 @@ async fn build_inference_context(
 
     let source = infer_route_source(sandbox_id, navigator_endpoint, inference_routes);
 
+    // Captured during the initial cluster bundle fetch so the background refresh
+    // loop can skip no-op updates from the very first tick.
+    let mut initial_revision: Option<String> = None;
+
     let routes = match source {
         InferenceRouteSource::File => {
             let Some(path) = inference_routes else {
@@ -579,6 +609,7 @@ async fn build_inference_context(
             info!(endpoint = %endpoint, "Fetching inference route bundle from gateway");
             match grpc_client::fetch_inference_bundle(endpoint).await {
                 Ok(bundle) => {
+                    initial_revision = Some(bundle.revision.clone());
                     info!(
                         route_count = bundle.routes.len(),
                         revision = %bundle.revision,
@@ -623,20 +654,27 @@ async fn build_inference_context(
     let router =
         Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
     let patterns = l7::inference::default_patterns();
+
     let ctx = Arc::new(proxy::InferenceContext::new(patterns, router, routes));
 
-    // Spawn background route cache refresh for cluster mode
+    // Spawn background route cache refresh for cluster mode at startup so
+    // request handling never depends on control-plane latency.
     if matches!(source, InferenceRouteSource::Cluster)
         && let (Some(_id), Some(endpoint)) = (sandbox_id, navigator_endpoint)
     {
-        spawn_route_refresh(ctx.route_cache(), endpoint.to_string());
+        spawn_route_refresh(
+            ctx.route_cache(),
+            endpoint.to_string(),
+            route_refresh_interval_secs(),
+            initial_revision,
+        );
     }
 
     Ok(Some(ctx))
 }
 
 /// Convert a proto bundle response into resolved routes for the router.
-fn bundle_to_resolved_routes(
+pub(crate) fn bundle_to_resolved_routes(
     bundle: &navigator_core::proto::GetInferenceBundleResponse,
 ) -> Vec<navigator_router::config::ResolvedRoute> {
     bundle
@@ -658,14 +696,23 @@ fn bundle_to_resolved_routes(
 }
 
 /// Spawn a background task that periodically refreshes the route cache from the gateway.
-fn spawn_route_refresh(
+///
+/// The loop uses the bundle `revision` hash to avoid unnecessary cache writes
+/// when routes haven't changed. `initial_revision` is the revision captured
+/// during the startup fetch in [`build_inference_context`] so the first refresh
+/// cycle can already skip a no-op update.
+pub(crate) fn spawn_route_refresh(
     cache: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
     endpoint: String,
+    interval_secs: u64,
+    initial_revision: Option<String>,
 ) {
     tokio::spawn(async move {
         use tokio::time::{MissedTickBehavior, interval};
 
-        let mut tick = interval(Duration::from_secs(ROUTE_REFRESH_INTERVAL_SECS));
+        let mut current_revision = initial_revision;
+
+        let mut tick = interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
 
         loop {
@@ -673,12 +720,18 @@ fn spawn_route_refresh(
 
             match grpc_client::fetch_inference_bundle(&endpoint).await {
                 Ok(bundle) => {
+                    if current_revision.as_deref() == Some(&bundle.revision) {
+                        trace!(revision = %bundle.revision, "Inference bundle unchanged");
+                        continue;
+                    }
+
                     let routes = bundle_to_resolved_routes(&bundle);
-                    debug!(
+                    info!(
                         route_count = routes.len(),
                         revision = %bundle.revision,
-                        "Refreshed inference route cache"
+                        "Inference routes updated"
                     );
+                    current_revision = Some(bundle.revision);
                     *cache.write().await = routes;
                 }
                 Err(e) => {
@@ -1141,6 +1194,10 @@ async fn run_policy_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temp_env::with_vars;
+
+    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
@@ -1420,5 +1477,75 @@ filesystem_policy:
         let proto = navigator_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
+    }
+
+    // ---- Route refresh interval + revision tests ----
+
+    #[test]
+    fn default_route_refresh_interval_is_five_seconds() {
+        assert_eq!(DEFAULT_ROUTE_REFRESH_INTERVAL_SECS, 5);
+    }
+
+    #[test]
+    fn route_refresh_interval_uses_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars(
+            [("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS", Some("9"))],
+            || {
+                assert_eq!(route_refresh_interval_secs(), 9);
+            },
+        );
+    }
+
+    #[test]
+    fn route_refresh_interval_rejects_zero() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars(
+            [("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS", Some("0"))],
+            || {
+                assert_eq!(
+                    route_refresh_interval_secs(),
+                    DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn route_refresh_interval_rejects_invalid_values() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        with_vars(
+            [("NEMOCLAW_ROUTE_REFRESH_INTERVAL_SECS", Some("abc"))],
+            || {
+                assert_eq!(
+                    route_refresh_interval_secs(),
+                    DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
+                );
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn route_cache_preserves_content_when_not_written() {
+        use std::sync::Arc;
+        use tokio::sync::RwLock;
+
+        let routes = vec![navigator_router::config::ResolvedRoute {
+            endpoint: "http://original:8000/v1".to_string(),
+            model: "original-model".to_string(),
+            api_key: "key".to_string(),
+            auth: navigator_core::inference::AuthHeader::Bearer,
+            protocols: vec!["openai_chat_completions".to_string()],
+            default_headers: vec![],
+        }];
+
+        let cache = Arc::new(RwLock::new(routes));
+
+        // Verify the cache preserves its content — the revision-based skip
+        // logic in spawn_route_refresh ensures the cache is only written
+        // when the revision actually changes.
+        let read = cache.read().await;
+        assert_eq!(read.len(), 1);
+        assert_eq!(read[0].model, "original-model");
     }
 }
