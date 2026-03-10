@@ -13,14 +13,11 @@ Complete command reference for the `nemoclaw` CLI. Every subcommand, flag, and o
 nemoclaw
 ├── status
 ├── logs [name]
+├── term
 ├── forward
 │   ├── start <port> <name>
 │   ├── stop <port> <name>
 │   └── list
-├── policy
-│   ├── set <name>
-│   ├── get <name>
-│   └── list <name>
 ├── gateway
 │   ├── start
 │   ├── stop
@@ -37,6 +34,10 @@ nemoclaw
 │   ├── upload [name]
 │   ├── download [name]
 │   └── ssh-config <name>
+├── policy
+│   ├── set <name>
+│   ├── get <name>
+│   └── list <name>
 ├── provider
 │   ├── create
 │   ├── get <name>
@@ -47,24 +48,22 @@ nemoclaw
 │   ├── set
 │   ├── update
 │   └── get
-├── term
 └── completions <shell>
 ```
 
-## Top-Level Commands
+:::{tip}
+Commands that accept an optional `[name]` argument — such as `get`, `connect`, `upload`, `download`, and `logs` — fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect, and prints a hint showing which sandbox was selected.
+:::
 
-Commands available directly under `nemoclaw` for common operations.
+## Status, Logs, and Terminal
 
 | Command | Description |
 |---|---|
 | `nemoclaw status` | Show the health and status of the active gateway. |
-| `nemoclaw logs [name]` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. When name is omitted, uses the last-used sandbox. |
-| `nemoclaw forward start <port> <name>` | Forward a sandbox port to the host. Add `-d` for background mode. |
-| `nemoclaw forward stop <port> <name>` | Stop an active port forward. |
-| `nemoclaw forward list` | List all active port forwards. |
-| `nemoclaw policy set <name>` | Apply or update a policy on a running sandbox. Pass `--policy <file>`. |
-| `nemoclaw policy get <name>` | Show the active policy for a sandbox. Add `--full` for the complete policy with metadata. |
-| `nemoclaw policy list <name>` | List all policy versions applied to a sandbox, with status. |
+| `nemoclaw logs [name]` | View sandbox logs. Use `--tail` for streaming, `--source` and `--level` to filter. |
+| `nemoclaw term` | Launch the OpenShell Terminal — a dashboard showing sandbox status, live logs, and policy decisions in a single view. Navigate with `j`/`k`, press `f` to follow live output, `s` to filter by source, and `q` to quit. |
+
+Refer to {doc}`/sandboxes/create-and-manage` for more on monitoring sandboxes and reading log entries.
 
 ## Gateway Commands
 
@@ -87,12 +86,12 @@ Create and manage isolated agent execution environments.
 | Command | Description |
 |---|---|
 | `nemoclaw sandbox create` | Create a new sandbox. See flag reference below. |
-| `nemoclaw sandbox get [name]` | Show detailed information about a sandbox. When name is omitted, uses the last-used sandbox. |
+| `nemoclaw sandbox get [name]` | Show detailed information about a sandbox. |
 | `nemoclaw sandbox list` | List all sandboxes in the active cluster. |
 | `nemoclaw sandbox delete <name...>` | Delete one or more sandboxes by name. |
-| `nemoclaw sandbox connect [name]` | Open an interactive SSH session into a running sandbox. When name is omitted, reconnects to the last-used sandbox. |
-| `nemoclaw sandbox upload [name]` | Upload files from the host into a sandbox. When name is omitted, uses the last-used sandbox. |
-| `nemoclaw sandbox download [name]` | Download files from a sandbox to the host. When name is omitted, uses the last-used sandbox. |
+| `nemoclaw sandbox connect [name]` | Open an interactive SSH session into a running sandbox. |
+| `nemoclaw sandbox upload [name]` | Upload files from the host into a sandbox. |
+| `nemoclaw sandbox download [name]` | Download files from a sandbox to the host. |
 | `nemoclaw sandbox ssh-config <name>` | Print SSH config for a sandbox. Append to `~/.ssh/config` for VS Code Remote-SSH. |
 
 ### Sandbox Create Flags
@@ -107,6 +106,26 @@ Create and manage isolated agent execution environments.
 | `--forward` | Forward a local port into the sandbox at startup. |
 | `--from` | Build from a community sandbox name, local Dockerfile directory, or container image reference. |
 | `-- <command>` | The command to run inside the sandbox. Everything after `--` is passed as the agent command. |
+
+## Policy Commands
+
+Apply and inspect sandbox policies at runtime.
+
+| Command | Description |
+|---|---|
+| `nemoclaw policy set <name>` | Apply or update a policy on a running sandbox. Pass `--policy <file>`. |
+| `nemoclaw policy get <name>` | Show the active policy for a sandbox. Add `--full` for the complete policy with metadata. |
+| `nemoclaw policy list <name>` | List all policy versions applied to a sandbox, with status. |
+
+## Port Forwarding Commands
+
+Forward sandbox ports to the host for local access.
+
+| Command | Description |
+|---|---|
+| `nemoclaw forward start <port> <name>` | Forward a sandbox port to the host. Add `-d` for background mode. |
+| `nemoclaw forward stop <port> <name>` | Stop an active port forward. |
+| `nemoclaw forward list` | List all active port forwards. |
 
 ## Provider Commands
 
@@ -154,22 +173,7 @@ Update only the fields you specify.
 
 ### `nemoclaw inference get`
 
-Show the current inference configuration, including provider, model, and
-version.
-
-## OpenShell Terminal
-
-`nemoclaw term` launches the OpenShell Terminal, a dashboard that shows sandbox
-status, live logs, and policy decisions in a single view. Navigate with `j`/`k`,
-press `f` to follow live output, `s` to filter by source, and `q` to quit.
-
-Refer to {doc}`/sandboxes/create-and-manage` for more on monitoring sandboxes and reading log entries.
-
-## Sandbox Name Fallback
-
-Commands that accept an optional `[name]` argument, such as `get`, `connect`, `upload`, `download`, and `logs`, fall back to the last-used sandbox when the name is omitted. The CLI records the sandbox name each time you create or connect to a sandbox. When falling back, the CLI prints a hint showing which sandbox was selected.
-
-If no sandbox has been used yet and no name is provided, the command exits with an error prompting you to specify a name.
+Show the current inference configuration, including provider, model, and version.
 
 ## Environment Variables
 
@@ -195,7 +199,7 @@ $ nemoclaw completions zsh >> ~/.zshrc
 $ source ~/.zshrc
 ```
 
-## Self-Teaching
+## Built-in Help
 
 Every command and subcommand includes built-in help. Use `--help` at any level to see available subcommands, flags, and usage examples:
 
