@@ -29,9 +29,10 @@ async fn sandbox_file_upload_download_round_trip() {
     // ---------------------------------------------------------------
     // Step 1 — Create a sandbox with `--keep` running `sleep infinity`.
     // ---------------------------------------------------------------
-    let mut guard = SandboxGuard::create_keep(&["sleep", "infinity"], "Ready")
-        .await
-        .expect("sandbox create --keep");
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
 
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
 
@@ -174,9 +175,10 @@ async fn upload_respects_gitignore_by_default() {
     // ---------------------------------------------------------------
     // Step 1 — Create a sandbox with `--keep`.
     // ---------------------------------------------------------------
-    let mut guard = SandboxGuard::create_keep(&["sleep", "infinity"], "Ready")
-        .await
-        .expect("sandbox create --keep");
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
 
     // ---------------------------------------------------------------
     // Step 2 — Set up a temp git repo with tracked + ignored files.
@@ -292,9 +294,10 @@ async fn upload_respects_gitignore_by_default() {
 /// expand to the entire repository.
 #[tokio::test]
 async fn upload_single_file_from_git_repo_only_uploads_that_file() {
-    let mut guard = SandboxGuard::create_keep(&["sleep", "infinity"], "Ready")
-        .await
-        .expect("sandbox create --keep");
+    let mut guard =
+        SandboxGuard::create_keep(&["sh", "-c", "echo Ready && sleep infinity"], "Ready")
+            .await
+            .expect("sandbox create --keep");
 
     let tmpdir = tempfile::tempdir().expect("create tmpdir");
     let repo = tmpdir.path().join("repo");
