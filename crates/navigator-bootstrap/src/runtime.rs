@@ -357,16 +357,16 @@ pub async fn clean_stale_nodes(docker: &Docker, name: &str) -> Result<usize> {
     Ok(count)
 }
 
-/// Restart the navigator workload so pods pick up updated images or secrets.
+/// Restart the openshell workload so pods pick up updated images or secrets.
 ///
 /// Probes for a `StatefulSet` first, then falls back to a `Deployment`, matching
 /// the same detection pattern used by `cluster-deploy-fast.sh`.
-pub async fn restart_navigator_deployment(docker: &Docker, name: &str) -> Result<()> {
+pub async fn restart_openshell_deployment(docker: &Docker, name: &str) -> Result<()> {
     let cname = container_name(name);
 
     // Detect which workload kind exists in the cluster.
-    let workload_kind = detect_navigator_workload_kind(docker, &cname).await?;
-    let workload_ref = format!("{workload_kind}/navigator");
+    let workload_kind = detect_openshell_workload_kind(docker, &cname).await?;
+    let workload_ref = format!("{workload_kind}/openshell");
 
     let (restart_output, restart_exit) = exec_capture_with_exit(
         docker,
@@ -375,14 +375,14 @@ pub async fn restart_navigator_deployment(docker: &Docker, name: &str) -> Result
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout restart {workload_ref} -n navigator"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout restart {workload_ref} -n openshell"
             ),
         ],
     )
     .await?;
     if restart_exit != 0 {
         return Err(miette::miette!(
-            "failed to restart navigator {workload_ref} (exit code {restart_exit})\n{restart_output}"
+            "failed to restart openshell {workload_ref} (exit code {restart_exit})\n{restart_output}"
         ));
     }
 
@@ -393,32 +393,32 @@ pub async fn restart_navigator_deployment(docker: &Docker, name: &str) -> Result
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status {workload_ref} -n navigator --timeout=180s"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status {workload_ref} -n openshell --timeout=180s"
             ),
         ],
     )
     .await?;
     if status_exit != 0 {
         return Err(miette::miette!(
-            "navigator rollout status failed for {workload_ref} (exit code {status_exit})\n{status_output}"
+            "openshell rollout status failed for {workload_ref} (exit code {status_exit})\n{status_output}"
         ));
     }
 
     Ok(())
 }
 
-/// Check whether a navigator workload exists in the cluster (`StatefulSet` or `Deployment`).
-pub async fn navigator_workload_exists(docker: &Docker, name: &str) -> Result<bool> {
+/// Check whether an openshell workload exists in the cluster (`StatefulSet` or `Deployment`).
+pub async fn openshell_workload_exists(docker: &Docker, name: &str) -> Result<bool> {
     let cname = container_name(name);
-    match detect_navigator_workload_kind(docker, &cname).await {
+    match detect_openshell_workload_kind(docker, &cname).await {
         Ok(_) => Ok(true),
         Err(_) => Ok(false),
     }
 }
 
-/// Detect whether navigator is deployed as a `StatefulSet` or `Deployment`.
+/// Detect whether openshell is deployed as a `StatefulSet` or `Deployment`.
 /// Returns "statefulset" or "deployment".
-async fn detect_navigator_workload_kind(docker: &Docker, container_name: &str) -> Result<String> {
+async fn detect_openshell_workload_kind(docker: &Docker, container_name: &str) -> Result<String> {
     // Check StatefulSet first (primary workload type for fresh deploys)
     let (_, ss_exit) = exec_capture_with_exit(
         docker,
@@ -427,7 +427,7 @@ async fn detect_navigator_workload_kind(docker: &Docker, container_name: &str) -
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl get statefulset/navigator -n navigator -o name 2>/dev/null"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl get statefulset/openshell -n openshell -o name 2>/dev/null"
             ),
         ],
     )
@@ -444,7 +444,7 @@ async fn detect_navigator_workload_kind(docker: &Docker, container_name: &str) -
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl get deployment/navigator -n navigator -o name 2>/dev/null"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl get deployment/openshell -n openshell -o name 2>/dev/null"
             ),
         ],
     )
@@ -454,7 +454,7 @@ async fn detect_navigator_workload_kind(docker: &Docker, container_name: &str) -
     }
 
     Err(miette::miette!(
-        "no navigator workload (statefulset or deployment) found in namespace 'navigator'"
+        "no openshell workload (statefulset or deployment) found in namespace 'openshell'"
     ))
 }
 
