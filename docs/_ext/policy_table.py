@@ -49,18 +49,73 @@ def _binaries_line(binaries: list[dict[str, str]]) -> str:
     return ", ".join(paths)
 
 
-def _block_subtitle(key: str, name: str) -> str:
-    label_map = {
-        "claude_code": "Anthropic API and Telemetry",
-        "github_ssh_over_https": "Git Clone and Fetch",
-        "nvidia_inference": "NVIDIA API Catalog",
-        "github_rest_api": "GitHub API (Read-Only)",
-        "pypi": "Python Package Installation",
-        "vscode": "VS Code Remote and Marketplace",
-        "gitlab": "GitLab",
-    }
-    subtitle = label_map.get(key, name)
-    return f"{key} \u2014 {subtitle}"
+BLOCK_INFO: dict[str, dict[str, str]] = {
+    "claude_code": {
+        "title": "Anthropic API and Telemetry",
+        "description": (
+            "Allows Claude Code to reach its API, feature-flagging "
+            "(Statsig), error reporting (Sentry), release notes, and "
+            "the Claude platform dashboard."
+        ),
+    },
+    "github_ssh_over_https": {
+        "title": "Git Clone and Fetch",
+        "description": (
+            "Allows ``git clone``, ``git fetch``, and ``git pull`` over "
+            "HTTPS via Git Smart HTTP. Push (``git-receive-pack``) is "
+            "disabled by default."
+        ),
+    },
+    "nvidia_inference": {
+        "title": "NVIDIA API Catalog",
+        "description": (
+            "Allows outbound calls to the NVIDIA hosted inference API. "
+            "Used by agents that route LLM requests through "
+            "``integrate.api.nvidia.com``."
+        ),
+    },
+    "github_rest_api": {
+        "title": "GitHub API (Read-Only)",
+        "description": (
+            "Grants read-only access to the GitHub REST API. Enables "
+            "issue reads, PR listing, and repository metadata lookups "
+            "without allowing mutations."
+        ),
+    },
+    "pypi": {
+        "title": "Python Package Installation",
+        "description": (
+            "Allows ``pip install`` and ``uv pip install`` to reach PyPI, "
+            "python-build-standalone releases on GitHub, and "
+            "``downloads.python.org``."
+        ),
+    },
+    "vscode": {
+        "title": "VS Code Remote and Marketplace",
+        "description": (
+            "Allows VS Code Server, Remote Containers, and extension "
+            "marketplace traffic so remote development sessions can "
+            "download updates and extensions."
+        ),
+    },
+    "gitlab": {
+        "title": "GitLab",
+        "description": (
+            "Allows the ``glab`` CLI to reach ``gitlab.com`` for "
+            "repository and merge-request operations."
+        ),
+    },
+}
+
+
+def _block_title(key: str, name: str) -> str:
+    info = BLOCK_INFO.get(key)
+    return info["title"] if info else name
+
+
+def _block_description(key: str) -> str | None:
+    info = BLOCK_INFO.get(key)
+    return info["description"] if info else None
 
 
 class PolicyTableDirective(SphinxDirective):
@@ -90,7 +145,8 @@ class PolicyTableDirective(SphinxDirective):
         landlock = policy.get("landlock", {})
         proc = policy.get("process", {})
 
-        lines.append("### Filesystem, Landlock, and Process")
+        lines.append("(default-policy-fs-landlock-process)=")
+        lines.append("<h2>Filesystem, Landlock, and Process</h2>")
         lines.append("")
         lines.append("| Section | Setting | Value |")
         lines.append("|---|---|---|")
@@ -117,7 +173,18 @@ class PolicyTableDirective(SphinxDirective):
 
         net = policy.get("network_policies", {})
         if net:
-            lines.append("### Network Policy Blocks")
+            lines.append("(default-policy-network-policies)=")
+            lines.append("<h2>Network Policy Blocks</h2>")
+            lines.append("")
+            lines.append(
+                "Each block pairs a set of endpoints (host and port) with "
+                "a set of binaries (executable paths inside the sandbox). "
+                "The proxy identifies the calling binary by resolving the "
+                "socket to a PID through ``/proc/net/tcp`` and reading "
+                "``/proc/{pid}/exe``. A connection is allowed only when both "
+                "the destination and the calling binary match an entry in the "
+                "same block. All other outbound traffic is denied."
+            )
             lines.append("")
 
             for key, block in net.items():
@@ -125,8 +192,12 @@ class PolicyTableDirective(SphinxDirective):
                 endpoints = block.get("endpoints", [])
                 binaries = block.get("binaries", [])
 
-                lines.append(f"**{_block_subtitle(key, name)}**")
+                lines.append(f"<h3>{_block_title(key, name)}</h3>")
                 lines.append("")
+                desc = _block_description(key)
+                if desc:
+                    lines.append(desc)
+                    lines.append("")
 
                 has_rules = any("rules" in ep for ep in endpoints)
                 if has_rules:
@@ -143,7 +214,10 @@ class PolicyTableDirective(SphinxDirective):
                     lines.append(f"| ``{host}`` | {port} | {tls} | {access} |")
 
                 lines.append("")
-                lines.append(f"**Binaries:** {_binaries_line(binaries)}")
+                lines.append(
+                    f"Only the following binaries can use these endpoints: "
+                    f"{_binaries_line(binaries)}."
+                )
                 lines.append("")
 
         rst = StringList(lines, source=str(yaml_path))

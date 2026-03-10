@@ -5,9 +5,16 @@
 
 # Built-in Default Policy
 
-NVIDIA OpenShell ships a built-in policy that covers common agent workflows out of the box. When you create a sandbox without `--policy`, this policy is applied automatically.
+NVIDIA OpenShell ships a built-in policy that covers common agent workflows out of the box.
+When you create a sandbox without `--policy`, OpenShell applies a built-in default policy. This policy controls three things:
+
+- What the agent can access on disk. Filesystem paths are split into read-only and read-write sets. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level.
+- What the agent can reach on the network. Each network policy block pairs a set of allowed destinations (host and port) with a set of allowed binaries (executable paths inside the sandbox). The proxy resolves every outbound connection to the binary that opened it. A connection is allowed only when both the destination and the calling binary match an entry in the same block. Everything else is denied.
+- What privileges the agent has. The agent runs as an unprivileged user with seccomp filters that block dangerous system calls. There is no `sudo`, no `setuid`, and no path to elevated privileges.
 
 ## Agent Compatibility
+
+The following table shows the coverage of the default policy for common agents.
 
 | Agent | Coverage | Action Required |
 |---|---|---|
@@ -21,13 +28,7 @@ If you run a non-Claude agent without a custom policy, the agent's API calls are
 
 ## What the Default Policy Allows
 
-The default policy defines six network policy blocks, filesystem isolation, Landlock enforcement, and process identity.
-
-The following tables show the default policy blocks that are generated from [`deploy/docker/sandbox/dev-sandbox-policy.yaml`](https://github.com/NVIDIA/NemoClaw/blob/main/deploy/docker/sandbox/dev-sandbox-policy.yaml).
-
-```{policy-table} deploy/docker/sandbox/dev-sandbox-policy.yaml
-```
--->
+The default policy defines six network policy blocks, plus filesystem isolation, Landlock enforcement, and process identity. For the full breakdown of each block, see {doc}`../reference/default-policy`.
 
 ## Next Steps
 

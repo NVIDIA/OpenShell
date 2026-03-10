@@ -229,6 +229,7 @@ inference/configure-routes
 :hidden:
 
 reference/cli
+reference/default-policy
 reference/policy-schema
 reference/architecture
 ```
