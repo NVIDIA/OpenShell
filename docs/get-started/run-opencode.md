@@ -254,4 +254,4 @@ $ nemoclaw sandbox delete opencode-sandbox
 - {doc}`../safety-and-privacy/policies`: How network policy fits into the sandbox iteration workflow.
 - {doc}`../inference/index`: `inference.local`, supported API patterns, and request routing.
 - {doc}`../sandboxes/providers`: Provider types, credential discovery, and manual and automatic creation.
-- {doc}`../safety-and-privacy/security-model`: The protection layers and how they interact.
+- {doc}`../safety-and-privacy/index`: The protection layers and how they interact.

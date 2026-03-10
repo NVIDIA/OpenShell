@@ -93,7 +93,7 @@ security reasons. External providers that should be reached directly belong in
 ## Next Steps
 
 - {doc}`index`: understand the interception flow and supported API patterns.
-- [Network policy evaluation](/safety-and-privacy/policies.md#network-policy-evaluation):
+- [Network Access Rules](/safety-and-privacy/policies.md#network-access-rules):
   configure direct access to external inference endpoints.
 - {doc}`../sandboxes/providers`: create and manage provider records.
 - {doc}`../reference/cli`: see the CLI reference for `nemoclaw inference`

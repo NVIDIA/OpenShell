@@ -67,26 +67,9 @@ The `--from` flag pulls a pre-built sandbox definition from the [NemoClaw Commun
 
 ::::
 
-## What Happens Behind the Scenes
-
-When you create a sandbox, OpenShell activates the following protection layers.
-
-| Protection Layer        | Description                                                                                   |
-|------------------------|-----------------------------------------------------------------------------------------------|
-| Filesystem isolation   | The agent can only read and write paths that the policy explicitly permits.                   |
-| Network enforcement    | Outbound connections are denied by default. The policy allowlists specific hosts, ports, and binaries. |
-| Process restrictions   | The agent runs as a non-root user inside the container.                                       |
-| Inference privacy     | LLM API traffic is routed through a privacy-aware proxy. Credentials never leak outside the sandbox. |
-
-A single YAML policy file controls all four layers. You can hot-reload network and inference rules on a running sandbox without restarting it.
-
-:::{note}
-For OpenCode or Codex, the default policy does not cover the required endpoints. Follow the [Run OpenCode with NVIDIA Inference](run-opencode.md) tutorial for agent-specific setup.
-:::
-
 ## Next Steps
 
-You now have a working sandbox. From here, you can:
+You now have a working sandbox! From here, you can:
 
 - Follow the [Tutorials](tutorials.md) for step-by-step walkthroughs with Claude Code, OpenClaw, and OpenCode.
 - Learn how sandboxes work in [Sandboxes](../sandboxes/create-and-manage.md).

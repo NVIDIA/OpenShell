@@ -48,9 +48,9 @@ graph TB
     linkStyle default stroke:#76b900,stroke-width:2px
 ```
 
-## How the Layers Work Together
+## Sandbox Policies
 
-You control all four layers through a single YAML policy.
+You control all four layers through a single YAML policy — a file you attach when creating a sandbox that declares which paths the agent can access, which hosts it can reach, and how inference calls are routed.
 
 | Layer | What It Protects | When It Applies |
 |---|---|---|
