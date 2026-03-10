@@ -46,6 +46,31 @@ uv pip install nemoclaw \
   --index-url https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi/simple
 ```
 
+## Connect to a Gateway
+
+:::::{tab-set}
+
+::::{tab-item} Local (Docker)
+
+If Docker is running on your machine, the CLI creates a local gateway automatically when you create your first sandbox. No additional setup is needed — skip to the next step.
+
+::::
+
+::::{tab-item} Remote (Brev)
+
+Deploy an OpenShell gateway on Brev with the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT), then connect to it:
+
+```console
+$ nemoclaw gateway add <your-brev-instance-url>
+$ nemoclaw status
+```
+
+Once `nemoclaw status` shows the gateway as healthy, all subsequent commands target that remote instance.
+
+::::
+
+:::::
+
 ## Create Your First OpenShell Sandbox
 
 Choose the tab that matches your agent:

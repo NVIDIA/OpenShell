@@ -30,6 +30,15 @@ Before you begin, make sure you have:
 
 ## Step 1: Create a GitHub Provider
 
+:::{admonition} Already have a sandbox running?
+:class: tip
+
+If you followed the Quickstart and already have a sandbox without a GitHub provider, you have two options:
+
+1. **Add a provider to a new sandbox** — delete the existing sandbox, create the provider below, and recreate the sandbox with `--provider my-github` in Step 3.
+2. **Set the token inside the sandbox** — connect with `nemoclaw sandbox connect <name>` and run `export GITHUB_TOKEN=<your-token>`. This skips the provider workflow but the token is not persisted across sandbox recreations.
+:::
+
 Create a provider that reads your GitHub token from the environment:
 
 ```console
