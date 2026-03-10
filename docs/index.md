@@ -226,13 +226,6 @@ reference/policy-schema
 ```
 
 ```{toctree}
-:caption: Troubleshooting
-:hidden:
-
-troubleshooting
-```
-
-```{toctree}
 :caption: Resources
 :hidden:
 
