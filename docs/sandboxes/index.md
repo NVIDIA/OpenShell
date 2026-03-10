@@ -101,7 +101,7 @@ Every outbound connection from the sandbox goes through the proxy:
 
 Continue with one of the following:
 
-- **Ready to create your first sandbox?** Start with {doc}`create-and-manage`.
-- **Need to supply API keys or tokens?** Set up {doc}`providers` before creating.
-- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
-- **Want a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
+- To create your first sandbox, refer to {doc}`create-and-manage`.
+- To supply API keys or tokens, refer to {doc}`providers`.
+- To control what the agent can access, refer to {doc}`policies`.
+- To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.

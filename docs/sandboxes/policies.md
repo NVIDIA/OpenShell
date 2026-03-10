@@ -53,7 +53,7 @@ The following steps outline the hot-reload policy update workflow.
 
 1. Create the sandbox with your initial policy by following [Quick Start: Apply a Custom Policy](#quick-start-apply-a-custom-policy) above (or set `OPENSHELL_SANDBOX_POLICY`).
 
-2. Monitor denials — each log entry shows host, port, binary, and reason. Alternatively use `openshell term` for a live dashboard.
+2. Monitor denials. Each log entry shows host, port, binary, and reason. Alternatively, use `openshell term` for a live dashboard.
 
    ```console
    $ openshell logs <name> --tail --source sandbox
@@ -169,6 +169,6 @@ Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspect
 
 Explore related topics:
 
-- **New to policies?** Read about {doc}`policy structure and network access rules <index>` first.
-- **Need the full field reference?** Refer to the [Policy Schema Reference](../reference/policy-schema.md).
-- **Looking for the default policy breakdown?** Refer to {doc}`../reference/default-policy`.
+- To learn about policy structure and network access rules, refer to {doc}`index`.
+- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](../reference/policy-schema.md).
+- To review the default policy breakdown, refer to {doc}`../reference/default-policy`.

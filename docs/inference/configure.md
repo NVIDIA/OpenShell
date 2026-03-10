@@ -134,7 +134,7 @@ A successful response confirms the privacy router can reach the configured backe
 
 Explore related topics:
 
-- **How does inference routing work?** Refer to {doc}`index` for the interception flow and supported API patterns.
-- **Need to control external endpoints?** Refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
-- **Managing provider records?** Refer to {doc}`../sandboxes/providers`.
-- **CLI reference?** Refer to {doc}`../reference/cli` for `openshell inference` commands.
+- To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
+- To control external endpoints, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- To manage provider records, refer to {doc}`../sandboxes/providers`.
+- To view `openshell inference` commands, refer to {doc}`../reference/cli`.

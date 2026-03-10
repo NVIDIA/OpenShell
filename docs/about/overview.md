@@ -66,6 +66,6 @@ OpenShell supports a range of agent deployment patterns.
 
 Explore these topics to go deeper:
 
-- [Architecture Overview](architecture.md): Understand the components that make up the OpenShell runtime.
-- [Quickstart](../get-started/quickstart.md): Install the CLI and create your first sandbox.
-- [Sandboxes](../sandboxes/index.md): Learn how OpenShell enforces isolation across all protection layers.
+- To understand the components that make up the OpenShell runtime, refer to the [Architecture Overview](architecture.md).
+- To install the CLI and create your first sandbox, refer to the [Quickstart](../get-started/quickstart.md).
+- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](../sandboxes/index.md).

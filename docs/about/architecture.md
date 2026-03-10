@@ -67,5 +67,5 @@ OpenShell can run locally or on a remote host. The architecture is identical in 
 
 Continue with one of the following:
 
-- [Quickstart](../get-started/quickstart.md): Create your first sandbox.
-- [Sandboxes](../sandboxes/index.md): Learn how OpenShell enforces isolation across all protection layers.
+- To create your first sandbox, refer to the [Quickstart](../get-started/quickstart.md).
+- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](../sandboxes/index.md).

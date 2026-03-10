@@ -92,6 +92,9 @@ Choose the tab that matches your agent:
 ::::{tab-set}
 
 :::{tab-item} Claude Code
+
+Run the following command to create a sandbox with Claude Code:
+
 ```console
 $ openshell sandbox create -- claude
 ```
@@ -100,22 +103,31 @@ The CLI prompts you to create a provider from local credentials — type `yes` t
 :::
 
 :::{tab-item} OpenCode
+
+Run the following command to create a sandbox with OpenCode:
+
 ```console
 $ openshell sandbox create -- opencode
 ```
 
-The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+The CLI prompts you to create a provider from local credentials. Type `yes` to continue. If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
 :::
 
 :::{tab-item} Codex
+
+Run the following command to create a sandbox with Codex:
+
 ```console
 $ openshell sandbox create -- codex
 ```
 
-The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `OPENAI_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+The CLI prompts you to create a provider from local credentials. Type `yes` to continue. If `OPENAI_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
 :::
 
-:::{tab-item} Community Sandbox
+:::{tab-item} OpenClaw
+
+Run the following command to create a sandbox with OpenClaw:
+
 ```console
 $ openshell sandbox create --from openclaw
 ```
@@ -123,12 +135,12 @@ $ openshell sandbox create --from openclaw
 The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog. Each definition bundles a container image, a tailored policy, and optional skills into a single package.
 :::
 
-::::
+:::{tab-item} Community Sandbox
 
-## Next Steps
+You can use the `--from` flag to pull other OpenShell sandbox images from the [NVIDIA Container Registry](https://registry.nvidia.com/). For example, to pull the `base` image, run the following command:
 
-You now have a working sandbox! From here, you can:
+```console
+$ openshell sandbox create --from base
+```
 
-- **Follow a guided tutorial** — set up scoped GitHub repo access in {doc}`/tutorials/github-sandbox`.
-- **Learn how sandboxes work** — refer to {doc}`/sandboxes/create-and-manage` for the full lifecycle.
-- **Write your own policies** — refer to {doc}`/sandboxes/policies` for custom access rules.
+:::

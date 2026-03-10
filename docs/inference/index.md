@@ -59,5 +59,5 @@ Requests to `inference.local` that do not match the configured provider's suppor
 
 Continue with one of the following:
 
-- **Ready to configure?** Set up the backend behind `inference.local` in {doc}`configure`.
-- **Need to control external endpoints?** Refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- To set up the backend behind `inference.local`, refer to {doc}`configure`.
+- To control external endpoints, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).

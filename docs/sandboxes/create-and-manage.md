@@ -157,7 +157,7 @@ $ openshell sandbox delete my-sandbox
 
 Explore related topics:
 
-- **Want a complete end-to-end example?** Follow the {doc}`/tutorials/github-sandbox` tutorial.
-- **Need to supply API keys or tokens?** Set up {doc}`providers` for credential management.
-- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
-- **Want a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
+- To follow a complete end-to-end example, refer to the {doc}`/tutorials/github-sandbox` tutorial.
+- To supply API keys or tokens, refer to {doc}`providers`.
+- To control what the agent can access, refer to {doc}`policies`.
+- To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.

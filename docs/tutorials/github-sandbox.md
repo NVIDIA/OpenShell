@@ -5,20 +5,19 @@
 
 # Set Up a Sandbox with GitHub Repo Access
 
-Multi-repository workflows require differentiated access controls. An agent that commits code to a feature repository must have read-write permissions, while a shared library it depends on should remain read-only. OpenShell policies enforce this separation at the network layer — the proxy inspects each Git and API request and applies per-repository rules before traffic leaves the sandbox.
+This tutorial walks through configuring a sandbox that grants different access levels to two GitHub repositories and enforces these rules at the network layer. The sandbox runs Claude Code as the agent.
 
-This tutorial demonstrates how to configure a sandbox with two repositories at distinct privilege levels.
+The tutorial uses the following two example repositories for illustration purposes.
 
-- The `alpha-repo` has read-write access. The agent can clone, push, and call read-write GitHub API endpoints (pull requests, issues, comments).
-- The `bravo-repo` has read-only access. The agent can clone and fetch, but the proxy denies push operations and mutating API calls.
+- A `alpha-repo` repository with read-write access. The agent can clone, push, and call mutating GitHub API endpoints such as pull requests, issues, and comments.
+- A `bravo-repo` repository with read-only access. The agent can clone and fetch, but push operations and mutating API calls are denied.
+- All other GitHub repositories are denied by default. No clone, fetch, or API call to an unlisted repository is allowed.
 
-All other GitHub repositories are denied by default. No clone, fetch, or API call to an unlisted repository is allowed.
+After completing this tutorial, the sandbox environment includes the following:
 
-After completing this tutorial, the sandbox environment will include:
-
-- A GitHub credential provider that injects your token into the sandbox at runtime.
+- A GitHub credential provider that injects your GitHub token into the sandbox at runtime.
 - A network policy that extends the default policy with per-repository GitHub access rules.
-- A running sandbox in which Claude Code, OpenCode, and the `gh` CLI operate under the defined access constraints.
+- A running sandbox in which Claude Code operates under the defined access constraints.
 
 ## Prerequisites
 
@@ -319,6 +318,6 @@ For the complete policy iteration workflow (pull, edit, push, verify), refer to 
 
 The following resources cover related topics in greater depth:
 
-- For additional credential types, refer to {doc}`/sandboxes/providers` for all supported provider types.
-- For advanced policy configuration, refer to {doc}`/sandboxes/policies` for additional examples and the full iteration workflow.
-- For the policy YAML specification, refer to the [Policy Schema Reference](/reference/policy-schema.md) for the complete schema definition.
+- To configure additional credential types, refer to {doc}`/sandboxes/providers`.
+- To iterate on policy configuration, refer to {doc}`/sandboxes/policies`.
+- To view the policy YAML specification, refer to the [Policy Schema Reference](/reference/policy-schema.md).

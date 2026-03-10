@@ -126,6 +126,6 @@ environment variable names and values yourself with `--credential`.
 
 Explore related topics:
 
-- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
-- **Looking for a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
-- [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.
+- To control what the agent can access, refer to {doc}`policies`.
+- To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.
+- To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](../reference/policy-schema.md).
