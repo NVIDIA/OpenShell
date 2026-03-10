@@ -8,7 +8,7 @@ The `--from` flag accepts four kinds of input:
 
 | Input | Example | Behavior |
 |-------|---------|----------|
-| **Community sandbox name** | `--from openclaw` | Resolves to `d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes/openclaw:latest` |
+| **Community sandbox name** | `--from openclaw` | Resolves to `ghcr.io/nvidia/nemoclaw-community/sandboxes/openclaw:latest` |
 | **Dockerfile path** | `--from ./Dockerfile` | Builds the image, pushes it into the cluster, then creates the sandbox |
 | **Directory with Dockerfile** | `--from ./my-sandbox/` | Uses the directory as the build context |
 | **Full image reference** | `--from myregistry.com/img:tag` | Uses the image directly |
@@ -22,7 +22,7 @@ The CLI classifies the value in this order:
 3. **Contains `/`, `:`, or `.`** — treated as a full container image reference.
 4. **Otherwise** — treated as a community sandbox name, expanded to `{NEMOCLAW_COMMUNITY_REGISTRY}/{name}:latest`.
 
-The community registry prefix defaults to `d1i0nduu2f6qxk.cloudfront.net/nemoclaw-community/sandboxes` and can be overridden with the `NEMOCLAW_COMMUNITY_REGISTRY` environment variable.
+The community registry prefix defaults to `ghcr.io/nvidia/nemoclaw-community/sandboxes` and can be overridden with the `NEMOCLAW_COMMUNITY_REGISTRY` environment variable.
 
 ### Dockerfile build flow
 
