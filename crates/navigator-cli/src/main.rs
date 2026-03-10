@@ -152,11 +152,127 @@ fn resolve_sandbox_name(name: Option<String>, cluster: &str) -> Result<String> {
     Ok(last)
 }
 
+// Custom help template organized like `gh` CLI
+const HELP_TEMPLATE: &str = "\
+{about-with-newline}
+\x1b[1mUSAGE\x1b[0m
+  nemoclaw <command> <subcommand> [flags]
+
+\x1b[1mSANDBOX COMMANDS\x1b[0m
+  sandbox:     Manage sandboxes
+  forward:     Manage port forwarding to a sandbox
+  logs:        View sandbox logs
+  policy:      Manage sandbox policy
+  provider:    Manage provider configuration
+
+\x1b[1mGATEWAY COMMANDS\x1b[0m
+  gateway:     Manage the gateway lifecycle
+  status:      Show gateway status and information
+  inference:   Manage inference configuration
+
+\x1b[1mADDITIONAL COMMANDS\x1b[0m
+  term:        Launch the NemoClaw interactive TUI
+  completions: Generate shell completions
+  ssh-proxy:   SSH proxy (used by ProxyCommand)
+  help:        Print this message or the help of the given subcommand(s)
+
+\x1b[1mFLAGS\x1b[0m
+{options}
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw sandbox create
+  $ nemoclaw gateway start
+  $ nemoclaw logs my-sandbox
+
+\x1b[1mLEARN MORE\x1b[0m
+  Use `nemoclaw <command> --help` for more information about a command.
+";
+
+// Help template for subcommands (sandbox, gateway, etc.)
+const SUBCOMMAND_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+\x1b[1mUSAGE\x1b[0m
+  {usage}
+
+\x1b[1mCOMMANDS\x1b[0m
+{subcommands}
+
+\x1b[1mFLAGS\x1b[0m
+{options}
+{after-help}";
+
+const SANDBOX_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  sb
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw sandbox create
+  $ nemoclaw sandbox create --from python
+  $ nemoclaw sandbox connect my-sandbox
+  $ nemoclaw sandbox list
+  $ nemoclaw sandbox delete my-sandbox
+";
+
+const FORWARD_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  fwd
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw forward start 8080
+  $ nemoclaw forward start 3000 my-sandbox
+  $ nemoclaw forward stop 8080
+  $ nemoclaw forward list
+";
+
+const LOGS_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  lg
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw logs my-sandbox
+  $ nemoclaw logs my-sandbox --tail
+  $ nemoclaw logs --since 5m
+  $ nemoclaw logs --source sandbox --level debug
+";
+
+const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  pol
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw policy get my-sandbox
+  $ nemoclaw policy set my-sandbox --policy policy.yaml
+  $ nemoclaw policy list my-sandbox
+";
+
+const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw provider create --name openai --type openai --credential OPENAI_API_KEY
+  $ nemoclaw provider create --name anthropic --type anthropic --from-existing
+  $ nemoclaw provider list
+  $ nemoclaw provider get openai
+  $ nemoclaw provider delete openai
+";
+
+const GATEWAY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
+  gw
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw gateway start
+  $ nemoclaw gateway start --name my-gateway --port 9090
+  $ nemoclaw gateway stop
+  $ nemoclaw gateway select my-gateway
+  $ nemoclaw gateway info
+";
+
+const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ nemoclaw inference set --provider openai --model gpt-4
+  $ nemoclaw inference get
+  $ nemoclaw inference update --model gpt-4-turbo
+";
+
 /// NemoClaw CLI - agent execution and management.
 #[derive(Parser, Debug)]
 #[command(name = "nemoclaw")]
 #[command(author, version, about, long_about = None)]
 #[command(propagate_version = true)]
+#[command(help_template = HELP_TEMPLATE)]
+#[command(disable_help_subcommand = true)]
 struct Cli {
     /// Increase verbosity (-v, -vv, -vvv).
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -177,28 +293,25 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Commands {
-    /// Manage the gateway lifecycle.
-    Gateway {
-        #[command(subcommand)]
-        command: GatewayCommands,
-    },
-
-    /// Show gateway status and information.
-    Status,
-
+    // ===================================================================
+    // SANDBOX COMMANDS
+    // ===================================================================
     /// Manage sandboxes.
+    #[command(visible_alias = "sb", hide = true, after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Sandbox {
         #[command(subcommand)]
-        command: SandboxCommands,
+        command: Option<SandboxCommands>,
     },
 
     /// Manage port forwarding to a sandbox.
+    #[command(visible_alias = "fwd", hide = true, after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Forward {
         #[command(subcommand)]
-        command: ForwardCommands,
+        command: Option<ForwardCommands>,
     },
 
     /// View sandbox logs.
+    #[command(visible_alias = "lg", hide = true, after_help = LOGS_EXAMPLES)]
     Logs {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
@@ -226,28 +339,49 @@ enum Commands {
     },
 
     /// Manage sandbox policy.
+    #[command(visible_alias = "pol", hide = true, after_help = POLICY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Policy {
         #[command(subcommand)]
-        command: PolicyCommands,
-    },
-
-    /// Manage inference configuration.
-    Inference {
-        #[command(subcommand)]
-        command: ClusterInferenceCommands,
+        command: Option<PolicyCommands>,
     },
 
     /// Manage provider configuration.
+    #[command(hide = true, after_help = PROVIDER_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Provider {
         #[command(subcommand)]
-        command: ProviderCommands,
+        command: Option<ProviderCommands>,
     },
 
-    /// Launch the NemoClaw interactive TUI.
+    // ===================================================================
+    // GATEWAY COMMANDS
+    // ===================================================================
+    /// Manage the gateway lifecycle.
+    #[command(visible_alias = "gw", hide = true, after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Gateway {
+        #[command(subcommand)]
+        command: Option<GatewayCommands>,
+    },
+
+    /// Show gateway status and information.
+    #[command(hide = true)]
+    Status,
+
+    /// Manage inference configuration.
+    #[command(hide = true, after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Inference {
+        #[command(subcommand)]
+        command: Option<ClusterInferenceCommands>,
+    },
+
+    // ===================================================================
+    // ADDITIONAL COMMANDS
+    // ===================================================================
+    /// Launch the `NemoClaw` interactive TUI.
+    #[command(hide = true)]
     Term,
 
     /// Generate shell completions.
-    #[command(after_long_help = COMPLETIONS_HELP)]
+    #[command(hide = true, after_long_help = COMPLETIONS_HELP)]
     Completions {
         /// Shell to generate completions for.
         shell: CompletionShell,
@@ -262,6 +396,7 @@ enum Commands {
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
     ///   `nemoclaw ssh-proxy --cluster <name> --name <sandbox-name>`
+    #[command(hide = true)]
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode.
@@ -1042,7 +1177,9 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Gateway commands (was `cluster` / `cluster admin`)
         // -----------------------------------------------------------
-        Some(Commands::Gateway { command }) => match command {
+        Some(Commands::Gateway {
+            command: Some(command),
+        }) => match command {
             GatewayCommands::Start {
                 name,
                 update_kube_config,
@@ -1172,7 +1309,9 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Top-level forward (was `sandbox forward`)
         // -----------------------------------------------------------
-        Some(Commands::Forward { command: fwd_cmd }) => match fwd_cmd {
+        Some(Commands::Forward {
+            command: Some(fwd_cmd),
+        }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
                 let cluster_name = resolve_gateway_name(&cli.cluster).unwrap_or_default();
                 let name = resolve_sandbox_name(name, &cluster_name)?;
@@ -1276,7 +1415,7 @@ async fn main() -> Result<()> {
         // Top-level policy (was `sandbox policy`)
         // -----------------------------------------------------------
         Some(Commands::Policy {
-            command: policy_cmd,
+            command: Some(policy_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
             let mut tls = tls.with_cluster_name(&ctx.name);
@@ -1306,7 +1445,9 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Inference commands
         // -----------------------------------------------------------
-        Some(Commands::Inference { command }) => {
+        Some(Commands::Inference {
+            command: Some(command),
+        }) => {
             let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_cluster_name(&ctx.name);
@@ -1333,7 +1474,9 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Sandbox commands
         // -----------------------------------------------------------
-        Some(Commands::Sandbox { command }) => {
+        Some(Commands::Sandbox {
+            command: Some(command),
+        }) => {
             match command {
                 SandboxCommands::Create {
                     name,
@@ -1536,7 +1679,9 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Provider { command }) => {
+        Some(Commands::Provider {
+            command: Some(command),
+        }) => {
             let ctx = resolve_gateway(&cli.cluster, &cli.gateway_endpoint)?;
             let endpoint = &ctx.endpoint;
             let mut tls = tls.with_cluster_name(&ctx.name);
@@ -1725,6 +1870,50 @@ async fn main() -> Result<()> {
                 }
             }
         },
+
+        // No subcommand provided - print help for the command
+        Some(Commands::Sandbox { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("sandbox")
+                .expect("sandbox subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Forward { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("forward")
+                .expect("forward subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Policy { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("policy")
+                .expect("policy subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Provider { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("provider")
+                .expect("provider subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Gateway { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("gateway")
+                .expect("gateway subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Inference { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("inference")
+                .expect("inference subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
 
         None => {
             Cli::command().print_help().expect("Failed to print help");
