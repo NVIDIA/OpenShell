@@ -6,7 +6,7 @@
 # Built-in Default Policy
 
 NVIDIA OpenShell ships a built-in policy that covers common agent workflows out of the box.
-When you create a sandbox without `--policy`, OpenShell applies a built-in default policy. This policy controls three things:
+When you create a sandbox without `--policy`, OpenShell applies the default policy. This policy controls three things:
 
 - What the agent can access on disk. Filesystem paths are split into read-only and read-write sets. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level.
 - What the agent can reach on the network. Each network policy block pairs a set of allowed destinations (host and port) with a set of allowed binaries (executable paths inside the sandbox). The proxy resolves every outbound connection to the binary that opened it. A connection is allowed only when both the destination and the calling binary match an entry in the same block. Everything else is denied.
