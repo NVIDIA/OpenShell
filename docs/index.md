@@ -24,9 +24,9 @@ content:
 
 # NVIDIA OpenShell
 
-[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/OpenShell)
-[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
-[![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
+[![GitHub](https://img.shields.io/badge/github-repo-green?logo=github)](https://github.com/NVIDIA/NemoClaw)
+[![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/NemoClaw/blob/main/LICENSE)
+[![PyPI](https://img.shields.io/badge/PyPI-nemoclaw-orange?logo=pypi)](https://pypi.org/project/nemoclaw/)
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
@@ -97,13 +97,13 @@ Install the CLI and create your first sandbox in two commands.
     <span class="nc-term-dot nc-term-dot-g"></span>
   </div>
   <div class="nc-term-body">
-    <div><span class="nc-ps">$ </span>pip install openshell</div>
-    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
+    <div><span class="nc-ps">$ </span>uv pip install nemoclaw</div>
+    <div><span class="nc-ps">$ </span>nemoclaw sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```
 
-Refer to the [Quickstart](get-started/quickstart.md) for more details.
+Refer to the [Quickstart](about/get-started.md) for more details.
 
 ---
 
@@ -122,11 +122,21 @@ Learn about OpenShell and its capabilities.
 {bdg-secondary}`Concept`
 :::
 
-:::{grid-item-card} Get Started
-:link: get-started/quickstart
+:::{grid-item-card} Quickstart
+:link: about/get-started
 :link-type: doc
 
-Quickstart guide and tutorials for creating a OpenShell sandbox with Claude Code, OpenClaw, and OpenCode.
+Install the CLI and create your first sandbox in two commands.
+
++++
+{bdg-secondary}`Tutorial`
+:::
+
+:::{grid-item-card} Tutorials
+:link: tutorials/index
+:link-type: doc
+
+End-to-end guides: GitHub repo access, custom policies, and more.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -136,17 +146,7 @@ Quickstart guide and tutorials for creating a OpenShell sandbox with Claude Code
 :link: sandboxes/index
 :link-type: doc
 
-Create, manage, and customize sandboxes. Use community images or bring your own container.
-
-+++
-{bdg-secondary}`Concept`
-:::
-
-:::{grid-item-card} Safety and Privacy
-:link: safety-and-privacy/index
-:link-type: doc
-
-Write policies that control what agents can access. Iterate on network rules in real time.
+Create, manage, and customize sandboxes. Configure policies, providers, and community images.
 
 +++
 {bdg-secondary}`Concept`
@@ -193,8 +193,8 @@ Release Notes <about/release-notes>
 :caption: Get Started
 :hidden:
 
-get-started/quickstart
-get-started/tutorials
+Quickstart <about/get-started>
+tutorials/index
 ```
 
 ```{toctree}
@@ -204,16 +204,8 @@ get-started/tutorials
 sandboxes/index
 sandboxes/create-and-manage
 sandboxes/providers
+sandboxes/policies
 sandboxes/community-sandboxes
-```
-
-```{toctree}
-:caption: Safety and Privacy
-:hidden:
-
-safety-and-privacy/index
-safety-and-privacy/default-policies
-safety-and-privacy/policies
 ```
 
 ```{toctree}
@@ -231,14 +223,6 @@ inference/configure
 reference/cli
 reference/default-policy
 reference/policy-schema
-reference/architecture
-```
-
-```{toctree}
-:caption: Troubleshooting
-:hidden:
-
-troubleshooting
 ```
 
 ```{toctree}

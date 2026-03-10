@@ -132,7 +132,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 |---|---|---|---|
 | `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
 | `port` | integer | Yes | TCP port number. |
-| `protocol` | string | No | Set to `rest` to enable L7 (HTTP) inspection. Omit for L4-only (TCP passthrough). |
+| `protocol` | string | No | Set to `rest` to enable HTTP request inspection. Omit for TCP passthrough. |
 | `tls` | string | No | TLS handling mode. `terminate` decrypts TLS at the proxy for inspection. `passthrough` forwards encrypted traffic without inspection. Only relevant when `protocol` is `rest`. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |

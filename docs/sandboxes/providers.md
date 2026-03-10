@@ -111,7 +111,7 @@ The following provider types are supported.
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — see {doc}`/tutorials/github-sandbox` |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `generic` | User-defined | Any service with custom credentials |
@@ -124,5 +124,6 @@ environment variable names and values yourself with `--credential`.
 
 ## Next Steps
 
-- {doc}`create-and-manage`: Full sandbox lifecycle management
-- {doc}`../safety-and-privacy/index`: Why credential isolation matters
+- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
+- **Looking for a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
+- [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.

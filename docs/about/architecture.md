@@ -1,9 +1,9 @@
 ---
 title:
-  page: "Architecture Overview"
-  nav: "Architecture"
-description: "High-level overview of the OpenShell architecture: gateway, sandboxes, policy engine, and privacy router."
-keywords: ["openshell architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
+  page: "How OpenShell Works"
+  nav: "How It Works"
+description: "OpenShell architecture: gateway, sandbox, policy engine, and privacy router."
+keywords: ["nemoclaw architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
 topics: ["generative_ai", "cybersecurity"]
 tags: ["ai_agents", "sandboxing", "security", "architecture"]
 content:
@@ -19,63 +19,48 @@ content:
 
 # How OpenShell Works
 
-OpenShell runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker container.
-Each sandbox is an isolated Kubernetes pod managed by the OpenShell control plane.
-Four components work together to keep agents secure.
+OpenShell runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated Kubernetes pod managed through the gateway. Four components work together to keep agents secure.
 
-```{mermaid}
-flowchart LR
-    CLI["CLI"] -->|gRPC| GW["Gateway"]
-    GW --> SBX["Sandbox"]
-
-    subgraph SBX["Sandbox"]
-        direction TB
-        AGENT["Agent Process"] -->|All traffic| PROXY["Network Proxy"]
-        PROXY -->|Evaluate| OPA["Policy Engine"]
-    end
-
-    PROXY -->|Allowed traffic| EXT["External Services"]
-
-    style CLI fill:#ffffff,stroke:#000000,color:#000000
-    style GW fill:#76b900,stroke:#000000,color:#000000
-    style SBX fill:#f5f5f5,stroke:#000000,color:#000000
-    style AGENT fill:#ffffff,stroke:#000000,color:#000000
-    style PROXY fill:#76b900,stroke:#000000,color:#000000
-    style OPA fill:#76b900,stroke:#000000,color:#000000
-    style EXT fill:#ffffff,stroke:#000000,color:#000000
-
-    linkStyle default stroke:#76b900,stroke-width:2px
+```{image} architecture.svg
+:alt: OpenShell architecture diagram showing the NemoClaw component layout
+:align: center
 ```
 
 ## Components
 
-OpenShell consists of the following components.
-
-Gateway
-: The control-plane API that manages sandbox lifecycle, stores encrypted credentials, distributes policies, and terminates SSH tunnels. The CLI communicates exclusively with the gateway—it never talks to sandbox pods directly.
-
-Sandbox
-: An isolated pod that runs your agent. Each sandbox contains a **supervisor** (sets up isolation and starts the agent), an **L7 proxy** (intercepts and evaluates every outbound connection), and the agent process itself.
-
-Policy Engine
-: Evaluates declarative YAML policies that define filesystem, network, and process constraints. The proxy queries the engine on every outbound connection. Policies can be hot-reloaded without restarting the agent.
-
-Privacy Router
-: Intercepts LLM API calls and routes them to local or self-hosted backends based on your routing policy. Sensitive prompts and completions stay on infrastructure you control.
+| Component | Role |
+|---|---|
+| **Gateway** | Control-plane API that coordinates sandbox lifecycle and state, acts as the auth boundary, and brokers requests across the platform. |
+| **Sandbox** | Isolated runtime that includes container supervision and policy-enforced egress routing. |
+| **Policy Engine** | Policy definition and enforcement layer for filesystem, network, and process constraints. Defense in depth enforces policies from the application layer down to infrastructure and kernel layers. |
+| **Privacy Router** | Privacy-aware LLM routing layer that keeps sensitive context on sandbox compute and routes based on cost and privacy policy. |
 
 ## How a Request Flows
 
-OpenShell works in the following way:
+Every outbound connection from agent code passes through the same decision path:
 
-1. The agent makes an outbound connection (for example, an API call).
-2. The L7 proxy intercepts the connection and identifies the calling process.
-3. The proxy queries the policy engine with the destination and process identity.
-4. Based on the policy decision, the proxy either allows the connection, routes it through the privacy router for inference, or denies it.
+1. The agent process opens an outbound connection (API call, package install, git clone, etc.).
+2. The proxy inside the sandbox intercepts the connection and identifies which binary opened it.
+3. The proxy queries the policy engine with the destination, port, and calling binary.
+4. The policy engine returns one of three decisions:
+   - **Allow** — the destination and binary match a policy block. Traffic flows directly to the external service.
+   - **Route for inference** — no policy block matched, but inference routing is configured. The privacy router intercepts the request, strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint.
+   - **Deny** — no match and no inference route. The connection is blocked and logged.
 
-## Remote Deployment
+For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and checks each HTTP request against per-method, per-path rules before allowing it through.
 
-OpenShell can also run on a remote host. Deploy with `openshell gateway start --remote user@host`, then set up a tunnel with `openshell gateway tunnel`. The architecture is identical—only the Docker container location changes.
+## Deployment Modes
 
----
+OpenShell can run locally or on a remote host. The architecture is identical in both cases — only the Docker container location changes.
 
-For detailed component internals, refer to the [Architecture Reference](../reference/architecture.md).
+- **Local**: the k3s cluster runs inside Docker on your workstation. The CLI provisions it automatically on first use.
+- **Remote**: the cluster runs on a remote host. Deploy with `nemoclaw gateway start --remote user@host`. For example, connect to your DGX Spark
+  ```console
+  $ nemoclaw gateway start --remote <username>@<spark-SSID>.local
+  $ nemoclaw status
+  ```
+
+## Next Steps
+
+- [Quickstart](get-started.md): Create your first sandbox.
+- [Sandboxes](../sandboxes/index.md): Learn how OpenShell enforces isolation across all protection layers.

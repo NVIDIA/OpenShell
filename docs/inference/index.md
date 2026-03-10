@@ -7,78 +7,55 @@
 
 OpenShell handles inference in two ways:
 
-- External inference endpoints are controlled by sandbox `network_policies`.
-- Each sandbox also exposes `https://inference.local`, a special endpoint for
-  inference that should stay local to the host for privacy and security.
+| Path | How It Works |
+|---|---|
+| **External endpoints** | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request — allowed or denied by `network_policies`. See [Network Access Rules](/sandboxes/index.md#network-access-rules). |
+| **`inference.local`** | A special endpoint exposed inside every sandbox for inference that should stay local to the host for privacy and security. The {doc}`privacy router </about/architecture>` strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint. |
 
-## External Inference
+## How `inference.local` Works
 
-If sandbox code calls an external inference API like `api.openai.com` or
-`api.anthropic.com`, that traffic is treated like any other outbound network
-request. It is allowed or denied by `network_policies`.
+When code inside a sandbox calls `https://inference.local`, the privacy router routes the request to the configured backend for that gateway. The configured model is applied to generation requests, and provider credentials are supplied by OpenShell rather than by code inside the sandbox.
 
-Refer to {doc}`/safety-and-privacy/policies` and the
-[Network policy evaluation](/safety-and-privacy/policies.md#network-policy-evaluation)
-section for details.
+If code calls an external inference host directly, that traffic is evaluated only by `network_policies`.
 
-## `inference.local`
-
-Every sandbox also exposes a special endpoint: `https://inference.local`.
-
-This endpoint exists so inference can be routed to a model running locally on
-the same host. In the future, it can also route to a model managed by the
-cluster. It is the special case for inference that should stay local for
-privacy and security reasons.
-
-## Using `inference.local`
-
-When code inside a sandbox calls `https://inference.local`, OpenShell routes the
-request to the configured backend for that gateway.
-
-The configured model is applied to generation requests, and provider
-credentials are supplied by OpenShell rather than by code inside the sandbox.
-
-If code calls an external inference host directly, that traffic is evaluated
-only by `network_policies`.
+| Property | Detail |
+|---|---|
+| Credentials | No sandbox API keys needed — credentials come from the configured provider record. |
+| Configuration | One provider and one model define sandbox inference. |
+| Provider support | OpenAI, Anthropic, and NVIDIA providers all work through the same endpoint. |
+| Hot-refresh | Provider credential changes and inference updates are picked up without recreating sandboxes. |
 
 ## Supported API Patterns
 
-Supported request patterns depend on the provider configured for
-`inference.local`.
+Supported request patterns depend on the provider configured for `inference.local`.
 
-For OpenAI-compatible providers, these patterns are supported:
+:::::{tab-set}
+
+::::{tab-item} OpenAI-compatible
 
 | Pattern | Method | Path |
 |---|---|---|
-| OpenAI Chat Completions | `POST` | `/v1/chat/completions` |
-| OpenAI Completions | `POST` | `/v1/completions` |
-| OpenAI Responses | `POST` | `/v1/responses` |
+| Chat Completions | `POST` | `/v1/chat/completions` |
+| Completions | `POST` | `/v1/completions` |
+| Responses | `POST` | `/v1/responses` |
 | Model Discovery | `GET` | `/v1/models` |
 | Model Discovery | `GET` | `/v1/models/*` |
 
-For Anthropic-compatible providers, this pattern is supported:
+::::
+
+::::{tab-item} Anthropic-compatible
 
 | Pattern | Method | Path |
 |---|---|---|
-| Anthropic Messages | `POST` | `/v1/messages` |
+| Messages | `POST` | `/v1/messages` |
 
-Requests to `inference.local` that do not match the configured provider's
-supported patterns are denied.
+::::
 
-## Key Properties
+:::::
 
-- External endpoints use `network_policies`.
-- Explicit local endpoint: special local routing happens through
-  `inference.local`.
-- No sandbox API keys: credentials come from the configured provider record.
-- Single managed config: one provider and one model define sandbox inference.
-- Provider-agnostic: OpenAI, Anthropic, and NVIDIA providers all work through
-  the same endpoint.
-- Hot-refresh: provider credential changes and inference updates are picked up
-  without recreating sandboxes.
+Requests to `inference.local` that do not match the configured provider's supported patterns are denied.
 
 ## Next Steps
 
-- {doc}`configure`: configure the backend behind `inference.local`.
-- [Network policy evaluation](/safety-and-privacy/policies.md#network-policy-evaluation):
-  understand how external endpoints are controlled.
+- **Ready to configure?** Set up the backend behind `inference.local` in {doc}`configure`.
+- **Need to control external endpoints?** See [Network Access Rules](/sandboxes/index.md#network-access-rules).
