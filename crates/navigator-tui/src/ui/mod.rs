@@ -11,10 +11,10 @@ mod sandbox_policy;
 pub(crate) mod sandboxes;
 mod splash;
 
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
-use ratatui::Frame;
 
 use crate::app::{self, App, Focus, InputMode, Screen};
 use crate::theme::styles;

@@ -6,11 +6,11 @@
 //! Renders the ANSI Shadow block-letter logo (OPEN in white, SHELL in green)
 //! inside a double-line border, with the tagline and a version/prompt footer.
 
+use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
-use ratatui::Frame;
 
 use crate::theme::{colors, styles};
 
