@@ -1,7 +1,7 @@
 ---
 title:
   page: Set Up a Sandbox of Claude Code with a Custom GitHub Policy
-  nav: GitHub Sandbox Tutorial
+  nav: "Tutorial: GitHub Policy Iteration"
 description: Learn the iterative policy workflow by launching a sandbox, diagnosing a GitHub access denial, and applying a custom policy to fix it.
 topics:
 - Generative AI
@@ -44,18 +44,6 @@ This tutorial requires the following:
 
 - Completed the {doc}`Quickstart </get-started/quickstart>` tutorial.
 - A GitHub personal access token (PAT) with `repo` scope. To create one, go to [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens), select **Generate new token (classic)**, check the `repo` scope, and copy the token.
-
-  :::{tip}
-  Instead of pasting the token into Claude during the tutorial, use a {doc}`credential provider </sandboxes/providers>` to inject it into the sandbox automatically at startup:
-
-  ```console
-  $ openshell provider create --name my-github --type github --from-existing
-  $ openshell sandbox create --provider my-github --keep -- claude
-  ```
-
-  The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox so Claude can use it directly.
-  :::
-
 - An agent API key configured in the environment. For example, `ANTHROPIC_API_KEY` for Claude Code.
 - A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can [create a new repository](https://github.com/new) with a README if you do not have one handy.
 
@@ -70,7 +58,20 @@ Each section below indicates which terminal to use.
 
 ## Launch the Sandbox
 
-**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically:
+:::::{tab-set}
+
+::::{tab-item} Starting a new sandbox
+
+**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically.
+
+The recommended approach is to create a {doc}`credential provider </sandboxes/providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
+
+```console
+$ openshell provider create --name my-github --type github --from-existing
+$ openshell sandbox create --provider my-github --keep -- claude
+```
+
+If you prefer to handle authentication manually, you can skip the provider and create the sandbox without one:
 
 ```console
 $ openshell sandbox create --keep -- claude
@@ -80,6 +81,34 @@ The `--keep` flag keeps the sandbox running after Claude Code exits, so you can 
 
 Claude Code starts inside the sandbox. Log in through your preferred authentication method and trust the `/sandbox` workspace when prompted.
 
+::::
+
+::::{tab-item} Using an existing sandbox
+
+If you already have a sandbox running from the Quickstart, you do not need to create a new one. Providers can only be attached at creation time, so you will set up GitHub authentication inside the sandbox instead.
+
+**Terminal 1 (sandbox)** — Connect to your running sandbox:
+
+```console
+$ openshell sandbox connect <sandbox-name>
+```
+
+From inside the sandbox, set your GitHub token as an environment variable:
+
+```console
+$ export GITHUB_TOKEN=<your-token>
+```
+
+Or start Claude Code and paste the token when it asks for GitHub credentials in the next step:
+
+```console
+$ claude
+```
+
+::::
+
+:::::
+
 ## Push Code to GitHub
 
 **Terminal 1 (sandbox)** — Ask Claude Code to write a simple script and push it to your repository:
@@ -88,9 +117,9 @@ Claude Code starts inside the sandbox. Log in through your preferred authenticat
 Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
 ```
 
-Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.
+If you used a provider or set `GITHUB_TOKEN` as an environment variable, Claude uses the token automatically. Otherwise, Claude recognizes that it needs GitHub credentials, asks how you want to authenticate, and you can paste your personal access token into the conversation.
 
-The push fails. Claude reports an error — but the failure is not an authentication problem. The default sandbox policy does not permit outbound requests to GitHub, so the proxy blocks the connection before the request reaches GitHub's servers.
+Either way, Claude configures authentication and attempts the push. The push fails — but the failure is not an authentication problem. The default sandbox policy does not permit outbound requests to GitHub, so the proxy blocks the connection before the request reaches GitHub's servers.
 
 ## Diagnose the Denial
 
