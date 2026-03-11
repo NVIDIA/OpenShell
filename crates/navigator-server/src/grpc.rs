@@ -1429,6 +1429,27 @@ impl Navigator for NavigatorService {
             req.proposed_chunks.clone()
         };
 
+        // Build a set of host:port endpoints already covered by pending or
+        // approved chunks so we don't create duplicates across flush cycles.
+        let covered_endpoints: std::collections::HashSet<(String, u32)> = {
+            let existing = self
+                .state
+                .store
+                .list_draft_chunks(&sandbox_id, None)
+                .await
+                .unwrap_or_default();
+            existing
+                .iter()
+                .filter(|c| c.status == "pending" || c.status == "approved")
+                .filter_map(|c| {
+                    navigator_core::proto::NetworkPolicyRule::decode(c.proposed_rule.as_slice())
+                        .ok()
+                        .and_then(|r| r.endpoints.first().cloned())
+                        .map(|ep| (ep.host.to_lowercase(), ep.port))
+                })
+                .collect()
+        };
+
         // Persist proposed chunks and validate them.
         let mut accepted: u32 = 0;
         let mut rejected: u32 = 0;
@@ -1446,6 +1467,24 @@ impl Navigator for NavigatorService {
                 rejection_reasons
                     .push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
                 continue;
+            }
+
+            // Skip if a pending/approved chunk already covers this endpoint.
+            if let Some(ep) = chunk
+                .proposed_rule
+                .as_ref()
+                .and_then(|r| r.endpoints.first())
+            {
+                let key = (ep.host.to_lowercase(), ep.port);
+                if covered_endpoints.contains(&key) {
+                    tracing::debug!(
+                        rule_name = %chunk.rule_name,
+                        host = %ep.host,
+                        port = ep.port,
+                        "Skipping duplicate draft chunk — endpoint already covered"
+                    );
+                    continue;
+                }
             }
 
             let chunk_id = uuid::Uuid::new_v4().to_string();
