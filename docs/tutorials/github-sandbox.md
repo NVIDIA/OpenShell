@@ -135,17 +135,25 @@ The log shows that the sandbox proxy intercepted an outbound `PUT` request to `a
 
 In terminal 1, ask Claude Code to check the sandbox logs for denied requests:
 
-```text
+:::{dropdown} Prompt
+:open:
+:icon: terminal
+
 Check the sandbox logs for any denied network requests. What is blocking the push?
-```
+:::
 
-Claude reads the deny entries and identifies the root cause. It explains that the failure is a sandbox network policy restriction, not a token permissions issue:
+Claude reads the deny entries and identifies the root cause. It explains that the failure is a sandbox network policy restriction, not a token permissions issue. For example, the following is a possible response:
 
-> The sandbox runs a proxy that enforces policies on outbound traffic. The
-> `github_rest_api` policy allows GET requests (used to read the file) but blocks
-> PUT/write requests to GitHub. This is a sandbox-level restriction, not a token
-> issue. No matter what token you provide, pushes through the API will be blocked
-> until the policy is updated.
+:::{dropdown} Response
+:open:
+:icon: comment
+
+The sandbox runs a proxy that enforces policies on outbound traffic.
+The `github_rest_api` policy allows GET requests (used to read the file)
+but blocks PUT/write requests to GitHub. This is a sandbox-level restriction,
+not a token issue. No matter what token you provide, pushes through the API
+will be blocked until the policy is updated.
+:::
 
 Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.
 
@@ -155,9 +163,10 @@ Copy the deny reason from Claude's response — you will paste it into your lapt
 
 **Terminal 2 (laptop)** — Paste the deny reason from the previous step into your coding agent (for example, Claude Code or Cursor running on your laptop) and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
 
-1. Reads the default policy.
-2. Adds `github_git` and `github_api` blocks that grant write access to your repository.
-   Refer to the following policy example to compare with the policy the agent generated.
+1. Inspects the deny reasons.
+2. Writes an updated policy that adds `github_git` and `github_api` blocks that grant write access to your repository.
+3. Saves the policy to a file, such as `/tmp/sandbox-policy-update.yaml`. Refer to the following policy example to compare with the policy the agent generated.
+
     :::{dropdown} Full reference policy
     :icon: code
 
@@ -316,7 +325,6 @@ Copy the deny reason from Claude's response — you will paste it into your lapt
 
     For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
     :::
-3. Saves the policy to a file, such as `/tmp/sandbox-policy-update.yaml`.
 4. Applies the policy to the running sandbox by running the following command:
 
     ```console
