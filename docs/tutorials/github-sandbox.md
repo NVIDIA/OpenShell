@@ -1,6 +1,6 @@
 ---
 title:
-  page: Set Up a Sandbox with Custom GitHub Policies
+  page: Set Up a Sandbox of Claude Code with a Custom GitHub Policy
   nav: GitHub Sandbox Tutorial
 description: Learn the iterative policy workflow by launching a sandbox, diagnosing a GitHub access denial, and applying a custom policy to fix it.
 topics:
@@ -46,13 +46,14 @@ This tutorial requires the following:
 - A GitHub personal access token (PAT) with `repo` scope. To create one, go to [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens), select **Generate new token (classic)**, check the `repo` scope, and copy the token.
 
   :::{tip}
-  Instead of pasting the token into Claude during the tutorial, you can set `GITHUB_TOKEN` as an environment variable before launching so Claude picks it up automatically. For production workflows, use a {doc}`credential provider </sandboxes/providers>` to inject credentials at sandbox startup:
+  Instead of pasting the token into Claude during the tutorial, use a {doc}`credential provider </sandboxes/providers>` to inject it into the sandbox automatically at startup:
 
   ```console
   $ openshell provider create --name my-github --type github --from-existing
   $ openshell sandbox create --provider my-github --keep -- claude
   ```
 
+  The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox so Claude can use it directly.
   :::
 
 - An agent API key configured in the environment. For example, `ANTHROPIC_API_KEY` for Claude Code.
@@ -69,7 +70,7 @@ Each section below indicates which terminal to use.
 
 ## Launch the Sandbox
 
-Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically:
+**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically:
 
 ```console
 $ openshell sandbox create --keep -- claude
@@ -101,7 +102,7 @@ The push fails. Claude reports an error — but the failure is not an authentica
 $ openshell term
 ```
 
-The dashboard shows sandbox status and a live stream of policy decisions. Look for entries with `action=deny`. Select a deny entry to see the full detail:
+The dashboard shows sandbox status and a live stream of policy decisions. Look for entries with `l7_decision=deny`. Select a deny entry to see the full detail:
 
 ```text
 l7_action:      PUT
@@ -310,7 +311,7 @@ For details on policy block structure, refer to [Network Access Rules](/sandboxe
 The sandbox policy has been updated. Try pushing to the repository again.
 ```
 
-The push completes successfully. The `openshell term` dashboard now shows `action=allow` entries for `api.github.com` and `github.com` where it previously showed denials.
+The push completes successfully. The `openshell term` dashboard now shows `l7_decision=allow` entries for `api.github.com` and `github.com` where it previously showed denials.
 
 ## Next Steps
 
