@@ -396,10 +396,9 @@ pub async fn ensure_container(
     // runtime.  Pass community registry credentials as a separate set of
     // env vars so the entrypoint can add a second block to registries.yaml.
     if registry_host != DEFAULT_REGISTRY {
-        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={}", DEFAULT_REGISTRY));
+        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={DEFAULT_REGISTRY}"));
         env_vars.push(format!(
-            "COMMUNITY_REGISTRY_USERNAME={}",
-            DEFAULT_REGISTRY_USERNAME
+            "COMMUNITY_REGISTRY_USERNAME={DEFAULT_REGISTRY_USERNAME}"
         ));
         env_vars.push(format!(
             "COMMUNITY_REGISTRY_PASSWORD={}",

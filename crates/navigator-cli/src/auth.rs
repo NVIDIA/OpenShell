@@ -132,7 +132,7 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
         result = rx => {
             result.map_err(|_| miette::miette!("auth callback channel closed unexpectedly"))?
         }
-        _ = tokio::time::sleep(AUTH_TIMEOUT) => {
+        () = tokio::time::sleep(AUTH_TIMEOUT) => {
             return Err(miette::miette!(
                 "authentication timed out after {} seconds.\n\
                  Try again with: openshell gateway login",

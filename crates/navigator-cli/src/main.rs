@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell CLI - command-line interface for OpenShell.
+//! `OpenShell` CLI - command-line interface for `OpenShell`.
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum, ValueHint};
 use clap_complete::engine::ArgValueCompleter;
@@ -124,13 +124,11 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 /// stored edge token from disk and sets it on the `TlsOptions`. The token is
 /// always read from gateway metadata rather than supplied via a CLI flag.
 fn apply_edge_auth(tls: &mut TlsOptions, gateway_name: &str) {
-    if let Some(meta) = get_gateway_metadata(gateway_name) {
-        if meta.auth_mode.as_deref() == Some("cloudflare_jwt") {
-            if let Some(token) = load_edge_token(gateway_name) {
+    if let Some(meta) = get_gateway_metadata(gateway_name)
+        && meta.auth_mode.as_deref() == Some("cloudflare_jwt")
+            && let Some(token) = load_edge_token(gateway_name) {
                 tls.edge_token = Some(token);
             }
-        }
-    }
 }
 
 /// Resolve a sandbox name, falling back to the last-used sandbox for the gateway.
@@ -275,7 +273,7 @@ const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell inference update --model gpt-4-turbo
 ";
 
-/// OpenShell CLI - agent execution and management.
+/// `OpenShell` CLI - agent execution and management.
 #[derive(Parser, Debug)]
 #[command(name = "openshell")]
 #[command(author, version, about, long_about = None)]
@@ -294,7 +292,7 @@ struct Cli {
     )]
     gateway: Option<String>,
 
-    /// Gateway endpoint URL (e.g. https://gateway.example.com).
+    /// Gateway endpoint URL (e.g. <https://gateway.example.com>).
     /// Connects directly without looking up gateway metadata.
     #[arg(
         long,
@@ -405,7 +403,7 @@ enum Commands {
     // ===================================================================
     // ADDITIONAL COMMANDS
     // ===================================================================
-    /// Launch the OpenShell interactive TUI.
+    /// Launch the `OpenShell` interactive TUI.
     #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Term,
 
@@ -1873,7 +1871,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Parse an upload spec like `<local>[:<remote>]` into (local_path, optional_sandbox_path).
+/// Parse an upload spec like `<local>[:<remote>]` into (`local_path`, `optional_sandbox_path`).
 fn parse_upload_spec(spec: &str) -> (String, Option<String>) {
     if let Some((local, remote)) = spec.split_once(':') {
         (

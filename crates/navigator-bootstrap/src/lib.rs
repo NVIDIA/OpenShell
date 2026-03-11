@@ -280,7 +280,7 @@ where
 
     // Ensure the image is available on the target Docker daemon
     if remote_opts.is_some() {
-        log("[status] Pulling gateway image".to_string());
+        log("[status] Downloading gateway".to_string());
         let on_log_clone = Arc::clone(&on_log);
         let progress_cb = move |msg: String| {
             if let Ok(mut f) = on_log_clone.lock() {
@@ -296,15 +296,13 @@ where
         .await?;
     } else {
         // Local deployment: ensure image exists (pull if needed)
-        log("[status] Pulling gateway image".to_string());
+        log("[status] Downloading gateway".to_string());
         ensure_image(&target_docker, &image_ref, registry_token.as_deref()).await?;
     }
 
     // All subsequent operations use the target Docker (remote or local)
-    log("[status] Preparing gateway".to_string());
-    log("[progress] Creating gateway network".to_string());
+    log("[status] Initializing environment".to_string());
     ensure_network(&target_docker).await?;
-    log("[progress] Preparing gateway volume".to_string());
     ensure_volume(&target_docker, &volume_name(&name)).await?;
 
     // Compute extra TLS SANs for remote deployments so the gateway and k3s
@@ -341,7 +339,6 @@ where
             (sans, gateway_host)
         };
 
-    log("[progress] Creating gateway container".to_string());
     ensure_container(
         &target_docker,
         &name,
@@ -355,10 +352,7 @@ where
         registry_token.as_deref(),
     )
     .await?;
-    log("[status] Starting gateway".to_string());
     start_container(&target_docker, &name).await?;
-
-    log("[progress] Waiting for kubeconfig".to_string());
     let raw_kubeconfig = wait_for_kubeconfig(&target_docker, &name).await?;
 
     // Rewrite kubeconfig based on deployment mode
@@ -366,15 +360,13 @@ where
         || rewrite_kubeconfig(&raw_kubeconfig, &name, kube_port),
         |opts| rewrite_kubeconfig_remote(&raw_kubeconfig, &name, &opts.destination, kube_port),
     );
-    log("[progress] Writing kubeconfig".to_string());
     store_kubeconfig(&kubeconfig_path, &rewritten)?;
     // Clean up stale k3s nodes left over from previous container instances that
     // used the same persistent volume. Without this, pods remain scheduled on
     // NotReady ghost nodes and the health check will time out.
-    log("[progress] Cleaning stale nodes".to_string());
     match clean_stale_nodes(&target_docker, &name).await {
         Ok(0) => {}
-        Ok(n) => log(format!("[progress] Removed {n} stale node(s)")),
+        Ok(n) => tracing::debug!("removed {n} stale node(s)"),
         Err(err) => {
             tracing::debug!("stale node cleanup failed (non-fatal): {err}");
         }
@@ -391,7 +383,6 @@ where
     // cluster, secrets are always newly generated and a restart is unnecessary.
     // Restarting only when workload pre-existed avoids extra rollout latency.
     let workload_existed_before_pki = openshell_workload_exists(&target_docker, &name).await?;
-    log("[progress] Reconciling TLS certificates".to_string());
     let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
 
     if rotated && workload_existed_before_pki {
@@ -399,11 +390,9 @@ where
         // it picks up the new TLS secrets before we write CLI-side certs.
         // A failed rollout is a hard error — CLI certs must not be persisted
         // if the server cannot come up with the new PKI.
-        log("[progress] PKI rotated — restarting openshell workload".to_string());
         restart_openshell_deployment(&target_docker, &name).await?;
     }
 
-    log("[progress] Storing CLI mTLS credentials".to_string());
     store_pki_bundle(&name, &pki_bundle)?;
 
     // Push locally-built component images into the k3s containerd runtime.
@@ -419,10 +408,7 @@ where
             .filter(|s| !s.is_empty())
             .collect();
         if !images.is_empty() {
-            log(format!(
-                "[progress] Importing {} local image(s) into gateway",
-                images.len()
-            ));
+            log("[status] Deploying components".to_string());
             let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
             let container = container_name(&name);
             let on_log_ref = Arc::clone(&on_log);
@@ -440,12 +426,11 @@ where
             )
             .await?;
 
-            log("[progress] Restarting openshell deployment".to_string());
             restart_openshell_deployment(&target_docker, &name).await?;
         }
     }
 
-    log("[status] Waiting for gateway".to_string());
+    log("[status] Starting gateway".to_string());
     {
         // Create a short-lived closure that locks on each call rather than holding
         // the MutexGuard across await points.
@@ -459,7 +444,6 @@ where
     }
 
     // Create and store gateway metadata.
-    log("[progress] Persisting gateway metadata".to_string());
     let metadata = create_gateway_metadata_with_host(
         &name,
         remote_opts.as_ref(),
@@ -741,7 +725,7 @@ async fn load_existing_pki_bundle(
 
 /// Wait for a K8s namespace to exist inside the cluster container.
 ///
-/// The Helm controller creates the `navigator` namespace when it processes
+/// The Helm controller creates the `openshell` namespace when it processes
 /// the `HelmChart` manifest, but there's a race between kubeconfig being ready
 /// and the namespace being created. We poll briefly.
 async fn wait_for_namespace(

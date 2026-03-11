@@ -46,7 +46,7 @@ use crate::ServerState;
 ///
 /// Client-provided `limit` values are clamped to this ceiling to prevent
 /// unbounded memory allocation from an excessively large page request.
-pub(crate) const MAX_PAGE_SIZE: u32 = 1000;
+pub const MAX_PAGE_SIZE: u32 = 1000;
 
 // ---------------------------------------------------------------------------
 // Field-level size limits
@@ -99,7 +99,7 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 ///
 /// Returns `default` when `raw` is 0 (the protobuf zero-value convention),
 /// otherwise returns the smaller of `raw` and `max`.
-pub(crate) fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
+pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
 }
 
@@ -566,9 +566,9 @@ impl Navigator for NavigatorService {
             .await
         {
             for record in records {
-                if let Ok(session) = SshSession::decode(record.payload.as_slice()) {
-                    if session.sandbox_id == id {
-                        if let Err(e) = self
+                if let Ok(session) = SshSession::decode(record.payload.as_slice())
+                    && session.sandbox_id == id
+                        && let Err(e) = self
                             .state
                             .store
                             .delete(SshSession::object_type(), &session.id)
@@ -580,8 +580,6 @@ impl Navigator for NavigatorService {
                                 "Failed to delete SSH session during sandbox cleanup"
                             );
                         }
-                    }
-                }
             }
         }
 
@@ -1032,14 +1030,13 @@ impl Navigator for NavigatorService {
         let payload = new_policy.encode_to_vec();
         let hash = deterministic_policy_hash(&new_policy);
 
-        if let Some(ref current) = latest {
-            if current.policy_hash == hash {
+        if let Some(ref current) = latest
+            && current.policy_hash == hash {
                 return Ok(Response::new(UpdateSandboxPolicyResponse {
                     version: u32::try_from(current.version).unwrap_or(0),
                     policy_hash: hash,
                 }));
             }
-        }
 
         let next_version = latest.map_or(1, |r| r.version + 1);
         let policy_id = uuid::Uuid::new_v4().to_string();
@@ -1662,7 +1659,7 @@ fn validate_filesystem_additive(
 }
 
 /// Validate that network mode hasn't changed (Block ↔ Proxy).
-/// Adding network_policies when none existed (or removing all) changes the mode.
+/// Adding `network_policies` when none existed (or removing all) changes the mode.
 fn validate_network_mode_unchanged(
     baseline: &ProtoSandboxPolicy,
     new: &ProtoSandboxPolicy,
@@ -2302,7 +2299,7 @@ async fn update_provider_record(
     // sends a non-empty type that differs from the existing one.
     let incoming_type = provider.r#type.trim();
     if !incoming_type.is_empty()
-        && incoming_type.to_ascii_lowercase() != existing.r#type.trim().to_ascii_lowercase()
+        && !incoming_type.eq_ignore_ascii_case(existing.r#type.trim())
     {
         return Err(Status::invalid_argument(
             "provider type cannot be changed; delete and recreate the provider",

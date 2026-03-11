@@ -108,58 +108,50 @@ fn civil_from_days(days: u64) -> (i64, u64, u64) {
 /// Known provisioning steps derived from Kubernetes events and sandbox lifecycle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ProvisioningStep {
-    /// Sandbox CRD created, waiting for compute resources (node scheduling).
-    RequestingCompute,
-    /// Pod scheduled on a node.
-    Scheduled,
-    /// Pulling container image.
-    Pulling,
-    /// Container image pulled.
-    Pulled,
-    /// Container created (not yet started).
-    ContainerCreated,
-    /// Container started, waiting for sandbox to become ready.
-    ContainerStarted,
-    /// Sandbox is ready to accept connections.
-    SandboxReady,
+    /// Sandbox CRD created, waiting for pod to be scheduled.
+    RequestingSandbox,
+    /// Pulling the sandbox container image (the user-facing image, not init containers).
+    PullingSandboxImage,
+    /// Container is starting up.
+    StartingSandbox,
 }
 
 impl ProvisioningStep {
     /// Human-readable label for a completed step.
     fn completed_label(self) -> &'static str {
         match self {
-            Self::RequestingCompute => "Compute allocated",
-            Self::Scheduled => "Scheduled on node",
-            Self::Pulling => "Image pulled",
-            Self::Pulled => "Image pulled",
-            Self::ContainerCreated => "Container created",
-            Self::ContainerStarted => "Container started",
-            Self::SandboxReady => "Sandbox ready",
+            Self::RequestingSandbox => "Sandbox allocated",
+            Self::PullingSandboxImage => "Image pulled",
+            Self::StartingSandbox => "Sandbox ready",
         }
     }
 
     /// Human-readable label for an in-progress step (shown on the spinner).
     fn active_label(self) -> &'static str {
         match self {
-            Self::RequestingCompute => "Requesting compute...",
-            Self::Scheduled => "Scheduling on node...",
-            Self::Pulling => "Pulling image...",
-            Self::Pulled => "Pulling image...",
-            Self::ContainerCreated => "Creating container...",
-            Self::ContainerStarted => "Starting container...",
-            Self::SandboxReady => "Waiting for sandbox...",
+            Self::RequestingSandbox => "Requesting sandbox...",
+            Self::PullingSandboxImage => "Pulling image...",
+            Self::StartingSandbox => "Starting sandbox...",
         }
     }
 }
 
-/// Map a Kubernetes event reason to a provisioning step.
-fn kube_event_to_step(reason: &str) -> Option<ProvisioningStep> {
+/// Kubernetes event reason codes we care about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KubeEventReason {
+    Scheduled,
+    Pulling,
+    Pulled,
+    Started,
+}
+
+/// Map a Kubernetes event reason string to an enum.
+fn parse_kube_event_reason(reason: &str) -> Option<KubeEventReason> {
     match reason {
-        "Scheduled" => Some(ProvisioningStep::Scheduled),
-        "Pulling" => Some(ProvisioningStep::Pulling),
-        "Pulled" => Some(ProvisioningStep::Pulled),
-        "Created" => Some(ProvisioningStep::ContainerCreated),
-        "Started" => Some(ProvisioningStep::ContainerStarted),
+        "Scheduled" => Some(KubeEventReason::Scheduled),
+        "Pulling" => Some(KubeEventReason::Pulling),
+        "Pulled" => Some(KubeEventReason::Pulled),
+        "Started" => Some(KubeEventReason::Started),
         _ => None,
     }
 }
@@ -171,8 +163,12 @@ fn kube_event_to_step(reason: &str) -> Option<ProvisioningStep> {
 struct ProvisioningDisplay {
     mp: MultiProgress,
     spinner: ProgressBar,
+    /// Blank line below the spinner (for visual spacing during long operations).
+    spacer: Option<ProgressBar>,
     /// Steps that have been completed, in order.
     completed_steps: Vec<ProvisioningStep>,
+    /// Progress bars for completed steps (so they can be cleared).
+    completed_bars: Vec<ProgressBar>,
     /// The currently active step label (shown on the spinner).
     active_label: String,
     /// Detail text shown next to the active step (e.g. image name).
@@ -196,8 +192,10 @@ impl ProvisioningDisplay {
         Self {
             mp,
             spinner,
+            spacer: None,
             completed_steps: Vec::new(),
-            active_label: ProvisioningStep::RequestingCompute
+            completed_bars: Vec::new(),
+            active_label: ProvisioningStep::RequestingSandbox
                 .active_label()
                 .to_string(),
             active_detail: String::new(),
@@ -223,12 +221,20 @@ impl ProvisioningDisplay {
 
         let elapsed = self.step_start.elapsed();
         let elapsed_str = format_elapsed(elapsed);
-        let _ = self.mp.println(format!(
-            "  {} {} {}",
+
+        // Use a progress bar instead of println so we can clear it later.
+        let bar = self.mp.insert_before(&self.spinner, ProgressBar::new(0));
+        bar.set_style(
+            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        bar.set_message(format!(
+            "{} {} {}",
             "\u{2713}".green().bold(),
             label,
             elapsed_str.dimmed()
         ));
+        bar.finish();
+        self.completed_bars.push(bar);
 
         // Reset step timer for the next step.
         self.step_start = Instant::now();
@@ -267,10 +273,10 @@ impl ProvisioningDisplay {
     }
 
     /// Finish with an error message shown on the last step line.
-    fn finish_error(&mut self, msg: &str) {
+    fn finish_error(&self, msg: &str) {
         let _ = self
             .mp
-            .println(format!("  {} {}", "\u{2717}".red().bold(), msg.red()));
+            .println(format!("{} {}", "\u{2717}".red().bold(), msg.red()));
         self.spinner.finish_and_clear();
     }
 
@@ -282,6 +288,35 @@ impl ProvisioningDisplay {
     /// Return a description of the current active step for error messages.
     fn current_step_description(&self) -> &str {
         &self.active_label
+    }
+
+    /// Show a blank line below the spinner for visual spacing.
+    fn show_spacer(&mut self) {
+        if self.spacer.is_none() {
+            let bar = self.mp.add(ProgressBar::new(0));
+            bar.set_style(
+                ProgressStyle::with_template("{msg}")
+                    .unwrap_or_else(|_| ProgressStyle::default_bar()),
+            );
+            bar.set_message("");
+            self.spacer = Some(bar);
+        }
+    }
+
+    /// Hide the spacer below the spinner.
+    fn hide_spacer(&mut self) {
+        if let Some(bar) = self.spacer.take() {
+            bar.finish_and_clear();
+        }
+    }
+
+    /// Clear all progress output (spinner and completed step lines).
+    fn clear(&mut self) {
+        self.hide_spacer();
+        self.spinner.finish_and_clear();
+        for bar in &self.completed_bars {
+            bar.finish_and_clear();
+        }
     }
 }
 
@@ -301,6 +336,33 @@ fn format_elapsed(d: Duration) -> String {
 fn format_timestamp(d: Duration) -> String {
     let secs = d.as_secs_f64();
     format!("[{secs:.1}s]")
+}
+
+/// Extract image size in bytes from a Kubernetes Pulled event message.
+/// Example: "Successfully pulled image ... Image size: 620405524 bytes."
+fn extract_image_size(message: &str) -> Option<u64> {
+    let size_prefix = "Image size: ";
+    let start = message.find(size_prefix)? + size_prefix.len();
+    let rest = &message[start..];
+    let end = rest.find(' ')?;
+    rest[..end].parse().ok()
+}
+
+/// Format bytes as a human-readable string (e.g., "620 MB").
+fn format_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = 1024 * KB;
+    const GB: u64 = 1024 * MB;
+
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{} MB", bytes / MB)
+    } else if bytes >= KB {
+        format!("{} KB", bytes / KB)
+    } else {
+        format!("{} B", bytes)
+    }
 }
 
 fn print_sandbox_header(sandbox: &Sandbox, display: Option<&ProvisioningDisplay>) {
@@ -476,7 +538,7 @@ impl GatewayDeployLogPanel {
         let top_border = self.mp.add(ProgressBar::new(0));
         top_border.set_style(line_style.clone());
         top_border.set_message(
-            horizontal_rule(Some("Container Logs"), width)
+            horizontal_rule(Some("Gateway Logs"), width)
                 .cyan()
                 .to_string(),
         );
@@ -592,7 +654,7 @@ pub async fn gateway_status(gateway_name: &str, server: &str, tls: &TlsOptions) 
     println!("  {} {}", "Gateway:".dimmed(), gateway_name);
     println!("  {} {}", "Server:".dimmed(), server);
     if tls.is_bearer_auth() {
-        println!("  {} {}", "Auth:".dimmed(), "Edge (bearer token)");
+        println!("  {} Edge (bearer token)", "Auth:".dimmed());
     }
 
     // Try to connect and get health
@@ -664,24 +726,21 @@ pub fn gateway_use(name: &str) -> Result<()> {
 /// authentication and stores the bearer token locally.
 pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> Result<()> {
     // Normalise the endpoint: ensure it has a scheme.
-    let endpoint = if !endpoint.contains("://") {
-        format!("https://{endpoint}")
-    } else {
+    let endpoint = if endpoint.contains("://") {
         endpoint.to_string()
+    } else {
+        format!("https://{endpoint}")
     };
 
     // Derive a gateway name from the hostname when none is provided.
     let derived_name;
-    let name = match name {
-        Some(n) => n,
-        None => {
-            // Parse out just the host portion of the URL.
-            derived_name = url::Url::parse(&endpoint)
-                .ok()
-                .and_then(|u| u.host_str().map(String::from))
-                .unwrap_or_else(|| endpoint.clone());
-            &derived_name
-        }
+    let name = if let Some(n) = name { n } else {
+        // Parse out just the host portion of the URL.
+        derived_name = url::Url::parse(&endpoint)
+            .ok()
+            .and_then(|u| u.host_str().map(String::from))
+            .unwrap_or_else(|| endpoint.clone());
+        &derived_name
     };
 
     // Build metadata for an edge-authenticated remote gateway.
@@ -831,13 +890,13 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
 
     let scheme = uri.scheme_str().unwrap_or("https");
     let https = if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
-        let https = HttpsConnectorBuilder::new()
+        
+        HttpsConnectorBuilder::new()
             .with_native_roots()
             .into_diagnostic()?
             .https_or_http()
             .enable_http1()
-            .build();
-        https
+            .build()
     } else {
         let materials = require_tls_materials(server, tls)?;
         let tls_config = build_rustls_config(&materials)?;
@@ -1100,8 +1159,7 @@ fn resolve_gateway_control_target_from(
     match metadata {
         Some(metadata) if metadata.is_remote => metadata
             .remote_host
-            .map(GatewayControlTarget::Remote)
-            .unwrap_or(GatewayControlTarget::ExternalRegistration),
+            .map_or(GatewayControlTarget::ExternalRegistration, GatewayControlTarget::Remote),
         _ => GatewayControlTarget::Local,
     }
 }
@@ -1241,7 +1299,7 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
         if let Some(ref host) = metadata.remote_host {
             println!("  {} {host}", "Remote host:".dimmed());
         } else {
-            println!("  {} {}", "Type:".dimmed(), "External registration");
+            println!("  {} External registration", "Type:".dimmed());
         }
         if let Some(ref resolved) = metadata.resolved_host {
             println!("  {} {resolved}", "Resolved host:".dimmed());
@@ -1482,7 +1540,7 @@ pub async fn sandbox_create(
 
     // Set initial active step on the spinner.
     if let Some(d) = display.as_mut() {
-        d.set_active_step(ProvisioningStep::RequestingCompute);
+        d.set_active_step(ProvisioningStep::RequestingSandbox);
     } else {
         let ts = format_timestamp(Duration::ZERO);
         println!("  {} Requesting compute...", ts.dimmed());
@@ -1568,7 +1626,7 @@ pub async fn sandbox_create(
                 // non-Ready phase, proving the controller has reconciled.
                 if saw_non_ready && phase == SandboxPhase::Ready {
                     if let Some(d) = display.as_mut() {
-                        d.spinner.finish_and_clear();
+                        d.clear();
                     }
                     break;
                 }
@@ -1577,77 +1635,92 @@ pub async fn sandbox_create(
                 // Detect gateway readiness from log messages.
                 if !saw_gateway_ready && line.message.contains("listening") {
                     saw_gateway_ready = true;
-                    if let Some(d) = display.as_mut() {
-                        d.set_active_step(ProvisioningStep::SandboxReady);
-                    }
                 }
             }
             Some(navigator_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
                 // Map Kubernetes events to provisioning steps.
-                if let Some(step) = kube_event_to_step(&ev.reason) {
-                    match step {
-                        ProvisioningStep::Scheduled => {
+                // We simplify the display to: Sandbox allocated -> Pulling image -> Ready
+                // Init container events are ignored; we only show the user's sandbox image.
+                if let Some(reason) = parse_kube_event_reason(&ev.reason) {
+                    match reason {
+                        KubeEventReason::Scheduled => {
                             if let Some(d) = display.as_mut() {
-                                // Complete "Requesting compute" step, then show "Pulling image"
                                 d.complete_step_with_label(
-                                    ProvisioningStep::RequestingCompute,
-                                    "Compute allocated",
+                                    ProvisioningStep::RequestingSandbox,
+                                    "Sandbox allocated",
                                 );
-                                d.set_active_step(ProvisioningStep::Pulling);
+                                d.set_active_step(ProvisioningStep::PullingSandboxImage);
                             } else {
                                 let ts = format_timestamp(provision_start.elapsed());
-                                println!("  {} Compute allocated", ts.dimmed());
+                                println!("{} Sandbox allocated", ts.dimmed());
                             }
                         }
-                        ProvisioningStep::Pulling => {
+                        KubeEventReason::Pulling => {
                             // Extract image name from the event message.
-                            let image_detail = ev
+                            let image_name = ev
                                 .message
                                 .strip_prefix("Pulling image ")
-                                .map(|s| s.trim_matches('"'))
-                                .unwrap_or("");
-                            if let Some(d) = display.as_mut() {
-                                d.set_active("Pulling image...");
-                                if !image_detail.is_empty() {
-                                    d.set_active_detail(image_detail);
-                                }
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                if image_detail.is_empty() {
-                                    println!("  {} Pulling image...", ts.dimmed());
+                                .map_or("", |s| s.trim_matches('"'));
+                            // Skip init container image pulls (openshell/sandbox).
+                            // Only show progress for the user's sandbox image.
+                            let is_init_container_image =
+                                image_name.contains("/openshell/sandbox:");
+                            if !is_init_container_image {
+                                if let Some(d) = display.as_mut() {
+                                    d.set_active("Pulling image...");
+                                    if !image_name.is_empty() {
+                                        d.set_active_detail(image_name);
+                                    }
+                                    d.show_spacer();
                                 } else {
-                                    println!("  {} Pulling image {image_detail}", ts.dimmed());
+                                    let ts = format_timestamp(provision_start.elapsed());
+                                    if image_name.is_empty() {
+                                        println!("{} Pulling image...", ts.dimmed());
+                                    } else {
+                                        println!("{} Pulling image {image_name}", ts.dimmed());
+                                    }
                                 }
                             }
                         }
-                        ProvisioningStep::Pulled => {
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step(ProvisioningStep::Pulled);
-                                d.set_active_step(ProvisioningStep::ContainerCreated);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("  {} Image pulled", ts.dimmed());
+                        KubeEventReason::Pulled => {
+                            // Skip init container pulls.
+                            let is_init_container_image =
+                                ev.message.contains("/openshell/sandbox:");
+                            if !is_init_container_image {
+                                // Extract image size from message like:
+                                // "Successfully pulled image ... Image size: 620405524 bytes."
+                                let size_label = extract_image_size(&ev.message)
+                                    .map(format_bytes)
+                                    .unwrap_or_default();
+                                let label = if size_label.is_empty() {
+                                    "Image pulled".to_string()
+                                } else {
+                                    format!("Image pulled ({})", size_label)
+                                };
+                                if let Some(d) = display.as_mut() {
+                                    d.hide_spacer();
+                                    d.complete_step_with_label(
+                                        ProvisioningStep::PullingSandboxImage,
+                                        &label,
+                                    );
+                                    d.set_active_step(ProvisioningStep::StartingSandbox);
+                                } else {
+                                    let ts = format_timestamp(provision_start.elapsed());
+                                    println!("{} {}", ts.dimmed(), label);
+                                }
                             }
                         }
-                        ProvisioningStep::ContainerCreated => {
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step(ProvisioningStep::ContainerCreated);
-                                d.set_active_step(ProvisioningStep::ContainerStarted);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("  {} Container created", ts.dimmed());
+                        KubeEventReason::Started => {
+                            // Started fires for both init and main containers.
+                            // Only complete StartingSandbox if we've already completed
+                            // PullingSandboxImage (meaning this is the main container starting).
+                            if let Some(d) = display.as_mut()
+                                && d.completed_steps
+                                    .contains(&ProvisioningStep::PullingSandboxImage)
+                            {
+                                d.complete_step(ProvisioningStep::StartingSandbox);
                             }
                         }
-                        ProvisioningStep::ContainerStarted => {
-                            if let Some(d) = display.as_mut() {
-                                d.complete_step(ProvisioningStep::ContainerStarted);
-                                d.set_active_step(ProvisioningStep::SandboxReady);
-                            } else {
-                                let ts = format_timestamp(provision_start.elapsed());
-                                println!("  {} Container started", ts.dimmed());
-                            }
-                        }
-                        _ => {}
                     }
                 } else if let Some(d) = display.as_mut() {
                     // Unknown events: show as detail on the current spinner.
@@ -1670,8 +1743,8 @@ pub async fn sandbox_create(
 
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
-    if final_phase != SandboxPhase::Ready {
-        if let Some(d) = display.as_mut() {
+    if final_phase != SandboxPhase::Ready
+        && let Some(d) = display.as_mut() {
             if final_phase == SandboxPhase::Error {
                 let msg = if last_error_reason.is_empty() {
                     "Sandbox entered error phase".to_string()
@@ -1683,7 +1756,6 @@ pub async fn sandbox_create(
                 d.finish_error("Provisioning stream ended unexpectedly");
             }
         }
-    }
     drop(display);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
@@ -3102,8 +3174,7 @@ pub async fn sandbox_policy_set(
         .await
         .ok()
         .and_then(|r| r.into_inner().revision)
-        .map(|r| r.version)
-        .unwrap_or(0);
+        .map_or(0, |r| r.version);
 
     let response = client
         .update_sandbox_policy(UpdateSandboxPolicyRequest {
@@ -3270,8 +3341,8 @@ pub async fn sandbox_policy_list(
     }
 
     println!(
-        "{:<8} {:<14} {:<12} {:<24} {}",
-        "VERSION", "HASH", "STATUS", "CREATED", "ERROR"
+        "{:<8} {:<14} {:<12} {:<24} ERROR",
+        "VERSION", "HASH", "STATUS", "CREATED"
     );
     for rev in &revisions {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
