@@ -6,6 +6,7 @@ pub(crate) mod create_sandbox;
 mod dashboard;
 pub(crate) mod providers;
 pub(crate) mod sandbox_detail;
+mod sandbox_draft;
 pub(crate) mod sandbox_logs;
 mod sandbox_policy;
 pub(crate) mod sandboxes;
@@ -79,6 +80,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     match app.focus {
         Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
+        Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
         _ => sandbox_policy::draw(frame, app, chunks[1]),
     }
 
@@ -244,6 +246,23 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled(" Quit", styles::MUTED),
                 ]
             }
+            Focus::SandboxDraft => vec![
+                Span::styled(" ", styles::TEXT),
+                Span::styled("[j/k]", styles::KEY_HINT),
+                Span::styled(" Navigate", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[p]", styles::KEY_HINT),
+                Span::styled(" Policy", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[l]", styles::KEY_HINT),
+                Span::styled(" Logs", styles::TEXT),
+                Span::styled("  |  ", styles::BORDER),
+                Span::styled("[Esc]", styles::MUTED),
+                Span::styled(" Back", styles::MUTED),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[q]", styles::MUTED),
+                Span::styled(" Quit", styles::MUTED),
+            ],
             _ => vec![
                 Span::styled(" ", styles::TEXT),
                 Span::styled("[j/k]", styles::KEY_HINT),
@@ -257,6 +276,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[l]", styles::KEY_HINT),
                 Span::styled(" Logs", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[r]", styles::KEY_HINT),
+                Span::styled(" Drafts", styles::TEXT),
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[d]", styles::KEY_HINT),
                 Span::styled(" Delete", styles::TEXT),

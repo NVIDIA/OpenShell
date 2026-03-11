@@ -374,6 +374,13 @@ enum Commands {
         command: Option<PolicyCommands>,
     },
 
+    /// Review and approve draft policy recommendations.
+    #[command(visible_alias = "dr", hide = true, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Draft {
+        #[command(subcommand)]
+        command: Option<DraftCommands>,
+    },
+
     /// Manage provider configuration.
     #[command(hide = true, after_help = PROVIDER_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Provider {
@@ -1068,6 +1075,82 @@ enum SandboxCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum DraftCommands {
+    /// Show pending draft policy recommendations.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Filter by status (pending, approved, rejected).
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// Approve a single draft chunk.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Approve {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to approve.
+        #[arg(long)]
+        chunk_id: String,
+    },
+
+    /// Reject a single draft chunk.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Reject {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to reject.
+        #[arg(long)]
+        chunk_id: String,
+
+        /// Reason for rejection.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+
+    /// Approve all pending draft chunks.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ApproveAll {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Also approve security-flagged chunks.
+        #[arg(long)]
+        include_security_flagged: bool,
+    },
+
+    /// Undo an approved chunk (revert to pending, remove from policy).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Undo {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to undo.
+        #[arg(long)]
+        chunk_id: String,
+    },
+
+    /// Clear all pending draft chunks.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Clear {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+    },
+
+    /// Show draft policy history.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    History {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum PolicyCommands {
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1441,6 +1524,61 @@ async fn main() -> Result<()> {
                 PolicyCommands::List { name, limit } => {
                     let name = resolve_sandbox_name(name, &ctx.name)?;
                     run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Draft policy recommendations
+        // -----------------------------------------------------------
+        Some(Commands::Draft {
+            command: Some(draft_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_edge_auth(&mut tls, &ctx.name);
+            match draft_cmd {
+                DraftCommands::Get { name, status } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_get(&ctx.endpoint, &name, status.as_deref(), &tls).await?;
+                }
+                DraftCommands::Approve { name, chunk_id } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_approve(&ctx.endpoint, &name, &chunk_id, &tls).await?;
+                }
+                DraftCommands::Reject {
+                    name,
+                    chunk_id,
+                    reason,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_reject(&ctx.endpoint, &name, &chunk_id, &reason, &tls)
+                        .await?;
+                }
+                DraftCommands::ApproveAll {
+                    name,
+                    include_security_flagged,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_approve_all(
+                        &ctx.endpoint,
+                        &name,
+                        include_security_flagged,
+                        &tls,
+                    )
+                    .await?;
+                }
+                DraftCommands::Undo { name, chunk_id } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_undo(&ctx.endpoint, &name, &chunk_id, &tls).await?;
+                }
+                DraftCommands::Clear { name } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_clear(&ctx.endpoint, &name, &tls).await?;
+                }
+                DraftCommands::History { name } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_history(&ctx.endpoint, &name, &tls).await?;
                 }
             }
         }
@@ -1861,6 +1999,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("inference")
                 .expect("inference subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Draft { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("draft")
+                .expect("draft subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
