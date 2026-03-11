@@ -15,7 +15,8 @@ use bollard::models::{
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
-    RemoveContainerOptions, RemoveImageOptions, RemoveVolumeOptions, StartContainerOptions,
+    ListContainersOptionsBuilder, RemoveContainerOptions, RemoveImageOptions, RemoveVolumeOptions,
+    StartContainerOptions,
 };
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -396,10 +397,9 @@ pub async fn ensure_container(
     // runtime.  Pass community registry credentials as a separate set of
     // env vars so the entrypoint can add a second block to registries.yaml.
     if registry_host != DEFAULT_REGISTRY {
-        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={}", DEFAULT_REGISTRY));
+        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={DEFAULT_REGISTRY}"));
         env_vars.push(format!(
-            "COMMUNITY_REGISTRY_USERNAME={}",
-            DEFAULT_REGISTRY_USERNAME
+            "COMMUNITY_REGISTRY_USERNAME={DEFAULT_REGISTRY_USERNAME}"
         ));
         env_vars.push(format!(
             "COMMUNITY_REGISTRY_PASSWORD={}",
@@ -478,6 +478,77 @@ pub async fn ensure_container(
         .into_diagnostic()
         .wrap_err("failed to create gateway container")?;
     Ok(())
+}
+
+/// Information about a container that is holding a port we need.
+#[derive(Debug, Clone)]
+pub struct PortConflict {
+    /// Name of the container holding the port (without leading `/`).
+    pub container_name: String,
+    /// The host port that conflicts.
+    pub host_port: u16,
+}
+
+/// Check whether any *other* running container already binds the host ports
+/// that the gateway needs.  Returns a list of conflicts (empty if none).
+///
+/// Docker silently fails to attach networking when a port is already bound,
+/// leaving the new container with only a loopback interface.  Detecting this
+/// up-front lets us give a clear error instead of a cryptic "no default route"
+/// failure 30 seconds later.
+pub async fn check_port_conflicts(
+    docker: &Docker,
+    name: &str,
+    gateway_port: u16,
+    kube_port: Option<u16>,
+) -> Result<Vec<PortConflict>> {
+    let our_container = container_name(name);
+    let needed_ports: Vec<u16> = std::iter::once(gateway_port).chain(kube_port).collect();
+
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                // Only running containers can hold port bindings.
+                .all(false)
+                .build(),
+        ))
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to list containers for port conflict check")?;
+
+    let mut conflicts = Vec::new();
+    for container in &containers {
+        // Skip our own container (it may already exist from a previous run).
+        let names = container.names.as_deref().unwrap_or_default();
+        let is_ours = names
+            .iter()
+            .any(|n| n.trim_start_matches('/') == our_container);
+        if is_ours {
+            continue;
+        }
+
+        let ports = container.ports.as_deref().unwrap_or_default();
+        for port in ports {
+            if let Some(public) = port.public_port {
+                if needed_ports.contains(&public) {
+                    let cname = names
+                        .first()
+                        .map(|n| n.trim_start_matches('/').to_string())
+                        .unwrap_or_else(|| {
+                            container
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| "<unknown>".to_string())
+                        });
+                    conflicts.push(PortConflict {
+                        container_name: cname,
+                        host_port: public,
+                    });
+                }
+            }
+        }
+    }
+    Ok(conflicts)
 }
 
 pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {

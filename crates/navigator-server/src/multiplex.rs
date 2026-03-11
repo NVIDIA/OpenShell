@@ -68,7 +68,7 @@ impl MultiplexService {
     }
 }
 
-/// Combined gRPC service that routes between OpenShell and Inference services
+/// Combined gRPC service that routes between `OpenShell` and Inference services
 /// based on the request path prefix.
 #[derive(Clone)]
 pub struct GrpcRouter<N, I> {

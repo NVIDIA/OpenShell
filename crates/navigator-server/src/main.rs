@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Server - gRPC/HTTP server with protocol multiplexing.
+//! `OpenShell` Server - gRPC/HTTP server with protocol multiplexing.
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
@@ -12,7 +12,7 @@ use tracing_subscriber::EnvFilter;
 
 use navigator_server::{run_server, tracing_bus::TracingLogBus};
 
-/// OpenShell Server - gRPC and HTTP server with protocol multiplexing.
+/// `OpenShell` Server - gRPC and HTTP server with protocol multiplexing.
 #[derive(Parser, Debug)]
 #[command(name = "navigator-server")]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
@@ -49,7 +49,7 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
-    /// gRPC endpoint for sandboxes to callback to OpenShell.
+    /// gRPC endpoint for sandboxes to callback to `OpenShell`.
     /// This should be reachable from within the Kubernetes cluster.
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
     grpc_endpoint: Option<String>,
