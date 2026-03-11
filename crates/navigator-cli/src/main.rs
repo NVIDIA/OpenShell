@@ -486,7 +486,7 @@ The script is output on stdout, allowing you to redirect the output to the file 
 The exact config file locations might vary based on your system. Make sure to restart your
 shell before testing whether completions are working.
 
-## bash
+\x1b[1mBASH\x1b[0m
 
 First, ensure that you install `bash-completion` using your package manager.
 
@@ -498,12 +498,12 @@ On macOS with Homebrew (install bash-completion first):
   mkdir -p $(brew --prefix)/etc/bash_completion.d
   openshell completions bash > $(brew --prefix)/etc/bash_completion.d/openshell.bash-completion
 
-## fish
+\x1b[1mFISH\x1b[0m
 
   mkdir -p ~/.config/fish/completions
   openshell completions fish > ~/.config/fish/completions/openshell.fish
 
-## zsh
+\x1b[1mZSH\x1b[0m
 
   mkdir -p ~/.zfunc
   openshell completions zsh > ~/.zfunc/_openshell
@@ -512,7 +512,7 @@ Then add the following to your .zshrc before compinit:
 
   fpath+=~/.zfunc
 
-## powershell
+\x1b[1mPOWERSHELL\x1b[0m
 
    openshell completions powershell >> $PROFILE
 
