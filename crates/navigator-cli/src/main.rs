@@ -151,7 +151,9 @@ fn resolve_sandbox_name(name: Option<String>, gateway: &str) -> Result<String> {
     Ok(last)
 }
 
-// Custom help template organized like `gh` CLI
+// Custom root help stays hand-authored so commands can be grouped into product
+// areas without relying on clap's default subcommand listing. User-facing
+// commands remain visible so shell completion can suggest them at the root.
 const HELP_TEMPLATE: &str = "\
 {about-with-newline}
 \x1b[1mUSAGE\x1b[0m
