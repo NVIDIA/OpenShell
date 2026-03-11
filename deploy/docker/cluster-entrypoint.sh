@@ -120,6 +120,35 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# Verify DNS is functional after proxy setup.
+# If resolution fails, the cluster will be unable to pull images and will
+# spin for minutes with opaque "Try again" errors. Log a clear marker so
+# the CLI polling loop can detect this early and fail fast.
+# ---------------------------------------------------------------------------
+verify_dns() {
+    local dns_target="${REGISTRY_HOST:-ghcr.io}"
+    local attempts=5
+    local i=1
+    while [ "$i" -le "$attempts" ]; do
+        if nslookup "$dns_target" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+if ! verify_dns; then
+    echo "DNS_PROBE_FAILED: cannot resolve ${REGISTRY_HOST:-ghcr.io} after DNS proxy setup"
+    echo "  resolv.conf: $(cat "$RESOLV_CONF")"
+    echo "  This usually means Docker DNS forwarding is broken."
+    echo "  Try restarting Docker or pruning networks: docker network prune -f"
+    # Don't exit — let k3s start so the Rust-side polling loop can detect the
+    # failure via the log marker and present a user-friendly diagnosis.
+fi
+
+# ---------------------------------------------------------------------------
 # Generate k3s private registry configuration
 # ---------------------------------------------------------------------------
 # Write registries.yaml so k3s/containerd can authenticate when pulling

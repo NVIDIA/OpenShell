@@ -51,6 +51,27 @@ pub async fn wait_for_kubeconfig(docker: &Docker, name: &str) -> Result<String> 
     Err(miette::miette!("timed out waiting for kubeconfig\n{logs}"))
 }
 
+/// Log markers emitted by the entrypoint and health-check scripts when DNS
+/// resolution fails inside the container. Detecting these early lets us
+/// short-circuit the 6-minute polling loop and surface a clear diagnosis.
+const DNS_FAILURE_MARKERS: &[&str] = &["DNS_PROBE_FAILED", "HEALTHCHECK_DNS_FAILURE"];
+
+/// Log marker emitted by the health-check script when a Kubernetes node is
+/// under resource pressure (`DiskPressure`, `MemoryPressure`, `PIDPressure`).
+/// When a node has pressure conditions the kubelet evicts pods and rejects
+/// new scheduling, so the cluster will never become healthy on its own.
+const NODE_PRESSURE_MARKER: &str = "HEALTHCHECK_NODE_PRESSURE";
+
+/// Number of consecutive polling iterations that must observe DNS failure
+/// markers before we treat the failure as persistent and abort. A small
+/// grace period avoids false positives on transient hiccups during startup.
+const DNS_FAILURE_GRACE_ITERATIONS: u32 = 5;
+
+/// Number of consecutive polling iterations that must observe node pressure
+/// markers before aborting. Slightly longer grace period than DNS since
+/// transient pressure can occur during image extraction on startup.
+const NODE_PRESSURE_GRACE_ITERATIONS: u32 = 8;
+
 pub async fn wait_for_gateway_ready<F>(docker: &Docker, name: &str, mut on_log: F) -> Result<()>
 where
     F: FnMut(String) + Send,
@@ -66,9 +87,72 @@ where
     let mut recent_logs = VecDeque::with_capacity(15);
     let attempts = 180;
     let mut result = None;
+    let mut dns_failure_seen_count: u32 = 0;
+    let mut node_pressure_seen_count: u32 = 0;
 
     for attempt in 0..attempts {
         drain_logs(&mut log_rx, &mut recent_logs, &mut on_log);
+
+        // -- Early DNS failure detection ---------------------------------
+        // Check recent logs for DNS failure markers emitted by the
+        // entrypoint or health-check scripts. If the marker persists for
+        // several consecutive iterations the DNS proxy is broken and
+        // waiting longer won't help.
+        let dns_failing = recent_logs
+            .iter()
+            .any(|line| DNS_FAILURE_MARKERS.iter().any(|m| line.contains(m)));
+        if dns_failing {
+            dns_failure_seen_count += 1;
+            if dns_failure_seen_count >= DNS_FAILURE_GRACE_ITERATIONS {
+                result = Some(Err(miette::miette!(
+                    "dial tcp: lookup registry: Try again\n\
+                     DNS resolution is failing inside the gateway container.\n{}",
+                    format_recent_logs(&recent_logs)
+                )));
+                break;
+            }
+        } else {
+            dns_failure_seen_count = 0;
+        }
+
+        // -- Early node pressure detection -------------------------------
+        // Check for DiskPressure / MemoryPressure / PIDPressure markers
+        // emitted by the health-check script. Under pressure the kubelet
+        // evicts pods and blocks new scheduling, so waiting won't help.
+        let pressure_lines: Vec<&str> = recent_logs
+            .iter()
+            .filter(|line| line.contains(NODE_PRESSURE_MARKER))
+            .map(String::as_str)
+            .collect();
+        if pressure_lines.is_empty() {
+            node_pressure_seen_count = 0;
+        } else {
+            node_pressure_seen_count += 1;
+            if node_pressure_seen_count >= NODE_PRESSURE_GRACE_ITERATIONS {
+                // Extract the specific pressure type(s) from the marker lines
+                let conditions: Vec<String> = pressure_lines
+                    .iter()
+                    .filter_map(|line| {
+                        line.find(NODE_PRESSURE_MARKER)
+                            .map(|pos| &line[pos + NODE_PRESSURE_MARKER.len()..])
+                            .map(|rest| rest.trim_start_matches(':').trim().to_string())
+                    })
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                let condition_list = if conditions.is_empty() {
+                    "unknown pressure condition".to_string()
+                } else {
+                    conditions.join(", ")
+                };
+                result = Some(Err(miette::miette!(
+                    "HEALTHCHECK_NODE_PRESSURE: {condition_list}\n\
+                     The cluster node is under resource pressure. \
+                     The kubelet is evicting pods and rejecting new scheduling.\n{}",
+                    format_recent_logs(&recent_logs)
+                )));
+                break;
+            }
+        }
 
         let inspect = docker
             .inspect_container(&container_name, None::<InspectContainerOptions>)

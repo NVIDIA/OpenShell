@@ -163,8 +163,9 @@ fn parse_kube_event_reason(reason: &str) -> Option<KubeEventReason> {
 struct ProvisioningDisplay {
     mp: MultiProgress,
     spinner: ProgressBar,
-    /// Blank line below the spinner (for visual spacing during long operations).
-    spacer: Option<ProgressBar>,
+    /// Blank line below the spinner so progress doesn't sit flush against
+    /// the bottom of the terminal.
+    spacer: ProgressBar,
     /// Steps that have been completed, in order.
     completed_steps: Vec<ProvisioningStep>,
     /// Progress bars for completed steps (so they can be cleared).
@@ -188,11 +189,19 @@ impl ProvisioningDisplay {
         );
         spinner.enable_steady_tick(Duration::from_millis(120));
 
+        // Always keep a blank line below the spinner so the progress area
+        // doesn't sit flush against the bottom of the terminal.
+        let spacer = mp.add(ProgressBar::new(0));
+        spacer.set_style(
+            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        spacer.set_message("");
+
         let now = Instant::now();
         Self {
             mp,
             spinner,
-            spacer: None,
+            spacer,
             completed_steps: Vec::new(),
             completed_bars: Vec::new(),
             active_label: ProvisioningStep::RequestingSandbox
@@ -290,29 +299,9 @@ impl ProvisioningDisplay {
         &self.active_label
     }
 
-    /// Show a blank line below the spinner for visual spacing.
-    fn show_spacer(&mut self) {
-        if self.spacer.is_none() {
-            let bar = self.mp.add(ProgressBar::new(0));
-            bar.set_style(
-                ProgressStyle::with_template("{msg}")
-                    .unwrap_or_else(|_| ProgressStyle::default_bar()),
-            );
-            bar.set_message("");
-            self.spacer = Some(bar);
-        }
-    }
-
-    /// Hide the spacer below the spinner.
-    fn hide_spacer(&mut self) {
-        if let Some(bar) = self.spacer.take() {
-            bar.finish_and_clear();
-        }
-    }
-
-    /// Clear all progress output (spinner and completed step lines).
+    /// Clear all progress output (spinner, spacer, and completed step lines).
     fn clear(&mut self) {
-        self.hide_spacer();
+        self.spacer.finish_and_clear();
         self.spinner.finish_and_clear();
         for bar in &self.completed_bars {
             bar.finish_and_clear();
@@ -446,6 +435,9 @@ struct GatewayDeployLogPanel {
     progress: Option<String>,
     current_step: Option<String>,
     spinner: ProgressBar,
+    /// Blank line below the spinner so progress doesn't sit flush against the
+    /// bottom of the terminal.
+    spacer: ProgressBar,
     completed_steps: Vec<ProgressBar>,
     top_border: Option<ProgressBar>,
     log_lines: Vec<ProgressBar>,
@@ -464,12 +456,21 @@ impl GatewayDeployLogPanel {
         );
         spinner.enable_steady_tick(Duration::from_millis(120));
 
+        // Keep a blank line below the spinner so it doesn't sit flush
+        // against the bottom of the terminal.
+        let spacer = mp.add(ProgressBar::new(0));
+        spacer.set_style(
+            ProgressStyle::with_template("{msg}").unwrap_or_else(|_| ProgressStyle::default_bar()),
+        );
+        spacer.set_message("");
+
         let panel = Self {
             mp,
             status: "Starting".to_string(),
             progress: None,
             current_step: None,
             spinner,
+            spacer,
             completed_steps: Vec::new(),
             top_border: None,
             log_lines: Vec::with_capacity(CLUSTER_DEPLOY_LOG_LINES),
@@ -596,6 +597,7 @@ impl GatewayDeployLogPanel {
         }
         self.clear_log_panel();
         self.spinner.finish_and_clear();
+        self.spacer.finish_and_clear();
     }
 
     fn finish_failure(&mut self) {
@@ -616,6 +618,7 @@ impl GatewayDeployLogPanel {
             bottom_border.finish();
         }
         self.spinner.finish_and_clear();
+        self.spacer.finish_and_clear();
     }
 
     /// Clear the container log panel from the terminal output.
@@ -1700,7 +1703,6 @@ pub async fn sandbox_create(
                                     if !image_name.is_empty() {
                                         d.set_active_detail(image_name);
                                     }
-                                    d.show_spacer();
                                 } else {
                                     let ts = format_timestamp(provision_start.elapsed());
                                     if image_name.is_empty() {
@@ -1727,7 +1729,6 @@ pub async fn sandbox_create(
                                     format!("Image pulled ({})", size_label)
                                 };
                                 if let Some(d) = display.as_mut() {
-                                    d.hide_spacer();
                                     d.complete_step_with_label(
                                         ProvisioningStep::PullingSandboxImage,
                                         &label,
@@ -1870,6 +1871,7 @@ pub async fn sandbox_create(
                 && let Err(err) = sandbox_delete(
                     &effective_server,
                     std::slice::from_ref(&sandbox_name),
+                    false,
                     &effective_tls,
                 )
                 .await
@@ -2258,11 +2260,35 @@ pub async fn sandbox_list(
     Ok(())
 }
 
-/// Delete a sandbox by name.
-pub async fn sandbox_delete(server: &str, names: &[String], tls: &TlsOptions) -> Result<()> {
+/// Delete a sandbox by name, or all sandboxes when `all` is true.
+pub async fn sandbox_delete(
+    server: &str,
+    names: &[String],
+    all: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
-    for name in names {
+    let names_to_delete: Vec<String> = if all {
+        // Fetch all sandboxes (use a large page size).
+        let response = client
+            .list_sandboxes(ListSandboxesRequest {
+                limit: 1000,
+                offset: 0,
+            })
+            .await
+            .into_diagnostic()?;
+        let sandboxes = response.into_inner().sandboxes;
+        if sandboxes.is_empty() {
+            println!("No sandboxes to delete.");
+            return Ok(());
+        }
+        sandboxes.into_iter().map(|s| s.name).collect()
+    } else {
+        names.to_vec()
+    };
+
+    for name in &names_to_delete {
         // Stop any background port forwards for this sandbox before deleting.
         if let Ok(stopped) = stop_forwards_for_sandbox(name) {
             for port in stopped {

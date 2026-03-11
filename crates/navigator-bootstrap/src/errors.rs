@@ -133,6 +133,12 @@ const FAILURE_PATTERNS: &[FailurePattern] = &[
         match_mode: MatchMode::Any,
         diagnose: diagnose_oom_killed,
     },
+    // Node resource pressure (DiskPressure, MemoryPressure, PIDPressure)
+    FailurePattern {
+        matchers: &["HEALTHCHECK_NODE_PRESSURE"],
+        match_mode: MatchMode::Any,
+        diagnose: diagnose_node_pressure,
+    },
     // TLS/certificate issues
     FailurePattern {
         matchers: &[
@@ -178,10 +184,18 @@ fn diagnose_corrupted_state(gateway_name: &str) -> GatewayFailureDiagnosis {
 fn diagnose_no_default_route(_gateway_name: &str) -> GatewayFailureDiagnosis {
     GatewayFailureDiagnosis {
         summary: "Docker networking issue".to_string(),
-        explanation: "The gateway container has no network route. This is usually caused by \
-            stale Docker networks or Docker Desktop networking issues."
+        explanation: "The gateway container has no network route. This can happen when \
+            another container is already bound to the same host port (Docker silently \
+            skips network attachment), or due to stale Docker networks."
             .to_string(),
         recovery_steps: vec![
+            RecoveryStep::with_command(
+                "Check for containers using the same port",
+                "docker ps --format '{{.Names}}\\t{{.Ports}}'",
+            ),
+            RecoveryStep::new(
+                "Stop any container holding the gateway port (default 8080), then retry",
+            ),
             RecoveryStep::with_command("Prune unused Docker networks", "docker network prune -f"),
             RecoveryStep::new("Restart Docker Desktop (if on Mac/Windows)"),
             RecoveryStep::new("Then retry: openshell gateway start"),
@@ -237,11 +251,22 @@ fn diagnose_k3s_dns_proxy_failure(gateway_name: &str) -> GatewayFailureDiagnosis
     GatewayFailureDiagnosis {
         summary: "Cluster DNS resolution failed".to_string(),
         explanation: "The gateway cluster started but its internal DNS proxy cannot resolve \
-            external hostnames. This is typically caused by stale Docker networking state \
-            or Docker Desktop DNS configuration issues."
+            external hostnames. Docker's embedded DNS inside the container cannot reach \
+            an upstream resolver. This is typically caused by Docker not being configured \
+            with the host's DNS servers, stale Docker networking state, or (on Desktop) \
+            DNS configuration issues."
             .to_string(),
         recovery_steps: vec![
-            RecoveryStep::new("Restart Docker Desktop"),
+            RecoveryStep::with_command(
+                "Check your host's DNS servers",
+                "resolvectl status | grep 'DNS Servers' -A2",
+            ),
+            RecoveryStep::with_command(
+                "Configure Docker to use those DNS servers \
+                 (add to /etc/docker/daemon.json, then restart Docker)",
+                "echo '{\"dns\": [\"<your-dns-server-ip>\"]}' | sudo tee /etc/docker/daemon.json \
+                 && sudo systemctl restart docker",
+            ),
             RecoveryStep::with_command("Prune Docker networks", "docker network prune -f"),
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway",
@@ -284,6 +309,34 @@ fn diagnose_oom_killed(_gateway_name: &str) -> GatewayFailureDiagnosis {
             ),
             RecoveryStep::new("Close other memory-intensive applications"),
             RecoveryStep::new("Then retry: openshell gateway start"),
+        ],
+        retryable: false,
+    }
+}
+
+fn diagnose_node_pressure(gateway_name: &str) -> GatewayFailureDiagnosis {
+    GatewayFailureDiagnosis {
+        summary: "Node under resource pressure".to_string(),
+        explanation: "The cluster node is reporting a resource pressure condition \
+            (DiskPressure, MemoryPressure, or PIDPressure). When a node is under \
+            pressure the kubelet evicts running pods and rejects new pod scheduling, \
+            so the gateway will never become healthy until the pressure is resolved."
+            .to_string(),
+        recovery_steps: vec![
+            RecoveryStep::with_command("Check available disk space on the host", "df -h /"),
+            RecoveryStep::with_command(
+                "Free disk space by pruning unused Docker resources",
+                "docker system prune -a --volumes",
+            ),
+            RecoveryStep::with_command("Check available memory on the host", "free -h"),
+            RecoveryStep::new(
+                "Increase Docker resource allocation \
+                (Docker Desktop → Settings → Resources), or free resources on the host",
+            ),
+            RecoveryStep::with_command(
+                "Destroy and recreate the gateway after freeing resources",
+                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+            ),
         ],
         retryable: false,
     }
@@ -436,5 +489,60 @@ mod tests {
         // Should NOT match with only "Try again" (no match at all since it's too generic)
         let diagnosis = diagnose_failure("test", "Try again later", None);
         assert!(diagnosis.is_none());
+    }
+
+    #[test]
+    fn test_diagnose_node_pressure_disk() {
+        let diagnosis = diagnose_failure(
+            "test",
+            "HEALTHCHECK_NODE_PRESSURE: DiskPressure\n\
+             The cluster node is under resource pressure.",
+            None,
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("pressure"),
+            "expected pressure diagnosis, got: {}",
+            d.summary
+        );
+        assert!(!d.retryable);
+    }
+
+    #[test]
+    fn test_diagnose_node_pressure_from_container_logs() {
+        let diagnosis = diagnose_failure(
+            "test",
+            "gateway health check reported unhealthy",
+            Some("HEALTHCHECK_NODE_PRESSURE: MemoryPressure"),
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("pressure"),
+            "expected pressure diagnosis, got: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn test_diagnose_dns_failure_from_namespace_timeout() {
+        // When wait_for_namespace detects DNS failure, the error message itself
+        // (not container logs) contains the DNS markers. The diagnose_failure
+        // function must match these from the error_message parameter alone,
+        // since container_logs may be None in this path.
+        let diagnosis = diagnose_failure(
+            "test",
+            "K8s namespace not ready\n\nCaused by:\n    dial tcp: lookup registry: Try again\n    DNS resolution is failing inside the gateway container.",
+            None,
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("DNS"),
+            "expected DNS diagnosis, got: {}",
+            d.summary
+        );
+        assert!(d.retryable);
     }
 }
