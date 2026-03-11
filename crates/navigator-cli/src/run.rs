@@ -725,7 +725,10 @@ pub fn gateway_use(name: &str) -> Result<()> {
 pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Result<()> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     gateway_select_with(name, gateway_flag, interactive, |gateways, default| {
-        let prompt = format!("{}\nSelect a gateway", format_gateway_select_header(gateways));
+        let prompt = format!(
+            "Select a gateway\n{}",
+            format_gateway_select_header(gateways)
+        );
         let items = format_gateway_select_items(gateways);
         Select::with_theme(&ColorfulTheme::default())
             .with_prompt(prompt)
