@@ -1,3 +1,24 @@
+---
+title:
+  page: Create and Manage Sandboxes
+  nav: Create and Manage
+description: Create, inspect, connect to, monitor, transfer files, and delete OpenShell sandboxes.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Sandboxing
+- AI Agents
+- Sandbox Management
+- CLI
+content:
+  type: how_to
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

@@ -1,15 +1,22 @@
 ---
 title:
-  page: "Quickstart"
-  nav: "Quickstart"
-description: "Install the OpenShell CLI and create your first sandboxed AI agent in two commands."
-keywords: ["openshell install", "quickstart", "sandbox create", "getting started"]
-topics: ["generative_ai", "cybersecurity"]
-tags: ["ai_agents", "sandboxing", "installation", "quickstart"]
+  page: Quickstart
+  nav: Quickstart
+description: Install the OpenShell CLI and create your first sandboxed AI agent in two commands.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- AI Agents
+- Sandboxing
+- Installation
+- Quickstart
 content:
   type: get_started
   difficulty: technical_beginner
-  audience: [engineer, data_scientist]
+  audience:
+  - engineer
+  - data_scientist
 ---
 
 <!--

@@ -1,9 +1,29 @@
+---
+title:
+  page: NVIDIA OpenShell Release Notes
+  nav: Release Notes
+description: Track the latest changes and improvements to NVIDIA OpenShell.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Release Notes
+- Changelog
+- AI Agents
+content:
+  type: reference
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Release Notes
+# NVIDIA OpenShell Release Notes
 
 Track the latest changes and improvements to NVIDIA OpenShell.
 This page covers the highlights of the release.

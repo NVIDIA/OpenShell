@@ -1,3 +1,25 @@
+---
+title:
+  page: About Sandboxes
+  nav: Sandboxes
+description: Understand sandbox lifecycle, supported agents, built-in default policy, and network access rules in OpenShell.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Sandboxing
+- AI Agents
+- Security
+- Policy
+- Isolation
+content:
+  type: concept
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

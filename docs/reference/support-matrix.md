@@ -1,3 +1,24 @@
+---
+title:
+  page: Support Matrix
+  nav: Support Matrix
+description: Platform, software, runtime, and kernel requirements for running NVIDIA OpenShell.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Support Matrix
+- Requirements
+- Compatibility
+- Platform
+content:
+  type: reference
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

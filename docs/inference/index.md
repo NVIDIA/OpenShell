@@ -1,3 +1,24 @@
+---
+title:
+  page: About Inference Routing
+  nav: Inference Routing
+description: Understand how OpenShell routes inference traffic through external endpoints and the local privacy router.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Inference Routing
+- Privacy
+- AI Agents
+- LLM
+content:
+  type: concept
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

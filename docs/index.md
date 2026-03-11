@@ -1,9 +1,9 @@
 ---
 title:
-  page: "NVIDIA OpenShell Developer Guide"
-  nav: "Get Started"
-  card: "NVIDIA OpenShell"
-description: "OpenShell is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
+  page: NVIDIA OpenShell Developer Guide
+  nav: Get Started
+  card: NVIDIA OpenShell
+description: OpenShell is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure.
 topics:
 - Generative AI
 - Cybersecurity
@@ -196,7 +196,7 @@ Release Notes <about/release-notes>
 :hidden:
 
 Quickstart <get-started/quickstart>
-GitHub Sandbox <tutorials/github-sandbox>
+Sandboxing Agents with Custom GitHub Policies <tutorials/github-sandbox>
 ```
 
 ```{toctree}

@@ -1,15 +1,22 @@
 ---
 title:
-  page: "How OpenShell Works"
-  nav: "How It Works"
-description: "OpenShell architecture: gateway, sandbox, policy engine, and privacy router."
-keywords: ["openshell architecture", "sandbox architecture", "agent isolation", "k3s", "policy engine"]
-topics: ["generative_ai", "cybersecurity"]
-tags: ["ai_agents", "sandboxing", "security", "architecture"]
+  page: How OpenShell Works
+  nav: How It Works
+description: OpenShell architecture overview covering the gateway, sandbox, policy engine, and privacy router.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- AI Agents
+- Sandboxing
+- Security
+- Architecture
 content:
   type: concept
   difficulty: technical_beginner
-  audience: [engineer, data_scientist]
+  audience:
+  - engineer
+  - data_scientist
 ---
 
 <!--

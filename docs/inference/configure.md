@@ -1,3 +1,24 @@
+---
+title:
+  page: Configure Inference Routing
+  nav: Configure
+description: Set up the managed local inference endpoint with provider credentials and model configuration.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Inference Routing
+- Configuration
+- Privacy
+- LLM
+- Provider
+content:
+  type: how_to
+  difficulty: technical_intermediate
+  audience:
+  - engineer
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
