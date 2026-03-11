@@ -758,6 +758,28 @@ async fn load_existing_pki_bundle(
 /// The Helm controller creates the `openshell` namespace when it processes
 /// the `HelmChart` manifest, but there's a race between kubeconfig being ready
 /// and the namespace being created. We poll briefly.
+/// Check whether DNS resolution is working inside the container.
+///
+/// Probes the configured `REGISTRY_HOST` (falling back to `ghcr.io`) since
+/// that is the primary registry the cluster needs to reach for image pulls.
+///
+/// Returns `Ok(true)` if DNS is functional, `Ok(false)` if the probe ran but
+/// resolution failed, and `Err` if the exec itself failed.
+async fn probe_container_dns(docker: &Docker, container_name: &str) -> Result<bool> {
+    let (output, exit_code) = exec_capture_with_exit(
+        docker,
+        container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "nslookup \"${REGISTRY_HOST:-ghcr.io}\" >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL"
+                .to_string(),
+        ],
+    )
+    .await?;
+    Ok(exit_code == 0 && output.contains("DNS_OK"))
+}
+
 async fn wait_for_namespace(
     docker: &Docker,
     container_name: &str,
@@ -770,7 +792,42 @@ async fn wait_for_namespace(
     let max_backoff = std::time::Duration::from_secs(2);
     let mut backoff = std::time::Duration::from_millis(200);
 
+    // Track consecutive DNS failures. We start probing early (iteration 3,
+    // giving k3s a few seconds to boot) and probe every 3 iterations after
+    // that. Two consecutive failures are enough to abort — the nslookup
+    // timeout already provides a built-in retry window.
+    let dns_probe_start = 3; // skip the first few iterations while k3s boots
+    let dns_probe_interval = 3; // probe every N iterations after start
+    let dns_failure_threshold: u32 = 2; // consecutive probe failures to abort
+    let mut dns_consecutive_failures: u32 = 0;
+
     for attempt in 0..attempts {
+        // --- Periodic DNS health probe ---
+        if attempt >= dns_probe_start && (attempt - dns_probe_start) % dns_probe_interval == 0 {
+            match probe_container_dns(docker, container_name).await {
+                Ok(true) => {
+                    dns_consecutive_failures = 0;
+                }
+                Ok(false) => {
+                    dns_consecutive_failures += 1;
+                    if dns_consecutive_failures >= dns_failure_threshold {
+                        let logs = fetch_recent_logs(docker, container_name, 40).await;
+                        return Err(miette::miette!(
+                            "dial tcp: lookup registry: Try again\n\
+                             DNS resolution is failing inside the gateway container. \
+                             The cluster cannot pull images or create the '{namespace}' namespace \
+                             until DNS is fixed.\n{logs}"
+                        ))
+                        .wrap_err("K8s namespace not ready");
+                    }
+                }
+                Err(_) => {
+                    // Exec failed — container may be restarting; don't count
+                    // as a DNS failure.
+                }
+            }
+        }
+
         let exec_result = exec_capture_with_exit(
             docker,
             container_name,
