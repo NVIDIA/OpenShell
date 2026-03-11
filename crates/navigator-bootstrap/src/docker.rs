@@ -10,8 +10,8 @@ use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
-    VolumeCreateRequest,
+    ContainerCreateBody, DeviceRequest, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest,
+    PortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -242,6 +242,7 @@ pub async fn ensure_container(
     disable_tls: bool,
     disable_gateway_auth: bool,
     registry_token: Option<&str>,
+    gpu: bool,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -321,7 +322,7 @@ pub async fn ensure_container(
         exposed_ports.push("6443/tcp".to_string());
     }
 
-    let host_config = HostConfig {
+    let mut host_config = HostConfig {
         privileged: Some(true),
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
@@ -331,6 +332,23 @@ pub async fn ensure_container(
         extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
         ..Default::default()
     };
+
+    // When GPU support is requested, add NVIDIA device requests.
+    // This is the programmatic equivalent of `docker run --gpus all`.
+    // The NVIDIA Container Toolkit runtime hook injects /dev/nvidia* devices
+    // and GPU driver libraries from the host into the container.
+    if gpu {
+        host_config.device_requests = Some(vec![DeviceRequest {
+            driver: Some("nvidia".to_string()),
+            count: Some(-1), // all GPUs
+            capabilities: Some(vec![vec![
+                "gpu".to_string(),
+                "utility".to_string(),
+                "compute".to_string(),
+            ]]),
+            ..Default::default()
+        }]);
+    }
 
     let mut cmd = vec![
         "server".to_string(),
@@ -453,6 +471,12 @@ pub async fn ensure_container(
     // manifest sets the flag on the server pod.
     if disable_gateway_auth {
         env_vars.push("DISABLE_GATEWAY_AUTH=true".to_string());
+    }
+
+    // GPU support: tell the entrypoint to deploy the NVIDIA device plugin
+    // HelmChart CR so k8s workloads can request nvidia.com/gpu resources.
+    if gpu {
+        env_vars.push("GPU_ENABLED=true".to_string());
     }
 
     let env = Some(env_vars);
