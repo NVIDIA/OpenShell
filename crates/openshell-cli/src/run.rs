@@ -24,13 +24,13 @@ use openshell_bootstrap::{
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    ExecSandboxRequest, GetClusterInferenceRequest, GetDraftHistoryRequest,
+    GetDraftPolicyRequest, GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     SetClusterInferenceRequest, SettingScope, SettingValue, UpdateConfigRequest,
-    UpdateProviderRequest, WatchSandboxRequest, setting_value,
+    UpdateProviderRequest, WatchSandboxRequest, exec_sandbox_event, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_providers::{
@@ -38,7 +38,7 @@ use openshell_providers::{
 };
 use owo_colors::OwoColorize;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::{IsTerminal, Write};
+use std::io::{IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
@@ -2691,6 +2691,93 @@ pub async fn sandbox_get(server: &str, name: &str, tls: &TlsOptions) -> Result<(
     }
 
     Ok(())
+}
+
+/// Execute a command in a running sandbox via gRPC, streaming output to the terminal.
+///
+/// Returns the remote command's exit code.
+pub async fn sandbox_exec_grpc(
+    server: &str,
+    name: &str,
+    command: &[String],
+    workdir: Option<&str>,
+    env_pairs: &[String],
+    timeout_seconds: u32,
+    tls: &TlsOptions,
+) -> Result<i32> {
+    let mut client = grpc_client(server, tls).await?;
+
+    // Resolve sandbox name to id.
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    // Parse KEY=VALUE environment pairs into a HashMap.
+    let environment: HashMap<String, String> = env_pairs
+        .iter()
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').ok_or_else(|| {
+                miette::miette!("invalid env format '{}': expected KEY=VALUE", pair)
+            })?;
+            Ok((k.to_string(), v.to_string()))
+        })
+        .collect::<Result<_>>()?;
+
+    // Read stdin if piped (not a TTY).
+    let stdin_payload = if !std::io::stdin().is_terminal() {
+        let mut buf = Vec::new();
+        std::io::stdin().read_to_end(&mut buf).into_diagnostic()?;
+        buf
+    } else {
+        Vec::new()
+    };
+
+    // Make the streaming gRPC call.
+    let mut stream = client
+        .exec_sandbox(ExecSandboxRequest {
+            sandbox_id: sandbox.id,
+            command: command.to_vec(),
+            workdir: workdir.unwrap_or_default().to_string(),
+            environment,
+            timeout_seconds,
+            stdin: stdin_payload,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    // Stream output to terminal in real-time.
+    let mut exit_code = 0i32;
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+
+    while let Some(event) = stream.next().await {
+        let event = event.into_diagnostic()?;
+        match event.payload {
+            Some(exec_sandbox_event::Payload::Stdout(out)) => {
+                let mut handle = stdout.lock();
+                handle.write_all(&out.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Stderr(err)) => {
+                let mut handle = stderr.lock();
+                handle.write_all(&err.data).into_diagnostic()?;
+                handle.flush().into_diagnostic()?;
+            }
+            Some(exec_sandbox_event::Payload::Exit(exit)) => {
+                exit_code = exit.exit_code;
+            }
+            None => {}
+        }
+    }
+
+    Ok(exit_code)
 }
 
 /// Print a single YAML line with dimmed keys and regular values.
