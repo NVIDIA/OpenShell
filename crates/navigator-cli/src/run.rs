@@ -725,18 +725,43 @@ pub fn gateway_use(name: &str) -> Result<()> {
 pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Result<()> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     gateway_select_with(name, gateway_flag, interactive, |gateways, default| {
-        let names: Vec<&str> = gateways
-            .iter()
-            .map(|gateway| gateway.name.as_str())
-            .collect();
+        let items = format_gateway_select_items(gateways);
         Select::with_theme(&ColorfulTheme::default())
             .with_prompt("Select a gateway")
-            .items(&names)
+            .items(&items)
             .default(default)
             .interact_opt()
             .into_diagnostic()
             .map(|selection| selection.map(|index| gateways[index].name.clone()))
     })
+}
+
+fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
+    let endpoint_width = gateways
+        .iter()
+        .map(|gateway| gateway.gateway_endpoint.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    gateways
+        .iter()
+        .map(|gateway| {
+            format!(
+                "{:<endpoint_width$}  {}",
+                gateway.gateway_endpoint,
+                gateway_type_label(gateway),
+            )
+        })
+        .collect()
+}
+
+fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
+    match gateway.auth_mode.as_deref() {
+        Some("cloudflare_jwt") => "edge",
+        _ if gateway.is_remote => "remote",
+        _ => "local",
+    }
 }
 
 fn gateway_select_with<F>(
@@ -928,11 +953,7 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
     for gateway in &gateways {
         let is_active = active.as_deref() == Some(&gateway.name);
         let marker = if is_active { "*" } else { " " };
-        let gateway_type = match gateway.auth_mode.as_deref() {
-            Some("cloudflare_jwt") => "edge",
-            _ if gateway.is_remote => "remote",
-            _ => "local",
-        };
+        let gateway_type = gateway_type_label(gateway);
         let line = format!(
             "{marker} {:<name_width$}  {:<endpoint_width$}  {gateway_type}",
             gateway.name, gateway.gateway_endpoint,
@@ -3612,8 +3633,9 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayControlTarget, TlsOptions, gateway_select_with, git_sync_files, http_health_check,
-        inferred_provider_type, parse_credential_pairs, resolve_gateway_control_target_from,
+        GatewayControlTarget, TlsOptions, format_gateway_select_items, gateway_select_with,
+        gateway_type_label, git_sync_files, http_health_check, inferred_provider_type,
+        parse_credential_pairs, resolve_gateway_control_target_from,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -3906,6 +3928,34 @@ mod tests {
             assert!(!prompted, "non-interactive mode should not prompt");
             assert_eq!(load_active_gateway(), None);
         });
+    }
+
+    #[test]
+    fn gateway_select_items_include_endpoint_and_type() {
+        let gateways = vec![
+            edge_registration("edge", "https://edge.example.com"),
+            GatewayMetadata {
+                name: "local".to_string(),
+                gateway_endpoint: "http://127.0.0.1:8080".to_string(),
+                is_remote: false,
+                gateway_port: 8080,
+                kube_port: None,
+                remote_host: None,
+                resolved_host: None,
+                auth_mode: None,
+                edge_team_domain: None,
+                edge_auth_url: None,
+            },
+        ];
+
+        let items = format_gateway_select_items(&gateways);
+
+        assert_eq!(gateway_type_label(&gateways[0]), "edge");
+        assert_eq!(gateway_type_label(&gateways[1]), "local");
+        assert!(items[0].contains("https://edge.example.com"));
+        assert!(items[0].contains("edge"));
+        assert!(items[1].contains("http://127.0.0.1:8080"));
+        assert!(items[1].contains("local"));
     }
 
     #[tokio::test]
