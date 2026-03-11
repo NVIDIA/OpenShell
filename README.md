@@ -22,17 +22,6 @@ OpenShell is the safe, private runtime for autonomous AI agents. It provides san
 uv pip install openshell
 ```
 
-**From a pre-built binary:**
-
-<!-- TODO: uncomment once release binaries are published -->
-<!-- Download the latest release from https://github.com/NVIDIA/OpenShell/releases -->
-
-```bash
-curl -L https://github.com/NVIDIA/OpenShell/releases/latest/download/openshell-$(uname -s)-$(uname -m) -o openshell
-chmod +x openshell
-sudo mv openshell /usr/local/bin/
-```
-
 ### Create a sandbox
 
 ```bash
@@ -68,13 +57,19 @@ Policies are declarative YAML files. Static sections (filesystem, process) are l
 | Agent | Source | Notes |
 |---|---|---|
 | [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Built-in | Works out of the box. Requires `ANTHROPIC_API_KEY`. |
-| [OpenCode](https://opencode.ai/) | Built-in | Add `opencode.ai` endpoint and OpenCode binary paths to the policy for full functionality. |
-| [Codex](https://developers.openai.com/codex) | Built-in | Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires `OPENAI_API_KEY`. |
+| [OpenCode](https://opencode.ai/) | Built-in | Works out of the box. Requires `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
+| [Codex](https://developers.openai.com/codex) | Built-in | Works out of the box. Requires `OPENAI_API_KEY`. |
 | [OpenClaw](https://openclaw.ai/) | [Community](https://github.com/NVIDIA/OpenShell-Community) | Launch with `openshell sandbox create --from openclaw`. |
 
 ## How It Works
 
-OpenShell runs as a [K3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated pod with policy-enforced egress routing.
+OpenShell isolates each sandbox in its own container with policy-enforced egress routing. A lightweight gateway coordinates sandbox lifecycle, and every outbound connection is intercepted by the policy engine, which does one of three things:
+
+- **Allows** — the destination and binary match a policy block.
+- **Routes for inference** — strips caller credentials, injects backend credentials, and forwards to the managed model.
+- **Denies** — blocks the request and logs it.
+
+Under the hood, the gateway runs as a [K3s](https://k3s.io/) Kubernetes cluster inside Docker — no separate K8s install required.
 
 | Component | Role |
 |---|---|
@@ -82,8 +77,6 @@ OpenShell runs as a [K3s](https://k3s.io/) Kubernetes cluster inside a Docker co
 | **Sandbox** | Isolated runtime with container supervision and policy-enforced egress routing. |
 | **Policy Engine** | Enforces filesystem, network, and process constraints from application layer down to kernel. |
 | **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute. |
-
-Every outbound connection is intercepted: the policy engine either **allows** it (destination and binary match a policy block), **routes it for inference** (strips credentials, injects backend credentials, forwards to the managed model), or **denies** it (blocked and logged).
 
 ## Key Commands
 
@@ -100,7 +93,7 @@ Every outbound connection is intercepted: the policy engine either **allows** it
 | `openshell logs [name] --tail` | Stream sandbox logs. |
 | `openshell term` | Launch the real-time terminal UI for debugging. |
 
-See the full [CLI reference](docs/reference/cli.md) for all commands, flags, and environment variables.
+See the full [CLI reference](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/cli.md) for all commands, flags, and environment variables.
 
 ## Community Sandboxes and BYOC
 
@@ -112,12 +105,20 @@ openshell sandbox create --from ./my-sandbox-dir   # local Dockerfile
 openshell sandbox create --from registry.io/img:v1 # container image
 ```
 
-See the [community sandboxes](docs/sandboxes/community-sandboxes.md) catalog and the [BYOC example](examples/bring-your-own-container) for details.
+See the [community sandboxes](https://github.com/NVIDIA/OpenShell/blob/main/docs/sandboxes/community-sandboxes.md) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
 ## Learn More
 
-- [Full Documentation](docs/) — overview, architecture, tutorials, and reference
-- [Quickstart](docs/get-started/quickstart.md) — detailed install and first sandbox walkthrough
-- [GitHub Sandbox Tutorial](docs/tutorials/github-sandbox.md) — end-to-end scoped GitHub repo access
-- [Architecture](architecture/) — detailed architecture docs and design decisions
-- [Support Matrix](docs/reference/support-matrix.md) — platforms, versions, and kernel requirements
+- [Full Documentation](https://github.com/NVIDIA/OpenShell/tree/main/docs) — overview, architecture, tutorials, and reference
+- [Quickstart](https://github.com/NVIDIA/OpenShell/blob/main/docs/get-started/quickstart.md) — detailed install and first sandbox walkthrough
+- [GitHub Sandbox Tutorial](https://github.com/NVIDIA/OpenShell/blob/main/docs/tutorials/github-sandbox.md) — end-to-end scoped GitHub repo access
+- [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
+- [Support Matrix](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/support-matrix.md) — platforms, versions, and kernel requirements
+
+## Contributing
+
+See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) for building from source and contributing to OpenShell.
+
+## License
+
+This project is licensed under the [Apache License 2.0](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE).
