@@ -213,6 +213,9 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                     if listed > 0 && listed != displayed {
                         refresh_sandbox_policy(&mut app).await;
                     }
+
+                    // Refresh draft chunks when on sandbox screen.
+                    refresh_draft_chunks(&mut app).await;
                 }
             }
             Some(Event::Redraw) => {
@@ -1715,6 +1718,35 @@ async fn refresh_sandbox_policy(app: &mut App) {
         }
         Err(_) => {
             tracing::warn!("sandbox policy refresh timed out");
+        }
+    }
+}
+
+async fn refresh_draft_chunks(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+
+    let req = navigator_core::proto::GetDraftPolicyRequest {
+        name: sandbox_name,
+        status_filter: String::new(),
+    };
+
+    match tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            app.draft_chunks = inner.chunks;
+            app.draft_version = inner.draft_version;
+            if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
+                app.draft_selected = app.draft_chunks.len() - 1;
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::debug!("draft chunks refresh: {}", e.message());
+        }
+        Err(_) => {
+            tracing::debug!("draft chunks refresh timed out");
         }
     }
 }

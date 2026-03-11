@@ -3,6 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine};
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -128,6 +130,7 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
+        denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -156,9 +159,10 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
+                        let dtx = denial_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, tls, inf).await
+                                handle_tcp_connection(stream, opa, cache, spid, tls, inf, dtx).await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -190,6 +194,64 @@ impl Drop for ProxyHandle {
     }
 }
 
+/// Emit a denial event to the aggregator channel (if configured).
+/// Used by `handle_tcp_connection` which owns `Option<Sender>`.
+fn emit_denial(
+    tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
+    host: &str,
+    port: u16,
+    binary: &str,
+    decision: &ConnectDecision,
+    reason: &str,
+    stage: &str,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(DenialEvent {
+            host: host.to_string(),
+            port,
+            binary: binary.to_string(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            deny_reason: reason.to_string(),
+            denial_stage: stage.to_string(),
+            l7_method: None,
+            l7_path: None,
+        });
+    }
+}
+
+/// Emit a denial event from a borrowed sender reference.
+/// Used by `handle_forward_proxy` which borrows `Option<&Sender>`.
+fn emit_denial_simple(
+    tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    host: &str,
+    port: u16,
+    binary: &str,
+    decision: &ConnectDecision,
+    reason: &str,
+    stage: &str,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(DenialEvent {
+            host: host.to_string(),
+            port,
+            binary: binary.to_string(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            deny_reason: reason.to_string(),
+            denial_stage: stage.to_string(),
+            l7_method: None,
+            l7_path: None,
+        });
+    }
+}
+
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
@@ -197,6 +259,7 @@ async fn handle_tcp_connection(
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -239,6 +302,7 @@ async fn handle_tcp_connection(
             opa_engine,
             identity_cache,
             entrypoint_pid,
+            denial_tx.as_ref(),
         )
         .await;
     }
@@ -329,6 +393,15 @@ async fn handle_tcp_connection(
     );
 
     if matches!(decision.action, NetworkAction::Deny { .. }) {
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            &deny_reason,
+            "connect",
+        );
         respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
     }
@@ -354,6 +427,15 @@ async fn handle_tcp_connection(
                         reason = %reason,
                         "CONNECT blocked: allowed_ips check failed"
                     );
+                    emit_denial(
+                        &denial_tx,
+                        &host_lc,
+                        port,
+                        &binary_str,
+                        &decision,
+                        &reason,
+                        "ssrf",
+                    );
                     respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                     return Ok(());
                 }
@@ -364,6 +446,15 @@ async fn handle_tcp_connection(
                     dst_port = port,
                     reason = %reason,
                     "CONNECT blocked: invalid allowed_ips in policy"
+                );
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
                 );
                 respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                 return Ok(());
@@ -381,6 +472,15 @@ async fn handle_tcp_connection(
                     dst_port = port,
                     reason = %reason,
                     "CONNECT blocked: internal address"
+                );
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
                 );
                 respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                 return Ok(());
@@ -1396,6 +1496,7 @@ async fn handle_forward_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI
     let (scheme, host, port, path) = match parse_proxy_uri(target_uri) {
@@ -1487,6 +1588,15 @@ async fn handle_forward_proxy(
                 reason = %reason,
                 "FORWARD",
             );
+            emit_denial_simple(
+                denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                reason,
+                "forward",
+            );
             respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             return Ok(());
         }
@@ -1514,6 +1624,15 @@ async fn handle_forward_proxy(
             reason = "forward proxy requires allowed_ips on endpoint",
             "FORWARD",
         );
+        emit_denial_simple(
+            denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            "forward proxy requires allowed_ips on endpoint",
+            "forward",
+        );
         respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
     }
@@ -1529,6 +1648,15 @@ async fn handle_forward_proxy(
                     reason = %reason,
                     "FORWARD blocked: allowed_ips check failed"
                 );
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
                 respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                 return Ok(());
             }
@@ -1539,6 +1667,15 @@ async fn handle_forward_proxy(
                 dst_port = port,
                 reason = %reason,
                 "FORWARD blocked: invalid allowed_ips in policy"
+            );
+            emit_denial_simple(
+                denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                &reason,
+                "ssrf",
             );
             respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             return Ok(());

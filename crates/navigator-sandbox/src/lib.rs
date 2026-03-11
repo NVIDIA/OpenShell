@@ -5,6 +5,7 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+pub mod denial_aggregator;
 mod grpc_client;
 mod identity;
 pub mod l7;
@@ -273,7 +274,7 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let _proxy = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let (_proxy, denial_rx) = if matches!(policy.network.mode, NetworkMode::Proxy) {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
@@ -305,20 +306,28 @@ pub async fn run_sandbox(
         )
         .await?;
 
-        Some(
-            ProxyHandle::start_with_bind_addr(
-                proxy_policy,
-                bind_addr,
-                engine,
-                cache,
-                entrypoint_pid.clone(),
-                tls_state,
-                inference_ctx,
-            )
-            .await?,
+        // Create denial aggregator channel if in gRPC mode (sandbox_id present).
+        let (denial_tx, denial_rx) = if sandbox_id.is_some() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let proxy_handle = ProxyHandle::start_with_bind_addr(
+            proxy_policy,
+            bind_addr,
+            engine,
+            cache,
+            entrypoint_pid.clone(),
+            tls_state,
+            inference_ctx,
+            denial_tx,
         )
+        .await?;
+        (Some(proxy_handle), denial_rx)
     } else {
-        None
+        (None, None)
     };
 
     // Compute the proxy URL and netns fd for SSH sessions.
@@ -534,6 +543,34 @@ pub async fn run_sandbox(
                 warn!(error = %e, "Policy poll loop exited with error");
             }
         });
+
+        // Spawn denial aggregator (gRPC mode only, when proxy is active).
+        if let Some(rx) = denial_rx {
+            let agg_id = id.clone();
+            let agg_endpoint = endpoint.clone();
+            let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(30);
+
+            let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+
+            tokio::spawn(async move {
+                aggregator
+                    .run(|summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_id = agg_id.clone();
+                        async move {
+                            if let Err(e) =
+                                flush_denials_to_gateway(&endpoint, &sandbox_id, summaries).await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
+                        }
+                    })
+                    .await;
+            });
+        }
     }
 
     // Wait for process with optional timeout
@@ -1151,6 +1188,66 @@ fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 /// Background loop that polls the server for policy updates.
 ///
 /// When a new version is detected, attempts to reload the OPA engine via
+/// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
+async fn flush_denials_to_gateway(
+    endpoint: &str,
+    sandbox_id: &str,
+    summaries: Vec<denial_aggregator::FlushableDenialSummary>,
+) -> Result<()> {
+    use crate::grpc_client::CachedNavigatorClient;
+    use navigator_core::proto::{DenialSummary, L7RequestSample};
+
+    let client = CachedNavigatorClient::connect(endpoint).await?;
+
+    // Convert FlushableDenialSummary to proto DenialSummary.
+    let proto_summaries: Vec<DenialSummary> = summaries
+        .into_iter()
+        .map(|s| DenialSummary {
+            sandbox_id: sandbox_id.to_string(),
+            host: s.host,
+            port: s.port as u32,
+            binary: s.binary,
+            ancestors: s.ancestors,
+            deny_reason: s.deny_reason,
+            first_seen_ms: s.first_seen_ms,
+            last_seen_ms: s.last_seen_ms,
+            count: s.count,
+            suppressed_count: 0,
+            total_count: s.count,
+            sample_cmdlines: s.sample_cmdlines,
+            binary_sha256: String::new(),
+            persistent: false,
+            denial_stage: s.denial_stage,
+            l7_request_samples: s
+                .l7_samples
+                .into_iter()
+                .map(|l| L7RequestSample {
+                    method: l.method,
+                    path: l.path,
+                    decision: "deny".to_string(),
+                    count: l.count,
+                })
+                .collect(),
+            l7_inspection_active: false,
+        })
+        .collect();
+
+    // The sandbox_id is not the sandbox name — we need the sandbox name
+    // for SubmitPolicyAnalysis. For now, use the sandbox_id as the name
+    // since in gRPC mode the sandbox variable holds the name.
+    // TODO: thread sandbox name through the aggregator.
+    client
+        .submit_policy_analysis(sandbox_id, proto_summaries, "mechanistic")
+        .await?;
+
+    info!(
+        sandbox_id = %sandbox_id,
+        "Flushed denial summaries to gateway"
+    );
+
+    Ok(())
+}
+
 /// `reload_from_proto()`. Reports load success/failure back to the server.
 /// On failure, the previous engine is untouched (LKG behavior).
 async fn run_policy_poll_loop(

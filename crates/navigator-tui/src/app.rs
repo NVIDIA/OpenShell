@@ -40,6 +40,7 @@ pub enum Focus {
     // the focused pane is always the bottom one (policy or logs).
     SandboxPolicy,
     SandboxLogs,
+    SandboxDraft,
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +354,12 @@ pub struct App {
     pub log_detail_index: Option<usize>,
     /// Handle for the streaming log task. Dropped to cancel.
     pub log_stream_handle: Option<tokio::task::JoinHandle<()>>,
+
+    // Draft policy recommendations
+    pub draft_chunks: Vec<navigator_core::proto::PolicyChunk>,
+    pub draft_version: u64,
+    pub draft_selected: usize,
+    pub draft_scroll: usize,
 }
 
 impl App {
@@ -416,6 +423,10 @@ impl App {
             log_viewport_height: 0,
             log_detail_index: None,
             log_stream_handle: None,
+            draft_chunks: Vec::new(),
+            draft_version: 0,
+            draft_selected: 0,
+            draft_scroll: 0,
         }
     }
 
@@ -490,6 +501,7 @@ impl App {
             Focus::Sandboxes => self.handle_sandboxes_key(key),
             Focus::SandboxPolicy => self.handle_policy_key(key),
             Focus::SandboxLogs => self.handle_logs_key(key),
+            Focus::SandboxDraft => self.handle_draft_key(key),
         }
     }
 
@@ -645,6 +657,9 @@ impl App {
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
+            KeyCode::Char('r') => {
+                self.focus = Focus::SandboxDraft;
+            }
             KeyCode::Char('s') => {
                 if self.sandbox_count > 0 {
                     self.pending_shell_connect = true;
@@ -665,6 +680,36 @@ impl App {
             }
             KeyCode::Char('g') => {
                 self.policy_scroll = 0;
+            }
+            KeyCode::Char('q') => self.running = false,
+            _ => {}
+        }
+    }
+
+    fn handle_draft_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('p') => {
+                // Back to policy view.
+                self.focus = Focus::SandboxPolicy;
+            }
+            KeyCode::Char('l') => {
+                self.sandbox_log_lines.clear();
+                self.sandbox_log_scroll = 0;
+                self.log_cursor = 0;
+                self.log_source_filter = LogSourceFilter::All;
+                self.log_autoscroll = true;
+                self.log_detail_index = None;
+                self.focus = Focus::SandboxLogs;
+                self.pending_log_fetch = true;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.draft_chunks.is_empty() {
+                    self.draft_selected =
+                        (self.draft_selected + 1).min(self.draft_chunks.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.draft_selected = self.draft_selected.saturating_sub(1);
             }
             KeyCode::Char('q') => self.running = false,
             _ => {}

@@ -585,6 +585,75 @@ impl navigator_core::proto::navigator_server::Navigator for TestNavigator {
     {
         Err(tonic::Status::unimplemented("test"))
     }
+
+    async fn submit_policy_analysis(
+        &self,
+        _request: tonic::Request<navigator_core::proto::SubmitPolicyAnalysisRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::SubmitPolicyAnalysisResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_draft_policy(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetDraftPolicyRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::GetDraftPolicyResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn approve_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ApproveDraftChunkRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::ApproveDraftChunkResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn reject_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::RejectDraftChunkRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::RejectDraftChunkResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn approve_all_draft_chunks(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ApproveAllDraftChunksRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::ApproveAllDraftChunksResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn edit_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::EditDraftChunkRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::EditDraftChunkResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn undo_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::UndoDraftChunkRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::UndoDraftChunkResponse>, tonic::Status> {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn clear_draft_chunks(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ClearDraftChunksRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::ClearDraftChunksResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_draft_history(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetDraftHistoryRequest>,
+    ) -> Result<tonic::Response<navigator_core::proto::GetDraftHistoryResponse>, tonic::Status>
+    {
+        Err(tonic::Status::unimplemented("not implemented in test"))
+    }
 }
 
 /// Test 7: Plaintext server (no TLS) accepts both gRPC and HTTP.
