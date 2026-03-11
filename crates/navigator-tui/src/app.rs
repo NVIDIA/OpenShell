@@ -360,9 +360,18 @@ pub struct App {
     pub draft_version: u64,
     pub draft_selected: usize,
     pub draft_scroll: usize,
+    /// Visible line count in the draft viewport (set by the draw pass).
+    pub draft_viewport_height: usize,
+    /// When true, the detail popup is shown for the selected draft chunk.
+    pub draft_detail_open: bool,
 
     /// Per-sandbox count of pending draft recommendations (parallel to `sandbox_names`).
     pub sandbox_draft_counts: Vec<usize>,
+
+    // Draft action flags (checked in the main loop after key events).
+    pub pending_draft_approve: bool,
+    pub pending_draft_reject: bool,
+    pub pending_draft_approve_all: bool,
 }
 
 impl App {
@@ -430,7 +439,12 @@ impl App {
             draft_version: 0,
             draft_selected: 0,
             draft_scroll: 0,
+            draft_viewport_height: 0,
+            draft_detail_open: false,
             sandbox_draft_counts: Vec::new(),
+            pending_draft_approve: false,
+            pending_draft_reject: false,
+            pending_draft_approve_all: false,
         }
     }
 
@@ -648,6 +662,7 @@ impl App {
         match key.code {
             KeyCode::Esc => {
                 self.cancel_log_stream();
+                self.draft_detail_open = false;
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
             }
@@ -691,6 +706,35 @@ impl App {
     }
 
     fn handle_draft_key(&mut self, key: KeyEvent) {
+        // Detail popup intercepts most keys when open.
+        if self.draft_detail_open {
+            match key.code {
+                KeyCode::Esc | KeyCode::Enter => {
+                    self.draft_detail_open = false;
+                }
+                // Allow approve/reject from within the popup.
+                KeyCode::Char('a') => {
+                    let abs = self.draft_scroll + self.draft_selected;
+                    if abs < self.draft_chunks.len() && self.draft_chunks[abs].status == "pending" {
+                        self.pending_draft_approve = true;
+                        self.draft_detail_open = false;
+                    }
+                }
+                KeyCode::Char('x') => {
+                    let abs = self.draft_scroll + self.draft_selected;
+                    if abs < self.draft_chunks.len() && self.draft_chunks[abs].status == "pending" {
+                        self.pending_draft_reject = true;
+                        self.draft_detail_open = false;
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        let total = self.draft_chunks.len();
+        let vh = self.draft_viewport_height;
+
         match key.code {
             KeyCode::Esc | KeyCode::Char('p') => {
                 // Back to policy view.
@@ -706,14 +750,72 @@ impl App {
                 self.focus = Focus::SandboxLogs;
                 self.pending_log_fetch = true;
             }
-            KeyCode::Char('j') | KeyCode::Down => {
+            KeyCode::Enter => {
                 if !self.draft_chunks.is_empty() {
-                    self.draft_selected =
-                        (self.draft_selected + 1).min(self.draft_chunks.len() - 1);
+                    self.draft_detail_open = true;
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if total == 0 {
+                    return;
+                }
+                let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                let max_cursor = visible.saturating_sub(1);
+                if self.draft_selected < max_cursor {
+                    self.draft_selected += 1;
+                } else {
+                    let max_scroll = total.saturating_sub(vh.min(total));
+                    if self.draft_scroll < max_scroll {
+                        self.draft_scroll += 1;
+                    }
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.draft_selected = self.draft_selected.saturating_sub(1);
+                if self.draft_selected > 0 {
+                    self.draft_selected -= 1;
+                } else if self.draft_scroll > 0 {
+                    self.draft_scroll -= 1;
+                }
+            }
+            KeyCode::Char('g') => {
+                self.draft_scroll = 0;
+                self.draft_selected = 0;
+            }
+            KeyCode::Char('G') => {
+                if total > 0 {
+                    let max_scroll = total.saturating_sub(vh.min(total));
+                    self.draft_scroll = max_scroll;
+                    let visible = total.saturating_sub(self.draft_scroll).min(vh);
+                    self.draft_selected = visible.saturating_sub(1);
+                }
+            }
+            // Approve selected chunk.
+            KeyCode::Char('a') => {
+                if !self.draft_chunks.is_empty() {
+                    let abs = self.draft_scroll + self.draft_selected;
+                    if abs < total {
+                        if self.draft_chunks[abs].status == "pending" {
+                            self.pending_draft_approve = true;
+                        }
+                    }
+                }
+            }
+            // Reject selected chunk.
+            KeyCode::Char('x') => {
+                if !self.draft_chunks.is_empty() {
+                    let abs = self.draft_scroll + self.draft_selected;
+                    if abs < total {
+                        if self.draft_chunks[abs].status == "pending" {
+                            self.pending_draft_reject = true;
+                        }
+                    }
+                }
+            }
+            // Approve all pending chunks.
+            KeyCode::Char('A') => {
+                if self.draft_chunks.iter().any(|c| c.status == "pending") {
+                    self.pending_draft_approve_all = true;
+                }
             }
             KeyCode::Char('q') => self.running = false,
             _ => {}
