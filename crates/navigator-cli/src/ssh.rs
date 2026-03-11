@@ -681,19 +681,35 @@ fn ensure_openshell_include(main_config: &Path, managed_config: &Path) -> Result
     }
 
     let include_line = render_include_line(managed_config);
-    let mut contents = fs::read_to_string(main_config).unwrap_or_default();
-    if ssh_config_includes_path(&contents, managed_config) {
-        return Ok(());
+    let contents = fs::read_to_string(main_config).unwrap_or_default();
+    let mut lines: Vec<&str> = contents.lines().collect();
+    lines.retain(|line| !ssh_config_includes_path(line, managed_config));
+
+    let insert_at = lines
+        .iter()
+        .position(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("Host ") || trimmed.starts_with("Match ")
+        })
+        .unwrap_or(lines.len());
+
+    let mut out = Vec::new();
+    out.extend_from_slice(&lines[..insert_at]);
+    if !out.is_empty() && !out.last().is_some_and(|line| line.is_empty()) {
+        out.push("");
     }
-    if !contents.is_empty() && !contents.ends_with('\n') {
-        contents.push('\n');
+    out.push(&include_line);
+    if insert_at < lines.len() && !lines[insert_at].is_empty() {
+        out.push("");
     }
-    if !contents.is_empty() {
-        contents.push('\n');
+    out.extend_from_slice(&lines[insert_at..]);
+
+    let mut rendered = out.join("\n");
+    if !rendered.is_empty() {
+        rendered.push('\n');
     }
-    contents.push_str(&include_line);
-    contents.push('\n');
-    fs::write(main_config, contents)
+
+    fs::write(main_config, rendered)
         .into_diagnostic()
         .wrap_err("failed to update ~/.ssh/config")?;
     Ok(())
@@ -956,6 +972,9 @@ mod tests {
         assert!(main_contents.contains("Host personal"));
         assert_eq!(main_contents.matches("Include ").count(), 1);
         assert!(main_contents.contains(&render_include_line(&managed_path)));
+        let include_idx = main_contents.find("Include ").unwrap();
+        let host_idx = main_contents.find("Host personal").unwrap();
+        assert!(include_idx < host_idx);
 
         let managed_contents = fs::read_to_string(&managed_path).unwrap();
         assert_eq!(managed_contents.matches("Host openshell-demo").count(), 1);
