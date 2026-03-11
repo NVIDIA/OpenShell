@@ -13,7 +13,14 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 # can't start, etc.). Fail fast with a clear signal instead of letting the
 # health check return unhealthy for 5+ minutes with no useful output.
 # ---------------------------------------------------------------------------
+# Strip port from REGISTRY_HOST and fall back to COMMUNITY_REGISTRY_HOST
+# (or ghcr.io) when the host part is an IP address, since nslookup cannot
+# resolve raw IPs and would false-positive as a DNS failure.
 DNS_TARGET="${REGISTRY_HOST:-ghcr.io}"
+DNS_TARGET="${DNS_TARGET%%:*}"
+case "$DNS_TARGET" in
+    [0-9]*) DNS_TARGET="${COMMUNITY_REGISTRY_HOST:-ghcr.io}" ;;
+esac
 if ! nslookup "$DNS_TARGET" >/dev/null 2>&1; then
     echo "HEALTHCHECK_DNS_FAILURE: cannot resolve $DNS_TARGET" >&2
     exit 1

@@ -126,7 +126,14 @@ fi
 # the CLI polling loop can detect this early and fail fast.
 # ---------------------------------------------------------------------------
 verify_dns() {
+    # Strip port from REGISTRY_HOST and fall back to COMMUNITY_REGISTRY_HOST
+    # (or ghcr.io) when the host part is an IP address, since nslookup cannot
+    # resolve raw IPs and would false-positive as a DNS failure.
     local dns_target="${REGISTRY_HOST:-ghcr.io}"
+    dns_target="${dns_target%%:*}"
+    case "$dns_target" in
+        [0-9]*) dns_target="${COMMUNITY_REGISTRY_HOST:-ghcr.io}" ;;
+    esac
     local attempts=5
     local i=1
     while [ "$i" -le "$attempts" ]; do
@@ -140,7 +147,7 @@ verify_dns() {
 }
 
 if ! verify_dns; then
-    echo "DNS_PROBE_FAILED: cannot resolve ${REGISTRY_HOST:-ghcr.io} after DNS proxy setup"
+    echo "DNS_PROBE_FAILED: cannot resolve DNS after proxy setup (REGISTRY_HOST=${REGISTRY_HOST:-ghcr.io})"
     echo "  resolv.conf: $(cat "$RESOLV_CONF")"
     echo "  This usually means Docker DNS forwarding is broken."
     echo "  Try restarting Docker or pruning networks: docker network prune -f"

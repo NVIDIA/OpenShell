@@ -772,8 +772,16 @@ async fn probe_container_dns(docker: &Docker, container_name: &str) -> Result<bo
         vec![
             "sh".to_string(),
             "-c".to_string(),
-            "nslookup \"${REGISTRY_HOST:-ghcr.io}\" >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL"
-                .to_string(),
+            // Strip port from REGISTRY_HOST and fall back to COMMUNITY_REGISTRY_HOST
+            // (or ghcr.io) when the host part is an IP address, since nslookup
+            // cannot resolve raw IPs and would false-positive as a DNS failure.
+            concat!(
+                "dns_host=\"${REGISTRY_HOST:-ghcr.io}\"; ",
+                "dns_host=\"${dns_host%%:*}\"; ",
+                "case \"$dns_host\" in [0-9]*) dns_host=\"${COMMUNITY_REGISTRY_HOST:-ghcr.io}\" ;; esac; ",
+                "nslookup \"$dns_host\" >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL",
+            )
+            .to_string(),
         ],
     )
     .await?;
