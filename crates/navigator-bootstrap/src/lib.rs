@@ -766,14 +766,24 @@ async fn load_existing_pki_bundle(
 /// Returns `Ok(true)` if DNS is functional, `Ok(false)` if the probe ran but
 /// resolution failed, and `Err` if the exec itself failed.
 async fn probe_container_dns(docker: &Docker, container_name: &str) -> Result<bool> {
+    // The probe must handle IP-literal registry hosts (e.g. 127.0.0.1:5000)
+    // which don't need DNS resolution. Strip the port suffix since nslookup
+    // doesn't understand host:port, and skip the probe entirely for IP
+    // literals.
     let (output, exit_code) = exec_capture_with_exit(
         docker,
         container_name,
         vec![
             "sh".to_string(),
             "-c".to_string(),
-            "nslookup \"${REGISTRY_HOST:-ghcr.io}\" >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL"
-                .to_string(),
+            concat!(
+                "host=\"${REGISTRY_HOST:-ghcr.io}\"; ",
+                "host=\"${host%%:*}\"; ",
+                "echo \"$host\" | grep -qE '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$' && { echo DNS_OK; exit 0; }; ",
+                "echo \"$host\" | grep -qE '^\\[?[0-9a-fA-F:]+\\]?$' && { echo DNS_OK; exit 0; }; ",
+                "nslookup \"$host\" >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL",
+            )
+            .to_string(),
         ],
     )
     .await?;

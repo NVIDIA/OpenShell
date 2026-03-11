@@ -13,10 +13,23 @@ export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
 # can't start, etc.). Fail fast with a clear signal instead of letting the
 # health check return unhealthy for 5+ minutes with no useful output.
 # ---------------------------------------------------------------------------
+
+# Check whether a string looks like an IP address (v4 or v6) with optional port.
+is_ip_literal() {
+    local host="${1%:*}"
+    echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
+    echo "$host" | grep -qE '^\[?[0-9a-fA-F:]+\]?$' && return 0
+    return 1
+}
+
 DNS_TARGET="${REGISTRY_HOST:-ghcr.io}"
-if ! nslookup "$DNS_TARGET" >/dev/null 2>&1; then
-    echo "HEALTHCHECK_DNS_FAILURE: cannot resolve $DNS_TARGET" >&2
-    exit 1
+# IP-literal registry hosts (e.g. 127.0.0.1:5000) don't need DNS resolution.
+if ! is_ip_literal "$DNS_TARGET"; then
+    DNS_LOOKUP="${DNS_TARGET%%:*}"
+    if ! nslookup "$DNS_LOOKUP" >/dev/null 2>&1; then
+        echo "HEALTHCHECK_DNS_FAILURE: cannot resolve $DNS_TARGET" >&2
+        exit 1
+    fi
 fi
 
 kubectl get --raw='/readyz' >/dev/null 2>&1 || exit 1
