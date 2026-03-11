@@ -201,6 +201,15 @@ const SUBCOMMAND_HELP_TEMPLATE: &str = "\
 {options}
 {after-help}";
 
+// Help template for leaf commands (sandbox create, provider list, etc.)
+const LEAF_HELP_TEMPLATE: &str = "\
+{about-with-newline}
+\x1b[1mUSAGE\x1b[0m
+  {usage}
+
+{all-args}
+{after-help}";
+
 const SANDBOX_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
   sb
 
@@ -273,19 +282,39 @@ const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
 #[command(propagate_version = true)]
 #[command(help_template = HELP_TEMPLATE)]
 #[command(disable_help_subcommand = true)]
+#[command(disable_help_flag = true, disable_version_flag = true)]
 struct Cli {
-    /// Increase verbosity (-v, -vv, -vvv).
-    #[arg(short, long, action = clap::ArgAction::Count, global = true)]
-    verbose: u8,
-
     /// Gateway name to operate on (resolved from stored metadata).
-    #[arg(long, short = 'g', global = true, env = "OPENSHELL_GATEWAY")]
+    #[arg(
+        long,
+        short = 'g',
+        global = true,
+        env = "OPENSHELL_GATEWAY",
+        help_heading = "GATEWAY FLAGS"
+    )]
     gateway: Option<String>,
 
     /// Gateway endpoint URL (e.g. https://gateway.example.com).
     /// Connects directly without looking up gateway metadata.
-    #[arg(long, global = true, env = "OPENSHELL_GATEWAY_ENDPOINT")]
+    #[arg(
+        long,
+        global = true,
+        env = "OPENSHELL_GATEWAY_ENDPOINT",
+        help_heading = "GATEWAY FLAGS"
+    )]
     gateway_endpoint: Option<String>,
+
+    /// Increase verbosity (-v, -vv, -vvv).
+    #[arg(short, long, action = clap::ArgAction::Count, global = true, help_heading = "GLOBAL FLAGS")]
+    verbose: u8,
+
+    /// Print help.
+    #[arg(short = 'h', long, action = clap::ArgAction::Help, global = true, help_heading = "GLOBAL FLAGS")]
+    help: (),
+
+    /// Print version.
+    #[arg(short = 'V', long, action = clap::ArgAction::Version, global = true, help_heading = "GLOBAL FLAGS")]
+    version: (),
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -311,7 +340,7 @@ enum Commands {
     },
 
     /// View sandbox logs.
-    #[command(visible_alias = "lg", hide = true, after_help = LOGS_EXAMPLES)]
+    #[command(visible_alias = "lg", hide = true, after_help = LOGS_EXAMPLES, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logs {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
@@ -363,7 +392,7 @@ enum Commands {
     },
 
     /// Show gateway status and information.
-    #[command(hide = true)]
+    #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Status,
 
     /// Manage inference configuration.
@@ -377,11 +406,11 @@ enum Commands {
     // ADDITIONAL COMMANDS
     // ===================================================================
     /// Launch the OpenShell interactive TUI.
-    #[command(hide = true)]
+    #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Term,
 
     /// Generate shell completions.
-    #[command(hide = true, after_long_help = COMPLETIONS_HELP)]
+    #[command(hide = true, after_long_help = COMPLETIONS_HELP, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Completions {
         /// Shell to generate completions for.
         shell: CompletionShell,
@@ -396,7 +425,7 @@ enum Commands {
     ///
     /// **Name mode** (for use in `~/.ssh/config`):
     ///   `openshell ssh-proxy --gateway <name> --name <sandbox-name>`
-    #[command(hide = true)]
+    #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshProxy {
         /// Gateway URL (e.g., <https://gw.example.com:443/proxy/connect>).
         /// Required in token mode. In name mode, can be a gateway name.
@@ -523,7 +552,7 @@ impl CliProviderType {
 #[derive(Subcommand, Debug)]
 enum ProviderCommands {
     /// Create a provider config.
-    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]))]
+    #[command(group = clap::ArgGroup::new("cred_source").required(true).args(["from_existing", "credentials"]), help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Provider name.
         #[arg(long)]
@@ -551,6 +580,7 @@ enum ProviderCommands {
     },
 
     /// Fetch a provider by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -558,6 +588,7 @@ enum ProviderCommands {
     },
 
     /// List providers.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Maximum number of providers to return.
         #[arg(long, default_value_t = 100)]
@@ -573,6 +604,7 @@ enum ProviderCommands {
     },
 
     /// Update an existing provider's credentials or config.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
         /// Provider name.
         #[arg(add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -596,6 +628,7 @@ enum ProviderCommands {
     },
 
     /// Delete providers by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
         /// Provider names.
         #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -610,6 +643,7 @@ enum ProviderCommands {
 #[derive(Subcommand, Debug)]
 enum GatewayCommands {
     /// Deploy/start the gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
         /// Gateway name.
         #[arg(long, default_value = "openshell", env = "OPENSHELL_GATEWAY")]
@@ -685,6 +719,7 @@ enum GatewayCommands {
     },
 
     /// Stop the gateway (preserves state).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Stop {
         /// Gateway name (defaults to active gateway).
         #[arg(long, env = "OPENSHELL_GATEWAY")]
@@ -700,6 +735,7 @@ enum GatewayCommands {
     },
 
     /// Destroy the gateway and its state.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Destroy {
         /// Gateway name (defaults to active gateway).
         #[arg(long, env = "OPENSHELL_GATEWAY")]
@@ -720,6 +756,7 @@ enum GatewayCommands {
     /// edge proxy (e.g., Cloudflare Access). Opens a browser for
     /// authentication and stores the token locally. After adding, the
     /// gateway appears in `openshell gateway select`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
         /// Gateway endpoint URL (e.g., `https://8080-3vdegyusg.brevlab.com`).
         endpoint: String,
@@ -738,6 +775,7 @@ enum GatewayCommands {
     /// Opens a browser for the edge proxy's login flow and stores the
     /// token locally. Use this to re-authenticate when a token expires
     /// or to authenticate a gateway added with `--no-auth`.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
         #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
@@ -747,6 +785,7 @@ enum GatewayCommands {
     /// Select the active gateway.
     ///
     /// When called without a name, lists available gateways to choose from.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Select {
         /// Gateway name (omit to list available gateways).
         #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
@@ -754,6 +793,7 @@ enum GatewayCommands {
     },
 
     /// Show gateway deployment details.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
         /// Gateway name (defaults to active gateway).
         #[arg(long, env = "OPENSHELL_GATEWAY")]
@@ -761,6 +801,7 @@ enum GatewayCommands {
     },
 
     /// Print or start an SSH tunnel for kubectl access to a remote gateway.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Tunnel {
         /// Gateway name (defaults to active gateway).
         #[arg(long, env = "OPENSHELL_GATEWAY")]
@@ -787,6 +828,7 @@ enum GatewayCommands {
 #[derive(Subcommand, Debug)]
 enum InferenceCommands {
     /// Set gateway-level inference provider and model.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
         /// Provider name.
         #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -804,6 +846,7 @@ enum InferenceCommands {
     },
 
     /// Update gateway-level inference configuration (partial update).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Update {
         /// Provider name (unchanged if omitted).
         #[arg(long, add = ArgValueCompleter::new(completers::complete_provider_names))]
@@ -819,6 +862,7 @@ enum InferenceCommands {
     },
 
     /// Get gateway-level inference provider and model.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Show the system inference route instead of the user-facing route.
         /// When omitted, both routes are displayed.
@@ -830,6 +874,7 @@ enum InferenceCommands {
 #[derive(Subcommand, Debug)]
 enum SandboxCommands {
     /// Create a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Create {
         /// Optional sandbox name (auto-generated when omitted).
         #[arg(long)]
@@ -855,11 +900,11 @@ enum SandboxCommands {
         /// working directory (`/sandbox`).
         /// `.gitignore` rules are applied by default; use `--no-git-ignore` to
         /// upload everything.
-        #[arg(long, value_hint = ValueHint::AnyPath)]
+        #[arg(long, value_hint = ValueHint::AnyPath, help_heading = "UPLOAD FLAGS")]
         upload: Option<String>,
 
         /// Disable `.gitignore` filtering for `--upload`.
-        #[arg(long, requires = "upload")]
+        #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
         no_git_ignore: bool,
 
         /// Keep the sandbox alive after non-interactive commands.
@@ -869,11 +914,11 @@ enum SandboxCommands {
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
-        #[arg(long)]
+        #[arg(long, help_heading = "BOOTSTRAP FLAGS")]
         remote: Option<String>,
 
         /// Path to SSH private key for remote bootstrap.
-        #[arg(long, value_hint = ValueHint::FilePath)]
+        #[arg(long, value_hint = ValueHint::FilePath, help_heading = "BOOTSTRAP FLAGS")]
         ssh_key: Option<String>,
 
         /// Provider names to attach to this sandbox.
@@ -905,11 +950,15 @@ enum SandboxCommands {
         ///
         /// Without this flag, an interactive prompt asks whether to bootstrap;
         /// in non-interactive mode the command errors.
-        #[arg(long, overrides_with = "no_bootstrap")]
+        #[arg(
+            long,
+            overrides_with = "no_bootstrap",
+            help_heading = "BOOTSTRAP FLAGS"
+        )]
         bootstrap: bool,
 
         /// Never bootstrap a gateway automatically; error if none is available.
-        #[arg(long, overrides_with = "bootstrap")]
+        #[arg(long, overrides_with = "bootstrap", help_heading = "BOOTSTRAP FLAGS")]
         no_bootstrap: bool,
 
         /// Auto-create missing providers from local credentials.
@@ -929,6 +978,7 @@ enum SandboxCommands {
     },
 
     /// Fetch a sandbox by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -936,6 +986,7 @@ enum SandboxCommands {
     },
 
     /// List sandboxes.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Maximum number of sandboxes to return.
         #[arg(long, default_value_t = 100)]
@@ -955,6 +1006,7 @@ enum SandboxCommands {
     },
 
     /// Delete a sandbox by name.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
         /// Sandbox names.
         #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -964,6 +1016,7 @@ enum SandboxCommands {
     /// Connect to a sandbox.
     ///
     /// When no name is given, reconnects to the last-used sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Connect {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -971,6 +1024,7 @@ enum SandboxCommands {
     },
 
     /// Upload local files to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Upload {
         /// Sandbox name.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -989,6 +1043,7 @@ enum SandboxCommands {
     },
 
     /// Download files from a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Download {
         /// Sandbox name.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -1005,6 +1060,7 @@ enum SandboxCommands {
     ///
     /// Outputs a Host block suitable for appending to ~/.ssh/config,
     /// enabling tools like `VSCode` Remote-SSH to connect to the sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshConfig {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
@@ -1014,6 +1070,7 @@ enum SandboxCommands {
 #[derive(Subcommand, Debug)]
 enum PolicyCommands {
     /// Update policy on a live sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
@@ -1032,6 +1089,7 @@ enum PolicyCommands {
     },
 
     /// Show current active policy for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
@@ -1046,6 +1104,7 @@ enum PolicyCommands {
     },
 
     /// List policy history for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
@@ -1059,6 +1118,7 @@ enum PolicyCommands {
 #[derive(Subcommand, Debug)]
 enum ForwardCommands {
     /// Start forwarding a local port to a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
         /// Port to forward (used as both local and remote port).
         port: u16,
@@ -1073,6 +1133,7 @@ enum ForwardCommands {
     },
 
     /// Stop a background port forward.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Stop {
         /// Port that was forwarded.
         port: u16,
@@ -1083,6 +1144,7 @@ enum ForwardCommands {
     },
 
     /// List active port forwards.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List,
 }
 
