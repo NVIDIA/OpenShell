@@ -28,11 +28,12 @@
 #   CVE-2024-36623       docker/docker v25.0.8 (streamformatter race condition)
 # Bump K3S_VERSION when a release with updated dependencies ships.
 
+ARG K3S_VERSION=v1.35.2-k3s1
+ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
+
 # ---------------------------------------------------------------------------
 # Stage 1: Extract k3s artifacts from upstream rancher image (Alpine-based)
 # ---------------------------------------------------------------------------
-ARG K3S_VERSION=v1.35.2-k3s1
-ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 FROM rancher/k3s:${K3S_VERSION} AS k3s
 
 # ---------------------------------------------------------------------------
