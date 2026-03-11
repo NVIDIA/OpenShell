@@ -737,6 +737,12 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
 }
 
 fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
+    let name_width = gateways
+        .iter()
+        .map(|gateway| gateway.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
     let endpoint_width = gateways
         .iter()
         .map(|gateway| gateway.gateway_endpoint.len())
@@ -748,7 +754,8 @@ fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
         .iter()
         .map(|gateway| {
             format!(
-                "{:<endpoint_width$}  {}",
+                "{:<name_width$}  {:<endpoint_width$}  {}",
+                gateway.name,
                 gateway.gateway_endpoint,
                 gateway_type_label(gateway),
             )
@@ -3933,7 +3940,7 @@ mod tests {
     #[test]
     fn gateway_select_items_include_endpoint_and_type() {
         let gateways = vec![
-            edge_registration("edge", "https://edge.example.com"),
+            edge_registration("alpha", "https://edge.example.com"),
             GatewayMetadata {
                 name: "local".to_string(),
                 gateway_endpoint: "http://127.0.0.1:8080".to_string(),
@@ -3952,10 +3959,11 @@ mod tests {
 
         assert_eq!(gateway_type_label(&gateways[0]), "edge");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
+        assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
         assert!(items[0].contains("edge"));
-        assert!(items[1].contains("http://127.0.0.1:8080"));
         assert!(items[1].contains("local"));
+        assert!(items[1].contains("http://127.0.0.1:8080"));
     }
 
     #[tokio::test]
