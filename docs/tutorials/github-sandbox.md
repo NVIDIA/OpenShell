@@ -1,9 +1,31 @@
+---
+title:
+  page: Set Up a Sandbox with Custom GitHub Policies
+  nav: GitHub Sandbox Tutorial
+description: Configure a sandbox with per-repository GitHub access policies and credential providers for Claude Code.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Tutorial
+- GitHub
+- Sandbox
+- Policy
+- Claude Code
+- Credential Provider
+content:
+  type: how_to
+  difficulty: technical_intermediate
+  audience:
+  - engineer
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Set Up a Sandbox with GitHub Repo Access
+# Set Up a Sandbox of Claude Code with a Custom GitHub Policy
 
 This tutorial walks through configuring a sandbox that grants different access levels to two GitHub repositories and enforces these rules at the network layer. The sandbox runs Claude Code as the agent.
 

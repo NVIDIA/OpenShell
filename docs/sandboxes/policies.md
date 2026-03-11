@@ -1,3 +1,24 @@
+---
+title:
+  page: Customize Sandbox Policies
+  nav: Policies
+description: Apply, iterate, and debug sandbox network policies with hot-reload on running OpenShell sandboxes.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Policy
+- Network Policy
+- Sandbox
+- Security
+- Hot Reload
+content:
+  type: how_to
+  difficulty: technical_intermediate
+  audience:
+  - engineer
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

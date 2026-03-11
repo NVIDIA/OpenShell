@@ -1,3 +1,25 @@
+---
+title:
+  page: Providers
+  nav: Providers
+description: Create and manage credential providers that inject API keys and tokens into OpenShell sandboxes.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Providers
+- Credentials
+- API Keys
+- Sandbox
+- Security
+content:
+  type: how_to
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

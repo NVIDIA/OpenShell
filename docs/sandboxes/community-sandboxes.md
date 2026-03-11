@@ -1,3 +1,24 @@
+---
+title:
+  page: Community Sandboxes
+  nav: Community Sandboxes
+description: Use pre-built sandboxes from the OpenShell Community catalog or contribute your own.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Community
+- Sandbox
+- Container Image
+- Open Source
+content:
+  type: concept
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
@@ -92,5 +113,5 @@ or anything else), consider contributing it back so others can use it.
 
 Explore related topics:
 
-- **Need to supply API keys or tokens?** Set up {doc}`providers` for credential management.
-- **Want to customize the sandbox policy?** Write custom rules in {doc}`policies`.
+- To supply API keys or tokens, refer to {doc}`providers`.
+- To customize the sandbox policy, refer to {doc}`policies`.

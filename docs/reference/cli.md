@@ -1,3 +1,24 @@
+---
+title:
+  page: CLI Reference
+  nav: CLI
+description: Complete command reference for the openshell CLI including all subcommands, flags, and environment variables.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- CLI
+- Reference
+- Commands
+- AI Agents
+content:
+  type: reference
+  difficulty: technical_beginner
+  audience:
+  - engineer
+  - data_scientist
+---
+
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0

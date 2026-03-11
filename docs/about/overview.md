@@ -1,15 +1,23 @@
 ---
 title:
-  page: "Overview of NVIDIA OpenShell"
-  nav: "Overview"
-description: "OpenShell is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure."
-keywords: ["openshell", "ai agent sandbox", "agent security", "agent isolation", "inference routing"]
-topics: ["generative_ai", "cybersecurity"]
-tags: ["ai_agents", "sandboxing", "security", "privacy", "inference_routing"]
+  page: Overview of NVIDIA OpenShell
+  nav: Overview
+description: OpenShell is the safe, private runtime for autonomous AI agents. Run agents in sandboxed environments that protect your data, credentials, and infrastructure.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- AI Agents
+- Sandboxing
+- Security
+- Privacy
+- Inference Routing
 content:
   type: concept
   difficulty: technical_beginner
-  audience: [engineer, data_scientist]
+  audience:
+  - engineer
+  - data_scientist
 ---
 
 <!--
