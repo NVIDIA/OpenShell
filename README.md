@@ -98,7 +98,7 @@ Every outbound connection is intercepted: the policy engine either **allows** it
 | `openshell policy get <name>` | Show the active policy. |
 | `openshell inference set --provider <p> --model <m>` | Configure the `inference.local` endpoint. |
 | `openshell logs [name] --tail` | Stream sandbox logs. |
-| `openshell term` | Launch the real-time dashboard. |
+| `openshell term` | Launch the real-time terminal UI for debugging. |
 
 See the full [CLI reference](docs/reference/cli.md) for all commands, flags, and environment variables.
 
