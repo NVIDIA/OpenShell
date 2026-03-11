@@ -25,6 +25,8 @@ extensions = [
     "sphinx_design",
     "sphinxcontrib.mermaid",
     "policy_table",
+    "json_output",
+    "search_assets",
 ]
 
 autodoc_default_options = {
@@ -42,6 +44,7 @@ exclude_patterns = [
     "README.md",
     "SETUP.md",
     "_build/**",
+    "_ext/**",
 ]
 
 myst_linkify_fuzzy_links = False
@@ -102,4 +105,9 @@ html_theme_options = {
             "type": "fontawesome",
         },
     ],
+}
+
+json_output_settings = {
+    "enabled": True,
+    "verbose": True,
 }
