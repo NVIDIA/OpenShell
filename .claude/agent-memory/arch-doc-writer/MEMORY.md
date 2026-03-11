@@ -59,16 +59,16 @@
 - Proto files also include: `proto/inference.proto` (navigator.inference.v1)
 
 ## Container/Build Details
-- Four runtime images: sandbox (5 stages), server (2 stages), cluster (k3s base), pki-job (Alpine)
+- Four runtime images: sandbox (5 stages), gateway (2 stages), cluster (k3s base), pki-job (Alpine)
 - Two build-only images: python-wheels (Linux multi-arch), python-wheels-macos (osxcross cross-compile)
 - CI image: Dockerfile.ci (Ubuntu 24.04, pre-installs docker/buildx/aws/kubectl/helm/mise/uv/sccache/socat)
-- Cross-compilation: `deploy/docker/cross-build.sh` shared by sandbox + server Dockerfiles
+- Cross-compilation: `deploy/docker/cross-build.sh` shared by sandbox + gateway Dockerfiles
 - Sandbox image has coding-agents stage: Claude CLI (native installer), OpenCode, Codex (npm)
 - Helm chart deploys a StatefulSet (NOT Deployment), PVC 1Gi at /var/navigator
 - Cluster image does NOT bundle image tarballs -- components pulled at runtime from distribution registry
 - PKI job generates CA + server cert + client cert for mTLS (RSA 2048, 10yr, Helm pre-install hook)
 - Build tasks in `tasks/*.toml`; scripts in `tasks/scripts/`
-- `cluster-deploy-fast.sh` supports both auto mode (git diff) and explicit targets (server/sandbox/pki-job/chart/all)
+- `cluster-deploy-fast.sh` supports both auto mode (git diff) and explicit targets (gateway/sandbox/chart/all)
 - `cluster-bootstrap.sh` ensures local Docker registry on port 5000, pushes all components, then deploys
 - Default values.yaml: repository is CloudFront-backed CDN, tag: "latest", pullPolicy: Always
 - Envoy Gateway version: v1.5.8 (set in mise.toml)

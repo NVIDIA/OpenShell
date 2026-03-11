@@ -87,7 +87,7 @@ if [[ ! -f "${DOCKERFILE}" ]]; then
   exit 1
 fi
 
-# Prefix with registry when set (e.g. ghcr.io/org/repo/server:tag).
+# Prefix with registry when set (e.g. ghcr.io/org/repo/gateway:tag).
 # Replaces the default "openshell/" prefix with the registry path.
 if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
   _suffix="${IMAGE_NAME#openshell/}"
