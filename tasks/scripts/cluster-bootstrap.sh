@@ -223,7 +223,7 @@ fi
 if [ "${SKIP_IMAGE_PUSH:-}" = "1" ]; then
   echo "Skipping image push (SKIP_IMAGE_PUSH=1; images already in registry)."
 elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
-  for component in server sandbox; do
+  for component in gateway sandbox; do
     tasks/scripts/cluster-push-component.sh "${component}"
   done
 fi
