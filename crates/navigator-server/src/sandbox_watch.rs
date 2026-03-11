@@ -127,9 +127,14 @@ fn map_kube_event_to_platform(
         "Sandbox" => state
             .sandbox_index
             .sandbox_id_for_sandbox_name(&involved_name)?,
-        "Pod" => state
-            .sandbox_index
-            .sandbox_id_for_agent_pod(&involved_name)?,
+        "Pod" => {
+            // The sandbox controller creates pods with the same name as the sandbox,
+            // so try looking up by sandbox name first, then fall back to agent_pod index.
+            state
+                .sandbox_index
+                .sandbox_id_for_sandbox_name(&involved_name)
+                .or_else(|| state.sandbox_index.sandbox_id_for_agent_pod(&involved_name))?
+        }
         _ => return None,
     };
 

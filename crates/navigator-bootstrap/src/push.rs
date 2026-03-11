@@ -24,7 +24,7 @@ use crate::runtime::exec_capture_with_exit;
 const CONTAINERD_SOCK: &str = "/run/k3s/containerd/containerd.sock";
 
 /// Path inside the container where the image tar is staged.
-const IMPORT_TAR_PATH: &str = "/tmp/navigator-images.tar";
+const IMPORT_TAR_PATH: &str = "/tmp/openshell-images.tar";
 
 /// Push a list of images from the local Docker daemon into a k3s gateway's
 /// containerd runtime.
@@ -42,30 +42,20 @@ pub async fn push_local_images(
         return Ok(());
     }
 
-    on_log(format!(
-        "[status] Importing {} component image(s) into gateway",
-        images.len()
-    ));
-    for img in images {
-        on_log(format!("[status]   {img}"));
-    }
-
     // 1. Export all images from the local Docker daemon as a single tar.
-    on_log("[status] Exporting images from Docker".to_string());
     let image_tar = collect_export(local_docker, images).await?;
     on_log(format!(
-        "[status] Exported {} MiB of image data",
+        "[progress] Exported {} MiB",
         image_tar.len() / (1024 * 1024)
     ));
 
     // 2. Wrap the image tar as a file inside an outer tar archive and upload
     //    it into the container filesystem via the Docker put_archive API.
-    on_log("[status] Uploading images into gateway container".to_string());
     let outer_tar = wrap_in_tar(IMPORT_TAR_PATH, &image_tar)?;
     upload_archive(gateway_docker, container_name, &outer_tar).await?;
+    on_log("[progress] Uploaded to gateway".to_string());
 
     // 3. Import the tar into containerd via ctr.
-    on_log("[status] Running ctr images import".to_string());
     let (output, exit_code) = exec_capture_with_exit(
         gateway_docker,
         container_name,
@@ -100,7 +90,6 @@ pub async fn push_local_images(
     )
     .await;
 
-    on_log("[status] All component images imported into gateway".to_string());
     Ok(())
 }
 

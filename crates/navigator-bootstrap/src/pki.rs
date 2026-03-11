@@ -83,7 +83,7 @@ pub fn generate_pki(extra_sans: &[String]) -> Result<PkiBundle> {
         .wrap_err("failed to create client cert params")?;
     client_params
         .distinguished_name
-        .push(DnType::CommonName, "navigator-client");
+        .push(DnType::CommonName, "openshell-client");
 
     let client_cert = client_params
         .signed_by(&client_key, &ca_cert, &ca_key)
