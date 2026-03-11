@@ -114,10 +114,10 @@ OpenShell Terminal is a real-time dashboard that combines sandbox status and liv
 $ openshell term
 ```
 
-The dashboard shows:
+The dashboard shows the following information.
 
-- **Sandbox status** — name, phase, image, attached providers, age, and active port forwards.
-- **Live log stream** — outbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
+- **Sandbox status**: Name, phase, image, attached providers, age, and active port forwards.
+- **Live log stream**: Omutbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
 
 Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy — refer to {doc}`policies` for the workflow.
 

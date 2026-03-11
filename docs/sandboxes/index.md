@@ -88,11 +88,11 @@ For the complete structure and every field, refer to the [Policy Schema Referenc
 
 ## Network Access Rules
 
-Network access is controlled by policy blocks under `network_policies`. Each block has a **name**, a list of **endpoints** (host, port, protocol, and optional rules), and a list of **binaries** that are allowed to use those endpoints.
+Network access is controlled by policy blocks under `network_policies`. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries that are allowed to use those endpoints.
 
 Every outbound connection from the sandbox goes through the proxy:
 
-- The proxy queries the {doc}`policy engine <../about/architecture>` with the **destination** (host and port) and the **calling binary**. A connection is allowed only when both match an entry in the same policy block.
+- The proxy queries the {doc}`policy engine <../about/architecture>` with the destination (host and port) and the calling binary. A connection is allowed only when both match an entry in the same policy block.
 - For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is checked against that endpoint's `rules` (method and path).
 - If no endpoint matches and inference routes are configured, the request may be rerouted for inference.
 - Otherwise the connection is denied. Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads.

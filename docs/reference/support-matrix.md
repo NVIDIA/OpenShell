@@ -31,7 +31,7 @@ The following software must be installed on the host before using the OpenShell 
 
 ## Sandbox Runtime Versions
 
-The base sandbox container image ships the following components. These versions apply to sandboxes created with the default image (`ghcr.io/nvidia/nemoclaw/sandbox`).
+The base sandbox container image ships the following components. These versions apply to sandboxes created with the default image (`ghcr.io/nvidia/openshell/sandbox`).
 
 | Component | Version |
 |---|---|
@@ -50,9 +50,9 @@ OpenShell uses several container images that are pulled automatically during gat
 
 | Image | Registry | Reference | Pulled When |
 |---|---|---|---|
-| Cluster | ghcr.io | `ghcr.io/nvidia/nemoclaw/cluster:latest` | `openshell gateway start` |
-| Server | ghcr.io | `ghcr.io/nvidia/nemoclaw/server:latest` | Cluster startup (via Helm chart) |
-| Sandbox | ghcr.io | `ghcr.io/nvidia/nemoclaw/sandbox:latest` | First sandbox creation (via Helm chart) |
+| Cluster | ghcr.io | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start` |
+| Server | ghcr.io | `ghcr.io/nvidia/openshell/server:latest` | Cluster startup (via Helm chart) |
+| Sandbox | ghcr.io | `ghcr.io/nvidia/openshell/sandbox:latest` | First sandbox creation (via Helm chart) |
 | Community sandboxes | CloudFront CDN | `d1i0nduu2f6qxk.cloudfront.net/openshell-community/sandboxes/{name}:latest` | `openshell sandbox create --from <name>` |
 
 The cluster image is based on `rancher/k3s:v1.35.2-k3s1` and bundles the Helm charts and Kubernetes manifests required to bootstrap the control plane. The server and sandbox images are pulled separately at runtime.
