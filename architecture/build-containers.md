@@ -72,7 +72,7 @@ The sandbox container runs inside each sandbox pod. It contains the sandbox supe
 
 - Multi-user isolation: `supervisor` (runs the sandbox supervisor) and `sandbox` (runs the restricted agent process).
 - Policy files are mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data) when running in file-based policy mode.
-- The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/navigator/`.
+- The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/openshell/`.
 
 ### Gateway Image (`openshell/server`)
 

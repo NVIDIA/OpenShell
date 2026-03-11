@@ -20,7 +20,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
-        .env_remove("OPENSHELL_CLUSTER")
+        .env_remove("OPENSHELL_GATEWAY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -39,7 +39,7 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir)
         .env("HOME", tmpdir)
-        .env_remove("OPENSHELL_CLUSTER")
+        .env_remove("OPENSHELL_GATEWAY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -160,8 +160,9 @@ async fn gateway_add_creates_cf_metadata() {
     let metadata_path = tmpdir
         .path()
         .join("openshell")
-        .join("clusters")
-        .join("test-cf-gw_metadata.json");
+        .join("gateways")
+        .join("test-cf-gw")
+        .join("metadata.json");
     assert!(
         metadata_path.exists(),
         "metadata file should exist at {}",
@@ -197,17 +198,17 @@ async fn gateway_add_creates_cf_metadata() {
     let active_path = tmpdir
         .path()
         .join("openshell")
-        .join("active_cluster");
+        .join("active_gateway");
     assert!(
         active_path.exists(),
-        "active_cluster file should exist at {}",
+        "active_gateway file should exist at {}",
         active_path.display()
     );
-    let active = std::fs::read_to_string(&active_path).expect("read active_cluster");
+    let active = std::fs::read_to_string(&active_path).expect("read active_gateway");
     assert_eq!(
         active.trim(),
         "test-cf-gw",
-        "active cluster should be 'test-cf-gw'"
+        "active gateway should be 'test-cf-gw'"
     );
 
     // Verify the output mentions the gateway was added.
@@ -243,8 +244,9 @@ async fn gateway_add_derives_name_from_hostname() {
     let metadata_path = tmpdir
         .path()
         .join("openshell")
-        .join("clusters")
-        .join("my-special-gateway.brevlab.com_metadata.json");
+        .join("gateways")
+        .join("my-special-gateway.brevlab.com")
+        .join("metadata.json");
     assert!(
         metadata_path.exists(),
         "metadata file should exist with hostname-derived name at {}",

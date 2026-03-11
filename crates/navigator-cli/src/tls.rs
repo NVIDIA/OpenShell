@@ -113,7 +113,7 @@ fn tls_dir_for_gateway(name: &str) -> Option<PathBuf> {
 ///
 /// Used when no gateway name is set (e.g., `SshProxy` which receives a raw URL).
 fn default_tls_dir(server: &str) -> Option<PathBuf> {
-    let mut name = std::env::var("OPENSHELL_GATEWAY_NAME")
+    let mut name = std::env::var("OPENSHELL_GATEWAY")
         .ok()
         .filter(|value| !value.trim().is_empty());
 

@@ -212,7 +212,7 @@ The following environment variables override CLI defaults:
 
 | Variable | Description |
 |---|---|
-| `OPENSHELL_CLUSTER` | Name of the cluster to operate on. Overrides the active cluster set by `openshell gateway select`. |
+| `OPENSHELL_GATEWAY` | Name of the gateway to operate on. Overrides the active gateway set by `openshell gateway select`. |
 | `OPENSHELL_SANDBOX_POLICY` | Default path to a policy YAML file. When set, `openshell sandbox create` uses this policy if no `--policy` flag is provided. |
 
 ## Shell Completions

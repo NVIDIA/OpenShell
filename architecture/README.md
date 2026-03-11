@@ -238,7 +238,7 @@ The CLI is the primary way users interact with the platform. It provides command
 - **Provider management** (`openshell provider`): Create, update, list, and delete external service credentials.
 - **Inference management** (`openshell cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
 
-The CLI resolves which cluster to operate on through a priority chain: explicit `--gateway` flag, then the `OPENSHELL_CLUSTER` environment variable, then the active cluster set by `openshell gateway select`. It supports TLS client certificates for mutual authentication with the gateway.
+The CLI resolves which gateway to operate on through a priority chain: explicit `--gateway` flag, then the `OPENSHELL_GATEWAY` environment variable, then the active gateway set by `openshell gateway select`. It supports TLS client certificates for mutual authentication with the gateway.
 
 ## How Users Get Started
 

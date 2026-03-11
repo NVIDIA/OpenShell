@@ -2,9 +2,9 @@
 # diffs, stats, and language detection.
 
 # Generated Python protobuf stubs
-python/navigator/_proto/*_pb2.py linguist-generated
-python/navigator/_proto/*_pb2_grpc.py linguist-generated
-python/navigator/_proto/*_pb2.pyi linguist-generated
+python/openshell/_proto/*_pb2.py linguist-generated
+python/openshell/_proto/*_pb2_grpc.py linguist-generated
+python/openshell/_proto/*_pb2.pyi linguist-generated
 
 # Generated Rust protobuf code (excludes hand-written mod.rs)
 crates/navigator-core/src/proto/navigator.*.rs linguist-generated

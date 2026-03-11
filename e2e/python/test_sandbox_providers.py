@@ -17,12 +17,12 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from navigator._proto import datamodel_pb2, navigator_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, navigator_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
 
-    from navigator import Sandbox, SandboxClient
+    from openshell import Sandbox, SandboxClient
 
 
 def _default_policy() -> sandbox_pb2.SandboxPolicy:

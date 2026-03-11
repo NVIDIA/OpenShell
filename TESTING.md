@@ -13,7 +13,7 @@ mise run ci            # Everything: lint, compile checks, and tests
 ```
 crates/*/src/          # Inline #[cfg(test)] modules
 crates/*/tests/        # Rust integration tests
-python/navigator/      # Python unit tests (*_test.py suffix)
+python/openshell/      # Python unit tests (*_test.py suffix)
 e2e/python/            # Python E2E tests (test_*.py prefix)
 e2e/rust/              # Rust CLI E2E tests
 ```
@@ -49,7 +49,7 @@ mise run test:rust     # cargo test --workspace
 ## Python Unit Tests
 
 Python unit tests use the `*_test.py` suffix convention (not `test_*` prefix)
-and live alongside the source in `python/navigator/`. They use mock-based
+and live alongside the source in `python/openshell/`. They use mock-based
 patterns with fake gRPC stubs:
 
 ```python
@@ -167,4 +167,4 @@ The harness (`e2e/rust/src/harness/`) provides:
 
 | Variable | Purpose |
 |---|---|
-| `OPENSHELL_CLUSTER` | Override active cluster name for E2E tests |
+| `OPENSHELL_GATEWAY` | Override active gateway name for E2E tests |

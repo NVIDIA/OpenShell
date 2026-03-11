@@ -1,22 +1,15 @@
 ---
 title:
-  page: Default Policy Reference
-  nav: Default Policy
-description: Breakdown of the built-in default policy applied when you create an OpenShell sandbox without a custom policy.
-topics:
-- Generative AI
-- Cybersecurity
-tags:
-- AI Agents
-- Sandboxing
-- Security
-- Policy
+  page: "Default Policy Reference"
+  nav: "Default Policy"
+description: "Breakdown of the built-in default policy applied when you create an OpenShell sandbox without a custom policy."
+keywords: ["openshell default policy", "sandbox policy", "agent compatibility"]
+topics: ["generative_ai", "cybersecurity"]
+tags: ["ai_agents", "sandboxing", "security", "policy"]
 content:
   type: reference
   difficulty: technical_beginner
-  audience:
-  - engineer
-  - data_scientist
+  audience: [engineer, data_scientist]
 ---
 
 # Default Policy Reference
