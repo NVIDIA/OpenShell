@@ -715,6 +715,15 @@ enum GatewayCommands {
         /// runtime.
         #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
         registry_token: Option<String>,
+
+        /// Enable NVIDIA GPU passthrough.
+        ///
+        /// Passes all host GPUs into the cluster container and deploys the
+        /// NVIDIA k8s-device-plugin so Kubernetes workloads can request
+        /// `nvidia.com/gpu` resources. Requires NVIDIA drivers and the
+        /// NVIDIA Container Toolkit on the host.
+        #[arg(long)]
+        gpu: bool,
     },
 
     /// Stop the gateway (preserves state).
@@ -1199,6 +1208,7 @@ async fn main() -> Result<()> {
                 plaintext,
                 disable_gateway_auth,
                 registry_token,
+                gpu,
             } => {
                 run::gateway_admin_deploy(
                     &name,
@@ -1213,6 +1223,7 @@ async fn main() -> Result<()> {
                     plaintext,
                     disable_gateway_auth,
                     registry_token.as_deref(),
+                    gpu,
                 )
                 .await?;
             }

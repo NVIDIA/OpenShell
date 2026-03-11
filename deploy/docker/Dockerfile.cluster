@@ -32,10 +32,33 @@
 # Stage 1: Extract k3s artifacts from upstream rancher image (Alpine-based)
 # ---------------------------------------------------------------------------
 ARG K3S_VERSION=v1.35.2-k3s1
+ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 FROM rancher/k3s:${K3S_VERSION} AS k3s
 
 # ---------------------------------------------------------------------------
-# Stage 2: Runtime on NVIDIA hardened Ubuntu base
+# Stage 2: Install NVIDIA container toolkit on Ubuntu
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS nvidia-toolkit
+
+ARG NVIDIA_CONTAINER_TOOLKIT_VERSION
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gpg curl ca-certificates && \
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey \
+        | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && \
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list \
+        | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' \
+        | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
+        "nvidia-container-toolkit=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+        "nvidia-container-toolkit-base=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+        "libnvidia-container-tools=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" \
+        "libnvidia-container1=${NVIDIA_CONTAINER_TOOLKIT_VERSION}" && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Stage 3: Runtime on NVIDIA hardened Ubuntu base
 # ---------------------------------------------------------------------------
 FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
 
@@ -77,12 +100,25 @@ COPY --from=k3s /usr/share/zoneinfo/ /usr/share/zoneinfo/
 ENV PATH="/var/lib/rancher/k3s/data/cni:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/bin/aux" \
     CRI_CONFIG_FILE="/var/lib/rancher/k3s/agent/etc/crictl.yaml"
 
+# Copy NVIDIA Container Toolkit userspace into the final Ubuntu image.
+# Because the runtime image is no longer Alpine-based, we only need the toolkit
+# binaries, config, and libnvidia-container shared libraries rather than the
+# full glibc/loader closure used by the earlier Spark bring-up experiment.
+COPY --from=nvidia-toolkit /usr/bin/nvidia-cdi-hook /usr/bin/
+COPY --from=nvidia-toolkit /usr/bin/nvidia-container-runtime /usr/bin/
+COPY --from=nvidia-toolkit /usr/bin/nvidia-container-runtime-hook /usr/bin/
+COPY --from=nvidia-toolkit /usr/bin/nvidia-container-cli /usr/bin/
+COPY --from=nvidia-toolkit /usr/bin/nvidia-ctk /usr/bin/
+COPY --from=nvidia-toolkit /etc/nvidia-container-runtime /etc/nvidia-container-runtime
+COPY --from=nvidia-toolkit /usr/lib/*-linux-gnu/libnvidia-container*.so* /usr/lib/
+
 # Create directories for manifests, charts, and configuration
 RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /var/lib/rancher/k3s/server/static/charts \
              /etc/rancher/k3s \
              /opt/openshell/manifests \
              /opt/openshell/charts \
+             /opt/openshell/gpu-manifests \
              /run/flannel
 
 # Copy entrypoint script that configures DNS for Docker environments
@@ -105,6 +141,9 @@ COPY deploy/docker/.build/charts/*.tgz /opt/openshell/charts/
 # Copy Kubernetes manifests to a persistent location that won't be overwritten by the volume mount.
 # The bootstrap code will copy these to /var/lib/rancher/k3s/server/manifests/ after cluster start.
 COPY deploy/kube/manifests/*.yaml /opt/openshell/manifests/
+
+# Copy GPU-specific manifests (deployed conditionally by entrypoint when GPU_ENABLED=true)
+COPY deploy/kube/gpu-manifests/*.yaml /opt/openshell/gpu-manifests/
 
 # Use custom entrypoint that configures DNS before starting k3s
 ENTRYPOINT ["/usr/local/bin/cluster-entrypoint.sh"]
