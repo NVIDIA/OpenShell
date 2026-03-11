@@ -7,7 +7,7 @@ use crate::tls::{
     TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
-use dialoguer::Confirm;
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
@@ -722,6 +722,117 @@ pub fn gateway_use(name: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Result<()> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    gateway_select_with(name, gateway_flag, interactive, |gateways, default| {
+        let prompt = format!(
+            "Select a gateway\n{}",
+            format_gateway_select_header(gateways)
+        );
+        let items = format_gateway_select_items(gateways);
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt(prompt)
+            .items(&items)
+            .default(default)
+            .report(false)
+            .interact_opt()
+            .into_diagnostic()
+            .map(|selection| selection.map(|index| gateways[index].name.clone()))
+    })
+}
+
+fn format_gateway_select_header(gateways: &[GatewayMetadata]) -> String {
+    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+    format!(
+        "  {:<name_width$}  {:<endpoint_width$}  {}",
+        "NAME".bold(),
+        "ENDPOINT".bold(),
+        "TYPE".bold(),
+    )
+}
+
+fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
+    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+
+    gateways
+        .iter()
+        .map(|gateway| {
+            format!(
+                "{:<name_width$}  {:<endpoint_width$}  {}",
+                gateway.name,
+                gateway.gateway_endpoint,
+                gateway_type_label(gateway),
+            )
+        })
+        .collect()
+}
+
+fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) {
+    let name_width = gateways
+        .iter()
+        .map(|gateway| gateway.name.len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
+    let endpoint_width = gateways
+        .iter()
+        .map(|gateway| gateway.gateway_endpoint.len())
+        .max()
+        .unwrap_or(8)
+        .max(8);
+
+    (name_width, endpoint_width)
+}
+
+fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
+    match gateway.auth_mode.as_deref() {
+        Some("cloudflare_jwt") => "edge",
+        _ if gateway.is_remote => "remote",
+        _ => "local",
+    }
+}
+
+fn gateway_select_with<F>(
+    name: Option<&str>,
+    gateway_flag: &Option<String>,
+    interactive: bool,
+    choose_gateway: F,
+) -> Result<()>
+where
+    F: FnOnce(&[GatewayMetadata], usize) -> Result<Option<String>>,
+{
+    if let Some(name) = name {
+        return gateway_use(name);
+    }
+
+    let gateways = list_gateways()?;
+    if gateways.is_empty() || !interactive {
+        gateway_list(gateway_flag)?;
+        if !gateways.is_empty() {
+            eprintln!();
+            eprintln!(
+                "Select a gateway with: {}",
+                "openshell gateway select <name>".dimmed()
+            );
+        }
+        return Ok(());
+    }
+
+    let active = gateway_flag.clone().or_else(load_active_gateway);
+    let default = active
+        .as_deref()
+        .and_then(|name| gateways.iter().position(|gateway| gateway.name == name))
+        .unwrap_or(0);
+
+    if let Some(name) = choose_gateway(&gateways, default)? {
+        gateway_use(&name)?;
+    } else {
+        eprintln!("{} Gateway selection cancelled", "!".yellow());
+    }
+
+    Ok(())
+}
+
 /// Register an external edge-authenticated gateway.
 ///
 /// Creates local metadata for the given endpoint so it appears in
@@ -870,11 +981,7 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
     for gateway in &gateways {
         let is_active = active.as_deref() == Some(&gateway.name);
         let marker = if is_active { "*" } else { " " };
-        let gateway_type = match gateway.auth_mode.as_deref() {
-            Some("cloudflare_jwt") => "edge",
-            _ if gateway.is_remote => "remote",
-            _ => "local",
-        };
+        let gateway_type = gateway_type_label(gateway);
         let line = format!(
             "{marker} {:<name_width$}  {:<endpoint_width$}  {gateway_type}",
             gateway.name, gateway.gateway_endpoint,
@@ -3556,10 +3663,14 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayControlTarget, TlsOptions, git_sync_files, http_health_check,
-        inferred_provider_type, parse_credential_pairs, resolve_gateway_control_target_from,
+        GatewayControlTarget, TlsOptions, format_gateway_select_header,
+        format_gateway_select_items, gateway_select_with, gateway_type_label, git_sync_files,
+        http_health_check, inferred_provider_type, parse_credential_pairs,
+        resolve_gateway_control_target_from,
     };
+    use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
+    use navigator_bootstrap::{load_active_gateway, store_gateway_metadata};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3606,6 +3717,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &Path, f: F) {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            tmp.to_str().expect("temp path should be utf-8"),
+        );
+        f();
+        drop(guard);
     }
 
     fn edge_registration(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -3764,6 +3887,111 @@ mod tests {
                 panic!("expected remote target")
             }
         }
+    }
+
+    #[test]
+    fn gateway_select_uses_explicit_name_without_prompting() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_registration("alpha", "https://alpha.example.com"),
+            )
+            .expect("store gateway");
+
+            let mut prompted = false;
+            gateway_select_with(Some("alpha"), &None, true, |_, _| {
+                prompted = true;
+                Ok(None)
+            })
+            .expect("select explicit gateway");
+
+            assert_eq!(load_active_gateway().as_deref(), Some("alpha"));
+            assert!(!prompted, "explicit gateway should skip prompting");
+        });
+    }
+
+    #[test]
+    fn gateway_select_prefers_active_gateway_as_default_choice() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_registration("alpha", "https://alpha.example.com"),
+            )
+            .expect("store alpha");
+            store_gateway_metadata(
+                "beta",
+                &edge_registration("beta", "https://beta.example.com"),
+            )
+            .expect("store beta");
+            super::save_active_gateway("beta").expect("save active gateway");
+
+            let mut seen_default = None;
+            gateway_select_with(None, &None, true, |gateways, default| {
+                seen_default = Some(default);
+                Ok(Some(gateways[default].name.clone()))
+            })
+            .expect("interactive selection");
+
+            assert_eq!(seen_default, Some(1));
+            assert_eq!(load_active_gateway().as_deref(), Some("beta"));
+        });
+    }
+
+    #[test]
+    fn gateway_select_non_interactive_lists_gateways_without_prompting() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_registration("alpha", "https://alpha.example.com"),
+            )
+            .expect("store gateway");
+
+            let mut prompted = false;
+            gateway_select_with(None, &None, false, |_, _| {
+                prompted = true;
+                Ok(None)
+            })
+            .expect("non-interactive selection");
+
+            assert!(!prompted, "non-interactive mode should not prompt");
+            assert_eq!(load_active_gateway(), None);
+        });
+    }
+
+    #[test]
+    fn gateway_select_items_include_endpoint_and_type() {
+        let gateways = vec![
+            edge_registration("alpha", "https://edge.example.com"),
+            GatewayMetadata {
+                name: "local".to_string(),
+                gateway_endpoint: "http://127.0.0.1:8080".to_string(),
+                is_remote: false,
+                gateway_port: 8080,
+                kube_port: None,
+                remote_host: None,
+                resolved_host: None,
+                auth_mode: None,
+                edge_team_domain: None,
+                edge_auth_url: None,
+            },
+        ];
+
+        let items = format_gateway_select_items(&gateways);
+        let header = format_gateway_select_header(&gateways);
+
+        assert_eq!(gateway_type_label(&gateways[0]), "edge");
+        assert_eq!(gateway_type_label(&gateways[1]), "local");
+        assert!(header.contains("NAME"));
+        assert!(header.contains("ENDPOINT"));
+        assert!(header.contains("TYPE"));
+        assert!(items[0].contains("alpha"));
+        assert!(items[0].contains("https://edge.example.com"));
+        assert!(items[0].contains("edge"));
+        assert!(items[1].contains("local"));
+        assert!(items[1].contains("http://127.0.0.1:8080"));
     }
 
     #[tokio::test]
