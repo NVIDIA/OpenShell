@@ -1517,18 +1517,7 @@ pub async fn sandbox_create(
     )
     .await?;
 
-    let mut policy = load_sandbox_policy(policy)?;
-
-    // When a custom image is specified, clear the default run_as_user/group
-    // to prevent failures on images that lack the "sandbox" user/group.
-    // If no explicit policy was provided, start from the restrictive default
-    // so the server stores a policy with cleared identity — otherwise the
-    // sandbox falls back to disk discovery which may re-introduce
-    // run_as_user: sandbox for images that don't have that user.
-    if image.is_some() {
-        let p = policy.get_or_insert_with(navigator_policy::restrictive_default_policy);
-        navigator_policy::clear_process_identity(p);
-    }
+    let policy = load_sandbox_policy(policy)?;
 
     let template = image.map(|img| SandboxTemplate {
         image: img,
