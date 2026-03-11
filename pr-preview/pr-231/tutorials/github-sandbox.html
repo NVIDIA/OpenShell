@@ -1,0 +1,874 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>Set Up a Sandbox of Claude Code with a Custom GitHub Policy &#8212; NVIDIA OpenShell Developer Guide</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/enhanced-search.css?v=2e2db37d" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script src="../_static/documentation_options.js?v=2caa9db7"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=6dbb43f8"></script>
+    <script src="../_static/search-assets.bundle.js?v=00e3e057"></script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'tutorials/github-sandbox';</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="About Sandboxes" href="../sandboxes/index.html" />
+    <link rel="prev" title="Quickstart" href="../get-started/quickstart.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA OpenShell Developer Guide - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="NVIDIA OpenShell Developer Guide - Home"/>
+  
+  
+    <p class="title logo__title">NVIDIA OpenShell Developer Guide</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/NVIDIA/OpenShell" title="GitHub" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">GitHub</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://pypi.org/project/openshell/" title="PyPI" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-python fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">PyPI</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA OpenShell Developer Guide - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="NVIDIA OpenShell Developer Guide - Home"/>
+  
+  
+    <p class="title logo__title">NVIDIA OpenShell Developer Guide</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/NVIDIA/OpenShell" title="GitHub" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">GitHub</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://pypi.org/project/openshell/" title="PyPI" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-python fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">PyPI</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">Home</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">About NVIDIA OpenShell</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../about/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/architecture.html">How It Works</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get-started/quickstart.html">Quickstart</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Tutorial: GitHub Policy Iteration</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Sandboxes</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/index.html">About Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/create-and-manage.html">Create and Manage Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/providers.html">Providers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/policies.html">Customize Sandbox Policies</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/community-sandboxes.html">Community Sandboxes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Inference Routing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../inference/index.html">About Inference Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../inference/configure.html">Configure Inference Routing</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/cli.html">CLI Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/default-policy.html">Default Policy Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/policy-schema.html">Policy Schema Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../resources/eula.html">License</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">Set Up a Sandbox of Claude Code with a Custom GitHub Policy</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+  SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<section class="tex2jax_ignore mathjax_ignore" id="set-up-a-sandbox-of-claude-code-with-a-custom-github-policy">
+<h1>Set Up a Sandbox of Claude Code with a Custom GitHub Policy<a class="headerlink" href="#set-up-a-sandbox-of-claude-code-with-a-custom-github-policy" title="Link to this heading">#</a></h1>
+<p>This tutorial walks through the iterative policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, get blocked by the default network policy, diagnose the denial from two angles — the OpenShell Terminal on your laptop and the sandbox logs from inside — and then apply a custom policy to fix it, all without recreating the sandbox.</p>
+<p>After completing this tutorial, you will have:</p>
+<ul class="simple">
+<li><p>A running sandbox with Claude Code that can push to a GitHub repository.</p></li>
+<li><p>A custom network policy that grants GitHub access for a specific repository.</p></li>
+<li><p>Experience with the policy iteration workflow: fail, diagnose, update, verify.</p></li>
+</ul>
+<div class="admonition note">
+<p class="admonition-title">Note</p>
+<p>This tutorial shows example prompts and responses from Claude Code. The exact wording you see may differ between sessions — use the examples as a guide for the type of interaction, not as expected output.</p>
+</div>
+<section id="prerequisites">
+<h2>Prerequisites<a class="headerlink" href="#prerequisites" title="Link to this heading">#</a></h2>
+<p>This tutorial requires the following:</p>
+<ul class="simple">
+<li><p>Completed the <a class="reference internal" href="../get-started/quickstart.html"><span class="doc">Quickstart</span></a> tutorial.</p></li>
+<li><p>A GitHub personal access token (PAT) with <code class="docutils literal notranslate"><span class="pre">repo</span></code> scope. To create one, go to <a class="reference external" href="https://github.com/settings/tokens" rel="noreferer noopener" target="_blank">GitHub Settings &gt; Developer settings &gt; Personal access tokens</a>, select <strong>Generate new token (classic)</strong>, check the <code class="docutils literal notranslate"><span class="pre">repo</span></code> scope, and copy the token.</p></li>
+<li><p>An agent API key configured in the environment. For example, <code class="docutils literal notranslate"><span class="pre">ANTHROPIC_API_KEY</span></code> for Claude Code.</p></li>
+<li><p>A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can <a class="reference external" href="https://github.com/new" rel="noreferer noopener" target="_blank">create a new repository</a> with a README if you do not have one handy.</p></li>
+</ul>
+<div class="admonition important">
+<p class="admonition-title">Important</p>
+<p>This tutorial uses two terminals throughout:</p>
+<ul class="simple">
+<li><p><strong>Terminal 1 (sandbox)</strong> — The terminal where you launch the sandbox. Claude Code runs here. You interact with the agent in this terminal.</p></li>
+<li><p><strong>Terminal 2 (laptop)</strong> — A separate terminal on your laptop. You use this for <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">term</span></code>, <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">policy</span> <span class="pre">set</span></code>, and other CLI commands that manage the sandbox from the outside.</p></li>
+</ul>
+<p>Each section below indicates which terminal to use.</p>
+</div>
+</section>
+<section id="launch-the-sandbox">
+<h2>Launch the Sandbox<a class="headerlink" href="#launch-the-sandbox" title="Link to this heading">#</a></h2>
+<div class="sd-tab-set docutils">
+<input checked="checked" id="sd-tab-item-0" name="sd-tab-set-0" type="radio">
+<label class="sd-tab-label" for="sd-tab-item-0">
+Starting a new sandbox</label><div class="sd-tab-content docutils">
+<p><strong>Terminal 1 (sandbox)</strong> — Create a sandbox and start Claude Code. No custom policy is needed yet — the <a class="reference internal" href="../reference/default-policy.html"><span class="doc">default policy</span></a> is applied automatically.</p>
+<p>The recommended approach is to create a <a class="reference internal" href="../sandboxes/providers.html"><span class="doc">credential provider</span></a> that injects your GitHub token into the sandbox automatically. The provider reads <code class="docutils literal notranslate"><span class="pre">GITHUB_TOKEN</span></code> from your host environment and sets it as an environment variable inside the sandbox:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>provider<span class="w"> </span>create<span class="w"> </span>--name<span class="w"> </span>my-github<span class="w"> </span>--type<span class="w"> </span>github<span class="w"> </span>--from-existing
+<span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>create<span class="w"> </span>--provider<span class="w"> </span>my-github<span class="w"> </span>--keep<span class="w"> </span>--<span class="w"> </span>claude
+</pre></div>
+</div>
+<p>If you prefer to handle authentication manually, you can skip the provider and create the sandbox without one:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>create<span class="w"> </span>--keep<span class="w"> </span>--<span class="w"> </span>claude
+</pre></div>
+</div>
+<p>The <code class="docutils literal notranslate"><span class="pre">--keep</span></code> flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.</p>
+<p>Claude Code starts inside the sandbox. Log in through your preferred authentication method and trust the <code class="docutils literal notranslate"><span class="pre">/sandbox</span></code> workspace when prompted.</p>
+</div>
+<input id="sd-tab-item-1" name="sd-tab-set-0" type="radio">
+<label class="sd-tab-label" for="sd-tab-item-1">
+Using an existing sandbox</label><div class="sd-tab-content docutils">
+<p>If you already have a sandbox running from the Quickstart, you do not need to create a new one. Providers can only be attached at creation time, so you will set up GitHub authentication inside the sandbox instead.</p>
+<p><strong>Terminal 1 (sandbox)</strong> — Connect to your running sandbox:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>connect<span class="w"> </span>&lt;sandbox-name&gt;
+</pre></div>
+</div>
+<p>From inside the sandbox, set your GitHub token as an environment variable:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span><span class="nb">export</span><span class="w"> </span><span class="nv">GITHUB_TOKEN</span><span class="o">=</span>&lt;your-token&gt;
+</pre></div>
+</div>
+<p>Or start Claude Code and paste the token when it asks for GitHub credentials in the next step:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>claude
+</pre></div>
+</div>
+</div>
+</div>
+</section>
+<section id="push-code-to-github">
+<h2>Push Code to GitHub<a class="headerlink" href="#push-code-to-github" title="Link to this heading">#</a></h2>
+<p><strong>Terminal 1 (sandbox)</strong> — Ask Claude Code to write a simple script and push it to your repository:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Write a hello_world.py script and push it to https://github.com/&lt;org&gt;/&lt;repo&gt;.
+</pre></div>
+</div>
+<p>If you used a provider or set <code class="docutils literal notranslate"><span class="pre">GITHUB_TOKEN</span></code> as an environment variable, Claude uses the token automatically. Otherwise, Claude recognizes that it needs GitHub credentials, asks how you want to authenticate, and you can paste your personal access token into the conversation.</p>
+<p>Either way, Claude configures authentication and attempts the push. The push fails — but the failure is not an authentication problem. The default sandbox policy does not permit outbound requests to GitHub, so the proxy blocks the connection before the request reaches GitHub’s servers.</p>
+</section>
+<section id="diagnose-the-denial">
+<h2>Diagnose the Denial<a class="headerlink" href="#diagnose-the-denial" title="Link to this heading">#</a></h2>
+<section id="view-the-logs-from-your-laptop">
+<h3>View the logs from your laptop<a class="headerlink" href="#view-the-logs-from-your-laptop" title="Link to this heading">#</a></h3>
+<p><strong>Terminal 2 (laptop)</strong> — Open a separate terminal on your laptop and launch the OpenShell Terminal:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>term
+</pre></div>
+</div>
+<p>The dashboard shows sandbox status and a live stream of policy decisions. Look for entries with <code class="docutils literal notranslate"><span class="pre">l7_decision=deny</span></code>. Select a deny entry to see the full detail:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>l7_action:      PUT
+l7_target:      /repos/&lt;org&gt;/&lt;repo&gt;/contents/hello_world.py
+l7_decision:    deny
+dst_host:       api.github.com
+dst_port:       443
+l7_protocol:    rest
+policy:         github_rest_api
+l7_deny_reason: PUT /repos/&lt;org&gt;/&lt;repo&gt;/contents/hello_world.py not permitted by policy
+</pre></div>
+</div>
+<p>The log shows that the sandbox proxy intercepted an outbound <code class="docutils literal notranslate"><span class="pre">PUT</span></code> request to <code class="docutils literal notranslate"><span class="pre">api.github.com</span></code> and denied it. The <code class="docutils literal notranslate"><span class="pre">github_rest_api</span></code> policy allows read operations (GET) but blocks write operations (PUT, POST, DELETE) to the GitHub API. A similar denial appears for <code class="docutils literal notranslate"><span class="pre">github.com</span></code> if Claude attempted a git push over HTTPS.</p>
+</section>
+<section id="ask-claude-to-check-the-sandbox-logs">
+<h3>Ask Claude to check the sandbox logs<a class="headerlink" href="#ask-claude-to-check-the-sandbox-logs" title="Link to this heading">#</a></h3>
+<p><strong>Terminal 1 (sandbox)</strong> — Switch back to Claude Code. Ask it to check the sandbox logs for denied requests:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>Check the sandbox logs for any denied network requests. What is blocking the push?
+</pre></div>
+</div>
+<p>Claude reads the deny entries and identifies the root cause. It explains that the failure is a sandbox network policy restriction, not a token permissions issue:</p>
+<blockquote>
+<div><p>The sandbox runs a proxy that enforces policies on outbound traffic. The
+<code class="docutils literal notranslate"><span class="pre">github_rest_api</span></code> policy allows GET requests (used to read the file) but blocks
+PUT/write requests to GitHub. This is a sandbox-level restriction, not a token
+issue — no matter what token you provide, pushes via the API will be blocked
+until the policy is updated.</p>
+</div></blockquote>
+<p>Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.</p>
+</section>
+</section>
+<section id="update-the-policy-from-your-laptop">
+<h2>Update the Policy from Your Laptop<a class="headerlink" href="#update-the-policy-from-your-laptop" title="Link to this heading">#</a></h2>
+<p><strong>Terminal 2 (laptop)</strong> — Ask your coding agent (for example, Claude Code or Cursor running on your laptop) to recommend a policy update based on the denied requests and apply it to the running sandbox.</p>
+<p>The agent inspects the deny reasons, writes an updated policy that adds <code class="docutils literal notranslate"><span class="pre">github_git</span></code> and <code class="docutils literal notranslate"><span class="pre">github_api</span></code> blocks for your repository, and runs <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">policy</span> <span class="pre">set</span></code> to apply it:</p>
+<div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>policy<span class="w"> </span><span class="nb">set</span><span class="w"> </span>&lt;sandbox-name&gt;<span class="w"> </span>--policy<span class="w"> </span>/tmp/sandbox-policy-update.yaml<span class="w"> </span>--wait
+</pre></div>
+</div>
+<p>Your coding agent generates both the policy file and this command. Network policies are hot-reloadable — the <code class="docutils literal notranslate"><span class="pre">--wait</span></code> flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.</p>
+<details class="sd-sphinx-override sd-dropdown sd-card sd-mb-3">
+<summary class="sd-summary-title sd-card-header">
+<span class="sd-summary-text">Full reference policy</span><span class="sd-summary-state-marker sd-summary-chevron-right"><svg version="1.1" width="1.5em" height="1.5em" class="sd-octicon sd-octicon-chevron-right" viewBox="0 0 24 24" aria-hidden="true"><path d="M8.72 18.78a.75.75 0 0 1 0-1.06L14.44 12 8.72 6.28a.751.751 0 0 1 .018-1.042.751.751 0 0 1 1.042-.018l6.25 6.25a.75.75 0 0 1 0 1.06l-6.25 6.25a.75.75 0 0 1-1.06 0Z"></path></svg></span></summary><div class="sd-summary-content sd-card-body docutils">
+<p class="sd-card-text">The following YAML shows a complete policy that extends the <a class="reference internal" href="../reference/default-policy.html"><span class="doc">default policy</span></a> with GitHub access for a single repository. This is representative of what a coding agent generates when asked to unblock GitHub pushes. Replace <code class="docutils literal notranslate"><span class="pre">&lt;org&gt;</span></code> with your GitHub organization or username and <code class="docutils literal notranslate"><span class="pre">&lt;repo&gt;</span></code> with your repository name.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+
+<span class="c1"># ── Static (locked at sandbox creation) ──────────────────────────</span>
+
+<span class="nt">filesystem_policy</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">include_workdir</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">read_only</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/usr</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/lib</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/proc</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/dev/urandom</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/app</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/etc</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/var/log</span>
+<span class="w">  </span><span class="nt">read_write</span><span class="p">:</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/sandbox</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/tmp</span>
+<span class="w">    </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/dev/null</span>
+
+<span class="nt">landlock</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">best_effort</span>
+
+<span class="nt">process</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">run_as_user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+<span class="w">  </span><span class="nt">run_as_group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+
+<span class="c1"># ── Dynamic (hot-reloadable) ─────────────────────────────────────</span>
+
+<span class="nt">network_policies</span><span class="p">:</span>
+
+<span class="w">  </span><span class="c1"># Claude Code ↔ Anthropic API</span>
+<span class="w">  </span><span class="nt">claude_code</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">claude-code</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">api.anthropic.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="p p-Indicator">,</span><span class="nt"> protocol</span><span class="p">:</span><span class="w"> </span><span class="nv">rest</span><span class="p p-Indicator">,</span><span class="nt"> enforcement</span><span class="p">:</span><span class="w"> </span><span class="nv">enforce</span><span class="p p-Indicator">,</span><span class="nt"> access</span><span class="p">:</span><span class="w"> </span><span class="nv">full</span><span class="p p-Indicator">,</span><span class="nt"> tls</span><span class="p">:</span><span class="w"> </span><span class="nv">terminate</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">statsig.anthropic.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">sentry.io</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">raw.githubusercontent.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">platform.claude.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/claude</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/node</span><span class="w"> </span><span class="p p-Indicator">}</span>
+
+<span class="w">  </span><span class="c1"># NVIDIA inference endpoint</span>
+<span class="w">  </span><span class="nt">nvidia_inference</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">nvidia-inference</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">integrate.api.nvidia.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/curl</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/bin/bash</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/opencode</span><span class="w"> </span><span class="p p-Indicator">}</span>
+
+<span class="w">  </span><span class="c1"># ── GitHub: git operations (clone, fetch, push) ──────────────</span>
+
+<span class="w">  </span><span class="nt">github_git</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-git</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github.com</span>
+<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
+<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+<span class="w">        </span><span class="nt">rules</span><span class="p">:</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">GET</span>
+<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/info/refs*&quot;</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/git-upload-pack&quot;</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/&lt;org&gt;/&lt;repo&gt;.git/git-receive-pack&quot;</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/git</span><span class="w"> </span><span class="p p-Indicator">}</span>
+
+<span class="w">  </span><span class="c1"># ── GitHub: REST API ─────────────────────────────────────────</span>
+
+<span class="w">  </span><span class="nt">github_api</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">github-api</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.github.com</span>
+<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
+<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+<span class="w">        </span><span class="nt">rules</span><span class="p">:</span>
+<span class="w">          </span><span class="c1"># GraphQL API (used by gh CLI)</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">POST</span>
+<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/graphql&quot;</span>
+<span class="w">          </span><span class="c1"># Full read-write access to the repository</span>
+<span class="w">          </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">allow</span><span class="p">:</span>
+<span class="w">              </span><span class="nt">method</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;*&quot;</span>
+<span class="w">              </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/repos/&lt;org&gt;/&lt;repo&gt;/**&quot;</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/claude</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/opencode</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/gh</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/curl</span><span class="w"> </span><span class="p p-Indicator">}</span>
+
+<span class="w">  </span><span class="c1"># ── Package managers ─────────────────────────────────────────</span>
+
+<span class="w">  </span><span class="nt">pypi</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">pypi</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">pypi.org</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">files.pythonhosted.org</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">github.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">objects.githubusercontent.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">api.github.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">downloads.python.org</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/sandbox/.venv/bin/python</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/sandbox/.venv/bin/python3</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/sandbox/.venv/bin/pip</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/app/.venv/bin/python</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/app/.venv/bin/python3</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/app/.venv/bin/pip</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/local/bin/uv</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/sandbox/.uv/python/**&quot;</span><span class="w"> </span><span class="p p-Indicator">}</span>
+
+<span class="w">  </span><span class="c1"># ── VS Code Remote ──────────────────────────────────────────</span>
+
+<span class="w">  </span><span class="nt">vscode</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">vscode</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">update.code.visualstudio.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;*.vo.msecnd.net&quot;</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">vscode.download.prss.microsoft.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="nv">marketplace.visualstudio.com</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> host</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;*.gallerycdn.vsassets.io&quot;</span><span class="p p-Indicator">,</span><span class="nt"> port</span><span class="p">:</span><span class="w"> </span><span class="nv">443</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/curl</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="nv">/usr/bin/wget</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/sandbox/.vscode-server/**&quot;</span><span class="w"> </span><span class="p p-Indicator">}</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="p p-Indicator">{</span><span class="nt"> path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;/sandbox/.vscode-remote-containers/**&quot;</span><span class="w"> </span><span class="p p-Indicator">}</span>
+</pre></div>
+</div>
+<p class="sd-card-text">The following table summarizes the two GitHub-specific blocks:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p class="sd-card-text">Block</p></th>
+<th class="head"><p class="sd-card-text">Endpoint</p></th>
+<th class="head"><p class="sd-card-text">Behavior</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">github_git</span></code></p></td>
+<td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">github.com:443</span></code></p></td>
+<td><p class="sd-card-text">Git Smart HTTP protocol with TLS termination. Permits <code class="docutils literal notranslate"><span class="pre">info/refs</span></code> (clone/fetch), <code class="docutils literal notranslate"><span class="pre">git-upload-pack</span></code> (fetch data), and <code class="docutils literal notranslate"><span class="pre">git-receive-pack</span></code> (push) for the specified repository. Denies all operations on unlisted repositories.</p></td>
+</tr>
+<tr class="row-odd"><td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">github_api</span></code></p></td>
+<td><p class="sd-card-text"><code class="docutils literal notranslate"><span class="pre">api.github.com:443</span></code></p></td>
+<td><p class="sd-card-text">REST API with TLS termination. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p class="sd-card-text">The remaining blocks (<code class="docutils literal notranslate"><span class="pre">claude_code</span></code>, <code class="docutils literal notranslate"><span class="pre">nvidia_inference</span></code>, <code class="docutils literal notranslate"><span class="pre">pypi</span></code>, <code class="docutils literal notranslate"><span class="pre">vscode</span></code>) are identical to the <a class="reference internal" href="../reference/default-policy.html"><span class="doc">default policy</span></a>. Sandbox behavior outside of GitHub operations is unchanged.</p>
+<p class="sd-card-text">For details on policy block structure, refer to <a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>.</p>
+</div>
+</details></section>
+<section id="retry-the-push">
+<h2>Retry the Push<a class="headerlink" href="#retry-the-push" title="Link to this heading">#</a></h2>
+<p><strong>Terminal 1 (sandbox)</strong> — Switch back to Claude Code and ask it to retry the push:</p>
+<div class="highlight-text notranslate"><div class="highlight"><pre><span></span>The sandbox policy has been updated. Try pushing to the repository again.
+</pre></div>
+</div>
+<p>The push completes successfully. The <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">term</span></code> dashboard now shows <code class="docutils literal notranslate"><span class="pre">l7_decision=allow</span></code> entries for <code class="docutils literal notranslate"><span class="pre">api.github.com</span></code> and <code class="docutils literal notranslate"><span class="pre">github.com</span></code> where it previously showed denials.</p>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
+<p>The following resources cover related topics in greater depth:</p>
+<ul class="simple">
+<li><p>To add per-repository access levels (read-write vs read-only) or restrict to specific API methods, refer to the <a class="reference internal" href="../reference/policy-schema.html"><span class="std std-doc">Policy Schema Reference</span></a>.</p></li>
+<li><p>To learn the full policy iteration workflow (pull, edit, push, verify), refer to <a class="reference internal" href="../sandboxes/policies.html"><span class="doc">Customize Sandbox Policies</span></a>.</p></li>
+<li><p>To inject credentials automatically instead of pasting tokens, refer to <a class="reference internal" href="../sandboxes/providers.html"><span class="doc">Providers</span></a>.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../get-started/quickstart.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Quickstart</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="../sandboxes/index.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">About Sandboxes</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#prerequisites">Prerequisites</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-sandbox">Launch the Sandbox</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#push-code-to-github">Push Code to GitHub</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#diagnose-the-denial">Diagnose the Denial</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#view-the-logs-from-your-laptop">View the logs from your laptop</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ask-claude-to-check-the-sandbox-logs">Ask Claude to check the sandbox logs</a></li>
+</ul>
+</li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#update-the-policy-from-your-laptop">Update the Policy from Your Laptop</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#retry-the-push">Retry the Push</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>

@@ -1,0 +1,716 @@
+
+
+<!DOCTYPE html>
+
+
+<html lang="en" data-content_root="../" >
+
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+    <title>About Sandboxes &#8212; NVIDIA OpenShell Developer Guide</title>
+  
+  
+  
+  <script data-cfasync="false">
+    document.documentElement.dataset.mode = localStorage.getItem("mode") || "";
+    document.documentElement.dataset.theme = localStorage.getItem("theme") || "";
+  </script>
+  <!--
+    this give us a css class that will be invisible only if js is disabled
+  -->
+  <noscript>
+    <style>
+      .pst-js-only { display: none !important; }
+
+    </style>
+  </noscript>
+  
+  <!-- Loaded before other Sphinx assets -->
+  <link href="../_static/styles/theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+<link href="../_static/styles/pydata-sphinx-theme.css?digest=8878045cc6db502f8baf" rel="stylesheet" />
+
+    <link rel="stylesheet" type="text/css" href="../_static/pygments.css?v=8f2a1f02" />
+    <link rel="stylesheet" type="text/css" href="../_static/styles/nvidia-sphinx-theme.css?v=933278ad" />
+    <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
+    <link rel="stylesheet" type="text/css" href="../_static/enhanced-search.css?v=2e2db37d" />
+    <link rel="stylesheet" type="text/css" href="../_static/sphinx-design.min.css?v=95c83b7e" />
+  
+  <!-- So that users can add custom icons -->
+  <script src="../_static/scripts/fontawesome.js?digest=8878045cc6db502f8baf"></script>
+  <!-- Pre-loaded scripts that we'll load fully later -->
+  <link rel="preload" as="script" href="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf" />
+<link rel="preload" as="script" href="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf" />
+
+
+
+    <script src="../_static/documentation_options.js?v=2caa9db7"></script>
+    <script src="../_static/doctools.js?v=9a2dae69"></script>
+    <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
+    <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
+    <script src="../_static/copybutton.js?v=6dbb43f8"></script>
+    <script src="../_static/search-assets.bundle.js?v=00e3e057"></script>
+    <script src="../_static/design-tabs.js?v=f930bc37"></script>
+    <script>DOCUMENTATION_OPTIONS.pagename = 'sandboxes/index';</script>
+
+    <link rel="icon" href="../_static/favicon.png"/>
+
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="Create and Manage Sandboxes" href="create-and-manage.html" />
+    <link rel="prev" title="Set Up a Sandbox of Claude Code with a Custom GitHub Policy" href="../tutorials/github-sandbox.html" />
+
+
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="docsearch:language" content="en"/>
+  <meta name="docsearch:version" content="" />
+
+
+  </head>
+
+  
+  
+  <body data-bs-spy="scroll" data-bs-target=".bd-toc-nav" data-offset="180" data-bs-root-margin="0px 0px -60%" data-default-mode="">
+
+  
+  
+  <div id="pst-skip-link" class="skip-link d-print-none"><a href="#main-content">Skip to main content</a></div>
+
+
+  
+  <div id="pst-scroll-pixel-helper"></div>
+  
+  <button type="button" class="btn rounded-pill" id="pst-back-to-top">
+    <i class="fa-solid fa-arrow-up"></i>Back to top</button>
+
+  
+  <dialog id="pst-search-dialog">
+    
+<form class="bd-search d-flex align-items-center"
+      action="../search.html"
+      method="get">
+  <i class="fa-solid fa-magnifying-glass"></i>
+  <input type="search"
+         class="form-control"
+         name="q"
+         placeholder="Search the docs ..."
+         aria-label="Search the docs ..."
+         autocomplete="off"
+         autocorrect="off"
+         autocapitalize="off"
+         spellcheck="false"/>
+  <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd>K</kbd></span>
+</form>
+  </dialog>
+
+  <div class="pst-async-banner-revealer d-none">
+  <aside id="bd-header-version-warning" class="d-none d-print-none" aria-label="Version warning"></aside>
+</div>
+
+  
+    <header class="bd-header navbar navbar-expand-lg bd-navbar d-print-none">
+<div class="bd-header__inner bd-page-width">
+  <button class="pst-navbar-icon sidebar-toggle primary-toggle" aria-label="Site navigation">
+    <span class="fa-solid fa-bars"></span>
+  </button>
+  
+  
+  <div class="col-lg-3 navbar-header-items__start">
+    
+      <div class="navbar-item">
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA OpenShell Developer Guide - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="NVIDIA OpenShell Developer Guide - Home"/>
+  
+  
+    <p class="title logo__title">NVIDIA OpenShell Developer Guide</p>
+  
+</a></div>
+    
+  </div>
+  
+  <div class="col-lg-9 navbar-header-items">
+    
+    
+    <div class="navbar-header-items__end">
+      
+        <div class="navbar-item navbar-persistent--container">
+          
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+        </div>
+      
+      
+        <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+      
+        <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/NVIDIA/OpenShell" title="GitHub" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">GitHub</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://pypi.org/project/openshell/" title="PyPI" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-python fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">PyPI</span></a>
+        </li>
+</ul></div>
+      
+    </div>
+    
+  </div>
+  
+  
+    <div class="navbar-persistent--mobile">
+
+<button class="btn search-button-field search-button__button pst-js-only" title="Search" aria-label="Search" data-bs-placement="bottom" data-bs-toggle="tooltip">
+ <i class="fa-solid fa-magnifying-glass"></i>
+ <span class="search-button__default-text">Search</span>
+ <span class="search-button__kbd-shortcut"><kbd class="kbd-shortcut__modifier">Ctrl</kbd>+<kbd class="kbd-shortcut__modifier">K</kbd></span>
+</button>
+    </div>
+  
+
+  
+    <button class="pst-navbar-icon sidebar-toggle secondary-toggle" aria-label="On this page">
+      <span class="fa-solid fa-outdent"></span>
+    </button>
+  
+</div>
+
+    </header>
+  
+
+  <div class="bd-container">
+    <div class="bd-container__inner bd-page-width">
+      
+      
+      
+      <dialog id="pst-primary-sidebar-modal"></dialog>
+      <div id="pst-primary-sidebar" class="bd-sidebar-primary bd-sidebar">
+        
+
+
+
+  
+    
+  
+
+<a class="navbar-brand logo" href="../index.html">
+  
+  
+  
+  
+  
+    
+    
+      
+    
+    
+    <img src="../_static/nvidia-logo-horiz-rgb-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA OpenShell Developer Guide - Home"/>
+    <img src="../_static/nvidia-logo-horiz-rgb-wht-for-screen.svg" class="logo__image only-dark pst-js-only" alt="NVIDIA OpenShell Developer Guide - Home"/>
+  
+  
+    <p class="title logo__title">NVIDIA OpenShell Developer Guide</p>
+  
+</a>
+
+
+  
+  <div class="sidebar-header-items sidebar-primary__section">
+    
+    
+    
+    
+      <div class="sidebar-header-items__end">
+        
+          <div class="navbar-item">
+
+<button class="btn btn-sm nav-link pst-navbar-icon theme-switch-button pst-js-only" aria-label="Color mode" data-bs-title="Color mode"  data-bs-placement="bottom" data-bs-toggle="tooltip">
+  <i class="theme-switch fa-solid fa-sun                fa-lg" data-mode="light" title="Light"></i>
+  <i class="theme-switch fa-solid fa-moon               fa-lg" data-mode="dark"  title="Dark"></i>
+  <i class="theme-switch fa-solid fa-circle-half-stroke fa-lg" data-mode="auto"  title="System Settings"></i>
+</button></div>
+        
+          <div class="navbar-item"><ul class="navbar-icon-links"
+    aria-label="Icon Links">
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://github.com/NVIDIA/OpenShell" title="GitHub" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-github fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">GitHub</span></a>
+        </li>
+        <li class="nav-item">
+          
+          
+          
+          
+          
+          
+          
+          
+          <a href="https://pypi.org/project/openshell/" title="PyPI" class="nav-link pst-navbar-icon" rel="noopener" target="_blank" data-bs-toggle="tooltip" data-bs-placement="bottom"><i class="fa-brands fa-python fa-lg" aria-hidden="true"></i>
+            <span class="sr-only">PyPI</span></a>
+        </li>
+</ul></div>
+        
+      </div>
+    
+  </div>
+  
+    <div class="sidebar-primary-items__start sidebar-primary__section">
+        <div class="sidebar-primary-item">
+
+
+
+<nav class="bd-docs-nav bd-links"
+     aria-label="Table of Contents">
+  <p class="bd-links__title" role="heading" aria-level="1">Table of Contents</p>
+  <div class="bd-toc-item navbar-nav"><ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../index.html">Home</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">About NVIDIA OpenShell</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../about/overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/architecture.html">How It Works</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../about/release-notes.html">Release Notes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Get Started</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../get-started/quickstart.html">Quickstart</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../tutorials/github-sandbox.html">Tutorial: GitHub Policy Iteration</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Sandboxes</span></p>
+<ul class="current nav bd-sidenav">
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">About Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="providers.html">Providers</a></li>
+<li class="toctree-l1"><a class="reference internal" href="policies.html">Customize Sandbox Policies</a></li>
+<li class="toctree-l1"><a class="reference internal" href="community-sandboxes.html">Community Sandboxes</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Inference Routing</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../inference/index.html">About Inference Routing</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../inference/configure.html">Configure Inference Routing</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Reference</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../reference/cli.html">CLI Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/default-policy.html">Default Policy Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/policy-schema.html">Policy Schema Reference</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../reference/support-matrix.html">Support Matrix</a></li>
+</ul>
+<p aria-level="2" class="caption" role="heading"><span class="caption-text">Resources</span></p>
+<ul class="nav bd-sidenav">
+<li class="toctree-l1"><a class="reference internal" href="../resources/eula.html">License</a></li>
+</ul>
+</div>
+</nav></div>
+    </div>
+  
+  
+  <div class="sidebar-primary-items__end sidebar-primary__section">
+  </div>
+
+
+
+      </div>
+      
+      <main id="main-content" class="bd-main" role="main">
+        
+        
+          <div class="bd-content">
+            <div class="bd-article-container">
+              
+              <div class="bd-header-article d-print-none">
+<div class="header-article-items header-article__inner">
+  
+    <div class="header-article-items__start">
+      
+        <div class="header-article-item">
+
+<nav aria-label="Breadcrumb" class="d-print-none">
+  <ul class="bd-breadcrumbs">
+    
+    <li class="breadcrumb-item breadcrumb-home">
+      <a href="../index.html" class="nav-link" aria-label="Home">
+        <i class="fa-solid fa-home"></i>
+      </a>
+    </li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">About Sandboxes</span></li>
+  </ul>
+</nav>
+</div>
+      
+    </div>
+  
+  
+</div>
+</div>
+              
+              
+              
+                
+<div id="searchbox"></div>
+                <article class="bd-article">
+                  
+  <!--
+  SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0
+-->
+<section class="tex2jax_ignore mathjax_ignore" id="about-sandboxes">
+<h1>About Sandboxes<a class="headerlink" href="#about-sandboxes" title="Link to this heading">#</a></h1>
+<p>An OpenShell sandbox is a safe, private execution environment for an AI agent. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.</p>
+<section id="sandbox-lifecycle">
+<h2>Sandbox Lifecycle<a class="headerlink" href="#sandbox-lifecycle" title="Link to this heading">#</a></h2>
+<p>Every sandbox moves through a defined set of phases:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Phase</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Provisioning</p></td>
+<td><p>The runtime is setting up the sandbox environment, injecting credentials, and applying your policy.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Ready</p></td>
+<td><p>The sandbox is running. The agent process is active and all isolation layers are enforced. You can connect, sync files, and view logs.</p></td>
+</tr>
+<tr class="row-even"><td><p>Error</p></td>
+<td><p>Something went wrong during provisioning or execution. Check logs with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">logs</span></code> for details.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Deleting</p></td>
+<td><p>The sandbox is being torn down. The system releases resources and purges credentials.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="supported-agents">
+<h2>Supported Agents<a class="headerlink" href="#supported-agents" title="Link to this heading">#</a></h2>
+<p>The following table summarizes the agents that run in OpenShell sandboxes. Built-in agents are pre-installed in the OpenShell base sandbox image and auto-configured when passed as the trailing command to <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">create</span></code>. More community agent sandboxes are available in the <a class="reference internal" href="community-sandboxes.html"><span class="doc">Community Sandboxes</span></a> catalog.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Agent</p></th>
+<th class="head"><p>Source</p></th>
+<th class="head"><p>Default Policy</p></th>
+<th class="head"><p>Notes</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><a class="reference external" href="https://docs.anthropic.com/en/docs/claude-code" rel="noreferer noopener" target="_blank">Claude Code</a></p></td>
+<td><p>Built-in</p></td>
+<td><p>Full coverage</p></td>
+<td><p>Works out of the box. Requires <code class="docutils literal notranslate"><span class="pre">ANTHROPIC_API_KEY</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://opencode.ai/" rel="noreferer noopener" target="_blank">OpenCode</a></p></td>
+<td><p>Built-in</p></td>
+<td><p>Partial coverage</p></td>
+<td><p>Pre-installed. Add <code class="docutils literal notranslate"><span class="pre">opencode.ai</span></code> endpoint and OpenCode binary paths to the policy for full functionality.</p></td>
+</tr>
+<tr class="row-even"><td><p><a class="reference external" href="https://developers.openai.com/codex" rel="noreferer noopener" target="_blank">Codex</a></p></td>
+<td><p>Built-in</p></td>
+<td><p>No coverage</p></td>
+<td><p>Pre-installed. Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires <code class="docutils literal notranslate"><span class="pre">OPENAI_API_KEY</span></code>.</p></td>
+</tr>
+<tr class="row-odd"><td><p><a class="reference external" href="https://openclaw.ai/" rel="noreferer noopener" target="_blank">OpenClaw</a></p></td>
+<td><p><a class="reference external" href="https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/openclaw" rel="noreferer noopener" target="_blank">OpenShell Community</a></p></td>
+<td><p>Bundled</p></td>
+<td><p>Agent orchestration layer. Launch with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">create</span> <span class="pre">--from</span> <span class="pre">openclaw</span></code>.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<!-- | [NemoClaw](https://github.com/NVIDIA/OpenShell-Community) | [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/nemoclaw) | Bundled | OpenClaw with NVIDIA DevX UI extension. Launch with `openshell sandbox create --from nemoclaw`. | -->
+</section>
+<section id="built-in-default-policy">
+<h2>Built-in Default Policy<a class="headerlink" href="#built-in-default-policy" title="Link to this heading">#</a></h2>
+<p>OpenShell ships a built-in policy that covers common agent workflows out of the box.
+When you create a sandbox without <code class="docutils literal notranslate"><span class="pre">--policy</span></code>, the default policy is applied. It controls three things:</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Layer</p></th>
+<th class="head"><p>What It Controls</p></th>
+<th class="head"><p>How It Works</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p>Filesystem</p></td>
+<td><p>What the agent can access on disk</p></td>
+<td><p>Paths are split into read-only and read-write sets. <a class="reference external" href="https://docs.kernel.org/security/landlock.html" rel="noreferer noopener" target="_blank">Landlock LSM</a> enforces these restrictions at the kernel level.</p></td>
+</tr>
+<tr class="row-odd"><td><p>Network</p></td>
+<td><p>What the agent can reach on the network</p></td>
+<td><p>Each policy block pairs allowed destinations (host and port) with allowed binaries (executable paths). The proxy matches every outbound connection to the binary that opened it. Both must match or the connection is denied.</p></td>
+</tr>
+<tr class="row-even"><td><p>Process</p></td>
+<td><p>What privileges the agent has</p></td>
+<td><p>The agent runs as an unprivileged user with seccomp filters that block dangerous system calls. No <code class="docutils literal notranslate"><span class="pre">sudo</span></code>, no <code class="docutils literal notranslate"><span class="pre">setuid</span></code>, no path to elevated privileges.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>For the full breakdown of each default policy block and agent compatibility details, refer to <a class="reference internal" href="../reference/default-policy.html"><span class="doc">Default Policy Reference</span></a>.</p>
+</section>
+<section id="policy-structure">
+<h2>Policy Structure<a class="headerlink" href="#policy-structure" title="Link to this heading">#</a></h2>
+<p>A policy has static sections (<code class="docutils literal notranslate"><span class="pre">filesystem_policy</span></code>, <code class="docutils literal notranslate"><span class="pre">landlock</span></code>, <code class="docutils literal notranslate"><span class="pre">process</span></code>) that are locked at sandbox creation, and dynamic sections (<code class="docutils literal notranslate"><span class="pre">network_policies</span></code>, <code class="docutils literal notranslate"><span class="pre">inference</span></code>) that are hot-reloadable on a running sandbox.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+
+<span class="c1"># Static: locked at sandbox creation. Paths the agent can read vs read/write.</span>
+<span class="nt">filesystem_policy</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">read_only</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/usr</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/lib</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/etc</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">read_write</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/sandbox</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/tmp</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.</span>
+<span class="nt">landlock</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">best_effort</span>
+
+<span class="c1"># Static: Unprivileged user/group the agent process runs as.</span>
+<span class="nt">process</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">run_as_user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+<span class="w">  </span><span class="nt">run_as_group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+
+<span class="c1"># Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.</span>
+<span class="nt">network_policies</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">my_api</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-api</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.example.com</span>
+<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
+<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+<span class="w">        </span><span class="nt">access</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">full</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/usr/bin/curl</span>
+
+<span class="c1"># Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).</span>
+<span class="nt">inference</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">allowed_routes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">local</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>For the complete structure and every field, refer to the <a class="reference internal" href="../reference/policy-schema.html"><span class="std std-doc">Policy Schema Reference</span></a>.</p>
+</section>
+<section id="network-access-rules">
+<h2>Network Access Rules<a class="headerlink" href="#network-access-rules" title="Link to this heading">#</a></h2>
+<p>Network access is controlled by policy blocks under <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries that are allowed to use those endpoints.</p>
+<p>Every outbound connection from the sandbox goes through the proxy:</p>
+<ul class="simple">
+<li><p>The proxy queries the <a class="reference internal" href="../about/architecture.html"><span class="doc">policy engine</span></a> with the destination (host and port) and the calling binary. A connection is allowed only when both match an entry in the same policy block.</p></li>
+<li><p>For endpoints with <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> and <code class="docutils literal notranslate"><span class="pre">tls:</span> <span class="pre">terminate</span></code>, each HTTP request is checked against that endpoint’s <code class="docutils literal notranslate"><span class="pre">rules</span></code> (method and path).</p></li>
+<li><p>If no endpoint matches and inference routes are configured, the request may be rerouted for inference.</p></li>
+<li><p>Otherwise the connection is denied. Endpoints without <code class="docutils literal notranslate"><span class="pre">protocol</span></code> or <code class="docutils literal notranslate"><span class="pre">tls</span></code> allow the TCP stream through without inspecting payloads.</p></li>
+</ul>
+</section>
+<section id="next-steps">
+<h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
+<p>Continue with one of the following:</p>
+<ul class="simple">
+<li><p>To create your first sandbox, refer to <a class="reference internal" href="create-and-manage.html"><span class="doc">Create and Manage Sandboxes</span></a>.</p></li>
+<li><p>To supply API keys or tokens, refer to <a class="reference internal" href="providers.html"><span class="doc">Providers</span></a>.</p></li>
+<li><p>To control what the agent can access, refer to <a class="reference internal" href="policies.html"><span class="doc">Customize Sandbox Policies</span></a>.</p></li>
+<li><p>To use a pre-built environment, refer to the <a class="reference internal" href="community-sandboxes.html"><span class="doc">Community Sandboxes</span></a> catalog.</p></li>
+</ul>
+</section>
+</section>
+
+
+                </article>
+              
+              
+              
+              
+              
+                <footer class="prev-next-footer d-print-none">
+                  
+<div class="prev-next-area">
+    <a class="left-prev"
+       href="../tutorials/github-sandbox.html"
+       title="previous page">
+      <i class="fa-solid fa-angle-left"></i>
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">previous</p>
+        <p class="prev-next-title">Set Up a Sandbox of Claude Code with a Custom GitHub Policy</p>
+      </div>
+    </a>
+    <a class="right-next"
+       href="create-and-manage.html"
+       title="next page">
+      <div class="prev-next-info">
+        <p class="prev-next-subtitle">next</p>
+        <p class="prev-next-title">Create and Manage Sandboxes</p>
+      </div>
+      <i class="fa-solid fa-angle-right"></i>
+    </a>
+</div>
+                </footer>
+              
+            </div>
+            
+            
+
+
+              
+                <dialog id="pst-secondary-sidebar-modal"></dialog>
+                <div id="pst-secondary-sidebar" class="bd-sidebar-secondary bd-toc"><div class="sidebar-secondary-items sidebar-secondary__inner">
+
+
+  <div class="sidebar-secondary-item">
+<div
+    id="pst-page-navigation-heading-2"
+    class="page-toc tocsection onthispage">
+    <i class="fa-solid fa-list"></i> On this page
+  </div>
+  <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
+    <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sandbox-lifecycle">Sandbox Lifecycle</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-agents">Supported Agents</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#built-in-default-policy">Built-in Default Policy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#policy-structure">Policy Structure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#network-access-rules">Network Access Rules</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
+</ul>
+  </nav></div>
+
+</div></div>
+              
+            
+
+          </div>
+          <footer class="bd-footer-content">
+            
+          </footer>
+        
+      </main>
+    </div>
+  </div>
+  
+
+  <!-- Scripts loaded after <body> so the DOM is not blocked -->
+  <script defer src="../_static/scripts/bootstrap.js?digest=8878045cc6db502f8baf"></script>
+<script defer src="../_static/scripts/pydata-sphinx-theme.js?digest=8878045cc6db502f8baf"></script>
+
+
+  <footer class="bd-footer">
+<div class="bd-footer__inner bd-page-width">
+  
+    <div class="footer-items__start">
+      
+        <div class="footer-item">
+<a class="footer-brand logo" href="https://www.nvidia.com">
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-blk-for-screen.svg" class="logo__image only-light" alt="NVIDIA"/>
+  <img src="../_static/nvidia-logo-horiz-rgb-1c-wht-for-screen.svg" class="logo__image only-dark" alt="NVIDIA"/>
+</a></div>
+      
+        <div class="footer-item">
+
+<div class="footer-links">
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-policy/">Privacy Policy</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/privacy-center/">Your Privacy Choices</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/terms-of-service/">Terms of Service</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/accessibility/">Accessibility</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/about-nvidia/company-policies/">Corporate Policies</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/product-security/">Product Security</a>
+   | 
+  
+  
+  
+  <a class="external" href="https://www.nvidia.com/en-us/contact/">Contact</a>
+  
+  
+  
+</div>
+</div>
+      
+        <div class="footer-item">
+
+
+
+
+  <p class="copyright">
+    
+      Copyright © 2025-2026, NVIDIA Corporation.
+      <br/>
+    
+  </p>
+</div>
+      
+    </div>
+  
+  
+  
+</div>
+
+  </footer>
+  </body>
+</html>
