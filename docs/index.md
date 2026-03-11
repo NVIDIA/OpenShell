@@ -196,7 +196,7 @@ Release Notes <about/release-notes>
 :hidden:
 
 Quickstart <get-started/quickstart>
-Sandboxing Agents with Custom GitHub Policies <tutorials/github-sandbox>
+Tutorial: GitHub Policy Iteration <tutorials/github-sandbox>
 ```
 
 ```{toctree}

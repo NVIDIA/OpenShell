@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from navigator import InferenceRouteClient, Sandbox, SandboxClient
+from openshell import InferenceRouteClient, Sandbox, SandboxClient
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -18,7 +18,7 @@ if TYPE_CHECKING:
 
 @pytest.fixture(scope="session")
 def cluster_name() -> str | None:
-    return os.environ.get("OPENSHELL_CLUSTER")
+    return os.environ.get("OPENSHELL_GATEWAY")
 
 
 @pytest.fixture(scope="session")

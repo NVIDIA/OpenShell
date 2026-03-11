@@ -86,21 +86,24 @@ RUN --mount=type=cache,id=cargo-registry-sandbox-${TARGETARCH},sharing=locked,ta
     cp "$(cross_output_dir "$RUST_BUILD_PROFILE")/navigator-sandbox" /build/out/
 
 # Stage 2: Python base (uses target platform)
-# Pin to specific Python patch + Debian release for reproducible builds.
-# CVE-2025-13836 (stdlib urllib Content-Length OOM) affects Python <= 3.12.13;
-# update to python:3.12.14-slim-bookworm (or later) when released.
-FROM python:3.12.13-slim-bookworm AS base
+# NVIDIA hardened Ubuntu base for supply chain consistency.
+# Ubuntu Noble ships Python 3.12 natively; install from default repos.
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS base
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
 WORKDIR /sandbox
 
-# Install system dependencies
-# iproute2 is needed for network namespace management (ip netns, veth pairs)
+# Install Python 3.12 and system dependencies.
+# python3.12-venv provides the venv module (required by uv venv).
+# iproute2 is needed for network namespace management (ip netns, veth pairs).
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.12 python3.12-venv python3.12-dev python3-pip \
     curl dnsutils iproute2 iputils-ping \
     net-tools netcat-openbsd traceroute \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
+    && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && rm -rf /var/lib/apt/lists/*
 
 # Create supervisor and sandbox users/groups
@@ -135,7 +138,7 @@ FROM base AS coding-agents
 # CVE-2026-21637, CVE-2025-59466, CVE-2025-59465, CVE-2025-55131 affect
 # Node.js <= 22.22.1. Update to 22.23.0+ when a patched release ships.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends build-essential git nodejs=22.22.1-1nodesource1 python3 nano && \
+    apt-get install -y --no-install-recommends build-essential git nodejs=22.22.1-1nodesource1 nano && \
     rm -rf /var/lib/apt/lists/*
 
 # Install GitHub CLI (gh) from the official apt repository
@@ -177,8 +180,8 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=rust-builder /build/out/navigator-sandbox /usr/local/bin/
 
-# Copy navigator Python SDK into the virtual environment
-COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
+# Copy openshell Python SDK into the virtual environment
+COPY python/openshell/ /app/.venv/lib/python3.12/site-packages/openshell/
 
 # Add venvs to PATH -- /sandbox/.venv (writable, user-installed packages)
 # takes priority over /app/.venv (read-only, build-time packages).

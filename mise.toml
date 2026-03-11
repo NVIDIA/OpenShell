@@ -19,6 +19,8 @@ uv = "0.10.2"
 protoc = "29.6"
 helm = "4.1.1"
 "ubi:mozilla/sccache" = { version = "0.14.0", matching = "sccache-v" }
+"ubi:anchore/syft" = { version = "1.42.2", matching = "syft_" }
+"ubi:EmbarkStudios/cargo-about" = "0.8.4"
 
 [env]
 _.path = ["{{config_root}}/scripts/bin"]
@@ -42,7 +44,7 @@ DOCKER_BUILDKIT = "1"
 
 [vars]
 # Python paths to include in formatting/linting
-python_paths = "python/ tasks/scripts/*.py"
+python_paths = "python/ tasks/scripts/*.py deploy/sbom/*.py"
 
 [task_config]
 includes = ["tasks/*.toml"]

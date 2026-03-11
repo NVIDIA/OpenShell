@@ -1,0 +1,101 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# SBOM generation, license resolution, and CSV export tasks
+#
+# Usage:
+#   mise run sbom          # generate SBOMs, resolve licenses, export CSVs
+#   mise run sbom:check    # advisory license check (for CI)
+
+[sbom]
+description = "Generate SBOMs, resolve licenses, and export CSVs to deploy/sbom/output/"
+depends = ["sbom:csv"]
+
+["sbom:generate"]
+description = "Generate CycloneDX SBOMs with Syft"
+hide = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTPUT_DIR="deploy/sbom/output"
+mkdir -p "$OUTPUT_DIR"
+
+VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
+
+echo "Generating SBOM for workspace (version ${VERSION})..."
+
+syft dir:. \
+  --exclude './.github/**' \
+  --exclude './.venv/**' \
+  --exclude './.cache/**' \
+  --output "cyclonedx-json=$OUTPUT_DIR/openshell-source-${VERSION}.cdx.json" \
+  --source-name openshell \
+  --source-version "$VERSION"
+
+echo ""
+echo "SBOM written to $OUTPUT_DIR/"
+ls -la "$OUTPUT_DIR"/*.cdx.json
+"""
+
+["sbom:resolve"]
+description = "Resolve missing licenses in SBOM JSON files via public registries"
+depends = ["sbom:generate"]
+hide = true
+run = "uv run python deploy/sbom/resolve_licenses.py"
+
+["sbom:csv"]
+description = "Convert SBOM JSON files to CSV"
+depends = ["sbom:resolve"]
+hide = true
+run = "uv run python deploy/sbom/sbom_to_csv.py"
+
+["sbom:check"]
+description = "Check SBOMs for unresolved licenses (advisory, non-blocking)"
+hide = true
+run = """
+#!/usr/bin/env bash
+set -euo pipefail
+
+OUTPUT_DIR="deploy/sbom/output"
+
+if [ ! -d "$OUTPUT_DIR" ] || [ -z "$(ls -A "$OUTPUT_DIR"/*.cdx.json 2>/dev/null)" ]; then
+  echo "No SBOM files found in $OUTPUT_DIR/. Run 'mise run sbom' first."
+  exit 0
+fi
+
+echo "Checking for unresolved licenses..."
+UNRESOLVED=0
+for f in "$OUTPUT_DIR"/*.cdx.json; do
+  COUNT=$(uv run python -c "
+import json, sys
+with open('$f') as fh:
+    sbom = json.load(fh)
+missing = 0
+for c in sbom.get('components', []):
+    lics = c.get('licenses', [])
+    if not lics:
+        missing += 1
+        continue
+    for e in lics:
+        lid = e.get('license', {}).get('id', '')
+        lname = e.get('license', {}).get('name', '')
+        if lid.startswith('sha256:') or lname.startswith('sha256:'):
+            missing += 1
+            break
+print(missing)
+")
+  if [ "$COUNT" -gt 0 ]; then
+    echo "  $(basename "$f"): $COUNT components with unresolved licenses"
+    UNRESOLVED=$((UNRESOLVED + COUNT))
+  fi
+done
+
+if [ "$UNRESOLVED" -gt 0 ]; then
+  echo ""
+  echo "WARNING: $UNRESOLVED total components with unresolved licenses."
+  echo "This is advisory -- not blocking the build."
+else
+  echo "All licenses resolved."
+fi
+"""

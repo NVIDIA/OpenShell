@@ -120,6 +120,59 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
+# Verify DNS is functional after proxy setup.
+# If resolution fails, the cluster will be unable to pull images and will
+# spin for minutes with opaque "Try again" errors. Log a clear marker so
+# the CLI polling loop can detect this early and fail fast.
+# ---------------------------------------------------------------------------
+
+# Check whether a string looks like an IP address (v4 or v6) with an
+# optional port suffix.  When the registry host is an IP literal, DNS
+# resolution is not required and we should skip the nslookup probe.
+is_ip_literal() {
+    # Strip an optional :port suffix
+    local host="${1%:*}"
+    # IPv4: digits and dots only
+    echo "$host" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' && return 0
+    # IPv6 (bare or bracketed)
+    echo "$host" | grep -qE '^\[?[0-9a-fA-F:]+\]?$' && return 0
+    return 1
+}
+
+verify_dns() {
+    local dns_target="${REGISTRY_HOST:-ghcr.io}"
+
+    # IP-literal registry hosts (e.g. 127.0.0.1:5000) don't need DNS.
+    if is_ip_literal "$dns_target"; then
+        echo "Registry host is an IP literal ($dns_target), skipping DNS probe"
+        return 0
+    fi
+
+    # Strip port suffix — nslookup doesn't understand host:port.
+    local lookup_host="${dns_target%%:*}"
+
+    local attempts=5
+    local i=1
+    while [ "$i" -le "$attempts" ]; do
+        if nslookup "$lookup_host" >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+if ! verify_dns; then
+    echo "DNS_PROBE_FAILED: cannot resolve ${REGISTRY_HOST:-ghcr.io} after DNS proxy setup"
+    echo "  resolv.conf: $(cat "$RESOLV_CONF")"
+    echo "  This usually means Docker DNS forwarding is broken."
+    echo "  Try restarting Docker or pruning networks: docker network prune -f"
+    # Don't exit — let k3s start so the Rust-side polling loop can detect the
+    # failure via the log marker and present a user-friendly diagnosis.
+fi
+
+# ---------------------------------------------------------------------------
 # Generate k3s private registry configuration
 # ---------------------------------------------------------------------------
 # Write registries.yaml so k3s/containerd can authenticate when pulling
@@ -258,6 +311,26 @@ if [ -d "$BUNDLED_MANIFESTS" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# GPU support: deploy NVIDIA device plugin when GPU_ENABLED=true
+# ---------------------------------------------------------------------------
+# When the cluster is started with --gpu, the bootstrap code sets
+# GPU_ENABLED=true. This copies the NVIDIA device plugin HelmChart CR into
+# the k3s manifests directory so the Helm controller installs it automatically.
+# The nvidia-container-runtime binary is already on PATH (baked into the image)
+# so k3s registers the "nvidia" RuntimeClass at startup.
+if [ "${GPU_ENABLED:-}" = "true" ]; then
+    echo "GPU support enabled — deploying NVIDIA device plugin"
+
+    GPU_MANIFESTS="/opt/openshell/gpu-manifests"
+    if [ -d "$GPU_MANIFESTS" ]; then
+        for manifest in "$GPU_MANIFESTS"/*.yaml; do
+            [ ! -f "$manifest" ] && continue
+            cp "$manifest" "$K3S_MANIFESTS/"
+        done
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Override image tag and pull policy for local development
 # ---------------------------------------------------------------------------
 # When IMAGE_TAG is set, replace the default ":latest" tag on all component
@@ -269,7 +342,7 @@ HELMCHART="/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
     target_tag="${IMAGE_TAG:-latest}"
     echo "Setting image repository base: ${IMAGE_REPO_BASE}"
-    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/server|" "$HELMCHART"
+    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
     sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${IMAGE_REPO_BASE}/sandbox:${target_tag}|" "$HELMCHART"
 fi
 
@@ -282,7 +355,7 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
     IFS=','
     for ref in $PUSH_IMAGE_REFS; do
         case "$ref" in
-            */server:*) server_image="$ref" ;;
+            */gateway:*) server_image="$ref" ;;
             */sandbox:*) sandbox_image="$ref" ;;
         esac
     done
@@ -373,6 +446,18 @@ else
     # Remove the placeholder line entirely so invalid YAML isn't left behind
     sed -i '/__CHART_CHECKSUM__/d' "$HELMCHART"
 fi
+
+# ---------------------------------------------------------------------------
+# Ensure flannel CNI directories exist
+# ---------------------------------------------------------------------------
+# k3s uses flannel as its default CNI. Flannel writes subnet configuration to
+# /run/flannel/subnet.env during startup. When running inside a Docker
+# container, /run/flannel/ may not exist, causing a race where kubelet tries
+# to create pod sandboxes before flannel can write the file. Without it, every
+# pod (including CoreDNS) fails with:
+#   plugin type="flannel" failed (add): failed to load flannel 'subnet.env'
+# Pre-creating the directory eliminates this failure mode.
+mkdir -p /run/flannel
 
 # Docker Desktop can briefly start the container before its bridge default route
 # is fully installed. k3s exits immediately in that state, so wait briefly for

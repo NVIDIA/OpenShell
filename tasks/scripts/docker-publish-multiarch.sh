@@ -157,7 +157,7 @@ resolve_dockerfile() {
 # ---------------------------------------------------------------------------
 echo "Building multi-arch component images..."
 LOCK_HASH=$(sha256_16 Cargo.lock)
-for component in sandbox server; do
+for component in sandbox gateway; do
   echo "Building ${IMAGE_PREFIX}${component} for ${PLATFORMS}..."
   BUILD_ARGS=""
   if [ "$component" = "sandbox" ]; then
@@ -218,7 +218,7 @@ if [ "$TAG_LATEST" = true ]; then
 fi
 
 if [ ${#TAGS_TO_APPLY[@]} -gt 0 ]; then
-  for component in sandbox server cluster; do
+  for component in sandbox gateway cluster; do
     FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}${component}"
     for tag in "${TAGS_TO_APPLY[@]}"; do
       if [ "${tag}" = "${IMAGE_TAG}" ]; then
@@ -236,7 +236,7 @@ fi
 echo ""
 echo "Done! Multi-arch images pushed to ${REGISTRY}:"
 echo "  ${REGISTRY}/${IMAGE_PREFIX}sandbox:${IMAGE_TAG}"
-echo "  ${REGISTRY}/${IMAGE_PREFIX}server:${IMAGE_TAG}"
+echo "  ${REGISTRY}/${IMAGE_PREFIX}gateway:${IMAGE_TAG}"
 echo "  ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:${IMAGE_TAG}"
 if [ "$TAG_LATEST" = true ]; then
   echo "  (all also tagged :latest)"

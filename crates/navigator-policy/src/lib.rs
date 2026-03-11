@@ -363,14 +363,20 @@ pub fn restrictive_default_policy() -> SandboxPolicy {
     }
 }
 
-/// Clear `run_as_user` / `run_as_group` from the policy's process section.
+/// Ensure the policy has `run_as_user: sandbox` and `run_as_group: sandbox`.
 ///
-/// Call this when a custom image is specified, since the image may lack the
-/// default "sandbox" user/group.
-pub fn clear_process_identity(policy: &mut SandboxPolicy) {
-    if let Some(ref mut process) = policy.process {
-        process.run_as_user = String::new();
-        process.run_as_group = String::new();
+/// If the process section is missing, or either field is empty, this fills in
+/// the required `"sandbox"` value. Call this before validation so that
+/// policies without an explicit process section get the correct default.
+pub fn ensure_sandbox_process_identity(policy: &mut SandboxPolicy) {
+    let process = policy
+        .process
+        .get_or_insert_with(|| ProcessPolicy::default());
+    if process.run_as_user.is_empty() {
+        process.run_as_user = "sandbox".into();
+    }
+    if process.run_as_group.is_empty() {
+        process.run_as_group = "sandbox".into();
     }
 }
 
@@ -387,8 +393,8 @@ const MAX_PATH_LENGTH: usize = 4096;
 /// A safety violation found in a sandbox policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PolicyViolation {
-    /// `run_as_user` or `run_as_group` is "root" or "0".
-    RootProcessIdentity { field: &'static str, value: String },
+    /// `run_as_user` or `run_as_group` is not "sandbox".
+    InvalidProcessIdentity { field: &'static str, value: String },
     /// A filesystem path contains `..` components.
     PathTraversal { path: String },
     /// A filesystem path is not absolute (does not start with `/`).
@@ -404,8 +410,8 @@ pub enum PolicyViolation {
 impl fmt::Display for PolicyViolation {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::RootProcessIdentity { field, value } => {
-                write!(f, "{field} cannot be '{value}' (root is not allowed)")
+            Self::InvalidProcessIdentity { field, value } => {
+                write!(f, "{field} must be 'sandbox', got '{value}'")
             }
             Self::PathTraversal { path } => {
                 write!(f, "path contains '..' traversal component: {path}")
@@ -439,7 +445,7 @@ impl fmt::Display for PolicyViolation {
 /// error vs. logged warning).
 ///
 /// Checks performed:
-/// - `run_as_user` / `run_as_group` must not be "root" or "0"
+/// - `run_as_user` / `run_as_group` must be "sandbox"
 /// - Filesystem paths must be absolute (start with `/`)
 /// - Filesystem paths must not contain `..` components
 /// - Read-write paths must not be overly broad (just `/`)
@@ -450,16 +456,18 @@ pub fn validate_sandbox_policy(
 ) -> std::result::Result<(), Vec<PolicyViolation>> {
     let mut violations = Vec::new();
 
-    // Check process identity
+    // Check process identity — must be "sandbox".
+    // `ensure_sandbox_process_identity` should be called before this to
+    // fill in defaults; anything other than "sandbox" is rejected.
     if let Some(ref process) = policy.process {
-        if is_root_identity(&process.run_as_user) {
-            violations.push(PolicyViolation::RootProcessIdentity {
+        if process.run_as_user != "sandbox" {
+            violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 value: process.run_as_user.clone(),
             });
         }
-        if is_root_identity(&process.run_as_group) {
-            violations.push(PolicyViolation::RootProcessIdentity {
+        if process.run_as_group != "sandbox" {
+            violations.push(PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_group",
                 value: process.run_as_group.clone(),
             });
@@ -517,15 +525,6 @@ pub fn validate_sandbox_policy(
     } else {
         Err(violations)
     }
-}
-
-/// Check if a user/group identity string refers to root.
-fn is_root_identity(value: &str) -> bool {
-    if value.is_empty() {
-        return false;
-    }
-    let trimmed = value.trim();
-    trimmed == "root" || trimmed == "0"
 }
 
 /// Truncate a string for safe inclusion in error messages.
@@ -724,13 +723,35 @@ network_policies:
     }
 
     #[test]
-    fn clear_process_identity_clears_fields() {
+    fn ensure_sandbox_process_identity_fills_defaults() {
         let mut policy = restrictive_default_policy();
-        assert_eq!(policy.process.as_ref().unwrap().run_as_user, "sandbox");
-        clear_process_identity(&mut policy);
+        policy.process = None;
+        ensure_sandbox_process_identity(&mut policy);
         let proc = policy.process.unwrap();
-        assert!(proc.run_as_user.is_empty());
-        assert!(proc.run_as_group.is_empty());
+        assert_eq!(proc.run_as_user, "sandbox");
+        assert_eq!(proc.run_as_group, "sandbox");
+    }
+
+    #[test]
+    fn ensure_sandbox_process_identity_fills_empty_strings() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: String::new(),
+            run_as_group: String::new(),
+        });
+        ensure_sandbox_process_identity(&mut policy);
+        let proc = policy.process.unwrap();
+        assert_eq!(proc.run_as_user, "sandbox");
+        assert_eq!(proc.run_as_group, "sandbox");
+    }
+
+    #[test]
+    fn ensure_sandbox_process_identity_preserves_sandbox() {
+        let mut policy = restrictive_default_policy();
+        ensure_sandbox_process_identity(&mut policy);
+        let proc = policy.process.unwrap();
+        assert_eq!(proc.run_as_user, "sandbox");
+        assert_eq!(proc.run_as_group, "sandbox");
     }
 
     #[test]
@@ -750,7 +771,7 @@ network_policies:
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert!(violations.iter().any(|v| matches!(
             v,
-            PolicyViolation::RootProcessIdentity {
+            PolicyViolation::InvalidProcessIdentity {
                 field: "run_as_user",
                 ..
             }
@@ -766,6 +787,28 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
+    }
+
+    #[test]
+    fn validate_rejects_non_sandbox_user() {
+        let mut policy = restrictive_default_policy();
+        policy.process = Some(ProcessPolicy {
+            run_as_user: "nobody".into(),
+            run_as_group: "nogroup".into(),
+        });
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert_eq!(violations.len(), 2);
+        assert!(
+            violations
+                .iter()
+                .all(|v| matches!(v, PolicyViolation::InvalidProcessIdentity { .. }))
+        );
+    }
+
+    #[test]
+    fn validate_accepts_sandbox_identity() {
+        let policy = restrictive_default_policy();
+        assert!(validate_sandbox_policy(&policy).is_ok());
     }
 
     #[test]
@@ -835,13 +878,14 @@ network_policies:
     }
 
     #[test]
-    fn validate_accepts_empty_run_as_user() {
+    fn validate_rejects_empty_run_as_user() {
         let mut policy = restrictive_default_policy();
         policy.process = Some(ProcessPolicy {
             run_as_user: String::new(),
             run_as_group: String::new(),
         });
-        assert!(validate_sandbox_policy(&policy).is_ok());
+        let violations = validate_sandbox_policy(&policy).unwrap_err();
+        assert_eq!(violations.len(), 2);
     }
 
     #[test]
@@ -893,12 +937,13 @@ network_policies:
 
     #[test]
     fn policy_violation_display() {
-        let v = PolicyViolation::RootProcessIdentity {
+        let v = PolicyViolation::InvalidProcessIdentity {
             field: "run_as_user",
             value: "root".into(),
         };
         let s = format!("{v}");
         assert!(s.contains("root"));
         assert!(s.contains("run_as_user"));
+        assert!(s.contains("sandbox"));
     }
 }

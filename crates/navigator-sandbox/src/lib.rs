@@ -165,7 +165,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (mut policy, opa_engine) = load_policy(
+    let (policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         sandbox,
         navigator_endpoint.clone(),
@@ -174,13 +174,10 @@ pub async fn run_sandbox(
     )
     .await?;
 
-    // When no run_as_user/group is configured (e.g. custom/community images
-    // where the CLI cleared identity) and the supervisor is running as root
-    // (forced via runAsUser: 0 in the pod spec), auto-detect the image's
-    // intended sandbox user. This prevents child processes from running as
-    // root unnecessarily.
+    // Validate that the required "sandbox" user exists in this image.
+    // All sandbox images must include this user for privilege dropping.
     #[cfg(unix)]
-    maybe_infer_sandbox_user(&mut policy);
+    validate_sandbox_user(&policy)?;
 
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
@@ -1065,61 +1062,36 @@ fn discover_policy_from_path(path: &std::path::Path) -> navigator_core::proto::S
     }
 }
 
-/// When the policy has no `run_as_user`/`run_as_group` and the supervisor is
-/// running as root, try to detect the image's intended non-root user for
-/// child process privilege dropping.
+/// Validate that the `sandbox` user exists in this image.
 ///
-/// This handles the BYOC / community-image case where the CLI clears
-/// `run_as_user` (to avoid failures if the default "sandbox" user doesn't
-/// exist), but the K8s pod spec forces `runAsUser: 0` so the supervisor can
-/// perform privileged setup. Without this, child processes would inherit
-/// root — undermining the image author's security intent.
-///
-/// Detection strategy: look for a `sandbox` user in `/etc/passwd`. This is
-/// the conventional non-root user in OpenShell sandbox images.
+/// All sandbox images must include a `sandbox` user for privilege dropping.
+/// This check runs at supervisor startup (inside the container) where we can
+/// inspect `/etc/passwd`. If the user is missing, the sandbox fails fast
+/// with a clear error instead of silently running child processes as root.
 #[cfg(unix)]
-fn maybe_infer_sandbox_user(policy: &mut SandboxPolicy) {
-    use nix::unistd::{Uid, User};
+fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
+    use nix::unistd::User;
 
-    // Only infer when both fields are empty and we're running as root.
-    let has_user = policy
-        .process
-        .run_as_user
-        .as_ref()
-        .is_some_and(|u| !u.is_empty());
-    let has_group = policy
-        .process
-        .run_as_group
-        .as_ref()
-        .is_some_and(|g| !g.is_empty());
-    if has_user || has_group || !Uid::effective().is_root() {
-        return;
+    let user_name = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
+
+    if user_name.is_empty() || user_name == "sandbox" {
+        match User::from_name("sandbox") {
+            Ok(Some(_)) => {
+                info!("Validated 'sandbox' user exists in image");
+            }
+            Ok(None) => {
+                return Err(miette::miette!(
+                    "sandbox user 'sandbox' not found in image; \
+                     all sandbox images must include a 'sandbox' user and group"
+                ));
+            }
+            Err(e) => {
+                return Err(miette::miette!("failed to look up 'sandbox' user: {e}"));
+            }
+        }
     }
 
-    // Check if a "sandbox" user exists in the image.
-    match User::from_name("sandbox") {
-        Ok(Some(_)) => {
-            info!(
-                "Policy has no run_as_user but image has 'sandbox' user; \
-                 inferring run_as_user=sandbox, run_as_group=sandbox"
-            );
-            policy.process.run_as_user = Some("sandbox".to_string());
-            policy.process.run_as_group = Some("sandbox".to_string());
-        }
-        Ok(None) => {
-            warn!(
-                "Policy has no run_as_user and image has no 'sandbox' user; \
-                 child processes will run as root. Set process.run_as_user in \
-                 your sandbox policy to specify a non-root user."
-            );
-        }
-        Err(e) => {
-            warn!(
-                error = %e,
-                "Failed to look up 'sandbox' user; child processes will run as root"
-            );
-        }
-    }
+    Ok(())
 }
 
 /// Prepare filesystem for the sandboxed process.

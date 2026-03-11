@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# HelmChart CR for auto-deploying the NVIDIA k8s-device-plugin via k3s Helm controller.
+# This manifest is conditionally copied into /var/lib/rancher/k3s/server/manifests/
+# by the cluster entrypoint when GPU_ENABLED=true.
+#
+# The chart installs:
+#   - NVIDIA device plugin DaemonSet (advertises nvidia.com/gpu resources)
+#   - GPU Feature Discovery (labels nodes with GPU properties)
+#   - Node Feature Discovery (dependency for GFD)
+#
+# k3s auto-detects nvidia-container-runtime on PATH and registers the "nvidia"
+# RuntimeClass automatically, so no manual RuntimeClass manifest is needed.
+
+apiVersion: helm.cattle.io/v1
+kind: HelmChart
+metadata:
+  name: nvidia-device-plugin
+  namespace: kube-system
+spec:
+  repo: https://nvidia.github.io/k8s-device-plugin
+  chart: nvidia-device-plugin
+  version: "0.18.2"
+  targetNamespace: nvidia-device-plugin
+  createNamespace: true
+  valuesContent: |-
+    runtimeClassName: nvidia
+    gfd:
+      enabled: true
+    nfd:
+      enabled: true

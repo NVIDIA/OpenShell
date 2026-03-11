@@ -4,7 +4,7 @@ on:
   workflow_call:
     inputs:
       component:
-        description: "Component to build (server, sandbox, cluster)"
+        description: "Component to build (gateway, sandbox, cluster)"
         required: true
         type: string
       timeout-minutes:

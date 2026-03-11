@@ -15,7 +15,7 @@ from urllib.parse import urlparse
 
 import grpc
 
-from navigator._proto import (
+from ._proto import (
     datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
@@ -151,8 +151,9 @@ class SandboxClient:
         metadata_path = (
             _xdg_config_home()
             / "openshell"
-            / "clusters"
-            / f"{cluster_name}_metadata.json"
+            / "gateways"
+            / cluster_name
+            / "metadata.json"
         )
         metadata = json.loads(metadata_path.read_text())
         parsed = urlparse(metadata["gateway_endpoint"])
@@ -161,7 +162,7 @@ class SandboxClient:
         endpoint = f"{host}:{port}"
         if parsed.scheme == "https":
             mtls_dir = (
-                _xdg_config_home() / "openshell" / "clusters" / cluster_name / "mtls"
+                _xdg_config_home() / "openshell" / "gateways" / cluster_name / "mtls"
             )
             tls = TlsConfig(
                 ca_path=mtls_dir / "ca.crt",
@@ -599,11 +600,11 @@ def _xdg_config_home() -> pathlib.Path:
 
 
 def _resolve_active_cluster() -> str:
-    env_cluster = os.environ.get("OPENSHELL_CLUSTER")
-    if env_cluster:
-        return env_cluster
-    active_file = _xdg_config_home() / "openshell" / "active_cluster"
+    env_gateway = os.environ.get("OPENSHELL_GATEWAY")
+    if env_gateway:
+        return env_gateway
+    active_file = _xdg_config_home() / "openshell" / "active_gateway"
     value = active_file.read_text().strip()
     if value == "":
-        raise SandboxError("no active cluster configured")
+        raise SandboxError("no active gateway configured")
     return value

@@ -1,8 +1,8 @@
 ---
 title:
-  page: Set Up a Sandbox with Custom GitHub Policies
+  page: Set Up a Sandbox of Claude Code with a Custom GitHub Policy
   nav: GitHub Sandbox Tutorial
-description: Configure a sandbox with per-repository GitHub access policies and credential providers for Claude Code.
+description: Learn the iterative policy workflow by launching a sandbox, diagnosing a GitHub access denial, and applying a custom policy to fix it.
 topics:
 - Generative AI
 - Cybersecurity
@@ -12,7 +12,6 @@ tags:
 - Sandbox
 - Policy
 - Claude Code
-- Credential Provider
 content:
   type: how_to
   difficulty: technical_intermediate
@@ -27,61 +26,132 @@ content:
 
 # Set Up a Sandbox of Claude Code with a Custom GitHub Policy
 
-This tutorial walks through configuring a sandbox that grants different access levels to two GitHub repositories and enforces these rules at the network layer. The sandbox runs Claude Code as the agent.
+This tutorial walks through the iterative policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, get blocked by the default network policy, diagnose the denial from two angles — the OpenShell Terminal on your laptop and the sandbox logs from inside — and then apply a custom policy to fix it, all without recreating the sandbox.
 
-The tutorial uses the following two example repositories for illustration purposes.
+After completing this tutorial, you will have:
 
-- A `alpha-repo` repository with read-write access. The agent can clone, push, and call mutating GitHub API endpoints such as pull requests, issues, and comments.
-- A `bravo-repo` repository with read-only access. The agent can clone and fetch, but push operations and mutating API calls are denied.
-- All other GitHub repositories are denied by default. No clone, fetch, or API call to an unlisted repository is allowed.
+- A running sandbox with Claude Code that can push to a GitHub repository.
+- A custom network policy that grants GitHub access for a specific repository.
+- Experience with the policy iteration workflow: fail, diagnose, update, verify.
 
-After completing this tutorial, the sandbox environment includes the following:
-
-- A GitHub credential provider that injects your GitHub token into the sandbox at runtime.
-- A network policy that extends the default policy with per-repository GitHub access rules.
-- A running sandbox in which Claude Code operates under the defined access constraints.
+:::{note}
+This tutorial shows example prompts and responses from Claude Code. The exact wording you see may differ between sessions — use the examples as a guide for the type of interaction, not as expected output.
+:::
 
 ## Prerequisites
 
 This tutorial requires the following:
 
 - Completed the {doc}`Quickstart </get-started/quickstart>` tutorial.
-- A GitHub personal access token (PAT) with `repo` scope, exported as `GITHUB_TOKEN`.
-- An agent API key configured in the environment. For example, `ANTHROPIC_API_KEY` for Claude Code.
+- A GitHub personal access token (PAT) with `repo` scope. To create one, go to [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens), select **Generate new token (classic)**, check the `repo` scope, and copy the token.
 
-## Create a GitHub Provider
+  :::{tip}
+  Instead of pasting the token into Claude during the tutorial, use a {doc}`credential provider </sandboxes/providers>` to inject it into the sandbox automatically at startup:
 
-In this section, you learn how to create a GitHub provider that injects your token into the sandbox at runtime.
+  ```console
+  $ openshell provider create --name my-github --type github --from-existing
+  $ openshell sandbox create --provider my-github --keep -- claude
+  ```
 
-:::{admonition} Already have a sandbox running?
-:class: tip
+  The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox so Claude can use it directly.
+  :::
 
-If you completed the Quickstart tutorial and have the default sandbox without a GitHub provider, there are two options to add the provider.
+- Your own [Anthropic account](https://console.anthropic.com/) for Claude Code. OpenShell provides the sandbox, not the agent — you need your own account to log in to Claude Code.
+- A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can [create a new repository](https://github.com/new) with a README if you do not have one handy.
 
-- **Option 1**: Recreate with a provider. Delete the existing sandbox, create the provider below, then recreate the sandbox with `--provider my-github`.
-- **Option 2**: Inject the token manually. Connect with `openshell sandbox connect <name>` and run `export GITHUB_TOKEN=<your-token>`. This bypasses the provider workflow. Note that the token does not persist across sandbox recreations.
+:::{important}
+This tutorial uses two terminals throughout:
+
+- **Terminal 1 (sandbox)** — The terminal where you launch the sandbox. Claude Code runs here. You interact with the agent in this terminal.
+- **Terminal 2 (laptop)** — A separate terminal on your laptop. You use this for `openshell term`, `openshell policy set`, and other CLI commands that manage the sandbox from the outside.
+
+Each section below indicates which terminal to use.
 :::
 
-Create a provider that sources your GitHub token from the host environment:
+## Launch the Sandbox
+
+**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically:
 
 ```console
-$ openshell provider create --name my-github --type github --from-existing
+$ openshell sandbox create --keep -- claude
 ```
 
-This command reads `GITHUB_TOKEN` (and `GH_TOKEN` if set) from the current shell session and stores them in the provider configuration. At sandbox startup, the provider injects these values as environment variables into the container.
+The `--keep` flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.
 
-For additional provider types, refer to {doc}`/sandboxes/providers`.
+Claude Code starts inside the sandbox. Log in through your preferred authentication method and trust the `/sandbox` workspace when prompted.
 
-## Write the Policy
+## Push Code to GitHub
 
-In this section, you learn how to write a policy that extends the default policy with per-repository GitHub access rules.
+**Terminal 1 (sandbox)** — Ask Claude Code to write a simple script and push it to your repository:
 
-Run the following command to create a file named `github-policy.yaml` with policy blocks. This policy extends the {doc}`default policy </reference/default-policy>` and overrides the GitHub network blocks with per-repository rules. The `alpha-repo` receives read-write access, the `bravo-repo` receives read-only access, and all other repositories are denied by default.
+```text
+Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
+```
 
-Replace every occurrence of `<org>` with your GitHub organization or username.
+Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.
+
+The push fails. Claude reports an error — but the failure is not an authentication problem. The default sandbox policy does not permit outbound requests to GitHub, so the proxy blocks the connection before the request reaches GitHub's servers.
+
+## Diagnose the Denial
+
+### View the logs from your laptop
+
+**Terminal 2 (laptop)** — Open a separate terminal on your laptop and launch the OpenShell Terminal:
 
 ```console
-$ cat << 'EOF' > github-policy.yaml
+$ openshell term
+```
+
+The dashboard shows sandbox status and a live stream of policy decisions. Look for entries with `l7_decision=deny`. Select a deny entry to see the full detail:
+
+```text
+l7_action:      PUT
+l7_target:      /repos/<org>/<repo>/contents/hello_world.py
+l7_decision:    deny
+dst_host:       api.github.com
+dst_port:       443
+l7_protocol:    rest
+policy:         github_rest_api
+l7_deny_reason: PUT /repos/<org>/<repo>/contents/hello_world.py not permitted by policy
+```
+
+The log shows that the sandbox proxy intercepted an outbound `PUT` request to `api.github.com` and denied it. The `github_rest_api` policy allows read operations (GET) but blocks write operations (PUT, POST, DELETE) to the GitHub API. A similar denial appears for `github.com` if Claude attempted a git push over HTTPS.
+
+### Ask Claude to check the sandbox logs
+
+**Terminal 1 (sandbox)** — Switch back to Claude Code. Ask it to check the sandbox logs for denied requests:
+
+```text
+Check the sandbox logs for any denied network requests. What is blocking the push?
+```
+
+Claude reads the deny entries and identifies the root cause. It explains that the failure is a sandbox network policy restriction, not a token permissions issue:
+
+> The sandbox runs a proxy that enforces policies on outbound traffic. The
+> `github_rest_api` policy allows GET requests (used to read the file) but blocks
+> PUT/write requests to GitHub. This is a sandbox-level restriction, not a token
+> issue — no matter what token you provide, pushes via the API will be blocked
+> until the policy is updated.
+
+Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.
+
+## Update the Policy from Your Laptop
+
+**Terminal 2 (laptop)** — Ask your coding agent (for example, Claude Code or Cursor running on your laptop) to recommend a policy update based on the denied requests and apply it to the running sandbox.
+
+The agent inspects the deny reasons, writes an updated policy that adds `github_git` and `github_api` blocks for your repository, and runs `openshell policy set` to apply it:
+
+```console
+$ openshell policy set <sandbox-name> --policy /tmp/sandbox-policy-update.yaml --wait
+```
+
+Your coding agent generates both the policy file and this command. Network policies are hot-reloadable — the `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
+
+:::{dropdown} Full reference policy
+
+The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. This is representative of what a coding agent generates when asked to unblock GitHub pushes. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
+
+```yaml
 version: 1
 
 # ── Static (locked at sandbox creation) ──────────────────────────
@@ -146,23 +216,15 @@ network_policies:
         tls: terminate
         enforcement: enforce
         rules:
-          # alpha-repo: clone, fetch, and push
           - allow:
               method: GET
-              path: "/<org>/alpha-repo.git/info/refs*"
+              path: "/<org>/<repo>.git/info/refs*"
           - allow:
               method: POST
-              path: "/<org>/alpha-repo.git/git-upload-pack"
+              path: "/<org>/<repo>.git/git-upload-pack"
           - allow:
               method: POST
-              path: "/<org>/alpha-repo.git/git-receive-pack"
-          # bravo-repo: clone and fetch only (no push)
-          - allow:
-              method: GET
-              path: "/<org>/bravo-repo.git/info/refs*"
-          - allow:
-              method: POST
-              path: "/<org>/bravo-repo.git/git-upload-pack"
+              path: "/<org>/<repo>.git/git-receive-pack"
     binaries:
       - { path: /usr/bin/git }
 
@@ -181,20 +243,10 @@ network_policies:
           - allow:
               method: POST
               path: "/graphql"
-          # alpha-repo: full read-write (PRs, issues, comments, etc.)
+          # Full read-write access to the repository
           - allow:
               method: "*"
-              path: "/repos/<org>/alpha-repo/**"
-          # bravo-repo: read-only
-          - allow:
-              method: GET
-              path: "/repos/<org>/bravo-repo/**"
-          - allow:
-              method: HEAD
-              path: "/repos/<org>/bravo-repo/**"
-          - allow:
-              method: OPTIONS
-              path: "/repos/<org>/bravo-repo/**"
+              path: "/repos/<org>/<repo>/**"
     binaries:
       - { path: /usr/local/bin/claude }
       - { path: /usr/local/bin/opencode }
@@ -237,109 +289,34 @@ network_policies:
       - { path: /usr/bin/wget }
       - { path: "/sandbox/.vscode-server/**" }
       - { path: "/sandbox/.vscode-remote-containers/**" }
-EOF
 ```
 
-The following table summarizes the behavior of the GitHub policy blocks.
+The following table summarizes the two GitHub-specific blocks:
 
 | Block | Endpoint | Behavior |
 |---|---|---|
-| `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch) for both repositories. Permits `git-receive-pack` (push) for `alpha-repo` only. Denies all operations on unlisted repositories. |
-| `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for `alpha-repo`. Restricts `bravo-repo` to GET, HEAD, and OPTIONS (read-only). Denies API access to unlisted repositories. |
+| `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch), `git-upload-pack` (fetch data), and `git-receive-pack` (push) for the specified repository. Denies all operations on unlisted repositories. |
+| `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories. |
 
 The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. Sandbox behavior outside of GitHub operations is unchanged.
 
-For details on network policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+:::
 
-## Create the Sandbox
+## Retry the Push
 
-Run the following command to create the sandbox with the GitHub provider, the custom policy applied, and Claude Code running inside the sandbox:
-
-```console
-$ openshell sandbox create \
-    --provider my-github \
-    --policy github-policy.yaml \
-    --keep \
-    -- claude
-```
-
-The `--keep` flag keeps the sandbox running after Claude Code exits. With this flag, you can reconnect to the same sandbox or apply policy updates without recreating the environment.
-
-## Verify Access
-
-With Claude Code running inside the sandbox, validate that the policy enforces the expected access levels for each repository.
-
-### Verify Read-Write Access
-
-Instruct Claude to clone, commit, and push to `alpha-repo`:
+**Terminal 1 (sandbox)** — Switch back to Claude Code and ask it to retry the push:
 
 ```text
-Clone https://github.com/<org>/alpha-repo.git, add a blank line to the
-README.md file, commit, and push.
+The sandbox policy has been updated. Try pushing to the repository again.
 ```
 
-The clone, commit, and push operations should complete successfully. Verify that the sandbox logs contain `action=allow` entries for `github.com` (the git push) and `api.github.com` (any associated API calls).
-
-### Verify Read-Only Enforcement
-
-Instruct Claude to perform the same operations on `bravo-repo`:
-
-```text
-Clone https://github.com/<org>/bravo-repo.git, add a blank line to the
-README.md file, commit, and push.
-```
-
-The clone operation succeeds because the policy permits read access. The push operation fails because the proxy denies `git-receive-pack` for `bravo-repo`. Verify the denial by inspecting the sandbox logs:
-
-```console
-$ openshell logs <sandbox-name> --tail --source sandbox
-```
-
-The output contains an `action=deny` entry with `host=github.com` and `path=/<org>/bravo-repo.git/git-receive-pack`.
-
-### Verify API Scoping
-
-Instruct Claude to create a GitHub issue on each repository:
-
-```text
-Create a GitHub issue titled "Test from sandbox" on <org>/alpha-repo.
-Then try to create the same issue on <org>/bravo-repo.
-```
-
-Expected result is that the issue is created on `alpha-repo`. The request to `bravo-repo` is denied because the policy restricts that repository to GET, HEAD, and OPTIONS methods. The POST required to create an issue is blocked by the proxy.
-
-## Iterate on the Policy
-
-In this section, you learn how to iterate on the policy to modify repository access or add new repositories.
-
-Network policies support hot-reloading. To modify repository access or add new repositories, edit `github-policy.yaml` and run the following command to apply the updated policy to the running sandbox:
-
-```console
-$ openshell policy set <sandbox-name> --policy github-policy.yaml --wait
-```
-
-For example, to change the access level of `bravo-repo` from read-only to read-write, add the following rule under `github_api`:
-
-```yaml
-          - allow:
-              method: "*"
-              path: "/repos/<org>/bravo-repo/**"
-```
-
-Then add the corresponding push rule under `github_git`:
-
-```yaml
-          - allow:
-              method: POST
-              path: "/<org>/bravo-repo.git/git-receive-pack"
-```
-
-For the complete policy iteration workflow (pull, edit, push, verify), refer to {doc}`/sandboxes/policies`.
+The push completes successfully. The `openshell term` dashboard now shows `l7_decision=allow` entries for `api.github.com` and `github.com` where it previously showed denials.
 
 ## Next Steps
 
 The following resources cover related topics in greater depth:
 
-- To configure additional credential types, refer to {doc}`/sandboxes/providers`.
-- To iterate on policy configuration, refer to {doc}`/sandboxes/policies`.
-- To view the policy YAML specification, refer to the [Policy Schema Reference](/reference/policy-schema.md).
+- To add per-repository access levels (read-write vs read-only) or restrict to specific API methods, refer to the [Policy Schema Reference](/reference/policy-schema.md).
+- To learn the full policy iteration workflow (pull, edit, push, verify), refer to {doc}`/sandboxes/policies`.
+- To inject credentials automatically instead of pasting tokens, refer to {doc}`/sandboxes/providers`.

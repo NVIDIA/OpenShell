@@ -410,13 +410,9 @@ async fn cli_requires_client_cert_for_https() {
     let addr = run_server(server_cert, server_key, ca_cert.clone()).await;
 
     let dir = tempdir().unwrap();
-    let cluster_name = dir
-        .path()
-        .file_name()
-        .unwrap()
-        .to_string_lossy()
-        .to_string();
-    let _env = EnvVarGuard::set("OPENSHELL_CLUSTER_NAME", &cluster_name);
+    // Point XDG_CONFIG_HOME at the isolated temp dir so that default_tls_dir
+    // cannot discover real client certs from the developer's machine.
+    let _xdg_env = EnvVarGuard::set("XDG_CONFIG_HOME", &dir.path().to_string_lossy());
     let ca_path = dir.path().join("ca.crt");
     std::fs::write(&ca_path, ca_cert).unwrap();
 

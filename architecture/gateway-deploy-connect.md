@@ -12,8 +12,8 @@ When any CLI command needs to talk to the gateway, it resolves the target throug
 
 1. `--gateway-endpoint <URL>` flag (direct URL, reusing stored metadata when the gateway is known).
 2. `--cluster <NAME>` / `-g <NAME>` flag.
-3. `OPENSHELL_CLUSTER` environment variable.
-4. Active cluster from `~/.config/openshell/active_cluster`.
+3. `OPENSHELL_GATEWAY` environment variable.
+4. Active gateway from `~/.config/openshell/active_gateway`.
 
 Resolution loads `ClusterMetadata` from disk to get the `gateway_endpoint` URL and `auth_mode`. When `--gateway-endpoint` is used, the CLI still tries to match the URL to stored metadata so edge auth tokens and TLS bundles continue to resolve by cluster name.
 

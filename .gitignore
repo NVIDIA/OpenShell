@@ -96,8 +96,8 @@ dmypy.json
 cython_debug/
 
 # Generated Python protobuf stubs (keep package marker)
-python/navigator/_proto/*
-!python/navigator/_proto/__init__.py
+python/openshell/_proto/*
+!python/openshell/_proto/__init__.py
 
 # =============================================================================
 # IDE / Editor
@@ -183,6 +183,9 @@ _build/
 
 # Docker build artifacts (image tarballs, packaged helm charts)
 deploy/docker/.build/
+
+# SBOM generated output (JSON, CSV) — release artifacts, not committed
+deploy/sbom/output/
 
 # Local mise settings
 mise.local.toml

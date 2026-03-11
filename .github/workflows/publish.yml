@@ -14,10 +14,10 @@ defaults:
     shell: bash
 
 jobs:
-  build-server:
+  build-gateway:
     uses: ./.github/workflows/docker-build.yml
     with:
-      component: server
+      component: gateway
 
   build-sandbox:
     uses: ./.github/workflows/docker-build.yml
@@ -31,7 +31,7 @@ jobs:
 
   tag-ghcr-latest:
     name: Tag GHCR Images as Latest
-    needs: [build-server, build-sandbox, build-cluster]
+    needs: [build-gateway, build-sandbox, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -42,7 +42,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          for component in server sandbox cluster; do
+          for component in gateway sandbox cluster; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as latest..."
             docker buildx imagetools create \
               --prefer-index=false \
@@ -52,7 +52,7 @@ jobs:
 
   build-python-wheels:
     name: Stage Python Wheels
-    needs: [build-server, build-sandbox, build-cluster]
+    needs: [build-gateway, build-sandbox, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 120
     outputs:

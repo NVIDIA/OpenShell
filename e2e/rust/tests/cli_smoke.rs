@@ -20,7 +20,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
-        .env_remove("OPENSHELL_CLUSTER")
+        .env_remove("OPENSHELL_GATEWAY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
@@ -144,23 +144,4 @@ async fn status_without_gateway_prints_friendly_message() {
     );
 }
 
-// -------------------------------------------------------------------
-// Hidden backwards-compat: `cluster admin deploy` is still parseable
-// -------------------------------------------------------------------
 
-/// `openshell cluster admin deploy --help` should still work (hidden alias).
-#[tokio::test]
-async fn cluster_admin_deploy_help_is_accessible() {
-    let (output, code) = run_isolated(&["cluster", "admin", "deploy", "--help"]).await;
-    assert_eq!(
-        code, 0,
-        "cluster admin deploy --help should exit 0:\n{output}"
-    );
-
-    let clean = strip_ansi(&output);
-    // Should show the deploy options (name, remote, ssh-key, etc.)
-    assert!(
-        clean.contains("--name") || clean.contains("--remote"),
-        "expected deploy flags in cluster admin deploy --help:\n{clean}"
-    );
-}

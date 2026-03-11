@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell CLI library.
+//! `OpenShell` CLI library.
 //!
-//! This crate provides the CLI implementation for OpenShell.
+//! This crate provides the CLI implementation for `OpenShell`.
 
 #[cfg(test)]
 pub(crate) static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

@@ -107,15 +107,15 @@ else
   RESOLVED_GATEWAY_PORT=8080
 fi
 
-OPENSHELL_CLUSTER=${OPENSHELL_CLUSTER:-${CLUSTER_NAME}}
+OPENSHELL_GATEWAY=${OPENSHELL_GATEWAY:-${CLUSTER_NAME}}
 GATEWAY_PORT=${RESOLVED_GATEWAY_PORT}
 
 append_env_if_missing "GATEWAY_PORT" "${GATEWAY_PORT}"
-append_env_if_missing "OPENSHELL_CLUSTER" "${OPENSHELL_CLUSTER}"
+append_env_if_missing "OPENSHELL_GATEWAY" "${OPENSHELL_GATEWAY}"
 
 export CLUSTER_NAME
 export GATEWAY_PORT
-export OPENSHELL_CLUSTER
+export OPENSHELL_GATEWAY
 
 is_local_registry_host() {
   [ "${REGISTRY_HOST}" = "127.0.0.1:5000" ] || [ "${REGISTRY_HOST}" = "localhost:5000" ]
@@ -223,7 +223,7 @@ fi
 if [ "${SKIP_IMAGE_PUSH:-}" = "1" ]; then
   echo "Skipping image push (SKIP_IMAGE_PUSH=1; images already in registry)."
 elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
-  for component in server sandbox; do
+  for component in gateway sandbox; do
     tasks/scripts/cluster-push-component.sh "${component}"
   done
 fi

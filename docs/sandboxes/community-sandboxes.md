@@ -113,5 +113,5 @@ or anything else), consider contributing it back so others can use it.
 
 Explore related topics:
 
-- To supply API keys or tokens, refer to {doc}`providers`.
-- To customize the sandbox policy, refer to {doc}`policies`.
+- **Need to supply API keys or tokens?** Set up {doc}`providers` for credential management.
+- **Want to customize the sandbox policy?** Write custom rules in {doc}`policies`.

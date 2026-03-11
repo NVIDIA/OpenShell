@@ -10,14 +10,14 @@ The TUI is a subcommand of the OpenShell CLI, so it inherits all your existing c
 openshell term                   # launch against the active gateway
 nav term                         # dev alias (builds from source)
 nav term --gateway prod          # target a specific gateway
-OPENSHELL_CLUSTER=prod nav term  # same thing, via environment variable
+OPENSHELL_GATEWAY=prod nav term  # same thing, via environment variable
 ```
 
 Gateway resolution follows the same priority as the rest of the CLI:
 
 1. `--gateway` flag (if provided)
-2. `OPENSHELL_CLUSTER` environment variable
-3. Active gateway from `~/.config/openshell/active_cluster`
+2. `OPENSHELL_GATEWAY` environment variable
+3. Active gateway from `~/.config/openshell/active_gateway`
 
 No separate configuration files or authentication are needed.
 

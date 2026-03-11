@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from navigator import Sandbox, SandboxClient
+    from openshell import Sandbox, SandboxClient
 
 
 def test_sandbox_api_crud_and_exec(

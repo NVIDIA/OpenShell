@@ -13,7 +13,7 @@
 //! These tests exercise the full CLI → WS tunnel → gRPC flow.
 //!
 //! Environment variables:
-//! - `OPENSHELL_CLUSTER`: Name of the active cluster (standard e2e var)
+//! - `OPENSHELL_GATEWAY`: Name of the active gateway (standard e2e var)
 //!
 //! The cluster must have been deployed with `openshell gateway start --plaintext`
 //! so that the server accepts plaintext HTTP connections.
@@ -45,7 +45,7 @@ async fn run_cli_with_config(config_dir: &std::path::Path, args: &[&str]) -> (St
     cmd.args(args)
         .env("XDG_CONFIG_HOME", config_dir)
         .env("HOME", config_dir)
-        .env_remove("OPENSHELL_CLUSTER")
+        .env_remove("OPENSHELL_GATEWAY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

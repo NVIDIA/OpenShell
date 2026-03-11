@@ -27,7 +27,9 @@ from pathlib import Path
 # Configuration
 # ---------------------------------------------------------------------------
 
-COPYRIGHT_TEXT = "Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved."
+COPYRIGHT_TEXT = (
+    "Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved."
+)
 LICENSE_ID = "Apache-2.0"
 
 # Map file extensions to their line-comment prefix.
@@ -49,7 +51,7 @@ EXCLUDE_DIRS: set[str] = {
     ".venv",
     ".git",
     ".cache",
-    "python/navigator/_proto",
+    "python/openshell/_proto",
     "deploy/helm/navigator/templates",
 }
 
@@ -135,11 +137,7 @@ def discover_files(root: Path) -> list[Path]:
         rel_dir = Path(dirpath).relative_to(root)
 
         # Prune excluded directories (modifying dirnames in-place).
-        dirnames[:] = [
-            d
-            for d in dirnames
-            if not is_excluded(rel_dir / d)
-        ]
+        dirnames[:] = [d for d in dirnames if not is_excluded(rel_dir / d)]
 
         for fname in filenames:
             fpath = Path(dirpath) / fname
@@ -254,7 +252,8 @@ def main() -> int:
         help="Check mode: exit 1 if any file is missing a header.",
     )
     parser.add_argument(
-        "--verbose", "-v",
+        "--verbose",
+        "-v",
         action="store_true",
         help="Print status for every file processed.",
     )

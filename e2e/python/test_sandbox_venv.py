@@ -23,7 +23,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from navigator import Sandbox
+    from openshell import Sandbox
 
 
 def test_sandbox_venv_in_path(

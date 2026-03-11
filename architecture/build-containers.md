@@ -9,7 +9,7 @@ deploy/
   docker/
     .dockerignore
     Dockerfile.sandbox             # Sandbox container (runs agent code in isolation)
-    Dockerfile.server              # Gateway container (orchestration / control plane)
+    Dockerfile.gateway             # Gateway container (orchestration / control plane)
     Dockerfile.cluster             # Airgapped k3s cluster with Helm charts and manifests
     Dockerfile.ci                  # CI runner image with pre-installed toolchain
     Dockerfile.python-wheels       # Multi-arch Linux wheel builder for the Python CLI package
@@ -72,13 +72,13 @@ The sandbox container runs inside each sandbox pod. It contains the sandbox supe
 
 - Multi-user isolation: `supervisor` (runs the sandbox supervisor) and `sandbox` (runs the restricted agent process).
 - Policy files are mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data) when running in file-based policy mode.
-- The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/navigator/`.
+- The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/openshell/`.
 
-### Gateway Image (`openshell/server`)
+### Gateway Image (`openshell/gateway`)
 
 The gateway container runs the control plane / orchestration service.
 
-**Build stages** (2 stages in `deploy/docker/Dockerfile.server`):
+**Build stages** (2 stages in `deploy/docker/Dockerfile.gateway`):
 
 1. **builder** -- Two-pass Rust compilation with dependency caching:
    - First pass copies only `Cargo.toml`/`Cargo.lock` files and creates dummy source files (`fn main() {}` / empty `lib.rs`) to build dependencies in isolation. This layer is cached unless dependency manifests change.
@@ -195,7 +195,7 @@ Modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/naviga
 | Variable | Effect |
 |---|---|
 | `IMAGE_REPO_BASE` | Rewrites `repository:` and `sandboxImage:` to use the specified base path |
-| `PUSH_IMAGE_REFS` | Parses comma-separated image refs and rewrites exact server and sandbox references (matching on path component `/server:`, `/sandbox:`) |
+| `PUSH_IMAGE_REFS` | Parses comma-separated image refs and rewrites exact gateway and sandbox references (matching on path component `/gateway:`, `/sandbox:`) |
 | `IMAGE_TAG` | Replaces `:latest` tags with the specified tag (handles both quoted and unquoted `tag: latest` formats) |
 | `IMAGE_PULL_POLICY` | Replaces `pullPolicy: Always` with the specified policy (e.g., `IfNotPresent`) |
 | `SSH_GATEWAY_HOST` / `SSH_GATEWAY_PORT` | Replaces `__SSH_GATEWAY_HOST__` and `__SSH_GATEWAY_PORT__` placeholders; clears to defaults if unset |
@@ -228,7 +228,7 @@ The Helm chart at `deploy/helm/navigator/` deploys the gateway to Kubernetes as 
 replicaCount: 1
 
 image:
-  repository: ghcr.io/nvidia/openshell/server
+  repository: ghcr.io/nvidia/openshell/gateway
   pullPolicy: Always
   tag: "latest"
 
@@ -268,7 +268,7 @@ The chart deploys a **StatefulSet** (not a Deployment) with a `volumeClaimTempla
 
 The StatefulSet always mounts TLS secrets as volumes and sets environment variables for the server to use `rustls` with mTLS:
 
-- **Volumes**: `tls-cert` (from `navigator-server-tls` secret, mounted at `/etc/navigator-tls/server/`) and `tls-client-ca` (from `navigator-server-client-ca` secret, mounted at `/etc/navigator-tls/client-ca/`).
+- **Volumes**: `tls-cert` (from `navigator-server-tls` secret, mounted at `/etc/openshell-tls/server/`) and `tls-client-ca` (from `navigator-server-client-ca` secret, mounted at `/etc/openshell-tls/client-ca/`).
 - **Environment**: `OPENSHELL_TLS_CERT`, `OPENSHELL_TLS_KEY`, `OPENSHELL_TLS_CLIENT_CA` pointing to the mounted files.
 - **Client TLS secret name**: `OPENSHELL_CLIENT_TLS_SECRET_NAME` set to the `clientTlsSecretName` value, used by the server to inject TLS volume mounts into sandbox pod specs.
 - **gRPC endpoint**: `https://navigator.navigator.svc.cluster.local:8080` so sandbox pods connect over mTLS.
@@ -306,7 +306,7 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 |---|---|
 | `mise run docker:build` | Build all runtime images (sandbox, gateway, cluster) |
 | `mise run docker:build:sandbox` | Build sandbox image |
-| `mise run docker:build:server` | Build gateway image |
+| `mise run docker:build:gateway` | Build gateway image |
 | `mise run docker:build:cluster` | Build k3s cluster image (packages Helm charts first) |
 | `mise run docker:build:ci` | Build CI runner image |
 | `mise run docker:build:cluster:multiarch` | Build multi-arch cluster image and push to a registry |
@@ -336,11 +336,11 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 | `Cargo.toml`, `Cargo.lock`, `proto/*`, `deploy/docker/cross-build.sh` | Gateway + sandbox rebuild |
 | `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway + sandbox rebuild |
 | `crates/navigator-router/*` | Gateway rebuild |
-| `crates/navigator-server/*`, `deploy/docker/Dockerfile.server` | Gateway rebuild |
+| `crates/navigator-server/*`, `deploy/docker/Dockerfile.gateway` | Gateway rebuild |
 | `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `python/*`, `pyproject.toml`, `uv.lock`, `crates/navigator-sandbox/data/sandbox-policy.rego` | Sandbox rebuild |
 | `deploy/helm/navigator/*` | Helm upgrade |
 
-**Explicit target mode** (arguments: `server`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.
+**Explicit target mode** (arguments: `gateway`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.
 
 Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
 
@@ -461,7 +461,7 @@ When the cluster container starts, k3s automatically deploys these HelmChart CRs
 ## Implementation References
 
 - `deploy/docker/Dockerfile.sandbox` -- Sandbox image (5-stage multi-arch build)
-- `deploy/docker/Dockerfile.server` -- Gateway image (2-stage with dependency caching)
+- `deploy/docker/Dockerfile.gateway` -- Gateway image (2-stage with dependency caching)
 - `deploy/docker/Dockerfile.cluster` -- Cluster image (k3s base + charts + manifests)
 - `deploy/docker/Dockerfile.ci` -- CI runner image (Ubuntu + full toolchain)
 - `deploy/docker/Dockerfile.python-wheels` -- Linux wheel builder

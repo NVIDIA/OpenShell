@@ -9,11 +9,11 @@ permissions:
   packages: write
 
 jobs:
-  build-server:
+  build-gateway:
     if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
-      component: server
+      component: gateway
 
   build-sandbox:
     if: contains(github.event.pull_request.labels.*.name, 'e2e')
@@ -28,7 +28,7 @@ jobs:
       component: cluster
 
   e2e:
-    needs: [build-server, build-sandbox, build-cluster]
+    needs: [build-gateway, build-sandbox, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}

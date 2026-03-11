@@ -1,23 +1,3 @@
----
-title:
-  page: Support Matrix
-  nav: Support Matrix
-description: Platform, software, runtime, and kernel requirements for running NVIDIA OpenShell.
-topics:
-- Generative AI
-- Cybersecurity
-tags:
-- Support Matrix
-- Requirements
-- Compatibility
-- Platform
-content:
-  type: reference
-  difficulty: technical_beginner
-  audience:
-  - engineer
-  - data_scientist
----
 
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
@@ -72,9 +52,9 @@ OpenShell uses several container images that are pulled automatically during gat
 | Image | Registry | Reference | Pulled When |
 |---|---|---|---|
 | Cluster | ghcr.io | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start` |
-| Server | ghcr.io | `ghcr.io/nvidia/openshell/server:latest` | Cluster startup (via Helm chart) |
+| Gateway | ghcr.io | `ghcr.io/nvidia/openshell/gateway:latest` | Cluster startup (via Helm chart) |
 | Sandbox | ghcr.io | `ghcr.io/nvidia/openshell/sandbox:latest` | First sandbox creation (via Helm chart) |
-| Community sandboxes | CloudFront CDN | `d1i0nduu2f6qxk.cloudfront.net/openshell-community/sandboxes/{name}:latest` | `openshell sandbox create --from <name>` |
+| Community sandboxes | GHCR | `ghcr.io/nvidia/openshell-community/sandboxes/{name}:latest` | `openshell sandbox create --from <name>` |
 
 The cluster image is based on `rancher/k3s:v1.35.2-k3s1` and bundles the Helm charts and Kubernetes manifests required to bootstrap the control plane. The server and sandbox images are pulled separately at runtime.
 

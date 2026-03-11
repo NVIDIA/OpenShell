@@ -1,9 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Server library.
+//! `OpenShell` Server library.
 //!
-//! This crate provides the server implementation for OpenShell, including:
+//! This crate provides the server implementation for `OpenShell`, including:
 //! - gRPC service implementation
 //! - HTTP health endpoints
 //! - Protocol multiplexing (gRPC + HTTP on same port)
@@ -92,7 +92,7 @@ impl ServerState {
     }
 }
 
-/// Run the OpenShell server.
+/// Run the `OpenShell` server.
 ///
 /// This starts a multiplexed gRPC/HTTP server on the configured bind address.
 ///
@@ -163,17 +163,16 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     info!(address = %config.bind_address, "Server listening");
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
-    let tls_acceptor = match &config.tls {
-        Some(tls) => Some(TlsAcceptor::from_files(
+    let tls_acceptor = if let Some(tls) = &config.tls {
+        Some(TlsAcceptor::from_files(
             &tls.cert_path,
             &tls.key_path,
             &tls.client_ca_path,
             tls.allow_unauthenticated,
-        )?),
-        None => {
-            info!("TLS disabled — accepting plaintext connections");
-            None
-        }
+        )?)
+    } else {
+        info!("TLS disabled — accepting plaintext connections");
+        None
     };
 
     // Accept connections
