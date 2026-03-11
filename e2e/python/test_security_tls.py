@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import grpc
 import pytest
 
-from navigator._proto import navigator_pb2, navigator_pb2_grpc
+from openshell._proto import navigator_pb2, navigator_pb2_grpc
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -36,22 +36,22 @@ def _xdg_config_home() -> pathlib.Path:
 
 
 def _resolve_cluster_name() -> str:
-    env_cluster = os.environ.get("OPENSHELL_CLUSTER")
+    env_cluster = os.environ.get("OPENSHELL_GATEWAY")
     if env_cluster:
         return env_cluster
-    active_file = _xdg_config_home() / "openshell" / "active_cluster"
+    active_file = _xdg_config_home() / "openshell" / "active_gateway"
     return active_file.read_text().strip()
 
 
 def _cluster_metadata(cluster_name: str) -> dict:
     metadata_path = (
-        _xdg_config_home() / "openshell" / "clusters" / f"{cluster_name}_metadata.json"
+        _xdg_config_home() / "openshell" / "gateways" / cluster_name / "metadata.json"
     )
     return json.loads(metadata_path.read_text())
 
 
 def _mtls_dir(cluster_name: str) -> pathlib.Path:
-    return _xdg_config_home() / "openshell" / "clusters" / cluster_name / "mtls"
+    return _xdg_config_home() / "openshell" / "gateways" / cluster_name / "mtls"
 
 
 def _generate_self_signed_cert(

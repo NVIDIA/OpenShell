@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from navigator.sandbox import (
+from .sandbox import (
     ClusterInferenceConfig,
     ExecChunk,
     ExecResult,
@@ -21,7 +21,7 @@ from navigator.sandbox import (
 try:
     from importlib.metadata import version
 
-    __version__ = version("navigator")
+    __version__ = version("openshell")
 except Exception:
     __version__ = "0.0.0"
 

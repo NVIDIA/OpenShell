@@ -20,7 +20,7 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
     cmd.args(args)
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
-        .env_remove("OPENSHELL_CLUSTER")
+        .env_remove("OPENSHELL_GATEWAY")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 

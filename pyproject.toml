@@ -59,12 +59,12 @@ package = false
 bindings = "bin"
 manifest-path = "crates/navigator-cli/Cargo.toml"
 python-source = "python"
-module-name = "navigator"
+module-name = "openshell"
 
 [tool.ruff]
 target-version = "py312"
 line-length = 88
-exclude = ["python/navigator/_proto"]
+exclude = ["python/openshell/_proto"]
 
 [tool.ruff.lint]
 select = [
@@ -86,7 +86,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["navigator"]
+known-first-party = ["openshell"]
 
 [tool.ruff.format]
 quote-style = "double"

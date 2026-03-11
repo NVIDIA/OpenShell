@@ -239,9 +239,9 @@ run = """
 set -euo pipefail
 uv run python -m grpc_tools.protoc \
   -Iproto \
-  --python_out=python/navigator/_proto \
-  --pyi_out=python/navigator/_proto \
-  --grpc_python_out=python/navigator/_proto \
+  --python_out=python/openshell/_proto \
+  --pyi_out=python/openshell/_proto \
+  --grpc_python_out=python/openshell/_proto \
   proto/inference.proto \
   proto/navigator.proto \
   proto/datamodel.proto \
@@ -252,24 +252,24 @@ from pathlib import Path
 import re
 
 line_rewrites = {
-    "python/navigator/_proto/inference_pb2_grpc.py": [
+    "python/openshell/_proto/inference_pb2_grpc.py": [
         (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
     ],
-    "python/navigator/_proto/navigator_pb2_grpc.py": [
+    "python/openshell/_proto/navigator_pb2_grpc.py": [
         (r"^import navigator_pb2 as navigator__pb2$", "from . import navigator_pb2 as navigator__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
-    "python/navigator/_proto/navigator_pb2.py": [
+    "python/openshell/_proto/navigator_pb2.py": [
         (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
-    "python/navigator/_proto/datamodel_pb2.py": [
+    "python/openshell/_proto/datamodel_pb2.py": [
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
-    "python/navigator/_proto/datamodel_pb2_grpc.py": [
+    "python/openshell/_proto/datamodel_pb2_grpc.py": [
         (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
     ],
-    "python/navigator/_proto/sandbox_pb2_grpc.py": [
+    "python/openshell/_proto/sandbox_pb2_grpc.py": [
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
 }

@@ -177,8 +177,8 @@ COPY --from=builder /app/.venv /app/.venv
 COPY --from=builder /usr/local/bin/uv /usr/local/bin/uv
 COPY --from=rust-builder /build/out/navigator-sandbox /usr/local/bin/
 
-# Copy navigator Python SDK into the virtual environment
-COPY python/navigator/ /app/.venv/lib/python3.12/site-packages/navigator/
+# Copy openshell Python SDK into the virtual environment
+COPY python/openshell/ /app/.venv/lib/python3.12/site-packages/openshell/
 
 # Add venvs to PATH -- /sandbox/.venv (writable, user-installed packages)
 # takes priority over /app/.venv (read-only, build-time packages).

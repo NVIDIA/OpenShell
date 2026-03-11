@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from navigator import Sandbox
+    from openshell import Sandbox
 
 
 def test_exec_python_accepts_bound_methods(

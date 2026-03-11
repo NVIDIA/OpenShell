@@ -6,12 +6,12 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
-from navigator._proto import datamodel_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from navigator import Sandbox
+    from openshell import Sandbox
 
 
 # =============================================================================
@@ -1089,7 +1089,7 @@ def test_live_policy_update_and_logs(
     sandbox_client: "SandboxClient",
 ) -> None:
     """End-to-end: live policy update lifecycle with log verification."""
-    from navigator._proto import navigator_pb2, sandbox_pb2
+    from openshell._proto import navigator_pb2, sandbox_pb2
 
     # --- Setup: two distinct policies ---
     # Policy A: python can reach api.anthropic.com
