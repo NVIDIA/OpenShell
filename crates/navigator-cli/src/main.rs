@@ -328,21 +328,21 @@ enum Commands {
     // SANDBOX COMMANDS
     // ===================================================================
     /// Manage sandboxes.
-    #[command(visible_alias = "sb", after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(alias = "sb", after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Sandbox {
         #[command(subcommand)]
         command: Option<SandboxCommands>,
     },
 
     /// Manage port forwarding to a sandbox.
-    #[command(visible_alias = "fwd", after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(alias = "fwd", after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Forward {
         #[command(subcommand)]
         command: Option<ForwardCommands>,
     },
 
     /// View sandbox logs.
-    #[command(visible_alias = "lg", after_help = LOGS_EXAMPLES, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(alias = "lg", after_help = LOGS_EXAMPLES, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logs {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -371,7 +371,7 @@ enum Commands {
     },
 
     /// Manage sandbox policy.
-    #[command(visible_alias = "pol", after_help = POLICY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(alias = "pol", after_help = POLICY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Policy {
         #[command(subcommand)]
         command: Option<PolicyCommands>,
@@ -388,7 +388,7 @@ enum Commands {
     // GATEWAY COMMANDS
     // ===================================================================
     /// Manage the gateway lifecycle.
-    #[command(visible_alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Gateway {
         #[command(subcommand)]
         command: Option<GatewayCommands>,
@@ -520,6 +520,12 @@ If no profile exists yet, create one first:
 
    New-Item -Path $PROFILE -Type File -Force
 ";
+
+fn normalize_completion_script(output: Vec<u8>, executable: &std::path::Path) -> Result<String> {
+    let script = String::from_utf8(output)
+        .map_err(|e| miette::miette!("generated completions were not valid UTF-8: {e}"))?;
+    Ok(script.replace(executable.to_string_lossy().as_ref(), "openshell"))
+}
 
 #[derive(Clone, Debug, ValueEnum)]
 enum CliProviderType {
@@ -1766,12 +1772,13 @@ async fn main() -> Result<()> {
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()
                 .map_err(|e| miette::miette!("failed to find current executable: {e}"))?;
-            let output = std::process::Command::new(exe)
+            let output = std::process::Command::new(&exe)
                 .env("COMPLETE", shell.to_string())
                 .output()
                 .map_err(|e| miette::miette!("failed to generate completions: {e}"))?;
+            let script = normalize_completion_script(output.stdout, &exe)?;
             std::io::stdout()
-                .write_all(&output.stdout)
+                .write_all(script.as_bytes())
                 .map_err(|e| miette::miette!("failed to write completions: {e}"))?;
         }
         Some(Commands::SshProxy {
@@ -1965,6 +1972,14 @@ mod tests {
             names.contains(&"--gateway".to_string()),
             "expected '--gateway' in root candidates, got: {names:?}"
         );
+        assert!(
+            !names.contains(&"lg".to_string()),
+            "expected root candidates to prefer canonical command names, got: {names:?}"
+        );
+        assert!(
+            !names.contains(&"pol".to_string()),
+            "expected root candidates to prefer canonical command names, got: {names:?}"
+        );
     }
 
     #[test]
@@ -2157,6 +2172,29 @@ mod tests {
 
         assert_eq!(cli.gateway.as_deref(), Some("demo"));
         assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn hidden_aliases_still_parse() {
+        let cli = Cli::try_parse_from(["openshell", "lg", "sandbox-1"])
+            .expect("hidden aliases should still parse");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Logs { name: Some(ref name), .. }) if name == "sandbox-1"
+        ));
+    }
+
+    #[test]
+    fn completion_script_uses_openshell_command_name() {
+        let script = normalize_completion_script(
+            b"/tmp/custom/openshell -- \"${words[@]}\"\n#compdef openshell\n".to_vec(),
+            std::path::Path::new("/tmp/custom/openshell"),
+        )
+        .expect("normalize completion script");
+
+        assert!(script.contains("openshell -- \"${words[@]}\""));
+        assert!(!script.contains("/tmp/custom/openshell"));
     }
 
     #[test]
