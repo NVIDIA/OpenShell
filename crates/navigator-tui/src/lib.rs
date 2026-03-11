@@ -202,6 +202,11 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                 refresh_gateway_list(&mut app);
                 refresh_data(&mut app).await;
 
+                // Refresh per-sandbox draft counts for the dashboard badge.
+                if app.screen == Screen::Dashboard {
+                    refresh_sandbox_draft_counts(&mut app).await;
+                }
+
                 // Auto-refresh the policy view when a new version is detected.
                 if app.screen == Screen::Sandbox {
                     let displayed = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
@@ -1749,6 +1754,27 @@ async fn refresh_draft_chunks(app: &mut App) {
             tracing::debug!("draft chunks refresh timed out");
         }
     }
+}
+
+/// Fetch the count of pending draft recommendations for every sandbox.
+///
+/// This runs on the Dashboard tick so the sandbox list can show notification
+/// badges without entering the sandbox detail view.
+async fn refresh_sandbox_draft_counts(app: &mut App) {
+    let names: Vec<String> = app.sandbox_names.clone();
+    let mut counts = vec![0usize; names.len()];
+    for (i, name) in names.iter().enumerate() {
+        let req = navigator_core::proto::GetDraftPolicyRequest {
+            name: name.clone(),
+            status_filter: "pending".to_string(),
+        };
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
+        {
+            counts[i] = resp.into_inner().chunks.len();
+        }
+    }
+    app.sandbox_draft_counts = counts;
 }
 
 fn phase_label(phase: i32) -> String {

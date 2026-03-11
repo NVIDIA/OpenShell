@@ -164,6 +164,7 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
+    let sandbox_name_for_agg = sandbox.clone();
     let (mut policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         sandbox,
@@ -546,7 +547,8 @@ pub async fn run_sandbox(
 
         // Spawn denial aggregator (gRPC mode only, when proxy is active).
         if let Some(rx) = denial_rx {
-            let agg_id = id.clone();
+            // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
+            let agg_name = sandbox_name_for_agg.clone().unwrap_or_else(|| id.clone());
             let agg_endpoint = endpoint.clone();
             let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
                 .ok()
@@ -559,10 +561,10 @@ pub async fn run_sandbox(
                 aggregator
                     .run(|summaries| {
                         let endpoint = agg_endpoint.clone();
-                        let sandbox_id = agg_id.clone();
+                        let sandbox_name = agg_name.clone();
                         async move {
                             if let Err(e) =
-                                flush_denials_to_gateway(&endpoint, &sandbox_id, summaries).await
+                                flush_denials_to_gateway(&endpoint, &sandbox_name, summaries).await
                             {
                                 warn!(error = %e, "Failed to flush denial summaries to gateway");
                             }
@@ -1191,7 +1193,7 @@ fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
 async fn flush_denials_to_gateway(
     endpoint: &str,
-    sandbox_id: &str,
+    sandbox_name: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
 ) -> Result<()> {
     use crate::grpc_client::CachedNavigatorClient;
@@ -1203,7 +1205,7 @@ async fn flush_denials_to_gateway(
     let proto_summaries: Vec<DenialSummary> = summaries
         .into_iter()
         .map(|s| DenialSummary {
-            sandbox_id: sandbox_id.to_string(),
+            sandbox_id: String::new(),
             host: s.host,
             port: s.port as u32,
             binary: s.binary,
@@ -1232,16 +1234,12 @@ async fn flush_denials_to_gateway(
         })
         .collect();
 
-    // The sandbox_id is not the sandbox name — we need the sandbox name
-    // for SubmitPolicyAnalysis. For now, use the sandbox_id as the name
-    // since in gRPC mode the sandbox variable holds the name.
-    // TODO: thread sandbox name through the aggregator.
     client
-        .submit_policy_analysis(sandbox_id, proto_summaries, "mechanistic")
+        .submit_policy_analysis(sandbox_name, proto_summaries, "mechanistic")
         .await?;
 
     info!(
-        sandbox_id = %sandbox_id,
+        sandbox_name = %sandbox_name,
         "Flushed denial summaries to gateway"
     );
 

@@ -28,6 +28,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             let age = app.sandbox_ages.get(i).map_or("", String::as_str);
             let image = app.sandbox_images.get(i).map_or("", String::as_str);
             let notes = app.sandbox_notes.get(i).map_or("", String::as_str);
+            let draft_count = app.sandbox_draft_counts.get(i).copied().unwrap_or(0);
 
             let phase_style = match phase {
                 "Ready" => styles::STATUS_OK,
@@ -37,17 +38,22 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             };
 
             let selected = focused && i == app.sandbox_selected;
-            let name_cell = if selected {
-                Cell::from(Line::from(vec![
+            let mut name_spans = if selected {
+                vec![
                     Span::styled("▌ ", styles::ACCENT),
                     Span::styled(name, styles::TEXT),
-                ]))
+                ]
             } else {
-                Cell::from(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(name, styles::TEXT),
-                ]))
+                vec![Span::raw("  "), Span::styled(name, styles::TEXT)]
             };
+
+            // Append notification badge when there are pending draft recommendations.
+            if draft_count > 0 {
+                name_spans.push(Span::raw(" "));
+                name_spans.push(Span::styled(format!(" {draft_count} "), styles::BADGE));
+            }
+
+            let name_cell = Cell::from(Line::from(name_spans));
 
             Row::new(vec![
                 name_cell,

@@ -193,3 +193,4 @@ architecture/plans
 # Claude
 .claude/settings.local.json.claude/worktrees/
 .claude/worktrees/
+rfc.md

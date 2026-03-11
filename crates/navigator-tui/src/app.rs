@@ -360,6 +360,9 @@ pub struct App {
     pub draft_version: u64,
     pub draft_selected: usize,
     pub draft_scroll: usize,
+
+    /// Per-sandbox count of pending draft recommendations (parallel to `sandbox_names`).
+    pub sandbox_draft_counts: Vec<usize>,
 }
 
 impl App {
@@ -427,6 +430,7 @@ impl App {
             draft_version: 0,
             draft_selected: 0,
             draft_scroll: 0,
+            sandbox_draft_counts: Vec::new(),
         }
     }
 

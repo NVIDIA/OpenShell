@@ -35,14 +35,36 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         _ => "…",
     };
 
-    // Row 1: Name + Status
-    let row1 = Line::from(vec![
+    // Count pending draft recommendations for this sandbox.
+    let pending_count = app.sandbox_draft_counts.get(idx).copied().unwrap_or(0);
+    // Also check the live draft_chunks when on the sandbox screen (more up-to-date).
+    let pending_count = if pending_count > 0 {
+        pending_count
+    } else {
+        app.draft_chunks
+            .iter()
+            .filter(|c| c.status == "pending")
+            .count()
+    };
+
+    // Row 1: Name + Status + optional draft badge
+    let mut row1_spans = vec![
         Span::styled("  Name: ", styles::MUTED),
         Span::styled(name, styles::HEADING),
+    ];
+    if pending_count > 0 {
+        row1_spans.push(Span::raw(" "));
+        row1_spans.push(Span::styled(
+            format!(" {pending_count} pending "),
+            styles::BADGE,
+        ));
+    }
+    row1_spans.extend([
         Span::styled("              Status: ", styles::MUTED),
         Span::styled(format!("{status_indicator} "), phase_style),
         Span::styled(phase, phase_style),
     ]);
+    let row1 = Line::from(row1_spans);
 
     // Row 2: Image + Created + Age
     let row2 = Line::from(vec![
@@ -93,8 +115,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ]));
     }
 
+    let mut title_spans: Vec<Span<'_>> =
+        vec![Span::styled(format!(" Sandbox: {name} "), styles::HEADING)];
+    if pending_count > 0 {
+        title_spans.push(Span::styled(
+            format!(" {pending_count} pending "),
+            styles::BADGE,
+        ));
+        title_spans.push(Span::raw(" "));
+    }
     let block = Block::default()
-        .title(Span::styled(format!(" Sandbox: {name} "), styles::HEADING))
+        .title(Line::from(title_spans))
         .borders(Borders::ALL)
         .border_style(styles::BORDER) // non-interactive — unfocused border
         .padding(Padding::horizontal(1));

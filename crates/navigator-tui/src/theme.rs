@@ -38,4 +38,9 @@ pub mod styles {
         .fg(colors::FG)
         .bg(colors::EVERGLADE)
         .add_modifier(Modifier::BOLD);
+    /// Notification badge for pending recommendation counts.
+    pub const BADGE: Style = Style::new()
+        .fg(colors::BG)
+        .bg(colors::NVIDIA_GREEN)
+        .add_modifier(Modifier::BOLD);
 }
