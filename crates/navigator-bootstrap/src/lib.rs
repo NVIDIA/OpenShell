@@ -124,6 +124,10 @@ pub struct DeployOptions {
     /// scope) used to pull images from ghcr.io both during the initial
     /// bootstrap pull and inside the k3s cluster at runtime.
     pub registry_token: Option<String>,
+    /// Enable NVIDIA GPU passthrough. When true, the Docker container is
+    /// created with GPU device requests (`--gpus all`) and the NVIDIA
+    /// k8s-device-plugin is deployed inside the k3s cluster.
+    pub gpu: bool,
 }
 
 impl DeployOptions {
@@ -138,6 +142,7 @@ impl DeployOptions {
             disable_tls: false,
             disable_gateway_auth: false,
             registry_token: None,
+            gpu: false,
         }
     }
 
@@ -188,6 +193,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_registry_token(mut self, token: impl Into<String>) -> Self {
         self.registry_token = Some(token.into());
+        self
+    }
+
+    /// Enable NVIDIA GPU passthrough for the cluster container.
+    #[must_use]
+    pub fn with_gpu(mut self, gpu: bool) -> Self {
+        self.gpu = gpu;
         self
     }
 }
@@ -255,6 +267,7 @@ where
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
     let registry_token = options.registry_token;
+    let gpu = options.gpu;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -380,6 +393,7 @@ where
         disable_tls,
         disable_gateway_auth,
         registry_token.as_deref(),
+        gpu,
     )
     .await?;
     start_container(&target_docker, &name).await?;

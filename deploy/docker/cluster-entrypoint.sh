@@ -311,6 +311,26 @@ if [ -d "$BUNDLED_MANIFESTS" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# GPU support: deploy NVIDIA device plugin when GPU_ENABLED=true
+# ---------------------------------------------------------------------------
+# When the cluster is started with --gpu, the bootstrap code sets
+# GPU_ENABLED=true. This copies the NVIDIA device plugin HelmChart CR into
+# the k3s manifests directory so the Helm controller installs it automatically.
+# The nvidia-container-runtime binary is already on PATH (baked into the image)
+# so k3s registers the "nvidia" RuntimeClass at startup.
+if [ "${GPU_ENABLED:-}" = "true" ]; then
+    echo "GPU support enabled — deploying NVIDIA device plugin"
+
+    GPU_MANIFESTS="/opt/openshell/gpu-manifests"
+    if [ -d "$GPU_MANIFESTS" ]; then
+        for manifest in "$GPU_MANIFESTS"/*.yaml; do
+            [ ! -f "$manifest" ] && continue
+            cp "$manifest" "$K3S_MANIFESTS/"
+        done
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Override image tag and pull policy for local development
 # ---------------------------------------------------------------------------
 # When IMAGE_TAG is set, replace the default ":latest" tag on all component

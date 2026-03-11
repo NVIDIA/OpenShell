@@ -1073,13 +1073,15 @@ pub async fn gateway_admin_deploy(
     disable_tls: bool,
     disable_gateway_auth: bool,
     registry_token: Option<&str>,
+    gpu: bool,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
     let mut options = DeployOptions::new(name)
         .with_port(port)
         .with_disable_tls(disable_tls)
-        .with_disable_gateway_auth(disable_gateway_auth);
+        .with_disable_gateway_auth(disable_gateway_auth)
+        .with_gpu(gpu);
     if let Some(kp) = kube_port {
         let resolved_kp = if kp == 0 {
             navigator_bootstrap::pick_available_port()?
