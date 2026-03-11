@@ -568,18 +568,18 @@ impl Navigator for NavigatorService {
             for record in records {
                 if let Ok(session) = SshSession::decode(record.payload.as_slice())
                     && session.sandbox_id == id
-                        && let Err(e) = self
-                            .state
-                            .store
-                            .delete(SshSession::object_type(), &session.id)
-                            .await
-                        {
-                            warn!(
-                                session_id = %session.id,
-                                error = %e,
-                                "Failed to delete SSH session during sandbox cleanup"
-                            );
-                        }
+                    && let Err(e) = self
+                        .state
+                        .store
+                        .delete(SshSession::object_type(), &session.id)
+                        .await
+                {
+                    warn!(
+                        session_id = %session.id,
+                        error = %e,
+                        "Failed to delete SSH session during sandbox cleanup"
+                    );
+                }
             }
         }
 
@@ -1031,12 +1031,13 @@ impl Navigator for NavigatorService {
         let hash = deterministic_policy_hash(&new_policy);
 
         if let Some(ref current) = latest
-            && current.policy_hash == hash {
-                return Ok(Response::new(UpdateSandboxPolicyResponse {
-                    version: u32::try_from(current.version).unwrap_or(0),
-                    policy_hash: hash,
-                }));
-            }
+            && current.policy_hash == hash
+        {
+            return Ok(Response::new(UpdateSandboxPolicyResponse {
+                version: u32::try_from(current.version).unwrap_or(0),
+                policy_hash: hash,
+            }));
+        }
 
         let next_version = latest.map_or(1, |r| r.version + 1);
         let policy_id = uuid::Uuid::new_v4().to_string();
@@ -2298,9 +2299,7 @@ async fn update_provider_record(
     // Provider type is immutable after creation. Reject if the caller
     // sends a non-empty type that differs from the existing one.
     let incoming_type = provider.r#type.trim();
-    if !incoming_type.is_empty()
-        && !incoming_type.eq_ignore_ascii_case(existing.r#type.trim())
-    {
+    if !incoming_type.is_empty() && !incoming_type.eq_ignore_ascii_case(existing.r#type.trim()) {
         return Err(Status::invalid_argument(
             "provider type cannot be changed; delete and recreate the provider",
         ));

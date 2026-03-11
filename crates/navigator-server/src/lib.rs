@@ -162,12 +162,14 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     info!(address = %config.bind_address, "Server listening");
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
-    let tls_acceptor = if let Some(tls) = &config.tls { Some(TlsAcceptor::from_files(
-        &tls.cert_path,
-        &tls.key_path,
-        &tls.client_ca_path,
-        tls.allow_unauthenticated,
-    )?) } else {
+    let tls_acceptor = if let Some(tls) = &config.tls {
+        Some(TlsAcceptor::from_files(
+            &tls.cert_path,
+            &tls.key_path,
+            &tls.client_ca_path,
+            tls.allow_unauthenticated,
+        )?)
+    } else {
         info!("TLS disabled — accepting plaintext connections");
         None
     };

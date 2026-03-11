@@ -126,9 +126,10 @@ fn resolve_gateway_name(gateway_flag: &Option<String>) -> Option<String> {
 fn apply_edge_auth(tls: &mut TlsOptions, gateway_name: &str) {
     if let Some(meta) = get_gateway_metadata(gateway_name)
         && meta.auth_mode.as_deref() == Some("cloudflare_jwt")
-            && let Some(token) = load_edge_token(gateway_name) {
-                tls.edge_token = Some(token);
-            }
+        && let Some(token) = load_edge_token(gateway_name)
+    {
+        tls.edge_token = Some(token);
+    }
 }
 
 /// Resolve a sandbox name, falling back to the last-used sandbox for the gateway.

@@ -65,7 +65,8 @@ async fn auth_connect(
     let gateway_display = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get("host"))
-        .and_then(|v| v.to_str().ok()).map_or_else(|| state.config.bind_address.to_string(), String::from);
+        .and_then(|v| v.to_str().ok())
+        .map_or_else(|| state.config.bind_address.to_string(), String::from);
 
     match cf_token {
         Some(token) => Html(render_connect_page(

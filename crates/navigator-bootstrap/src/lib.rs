@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod edge_token;
+pub mod errors;
 pub mod image;
 
 mod constants;

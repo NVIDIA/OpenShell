@@ -734,7 +734,9 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
 
     // Derive a gateway name from the hostname when none is provided.
     let derived_name;
-    let name = if let Some(n) = name { n } else {
+    let name = if let Some(n) = name {
+        n
+    } else {
         // Parse out just the host portion of the URL.
         derived_name = url::Url::parse(&endpoint)
             .ok()
@@ -890,7 +892,6 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
 
     let scheme = uri.scheme_str().unwrap_or("https");
     let https = if scheme.eq_ignore_ascii_case("http") || tls.is_bearer_auth() {
-        
         HttpsConnectorBuilder::new()
             .with_native_roots()
             .into_diagnostic()?
@@ -996,6 +997,13 @@ pub(crate) async fn deploy_gateway_with_panel(
                     "x".red().bold(),
                     "Gateway failed:".red().bold(),
                 );
+                // Try to diagnose the failure and provide guidance
+                let err_str = format!("{err:?}");
+                if let Some(diagnosis) =
+                    navigator_bootstrap::errors::diagnose_failure(name, &err_str, None)
+                {
+                    print_failure_diagnosis(&diagnosis);
+                }
                 Err(err)
             }
         }
@@ -1019,13 +1027,33 @@ pub(crate) async fn deploy_gateway_with_panel(
 /// Print post-deploy summary showing the gateway name and endpoint.
 pub(crate) fn print_deploy_summary(name: &str, handle: &navigator_bootstrap::GatewayHandle) {
     eprintln!();
-    eprintln!("{} {} {name}", "✓".green().bold(), "Gateway ready:".green(),);
-    eprintln!(
-        "  {} {}",
-        "Gateway endpoint:".bold(),
-        handle.gateway_endpoint()
-    );
+    eprintln!("{} Gateway ready", "✓".green().bold());
     eprintln!();
+    eprintln!("  {} {name}", "Name:".bold());
+    eprintln!("  {} {}", "Endpoint:".bold(), handle.gateway_endpoint());
+    eprintln!();
+}
+
+/// Print a user-friendly failure diagnosis with recovery steps.
+fn print_failure_diagnosis(diagnosis: &navigator_bootstrap::errors::GatewayFailureDiagnosis) {
+    eprintln!();
+    eprintln!("{}", diagnosis.summary.yellow().bold());
+    eprintln!();
+    eprintln!("  {}", diagnosis.explanation);
+    eprintln!();
+
+    if !diagnosis.recovery_steps.is_empty() {
+        eprintln!("  {}:", "To fix".bold());
+        for (i, step) in diagnosis.recovery_steps.iter().enumerate() {
+            eprintln!();
+            eprintln!("  {}. {}", i + 1, step.description);
+            if let Some(cmd) = &step.command {
+                eprintln!();
+                eprintln!("     {}", cmd.cyan());
+            }
+        }
+        eprintln!();
+    }
 }
 
 /// Provision or start a gateway (local or remote).
@@ -1157,9 +1185,10 @@ fn resolve_gateway_control_target_from(
     }
 
     match metadata {
-        Some(metadata) if metadata.is_remote => metadata
-            .remote_host
-            .map_or(GatewayControlTarget::ExternalRegistration, GatewayControlTarget::Remote),
+        Some(metadata) if metadata.is_remote => metadata.remote_host.map_or(
+            GatewayControlTarget::ExternalRegistration,
+            GatewayControlTarget::Remote,
+        ),
         _ => GatewayControlTarget::Local,
     }
 }
@@ -1744,18 +1773,19 @@ pub async fn sandbox_create(
     // If we exited the loop without hitting the Ready break, finish the display.
     let final_phase = SandboxPhase::try_from(last_phase).unwrap_or(SandboxPhase::Unknown);
     if final_phase != SandboxPhase::Ready
-        && let Some(d) = display.as_mut() {
-            if final_phase == SandboxPhase::Error {
-                let msg = if last_error_reason.is_empty() {
-                    "Sandbox entered error phase".to_string()
-                } else {
-                    format!("Error: {last_error_reason}")
-                };
-                d.finish_error(&msg);
+        && let Some(d) = display.as_mut()
+    {
+        if final_phase == SandboxPhase::Error {
+            let msg = if last_error_reason.is_empty() {
+                "Sandbox entered error phase".to_string()
             } else {
-                d.finish_error("Provisioning stream ended unexpectedly");
-            }
+                format!("Error: {last_error_reason}")
+            };
+            d.finish_error(&msg);
+        } else {
+            d.finish_error("Provisioning stream ended unexpectedly");
         }
+    }
     drop(display);
     let _ = std::io::stdout().flush();
     let _ = std::io::stderr().flush();
