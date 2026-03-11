@@ -7,15 +7,15 @@ set -euo pipefail
 
 component=${1:-}
 if [ -z "${component}" ]; then
-  echo "usage: $0 <server|sandbox>" >&2
+  echo "usage: $0 <gateway|sandbox>" >&2
   exit 1
 fi
 
 case "${component}" in
-  server|sandbox)
+  gateway|sandbox)
     ;;
   *)
-    echo "invalid component '${component}'; expected server or sandbox" >&2
+    echo "invalid component '${component}'; expected gateway or sandbox" >&2
     exit 1
     ;;
 esac

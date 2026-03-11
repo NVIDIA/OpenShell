@@ -322,7 +322,7 @@ HELMCHART="/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
     target_tag="${IMAGE_TAG:-latest}"
     echo "Setting image repository base: ${IMAGE_REPO_BASE}"
-    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/server|" "$HELMCHART"
+    sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
     sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${IMAGE_REPO_BASE}/sandbox:${target_tag}|" "$HELMCHART"
 fi
 
@@ -335,7 +335,7 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
     IFS=','
     for ref in $PUSH_IMAGE_REFS; do
         case "$ref" in
-            */server:*) server_image="$ref" ;;
+            */gateway:*) server_image="$ref" ;;
             */sandbox:*) sandbox_image="$ref" ;;
         esac
     done

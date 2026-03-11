@@ -230,7 +230,7 @@ docker save <image-ref> | docker exec -i openshell-cluster-<name> ctr -a /run/k3
 docker exec openshell-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 
 # Test pulling an image manually from inside the cluster
-docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/openshell/server:latest'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/openshell/gateway:latest'
 ```
 
 If `registries.yaml` is missing or has wrong values, verify env wiring (`OPENSHELL_REGISTRY_HOST`, `OPENSHELL_REGISTRY_INSECURE`, username/password for authenticated registries).

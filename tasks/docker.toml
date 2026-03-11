@@ -7,7 +7,7 @@
 description = "Build all Docker images"
 depends = [
   "docker:build:sandbox",
-  "docker:build:server",
+  "docker:build:gateway",
   "docker:build:cluster",
 ]
 hide = true
@@ -28,9 +28,9 @@ depends = ["docker:build:sandbox"]
 run = "tasks/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=openshell/sandbox:${IMAGE_TAG:-dev}"
 hide = true
 
-["docker:build:server"]
-description = "Build the server Docker image"
-run = "tasks/scripts/docker-build-component.sh server"
+["docker:build:gateway"]
+description = "Build the gateway Docker image"
+run = "tasks/scripts/docker-build-component.sh gateway"
 hide = true
 
 ["docker:build:cluster"]
