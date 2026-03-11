@@ -3510,6 +3510,16 @@ pub async fn sandbox_draft_get(
                 println!("  {} {}", "Binaries:".dimmed(), bins.join(", "));
             }
         }
+
+        if chunk.hit_count > 1 {
+            println!(
+                "  {} {} (first seen {}, last seen {})",
+                "Hits:".dimmed(),
+                chunk.hit_count,
+                format_epoch_ms(chunk.first_seen_ms),
+                format_epoch_ms(chunk.last_seen_ms),
+            );
+        }
         println!();
     }
 

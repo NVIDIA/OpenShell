@@ -657,6 +657,12 @@ message PolicyChunk {
   string stage = 11;
   // For stage="refined": the initial chunk this replaces.
   string supersedes_chunk_id = 12;
+  // How many times this endpoint has been seen across denial flush cycles.
+  int32 hit_count = 13;
+  // First time this endpoint was proposed (ms since epoch).
+  int64 first_seen_ms = 14;
+  // Most recent time this endpoint was re-proposed (ms since epoch).
+  int64 last_seen_ms = 15;
 }
 
 // Notification that the draft policy was updated.

@@ -428,6 +428,16 @@ pub struct DraftChunkRecord {
     pub created_at_ms: i64,
     pub decided_at_ms: Option<i64>,
     pub decided_by: String,
+    /// Denormalized endpoint host (lowercase) for DB-level dedup.
+    pub host: String,
+    /// Denormalized endpoint port for DB-level dedup.
+    pub port: i32,
+    /// How many times this endpoint has been seen across denial flush cycles.
+    pub hit_count: i32,
+    /// First time this endpoint was proposed (ms since epoch).
+    pub first_seen_ms: i64,
+    /// Most recent time this endpoint was re-proposed (ms since epoch).
+    pub last_seen_ms: i64,
 }
 
 /// Stored denial summary record.

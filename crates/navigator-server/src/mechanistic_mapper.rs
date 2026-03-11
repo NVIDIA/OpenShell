@@ -191,6 +191,9 @@ pub fn generate_proposals(
             decided_at_ms: 0,
             stage,
             supersedes_chunk_id: String::new(),
+            hit_count: 0,     // Set on persist
+            first_seen_ms: 0, // Set on persist
+            last_seen_ms: 0,  // Set on persist
         });
     }
 

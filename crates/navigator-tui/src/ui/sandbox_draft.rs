@@ -110,6 +110,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 format!("  {:.0}%", chunk.confidence * 100.0),
                 styles::MUTED,
             ));
+            if chunk.hit_count > 1 {
+                spans.push(Span::styled(
+                    format!("  {}x", chunk.hit_count),
+                    styles::ACCENT,
+                ));
+            }
 
             let mut line = Line::from(spans);
             if is_selected {
@@ -173,6 +179,22 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
             Span::styled(&chunk.stage, styles::TEXT),
         ]),
     ];
+
+    // Hit count and first/last seen.
+    if chunk.hit_count > 1 {
+        lines.push(Line::from(vec![
+            Span::styled("Hits:       ", styles::MUTED),
+            Span::styled(format!("{}", chunk.hit_count), styles::ACCENT),
+            Span::styled(
+                format!(
+                    "  (first {} / last {})",
+                    format_short_time(chunk.first_seen_ms),
+                    format_short_time(chunk.last_seen_ms),
+                ),
+                styles::MUTED,
+            ),
+        ]));
+    }
 
     // Endpoints.
     if let Some(ref rule) = chunk.proposed_rule {
@@ -243,6 +265,18 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
             .wrap(Wrap { trim: false }),
         popup_area,
     );
+}
+
+fn format_short_time(epoch_ms: i64) -> String {
+    if epoch_ms <= 0 {
+        return String::from("--:--:--");
+    }
+    let secs = epoch_ms / 1000;
+    let time_of_day = secs % 86400;
+    let hours = time_of_day / 3600;
+    let minutes = (time_of_day % 3600) / 60;
+    let seconds = time_of_day % 60;
+    format!("{hours:02}:{minutes:02}:{seconds:02}")
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

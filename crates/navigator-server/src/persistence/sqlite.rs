@@ -360,8 +360,16 @@ INSERT INTO "draft_policy_chunks"
     ("id", "sandbox_id", "draft_version", "status", "stage", "rule_name",
      "proposed_rule", "rationale", "security_notes", "confidence",
      "denial_refs", "supersedes_chunk_id", "analysis_mode", "created_at_ms",
-     "decided_at_ms", "decided_by")
-VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+     "decided_at_ms", "decided_by", "host", "port", "hit_count",
+     "first_seen_ms", "last_seen_ms")
+VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+        ?17, ?18, ?19, ?20, ?21)
+ON CONFLICT ("sandbox_id", "host", "port")
+    WHERE "status" IN ('pending', 'approved')
+DO UPDATE SET
+    "hit_count"    = "draft_policy_chunks"."hit_count" + 1,
+    "last_seen_ms" = excluded."last_seen_ms",
+    "denial_refs"  = excluded."denial_refs"
 "#,
         )
         .bind(&chunk.id)
@@ -380,6 +388,11 @@ VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
         .bind(chunk.created_at_ms)
         .bind(chunk.decided_at_ms)
         .bind(&chunk.decided_by)
+        .bind(&chunk.host)
+        .bind(chunk.port)
+        .bind(chunk.hit_count)
+        .bind(chunk.first_seen_ms)
+        .bind(chunk.last_seen_ms)
         .execute(&self.pool)
         .await
         .map_err(|e| map_db_error(&e))?;
@@ -631,6 +644,11 @@ fn row_to_draft_chunk_record(row: sqlx::sqlite::SqliteRow) -> DraftChunkRecord {
         created_at_ms: row.get("created_at_ms"),
         decided_at_ms: row.get("decided_at_ms"),
         decided_by: row.get("decided_by"),
+        host: row.get("host"),
+        port: row.get("port"),
+        hit_count: row.get("hit_count"),
+        first_seen_ms: row.get("first_seen_ms"),
+        last_seen_ms: row.get("last_seen_ms"),
     }
 }
 
