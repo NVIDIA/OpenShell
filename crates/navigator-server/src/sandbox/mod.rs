@@ -1135,16 +1135,16 @@ fn apply_required_env(
     // TLS cert paths for sandbox-to-server mTLS. Only set when TLS is enabled
     // and the client TLS secret is mounted into the sandbox pod.
     if tls_enabled {
-        upsert_env(env, "OPENSHELL_TLS_CA", "/etc/navigator-tls/client/ca.crt");
+        upsert_env(env, "OPENSHELL_TLS_CA", "/etc/openshell-tls/client/ca.crt");
         upsert_env(
             env,
             "OPENSHELL_TLS_CERT",
-            "/etc/navigator-tls/client/tls.crt",
+            "/etc/openshell-tls/client/tls.crt",
         );
         upsert_env(
             env,
             "OPENSHELL_TLS_KEY",
-            "/etc/navigator-tls/client/tls.key",
+            "/etc/openshell-tls/client/tls.key",
         );
     }
 }
@@ -1581,5 +1581,53 @@ mod tests {
             &template,
             "default-image:latest"
         ));
+    }
+
+    /// Regression test: TLS mount path must match env var paths.
+    /// The volume is mounted at a specific path and the env vars must point to
+    /// files within that same path, otherwise the sandbox will fail to start
+    /// with "No such file or directory" errors.
+    #[test]
+    fn tls_env_vars_match_volume_mount_path() {
+        // The mount path used in pod template construction
+        const TLS_MOUNT_PATH: &str = "/etc/openshell-tls/client";
+
+        // Build env with TLS enabled
+        let mut env = Vec::new();
+        apply_required_env(
+            &mut env,
+            "sandbox-1",
+            "my-sandbox",
+            "https://endpoint:8080",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            true, // tls_enabled
+        );
+
+        // Extract the TLS-related env vars
+        let get_env = |name: &str| -> Option<String> {
+            env.iter()
+                .find(|e| e.get("name").and_then(|v| v.as_str()) == Some(name))
+                .and_then(|e| e.get("value").and_then(|v| v.as_str()).map(String::from))
+        };
+
+        let tls_ca = get_env("OPENSHELL_TLS_CA").expect("OPENSHELL_TLS_CA must be set");
+        let tls_cert = get_env("OPENSHELL_TLS_CERT").expect("OPENSHELL_TLS_CERT must be set");
+        let tls_key = get_env("OPENSHELL_TLS_KEY").expect("OPENSHELL_TLS_KEY must be set");
+
+        // All TLS paths must be within the mount path
+        assert!(
+            tls_ca.starts_with(TLS_MOUNT_PATH),
+            "OPENSHELL_TLS_CA path '{tls_ca}' must start with mount path '{TLS_MOUNT_PATH}'"
+        );
+        assert!(
+            tls_cert.starts_with(TLS_MOUNT_PATH),
+            "OPENSHELL_TLS_CERT path '{tls_cert}' must start with mount path '{TLS_MOUNT_PATH}'"
+        );
+        assert!(
+            tls_key.starts_with(TLS_MOUNT_PATH),
+            "OPENSHELL_TLS_KEY path '{tls_key}' must start with mount path '{TLS_MOUNT_PATH}'"
+        );
     }
 }
