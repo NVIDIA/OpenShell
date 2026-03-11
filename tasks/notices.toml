@@ -1,0 +1,11 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Third-party license notice generation tasks
+#
+# Usage:
+#   mise run notices    # regenerate THIRD-PARTY-NOTICES at repo root
+
+[notices]
+description = "Regenerate THIRD-PARTY-NOTICES with full license texts"
+run = "uv run python scripts/generate_third_party_notices.py"
