@@ -93,9 +93,11 @@ Confirm that the provider and model are set correctly:
 
 ```console
 $ openshell inference get
-provider: nvidia-prod
-model:    nvidia/nemotron-3-nano-30b-a3b
-version:  1
+Gateway inference:
+
+  Provider: nvidia-prod
+  Model: nvidia/nemotron-3-nano-30b-a3b
+  Version: 1
 ```
 
 ## Step 4: Update Part of the Config
