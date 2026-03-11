@@ -22,10 +22,12 @@ from __future__ import annotations
 
 import json
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -199,17 +201,19 @@ GO_KNOWN: dict[str, str] = {
     "dario.cat/mergo": "BSD-3-Clause",
 }
 
-# Rate-limit helpers
+# Rate-limit helpers (thread-safe)
 _last_request: dict[str, float] = {}
+_rate_lock = threading.Lock()
 
 
 def _rate_limit(domain: str, interval: float = 0.15) -> None:
-    now = time.time()
-    last = _last_request.get(domain, 0)
-    wait = interval - (now - last)
-    if wait > 0:
-        time.sleep(wait)
-    _last_request[domain] = time.time()
+    with _rate_lock:
+        now = time.time()
+        last = _last_request.get(domain, 0)
+        wait = interval - (now - last)
+        if wait > 0:
+            time.sleep(wait)
+        _last_request[domain] = time.time()
 
 
 def _get_json(url: str, domain: str) -> dict | None:
@@ -355,6 +359,39 @@ def _find_sbom_files() -> list[Path]:
     return sorted(output_dir.glob("*.cdx.json"))
 
 
+def _classify_registry(comp: dict) -> str:
+    """Return the registry group for a component."""
+    purl = comp.get("purl", "")
+    name = comp.get("name", "")
+    comp_type = comp.get("type", "")
+
+    if name in KNOWN_LICENSES:
+        return "known"
+    if purl.startswith("pkg:cargo/"):
+        return "crates.io"
+    if purl.startswith("pkg:npm/"):
+        return "npm"
+    if purl.startswith("pkg:pypi/"):
+        return "pypi"
+    if purl.startswith("pkg:golang/"):
+        return "golang"
+    if purl.startswith("pkg:deb/"):
+        return "deb"
+    if comp_type == "operating-system" or not purl:
+        return "known"
+    return "other"
+
+
+def _resolve_one(key: str, comp: dict) -> tuple[str, str | None]:
+    """Resolve a single component, returning (key, license_id | None)."""
+    return key, resolve_component(comp)
+
+
+# Concurrency: different registries can run in parallel; within a domain
+# the rate limiter serialises requests via the shared lock.
+_MAX_WORKERS = 12
+
+
 def main() -> None:
     files = [Path(p) for p in sys.argv[1:]] if len(sys.argv) > 1 else _find_sbom_files()
 
@@ -363,41 +400,109 @@ def main() -> None:
         print("Run 'mise run sbom:generate' first, or pass file paths as arguments.")
         sys.exit(1)
 
+    print(f"Loading {len(files)} SBOM file(s)...")
+
     # Collect unique components needing fixes
     to_resolve: dict[str, dict] = {}  # key -> representative component
+    total_components = 0
     for f in files:
         with f.open() as fh:
             sbom = json.load(fh)
-        for comp in sbom.get("components", []):
+        components = sbom.get("components", [])
+        total_components += len(components)
+        for comp in components:
             if needs_fix(comp):
                 key = f"{comp.get('name', '')}@{comp.get('version', '')}"
                 if key not in to_resolve:
                     to_resolve[key] = comp
 
     total = len(to_resolve)
-    print(f"Found {total} unique components needing license resolution.")
-    print()
+    print(f"  {total_components} total components, {total} need license resolution")
 
     if total == 0:
         print("All licenses already resolved.")
         return
 
-    # Resolve licenses
-    resolved: dict[str, str] = {}  # key -> license_id
+    # Classify by registry for progress reporting
+    groups: dict[str, list[tuple[str, dict]]] = {}
+    for key, comp in to_resolve.items():
+        registry = _classify_registry(comp)
+        groups.setdefault(registry, []).append((key, comp))
+
+    print("\n  Breakdown by registry:")
+    for registry in sorted(groups):
+        count = len(groups[registry])
+        marker = "(local)" if registry in {"known", "golang", "deb"} else "(API)"
+        print(f"    {registry:<12} {count:>5}  {marker}")
+
+    # Resolve -- local lookups first (instant), then API calls concurrently
+    resolved: dict[str, str] = {}
     failed: list[str] = []
+    t0 = time.monotonic()
 
-    for i, (key, comp) in enumerate(sorted(to_resolve.items()), 1):
-        sys.stdout.write(f"\r  [{i}/{total}] Resolving {key[:60]:<60}")
-        sys.stdout.flush()
+    local_registries = {"known", "golang", "deb", "other"}
+    api_registries = {"crates.io", "npm", "pypi"}
 
-        license_id = resolve_component(comp)
-        if license_id:
-            resolved[key] = license_id
+    # Phase 1: local (no network)
+    local_items = [
+        (key, comp) for reg in local_registries for key, comp in groups.get(reg, [])
+    ]
+    for key, comp in local_items:
+        lic = resolve_component(comp)
+        if lic:
+            resolved[key] = lic
         else:
             failed.append(key)
 
-    print(f"\n\nResolved: {len(resolved)}/{total}")
-    print(f"Unresolved: {len(failed)}/{total}")
+    if local_items:
+        print(
+            f"\n  Local lookups: {len(resolved)} resolved, "
+            f"{len(failed)} unresolved  ({time.monotonic() - t0:.1f}s)"
+        )
+
+    # Phase 2: API calls (concurrent)
+    api_items = [
+        (key, comp) for reg in api_registries for key, comp in groups.get(reg, [])
+    ]
+
+    if api_items:
+        api_total = len(api_items)
+        api_resolved = 0
+        api_failed = 0
+        print(
+            f"\n  Resolving {api_total} packages via registry APIs "
+            f"({_MAX_WORKERS} workers)..."
+        )
+
+        with ThreadPoolExecutor(max_workers=_MAX_WORKERS) as pool:
+            futures = {
+                pool.submit(_resolve_one, key, comp): key for key, comp in api_items
+            }
+            for done_count, future in enumerate(as_completed(futures), 1):
+                key, lic = future.result()
+                if lic:
+                    resolved[key] = lic
+                    api_resolved += 1
+                else:
+                    failed.append(key)
+                    api_failed += 1
+
+                if done_count % 50 == 0 or done_count == api_total:
+                    elapsed = time.monotonic() - t0
+                    sys.stdout.write(
+                        f"\r    [{done_count}/{api_total}] "
+                        f"resolved={api_resolved} failed={api_failed}  "
+                        f"({elapsed:.1f}s)"
+                    )
+                    sys.stdout.flush()
+
+        print()  # newline after progress
+
+    elapsed = time.monotonic() - t0
+    print(
+        f"\n  Done: {len(resolved)}/{total} resolved, "
+        f"{len(failed)} unresolved  ({elapsed:.1f}s)"
+    )
 
     # Apply to all files
     total_patched = 0
@@ -420,13 +525,13 @@ def main() -> None:
         total_patched += patched
         print(f"  {f.name}: patched {patched} components")
 
-    print(f"\nTotal patches applied: {total_patched}")
+    print(f"\n  Total patches applied: {total_patched}")
 
     if failed:
-        print(f"\n--- Unresolved ({len(failed)}) ---")
+        print(f"\n  --- Unresolved ({len(failed)}) ---")
         for key in sorted(failed):
             comp = to_resolve[key]
-            print(f"  {key}  purl={comp.get('purl', '(none)')}")
+            print(f"    {key}  purl={comp.get('purl', '(none)')}")
 
 
 if __name__ == "__main__":
