@@ -174,6 +174,12 @@ Delete a sandbox by name:
 $ openshell sandbox delete my-sandbox
 ```
 
+Delete all sandboxes in the active gateway:
+
+```console
+$ openshell sandbox delete --all
+```
+
 ## Next Steps
 
 Explore related topics:

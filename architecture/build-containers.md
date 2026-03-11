@@ -268,7 +268,7 @@ The chart deploys a **StatefulSet** (not a Deployment) with a `volumeClaimTempla
 
 The StatefulSet always mounts TLS secrets as volumes and sets environment variables for the server to use `rustls` with mTLS:
 
-- **Volumes**: `tls-cert` (from `navigator-server-tls` secret, mounted at `/etc/navigator-tls/server/`) and `tls-client-ca` (from `navigator-server-client-ca` secret, mounted at `/etc/navigator-tls/client-ca/`).
+- **Volumes**: `tls-cert` (from `navigator-server-tls` secret, mounted at `/etc/openshell-tls/server/`) and `tls-client-ca` (from `navigator-server-client-ca` secret, mounted at `/etc/openshell-tls/client-ca/`).
 - **Environment**: `OPENSHELL_TLS_CERT`, `OPENSHELL_TLS_KEY`, `OPENSHELL_TLS_CLIENT_CA` pointing to the mounted files.
 - **Client TLS secret name**: `OPENSHELL_CLIENT_TLS_SECRET_NAME` set to the `clientTlsSecretName` value, used by the server to inject TLS volume mounts into sandbox pod specs.
 - **gRPC endpoint**: `https://navigator.navigator.svc.cluster.local:8080` so sandbox pods connect over mTLS.
