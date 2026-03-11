@@ -50,7 +50,7 @@ All gateway lifecycle commands live under `openshell gateway`:
 | `openshell gateway tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
 | `openshell status` | Show gateway health via gRPC/HTTP |
 | `openshell gateway select <name>` | Set the active gateway |
-| `openshell gateway select` | List all gateways with metadata |
+| `openshell gateway select` | Open an interactive chooser on a TTY, or list all gateways in non-interactive mode |
 
 The `--name` flag defaults to `"openshell"`. When omitted on commands that accept it, the CLI resolves the active gateway via: `--gateway` flag, then `OPENSHELL_GATEWAY` env, then `~/.config/openshell/active_gateway` file.
 

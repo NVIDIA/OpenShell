@@ -7,7 +7,7 @@ use crate::tls::{
     TlsOptions, build_rustls_config, grpc_client, grpc_inference_client, require_tls_materials,
 };
 use bytes::Bytes;
-use dialoguer::Confirm;
+use dialoguer::{Confirm, Select, theme::ColorfulTheme};
 use futures::StreamExt;
 use http_body_util::Full;
 use hyper::{Request, StatusCode};
@@ -719,6 +719,64 @@ pub fn gateway_use(name: &str) -> Result<()> {
 
     save_active_gateway(name)?;
     eprintln!("{} Active gateway set to '{name}'", "✓".green().bold());
+    Ok(())
+}
+
+pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Result<()> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    gateway_select_with(name, gateway_flag, interactive, |gateways, default| {
+        let names: Vec<&str> = gateways
+            .iter()
+            .map(|gateway| gateway.name.as_str())
+            .collect();
+        Select::with_theme(&ColorfulTheme::default())
+            .with_prompt("Select a gateway")
+            .items(&names)
+            .default(default)
+            .interact_opt()
+            .into_diagnostic()
+            .map(|selection| selection.map(|index| gateways[index].name.clone()))
+    })
+}
+
+fn gateway_select_with<F>(
+    name: Option<&str>,
+    gateway_flag: &Option<String>,
+    interactive: bool,
+    choose_gateway: F,
+) -> Result<()>
+where
+    F: FnOnce(&[GatewayMetadata], usize) -> Result<Option<String>>,
+{
+    if let Some(name) = name {
+        return gateway_use(name);
+    }
+
+    let gateways = list_gateways()?;
+    if gateways.is_empty() || !interactive {
+        gateway_list(gateway_flag)?;
+        if !gateways.is_empty() {
+            eprintln!();
+            eprintln!(
+                "Select a gateway with: {}",
+                "openshell gateway select <name>".dimmed()
+            );
+        }
+        return Ok(());
+    }
+
+    let active = gateway_flag.clone().or_else(load_active_gateway);
+    let default = active
+        .as_deref()
+        .and_then(|name| gateways.iter().position(|gateway| gateway.name == name))
+        .unwrap_or(0);
+
+    if let Some(name) = choose_gateway(&gateways, default)? {
+        gateway_use(&name)?;
+    } else {
+        eprintln!("{} Gateway selection cancelled", "!".yellow());
+    }
+
     Ok(())
 }
 
@@ -3554,10 +3612,12 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayControlTarget, TlsOptions, git_sync_files, http_health_check,
+        GatewayControlTarget, TlsOptions, gateway_select_with, git_sync_files, http_health_check,
         inferred_provider_type, parse_credential_pairs, resolve_gateway_control_target_from,
     };
+    use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
+    use navigator_bootstrap::{load_active_gateway, store_gateway_metadata};
     use std::fs;
     use std::io::{Read, Write};
     use std::net::TcpListener;
@@ -3604,6 +3664,18 @@ mod tests {
                 }
             }
         }
+    }
+
+    fn with_tmp_xdg<F: FnOnce()>(tmp: &Path, f: F) {
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let guard = EnvVarGuard::set(
+            "XDG_CONFIG_HOME",
+            tmp.to_str().expect("temp path should be utf-8"),
+        );
+        f();
+        drop(guard);
     }
 
     fn edge_registration(name: &str, endpoint: &str) -> GatewayMetadata {
@@ -3762,6 +3834,78 @@ mod tests {
                 panic!("expected remote target")
             }
         }
+    }
+
+    #[test]
+    fn gateway_select_uses_explicit_name_without_prompting() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_registration("alpha", "https://alpha.example.com"),
+            )
+            .expect("store gateway");
+
+            let mut prompted = false;
+            gateway_select_with(Some("alpha"), &None, true, |_, _| {
+                prompted = true;
+                Ok(None)
+            })
+            .expect("select explicit gateway");
+
+            assert_eq!(load_active_gateway().as_deref(), Some("alpha"));
+            assert!(!prompted, "explicit gateway should skip prompting");
+        });
+    }
+
+    #[test]
+    fn gateway_select_prefers_active_gateway_as_default_choice() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_registration("alpha", "https://alpha.example.com"),
+            )
+            .expect("store alpha");
+            store_gateway_metadata(
+                "beta",
+                &edge_registration("beta", "https://beta.example.com"),
+            )
+            .expect("store beta");
+            super::save_active_gateway("beta").expect("save active gateway");
+
+            let mut seen_default = None;
+            gateway_select_with(None, &None, true, |gateways, default| {
+                seen_default = Some(default);
+                Ok(Some(gateways[default].name.clone()))
+            })
+            .expect("interactive selection");
+
+            assert_eq!(seen_default, Some(1));
+            assert_eq!(load_active_gateway().as_deref(), Some("beta"));
+        });
+    }
+
+    #[test]
+    fn gateway_select_non_interactive_lists_gateways_without_prompting() {
+        let tmpdir = tempfile::tempdir().expect("create tmpdir");
+        with_tmp_xdg(tmpdir.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_registration("alpha", "https://alpha.example.com"),
+            )
+            .expect("store gateway");
+
+            let mut prompted = false;
+            gateway_select_with(None, &None, false, |_, _| {
+                prompted = true;
+                Ok(None)
+            })
+            .expect("non-interactive selection");
+
+            assert!(!prompted, "non-interactive mode should not prompt");
+            assert_eq!(load_active_gateway(), None);
+        });
     }
 
     #[tokio::test]

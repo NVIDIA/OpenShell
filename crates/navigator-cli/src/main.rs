@@ -289,7 +289,8 @@ struct Cli {
         short = 'g',
         global = true,
         env = "OPENSHELL_GATEWAY",
-        help_heading = "GATEWAY FLAGS"
+        help_heading = "GATEWAY FLAGS",
+        add = ArgValueCompleter::new(completers::complete_gateway_names)
     )]
     gateway: Option<String>,
 
@@ -325,23 +326,24 @@ enum Commands {
     // SANDBOX COMMANDS
     // ===================================================================
     /// Manage sandboxes.
-    #[command(visible_alias = "sb", hide = true, after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(visible_alias = "sb", after_help = SANDBOX_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Sandbox {
         #[command(subcommand)]
         command: Option<SandboxCommands>,
     },
 
     /// Manage port forwarding to a sandbox.
-    #[command(visible_alias = "fwd", hide = true, after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(visible_alias = "fwd", after_help = FORWARD_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Forward {
         #[command(subcommand)]
         command: Option<ForwardCommands>,
     },
 
     /// View sandbox logs.
-    #[command(visible_alias = "lg", hide = true, after_help = LOGS_EXAMPLES, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(visible_alias = "lg", after_help = LOGS_EXAMPLES, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Logs {
         /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Number of log lines to return.
@@ -367,14 +369,14 @@ enum Commands {
     },
 
     /// Manage sandbox policy.
-    #[command(visible_alias = "pol", hide = true, after_help = POLICY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(visible_alias = "pol", after_help = POLICY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Policy {
         #[command(subcommand)]
         command: Option<PolicyCommands>,
     },
 
     /// Manage provider configuration.
-    #[command(hide = true, after_help = PROVIDER_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(after_help = PROVIDER_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Provider {
         #[command(subcommand)]
         command: Option<ProviderCommands>,
@@ -384,18 +386,18 @@ enum Commands {
     // GATEWAY COMMANDS
     // ===================================================================
     /// Manage the gateway lifecycle.
-    #[command(visible_alias = "gw", hide = true, after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(visible_alias = "gw", after_help = GATEWAY_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Gateway {
         #[command(subcommand)]
         command: Option<GatewayCommands>,
     },
 
     /// Show gateway status and information.
-    #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Status,
 
     /// Manage inference configuration.
-    #[command(hide = true, after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    #[command(after_help = INFERENCE_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Inference {
         #[command(subcommand)]
         command: Option<InferenceCommands>,
@@ -405,11 +407,11 @@ enum Commands {
     // ADDITIONAL COMMANDS
     // ===================================================================
     /// Launch the `OpenShell` interactive TUI.
-    #[command(hide = true, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Term,
 
     /// Generate shell completions.
-    #[command(hide = true, after_long_help = COMPLETIONS_HELP, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    #[command(after_long_help = COMPLETIONS_HELP, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Completions {
         /// Shell to generate completions for.
         shell: CompletionShell,
@@ -721,7 +723,7 @@ enum GatewayCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Stop {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
+        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from gateway metadata).
@@ -737,7 +739,7 @@ enum GatewayCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Destroy {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
+        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from gateway metadata).
@@ -783,10 +785,11 @@ enum GatewayCommands {
 
     /// Select the active gateway.
     ///
-    /// When called without a name, lists available gateways to choose from.
+    /// When called without a name, opens an interactive chooser on a TTY and
+    /// lists available gateways in non-interactive mode.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Select {
-        /// Gateway name (omit to list available gateways).
+        /// Gateway name (omit to choose interactively or list in non-interactive mode).
         #[arg(add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
@@ -795,7 +798,7 @@ enum GatewayCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Info {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
+        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
 
@@ -803,7 +806,7 @@ enum GatewayCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Tunnel {
         /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY")]
+        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
 
         /// Override SSH destination (auto-resolved from gateway metadata).
@@ -889,7 +892,7 @@ enum SandboxCommands {
         ///
         /// When given a Dockerfile or directory, the image is built and pushed
         /// into the cluster automatically before creating the sandbox.
-        #[arg(long)]
+        #[arg(long, value_hint = ValueHint::AnyPath)]
         from: Option<String>,
 
         /// Upload local files into the sandbox before running.
@@ -1056,6 +1059,7 @@ enum SandboxCommands {
         sandbox_path: String,
 
         /// Local destination (defaults to `.`).
+        #[arg(value_hint = ValueHint::AnyPath)]
         dest: Option<String>,
     },
 
@@ -1066,6 +1070,7 @@ enum SandboxCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     SshConfig {
         /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
     },
 }
@@ -1076,6 +1081,7 @@ enum PolicyCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
         /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Path to the policy YAML file.
@@ -1095,6 +1101,7 @@ enum PolicyCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Show a specific policy revision (default: latest).
@@ -1110,6 +1117,7 @@ enum PolicyCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
         /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Maximum number of revisions to return.
@@ -1256,17 +1264,7 @@ async fn main() -> Result<()> {
                 run::gateway_login(&name).await?;
             }
             GatewayCommands::Select { name } => {
-                if let Some(name) = name {
-                    run::gateway_use(&name)?;
-                } else {
-                    // No name provided — show available gateways.
-                    run::gateway_list(&cli.gateway)?;
-                    eprintln!();
-                    eprintln!(
-                        "Select a gateway with: {}",
-                        "openshell gateway select <name>".dimmed()
-                    );
-                }
+                run::gateway_select(name.as_deref(), &cli.gateway)?;
             }
             GatewayCommands::Info { name } => {
                 let name = name
@@ -1952,9 +1950,18 @@ mod tests {
         let args: Vec<OsString> = vec!["openshell".into(), "".into()];
         let candidates = clap_complete::engine::complete(&mut cmd, args, 1, None)
             .expect("completion engine failed");
+        let names: Vec<String> = candidates
+            .iter()
+            .map(|c| c.get_value().to_string_lossy().into_owned())
+            .collect();
+
         assert!(
-            !candidates.is_empty(),
-            "expected subcommand completions for empty input"
+            names.contains(&"sandbox".to_string()),
+            "expected 'sandbox' in root candidates, got: {names:?}"
+        );
+        assert!(
+            names.contains(&"--gateway".to_string()),
+            "expected '--gateway' in root candidates, got: {names:?}"
         );
     }
 
@@ -2025,6 +2032,23 @@ mod tests {
                 4,
                 "Dockerfile",
             ),
+            (
+                vec!["openshell", "sandbox", "create", "--from", "Do"],
+                4,
+                "Dockerfile",
+            ),
+            (
+                vec![
+                    "openshell",
+                    "sandbox",
+                    "download",
+                    "demo",
+                    "/sandbox/file",
+                    "Do",
+                ],
+                5,
+                "Dockerfile",
+            ),
         ];
 
         for (raw_args, index, expected) in cases {
@@ -2088,6 +2112,77 @@ mod tests {
             names.iter().any(|name| name.contains("sample.txt")),
             "expected path completion for upload local_path, got: {names:?}"
         );
+    }
+
+    #[test]
+    fn gateway_completion_suggests_registered_gateways() {
+        let tmp = tempfile::tempdir().expect("failed to create tempdir");
+        with_tmp_xdg(tmp.path(), || {
+            store_gateway_metadata(
+                "alpha",
+                &edge_metadata("alpha", "https://alpha.example.com"),
+            )
+            .expect("store gateway alpha");
+            store_gateway_metadata("beta", &edge_metadata("beta", "https://beta.example.com"))
+                .expect("store gateway beta");
+
+            for (raw_args, index) in [
+                (vec!["openshell", "--gateway", "a"], 2),
+                (vec!["openshell", "gateway", "select", "a"], 3),
+                (vec!["openshell", "gateway", "info", "--name", "a"], 4),
+            ] {
+                let mut cmd = Cli::command();
+                let args: Vec<OsString> = raw_args.iter().copied().map(Into::into).collect();
+                let candidates = clap_complete::engine::complete(&mut cmd, args, index, None)
+                    .expect("completion engine failed");
+                let names: Vec<String> = candidates
+                    .iter()
+                    .map(|c| c.get_value().to_string_lossy().into_owned())
+                    .collect();
+
+                assert!(
+                    names.contains(&"alpha".to_string()),
+                    "expected gateway completion for args {raw_args:?}, got: {names:?}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn global_gateway_flag_still_parses_with_subcommands() {
+        let cli = Cli::try_parse_from(["openshell", "--gateway", "demo", "status"])
+            .expect("global gateway flag should parse with subcommands");
+
+        assert_eq!(cli.gateway.as_deref(), Some("demo"));
+        assert!(matches!(cli.command, Some(Commands::Status)));
+    }
+
+    #[test]
+    fn sandbox_create_and_download_use_path_value_hints() {
+        let cmd = Cli::command();
+        let sandbox = cmd
+            .get_subcommands()
+            .find(|c| c.get_name() == "sandbox")
+            .expect("missing sandbox subcommand");
+        let create = sandbox
+            .get_subcommands()
+            .find(|c| c.get_name() == "create")
+            .expect("missing create subcommand");
+        let from = create
+            .get_arguments()
+            .find(|arg| arg.get_id() == "from")
+            .expect("missing from argument");
+        let download = sandbox
+            .get_subcommands()
+            .find(|c| c.get_name() == "download")
+            .expect("missing download subcommand");
+        let dest = download
+            .get_arguments()
+            .find(|arg| arg.get_id() == "dest")
+            .expect("missing dest argument");
+
+        assert_eq!(from.get_value_hint(), ValueHint::AnyPath);
+        assert_eq!(dest.get_value_hint(), ValueHint::AnyPath);
     }
 
     #[test]
