@@ -102,11 +102,13 @@ Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
 
 Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.
 
-The push fails. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub but blocks write operations, so the proxy denies the push before the request reaches GitHub's servers.
+The push should fail. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub and blocks write operations, so the proxy denies the push before the request reaches the GitHub server.
 
 ## Diagnose the Denial
 
-### View the logs from your machine
+In this section, you diagnose the denial from your machine and from inside the sandbox.
+
+### View the Logs from Your Machine
 
 In terminal 2, launch the OpenShell terminal:
 
@@ -129,7 +131,7 @@ l7_deny_reason: PUT /repos/<org>/<repo>/contents/hello_world.py not permitted by
 
 The log shows that the sandbox proxy intercepted an outbound `PUT` request to `api.github.com` and denied it. The `github_rest_api` policy allows read operations (GET) but blocks write operations (PUT, POST, DELETE) to the GitHub API. A similar denial appears for `github.com` if Claude attempted a git push over HTTPS.
 
-### Ask Claude to check the sandbox logs
+### Ask Claude to Check the Sandbox Logs
 
 In terminal 1, ask Claude Code to check the sandbox logs for denied requests:
 
