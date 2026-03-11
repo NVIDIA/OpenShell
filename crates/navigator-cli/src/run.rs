@@ -1803,8 +1803,7 @@ pub async fn sandbox_create(
 /// Bare sandbox names (e.g., `openclaw`) are expanded to
 /// `{prefix}/{name}:latest` using this value.  Override with the
 /// `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
-const DEFAULT_COMMUNITY_REGISTRY: &str =
-    "d1i0nduu2f6qxk.cloudfront.net/openshell-community/sandboxes";
+const DEFAULT_COMMUNITY_REGISTRY: &str = "ghcr.io/nvidia/openshell-community/sandboxes";
 
 /// Resolved source for the `--from` flag on `sandbox create`.
 enum ResolvedSource {
