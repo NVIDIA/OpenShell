@@ -56,7 +56,7 @@ This tutorial requires the following:
   The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox so Claude can use it directly.
   :::
 
-- An agent API key configured in the environment. For example, `ANTHROPIC_API_KEY` for Claude Code.
+- Your own [Anthropic account](https://console.anthropic.com/) for Claude Code. OpenShell provides the sandbox, not the agent — you need your own account to log in to Claude Code.
 - A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can [create a new repository](https://github.com/new) with a README if you do not have one handy.
 
 :::{important}

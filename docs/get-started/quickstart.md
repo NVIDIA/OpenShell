@@ -35,6 +35,7 @@ Before you begin, make sure you have:
 - Python 3.12 or later
 - [uv](https://docs.astral.sh/uv/) installed
 - Docker Desktop running on your machine
+- An account for the agent you want to run — OpenShell provides the sandbox, not the agent itself. For example, Claude Code requires your own [Anthropic account](https://console.anthropic.com/) with `ANTHROPIC_API_KEY` set in your environment. Codex and OpenCode require an `OPENAI_API_KEY`.
 
 ## Install the OpenShell CLI
 
