@@ -94,7 +94,7 @@ Claude Code starts inside the sandbox. It prints an authentication link. Open it
 
 ## Push Code to GitHub
 
-In terminal 1, ask Claude Code to write a simple script and push it to your repository:
+In terminal 1, ask Claude Code to write a simple script and push it to your repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
 ```text
 Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
