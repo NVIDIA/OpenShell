@@ -730,6 +730,7 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
             .with_prompt("Select a gateway")
             .items(&items)
             .default(default)
+            .report(false)
             .interact_opt()
             .into_diagnostic()
             .map(|selection| selection.map(|index| gateways[index].name.clone()))
