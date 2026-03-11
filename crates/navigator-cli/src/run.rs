@@ -725,9 +725,10 @@ pub fn gateway_use(name: &str) -> Result<()> {
 pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Result<()> {
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     gateway_select_with(name, gateway_flag, interactive, |gateways, default| {
+        let prompt = format!("{}\nSelect a gateway", format_gateway_select_header(gateways));
         let items = format_gateway_select_items(gateways);
         Select::with_theme(&ColorfulTheme::default())
-            .with_prompt("Select a gateway")
+            .with_prompt(prompt)
             .items(&items)
             .default(default)
             .report(false)
@@ -737,7 +738,33 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
     })
 }
 
+fn format_gateway_select_header(gateways: &[GatewayMetadata]) -> String {
+    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+    format!(
+        "{:<name_width$}  {:<endpoint_width$}  {}",
+        "NAME".bold(),
+        "ENDPOINT".bold(),
+        "TYPE".bold(),
+    )
+}
+
 fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
+    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+
+    gateways
+        .iter()
+        .map(|gateway| {
+            format!(
+                "{:<name_width$}  {:<endpoint_width$}  {}",
+                gateway.name,
+                gateway.gateway_endpoint,
+                gateway_type_label(gateway),
+            )
+        })
+        .collect()
+}
+
+fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) {
     let name_width = gateways
         .iter()
         .map(|gateway| gateway.name.len())
@@ -751,17 +778,7 @@ fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
         .unwrap_or(8)
         .max(8);
 
-    gateways
-        .iter()
-        .map(|gateway| {
-            format!(
-                "{:<name_width$}  {:<endpoint_width$}  {}",
-                gateway.name,
-                gateway.gateway_endpoint,
-                gateway_type_label(gateway),
-            )
-        })
-        .collect()
+    (name_width, endpoint_width)
 }
 
 fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
@@ -3641,9 +3658,10 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 #[cfg(test)]
 mod tests {
     use super::{
-        GatewayControlTarget, TlsOptions, format_gateway_select_items, gateway_select_with,
-        gateway_type_label, git_sync_files, http_health_check, inferred_provider_type,
-        parse_credential_pairs, resolve_gateway_control_target_from,
+        GatewayControlTarget, TlsOptions, format_gateway_select_header,
+        format_gateway_select_items, gateway_select_with, gateway_type_label, git_sync_files,
+        http_health_check, inferred_provider_type, parse_credential_pairs,
+        resolve_gateway_control_target_from,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -3957,9 +3975,13 @@ mod tests {
         ];
 
         let items = format_gateway_select_items(&gateways);
+        let header = format_gateway_select_header(&gateways);
 
         assert_eq!(gateway_type_label(&gateways[0]), "edge");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
+        assert!(header.contains("NAME"));
+        assert!(header.contains("ENDPOINT"));
+        assert!(header.contains("TYPE"));
         assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
         assert!(items[0].contains("edge"));
