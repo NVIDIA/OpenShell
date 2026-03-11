@@ -19,14 +19,17 @@ content:
 
 # How OpenShell Works
 
-OpenShell runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated Kubernetes pod managed through the gateway. Four components work together to keep agents secure.
+OpenShell runs as a [K3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated Kubernetes pod managed through the gateway. Four components work together to keep agents secure.
 
-```{image} architecture.svg
-:alt: OpenShell architecture diagram showing the OpenShell component layout
+```{figure} architecture.svg
+:alt: OpenShell architecture diagram showing the component layout
 :align: center
+:target: ../_images/architecture.svg
 ```
 
 ## Components
+
+The following table describes each component  and its role in the system:
 
 | Component | Role |
 |---|---|
@@ -39,7 +42,7 @@ OpenShell runs as a [k3s](https://k3s.io/) Kubernetes cluster inside a Docker co
 
 Every outbound connection from agent code passes through the same decision path:
 
-1. The agent process opens an outbound connection (API call, package install, git clone, etc.).
+1. The agent process opens an outbound connection (API call, package install, git clone, and so on).
 2. The proxy inside the sandbox intercepts the connection and identifies which binary opened it.
 3. The proxy queries the policy engine with the destination, port, and calling binary.
 4. The policy engine returns one of three decisions:
@@ -54,13 +57,15 @@ For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and
 OpenShell can run locally or on a remote host. The architecture is identical in both cases — only the Docker container location changes.
 
 - **Local**: the k3s cluster runs inside Docker on your workstation. The CLI provisions it automatically on first use.
-- **Remote**: the cluster runs on a remote host. Deploy with `openshell gateway start --remote user@host`. For example, connect to your DGX Spark
+- **Remote**: the cluster runs on a remote host. Deploy with `openshell gateway start --remote user@host`. For example, connect to your DGX Spark.
   ```console
-  $ openshell gateway start --remote <username>@<spark-SSID>.local
+  $ openshell gateway start --remote <username>@<spark-ssid>.local
   $ openshell status
   ```
 
 ## Next Steps
 
-- [Quickstart](get-started.md): Create your first sandbox.
-- [Sandboxes](../sandboxes/index.md): Learn how OpenShell enforces isolation across all protection layers.
+Continue with one of the following:
+
+- To create your first sandbox, refer to the [Quickstart](../get-started/quickstart.md).
+- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](../sandboxes/index.md).

@@ -5,57 +5,61 @@
 
 # Set Up a Sandbox with GitHub Repo Access
 
-Agents often need to work across multiple repositories with different levels of trust. An agent might need full read-write access to a feature repo where it commits code, but only read access to a shared library repo that it references without modifying. OpenShell policies let you express this distinction — the agent can clone and push to one repo while treating another as a read-only dependency.
+This tutorial walks through configuring a sandbox that grants different access levels to two GitHub repositories and enforces these rules at the network layer. The sandbox runs Claude Code as the agent.
 
-This tutorial sets up exactly that scenario:
+The tutorial uses the following two example repositories for illustration purposes.
 
-- **alpha-repo** — the agent's working repo. Full read-write access: clone, push, create PRs and issues.
-- **bravo-repo** — a reference repo. Read-only access: clone and browse, but push and write API calls are denied.
+- A `alpha-repo` repository with read-write access. The agent can clone, push, and call mutating GitHub API endpoints such as pull requests, issues, and comments.
+- A `bravo-repo` repository with read-only access. The agent can clone and fetch, but push operations and mutating API calls are denied.
+- All other GitHub repositories are denied by default. No clone, fetch, or API call to an unlisted repository is allowed.
 
-Access is locked to these two repos. The agent cannot clone, fetch, or call the API for any other repository on GitHub.
+After completing this tutorial, the sandbox environment includes the following:
 
-By the end you will have:
-
-- A GitHub credential provider injecting your token into the sandbox
-- A policy that extends the default with scoped GitHub access to exactly two repos
-- A running sandbox where Claude Code, OpenCode, and the `gh` CLI can all interact with GitHub
+- A GitHub credential provider that injects your GitHub token into the sandbox at runtime.
+- A network policy that extends the default policy with per-repository GitHub access rules.
+- A running sandbox in which Claude Code operates under the defined access constraints.
 
 ## Prerequisites
 
-Before you begin, make sure you have:
+This tutorial requires the following:
 
-- Completed the {doc}`Quickstart </about/get-started>` (CLI installed, Docker running)
-- A GitHub personal access token (PAT) with `repo` scope, exported as `GITHUB_TOKEN`
-- Your agent's API key set (e.g., `ANTHROPIC_API_KEY` for Claude Code)
+- Completed the {doc}`Quickstart </get-started/quickstart>` tutorial.
+- A GitHub personal access token (PAT) with `repo` scope, exported as `GITHUB_TOKEN`.
+- An agent API key configured in the environment. For example, `ANTHROPIC_API_KEY` for Claude Code.
 
-## Step 1: Create a GitHub Provider
+## Create a GitHub Provider
+
+In this section, you learn how to create a GitHub provider that injects your token into the sandbox at runtime.
 
 :::{admonition} Already have a sandbox running?
 :class: tip
 
-If you followed the Quickstart and already have a sandbox without a GitHub provider, you have two options:
+If you completed the Quickstart tutorial and have the default sandbox without a GitHub provider, there are two options to add the provider.
 
-1. **Add a provider to a new sandbox** — delete the existing sandbox, create the provider below, and recreate the sandbox with `--provider my-github` in Step 3.
-2. **Set the token inside the sandbox** — connect with `openshell sandbox connect <name>` and run `export GITHUB_TOKEN=<your-token>`. This skips the provider workflow but the token is not persisted across sandbox recreations.
+- **Option 1**: Recreate with a provider. Delete the existing sandbox, create the provider below, then recreate the sandbox with `--provider my-github`.
+- **Option 2**: Inject the token manually. Connect with `openshell sandbox connect <name>` and run `export GITHUB_TOKEN=<your-token>`. This bypasses the provider workflow. Note that the token does not persist across sandbox recreations.
 :::
 
-Create a provider that reads your GitHub token from the environment:
+Create a provider that sources your GitHub token from the host environment:
 
 ```console
 $ openshell provider create --name my-github --type github --from-existing
 ```
 
-This reads `GITHUB_TOKEN` (and `GH_TOKEN` if set) from your shell and stores them in the provider. The sandbox receives these as environment variables at runtime.
+This command reads `GITHUB_TOKEN` (and `GH_TOKEN` if set) from the current shell session and stores them in the provider configuration. At sandbox startup, the provider injects these values as environment variables into the container.
 
-For more on provider types, see {doc}`/sandboxes/providers`.
+For additional provider types, refer to {doc}`/sandboxes/providers`.
 
-## Step 2: Write the Policy
+## Write the Policy
 
-Create a file called `github-policy.yaml`. This policy starts from the {doc}`default policy </reference/default-policy>` and replaces the GitHub blocks with scoped rules that grant read-write access to `alpha-repo` and read-only access to `bravo-repo`.
+In this section, you learn how to write a policy that extends the default policy with per-repository GitHub access rules.
 
-Replace `<org>` throughout with your GitHub organization or username.
+Run the following command to create a file named `github-policy.yaml` with policy blocks. This policy extends the {doc}`default policy </reference/default-policy>` and overrides the GitHub network blocks with per-repository rules. The `alpha-repo` receives read-write access, the `bravo-repo` receives read-only access, and all other repositories are denied by default.
 
-```yaml
+Replace every occurrence of `<org>` with your GitHub organization or username.
+
+```console
+$ cat << 'EOF' > github-policy.yaml
 version: 1
 
 # ── Static (locked at sandbox creation) ──────────────────────────
@@ -211,22 +215,23 @@ network_policies:
       - { path: /usr/bin/wget }
       - { path: "/sandbox/.vscode-server/**" }
       - { path: "/sandbox/.vscode-remote-containers/**" }
+EOF
 ```
 
-**What the GitHub blocks do:**
+The following table summarizes the behavior of the GitHub policy blocks.
 
-| Block | Endpoint | Access |
+| Block | Endpoint | Behavior |
 |---|---|---|
-| `github_git` | `github.com:443` | Git Smart HTTP with TLS termination. Clone and fetch allowed for both repos. Push (`git-receive-pack`) allowed only for `alpha-repo`. All other repos are denied. |
-| `github_api` | `api.github.com:443` | REST API with TLS termination. Full read-write for `alpha-repo`. Read-only (GET, HEAD, OPTIONS) for `bravo-repo`. All other repos are denied. |
+| `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch) for both repositories. Permits `git-receive-pack` (push) for `alpha-repo` only. Denies all operations on unlisted repositories. |
+| `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for `alpha-repo`. Restricts `bravo-repo` to GET, HEAD, and OPTIONS (read-only). Denies API access to unlisted repositories. |
 
-The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) match the {doc}`default policy </reference/default-policy>` so the sandbox behaves the same as a standard sandbox for everything outside of GitHub.
+The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. Sandbox behavior outside of GitHub operations is unchanged.
 
-For background on how network policy blocks work, see [Network Access Rules](/sandboxes/index.md#network-access-rules).
+For details on network policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
 
-## Step 3: Create the Sandbox
+## Create the Sandbox
 
-Create the sandbox with both the GitHub provider and your policy:
+Run the following command to create the sandbox with the GitHub provider, the custom policy applied, and Claude Code running inside the sandbox:
 
 ```console
 $ openshell sandbox create \
@@ -236,54 +241,62 @@ $ openshell sandbox create \
     -- claude
 ```
 
-The `--keep` flag keeps the sandbox running after Claude Code exits, so you can reconnect or iterate on the policy.
+The `--keep` flag keeps the sandbox running after Claude Code exits. With this flag, you can reconnect to the same sandbox or apply policy updates without recreating the environment.
 
-## Step 4: Verify Access
+## Verify Access
 
-Once Claude Code is running inside the sandbox, ask it to exercise both repos. The policy should allow writes to `alpha-repo` and block writes to `bravo-repo`.
+With Claude Code running inside the sandbox, validate that the policy enforces the expected access levels for each repository.
 
-**Test read-write access** — ask Claude to clone, commit, and push to `alpha-repo`:
+### Verify Read-Write Access
+
+Instruct Claude to clone, commit, and push to `alpha-repo`:
 
 ```text
 Clone https://github.com/<org>/alpha-repo.git, add a blank line to the
-README, commit, and push.
+README.md file, commit, and push.
 ```
 
-Claude clones the repo, makes the edit, and pushes. The sandbox logs show `action=allow` for both `github.com` (git push) and `api.github.com` (any API calls Claude makes along the way).
+The clone, commit, and push operations should complete successfully. Verify that the sandbox logs contain `action=allow` entries for `github.com` (the git push) and `api.github.com` (any associated API calls).
 
-**Test read-only enforcement** — ask Claude to try the same thing with `bravo-repo`:
+### Verify Read-Only Enforcement
+
+Instruct Claude to perform the same operations on `bravo-repo`:
 
 ```text
 Clone https://github.com/<org>/bravo-repo.git, add a blank line to the
-README, commit, and push.
+README.md file, commit, and push.
 ```
 
-Claude clones successfully (read is allowed), but the push fails. The proxy denies `git-receive-pack` for `bravo-repo` and Claude reports the error. You can confirm in the logs:
+The clone operation succeeds because the policy permits read access. The push operation fails because the proxy denies `git-receive-pack` for `bravo-repo`. Verify the denial by inspecting the sandbox logs:
 
 ```console
 $ openshell logs <sandbox-name> --tail --source sandbox
 ```
 
-Look for an `action=deny` entry showing `host=github.com` and `path=/<org>/bravo-repo.git/git-receive-pack`.
+The output contains an `action=deny` entry with `host=github.com` and `path=/<org>/bravo-repo.git/git-receive-pack`.
 
-**Test API scoping** — ask Claude to create an issue on each repo:
+### Verify API Scoping
+
+Instruct Claude to create a GitHub issue on each repository:
 
 ```text
 Create a GitHub issue titled "Test from sandbox" on <org>/alpha-repo.
 Then try to create the same issue on <org>/bravo-repo.
 ```
 
-The first issue is created. The second is denied — the policy only allows GET/HEAD/OPTIONS for `bravo-repo`, so the POST to create an issue is blocked.
+Expected result is that the issue is created on `alpha-repo`. The request to `bravo-repo` is denied because the policy restricts that repository to GET, HEAD, and OPTIONS methods. The POST required to create an issue is blocked by the proxy.
 
-## Step 5: Iterate on the Policy
+## Iterate on the Policy
 
-To grant access to additional repos or change access levels, edit `github-policy.yaml` and push the update to the running sandbox:
+In this section, you learn how to iterate on the policy to modify repository access or add new repositories.
+
+Network policies support hot-reloading. To modify repository access or add new repositories, edit `github-policy.yaml` and run the following command to apply the updated policy to the running sandbox:
 
 ```console
 $ openshell policy set <sandbox-name> --policy github-policy.yaml --wait
 ```
 
-For example, to grant write access to `bravo-repo` as well, add another rule under `github_api`:
+For example, to change the access level of `bravo-repo` from read-only to read-write, add the following rule under `github_api`:
 
 ```yaml
           - allow:
@@ -291,7 +304,7 @@ For example, to grant write access to `bravo-repo` as well, add another rule und
               path: "/repos/<org>/bravo-repo/**"
 ```
 
-And add a push rule under `github_git`:
+Then add the corresponding push rule under `github_git`:
 
 ```yaml
           - allow:
@@ -299,10 +312,12 @@ And add a push rule under `github_git`:
               path: "/<org>/bravo-repo.git/git-receive-pack"
 ```
 
-For the full iterate workflow (pull current policy, edit, push, verify), see {doc}`/sandboxes/policies`.
+For the complete policy iteration workflow (pull, edit, push, verify), refer to {doc}`/sandboxes/policies`.
 
 ## Next Steps
 
-- **Need other credentials?** See {doc}`/sandboxes/providers` for all supported provider types.
-- **Want finer policy control?** See {doc}`/sandboxes/policies` for more examples and the iterate workflow.
-- **Looking for the full YAML reference?** See the [Policy Schema Reference](/reference/policy-schema.md).
+The following resources cover related topics in greater depth:
+
+- To configure additional credential types, refer to {doc}`/sandboxes/providers`.
+- To iterate on policy configuration, refer to {doc}`/sandboxes/policies`.
+- To view the policy YAML specification, refer to the [Policy Schema Reference](/reference/policy-schema.md).

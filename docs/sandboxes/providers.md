@@ -111,7 +111,7 @@ The following provider types are supported.
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
 | `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
-| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — see {doc}`/tutorials/github-sandbox` |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to {doc}`/tutorials/github-sandbox` |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `generic` | User-defined | Any service with custom credentials |
@@ -124,6 +124,8 @@ environment variable names and values yourself with `--credential`.
 
 ## Next Steps
 
-- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
-- **Looking for a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
-- [Policy Schema Reference](../reference/policy-schema.md): Complete field reference for the policy YAML.
+Explore related topics:
+
+- To control what the agent can access, refer to {doc}`policies`.
+- To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.
+- To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](../reference/policy-schema.md).

@@ -8,18 +8,20 @@
 This page walks you through the full sandbox lifecycle: creating, inspecting, connecting to, monitoring, and deleting sandboxes. For background on what sandboxes are and how the runtime works, refer to [About Sandboxes](index.md).
 
 :::{warning}
-Docker must be running before you create a sandbox. If it isn't, the CLI
+Docker must be running before you create a sandbox. If it is not, the CLI
 returns a connection-refused error (`os error 61`) without explaining
 the cause. Start Docker and try again.
 :::
 
 ## Create a Sandbox
 
+Run a single command to create a sandbox and launch your agent:
+
 ```console
 $ openshell sandbox create -- claude
 ```
 
-If you have an existing gateway, a sandbox will be created within that gateway or if you don't have one, one will be created for you.
+If you have an existing gateway, the sandbox is created in it. Otherwise, a gateway is created automatically.
 
 
 A fully specified creation command might look like:
@@ -104,7 +106,7 @@ Use flags to filter and follow output:
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
 
-## Monitor your Sandbox
+## Monitor Your Sandbox
 
 OpenShell Terminal is a real-time dashboard that combines sandbox status and live logs in a single view.
 
@@ -112,10 +114,10 @@ OpenShell Terminal is a real-time dashboard that combines sandbox status and liv
 $ openshell term
 ```
 
-The dashboard shows:
+The dashboard shows the following information.
 
-- **Sandbox status** — name, phase, image, attached providers, age, and active port forwards.
-- **Live log stream** — outbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
+- **Sandbox status**: Name, phase, image, attached providers, age, and active port forwards.
+- **Live log stream**: Omutbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
 
 Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy — refer to {doc}`policies` for the workflow.
 
@@ -153,7 +155,9 @@ $ openshell sandbox delete my-sandbox
 
 ## Next Steps
 
-- **Want a complete end-to-end example?** Follow the {doc}`/tutorials/github-sandbox` tutorial.
-- **Need to supply API keys or tokens?** Set up {doc}`providers` for credential management.
-- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
-- **Want a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
+Explore related topics:
+
+- To follow a complete end-to-end example, refer to the {doc}`/tutorials/github-sandbox` tutorial.
+- To supply API keys or tokens, refer to {doc}`providers`.
+- To control what the agent can access, refer to {doc}`policies`.
+- To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.

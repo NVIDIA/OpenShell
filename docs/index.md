@@ -28,7 +28,7 @@ content:
 [![License](https://img.shields.io/badge/License-Apache_2.0-blue)](https://github.com/NVIDIA/OpenShell/blob/main/LICENSE)
 [![PyPI](https://img.shields.io/badge/PyPI-openshell-orange?logo=pypi)](https://pypi.org/project/openshell/)
 
-OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
+NVIDIA OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments
 that protect your data, credentials, and infrastructure. Agents run with exactly the permissions they need and
 nothing more, governed by declarative policies that prevent unauthorized file access, data exfiltration, and
 uncontrolled network activity.
@@ -70,13 +70,15 @@ Install the CLI and create your first sandbox in two commands.
   grid-area: 1 / 1;
   white-space: nowrap;
   opacity: 0;
-  animation: nc-cycle 6s ease-in-out infinite;
+  animation: nc-cycle 12s ease-in-out infinite;
 }
 .nc-swap > span:nth-child(2) { animation-delay: 3s; }
+.nc-swap > span:nth-child(3) { animation-delay: 6s; }
+.nc-swap > span:nth-child(4) { animation-delay: 9s; }
 @keyframes nc-cycle {
-  0%, 5%     { opacity: 0; }
-  10%, 42%   { opacity: 1; }
-  50%, 100%  { opacity: 0; }
+  0%, 3%     { opacity: 0; }
+  5%, 20%    { opacity: 1; }
+  25%, 100%  { opacity: 0; }
 }
 .nc-hl { color: #76b900; font-weight: 600; }
 .nc-cursor {
@@ -98,12 +100,12 @@ Install the CLI and create your first sandbox in two commands.
   </div>
   <div class="nc-term-body">
     <div><span class="nc-ps">$ </span>uv pip install openshell</div>
-    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span></span><span class="nc-cursor"></span></div>
+    <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span><span>-- <span class="nc-hl">opencode</span></span><span>-- <span class="nc-hl">codex</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
 ```
 
-Refer to the [Quickstart](about/get-started.md) for more details.
+Refer to the [Quickstart](get-started/quickstart.md) for more details.
 
 ---
 
@@ -123,7 +125,7 @@ Learn about OpenShell and its capabilities.
 :::
 
 :::{grid-item-card} Quickstart
-:link: about/get-started
+:link: get-started/quickstart
 :link-type: doc
 
 Install the CLI and create your first sandbox in two commands.
@@ -132,8 +134,8 @@ Install the CLI and create your first sandbox in two commands.
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Tutorials
-:link: tutorials/index
+:::{grid-item-card} Set Up a Sandbox with GitHub Repo Access
+:link: tutorials/github-sandbox
 :link-type: doc
 
 End-to-end guides: GitHub repo access, custom policies, and more.
@@ -193,8 +195,8 @@ Release Notes <about/release-notes>
 :caption: Get Started
 :hidden:
 
-Quickstart <about/get-started>
-tutorials/index
+Quickstart <get-started/quickstart>
+GitHub Sandbox <tutorials/github-sandbox>
 ```
 
 ```{toctree}
@@ -223,6 +225,7 @@ inference/configure
 reference/cli
 reference/default-policy
 reference/policy-schema
+reference/support-matrix
 ```
 
 ```{toctree}
@@ -231,4 +234,3 @@ reference/policy-schema
 
 resources/eula
 ```
-

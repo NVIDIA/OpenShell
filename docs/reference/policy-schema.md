@@ -9,6 +9,8 @@ Complete field reference for the sandbox policy YAML. Each field is documented w
 
 ## Top-Level Structure
 
+A policy YAML file contains the following top-level fields:
+
 ```yaml
 version: 1
 filesystem_policy: { ... }
@@ -28,6 +30,8 @@ network_policies: { ... }
 Static fields are set at sandbox creation time. Changing them requires destroying and recreating the sandbox. Dynamic fields can be updated on a running sandbox with `openshell policy set` and take effect without restarting.
 
 ## Version
+
+The version field identifies which schema the policy uses:
 
 | Field | Type | Required | Description |
 |---|---|---|---|
@@ -118,6 +122,8 @@ A map of named network policy entries. Each entry declares a set of endpoints an
 
 ### Network Policy Entry
 
+Each entry in the `network_policies` map has the following fields:
+
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `name` | string | No | Display name for the policy entry. Used in log output. Defaults to the map key. |
@@ -139,6 +145,8 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
 
 #### Access Levels
+
+The `access` field accepts one of the following values:
 
 | Value | Allowed HTTP Methods |
 |---|---|
@@ -176,6 +184,8 @@ Identifies an executable that is permitted to use the associated endpoints.
 | `path` | string | Yes | Filesystem path to the executable. Supports glob patterns with `*` and `**`. For example, `/sandbox/.vscode-server/**` matches any executable under that directory tree. |
 
 ### Full Example
+
+The following policy grants read-only GitHub API access and npm registry access:
 
 ```yaml
 network_policies:

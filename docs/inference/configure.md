@@ -5,7 +5,7 @@
 
 # Configure Inference Routing
 
-This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — see [Network Access Rules](/sandboxes/index.md#network-access-rules) for details.
+This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — refer to [Network Access Rules](/sandboxes/index.md#network-access-rules) for details.
 
 The configuration consists of two values:
 
@@ -68,6 +68,8 @@ $ openshell inference set \
 
 ## Step 3: Verify the Active Config
 
+Confirm that the provider and model are set correctly:
+
 ```console
 $ openshell inference get
 provider: nvidia-prod
@@ -91,7 +93,7 @@ $ openshell inference update --provider openai-prod
 
 ## Use It from a Sandbox
 
-Once inference is configured, code inside any sandbox can call `https://inference.local` directly:
+After inference is configured, code inside any sandbox can call `https://inference.local` directly:
 
 ```python
 from openai import OpenAI
@@ -130,7 +132,9 @@ A successful response confirms the privacy router can reach the configured backe
 
 ## Next Steps
 
-- **How does inference routing work?** See {doc}`index` for the interception flow and supported API patterns.
-- **Need to control external endpoints?** See [Network Access Rules](/sandboxes/index.md#network-access-rules).
-- **Managing provider records?** See {doc}`../sandboxes/providers`.
-- **CLI reference?** See {doc}`../reference/cli` for `openshell inference` commands.
+Explore related topics:
+
+- To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
+- To control external endpoints, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- To manage provider records, refer to {doc}`../sandboxes/providers`.
+- To view `openshell inference` commands, refer to {doc}`../reference/cli`.

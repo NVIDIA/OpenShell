@@ -38,7 +38,7 @@ The table below summarizes common failure modes and how OpenShell mitigates them
 
 ## Protection Layers at a Glance
 
-OpenShell applies defense in depth across four policy domains:
+OpenShell applies defense in depth across the following policy domains.
 
 | Layer | What it protects | When it applies |
 |---|---|---|
@@ -51,15 +51,21 @@ For details, refer to [Built-in Default Policy](../sandboxes/index.md#built-in-d
 
 ## Common Use Cases
 
-- **Secure coding agents**: Run Claude Code, OpenCode, or OpenClaw with constrained file and network access.
-- **Private enterprise development**: Route inference to self-hosted or private backends while keeping sensitive context under your control.
-- **Compliance and audit**: Treat policy YAML as version-controlled security controls that can be reviewed and audited.
-- **Reusable environments**: Use community sandbox images or bring your own containerized runtime.
+OpenShell supports a range of agent deployment patterns.
+
+| Use Case                    | Description                                                                                              |
+|-----------------------------|----------------------------------------------------------------------------------------------------------|
+| Secure coding agents        | Run Claude Code, OpenCode, or OpenClaw with constrained file and network access.                         |
+| Private enterprise development | Route inference to self-hosted or private backends while keeping sensitive context under your control. |
+| Compliance and audit        | Treat policy YAML as version-controlled security controls that can be reviewed and audited.              |
+| Reusable environments       | Use community sandbox images or bring your own containerized runtime.                                    |
 
 ---
 
 ## Next Steps
 
-- [Architecture Overview](architecture.md): Understand the components that make up the OpenShell runtime.
-- [Quickstart](get-started.md): Install the CLI and create your first sandbox.
-- [Sandboxes](../sandboxes/index.md): Learn how OpenShell enforces isolation across all protection layers.
+Explore these topics to go deeper:
+
+- To understand the components that make up the OpenShell runtime, refer to the [Architecture Overview](architecture.md).
+- To install the CLI and create your first sandbox, refer to the [Quickstart](../get-started/quickstart.md).
+- To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](../sandboxes/index.md).

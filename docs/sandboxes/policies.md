@@ -53,7 +53,7 @@ The following steps outline the hot-reload policy update workflow.
 
 1. Create the sandbox with your initial policy by following [Quick Start: Apply a Custom Policy](#quick-start-apply-a-custom-policy) above (or set `OPENSHELL_SANDBOX_POLICY`).
 
-2. Monitor denials — each log entry shows host, port, binary, and reason. Alternatively use `openshell term` for a live dashboard.
+2. Monitor denials. Each log entry shows host, port, binary, and reason. Alternatively, use `openshell term` for a live dashboard.
 
    ```console
    $ openshell logs <name> --tail --source sandbox
@@ -121,7 +121,7 @@ Endpoints without `protocol` or `tls` use TCP passthrough — the proxy allows t
 Allow Claude and the GitHub CLI to reach `api.github.com` with per-path rules: read-only (GET, HEAD, OPTIONS) and GraphQL (POST) for all paths; full write access for `alpha-repo`; and create/edit issues only for `bravo-repo`. Replace `<org_name>` with your GitHub org or username.
 
 :::{tip}
-For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, see {doc}`/tutorials/github-sandbox`.
+For an end-to-end walkthrough that combines this policy with a GitHub credential provider and sandbox creation, refer to {doc}`/tutorials/github-sandbox`.
 :::
 
 ```yaml
@@ -144,8 +144,8 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
               method: OPTIONS
               path: "/**"
           - allow:
-             method: POST
-             path: "/graphql"
+              method: POST
+              path: "/graphql"
           - allow:
               method: "*"
               path: "/repos/<org_name>/alpha-repo/**"
@@ -167,6 +167,8 @@ Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspect
 
 ## Next Steps
 
-- **New to policies?** Read about {doc}`policy structure and network access rules <index>` first.
-- **Need the full field reference?** See the [Policy Schema Reference](../reference/policy-schema.md).
-- **Looking for the default policy breakdown?** See {doc}`../reference/default-policy`.
+Explore related topics:
+
+- To learn about policy structure and network access rules, refer to {doc}`index`.
+- To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](../reference/policy-schema.md).
+- To review the default policy breakdown, refer to {doc}`../reference/default-policy`.

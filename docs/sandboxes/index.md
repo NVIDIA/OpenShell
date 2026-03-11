@@ -18,6 +18,19 @@ Every sandbox moves through a defined set of phases:
 | Error | Something went wrong during provisioning or execution. Check logs with `openshell logs` for details. |
 | Deleting | The sandbox is being torn down. The system releases resources and purges credentials. |
 
+## Supported Agents
+
+The following table summarizes the agents that run in OpenShell sandboxes. Built-in agents are pre-installed in the OpenShell base sandbox image and auto-configured when passed as the trailing command to `openshell sandbox create`. More community agent sandboxes are available in the {doc}`community-sandboxes` catalog.
+
+| Agent | Source | Default Policy | Notes |
+|---|---|---|---|
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Built-in | Full coverage | Works out of the box. Requires `ANTHROPIC_API_KEY`. |
+| [OpenCode](https://opencode.ai/) | Built-in | Partial coverage | Pre-installed. Add `opencode.ai` endpoint and OpenCode binary paths to the policy for full functionality. |
+| [Codex](https://developers.openai.com/codex) | Built-in | No coverage | Pre-installed. Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires `OPENAI_API_KEY`. |
+| [OpenClaw](https://openclaw.ai/) | [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/openclaw) | Bundled | Agent orchestration layer. Launch with `openshell sandbox create --from openclaw`. |
+
+<!-- | [NemoClaw](https://github.com/NVIDIA/OpenShell-Community) | [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/nemoclaw) | Bundled | OpenClaw with NVIDIA DevX UI extension. Launch with `openshell sandbox create --from nemoclaw`. | -->
+
 ## Built-in Default Policy
 
 OpenShell ships a built-in policy that covers common agent workflows out of the box.
@@ -29,7 +42,7 @@ When you create a sandbox without `--policy`, the default policy is applied. It 
 | Network | What the agent can reach on the network | Each policy block pairs allowed destinations (host and port) with allowed binaries (executable paths). The proxy matches every outbound connection to the binary that opened it. Both must match or the connection is denied. |
 | Process | What privileges the agent has | The agent runs as an unprivileged user with seccomp filters that block dangerous system calls. No `sudo`, no `setuid`, no path to elevated privileges. |
 
-For the full breakdown of each default policy block and agent compatibility details, see {doc}`../reference/default-policy`.
+For the full breakdown of each default policy block and agent compatibility details, refer to {doc}`../reference/default-policy`.
 
 ## Policy Structure
 
@@ -71,22 +84,24 @@ inference:
   allowed_routes: [local]
 ```
 
-For the complete structure and every field, see the [Policy Schema Reference](../reference/policy-schema.md).
+For the complete structure and every field, refer to the [Policy Schema Reference](../reference/policy-schema.md).
 
 ## Network Access Rules
 
-Network access is controlled by policy blocks under `network_policies`. Each block has a **name**, a list of **endpoints** (host, port, protocol, and optional rules), and a list of **binaries** that are allowed to use those endpoints.
+Network access is controlled by policy blocks under `network_policies`. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries that are allowed to use those endpoints.
 
 Every outbound connection from the sandbox goes through the proxy:
 
-- The proxy queries the {doc}`policy engine <../about/architecture>` with the **destination** (host and port) and the **calling binary**. A connection is allowed only when both match an entry in the same policy block.
+- The proxy queries the {doc}`policy engine <../about/architecture>` with the destination (host and port) and the calling binary. A connection is allowed only when both match an entry in the same policy block.
 - For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is checked against that endpoint's `rules` (method and path).
 - If no endpoint matches and inference routes are configured, the request may be rerouted for inference.
 - Otherwise the connection is denied. Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads.
 
 ## Next Steps
 
-- **Ready to create your first sandbox?** Start with {doc}`create-and-manage`.
-- **Need to supply API keys or tokens?** Set up {doc}`providers` before creating.
-- **Want to control what the agent can access?** Write a custom policy in {doc}`policies`.
-- **Want a pre-built environment?** Browse the {doc}`community-sandboxes` catalog.
+Continue with one of the following:
+
+- To create your first sandbox, refer to {doc}`create-and-manage`.
+- To supply API keys or tokens, refer to {doc}`providers`.
+- To control what the agent can access, refer to {doc}`policies`.
+- To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.
