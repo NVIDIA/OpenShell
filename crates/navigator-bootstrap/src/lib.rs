@@ -32,8 +32,9 @@ use crate::constants::{
     volume_name,
 };
 use crate::docker::{
-    check_existing_gateway, create_ssh_docker_client, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
+    check_existing_gateway, check_port_conflicts, create_ssh_docker_client,
+    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
+    start_container, stop_container,
 };
 use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
 use crate::metadata::{
@@ -339,6 +340,34 @@ where
             }
             (sans, gateway_host)
         };
+
+    // Check for port conflicts before creating/starting the container.
+    // Docker silently fails to attach networking when a host port is already
+    // bound by another container, leaving the new container with only loopback
+    // and no default route.  Detecting this up-front avoids a confusing 30s
+    // timeout followed by a misleading "Docker networking issue" diagnostic.
+    let conflicts = check_port_conflicts(&target_docker, &name, port, kube_port).await?;
+    if !conflicts.is_empty() {
+        let details: Vec<String> = conflicts
+            .iter()
+            .map(|c| {
+                format!(
+                    "port {} is held by container \"{}\"",
+                    c.host_port, c.container_name
+                )
+            })
+            .collect();
+        return Err(miette::miette!(
+            "cannot start gateway: {}\n\nStop or remove the conflicting container(s) first, \
+             then retry:\n{}",
+            details.join(", "),
+            conflicts
+                .iter()
+                .map(|c| format!("  docker stop {}", c.container_name))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
 
     ensure_container(
         &target_docker,

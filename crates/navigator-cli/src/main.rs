@@ -1008,8 +1008,12 @@ enum SandboxCommands {
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
         /// Sandbox names.
-        #[arg(required = true, num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        #[arg(required_unless_present = "all", num_args = 1.., value_name = "NAME", add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         names: Vec<String>,
+
+        /// Delete all sandboxes.
+        #[arg(long, conflicts_with = "names")]
+        all: bool,
     },
 
     /// Connect to a sandbox.
@@ -1678,8 +1682,8 @@ async fn main() -> Result<()> {
                         } => {
                             run::sandbox_list(endpoint, limit, offset, ids, names, &tls).await?;
                         }
-                        SandboxCommands::Delete { names } => {
-                            run::sandbox_delete(endpoint, &names, &tls).await?;
+                        SandboxCommands::Delete { names, all } => {
+                            run::sandbox_delete(endpoint, &names, all, &tls).await?;
                         }
                         SandboxCommands::Connect { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;

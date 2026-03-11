@@ -178,10 +178,18 @@ fn diagnose_corrupted_state(gateway_name: &str) -> GatewayFailureDiagnosis {
 fn diagnose_no_default_route(_gateway_name: &str) -> GatewayFailureDiagnosis {
     GatewayFailureDiagnosis {
         summary: "Docker networking issue".to_string(),
-        explanation: "The gateway container has no network route. This is usually caused by \
-            stale Docker networks or Docker Desktop networking issues."
+        explanation: "The gateway container has no network route. This can happen when \
+            another container is already bound to the same host port (Docker silently \
+            skips network attachment), or due to stale Docker networks."
             .to_string(),
         recovery_steps: vec![
+            RecoveryStep::with_command(
+                "Check for containers using the same port",
+                "docker ps --format '{{.Names}}\\t{{.Ports}}'",
+            ),
+            RecoveryStep::new(
+                "Stop any container holding the gateway port (default 8080), then retry",
+            ),
             RecoveryStep::with_command("Prune unused Docker networks", "docker network prune -f"),
             RecoveryStep::new("Restart Docker Desktop (if on Mac/Windows)"),
             RecoveryStep::new("Then retry: openshell gateway start"),
