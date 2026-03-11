@@ -569,8 +569,8 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
     let process = proto.process.as_ref().map_or_else(
         || {
             serde_json::json!({
-                "run_as_user": "",
-                "run_as_group": "",
+                "run_as_user": "sandbox",
+                "run_as_group": "sandbox",
             })
         },
         |p| {
@@ -1292,8 +1292,8 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 process:
-  run_as_user: ""
-  run_as_group: ""
+  run_as_user: sandbox
+  run_as_group: sandbox
 "#;
 
     fn l7_engine() -> OpaEngine {
@@ -1535,8 +1535,8 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 process:
-  run_as_user: ""
-  run_as_group: ""
+  run_as_user: sandbox
+  run_as_group: sandbox
 "#;
 
     const NO_INFERENCE_TEST_DATA: &str = r#"
@@ -1554,8 +1554,8 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 process:
-  run_as_user: ""
-  run_as_group: ""
+  run_as_user: sandbox
+  run_as_group: sandbox
 "#;
 
     fn inference_engine() -> OpaEngine {
@@ -1777,8 +1777,8 @@ filesystem_policy:
 landlock:
   compatibility: best_effort
 process:
-  run_as_user: ""
-  run_as_group: ""
+  run_as_user: sandbox
+  run_as_group: sandbox
 "#;
 
     fn allowed_ips_engine() -> OpaEngine {
@@ -1918,8 +1918,8 @@ process:
                 compatibility: "best_effort".to_string(),
             }),
             process: Some(ProtoProc {
-                run_as_user: "".to_string(),
-                run_as_group: "".to_string(),
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
             }),
             network_policies,
         };

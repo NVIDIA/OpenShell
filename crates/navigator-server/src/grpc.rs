@@ -163,8 +163,10 @@ impl Navigator for NavigatorService {
             template.image = self.state.sandbox_client.default_image().to_string();
         }
 
-        // Validate policy safety before persisting.
-        if let Some(ref policy) = spec.policy {
+        // Ensure process identity defaults to "sandbox" when missing or
+        // empty, then validate policy safety before persisting.
+        if let Some(ref mut policy) = spec.policy {
+            navigator_policy::ensure_sandbox_process_identity(policy);
             validate_policy_safety(policy)?;
         }
 
@@ -968,7 +970,7 @@ impl Navigator for NavigatorService {
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
-        let new_policy = req
+        let mut new_policy = req
             .policy
             .ok_or_else(|| Status::invalid_argument("policy is required"))?;
 
@@ -988,6 +990,9 @@ impl Navigator for NavigatorService {
             .spec
             .as_ref()
             .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+
+        // Ensure process identity defaults to "sandbox" when missing or empty.
+        navigator_policy::ensure_sandbox_process_identity(&mut new_policy);
 
         if let Some(baseline_policy) = spec.policy.as_ref() {
             // Validate static fields haven't changed.
