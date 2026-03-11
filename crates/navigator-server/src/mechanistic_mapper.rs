@@ -13,7 +13,7 @@
 //! mechanistic proposals with context-aware rationale and smarter grouping.
 
 use navigator_core::proto::{
-    DenialSummary, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
+    DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
 };
 use std::collections::HashMap;
 
@@ -83,11 +83,38 @@ pub fn generate_proposals(
             }
         }
 
+        // Collect L7 request samples across all denials in this group.
+        let mut l7_methods: HashMap<(String, String), u32> = HashMap::new();
+        let mut has_l7 = false;
+        for denial in denials {
+            if denial.l7_inspection_active || !denial.l7_request_samples.is_empty() {
+                has_l7 = true;
+            }
+            for sample in &denial.l7_request_samples {
+                *l7_methods
+                    .entry((sample.method.clone(), sample.path.clone()))
+                    .or_insert(0) += sample.count;
+            }
+        }
+
         // Build proposed NetworkPolicyRule.
-        let endpoint = NetworkEndpoint {
-            host: host.clone(),
-            port: *port,
-            ..Default::default()
+        let l7_rules = build_l7_rules(&l7_methods);
+        let endpoint = if has_l7 && !l7_rules.is_empty() {
+            NetworkEndpoint {
+                host: host.clone(),
+                port: *port,
+                protocol: "rest".to_string(),
+                tls: "terminate".to_string(),
+                enforcement: "enforce".to_string(),
+                rules: l7_rules,
+                ..Default::default()
+            }
+        } else {
+            NetworkEndpoint {
+                host: host.clone(),
+                port: *port,
+                ..Default::default()
+            }
         };
 
         let binaries: Vec<NetworkBinary> = binary_set
@@ -127,10 +154,20 @@ pub fn generate_proposals(
             .map(|(_, name)| format!(" ({name})"))
             .unwrap_or_default();
 
-        let rationale = format!(
-            "Allow {binary_list} to connect to {host}:{port}{port_name}. \
-             Observed {total_count} denied connection(s)."
-        );
+        let rationale = if has_l7 && !l7_methods.is_empty() {
+            let paths: Vec<String> = l7_methods.keys().map(|(m, p)| format!("{m} {p}")).collect();
+            format!(
+                "Allow {binary_list} to connect to {host}:{port}{port_name} \
+                 with L7 inspection. Observed {total_count} denied connection(s). \
+                 Allowed paths: {}.",
+                paths.join(", ")
+            )
+        } else {
+            format!(
+                "Allow {binary_list} to connect to {host}:{port}{port_name}. \
+                 Observed {total_count} denied connection(s)."
+            )
+        };
 
         // Generate security notes.
         #[allow(clippy::cast_possible_truncation)]
@@ -262,6 +299,94 @@ fn generate_security_notes(host: &str, port: u16, is_ssrf: bool) -> String {
     notes.join(" ")
 }
 
+/// Build L7 allow-rules from observed (method, path) samples.
+///
+/// Groups paths by HTTP method and generalises path patterns where possible:
+///   - `/v1/models/abc123` → `/v1/models/**`   (ID-like trailing segments)
+///   - `/api/v2/users/42`  → `/api/v2/users/*` (numeric trailing segment)
+///
+/// Falls back to the exact observed path when no pattern applies.
+fn build_l7_rules(samples: &HashMap<(String, String), u32>) -> Vec<L7Rule> {
+    // Deduplicate after generalisation.
+    let mut seen: HashMap<(String, String), ()> = HashMap::new();
+    let mut rules = Vec::new();
+
+    for (method, path) in samples.keys() {
+        let generalised = generalise_path(path);
+        let key = (method.clone(), generalised.clone());
+        if seen.contains_key(&key) {
+            continue;
+        }
+        seen.insert(key, ());
+
+        rules.push(L7Rule {
+            allow: Some(L7Allow {
+                method: method.clone(),
+                path: generalised,
+                command: String::new(),
+            }),
+        });
+    }
+
+    // Sort for deterministic output.
+    rules.sort_by(|a, b| {
+        let a = a.allow.as_ref().unwrap();
+        let b = b.allow.as_ref().unwrap();
+        (&a.method, &a.path).cmp(&(&b.method, &b.path))
+    });
+
+    rules
+}
+
+/// Generalise a URL path for policy rules.
+///
+/// Heuristics:
+///   - Strip query strings.
+///   - If the last segment looks like an ID (hex, UUID, or numeric), replace
+///     with `*`.
+///   - Preserve all other segments verbatim.
+fn generalise_path(raw: &str) -> String {
+    // Strip query string.
+    let path = raw.split('?').next().unwrap_or(raw);
+
+    let segments: Vec<&str> = path.split('/').collect();
+    if segments.len() <= 1 {
+        return path.to_string();
+    }
+
+    let last = segments.last().unwrap_or(&"");
+
+    // Replace ID-like trailing segments with a wildcard.
+    if looks_like_id(last) {
+        let mut out = segments[..segments.len() - 1].join("/");
+        out.push_str("/*");
+        return out;
+    }
+
+    path.to_string()
+}
+
+/// Heuristic: does a path segment look like an opaque identifier?
+fn looks_like_id(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+    // Pure numeric
+    if segment.chars().all(|c| c.is_ascii_digit()) && segment.len() >= 2 {
+        return true;
+    }
+    // UUID-ish (contains dashes, 32+ hex chars)
+    let hex_only: String = segment.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if hex_only.len() >= 24 && segment.contains('-') {
+        return true;
+    }
+    // Long hex string (hash, token)
+    if hex_only.len() >= 16 && segment.len() == hex_only.len() {
+        return true;
+    }
+    false
+}
+
 /// Extract just the binary name from a full path.
 fn short_binary_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
@@ -341,5 +466,109 @@ mod tests {
         assert_eq!(rule.endpoints[0].port, 443);
         assert_eq!(rule.binaries.len(), 1);
         assert_eq!(rule.binaries[0].path, "/usr/bin/curl");
+
+        // No L7 fields when no samples provided.
+        assert!(rule.endpoints[0].protocol.is_empty());
+        assert!(rule.endpoints[0].rules.is_empty());
+    }
+
+    #[test]
+    fn test_generate_proposals_with_l7_samples() {
+        use navigator_core::proto::L7RequestSample;
+
+        let summaries = vec![DenialSummary {
+            sandbox_id: "test".to_string(),
+            host: "icanhazdadjoke.com".to_string(),
+            port: 443,
+            binary: "/usr/bin/python3".to_string(),
+            ancestors: vec![],
+            deny_reason: "l7 deny".to_string(),
+            first_seen_ms: 1000,
+            last_seen_ms: 2000,
+            count: 3,
+            suppressed_count: 0,
+            total_count: 3,
+            sample_cmdlines: vec![],
+            binary_sha256: String::new(),
+            persistent: false,
+            denial_stage: "l7_deny".to_string(),
+            l7_request_samples: vec![
+                L7RequestSample {
+                    method: "GET".to_string(),
+                    path: "/".to_string(),
+                    decision: "deny".to_string(),
+                    count: 2,
+                },
+                L7RequestSample {
+                    method: "GET".to_string(),
+                    path: "/j/abc123def456abcd0099".to_string(),
+                    decision: "deny".to_string(),
+                    count: 1,
+                },
+            ],
+            l7_inspection_active: true,
+        }];
+
+        let proposals = generate_proposals(&summaries, &[]);
+        assert_eq!(proposals.len(), 1);
+
+        let rule = proposals[0].proposed_rule.as_ref().unwrap();
+        let ep = &rule.endpoints[0];
+
+        // L7 fields should be set.
+        assert_eq!(ep.protocol, "rest");
+        assert_eq!(ep.tls, "terminate");
+        assert_eq!(ep.enforcement, "enforce");
+
+        // Should have L7 rules.
+        assert!(!ep.rules.is_empty());
+
+        let paths: Vec<&str> = ep
+            .rules
+            .iter()
+            .filter_map(|r| r.allow.as_ref())
+            .map(|a| a.path.as_str())
+            .collect();
+        assert!(paths.contains(&"/"));
+        // The /j/abc123def456 path should be generalised to /j/*
+        assert!(paths.contains(&"/j/*"));
+
+        // Rationale should mention L7.
+        assert!(proposals[0].rationale.contains("L7"));
+    }
+
+    #[test]
+    fn test_generalise_path() {
+        // Exact path preserved.
+        assert_eq!(
+            generalise_path("/api/breeds/image/random"),
+            "/api/breeds/image/random"
+        );
+
+        // Numeric ID replaced.
+        assert_eq!(generalise_path("/posts/42"), "/posts/*");
+
+        // UUID-ish replaced.
+        assert_eq!(
+            generalise_path("/chunks/550e8400-e29b-41d4-a716-446655440000"),
+            "/chunks/*"
+        );
+
+        // Query string stripped.
+        assert_eq!(generalise_path("/json/?fields=status,country"), "/json/");
+
+        // Short path preserved.
+        assert_eq!(generalise_path("/"), "/");
+    }
+
+    #[test]
+    fn test_looks_like_id() {
+        assert!(looks_like_id("42"));
+        assert!(looks_like_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(looks_like_id("abc123def456abcd"));
+        assert!(!looks_like_id("random"));
+        assert!(!looks_like_id("get"));
+        assert!(!looks_like_id(""));
+        assert!(!looks_like_id("v1"));
     }
 }

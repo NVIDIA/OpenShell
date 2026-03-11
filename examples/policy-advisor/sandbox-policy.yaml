@@ -1,0 +1,14 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Restrictive sandbox policy: only Anthropic API is allowed.
+# All other outbound connections are blocked by the proxy.
+# Use the Policy Advisor to approve recommendations and unlock access.
+
+version: 1
+
+network_policies:
+  anthropic:
+    name: Anthropic API
+    endpoints:
+      - { host: api.anthropic.com, port: 443 }
