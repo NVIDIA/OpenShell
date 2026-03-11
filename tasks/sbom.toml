@@ -9,7 +9,7 @@
 
 [sbom]
 description = "Generate SBOMs, resolve licenses, and export CSVs to deploy/sbom/output/"
-depends = ["sbom:generate", "sbom:resolve", "sbom:csv"]
+depends = ["sbom:csv"]
 
 ["sbom:generate"]
 description = "Generate CycloneDX SBOMs with Syft"
@@ -37,11 +37,13 @@ ls -la "$OUTPUT_DIR"/*.cdx.json
 
 ["sbom:resolve"]
 description = "Resolve missing licenses in SBOM JSON files via public registries"
+depends = ["sbom:generate"]
 hide = true
 run = "uv run python deploy/sbom/resolve_licenses.py"
 
 ["sbom:csv"]
 description = "Convert SBOM JSON files to CSV"
+depends = ["sbom:resolve"]
 hide = true
 run = "uv run python deploy/sbom/sbom_to_csv.py"
 
