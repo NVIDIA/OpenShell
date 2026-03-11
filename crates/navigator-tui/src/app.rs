@@ -902,6 +902,12 @@ impl App {
                 self.sandbox_log_scroll = 0;
                 self.log_cursor = 0;
             }
+            KeyCode::Char('r') => {
+                self.focus = Focus::SandboxDraft;
+            }
+            KeyCode::Char('p') => {
+                self.focus = Focus::SandboxPolicy;
+            }
             _ => {}
         }
     }

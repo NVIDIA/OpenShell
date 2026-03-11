@@ -100,6 +100,23 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut lines = vec![Line::from(""), row1, row2, row3, row4];
 
+    // Show pending policy requests prompt.
+    if pending_count > 0 {
+        lines.push(Line::from(vec![
+            Span::styled("  ", styles::TEXT),
+            Span::styled(
+                format!(
+                    "{pending_count} pending policy request{}",
+                    if pending_count == 1 { "" } else { "s" }
+                ),
+                styles::ACCENT,
+            ),
+            Span::styled(" — press ", styles::MUTED),
+            Span::styled("[r]", styles::KEY_HINT),
+            Span::styled(" to review", styles::MUTED),
+        ]));
+    }
+
     // Delete confirmation in title area (same pattern as provider delete).
     if app.confirm_delete {
         lines.push(Line::from(""));

@@ -1424,7 +1424,7 @@ impl Navigator for NavigatorService {
                 .map(|c| c.rule_name.clone())
                 .collect();
 
-            crate::mechanistic_mapper::generate_proposals(&req.summaries, &existing_names)
+            crate::mechanistic_mapper::generate_proposals(&req.summaries, &existing_names).await
         } else {
             req.proposed_chunks.clone()
         };

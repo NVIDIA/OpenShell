@@ -51,7 +51,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             if draft_count > 0 {
                 name_spans.push(Span::raw(" "));
                 name_spans.push(Span::styled(
-                    format!(" {draft_count} pending "),
+                    format!(
+                        " {draft_count} policy request{} pending ",
+                        if draft_count == 1 { "" } else { "s" }
+                    ),
                     styles::BADGE,
                 ));
             }

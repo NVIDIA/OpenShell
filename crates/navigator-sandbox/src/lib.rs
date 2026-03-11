@@ -534,7 +534,7 @@ pub async fn run_sandbox(
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+            .unwrap_or(10);
 
         tokio::spawn(async move {
             if let Err(e) =
@@ -553,7 +553,7 @@ pub async fn run_sandbox(
             let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
                 .ok()
                 .and_then(|v| v.parse().ok())
-                .unwrap_or(30);
+                .unwrap_or(10);
 
             let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
 

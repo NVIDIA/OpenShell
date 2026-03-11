@@ -319,7 +319,7 @@ sequenceDiagram
     GW-->>PL: policy + version + hash
     PL->>PL: Store initial version
 
-    loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 30)
+    loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 10)
         PL->>GW: GetSandboxPolicy(sandbox_id)
         GW-->>PL: policy + version + hash
         alt version > current_version
@@ -389,7 +389,7 @@ Proto messages involved:
 | Initial version fetch fails | Log warning, retry on next interval (poll loop continues) |
 | `reload_from_proto()` fails (L7 validation error) | Log warning, keep last-known-good engine, report FAILED status |
 | Status report RPC fails | Log warning, poll loop continues unaffected |
-| Poll interval env var unparseable | Fall back to default (30 seconds) |
+| Poll interval env var unparseable | Fall back to default (10 seconds) |
 
 ## Linux Enforcement
 

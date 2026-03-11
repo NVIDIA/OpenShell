@@ -29,7 +29,7 @@ The `DenialAggregator` (`crates/navigator-sandbox/src/denial_aggregator.rs`) run
 2. Deduplicates events by `(host, port, binary)` key with running counters
 3. Periodically flushes accumulated summaries to the gateway via `SubmitPolicyAnalysis` gRPC
 
-The flush interval defaults to 30 seconds (configurable via `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS`).
+The flush interval defaults to 10 seconds (configurable via `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS`).
 
 ### Denial Event Sources
 
@@ -132,7 +132,7 @@ When a chunk is approved, the server:
 5. Supersedes older policy versions
 6. Notifies watchers (triggers sandbox policy poll)
 
-The sandbox picks up the new policy on its next poll cycle (default 30 seconds) and hot-reloads the OPA engine.
+The sandbox picks up the new policy on its next poll cycle (default 10 seconds) and hot-reloads the OPA engine.
 
 ## User Interfaces
 
@@ -175,8 +175,8 @@ Navigation: `[j/k]` to select chunks, `[p]` to return to policy, `[l]` for logs.
 
 | Environment Variable | Default | Description |
 |---------------------|---------|-------------|
-| `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS` | `30` | How often the aggregator flushes to the gateway |
-| `OPENSHELL_POLICY_POLL_INTERVAL_SECS` | `30` | How often the sandbox polls for policy updates |
+| `OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS` | `10` | How often the aggregator flushes to the gateway |
+| `OPENSHELL_POLICY_POLL_INTERVAL_SECS` | `10` | How often the sandbox polls for policy updates |
 
 ## Future Work (Issue #205)
 

@@ -16,6 +16,7 @@ use navigator_core::proto::{
     DenialSummary, L7Allow, L7Rule, NetworkBinary, NetworkEndpoint, NetworkPolicyRule, PolicyChunk,
 };
 use std::collections::HashMap;
+use std::net::IpAddr;
 
 /// Well-known ports that get higher confidence scores.
 const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
@@ -45,8 +46,12 @@ const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
 /// `PolicyChunk` with a `NetworkPolicyRule` allowing that endpoint for the
 /// observed binaries.
 ///
+/// When a host resolves to a private IP (RFC 1918, loopback, link-local),
+/// the proposed endpoint includes `allowed_ips` so the proxy's SSRF override
+/// accepts the connection. Public IPs do not need `allowed_ips`.
+///
 /// Returns an empty vec if there are no actionable denials.
-pub fn generate_proposals(
+pub async fn generate_proposals(
     summaries: &[DenialSummary],
     existing_rule_names: &[String],
 ) -> Vec<PolicyChunk> {
@@ -97,6 +102,11 @@ pub fn generate_proposals(
             }
         }
 
+        // Resolve the host and check if any IP is private. When a host
+        // resolves to private IP space, the proxy requires `allowed_ips` as an
+        // explicit SSRF override. Public IPs don't need this.
+        let allowed_ips = resolve_allowed_ips_if_private(host, *port).await;
+
         // Build proposed NetworkPolicyRule.
         let l7_rules = build_l7_rules(&l7_methods);
         let endpoint = if has_l7 && !l7_rules.is_empty() {
@@ -107,12 +117,14 @@ pub fn generate_proposals(
                 tls: "terminate".to_string(),
                 enforcement: "enforce".to_string(),
                 rules: l7_rules,
+                allowed_ips: allowed_ips.clone(),
                 ..Default::default()
             }
         } else {
             NetworkEndpoint {
                 host: host.clone(),
                 port: *port,
+                allowed_ips: allowed_ips.clone(),
                 ..Default::default()
             }
         };
@@ -154,18 +166,27 @@ pub fn generate_proposals(
             .map(|(_, name)| format!(" ({name})"))
             .unwrap_or_default();
 
+        let private_ip_note = if !allowed_ips.is_empty() {
+            format!(
+                " Host resolves to private IP ({}); allowed_ips included for SSRF override.",
+                allowed_ips.join(", ")
+            )
+        } else {
+            String::new()
+        };
+
         let rationale = if has_l7 && !l7_methods.is_empty() {
             let paths: Vec<String> = l7_methods.keys().map(|(m, p)| format!("{m} {p}")).collect();
             format!(
                 "Allow {binary_list} to connect to {host}:{port}{port_name} \
                  with L7 inspection. Observed {total_count} denied connection(s). \
-                 Allowed paths: {}.",
+                 Allowed paths: {}.{private_ip_note}",
                 paths.join(", ")
             )
         } else {
             format!(
                 "Allow {binary_list} to connect to {host}:{port}{port_name}. \
-                 Observed {total_count} denied connection(s)."
+                 Observed {total_count} denied connection(s).{private_ip_note}"
             )
         };
 
@@ -395,6 +416,77 @@ fn short_binary_name(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
+/// Check if an IP address is in private/internal space.
+///
+/// Matches the same ranges as the proxy's `is_internal_ip`: loopback,
+/// RFC 1918 private, link-local (IPv4), plus loopback, link-local, and
+/// ULA (IPv6). IPv4-mapped IPv6 addresses are unwrapped and checked.
+fn is_internal_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return true;
+            }
+            // fe80::/10 — IPv6 link-local
+            if (v6.segments()[0] & 0xffc0) == 0xfe80 {
+                return true;
+            }
+            // fc00::/7 — IPv6 unique local addresses (ULA)
+            if (v6.segments()[0] & 0xfe00) == 0xfc00 {
+                return true;
+            }
+            // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+            }
+            false
+        }
+    }
+}
+
+/// Resolve a hostname and return the IPs as `allowed_ips` strings only if any
+/// resolved address is in private IP space.
+///
+/// When a host resolves entirely to public IPs, the proxy doesn't need
+/// `allowed_ips` — it passes public traffic through after the OPA check.
+/// When any resolved IP is private/internal, the proxy requires `allowed_ips`
+/// as an explicit SSRF override, so the mapper includes them.
+///
+/// Returns an empty vec for public hosts or on DNS resolution failure.
+async fn resolve_allowed_ips_if_private(host: &str, port: u32) -> Vec<String> {
+    let addr = format!("{host}:{port}");
+    let addrs = match tokio::net::lookup_host(&addr).await {
+        Ok(addrs) => addrs.collect::<Vec<_>>(),
+        Err(e) => {
+            tracing::warn!(host, port, error = %e, "DNS resolution failed for allowed_ips check");
+            return Vec::new();
+        }
+    };
+
+    if addrs.is_empty() {
+        tracing::warn!(host, port, "DNS resolution returned no addresses");
+        return Vec::new();
+    }
+
+    let has_private = addrs.iter().any(|a| is_internal_ip(a.ip()));
+    if !has_private {
+        return Vec::new();
+    }
+
+    // Host has private IPs — include all resolved IPs in allowed_ips.
+    let mut ips: Vec<String> = addrs.iter().map(|a| a.ip().to_string()).collect();
+    ips.sort();
+    ips.dedup();
+    tracing::debug!(
+        host,
+        port,
+        ?ips,
+        "Host resolves to private IP; adding allowed_ips"
+    );
+    ips
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,14 +522,14 @@ mod tests {
         assert!(notes.contains("SSRF"));
     }
 
-    #[test]
-    fn test_generate_proposals_empty() {
-        let proposals = generate_proposals(&[], &[]);
+    #[tokio::test]
+    async fn test_generate_proposals_empty() {
+        let proposals = generate_proposals(&[], &[]).await;
         assert!(proposals.is_empty());
     }
 
-    #[test]
-    fn test_generate_proposals_basic() {
+    #[tokio::test]
+    async fn test_generate_proposals_basic() {
         let summaries = vec![DenialSummary {
             sandbox_id: "test".to_string(),
             host: "api.example.com".to_string(),
@@ -458,7 +550,7 @@ mod tests {
             l7_inspection_active: false,
         }];
 
-        let proposals = generate_proposals(&summaries, &[]);
+        let proposals = generate_proposals(&summaries, &[]).await;
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].rule_name, "allow_api_example_com_443");
         assert!(proposals[0].proposed_rule.is_some());
@@ -473,10 +565,16 @@ mod tests {
         // No L7 fields when no samples provided.
         assert!(rule.endpoints[0].protocol.is_empty());
         assert!(rule.endpoints[0].rules.is_empty());
+
+        // Public host should NOT have allowed_ips.
+        assert!(
+            rule.endpoints[0].allowed_ips.is_empty(),
+            "Public host should not get allowed_ips"
+        );
     }
 
-    #[test]
-    fn test_generate_proposals_with_l7_samples() {
+    #[tokio::test]
+    async fn test_generate_proposals_with_l7_samples() {
         use navigator_core::proto::L7RequestSample;
 
         let summaries = vec![DenialSummary {
@@ -512,7 +610,7 @@ mod tests {
             l7_inspection_active: true,
         }];
 
-        let proposals = generate_proposals(&summaries, &[]);
+        let proposals = generate_proposals(&summaries, &[]).await;
         assert_eq!(proposals.len(), 1);
 
         let rule = proposals[0].proposed_rule.as_ref().unwrap();
@@ -538,6 +636,55 @@ mod tests {
 
         // Rationale should mention L7.
         assert!(proposals[0].rationale.contains("L7"));
+    }
+
+    // -- is_internal_ip tests -------------------------------------------------
+
+    #[test]
+    fn test_is_internal_ip_private_v4() {
+        use std::net::Ipv4Addr;
+        // RFC 1918 ranges
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(10, 110, 50, 3))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(172, 31, 255, 255))));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1))));
+    }
+
+    #[test]
+    fn test_is_internal_ip_loopback_and_link_local() {
+        use std::net::Ipv4Addr;
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::LOCALHOST)));
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+    }
+
+    #[test]
+    fn test_is_internal_ip_public_v4() {
+        use std::net::Ipv4Addr;
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(208, 95, 112, 1))));
+        assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
+    }
+
+    #[test]
+    fn test_is_internal_ip_v6() {
+        use std::net::Ipv6Addr;
+        // Loopback
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+        // Link-local fe80::1
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfe80, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // ULA fd00::1
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::new(
+            0xfd00, 0, 0, 0, 0, 0, 0, 1
+        ))));
+        // Public 2001:db8::1
+        assert!(!is_internal_ip(IpAddr::V6(Ipv6Addr::new(
+            0x2001, 0xdb8, 0, 0, 0, 0, 0, 1
+        ))));
     }
 
     #[test]

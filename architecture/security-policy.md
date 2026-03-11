@@ -181,7 +181,7 @@ In gRPC mode, the sandbox spawns a background task that periodically polls the g
 
 | Parameter | Default | Override |
 |-----------|---------|----------|
-| Poll interval | 30 seconds | `OPENSHELL_POLICY_POLL_INTERVAL_SECS` environment variable |
+| Poll interval | 10 seconds | `OPENSHELL_POLICY_POLL_INTERVAL_SECS` environment variable |
 
 The poll loop:
 
