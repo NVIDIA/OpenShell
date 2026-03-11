@@ -88,6 +88,7 @@ mermaid_init_js = (
 
 html_domain_indices = False
 html_use_index = False
+html_extra_path = ["project.json", "versions1.json"]
 highlight_language = "console"
 
 html_theme_options = {
@@ -105,7 +106,13 @@ html_theme_options = {
             "type": "fontawesome",
         },
     ],
+    "switcher": {
+        "json_url": "../versions1.json",
+        "version_match": release,
+    },
 }
+
+html_baseurl = "https://docs.nvidia.com/openshell/latest/"
 
 json_output_settings = {
     "enabled": True,
