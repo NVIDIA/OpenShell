@@ -93,6 +93,14 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             }
         }
     }
+
+    // Draft detail popup renders over the full frame.
+    if app.focus == Focus::SandboxDraft && app.draft_detail_open {
+        let abs = app.draft_scroll + app.draft_selected;
+        if let Some(chunk) = app.draft_chunks.get(abs) {
+            sandbox_draft::draw_detail_popup(frame, chunk, frame.size());
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -250,6 +258,18 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled(" ", styles::TEXT),
                 Span::styled("[j/k]", styles::KEY_HINT),
                 Span::styled(" Navigate", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[Enter]", styles::KEY_HINT),
+                Span::styled(" Detail", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[a]", styles::KEY_HINT),
+                Span::styled(" Approve", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[x]", styles::KEY_HINT),
+                Span::styled(" Reject", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[A]", styles::KEY_HINT),
+                Span::styled(" Approve All", styles::TEXT),
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[p]", styles::KEY_HINT),
                 Span::styled(" Policy", styles::TEXT),

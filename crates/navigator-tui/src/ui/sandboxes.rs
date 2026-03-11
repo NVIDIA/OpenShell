@@ -50,7 +50,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             // Append notification badge when there are pending draft recommendations.
             if draft_count > 0 {
                 name_spans.push(Span::raw(" "));
-                name_spans.push(Span::styled(format!(" {draft_count} "), styles::BADGE));
+                name_spans.push(Span::styled(
+                    format!(" {draft_count} pending "),
+                    styles::BADGE,
+                ));
             }
 
             let name_cell = Cell::from(Line::from(name_spans));

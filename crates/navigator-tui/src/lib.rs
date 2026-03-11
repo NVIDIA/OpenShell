@@ -100,6 +100,19 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                     handle_shell_connect(&mut app, &mut terminal, &events).await;
                     refresh_data(&mut app).await;
                 }
+                // --- Draft actions ---
+                if app.pending_draft_approve {
+                    app.pending_draft_approve = false;
+                    spawn_draft_approve(&app, events.sender());
+                }
+                if app.pending_draft_reject {
+                    app.pending_draft_reject = false;
+                    spawn_draft_reject(&app, events.sender());
+                }
+                if app.pending_draft_approve_all {
+                    app.pending_draft_approve_all = false;
+                    spawn_draft_approve_all(&app, events.sender());
+                }
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -174,6 +187,19 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                     app.status_text = format!("delete provider failed: {msg}");
                 }
             },
+            Some(Event::DraftActionResult(result)) => {
+                match result {
+                    Ok(msg) => {
+                        app.status_text = msg;
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("draft action failed: {msg}");
+                    }
+                }
+                // Refresh draft chunks + counts immediately after any action.
+                refresh_draft_chunks(&mut app).await;
+                refresh_sandbox_draft_counts(&mut app).await;
+            }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
                     app.scroll_logs(-3);
@@ -202,10 +228,8 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                 refresh_gateway_list(&mut app);
                 refresh_data(&mut app).await;
 
-                // Refresh per-sandbox draft counts for the dashboard badge.
-                if app.screen == Screen::Dashboard {
-                    refresh_sandbox_draft_counts(&mut app).await;
-                }
+                // Refresh per-sandbox draft counts for badges (dashboard + detail).
+                refresh_sandbox_draft_counts(&mut app).await;
 
                 // Auto-refresh the policy view when a new version is detected.
                 if app.screen == Screen::Sandbox {
@@ -1548,6 +1572,133 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
             Err(_) => {
                 let _ = tx.send(Event::ProviderDeleteResult(Err(
                     "request timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Draft approval / rejection
+// ---------------------------------------------------------------------------
+
+/// Approve the currently selected draft chunk.
+fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let abs = app.draft_scroll + app.draft_selected;
+    let chunk_id = match app.draft_chunks.get(abs) {
+        Some(c) => c.id.clone(),
+        None => return,
+    };
+    let rule_name = app
+        .draft_chunks
+        .get(abs)
+        .map_or_else(String::new, |c| c.rule_name.clone());
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::ApproveDraftChunkRequest { name, chunk_id };
+        match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                let _ = tx.send(Event::DraftActionResult(Ok(format!(
+                    "Approved '{}' -> policy v{}",
+                    rule_name, inner.policy_version
+                ))));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(Err(
+                    "approve timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+/// Reject the currently selected draft chunk.
+fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let abs = app.draft_scroll + app.draft_selected;
+    let chunk_id = match app.draft_chunks.get(abs) {
+        Some(c) => c.id.clone(),
+        None => return,
+    };
+    let rule_name = app
+        .draft_chunks
+        .get(abs)
+        .map_or_else(String::new, |c| c.rule_name.clone());
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::RejectDraftChunkRequest {
+            name,
+            chunk_id,
+            reason: String::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
+            Ok(Ok(_)) => {
+                let _ = tx.send(Event::DraftActionResult(Ok(format!(
+                    "Rejected '{rule_name}'"
+                ))));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(
+                    Err("reject timed out".to_string()),
+                ));
+            }
+        }
+    });
+}
+
+/// Approve all pending draft chunks.
+fn spawn_draft_approve_all(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::ApproveAllDraftChunksRequest {
+            name,
+            include_security_flagged: false,
+        };
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            client.approve_all_draft_chunks(req),
+        )
+        .await
+        {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                let mut msg = format!(
+                    "Approved {} chunks -> policy v{}",
+                    inner.chunks_approved, inner.policy_version
+                );
+                if inner.chunks_skipped > 0 {
+                    use std::fmt::Write;
+                    let _ = write!(msg, " ({} security-flagged skipped)", inner.chunks_skipped);
+                }
+                let _ = tx.send(Event::DraftActionResult(Ok(msg)));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(Err(
+                    "approve-all timed out".to_string()
                 )));
             }
         }
