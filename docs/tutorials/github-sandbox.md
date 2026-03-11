@@ -155,19 +155,10 @@ Copy the deny reason from Claude's response — you will paste it into your lapt
 
 **Terminal 2 (laptop)** — Paste the deny reason from the previous step into your coding agent (for example, Claude Code or Cursor running on your laptop) and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
 
-The updated policy adds `github_git` and `github_api` blocks that grant write access to your repository. Use the reference policy in the dropdown below as a starting point, then apply it to the running sandbox:
-
-```console
-$ openshell policy set <sandbox-name> --policy /tmp/sandbox-policy-update.yaml --wait
-```
-
-:::{tip}
-To find your sandbox name, check the output from `openshell sandbox create` or run `openshell sandbox list`.
-:::
-
-Network policies are hot-reloadable. The `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
+The following is a complete policy example that you can use as a starting point. Expand the dropdown to see the policy. Save it to a file, such as `/tmp/sandbox-policy-update.yaml`.
 
 :::{dropdown} Full reference policy
+:icon: code
 
 The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
@@ -324,6 +315,18 @@ The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are i
 
 For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
 :::
+
+Apply the policy to the running sandbox:
+
+```console
+$ openshell policy set <sandbox-name> --policy /tmp/sandbox-policy-update.yaml --wait
+```
+
+:::{tip}
+To find the name of your sandbox, check the output from `openshell sandbox create` or run `openshell sandbox list`.
+:::
+
+Network policies are hot-reloadable. The `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
 
 ## Retry the Push
 
