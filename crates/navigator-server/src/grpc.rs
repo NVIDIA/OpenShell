@@ -1618,7 +1618,17 @@ impl Navigator for NavigatorService {
             )));
         }
 
-        // Merge the approved rule into the current policy.
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            host = %chunk.host,
+            port = chunk.port,
+            hit_count = chunk.hit_count,
+            "ApproveDraftChunk: merging rule into active policy"
+        );
+
+        // Merge the approved rule into the current policy (with optimistic retry).
         let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, &chunk).await?;
 
         // Mark chunk as approved.
@@ -1636,8 +1646,10 @@ impl Navigator for NavigatorService {
         info!(
             sandbox_id = %sandbox_id,
             chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
             version = version,
-            "ApproveDraftChunk: merged rule into active policy"
+            policy_hash = %hash,
+            "ApproveDraftChunk: rule merged successfully"
         );
 
         Ok(Response::new(ApproveDraftChunkResponse {
@@ -1684,6 +1696,16 @@ impl Navigator for NavigatorService {
             )));
         }
 
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            host = %chunk.host,
+            port = chunk.port,
+            reason = %req.reason,
+            "RejectDraftChunk: rejecting chunk"
+        );
+
         // Mark chunk as rejected.
         let now_ms =
             current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
@@ -1695,13 +1717,6 @@ impl Navigator for NavigatorService {
 
         // Notify watchers.
         self.state.sandbox_watch_bus.notify(&sandbox_id);
-
-        info!(
-            sandbox_id = %sandbox_id,
-            chunk_id = %req.chunk_id,
-            reason = %req.reason,
-            "RejectDraftChunk: chunk rejected"
-        );
 
         Ok(Response::new(RejectDraftChunkResponse {}))
     }
@@ -1737,6 +1752,13 @@ impl Navigator for NavigatorService {
             return Err(Status::failed_precondition("no pending chunks to approve"));
         }
 
+        info!(
+            sandbox_id = %sandbox_id,
+            pending_count = pending_chunks.len(),
+            include_security_flagged = req.include_security_flagged,
+            "ApproveAllDraftChunks: starting bulk approval"
+        );
+
         let mut chunks_approved: u32 = 0;
         let mut chunks_skipped: u32 = 0;
         let mut last_version: i64 = 0;
@@ -1745,11 +1767,27 @@ impl Navigator for NavigatorService {
         for chunk in &pending_chunks {
             // Skip security-flagged chunks unless explicitly included.
             if !req.include_security_flagged && !chunk.security_notes.is_empty() {
+                info!(
+                    sandbox_id = %sandbox_id,
+                    chunk_id = %chunk.id,
+                    rule_name = %chunk.rule_name,
+                    security_notes = %chunk.security_notes,
+                    "ApproveAllDraftChunks: skipping security-flagged chunk"
+                );
                 chunks_skipped += 1;
                 continue;
             }
 
-            // Merge each chunk into the policy.
+            info!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %chunk.id,
+                rule_name = %chunk.rule_name,
+                host = %chunk.host,
+                port = chunk.port,
+                "ApproveAllDraftChunks: merging chunk"
+            );
+
+            // Merge each chunk into the policy (with optimistic retry).
             let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, chunk).await?;
             last_version = version;
             last_hash = hash;
@@ -1774,6 +1812,7 @@ impl Navigator for NavigatorService {
             chunks_approved = chunks_approved,
             chunks_skipped = chunks_skipped,
             version = last_version,
+            policy_hash = %last_hash,
             "ApproveAllDraftChunks: bulk approval complete"
         );
 
@@ -1879,7 +1918,16 @@ impl Navigator for NavigatorService {
             )));
         }
 
-        // Remove the rule from the current policy.
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            host = %chunk.host,
+            port = chunk.port,
+            "UndoDraftChunk: removing rule from active policy"
+        );
+
+        // Remove the rule from the current policy (with optimistic retry).
         let (version, hash) = remove_chunk_from_policy(&self.state, &sandbox_id, &chunk).await?;
 
         // Mark chunk back to pending.
@@ -1895,8 +1943,10 @@ impl Navigator for NavigatorService {
         info!(
             sandbox_id = %sandbox_id,
             chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
             version = version,
-            "UndoDraftChunk: rule removed from active policy"
+            policy_hash = %hash,
+            "UndoDraftChunk: rule removed, chunk reverted to pending"
         );
 
         Ok(Response::new(UndoDraftChunkResponse {
@@ -2053,6 +2103,9 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
 /// Returns `(new_version, policy_hash)`. This reuses the same persistence
 /// pattern as `update_sandbox_policy`: compute hash, check for no-op,
 /// persist a new revision, supersede older versions, and notify watchers.
+/// Maximum number of optimistic retry attempts for policy version conflicts.
+const MERGE_RETRY_LIMIT: usize = 5;
+
 async fn merge_chunk_into_policy(
     state: &ServerState,
     sandbox_id: &str,
@@ -2060,47 +2113,87 @@ async fn merge_chunk_into_policy(
 ) -> Result<(i64, String), Status> {
     use navigator_core::proto::NetworkPolicyRule;
 
-    // Decode the proposed rule.
+    // Decode the proposed rule once — it doesn't change between retries.
     let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
         .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
 
-    // Get the current active policy.
-    let latest = state
-        .store
-        .get_latest_policy(sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+    for attempt in 1..=MERGE_RETRY_LIMIT {
+        // Get the current active policy (re-read on each attempt).
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-    let mut policy = if let Some(ref record) = latest {
-        ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
-            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
-    } else {
-        ProtoSandboxPolicy::default()
-    };
+        let mut policy = if let Some(ref record) = latest {
+            ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+        } else {
+            ProtoSandboxPolicy::default()
+        };
 
-    // Insert or replace the network policy rule.
-    policy
-        .network_policies
-        .insert(chunk.rule_name.clone(), rule);
+        let base_version = latest.as_ref().map_or(0, |r| r.version);
 
-    // Persist as a new version.
-    let payload = policy.encode_to_vec();
-    let hash = deterministic_policy_hash(&policy);
-    let next_version = latest.map_or(1, |r| r.version + 1);
-    let policy_id = uuid::Uuid::new_v4().to_string();
+        // Insert or replace the network policy rule.
+        policy
+            .network_policies
+            .insert(chunk.rule_name.clone(), rule.clone());
 
-    state
-        .store
-        .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
-        .await
-        .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
+        // Persist as a new version.
+        let payload = policy.encode_to_vec();
+        let hash = deterministic_policy_hash(&policy);
+        let next_version = base_version + 1;
+        let policy_id = uuid::Uuid::new_v4().to_string();
 
-    let _ = state
-        .store
-        .supersede_older_policies(sandbox_id, next_version)
-        .await;
+        match state
+            .store
+            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
+            .await
+        {
+            Ok(()) => {
+                let _ = state
+                    .store
+                    .supersede_older_policies(sandbox_id, next_version)
+                    .await;
 
-    Ok((next_version, hash))
+                if attempt > 1 {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        version = next_version,
+                        "merge_chunk_into_policy: succeeded after version conflict retry"
+                    );
+                }
+
+                return Ok((next_version, hash));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Check for UNIQUE constraint violation (version conflict).
+                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        conflicting_version = next_version,
+                        "merge_chunk_into_policy: version conflict, retrying"
+                    );
+                    // Brief yield to let the winning write settle.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(Status::internal(format!(
+                    "persist policy revision failed: {e}"
+                )));
+            }
+        }
+    }
+
+    Err(Status::aborted(format!(
+        "merge_chunk_into_policy: gave up after {} version conflict retries for rule '{}'",
+        MERGE_RETRY_LIMIT, chunk.rule_name
+    )))
 }
 
 /// Remove a previously-approved draft chunk's rule from the current active
@@ -2112,38 +2205,74 @@ async fn remove_chunk_from_policy(
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
-    // Get the current active policy.
-    let latest = state
-        .store
-        .get_latest_policy(sandbox_id)
-        .await
-        .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
-        .ok_or_else(|| Status::internal("no active policy to undo from"))?;
+    for attempt in 1..=MERGE_RETRY_LIMIT {
+        // Get the current active policy (re-read on each attempt).
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
+            .ok_or_else(|| Status::internal("no active policy to undo from"))?;
 
-    let mut policy = ProtoSandboxPolicy::decode(latest.policy_payload.as_slice())
-        .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
+        let mut policy = ProtoSandboxPolicy::decode(latest.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
 
-    // Remove the rule by name.
-    policy.network_policies.remove(&chunk.rule_name);
+        // Remove the rule by name.
+        policy.network_policies.remove(&chunk.rule_name);
 
-    // Persist as a new version.
-    let payload = policy.encode_to_vec();
-    let hash = deterministic_policy_hash(&policy);
-    let next_version = latest.version + 1;
-    let policy_id = uuid::Uuid::new_v4().to_string();
+        // Persist as a new version.
+        let payload = policy.encode_to_vec();
+        let hash = deterministic_policy_hash(&policy);
+        let next_version = latest.version + 1;
+        let policy_id = uuid::Uuid::new_v4().to_string();
 
-    state
-        .store
-        .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
-        .await
-        .map_err(|e| Status::internal(format!("persist policy revision failed: {e}")))?;
+        match state
+            .store
+            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
+            .await
+        {
+            Ok(()) => {
+                let _ = state
+                    .store
+                    .supersede_older_policies(sandbox_id, next_version)
+                    .await;
 
-    let _ = state
-        .store
-        .supersede_older_policies(sandbox_id, next_version)
-        .await;
+                if attempt > 1 {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        version = next_version,
+                        "remove_chunk_from_policy: succeeded after version conflict retry"
+                    );
+                }
 
-    Ok((next_version, hash))
+                return Ok((next_version, hash));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        conflicting_version = next_version,
+                        "remove_chunk_from_policy: version conflict, retrying"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(Status::internal(format!(
+                    "persist policy revision failed: {e}"
+                )));
+            }
+        }
+    }
+
+    Err(Status::aborted(format!(
+        "remove_chunk_from_policy: gave up after {} version conflict retries for rule '{}'",
+        MERGE_RETRY_LIMIT, chunk.rule_name
+    )))
 }
 
 /// Compute a deterministic SHA-256 hash of a `SandboxPolicy`.
