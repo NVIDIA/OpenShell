@@ -96,9 +96,12 @@ Claude Code starts inside the sandbox. It prints an authentication link. Open it
 
 In terminal 1, ask Claude Code to write a simple script and push it to your repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
-```text
-Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
-```
+:::{dropdown} Prompt
+:open:
+:icon: terminal
+
+Write a `hello_world.py` script and push it to `https://github.com/<org>/<repo>`.
+:::
 
 Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.
 
