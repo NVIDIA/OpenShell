@@ -3,7 +3,11 @@
 
 # k3s cluster image with OpenShell Helm charts and manifests
 #
-# This image is based on k3s and includes:
+# Multi-stage build: extracts k3s artifacts from the upstream rancher/k3s
+# Alpine image and layers them onto the NVIDIA Ubuntu base image.
+#
+# This image includes:
+# - k3s binary and all supporting binaries (containerd-shim, runc, CNI, etc.)
 # - Packaged OpenShell Helm chart
 # - HelmChart CR for auto-deploying OpenShell
 # - Custom entrypoint for DNS configuration in Docker environments
@@ -23,15 +27,63 @@
 #   GHSA-9h8m-3fm2-qjrq  otel/sdk v1.39.0 (macOS-only PATH hijack; N/A for Linux)
 #   CVE-2024-36623       docker/docker v25.0.8 (streamformatter race condition)
 # Bump K3S_VERSION when a release with updated dependencies ships.
+
+# ---------------------------------------------------------------------------
+# Stage 1: Extract k3s artifacts from upstream rancher image (Alpine-based)
+# ---------------------------------------------------------------------------
 ARG K3S_VERSION=v1.35.2-k3s1
-FROM rancher/k3s:${K3S_VERSION}
+FROM rancher/k3s:${K3S_VERSION} AS k3s
+
+# ---------------------------------------------------------------------------
+# Stage 2: Runtime on NVIDIA hardened Ubuntu base
+# ---------------------------------------------------------------------------
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
+
+# Install runtime dependencies that k3s expects from the host OS.
+# - iptables: used by flannel/kube-proxy for network policy and NAT rules
+# - mount/umount: needed by kubelet for volume mounts (provided by mount package)
+# - ca-certificates: TLS verification for registry pulls
+# - conntrack: k3s/kube-proxy uses conntrack for connection tracking
+# - dnsutils: nslookup used by entrypoint/healthcheck for DNS probe
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    iptables \
+    mount \
+    dnsutils \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy the full /bin directory from k3s (contains all statically-linked
+# binaries and their symlinks: k3s, kubectl, crictl, ctr, containerd,
+# containerd-shim-runc-v2, runc, cni plugins, busybox, coreutils,
+# ip, ipset, conntrack, nsenter, pigz, etc.)
+COPY --from=k3s /bin/ /bin/
+
+# Copy iptables/nftables tooling (xtables-nft-multi, iptables-detect.sh, etc.)
+# These are in /bin/aux/ in the k3s image and must be on PATH.
+# Note: the Ubuntu iptables package provides /usr/sbin/iptables, but k3s
+# expects its own bundled version at /bin/aux/iptables. Both are on PATH;
+# k3s finds its copy via /bin/aux in PATH.
+
+# Copy CA certificates from k3s (bundled Alpine CA bundle).
+# The Ubuntu ca-certificates package also installs certs; having both is fine.
+COPY --from=k3s /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/k3s-ca-certificates.crt
+
+# Copy timezone data used by k3s/Go for time.LoadLocation
+COPY --from=k3s /usr/share/zoneinfo/ /usr/share/zoneinfo/
+
+# Set environment variables matching the upstream k3s image.
+# PATH includes /bin/aux for iptables tooling and /var/lib/rancher/k3s/data/cni
+# for runtime-extracted CNI binaries.
+ENV PATH="/var/lib/rancher/k3s/data/cni:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/bin/aux" \
+    CRI_CONFIG_FILE="/var/lib/rancher/k3s/agent/etc/crictl.yaml"
 
 # Create directories for manifests, charts, and configuration
 RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /var/lib/rancher/k3s/server/static/charts \
              /etc/rancher/k3s \
              /opt/openshell/manifests \
-             /opt/openshell/charts
+             /opt/openshell/charts \
+             /run/flannel
 
 # Copy entrypoint script that configures DNS for Docker environments
 # This script detects the host gateway IP and configures CoreDNS to use it

@@ -6,7 +6,7 @@
 # CI runner image with all development tools pre-installed
 # Rebuild triggered automatically when mise.toml or this file changes
 
-FROM ubuntu:24.04
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013
 
 ARG DOCKER_VERSION=29.3.0
 ARG BUILDX_VERSION=v0.32.1
