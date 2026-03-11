@@ -744,7 +744,7 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
 fn format_gateway_select_header(gateways: &[GatewayMetadata]) -> String {
     let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
     format!(
-        "{:<name_width$}  {:<endpoint_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
