@@ -532,6 +532,21 @@ enum CliProviderType {
     Outlook,
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum CliEditor {
+    Vscode,
+    Cursor,
+}
+
+impl From<CliEditor> for navigator_cli::ssh::Editor {
+    fn from(value: CliEditor) -> Self {
+        match value {
+            CliEditor::Vscode => Self::Vscode,
+            CliEditor::Cursor => Self::Cursor,
+        }
+    }
+}
+
 impl CliProviderType {
     fn as_str(&self) -> &'static str {
         match self {
@@ -911,6 +926,11 @@ enum SandboxCommands {
         #[arg(long)]
         keep: bool,
 
+        /// Launch a remote editor after the sandbox is ready.
+        /// Implies `--keep` and installs OpenShell-managed SSH config.
+        #[arg(long, value_enum)]
+        editor: Option<CliEditor>,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -1021,6 +1041,11 @@ enum SandboxCommands {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Launch a remote editor instead of an interactive shell.
+        /// Installs OpenShell-managed SSH config if needed.
+        #[arg(long, value_enum)]
+        editor: Option<CliEditor>,
     },
 
     /// Upload local files to a sandbox.
@@ -1500,6 +1525,7 @@ async fn main() -> Result<()> {
                     upload,
                     no_git_ignore,
                     keep,
+                    editor,
                     remote,
                     ssh_key,
                     providers,
@@ -1546,6 +1572,9 @@ async fn main() -> Result<()> {
                         (local, remote, !no_git_ignore)
                     });
 
+                    let editor = editor.map(Into::into);
+                    let keep = keep || editor.is_some();
+
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.
                     match resolve_gateway(&cli.gateway, &cli.gateway_endpoint) {
@@ -1569,6 +1598,7 @@ async fn main() -> Result<()> {
                                 &ctx.name,
                                 upload_spec.as_ref(),
                                 keep,
+                                editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
@@ -1589,6 +1619,7 @@ async fn main() -> Result<()> {
                                 from.as_deref(),
                                 upload_spec.as_ref(),
                                 keep,
+                                editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
@@ -1682,10 +1713,17 @@ async fn main() -> Result<()> {
                         SandboxCommands::Delete { names } => {
                             run::sandbox_delete(endpoint, &names, &tls).await?;
                         }
-                        SandboxCommands::Connect { name } => {
+                        SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
                             let _ = save_last_sandbox(&ctx.name, &name);
-                            run::sandbox_connect(endpoint, &name, &tls).await?;
+                            if let Some(editor) = editor.map(Into::into) {
+                                run::sandbox_connect_editor(
+                                    endpoint, &ctx.name, &name, editor, &tls,
+                                )
+                                .await?;
+                            } else {
+                                run::sandbox_connect(endpoint, &name, &tls).await?;
+                            }
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;

@@ -18,12 +18,15 @@ There is also a gateway-side `ExecSandbox` gRPC RPC that executes commands insid
 
 **File**: `crates/navigator-cli/src/ssh.rs`
 
-Contains four public functions that implement the client side of sandbox connectivity:
+Contains the client-side SSH and editor-launch helpers for sandbox connectivity:
 
 - `sandbox_connect()` -- interactive SSH shell session
 - `sandbox_exec()` -- non-interactive command execution via SSH
 - `sandbox_rsync()` -- file synchronization via rsync over SSH
 - `sandbox_ssh_proxy()` -- the `ProxyCommand` process that bridges stdin/stdout to the gateway
+- OpenShell-managed SSH config helpers -- install a single `Include` entry in
+  `~/.ssh/config` and maintain generated `Host openshell-<name>` blocks in a
+  separate OpenShell-owned config file for editor workflows
 
 These are re-exported from `crates/navigator-cli/src/run.rs` for backward compatibility.
 

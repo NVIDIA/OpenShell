@@ -11,15 +11,42 @@ use navigator_core::forward::{
 use navigator_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
 use owo_colors::OwoColorize;
 use rustls::pki_types::ServerName;
+use std::fs;
 use std::io::IsTerminal;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::Command;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+#[derive(Clone, Copy, Debug)]
+pub enum Editor {
+    Vscode,
+    Cursor,
+}
+
+impl Editor {
+    fn binary(self) -> &'static str {
+        match self {
+            Self::Vscode => "code",
+            Self::Cursor => "cursor",
+        }
+    }
+
+    fn remote_target(self, host_alias: &str) -> String {
+        format!("ssh-remote+{host_alias}")
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Vscode => "VS Code",
+            Self::Cursor => "Cursor",
+        }
+    }
+}
 
 struct SshSessionConfig {
     proxy_command: String,
@@ -125,9 +152,9 @@ pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Resu
         .arg("-o")
         .arg("SetEnv=TERM=xterm-256color")
         .arg("sandbox")
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     if std::io::stdin().is_terminal() {
         #[cfg(unix)]
@@ -146,6 +173,25 @@ pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Resu
         return Err(miette::miette!("ssh exited with status {status}"));
     }
 
+    Ok(())
+}
+
+pub async fn sandbox_connect_editor(
+    _server: &str,
+    gateway: &str,
+    name: &str,
+    editor: Editor,
+    _tls: &TlsOptions,
+) -> Result<()> {
+    let host_alias = host_alias(name);
+    install_ssh_config(gateway, name)?;
+    launch_editor(editor, &host_alias)?;
+    eprintln!(
+        "{} Opened {} for sandbox {}",
+        "✓".green().bold(),
+        editor.label(),
+        name
+    );
     Ok(())
 }
 
@@ -176,9 +222,9 @@ pub async fn sandbox_forward(
 
     command
         .arg("sandbox")
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     let status = tokio::task::spawn_blocking(move || command.status())
         .await
@@ -238,9 +284,9 @@ pub async fn sandbox_exec(
 
     ssh.arg("sandbox")
         .arg(command_str)
-        .stdin(std::process::Stdio::inherit())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     // For interactive TTY sessions, replace this process with SSH via exec()
     // to avoid signal handling issues (e.g. Ctrl+C killing the parent openshell
@@ -293,9 +339,9 @@ pub async fn sandbox_sync_up_files(
             shell_escape(dest),
             shell_escape(dest)
         ))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     let mut child = ssh.spawn().into_diagnostic()?;
     let stdin = child
@@ -362,9 +408,9 @@ pub async fn sandbox_sync_up(
             shell_escape(sandbox_path),
             shell_escape(sandbox_path)
         ))
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::inherit())
-        .stderr(std::process::Stdio::inherit());
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
 
     let mut child = ssh.spawn().into_diagnostic()?;
     let stdin = child
@@ -451,9 +497,9 @@ pub async fn sandbox_sync_down(
         .arg("RequestTTY=no")
         .arg("sandbox")
         .arg(tar_cmd)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit());
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
 
     let mut child = ssh.spawn().into_diagnostic()?;
     let stdout = child
@@ -463,7 +509,7 @@ pub async fn sandbox_sync_down(
 
     let local_path = local_path.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        std::fs::create_dir_all(&local_path)
+        fs::create_dir_all(&local_path)
             .into_diagnostic()
             .wrap_err("failed to create local destination directory")?;
         let mut archive = tar::Archive::new(stdout);
@@ -575,6 +621,183 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
     .await
 }
 
+fn host_alias(name: &str) -> String {
+    format!("openshell-{name}")
+}
+
+fn render_ssh_config(gateway: &str, name: &str) -> String {
+    let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
+    let exe = shell_escape(&exe.to_string_lossy());
+
+    let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
+    let host_alias = host_alias(name);
+    format!(
+        "Host {host_alias}\n    User sandbox\n    StrictHostKeyChecking no\n    UserKnownHostsFile /dev/null\n    GlobalKnownHostsFile /dev/null\n    LogLevel ERROR\n    ProxyCommand {proxy_cmd}\n"
+    )
+}
+
+fn openshell_ssh_config_path() -> Result<PathBuf> {
+    let base = if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
+        PathBuf::from(path)
+    } else {
+        let home = std::env::var("HOME")
+            .into_diagnostic()
+            .wrap_err("HOME is not set")?;
+        PathBuf::from(home).join(".config")
+    };
+    Ok(base.join("openshell").join("ssh_config"))
+}
+
+fn user_ssh_config_path() -> Result<PathBuf> {
+    let home = std::env::var("HOME")
+        .into_diagnostic()
+        .wrap_err("HOME is not set")?;
+    Ok(PathBuf::from(home).join(".ssh").join("config"))
+}
+
+fn render_include_line(path: &Path) -> String {
+    format!("Include \"{}\"", path.display())
+}
+
+fn ssh_config_includes_path(contents: &str, path: &Path) -> bool {
+    let quoted = format!("\"{}\"", path.display());
+    let plain = path.display().to_string();
+    contents.lines().any(|line| {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("Include ") {
+            return false;
+        }
+        trimmed["Include ".len()..]
+            .split_whitespace()
+            .any(|token| token == quoted || token == plain)
+    })
+}
+
+fn ensure_openshell_include(main_config: &Path, managed_config: &Path) -> Result<()> {
+    if let Some(parent) = main_config.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err("failed to create ~/.ssh directory")?;
+    }
+
+    let include_line = render_include_line(managed_config);
+    let mut contents = fs::read_to_string(main_config).unwrap_or_default();
+    if ssh_config_includes_path(&contents, managed_config) {
+        return Ok(());
+    }
+    if !contents.is_empty() && !contents.ends_with('\n') {
+        contents.push('\n');
+    }
+    if !contents.is_empty() {
+        contents.push('\n');
+    }
+    contents.push_str(&include_line);
+    contents.push('\n');
+    fs::write(main_config, contents)
+        .into_diagnostic()
+        .wrap_err("failed to update ~/.ssh/config")?;
+    Ok(())
+}
+
+fn host_line_matches(line: &str, alias: &str) -> bool {
+    let trimmed = line.trim_start();
+    if !trimmed.starts_with("Host ") {
+        return false;
+    }
+    trimmed["Host ".len()..]
+        .split_whitespace()
+        .any(|token| token == alias)
+}
+
+fn upsert_host_block(contents: &str, alias: &str, block: &str) -> String {
+    let lines: Vec<&str> = contents.lines().collect();
+    let start = lines.iter().position(|line| host_line_matches(line, alias));
+
+    let mut out = Vec::new();
+    if let Some(start) = start {
+        let end = lines
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .find(|(_, line)| line.trim_start().starts_with("Host "))
+            .map(|(idx, _)| idx)
+            .unwrap_or(lines.len());
+
+        out.extend_from_slice(&lines[..start]);
+        if !out.is_empty() && !out.last().is_some_and(|line| line.is_empty()) {
+            out.push("");
+        }
+        out.extend(block.lines());
+        if end < lines.len() && !lines[end..].first().is_some_and(|line| line.is_empty()) {
+            out.push("");
+        }
+        out.extend_from_slice(&lines[end..]);
+    } else {
+        out.extend_from_slice(&lines);
+        if !out.is_empty() && !out.last().is_some_and(|line| line.is_empty()) {
+            out.push("");
+        }
+        out.extend(block.lines());
+    }
+
+    let mut rendered = out.join("\n");
+    if !rendered.is_empty() {
+        rendered.push('\n');
+    }
+    rendered
+}
+
+pub fn install_ssh_config(gateway: &str, name: &str) -> Result<PathBuf> {
+    let managed_config = openshell_ssh_config_path()?;
+    let main_config = user_ssh_config_path()?;
+    ensure_openshell_include(&main_config, &managed_config)?;
+
+    if let Some(parent) = managed_config.parent() {
+        fs::create_dir_all(parent)
+            .into_diagnostic()
+            .wrap_err("failed to create OpenShell config directory")?;
+    }
+
+    let alias = host_alias(name);
+    let block = render_ssh_config(gateway, name);
+    let contents = fs::read_to_string(&managed_config).unwrap_or_default();
+    let updated = upsert_host_block(&contents, &alias, &block);
+    fs::write(&managed_config, updated)
+        .into_diagnostic()
+        .wrap_err("failed to write OpenShell SSH config")?;
+    Ok(managed_config)
+}
+
+fn launch_editor(editor: Editor, host_alias: &str) -> Result<()> {
+    launch_editor_command(
+        editor.binary(),
+        editor.label(),
+        &editor.remote_target(host_alias),
+    )
+}
+
+fn launch_editor_command(binary: &str, label: &str, remote_target: &str) -> Result<()> {
+    let status = Command::new(binary)
+        .arg("--remote")
+        .arg(remote_target)
+        .arg("/sandbox")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    match status {
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Err(miette::miette!(
+            "{} is not installed or not on PATH",
+            binary
+        )),
+        Err(err) => Err(err)
+            .into_diagnostic()
+            .wrap_err(format!("failed to launch {label}")),
+    }
+}
+
 /// Print an SSH config `Host` block for a sandbox to stdout.
 ///
 /// The output is suitable for appending to `~/.ssh/config` so that tools like
@@ -584,18 +807,7 @@ pub async fn sandbox_ssh_proxy_by_name(server: &str, name: &str, tls: &TlsOption
 /// gateway endpoint and TLS certificates from the gateway metadata directory
 /// (`~/.config/openshell/gateways/<name>/mtls/`).
 pub fn print_ssh_config(gateway: &str, name: &str) {
-    let exe = std::env::current_exe().expect("failed to resolve OpenShell executable");
-    let exe = shell_escape(&exe.to_string_lossy());
-
-    let proxy_cmd = format!("{exe} ssh-proxy --gateway-name {gateway} --name {name}");
-
-    println!("Host openshell-{name}");
-    println!("    User sandbox");
-    println!("    StrictHostKeyChecking no");
-    println!("    UserKnownHostsFile /dev/null");
-    println!("    GlobalKnownHostsFile /dev/null");
-    println!("    LogLevel ERROR");
-    println!("    ProxyCommand {proxy_cmd}");
+    print!("{}", render_ssh_config(gateway, name));
 }
 
 /// Copy all bytes from `reader` to `writer`, flushing on completion.
@@ -688,3 +900,88 @@ async fn read_connect_status<R: AsyncRead + Unpin>(stream: &mut R) -> Result<u16
 trait ProxyStream: AsyncRead + AsyncWrite + Unpin + Send {}
 
 impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[test]
+    fn upsert_host_block_appends_when_missing() {
+        let input = "Host existing\n  HostName example.com\n";
+        let block = "Host openshell-demo\n    User sandbox\n";
+        let output = upsert_host_block(input, "openshell-demo", block);
+        assert!(output.contains("Host existing"));
+        assert!(output.contains("Host openshell-demo"));
+        assert_eq!(output.matches("Host openshell-demo").count(), 1);
+    }
+
+    #[test]
+    fn upsert_host_block_replaces_existing_without_duplicates() {
+        let input = "Host openshell-demo\n    User old\n\nHost other\n    HostName other.example\n";
+        let block = "Host openshell-demo\n    User sandbox\n    LogLevel ERROR\n";
+        let output = upsert_host_block(input, "openshell-demo", block);
+        assert!(!output.contains("User old"));
+        assert!(output.contains("LogLevel ERROR"));
+        assert!(output.contains("Host other"));
+        assert_eq!(output.matches("Host openshell-demo").count(), 1);
+    }
+
+    #[test]
+    fn install_ssh_config_adds_include_once_and_updates_managed_file() {
+        let _guard = env_lock().lock().unwrap();
+        let home = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let old_home = std::env::var("HOME").ok();
+        let old_xdg = std::env::var("XDG_CONFIG_HOME").ok();
+        unsafe {
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("XDG_CONFIG_HOME", xdg.path());
+        }
+
+        let ssh_dir = home.path().join(".ssh");
+        fs::create_dir_all(&ssh_dir).unwrap();
+        let user_config = ssh_dir.join("config");
+        fs::write(&user_config, "Host personal\n    HostName example.com\n").unwrap();
+
+        let managed_path = install_ssh_config("openshell", "demo").unwrap();
+        install_ssh_config("openshell", "demo").unwrap();
+
+        let main_contents = fs::read_to_string(&user_config).unwrap();
+        assert!(main_contents.contains("Host personal"));
+        assert_eq!(main_contents.matches("Include ").count(), 1);
+        assert!(main_contents.contains(&render_include_line(&managed_path)));
+
+        let managed_contents = fs::read_to_string(&managed_path).unwrap();
+        assert_eq!(managed_contents.matches("Host openshell-demo").count(), 1);
+        assert!(managed_contents.contains("ProxyCommand"));
+
+        unsafe {
+            match old_home {
+                Some(val) => std::env::set_var("HOME", val),
+                None => std::env::remove_var("HOME"),
+            }
+            match old_xdg {
+                Some(val) => std::env::set_var("XDG_CONFIG_HOME", val),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn launch_editor_returns_friendly_error_when_binary_missing() {
+        let err = launch_editor_command(
+            "openshell-test-missing-binary",
+            "Test Editor",
+            "ssh-remote+openshell-demo",
+        )
+        .unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("openshell-test-missing-binary is not installed or not on PATH"));
+    }
+}

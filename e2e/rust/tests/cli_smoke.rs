@@ -84,7 +84,8 @@ async fn sandbox_help_shows_upload_download() {
 }
 
 /// `openshell sandbox create --help` must show `--upload`, `--no-git-ignore`,
-/// `--bootstrap`/`--no-bootstrap`, and `--auto-providers`/`--no-auto-providers`.
+/// `--bootstrap`/`--no-bootstrap`, `--editor`, and
+/// `--auto-providers`/`--no-auto-providers`.
 #[tokio::test]
 async fn sandbox_create_help_shows_new_flags() {
     let (output, code) = run_isolated(&["sandbox", "create", "--help"]).await;
@@ -96,6 +97,7 @@ async fn sandbox_create_help_shows_new_flags() {
         "--no-git-ignore",
         "--bootstrap",
         "--no-bootstrap",
+        "--editor",
         "--auto-providers",
         "--no-auto-providers",
     ] {
@@ -104,6 +106,19 @@ async fn sandbox_create_help_shows_new_flags() {
             "expected '{flag}' in sandbox create --help:\n{clean}"
         );
     }
+}
+
+/// `openshell sandbox connect --help` must show `--editor`.
+#[tokio::test]
+async fn sandbox_connect_help_shows_editor_flag() {
+    let (output, code) = run_isolated(&["sandbox", "connect", "--help"]).await;
+    assert_eq!(code, 0, "openshell sandbox connect --help should exit 0");
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("--editor"),
+        "expected '--editor' in sandbox connect --help:\n{clean}"
+    );
 }
 
 /// `openshell gateway start --help` must show `--recreate`.
@@ -143,5 +158,4 @@ async fn status_without_gateway_prints_friendly_message() {
         "expected hint to run 'openshell gateway start':\n{clean}"
     );
 }
-
 

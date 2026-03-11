@@ -108,6 +108,19 @@ Open an SSH session into a running sandbox:
 $ openshell sandbox connect my-sandbox
 ```
 
+### Open in a remote editor
+
+Launch VS Code or Cursor directly into the sandbox workspace:
+
+```console
+$ openshell sandbox create --editor vscode --name my-sandbox
+$ openshell sandbox connect my-sandbox --editor cursor
+```
+
+When `--editor` is used, OpenShell keeps the sandbox alive and installs an
+OpenShell-managed SSH include file instead of cluttering your main
+`~/.ssh/config` with generated host blocks.
+
 ## View Logs
 
 Stream and filter sandbox logs to monitor agent activity and diagnose policy decisions.
