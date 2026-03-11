@@ -13,7 +13,7 @@ tags:
 - Policy
 - Claude Code
 content:
-  type: how_to
+  type: tutorial
   difficulty: technical_intermediate
   audience:
   - engineer
@@ -26,7 +26,8 @@ content:
 
 # Set Up a Sandbox of Claude Code with a Custom GitHub Policy
 
-This tutorial walks through the iterative policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, get blocked by the default network policy, diagnose the denial from two angles — the OpenShell Terminal on your laptop and the sandbox logs from inside — and then apply a custom policy to fix it, all without recreating the sandbox.
+This tutorial walks through an iterative sandbox policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, and observe the default network policy denying the request.
+You then diagnose the denial from your machine and from inside the sandbox, apply a custom policy, and verify that the policy update takes effect.
 
 After completing this tutorial, you will have:
 
@@ -35,7 +36,7 @@ After completing this tutorial, you will have:
 - Experience with the policy iteration workflow: fail, diagnose, update, verify.
 
 :::{note}
-This tutorial shows example prompts and responses from Claude Code. The exact wording you see may differ between sessions — use the examples as a guide for the type of interaction, not as expected output.
+This tutorial shows example prompts and responses from Claude Code. The exact wording you see might vary between sessions. Use the examples as a guide for the type of interaction, not as expected output.
 :::
 
 ## Prerequisites
@@ -47,22 +48,22 @@ This tutorial requires the following:
 - Your own [Anthropic account](https://console.anthropic.com/) for Claude Code. OpenShell provides the sandbox, not the agent — you need your own account to log in to Claude Code.
 - A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can [create a new repository](https://github.com/new) with a README if you do not have one handy.
 
-:::{important}
-This tutorial uses two terminals throughout:
+This tutorial uses two terminals to demonstrate the iterative policy workflow:
 
-- **Terminal 1 (sandbox)** — The terminal where you launch the sandbox. Claude Code runs here. You interact with the agent in this terminal.
-- **Terminal 2 (laptop)** — A separate terminal on your laptop. You use this for `openshell term`, `openshell policy set`, and other CLI commands that manage the sandbox from the outside.
+- **Terminal 1**: The sandbox terminal. You create the sandbox here with `openshell sandbox create` and interact with Claude Code inside it.
+- **Terminal 2**: A terminal outside the sandbox on your machine. You use this for viewing the sandbox logs with `openshell term` and applying an updated policy with `openshell policy set`.
 
 Each section below indicates which terminal to use.
-:::
 
-## Launch the Sandbox
+## Set up a Sandbox with the Default Policy
 
-**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically.
+Depending on whether you are starting a new sandbox or using an existing one, choose the appropriate tab and follow the instructions.
 
 ::::{tab-set}
 
 :::{tab-item} Starting a new sandbox
+
+In terminal 1, create a new sandbox with Claude Code. The {doc}`default policy </reference/default-policy>` is applied automatically, which allows read-only access to GitHub.
 
 Create a {doc}`credential provider </sandboxes/providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
 
@@ -89,11 +90,11 @@ $ export GITHUB_TOKEN=<your-token>
 
 The `--keep` flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.
 
-Claude Code starts inside the sandbox. Log in through your preferred authentication method and trust the `/sandbox` workspace when prompted.
+Claude Code starts inside the sandbox. It prints an authentication link. Open it in your browser, sign in to your Anthropic account, and return to the terminal. When prompted, trust the `/sandbox` workspace to allow Claude Code to read and write files.
 
 ## Push Code to GitHub
 
-**Terminal 1 (sandbox)** — Ask Claude Code to write a simple script and push it to your repository:
+In terminal 1, ask Claude Code to write a simple script and push it to your repository:
 
 ```text
 Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
@@ -101,13 +102,13 @@ Write a hello_world.py script and push it to https://github.com/<org>/<repo>.
 
 Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.
 
-The push fails. Claude reports an error — but the failure is not an authentication problem. The default sandbox policy does not permit outbound requests to GitHub, so the proxy blocks the connection before the request reaches GitHub's servers.
+The push fails. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub but blocks write operations, so the proxy denies the push before the request reaches GitHub's servers.
 
 ## Diagnose the Denial
 
-### View the logs from your laptop
+### View the logs from your machine
 
-**Terminal 2 (laptop)** — Open a separate terminal on your laptop and launch the OpenShell Terminal:
+In terminal 2, launch the OpenShell terminal:
 
 ```console
 $ openshell term
@@ -130,7 +131,7 @@ The log shows that the sandbox proxy intercepted an outbound `PUT` request to `a
 
 ### Ask Claude to check the sandbox logs
 
-**Terminal 1 (sandbox)** — Switch back to Claude Code. Ask it to check the sandbox logs for denied requests:
+In terminal 1, ask Claude Code to check the sandbox logs for denied requests:
 
 ```text
 Check the sandbox logs for any denied network requests. What is blocking the push?
@@ -141,7 +142,7 @@ Claude reads the deny entries and identifies the root cause. It explains that th
 > The sandbox runs a proxy that enforces policies on outbound traffic. The
 > `github_rest_api` policy allows GET requests (used to read the file) but blocks
 > PUT/write requests to GitHub. This is a sandbox-level restriction, not a token
-> issue — no matter what token you provide, pushes via the API will be blocked
+> issue. No matter what token you provide, pushes through the API will be blocked
 > until the policy is updated.
 
 Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.
@@ -152,17 +153,23 @@ Copy the deny reason from Claude's response — you will paste it into your lapt
 
 **Terminal 2 (laptop)** — Paste the deny reason from the previous step into your coding agent (for example, Claude Code or Cursor running on your laptop) and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
 
-The agent inspects the deny reasons, writes an updated policy that adds `github_git` and `github_api` blocks for your repository, and runs `openshell policy set` to apply it:
+The updated policy adds `github_git` and `github_api` blocks that grant write access to your repository. Use the reference policy in the dropdown below as a starting point, then apply it to the running sandbox:
 
 ```console
 $ openshell policy set <sandbox-name> --policy /tmp/sandbox-policy-update.yaml --wait
 ```
 
-Your coding agent generates both the policy file and this command. Network policies are hot-reloadable — the `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
+:::{tip}
+To find your sandbox name, check the output from `openshell sandbox create` or run `openshell sandbox list`.
+:::
+
+Network policies are hot-reloadable. The `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
 
 :::{dropdown} Full reference policy
 
-The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. This is representative of what a coding agent generates when asked to unblock GitHub pushes. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
+The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
+
+The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
 
 ```yaml
 version: 1
@@ -311,20 +318,28 @@ The following table summarizes the two GitHub-specific blocks:
 | `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch), `git-upload-pack` (fetch data), and `git-receive-pack` (push) for the specified repository. Denies all operations on unlisted repositories. |
 | `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories. |
 
-The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. Sandbox behavior outside of GitHub operations is unchanged.
+The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
 
 For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
 :::
 
 ## Retry the Push
 
-**Terminal 1 (sandbox)** — Switch back to Claude Code and ask it to retry the push:
+In terminal 1, ask Claude Code to retry the push:
 
 ```text
 The sandbox policy has been updated. Try pushing to the repository again.
 ```
 
 The push completes successfully. The `openshell term` dashboard now shows `l7_decision=allow` entries for `api.github.com` and `github.com` where it previously showed denials.
+
+## Clean Up
+
+When you are finished, delete the sandbox to free cluster resources:
+
+```console
+$ openshell sandbox delete <sandbox-name>
+```
 
 ## Next Steps
 
