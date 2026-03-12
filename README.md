@@ -11,15 +11,21 @@ OpenShell is the safe, private runtime for autonomous AI agents. It provides san
 ### Prerequisites
 
 - **Docker** — Docker Desktop (or a Docker daemon) must be running.
-- **Python 3.12+**
-- [**uv**](https://docs.astral.sh/uv/) 0.9+
 
 ### Install
 
-**From PyPI (recommended):**
+**Binary (recommended):**
 
 ```bash
-uv pip install openshell
+curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+```
+
+The install script auto-detects your platform (Linux x86_64, Linux aarch64, macOS Apple Silicon) and places the `openshell` binary in `/usr/local/bin`. See the [releases page](https://github.com/NVIDIA/OpenShell/releases) for manual download options.
+
+**From PyPI (requires [uv](https://docs.astral.sh/uv/)):**
+
+```bash
+uv tool install -U openshell
 ```
 
 ### Create a sandbox
@@ -94,6 +100,20 @@ Under the hood, the gateway runs as a [K3s](https://k3s.io/) Kubernetes cluster 
 | `openshell term` | Launch the real-time terminal UI for debugging. |
 
 See the full [CLI reference](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/cli.md) for all commands, flags, and environment variables.
+
+## Terminal UI
+
+OpenShell includes a real-time terminal dashboard for monitoring gateways, sandboxes, and providers — inspired by [k9s](https://k9scli.io/).
+
+```bash
+openshell term
+```
+
+<p align="center">
+  <img src="docs/assets/openshell-terminal.png" alt="OpenShell Terminal UI" width="800">
+</p>
+
+The TUI gives you a live, keyboard-driven view of your cluster. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Cluster health and sandbox status auto-refresh every two seconds.
 
 ## Community Sandboxes and BYOC
 
