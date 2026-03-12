@@ -450,7 +450,11 @@ enum Commands {
     // ===================================================================
     /// Launch the `OpenShell` interactive TUI.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Term,
+    Term {
+        /// Color theme for the TUI: auto, dark, or light.
+        #[arg(long, default_value = "auto", env = "OPENSHELL_THEME")]
+        theme: navigator_tui::ThemeMode,
+    },
 
     /// Generate shell completions.
     #[command(after_long_help = COMPLETIONS_HELP, help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -2024,12 +2028,12 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Some(Commands::Term) => {
+        Some(Commands::Term { theme }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
             let mut tls = tls.with_gateway_name(&ctx.name);
             apply_edge_auth(&mut tls, &ctx.name);
             let channel = navigator_cli::tls::build_channel(&ctx.endpoint, &tls).await?;
-            navigator_tui::run(channel, &ctx.name, &ctx.endpoint).await?;
+            navigator_tui::run(channel, &ctx.name, &ctx.endpoint, theme).await?;
         }
         Some(Commands::Completions { shell }) => {
             let exe = std::env::current_exe()

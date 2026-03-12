@@ -18,12 +18,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 
 use crate::app::{self, App, Focus, InputMode, Screen};
-use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Splash screen is a full-screen takeover — no chrome.
     if app.screen == Screen::Splash {
-        splash::draw(frame, frame.size());
+        splash::draw(frame, frame.size(), &app.theme);
         return;
     }
 
@@ -89,7 +88,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         if let Some(detail_idx) = app.log_detail_index {
             let filtered: Vec<&app::LogLine> = app.filtered_log_lines();
             if let Some(log) = filtered.get(detail_idx) {
-                sandbox_logs::draw_detail_popup(frame, log, frame.size());
+                sandbox_logs::draw_detail_popup(frame, log, frame.size(), &app.theme);
             }
         }
     }
@@ -98,13 +97,18 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     if app.focus == Focus::SandboxDraft && app.draft_detail_open {
         let abs = app.draft_scroll + app.draft_selected;
         if let Some(chunk) = app.draft_chunks.get(abs) {
-            sandbox_draft::draw_detail_popup(frame, chunk, frame.size());
+            sandbox_draft::draw_detail_popup(frame, chunk, frame.size(), &app.theme);
         }
     }
 
     // Approve-all confirmation popup renders over everything.
     if app.approve_all_confirm_open && !app.approve_all_confirm_chunks.is_empty() {
-        sandbox_draft::draw_approve_all_popup(frame, &app.approve_all_confirm_chunks, frame.size());
+        sandbox_draft::draw_approve_all_popup(
+            frame,
+            &app.approve_all_confirm_chunks,
+            frame.size(),
+            &app.theme,
+        );
     }
 }
 
@@ -113,113 +117,109 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_title_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let status_span = match app.status_text.as_str() {
-        s if s.contains("Healthy") => Span::styled(&app.status_text, styles::STATUS_OK),
-        s if s.contains("Degraded") => Span::styled(&app.status_text, styles::STATUS_WARN),
-        s if s.contains("Unhealthy") => Span::styled(&app.status_text, styles::STATUS_ERR),
-        _ => Span::styled(&app.status_text, styles::MUTED),
+        s if s.contains("Healthy") => Span::styled(&app.status_text, t.status_ok),
+        s if s.contains("Degraded") => Span::styled(&app.status_text, t.status_warn),
+        s if s.contains("Unhealthy") => Span::styled(&app.status_text, t.status_err),
+        _ => Span::styled(&app.status_text, t.muted),
     };
 
     let mut parts: Vec<Span<'_>> = vec![
-        Span::styled(" >_ OpenShell ", styles::ACCENT_BOLD),
-        Span::styled(
-            " ALPHA ",
-            ratatui::style::Style::new()
-                .fg(crate::theme::colors::BG)
-                .bg(crate::theme::colors::NVIDIA_GREEN)
-                .add_modifier(ratatui::style::Modifier::BOLD),
-        ),
-        Span::styled(" | ", styles::MUTED),
-        Span::styled("Current Gateway: ", styles::TEXT),
-        Span::styled(&app.gateway_name, styles::HEADING),
-        Span::styled(" (", styles::MUTED),
+        Span::styled(" >_ OpenShell ", t.accent_bold),
+        Span::styled(" ALPHA ", t.badge),
+        Span::styled(" | ", t.muted),
+        Span::styled("Current Gateway: ", t.text),
+        Span::styled(&app.gateway_name, t.heading),
+        Span::styled(" (", t.muted),
         status_span,
-        Span::styled(")", styles::MUTED),
-        Span::styled(" | ", styles::MUTED),
+        Span::styled(")", t.muted),
+        Span::styled(" | ", t.muted),
     ];
 
     match app.screen {
         Screen::Splash => unreachable!("splash handled before draw_title_bar"),
         Screen::Dashboard => {
-            parts.push(Span::styled("Dashboard", styles::TEXT));
+            parts.push(Span::styled("Dashboard", t.text));
         }
         Screen::Sandbox => {
             let name = app
                 .sandbox_names
                 .get(app.sandbox_selected)
                 .map_or("-", String::as_str);
-            parts.push(Span::styled("Sandbox: ", styles::TEXT));
-            parts.push(Span::styled(name, styles::HEADING));
+            parts.push(Span::styled("Sandbox: ", t.text));
+            parts.push(Span::styled(name, t.heading));
         }
     }
 
     let title = Line::from(parts);
-    frame.render_widget(Paragraph::new(title).style(styles::TITLE_BAR), area);
+    frame.render_widget(Paragraph::new(title).style(t.title_bar), area);
 }
 
 fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let spans = match app.screen {
         Screen::Splash => unreachable!("splash handled before draw_nav_bar"),
         Screen::Dashboard => match app.focus {
             Focus::Providers => vec![
-                Span::styled(" ", styles::TEXT),
-                Span::styled("[Tab]", styles::KEY_HINT),
-                Span::styled(" Switch Panel", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[j/k]", styles::KEY_HINT),
-                Span::styled(" Navigate", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[Enter]", styles::KEY_HINT),
-                Span::styled(" Detail", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[c]", styles::KEY_HINT),
-                Span::styled(" Create", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[u]", styles::KEY_HINT),
-                Span::styled(" Update", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[d]", styles::KEY_HINT),
-                Span::styled(" Delete", styles::TEXT),
-                Span::styled("  |  ", styles::BORDER),
-                Span::styled("[:]", styles::MUTED),
-                Span::styled(" Command  ", styles::MUTED),
-                Span::styled("[q]", styles::MUTED),
-                Span::styled(" Quit", styles::MUTED),
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Detail", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[c]", t.key_hint),
+                Span::styled(" Create", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[u]", t.key_hint),
+                Span::styled(" Update", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
             ],
             Focus::Sandboxes => vec![
-                Span::styled(" ", styles::TEXT),
-                Span::styled("[Tab]", styles::KEY_HINT),
-                Span::styled(" Switch Panel", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[j/k]", styles::KEY_HINT),
-                Span::styled(" Navigate", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[Enter]", styles::KEY_HINT),
-                Span::styled(" Select", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[c]", styles::KEY_HINT),
-                Span::styled(" Create Sandbox", styles::TEXT),
-                Span::styled("  |  ", styles::BORDER),
-                Span::styled("[:]", styles::MUTED),
-                Span::styled(" Command  ", styles::MUTED),
-                Span::styled("[q]", styles::MUTED),
-                Span::styled(" Quit", styles::MUTED),
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Select", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[c]", t.key_hint),
+                Span::styled(" Create Sandbox", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
             ],
             _ => vec![
-                Span::styled(" ", styles::TEXT),
-                Span::styled("[Tab]", styles::KEY_HINT),
-                Span::styled(" Switch Panel", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[j/k]", styles::KEY_HINT),
-                Span::styled(" Navigate", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[Enter]", styles::KEY_HINT),
-                Span::styled(" Select", styles::TEXT),
-                Span::styled("  |  ", styles::BORDER),
-                Span::styled("[:]", styles::MUTED),
-                Span::styled(" Command  ", styles::MUTED),
-                Span::styled("[q]", styles::MUTED),
-                Span::styled(" Quit", styles::MUTED),
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Select", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
             ],
         },
         Screen::Sandbox => match app.focus {
@@ -231,35 +231,35 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     " Follow"
                 };
                 let autoscroll_style = if app.log_autoscroll {
-                    styles::STATUS_OK
+                    t.status_ok
                 } else {
-                    styles::TEXT
+                    t.text
                 };
                 vec![
-                    Span::styled(" ", styles::TEXT),
-                    Span::styled("[j/k]", styles::KEY_HINT),
-                    Span::styled(" Navigate", styles::TEXT),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[Enter]", styles::KEY_HINT),
-                    Span::styled(" Detail", styles::TEXT),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[g/G]", styles::KEY_HINT),
-                    Span::styled(" Top/Bottom", styles::TEXT),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[f]", styles::KEY_HINT),
+                    Span::styled(" ", t.text),
+                    Span::styled("[j/k]", t.key_hint),
+                    Span::styled(" Navigate", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[Enter]", t.key_hint),
+                    Span::styled(" Detail", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[g/G]", t.key_hint),
+                    Span::styled(" Top/Bottom", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[f]", t.key_hint),
                     Span::styled(autoscroll_label, autoscroll_style),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[s]", styles::KEY_HINT),
-                    Span::styled(format!(" Source: {filter_label}"), styles::TEXT),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[r]", styles::KEY_HINT),
-                    Span::styled(" Rules", styles::TEXT),
-                    Span::styled("  |  ", styles::BORDER),
-                    Span::styled("[Esc]", styles::MUTED),
-                    Span::styled(" Policy", styles::MUTED),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[q]", styles::MUTED),
-                    Span::styled(" Quit", styles::MUTED),
+                    Span::styled("  ", t.text),
+                    Span::styled("[s]", t.key_hint),
+                    Span::styled(format!(" Source: {filter_label}"), t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[r]", t.key_hint),
+                    Span::styled(" Rules", t.text),
+                    Span::styled("  |  ", t.border),
+                    Span::styled("[Esc]", t.muted),
+                    Span::styled(" Policy", t.muted),
+                    Span::styled("  ", t.text),
+                    Span::styled("[q]", t.muted),
+                    Span::styled(" Quit", t.muted),
                 ]
             }
             Focus::SandboxDraft => {
@@ -270,84 +270,84 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     .map(|c| c.status.as_str())
                     .unwrap_or("");
                 let mut spans = vec![
-                    Span::styled(" ", styles::TEXT),
-                    Span::styled("[j/k]", styles::KEY_HINT),
-                    Span::styled(" Navigate", styles::TEXT),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[Enter]", styles::KEY_HINT),
-                    Span::styled(" Detail", styles::TEXT),
+                    Span::styled(" ", t.text),
+                    Span::styled("[j/k]", t.key_hint),
+                    Span::styled(" Navigate", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[Enter]", t.key_hint),
+                    Span::styled(" Detail", t.text),
                 ];
                 match selected_status {
                     "pending" => {
                         spans.extend([
-                            Span::styled("  ", styles::TEXT),
-                            Span::styled("[a]", styles::KEY_HINT),
-                            Span::styled(" Approve", styles::TEXT),
-                            Span::styled("  ", styles::TEXT),
-                            Span::styled("[x]", styles::KEY_HINT),
-                            Span::styled(" Reject", styles::TEXT),
-                            Span::styled("  ", styles::TEXT),
-                            Span::styled("[A]", styles::KEY_HINT),
-                            Span::styled(" Approve All", styles::TEXT),
+                            Span::styled("  ", t.text),
+                            Span::styled("[a]", t.key_hint),
+                            Span::styled(" Approve", t.text),
+                            Span::styled("  ", t.text),
+                            Span::styled("[x]", t.key_hint),
+                            Span::styled(" Reject", t.text),
+                            Span::styled("  ", t.text),
+                            Span::styled("[A]", t.key_hint),
+                            Span::styled(" Approve All", t.text),
                         ]);
                     }
                     "approved" => {
                         spans.extend([
-                            Span::styled("  ", styles::TEXT),
-                            Span::styled("[x]", styles::KEY_HINT),
-                            Span::styled(" Revoke", styles::TEXT),
+                            Span::styled("  ", t.text),
+                            Span::styled("[x]", t.key_hint),
+                            Span::styled(" Revoke", t.text),
                         ]);
                     }
                     "rejected" => {
                         spans.extend([
-                            Span::styled("  ", styles::TEXT),
-                            Span::styled("[a]", styles::KEY_HINT),
-                            Span::styled(" Approve", styles::TEXT),
+                            Span::styled("  ", t.text),
+                            Span::styled("[a]", t.key_hint),
+                            Span::styled(" Approve", t.text),
                         ]);
                     }
                     _ => {}
                 }
                 spans.extend([
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[p]", styles::KEY_HINT),
-                    Span::styled(" Policy", styles::TEXT),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[l]", styles::KEY_HINT),
-                    Span::styled(" Logs", styles::TEXT),
-                    Span::styled("  |  ", styles::BORDER),
-                    Span::styled("[Esc]", styles::MUTED),
-                    Span::styled(" Back", styles::MUTED),
-                    Span::styled("  ", styles::TEXT),
-                    Span::styled("[q]", styles::MUTED),
-                    Span::styled(" Quit", styles::MUTED),
+                    Span::styled("  ", t.text),
+                    Span::styled("[p]", t.key_hint),
+                    Span::styled(" Policy", t.text),
+                    Span::styled("  ", t.text),
+                    Span::styled("[l]", t.key_hint),
+                    Span::styled(" Logs", t.text),
+                    Span::styled("  |  ", t.border),
+                    Span::styled("[Esc]", t.muted),
+                    Span::styled(" Back", t.muted),
+                    Span::styled("  ", t.text),
+                    Span::styled("[q]", t.muted),
+                    Span::styled(" Quit", t.muted),
                 ]);
                 spans
             }
             _ => vec![
-                Span::styled(" ", styles::TEXT),
-                Span::styled("[j/k]", styles::KEY_HINT),
-                Span::styled(" Scroll", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[g/G]", styles::KEY_HINT),
-                Span::styled(" Top/Bottom", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[s]", styles::KEY_HINT),
-                Span::styled(" Shell", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[l]", styles::KEY_HINT),
-                Span::styled(" Logs", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[r]", styles::KEY_HINT),
-                Span::styled(" Rules", styles::TEXT),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[d]", styles::KEY_HINT),
-                Span::styled(" Delete", styles::TEXT),
-                Span::styled("  |  ", styles::BORDER),
-                Span::styled("[Esc]", styles::MUTED),
-                Span::styled(" Back", styles::MUTED),
-                Span::styled("  ", styles::TEXT),
-                Span::styled("[q]", styles::MUTED),
-                Span::styled(" Quit", styles::MUTED),
+                Span::styled(" ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Scroll", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[g/G]", t.key_hint),
+                Span::styled(" Top/Bottom", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[s]", t.key_hint),
+                Span::styled(" Shell", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[l]", t.key_hint),
+                Span::styled(" Logs", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[r]", t.key_hint),
+                Span::styled(" Rules", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[Esc]", t.muted),
+                Span::styled(" Back", t.muted),
+                Span::styled("  ", t.text),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
             ],
         },
     };
@@ -356,13 +356,14 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let line = match app.input_mode {
         InputMode::Command => Line::from(vec![
-            Span::styled(" :", styles::ACCENT_BOLD),
-            Span::styled(&app.command_input, styles::TEXT),
-            Span::styled("_", styles::ACCENT),
+            Span::styled(" :", t.accent_bold),
+            Span::styled(&app.command_input, t.text),
+            Span::styled("_", t.accent),
         ]),
-        InputMode::Normal => Line::from(vec![Span::styled("", styles::MUTED)]),
+        InputMode::Normal => Line::from(vec![Span::styled("", t.muted)]),
     };
 
     let bar = Paragraph::new(line).block(Block::default().borders(Borders::NONE));

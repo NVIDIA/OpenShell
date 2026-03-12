@@ -274,6 +274,9 @@ pub struct App {
     pub focus: Focus,
     pub command_input: String,
 
+    /// Active color theme (dark or light).
+    pub theme: crate::theme::Theme,
+
     /// When the splash screen was shown (for auto-dismiss timing).
     pub splash_start: Option<Instant>,
 
@@ -380,13 +383,19 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(client: NavigatorClient<Channel>, gateway_name: String, endpoint: String) -> Self {
+    pub fn new(
+        client: NavigatorClient<Channel>,
+        gateway_name: String,
+        endpoint: String,
+        theme: crate::theme::Theme,
+    ) -> Self {
         Self {
             running: true,
             screen: Screen::Splash,
             input_mode: InputMode::Normal,
             focus: Focus::Gateways,
             command_input: String::new(),
+            theme,
             splash_start: Some(Instant::now()),
             gateway_name,
             endpoint,

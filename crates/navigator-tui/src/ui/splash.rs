@@ -8,11 +8,8 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph};
-
-use crate::theme::{colors, styles};
 
 // ---------------------------------------------------------------------------
 // ANSI Shadow figlet art — OPEN (6 lines, 35 display cols)
@@ -55,7 +52,8 @@ const MODAL_HEIGHT: u16 = CONTENT_LINES + 6;
 const MODAL_WIDTH: u16 = ART_WIDTH + 8;
 
 /// Draw the splash screen centered on the full terminal area.
-pub fn draw(frame: &mut Frame<'_>, area: Rect) {
+pub fn draw(frame: &mut Frame<'_>, area: Rect, theme: &crate::theme::Theme) {
+    let t = theme;
     let modal_w = MODAL_WIDTH.min(area.width.saturating_sub(2));
     let modal_h = MODAL_HEIGHT.min(area.height.saturating_sub(2));
 
@@ -69,7 +67,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Double)
-        .border_style(Style::new().fg(colors::EVERGLADE))
+        .border_style(t.border)
         .padding(Padding::new(3, 3, 1, 1));
 
     let inner = block.inner(popup);
@@ -86,10 +84,8 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect) {
         .split(inner);
 
     // -- Art + tagline --
-    let open_style = Style::new().fg(colors::FG).add_modifier(Modifier::BOLD);
-    let shell_style = Style::new()
-        .fg(colors::NVIDIA_GREEN)
-        .add_modifier(Modifier::BOLD);
+    let open_style = t.heading;
+    let shell_style = t.accent_bold;
 
     let mut content_lines: Vec<Line<'_>> = Vec::with_capacity(CONTENT_LINES as usize);
 
@@ -102,8 +98,7 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect) {
 
     // Blank + tagline.
     content_lines.push(Line::from(""));
-    content_lines
-        .push(Line::from(Span::styled(TAGLINE, styles::MUTED)).alignment(Alignment::Center));
+    content_lines.push(Line::from(Span::styled(TAGLINE, t.muted)).alignment(Alignment::Center));
 
     frame.render_widget(Paragraph::new(content_lines), chunks[0]);
 
@@ -119,18 +114,12 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect) {
     let gap = footer_width.saturating_sub(used);
 
     let footer = Line::from(vec![
-        Span::styled(version, Style::new().fg(colors::NVIDIA_GREEN)),
-        Span::styled(spacer, styles::MUTED),
-        Span::styled(
-            alpha_badge,
-            Style::new()
-                .fg(colors::FG)
-                .bg(colors::EVERGLADE)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(" ".repeat(gap), styles::MUTED),
-        Span::styled(prompt_text, styles::MUTED),
-        Span::styled(" ░", styles::MUTED),
+        Span::styled(version, t.accent),
+        Span::styled(spacer, t.muted),
+        Span::styled(alpha_badge, t.title_bar),
+        Span::styled(" ".repeat(gap), t.muted),
+        Span::styled(prompt_text, t.muted),
+        Span::styled(" ░", t.muted),
     ]);
 
     frame.render_widget(Paragraph::new(footer), chunks[2]);

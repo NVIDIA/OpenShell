@@ -4,16 +4,16 @@
 //! Network rules panel for the sandbox screen.
 
 use crate::app::App;
-use crate::theme::styles;
 use navigator_core::proto::PolicyChunk;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 /// Draw the network rules panel (list view with highlight bar).
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let t = &app.theme;
     let pending_count = app
         .draft_chunks
         .iter()
@@ -22,18 +22,18 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let title = if pending_count > 0 {
         Line::from(vec![
-            Span::styled(" Network Rules ", styles::HEADING),
-            Span::styled(format!(" {pending_count} pending "), styles::BADGE),
+            Span::styled(" Network Rules ", t.heading),
+            Span::styled(format!(" {pending_count} pending "), t.badge),
             Span::raw(" "),
         ])
     } else {
-        Line::from(Span::styled(" Network Rules ", styles::HEADING))
+        Line::from(Span::styled(" Network Rules ", t.heading))
     };
 
     let block = Block::default()
         .title(title)
         .borders(Borders::ALL)
-        .border_style(styles::BORDER_FOCUSED)
+        .border_style(t.border_focused)
         .padding(Padding::horizontal(1));
 
     if app.draft_chunks.is_empty() {
@@ -42,7 +42,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
              generate rules automatically.",
         )
         .block(block)
-        .style(styles::MUTED);
+        .style(t.muted);
         frame.render_widget(msg, area);
         return;
     }
@@ -70,25 +70,25 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             let is_selected = i == cursor_pos;
 
             let status_style = match chunk.status.as_str() {
-                "pending" => Style::default().fg(Color::Yellow),
-                "approved" => Style::default().fg(Color::Green),
-                "rejected" => Style::default().fg(Color::Red),
-                _ => styles::MUTED,
+                "pending" => t.status_warn,
+                "approved" => t.status_ok,
+                "rejected" => t.status_err,
+                _ => t.muted,
             };
 
             let name_style = if is_selected {
-                styles::SELECTED
+                t.selected
             } else if chunk.status == "rejected" {
-                styles::MUTED
+                t.muted
             } else {
-                styles::TEXT
+                t.text
             };
 
             let mut spans = Vec::new();
 
             // Highlight bar prefix (like logs).
             if is_selected {
-                spans.push(Span::styled("▌ ", styles::ACCENT));
+                spans.push(Span::styled("▌ ", t.accent));
             } else {
                 spans.push(Span::raw("  "));
             }
@@ -103,31 +103,28 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
             spans.push(Span::styled(&chunk.rule_name, name_style));
             if !endpoint_str.is_empty() {
-                spans.push(Span::styled("  ", styles::MUTED));
-                spans.push(Span::styled(endpoint_str, styles::ACCENT));
+                spans.push(Span::styled("  ", t.muted));
+                spans.push(Span::styled(endpoint_str, t.accent));
             }
             // Show binary name (just the filename, not full path) if present.
             if !chunk.binary.is_empty() {
                 let bin_short = chunk.binary.rsplit('/').next().unwrap_or(&chunk.binary);
-                spans.push(Span::styled("  ", styles::MUTED));
-                spans.push(Span::styled(format!("({bin_short})"), styles::MUTED));
+                spans.push(Span::styled("  ", t.muted));
+                spans.push(Span::styled(format!("({bin_short})"), t.muted));
             }
             spans.push(Span::raw("  "));
             spans.push(Span::styled(format!("[{}]", chunk.status), status_style));
             spans.push(Span::styled(
                 format!("  {:.0}%", chunk.confidence * 100.0),
-                styles::MUTED,
+                t.muted,
             ));
             if chunk.hit_count > 1 {
-                spans.push(Span::styled(
-                    format!("  {}x", chunk.hit_count),
-                    styles::ACCENT,
-                ));
+                spans.push(Span::styled(format!("  {}x", chunk.hit_count), t.accent));
             }
 
             let mut line = Line::from(spans);
             if is_selected {
-                line = line.style(styles::LOG_CURSOR);
+                line = line.style(t.log_cursor);
             }
             line
         })
@@ -137,7 +134,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let pos = app.draft_scroll + cursor_pos + 1;
     let scroll_info = format!(" [{pos}/{total}] ");
 
-    let block = block.title_bottom(Line::from(vec![Span::styled(scroll_info, styles::MUTED)]));
+    let block = block.title_bottom(Line::from(vec![Span::styled(scroll_info, t.muted)]));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -146,7 +143,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 // Detail popup (Enter key)
 // ---------------------------------------------------------------------------
 
-pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect) {
+pub fn draw_detail_popup(
+    frame: &mut Frame<'_>,
+    chunk: &PolicyChunk,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
     let popup_height = 22u16.min(area.height.saturating_sub(4));
     let popup_area = centered_rect(popup_width, popup_height, area);
@@ -154,54 +157,47 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
     frame.render_widget(Clear, popup_area);
 
     let status_style = match chunk.status.as_str() {
-        "pending" => Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD),
-        "approved" => Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD),
-        "rejected" => Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
-        _ => styles::MUTED,
+        "pending" => t.status_warn.add_modifier(Modifier::BOLD),
+        "approved" => t.status_ok.add_modifier(Modifier::BOLD),
+        "rejected" => t.status_err.add_modifier(Modifier::BOLD),
+        _ => t.muted,
     };
 
     let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", chunk.rule_name),
-            styles::HEADING,
-        ))
+        .title(Span::styled(format!(" {} ", chunk.rule_name), t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(1, 1, 0, 0));
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
-            Span::styled("Status:     ", styles::MUTED),
+            Span::styled("Status:     ", t.muted),
             Span::styled(&chunk.status, status_style),
         ]),
         Line::from(vec![
-            Span::styled("Confidence: ", styles::MUTED),
-            Span::styled(format!("{:.0}%", chunk.confidence * 100.0), styles::TEXT),
+            Span::styled("Confidence: ", t.muted),
+            Span::styled(format!("{:.0}%", chunk.confidence * 100.0), t.text),
         ]),
     ];
 
     // Binary (denormalized from the denial).
     if !chunk.binary.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("Binary:     ", styles::MUTED),
-            Span::styled(&chunk.binary, styles::TEXT),
+            Span::styled("Binary:     ", t.muted),
+            Span::styled(&chunk.binary, t.text),
         ]));
     }
 
     // Hit count (accumulated real denial count) and first/last seen.
     lines.push(Line::from(vec![
-        Span::styled("Denied:     ", styles::MUTED),
+        Span::styled("Denied:     ", t.muted),
         Span::styled(
             format!(
                 "{} connection{}",
                 chunk.hit_count,
                 if chunk.hit_count == 1 { "" } else { "s" }
             ),
-            styles::ACCENT,
+            t.accent,
         ),
         Span::styled(
             format!(
@@ -209,30 +205,30 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
                 format_short_time(chunk.first_seen_ms),
                 format_short_time(chunk.last_seen_ms),
             ),
-            styles::MUTED,
+            t.muted,
         ),
     ]));
 
     // Endpoints.
     if let Some(ref rule) = chunk.proposed_rule {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Endpoints:", styles::MUTED)));
+        lines.push(Line::from(Span::styled("Endpoints:", t.muted)));
         for ep in &rule.endpoints {
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled("-> ", styles::MUTED),
-                Span::styled(format!("{}:{}", ep.host, ep.port), styles::ACCENT),
+                Span::styled("-> ", t.muted),
+                Span::styled(format!("{}:{}", ep.host, ep.port), t.accent),
             ]));
         }
 
         // Binaries.
         if !rule.binaries.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled("Binaries:", styles::MUTED)));
+            lines.push(Line::from(Span::styled("Binaries:", t.muted)));
             for b in &rule.binaries {
                 lines.push(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(&b.path, styles::TEXT),
+                    Span::styled(&b.path, t.text),
                 ]));
             }
         }
@@ -242,8 +238,8 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
     if !chunk.rationale.is_empty() {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("Rationale:  ", styles::MUTED),
-            Span::styled(&chunk.rationale, styles::TEXT),
+            Span::styled("Rationale:  ", t.muted),
+            Span::styled(&chunk.rationale, t.text),
         ]));
     }
 
@@ -252,9 +248,7 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
         lines.push(Line::from(""));
         lines.push(Line::from(vec![Span::styled(
             format!("! {}", chunk.security_notes),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            t.status_warn.add_modifier(Modifier::BOLD),
         )]));
     }
 
@@ -264,29 +258,29 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
     match chunk.status.as_str() {
         "pending" => {
             hint_spans.extend([
-                Span::styled("[a]", styles::KEY_HINT),
-                Span::styled(" Approve  ", styles::TEXT),
-                Span::styled("[x]", styles::KEY_HINT),
-                Span::styled(" Reject  ", styles::TEXT),
+                Span::styled("[a]", t.key_hint),
+                Span::styled(" Approve  ", t.text),
+                Span::styled("[x]", t.key_hint),
+                Span::styled(" Reject  ", t.text),
             ]);
         }
         "approved" => {
             hint_spans.extend([
-                Span::styled("[x]", styles::KEY_HINT),
-                Span::styled(" Revoke  ", styles::TEXT),
+                Span::styled("[x]", t.key_hint),
+                Span::styled(" Revoke  ", t.text),
             ]);
         }
         "rejected" => {
             hint_spans.extend([
-                Span::styled("[a]", styles::KEY_HINT),
-                Span::styled(" Approve  ", styles::TEXT),
+                Span::styled("[a]", t.key_hint),
+                Span::styled(" Approve  ", t.text),
             ]);
         }
         _ => {}
     }
     hint_spans.extend([
-        Span::styled("[Esc]", styles::MUTED),
-        Span::styled(" Close", styles::MUTED),
+        Span::styled("[Esc]", t.muted),
+        Span::styled(" Close", t.muted),
     ]);
     lines.push(Line::from(hint_spans));
 
@@ -302,7 +296,13 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
 // Approve-all confirmation popup ([A] key)
 // ---------------------------------------------------------------------------
 
-pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], area: Rect) {
+pub fn draw_approve_all_popup(
+    frame: &mut Frame<'_>,
+    chunks: &[PolicyChunk],
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let count = chunks.len();
     // Height: header(1) + blank(1) + chunks(count, capped at 12) + blank(1) + hints(1) + borders(2) + padding(1)
     let list_lines = count.min(12);
@@ -316,12 +316,10 @@ pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], are
     let block = Block::default()
         .title(Span::styled(
             " Approve All ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            t.status_warn.add_modifier(Modifier::BOLD),
         ))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(1, 1, 0, 0));
 
     // Usable width inside borders + padding.
@@ -330,19 +328,17 @@ pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], are
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     lines.push(Line::from(vec![
-        Span::styled("Approve ", styles::TEXT),
+        Span::styled("Approve ", t.text),
         Span::styled(
             format!("{count}"),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            t.status_warn.add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             format!(
                 " pending policy request{}?",
                 if count == 1 { "" } else { "s" }
             ),
-            styles::TEXT,
+            t.text,
         ),
     ]));
     lines.push(Line::from(""));
@@ -351,7 +347,7 @@ pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], are
         if i >= 12 {
             lines.push(Line::from(Span::styled(
                 format!("  ... and {} more", count - 12),
-                styles::MUTED,
+                t.muted,
             )));
             break;
         }
@@ -379,25 +375,25 @@ pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], are
         };
 
         let mut row_spans = vec![
-            Span::styled("  -> ", styles::MUTED),
-            Span::styled(name_str, styles::TEXT),
-            Span::styled("  ", styles::MUTED),
-            Span::styled(ep_str, styles::ACCENT),
+            Span::styled("  -> ", t.muted),
+            Span::styled(name_str, t.text),
+            Span::styled("  ", t.muted),
+            Span::styled(ep_str, t.accent),
         ];
         if !chunk.binary.is_empty() {
             let bin_short = chunk.binary.rsplit('/').next().unwrap_or(&chunk.binary);
-            row_spans.push(Span::styled("  ", styles::MUTED));
-            row_spans.push(Span::styled(format!("({bin_short})"), styles::MUTED));
+            row_spans.push(Span::styled("  ", t.muted));
+            row_spans.push(Span::styled(format!("({bin_short})"), t.muted));
         }
         lines.push(Line::from(row_spans));
     }
 
     lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::styled("[y/Enter]", styles::KEY_HINT),
-        Span::styled(" Approve all  ", styles::TEXT),
-        Span::styled("[n/Esc]", styles::KEY_HINT),
-        Span::styled(" Cancel", styles::TEXT),
+        Span::styled("[y/Enter]", t.key_hint),
+        Span::styled(" Approve all  ", t.text),
+        Span::styled("[n/Esc]", t.key_hint),
+        Span::styled(" Cancel", t.text),
     ]));
 
     frame.render_widget(Paragraph::new(lines).block(block), popup_area);

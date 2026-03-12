@@ -7,9 +7,9 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
 use crate::app::{App, LogLine};
-use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
+    let t = &app.theme;
     let name = app
         .sandbox_names
         .get(app.sandbox_selected)
@@ -18,9 +18,9 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let filter_label = app.log_source_filter.label();
 
     let block = Block::default()
-        .title(Span::styled(format!(" Logs: {name} "), styles::HEADING))
+        .title(Span::styled(format!(" Logs: {name} "), t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::BORDER_FOCUSED)
+        .border_style(t.border_focused)
         .padding(Padding::horizontal(1));
 
     // Calculate visible area inside the block (borders + padding).
@@ -48,10 +48,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     if filtered.is_empty() && app.sandbox_log_lines.is_empty() {
         // Still loading.
-        let lines = vec![Line::from(Span::styled("Loading...", styles::MUTED))];
+        let lines = vec![Line::from(Span::styled("Loading...", t.muted))];
         let block = block.title_bottom(Line::from(Span::styled(
             format!(" filter: {filter_label} "),
-            styles::MUTED,
+            t.muted,
         )));
         frame.render_widget(Paragraph::new(lines).block(block), area);
         return;
@@ -63,11 +63,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         .take(inner_height)
         .enumerate()
         .map(|(i, log)| {
-            let mut line = render_log_line(log, inner_width.saturating_sub(2));
+            let mut line = render_log_line(log, inner_width.saturating_sub(2), t);
             if i == cursor_pos {
                 // Prepend green cursor marker and apply highlight background.
-                line.spans.insert(0, Span::styled("▌ ", styles::ACCENT));
-                line = line.style(styles::LOG_CURSOR);
+                line.spans.insert(0, Span::styled("▌ ", t.accent));
+                line = line.style(t.log_cursor);
             } else {
                 line.spans.insert(0, Span::raw("  "));
             }
@@ -85,15 +85,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     };
 
     let autoscroll_span = if app.log_autoscroll {
-        Span::styled(" ● FOLLOWING ", styles::STATUS_OK)
+        Span::styled(" ● FOLLOWING ", t.status_ok)
     } else {
-        Span::styled(" ○ PAUSED ", styles::STATUS_WARN)
+        Span::styled(" ○ PAUSED ", t.status_warn)
     };
 
     let block = block.title_bottom(Line::from(vec![
         autoscroll_span,
-        Span::styled(scroll_info, styles::MUTED),
-        Span::styled(format!(" filter: {filter_label} "), styles::MUTED),
+        Span::styled(scroll_info, t.muted),
+        Span::styled(format!(" filter: {filter_label} "), t.muted),
     ]));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);
@@ -107,7 +107,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 // Detail popup (Enter key)
 // ---------------------------------------------------------------------------
 
-pub fn draw_detail_popup(frame: &mut Frame<'_>, log: &LogLine, area: Rect) {
+pub fn draw_detail_popup(
+    frame: &mut Frame<'_>,
+    log: &LogLine,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     // Center the popup — 80% width, up to 20 lines tall.
     let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
     let popup_height = 20u16.min(area.height.saturating_sub(4));
@@ -116,43 +122,43 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, log: &LogLine, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Log Detail ", styles::HEADING))
+        .title(Span::styled(" Log Detail ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(1, 1, 0, 0));
 
     let ts = format_short_time(log.timestamp_ms);
 
     let mut lines: Vec<Line<'_>> = vec![
         Line::from(vec![
-            Span::styled("Time:    ", styles::MUTED),
-            Span::styled(ts, styles::TEXT),
+            Span::styled("Time:    ", t.muted),
+            Span::styled(ts, t.text),
         ]),
         Line::from(vec![
-            Span::styled("Source:  ", styles::MUTED),
-            Span::styled(log.source.as_str(), styles::TEXT),
+            Span::styled("Source:  ", t.muted),
+            Span::styled(log.source.as_str(), t.text),
         ]),
         Line::from(vec![
-            Span::styled("Level:   ", styles::MUTED),
-            Span::styled(log.level.as_str(), level_style(&log.level)),
+            Span::styled("Level:   ", t.muted),
+            Span::styled(log.level.as_str(), level_style(&log.level, t)),
         ]),
     ];
 
     if !log.target.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("Target:  ", styles::MUTED),
-            Span::styled(log.target.as_str(), styles::MUTED),
+            Span::styled("Target:  ", t.muted),
+            Span::styled(log.target.as_str(), t.muted),
         ]));
     }
 
     lines.push(Line::from(vec![
-        Span::styled("Message: ", styles::MUTED),
-        Span::styled(log.message.as_str(), styles::TEXT),
+        Span::styled("Message: ", t.muted),
+        Span::styled(log.message.as_str(), t.text),
     ]));
 
     if !log.fields.is_empty() {
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled("Fields:", styles::MUTED)));
+        lines.push(Line::from(Span::styled("Fields:", t.muted)));
 
         let ordered = ordered_fields(log);
         for (k, v) in &ordered {
@@ -160,8 +166,8 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, log: &LogLine, area: Rect) {
                 continue;
             }
             lines.push(Line::from(vec![
-                Span::styled(format!("  {k}: "), styles::MUTED),
-                Span::styled((*v).to_string(), styles::TEXT),
+                Span::styled(format!("  {k}: "), t.muted),
+                Span::styled((*v).to_string(), t.text),
             ]));
         }
     }
@@ -170,7 +176,7 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, log: &LogLine, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         "Press Esc or Enter to close",
-        styles::MUTED,
+        t.muted,
     )));
 
     frame.render_widget(
@@ -206,25 +212,25 @@ fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
 // ---------------------------------------------------------------------------
 
 /// Render a single structured log line — no target, smart field order, truncated.
-fn render_log_line<'a>(log: &'a LogLine, max_width: usize) -> Line<'a> {
+fn render_log_line<'a>(log: &'a LogLine, max_width: usize, t: &'a crate::theme::Theme) -> Line<'a> {
     let source_style = match log.source.as_str() {
-        "sandbox" => styles::ACCENT,
-        _ => styles::MUTED,
+        "sandbox" => t.accent,
+        _ => t.muted,
     };
 
     let ts = format_short_time(log.timestamp_ms);
 
     let mut spans = vec![
-        Span::styled(ts, styles::MUTED),
+        Span::styled(ts, t.muted),
         Span::raw(" "),
         Span::styled(format!("{:<7}", log.source), source_style),
         Span::raw(" "),
-        Span::styled(format!("{:<5}", log.level), level_style(&log.level)),
+        Span::styled(format!("{:<5}", log.level), level_style(&log.level, t)),
         Span::raw(" "),
     ];
 
     // Message.
-    spans.push(Span::styled(log.message.as_str(), styles::TEXT));
+    spans.push(Span::styled(log.message.as_str(), t.text));
 
     // Structured fields — ordered, non-empty only.
     if !log.fields.is_empty() {
@@ -234,17 +240,21 @@ fn render_log_line<'a>(log: &'a LogLine, max_width: usize) -> Line<'a> {
                 continue;
             }
             spans.push(Span::raw(" "));
-            spans.push(Span::styled(format!("{k}="), styles::MUTED));
-            spans.push(Span::styled((*v).to_string(), styles::TEXT));
+            spans.push(Span::styled(format!("{k}="), t.muted));
+            spans.push(Span::styled((*v).to_string(), t.text));
         }
     }
 
     // Truncate to max_width.
-    truncate_line(spans, max_width)
+    truncate_line(spans, max_width, t)
 }
 
 /// Truncate a span list to fit within `max_width` characters, appending `…` if needed.
-fn truncate_line(spans: Vec<Span<'_>>, max_width: usize) -> Line<'_> {
+fn truncate_line<'a>(
+    spans: Vec<Span<'a>>,
+    max_width: usize,
+    t: &'a crate::theme::Theme,
+) -> Line<'a> {
     if max_width == 0 {
         return Line::from(spans);
     }
@@ -267,7 +277,7 @@ fn truncate_line(spans: Vec<Span<'_>>, max_width: usize) -> Line<'_> {
                 s.push('…');
                 out.push(Span::styled(s, span.style));
             } else if remaining == 1 {
-                out.push(Span::styled("…", styles::MUTED));
+                out.push(Span::styled("…", t.muted));
             }
             break;
         }
@@ -369,12 +379,12 @@ fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn level_style(level: &str) -> ratatui::style::Style {
+fn level_style(level: &str, t: &crate::theme::Theme) -> ratatui::style::Style {
     match level {
-        "ERROR" => styles::STATUS_ERR,
-        "WARN" => styles::STATUS_WARN,
-        "INFO" => styles::STATUS_OK,
-        _ => styles::MUTED,
+        "ERROR" => t.status_err,
+        "WARN" => t.status_warn,
+        "INFO" => t.status_ok,
+        _ => t.muted,
     }
 }
 

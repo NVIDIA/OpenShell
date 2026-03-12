@@ -28,12 +28,32 @@ use event::{Event, EventHandler};
 /// Duration to show the splash screen before auto-dismissing.
 const SPLASH_DURATION: Duration = Duration::from_secs(3);
 
+// Re-export for use by the CLI crate.
+pub use theme::ThemeMode;
+
 /// Launch the OpenShell TUI.
 ///
 /// `channel` must be a connected gRPC channel to the OpenShell gateway.
-pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result<()> {
+/// `theme_mode` selects the color theme: `Auto` detects the terminal
+/// background, `Dark`/`Light` forces a specific palette.
+pub async fn run(
+    channel: Channel,
+    gateway_name: &str,
+    endpoint: &str,
+    theme_mode: ThemeMode,
+) -> Result<()> {
+    // Detect theme *before* entering raw/alternate-screen mode.
+    // The OSC 11 query temporarily enters raw mode itself; calling it
+    // after our own enable_raw_mode() would conflict.
+    let detected_theme = theme::detect(theme_mode);
+
     let client = NavigatorClient::new(channel);
-    let mut app = App::new(client, gateway_name.to_string(), endpoint.to_string());
+    let mut app = App::new(
+        client,
+        gateway_name.to_string(),
+        endpoint.to_string(),
+        detected_theme,
+    );
 
     enable_raw_mode().into_diagnostic()?;
     let mut stdout = io::stdout();
@@ -669,7 +689,7 @@ async fn fetch_sandbox_detail(app: &mut App) {
                     // Use the version from the policy history, not from the
                     // policy proto's own version field (which is always 1).
                     policy.version = inner.version;
-                    app.policy_lines = render_policy_lines(&policy);
+                    app.policy_lines = render_policy_lines(&policy, &app.theme);
                     app.sandbox_policy = Some(policy);
                 }
             }
@@ -990,32 +1010,30 @@ use navigator_core::forward::{resolve_ssh_gateway, shell_escape};
 /// Convert a `SandboxPolicy` proto into styled ratatui lines for the policy viewer.
 fn render_policy_lines(
     policy: &navigator_core::proto::SandboxPolicy,
+    theme: &theme::Theme,
 ) -> Vec<ratatui::text::Line<'static>> {
-    use crate::theme::styles;
     use ratatui::text::{Line, Span};
 
+    let t = theme;
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     // --- Filesystem Access ---
     if let Some(fs) = &policy.filesystem {
-        lines.push(Line::from(Span::styled(
-            "Filesystem Access",
-            styles::HEADING,
-        )));
+        lines.push(Line::from(Span::styled("Filesystem Access", t.heading)));
 
         if !fs.read_only.is_empty() {
             let paths = fs.read_only.join(", ");
             lines.push(Line::from(vec![
-                Span::styled("  Read-only:  ", styles::MUTED),
-                Span::styled(paths, styles::TEXT),
+                Span::styled("  Read-only:  ", t.muted),
+                Span::styled(paths, t.text),
             ]));
         }
 
         if !fs.read_write.is_empty() {
             let paths = fs.read_write.join(", ");
             lines.push(Line::from(vec![
-                Span::styled("  Read-write: ", styles::MUTED),
-                Span::styled(paths, styles::TEXT),
+                Span::styled("  Read-write: ", t.muted),
+                Span::styled(paths, t.text),
             ]));
         }
 
@@ -1029,7 +1047,7 @@ fn render_policy_lines(
         rule_names.sort();
 
         let header = format!("Network Rules ({})", rule_names.len());
-        lines.push(Line::from(Span::styled(header, styles::HEADING)));
+        lines.push(Line::from(Span::styled(header, t.heading)));
         lines.push(Line::from(""));
 
         for name in rule_names {
@@ -1070,7 +1088,7 @@ fn render_policy_lines(
             } else {
                 format!("  {name} ({})", annotations.join(", "))
             };
-            lines.push(Line::from(Span::styled(title, styles::ACCENT)));
+            lines.push(Line::from(Span::styled(title, t.accent)));
 
             // Endpoints.
             for ep in &rule.endpoints {
@@ -1084,13 +1102,13 @@ fn render_policy_lines(
                 } else {
                     "    *".to_string()
                 };
-                lines.push(Line::from(Span::styled(addr, styles::TEXT)));
+                lines.push(Line::from(Span::styled(addr, t.text)));
 
                 // Allowed IPs (CIDR allowlist for private IP access).
                 if !ep.allowed_ips.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("      Allowed IPs: ", styles::MUTED),
-                        Span::styled(ep.allowed_ips.join(", "), styles::TEXT),
+                        Span::styled("      Allowed IPs: ", t.muted),
+                        Span::styled(ep.allowed_ips.join(", "), t.text),
                     ]));
                 }
 
@@ -1110,8 +1128,8 @@ fn render_policy_lines(
                             "*"
                         };
                         lines.push(Line::from(vec![
-                            Span::styled("      Allow: ", styles::MUTED),
-                            Span::styled(format!("{:<6} {}", method, target), styles::TEXT),
+                            Span::styled("      Allow: ", t.muted),
+                            Span::styled(format!("{:<6} {}", method, target), t.text),
                         ]));
                     }
                 }
@@ -1119,8 +1137,8 @@ fn render_policy_lines(
                 // Access preset (if set instead of explicit rules).
                 if !ep.access.is_empty() && ep.rules.is_empty() {
                     lines.push(Line::from(vec![
-                        Span::styled("      Access: ", styles::MUTED),
-                        Span::styled(ep.access.clone(), styles::TEXT),
+                        Span::styled("      Access: ", t.muted),
+                        Span::styled(ep.access.clone(), t.text),
                     ]));
                 }
             }
@@ -1129,8 +1147,8 @@ fn render_policy_lines(
             let binary_paths: Vec<&str> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
             if !binary_paths.is_empty() {
                 lines.push(Line::from(vec![
-                    Span::styled("    Binaries: ", styles::MUTED),
-                    Span::styled(binary_paths.join(", "), styles::TEXT),
+                    Span::styled("    Binaries: ", t.muted),
+                    Span::styled(binary_paths.join(", "), t.text),
                 ]));
             }
 
@@ -1142,7 +1160,7 @@ fn render_policy_lines(
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             "No policy data available.",
-            styles::MUTED,
+            t.muted,
         )));
     }
 
@@ -1876,7 +1894,7 @@ async fn refresh_sandbox_policy(app: &mut App) {
                 // Use the version from the policy history, not from the
                 // policy proto's own version field (which is always 1).
                 policy.version = inner.version;
-                app.policy_lines = render_policy_lines(&policy);
+                app.policy_lines = render_policy_lines(&policy, &app.theme);
                 app.sandbox_policy = Some(policy);
             }
         }

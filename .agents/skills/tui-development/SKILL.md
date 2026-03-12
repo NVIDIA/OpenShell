@@ -20,7 +20,7 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
   - `navigator-core` — proto-generated types (`NavigatorClient`, request/response structs)
   - `navigator-bootstrap` — cluster discovery (`list_clusters()`)
-- **Theme:** NVIDIA-branded green on dark terminal background
+- **Theme:** Adaptive dark/light via `Theme` struct — NVIDIA-branded green accents. Controlled by `--theme` flag, `OPENSHELL_THEME` env var, or auto-detection.
 
 ## 2. Domain Object Hierarchy
 
@@ -172,44 +172,82 @@ tokio::time::timeout(Duration::from_secs(5), client.health(req)).await
 
 ## 5. Style Guide & Colors
 
-### NVIDIA Green Theme (`theme.rs`)
+### Theme System (`theme.rs`)
 
-All colors and styles are defined in `crates/navigator-tui/src/theme.rs`.
+Colors and styles are defined in `crates/navigator-tui/src/theme.rs` via the `Theme` struct. The TUI supports dark and light terminal backgrounds.
 
-#### Colors (`theme::colors`)
+#### Theme selection
+
+Theme mode is controlled by three mechanisms (highest priority first):
+
+1. `--theme dark|light|auto` CLI flag on `openshell term`
+2. `OPENSHELL_THEME` environment variable
+3. Auto-detection via `COLORFGBG` env var (falls back to dark)
+
+The `ThemeMode` enum (`Auto`, `Dark`, `Light`) is resolved at startup via `theme::detect()` before entering raw mode.
+
+#### Brand colors (`theme::brand`)
 
 | Constant | Value | Usage |
 | --- | --- | --- |
-| `NVIDIA_GREEN` | `Color::Rgb(118, 185, 0)` | Primary accent — selections, active items, key hints |
-| `EVERGLADE` | `Color::Rgb(18, 49, 35)` | Dark green — borders (unfocused), title bar background |
-| `BG` | `Color::Black` | Terminal background |
-| `FG` | `Color::White` | Default foreground text |
+| `NVIDIA_GREEN` | `Color::Rgb(118, 185, 0)` | Primary accent (dark theme) |
+| `NVIDIA_GREEN_DARK` | `Color::Rgb(80, 140, 0)` | Primary accent (light theme — darker for contrast) |
+| `EVERGLADE` | `Color::Rgb(18, 49, 35)` | Dark green — borders, title bar bg (dark theme) |
+| `MAROON` | `Color::Rgb(128, 0, 0)` | Pacman chase animation |
 
-#### Styles (`theme::styles`)
+#### Theme struct fields
 
-| Constant | Definition | Usage |
-| --- | --- | --- |
-| `TEXT` | White foreground | Default body text |
-| `MUTED` | White + DIM modifier | Secondary info, separators (`│`), unfocused items |
-| `HEADING` | White + BOLD | Panel titles, sandbox/cluster names when active |
-| `ACCENT` | NVIDIA_GREEN foreground | Selected row marker (`▌`), sandbox source labels |
-| `ACCENT_BOLD` | NVIDIA_GREEN + BOLD | "OpenShell" brand text, command prompt `:` |
-| `SELECTED` | BOLD modifier only | Selected row text emphasis |
-| `BORDER` | EVERGLADE foreground | Unfocused panel borders |
-| `BORDER_FOCUSED` | NVIDIA_GREEN foreground | Focused panel borders |
-| `STATUS_OK` | NVIDIA_GREEN foreground | Healthy status, INFO log level, Ready phase |
-| `STATUS_WARN` | Yellow foreground | Degraded status, WARN log level, Provisioning phase |
-| `STATUS_ERR` | Red foreground | Unhealthy status, ERROR log level, Error phase |
-| `KEY_HINT` | NVIDIA_GREEN foreground | Keyboard shortcut labels in nav bar (e.g., `[Tab]`) |
-| `TITLE_BAR` | White on EVERGLADE + BOLD | Title bar background strip |
+The `Theme` struct has 16 `Style` fields, accessed at runtime via `app.theme`:
+
+| Field | Dark value | Light value | Usage |
+| --- | --- | --- | --- |
+| `text` | White fg | Near-black fg | Default body text |
+| `muted` | White + DIM | Gray fg | Secondary info, separators |
+| `heading` | White + BOLD | Near-black + BOLD | Panel titles, names |
+| `accent` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Selected row marker, source labels |
+| `accent_bold` | NVIDIA_GREEN + BOLD | NVIDIA_GREEN_DARK + BOLD | Brand text, command prompt |
+| `selected` | BOLD only | BOLD only | Selected row emphasis |
+| `border` | EVERGLADE fg | Light sage fg | Unfocused panel borders |
+| `border_focused` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Focused panel borders |
+| `status_ok` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Healthy, INFO, Ready |
+| `status_warn` | Yellow fg | Dark yellow fg | Degraded, WARN, Provisioning |
+| `status_err` | Red fg | Dark red fg | Unhealthy, ERROR |
+| `key_hint` | NVIDIA_GREEN fg | NVIDIA_GREEN_DARK fg | Keyboard shortcut labels |
+| `log_cursor` | EVERGLADE bg | Light green bg | Selected log line highlight |
+| `claw` | MAROON + BOLD | MAROON + BOLD | Pacman animation |
+| `title_bar` | White on EVERGLADE + BOLD | Near-black on light green + BOLD | Title bar strip |
+| `badge` | Black on NVIDIA_GREEN + BOLD | White on NVIDIA_GREEN_DARK + BOLD | Notification badges |
+
+#### Accessing the theme in draw functions
+
+The `Theme` is stored on `App` and accessed via a local alias:
+
+```rust
+fn draw_my_widget(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
+    frame.render_widget(
+        Paragraph::new(Span::styled("Hello", t.text)),
+        area,
+    );
+}
+```
+
+For functions that don't take `&App` (e.g., detail popups, helpers), pass `&Theme` as a parameter:
+
+```rust
+fn draw_detail_popup(frame: &mut Frame<'_>, data: &MyData, area: Rect, theme: &Theme) {
+    let t = theme;
+    // ...
+}
+```
 
 #### Visual conventions
 
 - **Selected row**: Green `▌` left-border marker on the selected row. Active gateway also gets a green `●` dot.
-- **Focused panel**: Border changes from `EVERGLADE` to `NVIDIA_GREEN`.
+- **Focused panel**: Border changes from `border` to `border_focused` style.
 - **Status indicators**: Green for healthy/ready/info, yellow for degraded/provisioning/warn, red for unhealthy/error.
 - **Separators**: Muted `│` characters between title bar segments and nav bar sections.
-- **Log source labels**: `"sandbox"` source renders in `ACCENT` (green), `"gateway"` in `MUTED`.
+- **Log source labels**: `"sandbox"` source renders in `accent` (green), `"gateway"` in `muted`.
 
 ## 6. UX Conventions
 

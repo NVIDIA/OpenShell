@@ -7,13 +7,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::App;
-use crate::theme::styles;
 
 /// Draw a compact metadata pane for the currently selected sandbox.
 ///
 /// This is non-interactive (no focus state) — always rendered with the
 /// unfocused border style in the top ~20% of the sandbox screen.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let idx = app.sandbox_selected;
     let name = app.sandbox_names.get(idx).map_or("-", String::as_str);
     let phase = app.sandbox_phases.get(idx).map_or("-", String::as_str);
@@ -22,10 +22,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let age = app.sandbox_ages.get(idx).map_or("-", String::as_str);
 
     let phase_style = match phase {
-        "Ready" => styles::STATUS_OK,
-        "Provisioning" => styles::STATUS_WARN,
-        "Error" => styles::STATUS_ERR,
-        _ => styles::MUTED,
+        "Ready" => t.status_ok,
+        "Provisioning" => t.status_warn,
+        "Error" => t.status_err,
+        _ => t.muted,
     };
 
     let status_indicator = match phase {
@@ -49,18 +49,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Row 1: Name + Status + optional draft badge
     let mut row1_spans = vec![
-        Span::styled("  Name: ", styles::MUTED),
-        Span::styled(name, styles::HEADING),
+        Span::styled("  Name: ", t.muted),
+        Span::styled(name, t.heading),
     ];
     if pending_count > 0 {
         row1_spans.push(Span::raw(" "));
-        row1_spans.push(Span::styled(
-            format!(" {pending_count} pending "),
-            styles::BADGE,
-        ));
+        row1_spans.push(Span::styled(format!(" {pending_count} pending "), t.badge));
     }
     row1_spans.extend([
-        Span::styled("              Status: ", styles::MUTED),
+        Span::styled("              Status: ", t.muted),
         Span::styled(format!("{status_indicator} "), phase_style),
         Span::styled(phase, phase_style),
     ]);
@@ -68,12 +65,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Row 2: Image + Created + Age
     let row2 = Line::from(vec![
-        Span::styled("  Image: ", styles::MUTED),
-        Span::styled(image, styles::TEXT),
-        Span::styled("   Created: ", styles::MUTED),
-        Span::styled(created, styles::TEXT),
-        Span::styled("   Age: ", styles::MUTED),
-        Span::styled(age, styles::TEXT),
+        Span::styled("  Image: ", t.muted),
+        Span::styled(image, t.text),
+        Span::styled("   Created: ", t.muted),
+        Span::styled(created, t.text),
+        Span::styled("   Age: ", t.muted),
+        Span::styled(age, t.text),
     ]);
 
     // Row 3: Providers
@@ -83,8 +80,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         app.sandbox_providers_list.join(", ")
     };
     let row3 = Line::from(vec![
-        Span::styled("  Providers: ", styles::MUTED),
-        Span::styled(providers_str, styles::TEXT),
+        Span::styled("  Providers: ", t.muted),
+        Span::styled(providers_str, t.text),
     ]);
 
     // Row 4: Forwarded Ports
@@ -94,8 +91,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .filter(|s| !s.is_empty())
         .map_or_else(|| "none".to_string(), Clone::clone);
     let row4 = Line::from(vec![
-        Span::styled("  Forwards: ", styles::MUTED),
-        Span::styled(forwards_str, styles::TEXT),
+        Span::styled("  Forwards: ", t.muted),
+        Span::styled(forwards_str, t.text),
     ]);
 
     let mut lines = vec![Line::from(""), row1, row2, row3, row4];
@@ -104,17 +101,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // active, since it would push the confirmation off the bottom of the pane.
     if pending_count > 0 && !app.confirm_delete {
         lines.push(Line::from(vec![
-            Span::styled("  ", styles::TEXT),
+            Span::styled("  ", t.text),
             Span::styled(
                 format!(
                     "{pending_count} pending network rule{}",
                     if pending_count == 1 { "" } else { "s" }
                 ),
-                styles::ACCENT,
+                t.accent,
             ),
-            Span::styled(" — press ", styles::MUTED),
-            Span::styled("[r]", styles::KEY_HINT),
-            Span::styled(" to review", styles::MUTED),
+            Span::styled(" — press ", t.muted),
+            Span::styled("[r]", t.key_hint),
+            Span::styled(" to review", t.muted),
         ]));
     }
 
@@ -123,30 +120,27 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     if app.confirm_delete {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
-            Span::styled("  ", styles::TEXT),
-            Span::styled("Delete sandbox '", styles::STATUS_ERR),
-            Span::styled(name, styles::STATUS_ERR),
-            Span::styled("'? ", styles::STATUS_ERR),
-            Span::styled("[y]", styles::KEY_HINT),
-            Span::styled(" Confirm  ", styles::TEXT),
-            Span::styled("[Esc]", styles::KEY_HINT),
-            Span::styled(" Cancel", styles::TEXT),
+            Span::styled("  ", t.text),
+            Span::styled("Delete sandbox '", t.status_err),
+            Span::styled(name, t.status_err),
+            Span::styled("'? ", t.status_err),
+            Span::styled("[y]", t.key_hint),
+            Span::styled(" Confirm  ", t.text),
+            Span::styled("[Esc]", t.key_hint),
+            Span::styled(" Cancel", t.text),
         ]));
     }
 
     let mut title_spans: Vec<Span<'_>> =
-        vec![Span::styled(format!(" Sandbox: {name} "), styles::HEADING)];
+        vec![Span::styled(format!(" Sandbox: {name} "), t.heading)];
     if pending_count > 0 {
-        title_spans.push(Span::styled(
-            format!(" {pending_count} pending "),
-            styles::BADGE,
-        ));
+        title_spans.push(Span::styled(format!(" {pending_count} pending "), t.badge));
         title_spans.push(Span::raw(" "));
     }
     let block = Block::default()
         .title(Line::from(title_spans))
         .borders(Borders::ALL)
-        .border_style(styles::BORDER) // non-interactive — unfocused border
+        .border_style(t.border) // non-interactive — unfocused border
         .padding(Padding::horizontal(1));
 
     frame.render_widget(Paragraph::new(lines).block(block), area);

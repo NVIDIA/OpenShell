@@ -18,6 +18,7 @@ navigator-providers = { path = "../navigator-providers" }
 
 ratatui = { workspace = true }
 crossterm = { workspace = true }
+terminal-colorsaurus = { workspace = true }
 tokio = { workspace = true }
 tonic = { workspace = true, features = ["tls"] }
 miette = { workspace = true }

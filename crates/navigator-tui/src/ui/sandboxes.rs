@@ -7,16 +7,16 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 
 use crate::app::App;
-use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    let t = &app.theme;
     let header = Row::new(vec![
-        Cell::from(Span::styled("  NAME", styles::MUTED)),
-        Cell::from(Span::styled("STATUS", styles::MUTED)),
-        Cell::from(Span::styled("CREATED", styles::MUTED)),
-        Cell::from(Span::styled("AGE", styles::MUTED)),
-        Cell::from(Span::styled("IMAGE", styles::MUTED)),
-        Cell::from(Span::styled("NOTES", styles::MUTED)),
+        Cell::from(Span::styled("  NAME", t.muted)),
+        Cell::from(Span::styled("STATUS", t.muted)),
+        Cell::from(Span::styled("CREATED", t.muted)),
+        Cell::from(Span::styled("AGE", t.muted)),
+        Cell::from(Span::styled("IMAGE", t.muted)),
+        Cell::from(Span::styled("NOTES", t.muted)),
     ])
     .bottom_margin(1);
 
@@ -31,20 +31,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             let draft_count = app.sandbox_draft_counts.get(i).copied().unwrap_or(0);
 
             let phase_style = match phase {
-                "Ready" => styles::STATUS_OK,
-                "Provisioning" => styles::STATUS_WARN,
-                "Error" => styles::STATUS_ERR,
-                _ => styles::MUTED,
+                "Ready" => t.status_ok,
+                "Provisioning" => t.status_warn,
+                "Error" => t.status_err,
+                _ => t.muted,
             };
 
             let selected = focused && i == app.sandbox_selected;
             let mut name_spans = if selected {
-                vec![
-                    Span::styled("▌ ", styles::ACCENT),
-                    Span::styled(name, styles::TEXT),
-                ]
+                vec![Span::styled("▌ ", t.accent), Span::styled(name, t.text)]
             } else {
-                vec![Span::raw("  "), Span::styled(name, styles::TEXT)]
+                vec![Span::raw("  "), Span::styled(name, t.text)]
             };
 
             // Append notification badge when there are pending network rules.
@@ -55,7 +52,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                         " {draft_count} pending rule{} ",
                         if draft_count == 1 { "" } else { "s" }
                     ),
-                    styles::BADGE,
+                    t.badge,
                 ));
             }
 
@@ -64,10 +61,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             Row::new(vec![
                 name_cell,
                 Cell::from(Span::styled(phase, phase_style)),
-                Cell::from(Span::styled(created, styles::MUTED)),
-                Cell::from(Span::styled(age, styles::MUTED)),
-                Cell::from(Span::styled(image, styles::MUTED)),
-                Cell::from(Span::styled(notes, styles::MUTED)),
+                Cell::from(Span::styled(created, t.muted)),
+                Cell::from(Span::styled(age, t.muted)),
+                Cell::from(Span::styled(image, t.muted)),
+                Cell::from(Span::styled(notes, t.muted)),
             ])
         })
         .collect();
@@ -81,17 +78,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Constraint::Percentage(20),
     ];
 
-    let border_style = if focused {
-        styles::BORDER_FOCUSED
-    } else {
-        styles::BORDER
-    };
+    let border_style = if focused { t.border_focused } else { t.border };
 
     let title = Line::from(vec![
-        Span::styled(" Sandboxes ", styles::HEADING),
-        Span::styled("─ ", styles::BORDER),
-        Span::styled(&app.gateway_name, styles::MUTED),
-        Span::styled(" ", styles::MUTED),
+        Span::styled(" Sandboxes ", t.heading),
+        Span::styled("─ ", t.border),
+        Span::styled(&app.gateway_name, t.muted),
+        Span::styled(" ", t.muted),
     ]);
 
     let block = Block::default()
@@ -111,10 +104,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(3),
         };
-        let msg = Paragraph::new(Span::styled(
-            " No sandboxes. Press [c] to create.",
-            styles::MUTED,
-        ));
+        let msg = Paragraph::new(Span::styled(" No sandboxes. Press [c] to create.", t.muted));
         frame.render_widget(msg, inner);
     }
 }
