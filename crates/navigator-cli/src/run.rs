@@ -744,32 +744,34 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
 }
 
 fn format_gateway_select_header(gateways: &[GatewayMetadata]) -> String {
-    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+    let (name_width, endpoint_width, type_width) = gateway_select_column_widths(gateways);
     format!(
-        "  {:<name_width$}  {:<endpoint_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "AUTH".bold(),
     )
 }
 
 fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
-    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+    let (name_width, endpoint_width, type_width) = gateway_select_column_widths(gateways);
 
     gateways
         .iter()
         .map(|gateway| {
             format!(
-                "{:<name_width$}  {:<endpoint_width$}  {}",
+                "{:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
                 gateway.name,
                 gateway.gateway_endpoint,
                 gateway_type_label(gateway),
+                gateway_auth_label(gateway),
             )
         })
         .collect()
 }
 
-fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) {
+fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize, usize) {
     let name_width = gateways
         .iter()
         .map(|gateway| gateway.name.len())
@@ -782,8 +784,14 @@ fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) 
         .max()
         .unwrap_or(8)
         .max(8);
+    let type_width = gateways
+        .iter()
+        .map(|gateway| gateway_type_label(gateway).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
-    (name_width, endpoint_width)
+    (name_width, endpoint_width, type_width)
 }
 
 fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
@@ -791,6 +799,14 @@ fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
         Some("cloudflare_jwt") => "cloud",
         _ if gateway.is_remote => "remote",
         _ => "local",
+    }
+}
+
+fn gateway_auth_label(gateway: &GatewayMetadata) -> &'static str {
+    match gateway.auth_mode.as_deref() {
+        Some("cloudflare_jwt") => "jwt",
+        Some("mtls") => "mtls",
+        _ => "mtls",
     }
 }
 
@@ -1029,23 +1045,31 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
         .max()
         .unwrap_or(8)
         .max(8);
+    let type_width = gateways
+        .iter()
+        .map(|g| gateway_type_label(g).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
     // Print header
     println!(
-        "  {:<name_width$}  {:<endpoint_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "AUTH".bold(),
     );
 
     // Print rows
     for gateway in &gateways {
         let is_active = active.as_deref() == Some(&gateway.name);
         let marker = if is_active { "*" } else { " " };
-        let gateway_type = gateway_type_label(gateway);
+        let gw_type = gateway_type_label(gateway);
+        let gw_auth = gateway_auth_label(gateway);
         let line = format!(
-            "{marker} {:<name_width$}  {:<endpoint_width$}  {gateway_type}",
-            gateway.name, gateway.gateway_endpoint,
+            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {gw_auth}",
+            gateway.name, gateway.gateway_endpoint, gw_type,
         );
         if is_active {
             println!("{}", line.green());
@@ -4058,8 +4082,8 @@ fn format_timestamp_ms(ms: i64) -> String {
 mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
-        format_gateway_select_items, gateway_select_with, gateway_type_label, git_sync_files,
-        http_health_check, inferred_provider_type, parse_credential_pairs,
+        format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, inferred_provider_type, parse_credential_pairs,
         resolve_gateway_control_target_from,
     };
     use crate::TEST_ENV_LOCK;
@@ -4376,13 +4400,18 @@ mod tests {
 
         assert_eq!(gateway_type_label(&gateways[0]), "cloud");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
+        assert_eq!(gateway_auth_label(&gateways[0]), "jwt");
+        assert_eq!(gateway_auth_label(&gateways[1]), "mtls");
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
+        assert!(header.contains("AUTH"));
         assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
         assert!(items[0].contains("cloud"));
+        assert!(items[0].contains("jwt"));
         assert!(items[1].contains("local"));
+        assert!(items[1].contains("mtls"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
     }
 
