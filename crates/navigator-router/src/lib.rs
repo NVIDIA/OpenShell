@@ -7,7 +7,7 @@ mod mock;
 
 use std::time::Duration;
 
-pub use backend::ProxyResponse;
+pub use backend::{ProxyResponse, StreamingProxyResponse};
 use config::{ResolvedRoute, RouterConfig};
 use tracing::info;
 
@@ -85,6 +85,51 @@ impl Router {
         }
 
         backend::proxy_to_backend(
+            &self.client,
+            route,
+            &normalized_source,
+            method,
+            path,
+            headers,
+            body,
+        )
+        .await
+    }
+
+    /// Streaming variant of [`proxy_with_candidates`](Self::proxy_with_candidates).
+    ///
+    /// Returns response headers immediately without buffering the body.
+    /// The caller streams body chunks via [`StreamingProxyResponse::response`].
+    pub async fn proxy_with_candidates_streaming(
+        &self,
+        source_protocol: &str,
+        method: &str,
+        path: &str,
+        headers: Vec<(String, String)>,
+        body: bytes::Bytes,
+        candidates: &[ResolvedRoute],
+    ) -> Result<StreamingProxyResponse, RouterError> {
+        let normalized_source = source_protocol.trim().to_ascii_lowercase();
+        let route = candidates
+            .iter()
+            .find(|r| r.protocols.iter().any(|p| p == &normalized_source))
+            .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
+
+        info!(
+            protocols = %route.protocols.join(","),
+            endpoint = %route.endpoint,
+            method = %method,
+            path = %path,
+            "routing proxy inference request (streaming)"
+        );
+
+        if mock::is_mock_route(route) {
+            info!(endpoint = %route.endpoint, "returning mock response (buffered)");
+            let buffered = mock::mock_response(route, &normalized_source);
+            return Ok(StreamingProxyResponse::from_buffered(buffered));
+        }
+
+        backend::proxy_to_backend_streaming(
             &self.client,
             route,
             &normalized_source,

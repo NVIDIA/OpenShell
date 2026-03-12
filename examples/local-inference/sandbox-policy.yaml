@@ -25,4 +25,12 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-# No network policies means all outbound connections are denied and only inference.local is allowed.
+# Allow PyPI access so pip can install dependencies inside the sandbox.
+network_policies:
+  pypi:
+    name: PyPI
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+    binaries:
+      - path: /usr/bin/python3.12

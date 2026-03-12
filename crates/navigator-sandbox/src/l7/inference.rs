@@ -251,6 +251,58 @@ pub fn format_http_response(status: u16, headers: &[(String, String)], body: &[u
     bytes
 }
 
+/// Format HTTP/1.1 response headers for a chunked (streaming) response.
+///
+/// Emits the status line, supplied headers (stripping any `content-length` or
+/// `transfer-encoding` the upstream may have sent), and a
+/// `transfer-encoding: chunked` header. The body is **not** included — the
+/// caller writes chunks separately via [`format_chunk`] and
+/// [`format_chunk_terminator`].
+pub fn format_http_response_header(status: u16, headers: &[(String, String)]) -> Vec<u8> {
+    use std::fmt::Write;
+
+    let status_text = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        411 => "Length Required",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        502 => "Bad Gateway",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    };
+
+    let mut response = format!("HTTP/1.1 {status} {status_text}\r\n");
+    for (name, value) in headers {
+        // Skip framing headers — we always emit chunked TE.
+        if name.eq_ignore_ascii_case("content-length")
+            || name.eq_ignore_ascii_case("transfer-encoding")
+        {
+            continue;
+        }
+        let _ = write!(response, "{name}: {value}\r\n");
+    }
+    let _ = write!(response, "transfer-encoding: chunked\r\n");
+    response.push_str("\r\n");
+    response.into_bytes()
+}
+
+/// Format a single HTTP chunked transfer-encoding segment.
+///
+/// Returns `<hex-length>\r\n<data>\r\n`.
+pub fn format_chunk(data: &[u8]) -> Vec<u8> {
+    let mut buf = format!("{:x}\r\n", data.len()).into_bytes();
+    buf.extend_from_slice(data);
+    buf.extend_from_slice(b"\r\n");
+    buf
+}
+
+/// The HTTP chunked transfer-encoding terminator: `0\r\n\r\n`.
+pub fn format_chunk_terminator() -> &'static [u8] {
+    b"0\r\n\r\n"
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,5 +423,65 @@ mod tests {
         assert!(response_str.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(response_str.contains("content-length: 11\r\n"));
         assert!(response_str.ends_with("{\"ok\":true}"));
+    }
+
+    #[test]
+    fn format_response_header_chunked() {
+        let headers = vec![
+            ("content-type".to_string(), "text/event-stream".to_string()),
+            ("x-request-id".to_string(), "abc123".to_string()),
+        ];
+        let header = format_http_response_header(200, &headers);
+        let header_str = String::from_utf8_lossy(&header);
+        assert!(header_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(header_str.contains("content-type: text/event-stream\r\n"));
+        assert!(header_str.contains("x-request-id: abc123\r\n"));
+        assert!(header_str.contains("transfer-encoding: chunked\r\n"));
+        assert!(header_str.ends_with("\r\n"));
+        // Must NOT contain content-length
+        assert!(!header_str.to_lowercase().contains("content-length"));
+    }
+
+    #[test]
+    fn format_response_header_strips_upstream_framing() {
+        let headers = vec![
+            ("content-length".to_string(), "9999".to_string()),
+            ("transfer-encoding".to_string(), "chunked".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+        let header = format_http_response_header(200, &headers);
+        let header_str = String::from_utf8_lossy(&header);
+        // Should not contain the upstream content-length or transfer-encoding values
+        assert!(!header_str.contains("content-length: 9999"));
+        // Should contain exactly one transfer-encoding: chunked (ours)
+        assert_eq!(header_str.matches("transfer-encoding: chunked").count(), 1);
+    }
+
+    #[test]
+    fn format_chunk_basic() {
+        let data = b"hello";
+        let chunk = format_chunk(data);
+        assert_eq!(chunk, b"5\r\nhello\r\n");
+    }
+
+    #[test]
+    fn format_chunk_empty() {
+        // Empty chunk is NOT the terminator — it's a zero-length data segment
+        let chunk = format_chunk(b"");
+        assert_eq!(chunk, b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn format_chunk_terminator_value() {
+        assert_eq!(format_chunk_terminator(), b"0\r\n\r\n");
+    }
+
+    #[test]
+    fn format_chunk_large_hex() {
+        let data = vec![0x41u8; 256]; // 0x100 bytes
+        let chunk = format_chunk(&data);
+        assert!(chunk.starts_with(b"100\r\n"));
+        assert!(chunk.ends_with(b"\r\n"));
+        assert_eq!(chunk.len(), 3 + 2 + 256 + 2); // "100" + \r\n + data + \r\n
     }
 }

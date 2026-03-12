@@ -924,7 +924,7 @@ async fn route_inference_request(
 
         match ctx
             .router
-            .proxy_with_candidates(
+            .proxy_with_candidates_streaming(
                 &pattern.protocol,
                 &request.method,
                 &normalized_path,
@@ -934,11 +934,36 @@ async fn route_inference_request(
             )
             .await
         {
-            Ok(resp) => {
-                let resp_headers =
-                    sanitize_inference_response_headers(resp.headers.into_iter().collect());
-                let response = format_http_response(resp.status, &resp_headers, &resp.body);
-                write_all(tls_client, &response).await?;
+            Ok(mut resp) => {
+                use crate::l7::inference::{
+                    format_chunk, format_chunk_terminator, format_http_response_header,
+                };
+
+                let resp_headers = sanitize_inference_response_headers(
+                    std::mem::take(&mut resp.headers).into_iter().collect(),
+                );
+
+                // Write response headers immediately (chunked TE).
+                let header_bytes = format_http_response_header(resp.status, &resp_headers);
+                write_all(tls_client, &header_bytes).await?;
+
+                // Stream body chunks as they arrive from the upstream.
+                loop {
+                    match resp.next_chunk().await {
+                        Ok(Some(chunk)) => {
+                            let encoded = format_chunk(&chunk);
+                            write_all(tls_client, &encoded).await?;
+                        }
+                        Ok(None) => break,
+                        Err(e) => {
+                            warn!(error = %e, "error reading upstream response chunk");
+                            break;
+                        }
+                    }
+                }
+
+                // Terminate the chunked stream.
+                write_all(tls_client, format_chunk_terminator()).await?;
             }
             Err(e) => {
                 warn!(error = %e, "inference endpoint detected but upstream service failed");
