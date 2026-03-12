@@ -483,15 +483,19 @@ pub async fn gateway_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
 /// them locally so the CLI can connect.
 ///
 /// Connects to Docker (local or remote via SSH), auto-discovers the running
-/// gateway container by image name, reads the PKI bundle from Kubernetes
-/// secrets inside it, and writes the client materials (ca.crt, tls.crt,
-/// tls.key) to the gateway config directory.
-pub async fn extract_and_store_pki(name: &str, remote: Option<&RemoteOptions>) -> Result<()> {
+/// gateway container by image name (narrowed by `port` when provided), reads
+/// the PKI bundle from Kubernetes secrets inside it, and writes the client
+/// materials (ca.crt, tls.crt, tls.key) to the gateway config directory.
+pub async fn extract_and_store_pki(
+    name: &str,
+    remote: Option<&RemoteOptions>,
+    port: Option<u16>,
+) -> Result<()> {
     let docker = match remote {
         Some(r) => create_ssh_docker_client(r).await?,
         None => Docker::connect_with_local_defaults().into_diagnostic()?,
     };
-    let cname = docker::find_gateway_container(&docker).await?;
+    let cname = docker::find_gateway_container(&docker, port).await?;
     let bundle = load_existing_pki_bundle(&docker, &cname, constants::KUBECONFIG_PATH)
         .await
         .map_err(|e| miette::miette!("Failed to extract TLS certificates: {e}"))?;

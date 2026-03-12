@@ -124,34 +124,59 @@ pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> 
 /// Find the running openshell gateway container by image name.
 ///
 /// Lists all running containers and returns the name of the one whose image
-/// contains `openshell/cluster`. Fails if zero or multiple containers match.
-pub async fn find_gateway_container(docker: &Docker) -> Result<String> {
+/// contains `openshell/cluster`. When `port` is provided, only containers
+/// with a matching host port binding are considered — this disambiguates
+/// when multiple gateway containers are running on the same host.
+///
+/// Fails if zero or multiple containers match.
+pub async fn find_gateway_container(docker: &Docker, port: Option<u16>) -> Result<String> {
     let containers = docker
         .list_containers(Some(ListContainersOptionsBuilder::new().all(false).build()))
         .await
         .into_diagnostic()
         .wrap_err("failed to list Docker containers")?;
 
+    let is_gateway_image = |c: &bollard::models::ContainerSummary| {
+        c.image
+            .as_deref()
+            .is_some_and(|img| img.contains("openshell/cluster"))
+    };
+
+    let has_port = |c: &bollard::models::ContainerSummary, p: u16| {
+        c.ports
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|binding| binding.public_port == Some(p))
+    };
+
+    let container_name = |c: &bollard::models::ContainerSummary| {
+        c.names
+            .as_ref()
+            .and_then(|n| n.first())
+            .map(|n| n.trim_start_matches('/').to_string())
+    };
+
     let matches: Vec<String> = containers
         .iter()
-        .filter(|c| {
-            c.image
-                .as_deref()
-                .is_some_and(|img| img.contains("openshell/cluster"))
-        })
-        .filter_map(|c| {
-            c.names
-                .as_ref()
-                .and_then(|n| n.first())
-                .map(|n| n.trim_start_matches('/').to_string())
-        })
+        .filter(|c| is_gateway_image(c) && port.map_or(true, |p| has_port(c, p)))
+        .filter_map(container_name)
         .collect();
 
     match matches.len() {
-        0 => Err(miette::miette!(
-            "No openshell gateway container found.\n\
-             Is the gateway running? Check with: docker ps"
-        )),
+        0 => {
+            let hint = if let Some(p) = port {
+                format!(
+                    "No openshell gateway container found listening on port {p}.\n\
+                     Is the gateway running? Check with: docker ps"
+                )
+            } else {
+                "No openshell gateway container found.\n\
+                 Is the gateway running? Check with: docker ps"
+                    .to_string()
+            };
+            Err(miette::miette!("{hint}"))
+        }
         1 => Ok(matches.into_iter().next().unwrap()),
         _ => Err(miette::miette!(
             "Found multiple openshell gateway containers: {}\n\

@@ -955,9 +955,15 @@ pub async fn gateway_add(
         });
 
         // Extract certs BEFORE storing metadata — if this fails the gateway
-        // is not registered.
+        // is not registered.  Pass the endpoint port so the container can be
+        // identified by its host port binding when multiple gateways run on
+        // the same Docker host.
+        let endpoint_port = url::Url::parse(&endpoint)
+            .ok()
+            .and_then(|u| u.port());
         eprintln!("• Extracting TLS certificates from gateway container...");
-        navigator_bootstrap::extract_and_store_pki(name, remote_opts.as_ref()).await?;
+        navigator_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
+            .await?;
 
         let (remote_host, resolved_host) = if let Some(dest) = remote {
             let ssh_host = extract_host_from_ssh_destination(dest);
