@@ -27,7 +27,7 @@ content:
 # Set Up a Sandbox of Claude Code with a Custom GitHub Policy
 
 This tutorial walks through an iterative sandbox policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, and observe the default network policy denying the request.
-You then diagnose the denial from your machine and from inside the sandbox, apply a custom policy, and verify that the policy update takes effect.
+You then diagnose the denial from your machine and from inside the sandbox, apply a policy update, and verify that the policy update to the sandbox takes effect.
 
 After completing this tutorial, you will have:
 
@@ -50,14 +50,14 @@ This tutorial requires the following:
 
 This tutorial uses two terminals to demonstrate the iterative policy workflow:
 
-- **Terminal 1**: The sandbox terminal. You create the sandbox here with `openshell sandbox create` and interact with Claude Code inside it.
-- **Terminal 2**: A terminal outside the sandbox on your machine. You use this for viewing the sandbox logs with `openshell term` and applying an updated policy with `openshell policy set`.
+- **Terminal 1**: The sandbox terminal. You create the sandbox in this terminal by running `openshell sandbox create` and interact with Claude Code inside it.
+- **Terminal 2**: A terminal outside the sandbox on your machine. You use this terminal for viewing the sandbox logs with `openshell term` and applying an updated policy with `openshell policy set`.
 
 Each section below indicates which terminal to use.
 
-## Set up a Sandbox with Your GitHub Token
+## Set Up a Sandbox with Your GitHub Token
 
-Depending on whether you are starting a new sandbox or using an existing one, choose the appropriate tab and follow the instructions.
+Depending on whether you start a new sandbox or use an existing sandbox, choose the appropriate tab and follow the instructions.
 
 ::::{tab-set}
 
@@ -106,7 +106,7 @@ Write a `hello_world.py` script and push it to `https://github.com/<org>/<repo>`
 
 Claude recognizes that it needs GitHub credentials. It asks how you want to authenticate. Provide your GitHub personal access token by pasting it into the conversation. Claude configures authentication and attempts the push.
 
-The push should fail. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub and blocks write operations, so the proxy denies the push before the request reaches the GitHub server.
+The push fails. Claude reports an error, but the failure is not an authentication problem. The default sandbox policy permits read-only access to GitHub and blocks write operations, so the proxy denies the push before the request reaches the GitHub server.
 
 ## Diagnose the Denial
 
@@ -135,7 +135,7 @@ l7_deny_reason: PUT /repos/<org>/<repo>/contents/hello_world.py not permitted by
 
 The log shows that the sandbox proxy intercepted an outbound `PUT` request to `api.github.com` and denied it. The `github_rest_api` policy allows read operations (GET) but blocks write operations (PUT, POST, DELETE) to the GitHub API. A similar denial appears for `github.com` if Claude attempted a git push over HTTPS.
 
-### Ask Claude to Check the Sandbox Logs
+### Ask Claude Code to Check the Sandbox Logs
 
 In terminal 1, ask Claude Code to check the sandbox logs for denied requests:
 
@@ -163,180 +163,199 @@ Both perspectives confirm the same thing: the proxy is doing its job. The defaul
 
 Copy the deny reason from Claude's response. You paste it into an agent running on your machine in the next step.
 
-## Update the Policy from Your Laptop
+## Update the Policy from Your Machine
 
-In terminal 2, paste the deny reason from the previous step into your coding agent, such as Claude Code or Cursor, and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
+In terminal 2, paste the deny reason from the previous step into your coding agent on your machine, such as Claude Code or Cursor, and ask it to recommend a policy update. The deny reason gives the agent the context it needs to generate the correct policy rules. After pasting the following prompt sample, properly provide the GitHub organization and repository names of the repository you are pushing to.
+
+:::{dropdown} Prompt
+:open:
+:icon: terminal
+
+Based on the following deny reasons, recommend a sandbox policy update that allows GitHub pushes to `https://github.com/<org>/<repo>`, and save to `/tmp/sandbox-policy-update.yaml`:
+
+The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
+:::
+
+The following steps outline the expected process done by the agent:
 
 1. Inspects the deny reasons.
 2. Writes an updated policy that adds `github_git` and `github_api` blocks that grant write access to your repository.
-3. Saves the policy to a file, such as `/tmp/sandbox-policy-update.yaml`. Refer to the following policy example to compare with the policy the agent generated.
+3. Saves the policy to `/tmp/sandbox-policy-update.yaml`. 
 
-    :::{dropdown} Full reference policy
-    :icon: code
+## Review the Generated Policy
 
-    The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
+Refer to the following policy example to compare with the generated policy before applying it. Confirm that the policy grants only the access you expect. In this case, `git push` operations and GitHub REST API access scoped to a single repository.
 
-    The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
+:::{dropdown} Full reference policy
+:icon: code
 
-    ```yaml
-    version: 1
+The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
-    # ── Static (locked at sandbox creation) ──────────────────────────
+The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
 
-    filesystem_policy:
-      include_workdir: true
-      read_only:
-        - /usr
-        - /lib
-        - /proc
-        - /dev/urandom
-        - /app
-        - /etc
-        - /var/log
-      read_write:
-        - /sandbox
-        - /tmp
-        - /dev/null
+:::{code-block} yaml
+:emphasize-lines: 54-100
 
-    landlock:
-      compatibility: best_effort
+version: 1
 
-    process:
-      run_as_user: sandbox
-      run_as_group: sandbox
+# ── Static (locked at sandbox creation) ──────────────────────────
 
-    # ── Dynamic (hot-reloadable) ─────────────────────────────────────
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
 
-    network_policies:
+landlock:
+  compatibility: best_effort
 
-      # Claude Code ↔ Anthropic API
-      claude_code:
-        name: claude-code
-        endpoints:
-          - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
-          - { host: statsig.anthropic.com, port: 443 }
-          - { host: sentry.io, port: 443 }
-          - { host: raw.githubusercontent.com, port: 443 }
-          - { host: platform.claude.com, port: 443 }
-        binaries:
-          - { path: /usr/local/bin/claude }
-          - { path: /usr/bin/node }
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
 
-      # NVIDIA inference endpoint
-      nvidia_inference:
-        name: nvidia-inference
-        endpoints:
-          - { host: integrate.api.nvidia.com, port: 443 }
-        binaries:
-          - { path: /usr/bin/curl }
-          - { path: /bin/bash }
-          - { path: /usr/local/bin/opencode }
+# ── Dynamic (hot-reloadable) ─────────────────────────────────────
 
-      # ── GitHub: git operations (clone, fetch, push) ──────────────
+network_policies:
 
-      github_git:
-        name: github-git
-        endpoints:
-          - host: github.com
-            port: 443
-            protocol: rest
-            tls: terminate
-            enforcement: enforce
-            rules:
-              - allow:
-                  method: GET
-                  path: "/<org>/<repo>.git/info/refs*"
-              - allow:
-                  method: POST
-                  path: "/<org>/<repo>.git/git-upload-pack"
-              - allow:
-                  method: POST
-                  path: "/<org>/<repo>.git/git-receive-pack"
-        binaries:
-          - { path: /usr/bin/git }
+  # Claude Code ↔ Anthropic API
+  claude_code:
+    name: claude-code
+    endpoints:
+      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+      - { host: statsig.anthropic.com, port: 443 }
+      - { host: sentry.io, port: 443 }
+      - { host: raw.githubusercontent.com, port: 443 }
+      - { host: platform.claude.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/bin/node }
 
-      # ── GitHub: REST API ─────────────────────────────────────────
+  # NVIDIA inference endpoint
+  nvidia_inference:
+    name: nvidia-inference
+    endpoints:
+      - { host: integrate.api.nvidia.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /bin/bash }
+      - { path: /usr/local/bin/opencode }
 
-      github_api:
-        name: github-api
-        endpoints:
-          - host: api.github.com
-            port: 443
-            protocol: rest
-            tls: terminate
-            enforcement: enforce
-            rules:
-              # GraphQL API (used by gh CLI)
-              - allow:
-                  method: POST
-                  path: "/graphql"
-              # Full read-write access to the repository
-              - allow:
-                  method: "*"
-                  path: "/repos/<org>/<repo>/**"
-        binaries:
-          - { path: /usr/local/bin/claude }
-          - { path: /usr/local/bin/opencode }
-          - { path: /usr/bin/gh }
-          - { path: /usr/bin/curl }
+  # ── GitHub: git operations (clone, fetch, push) ──────────────
 
-      # ── Package managers ─────────────────────────────────────────
+  github_git:
+    name: github-git
+    endpoints:
+      - host: github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/<org>/<repo>.git/info/refs*"
+          - allow:
+              method: POST
+              path: "/<org>/<repo>.git/git-upload-pack"
+          - allow:
+              method: POST
+              path: "/<org>/<repo>.git/git-receive-pack"
+    binaries:
+      - { path: /usr/bin/git }
 
-      pypi:
-        name: pypi
-        endpoints:
-          - { host: pypi.org, port: 443 }
-          - { host: files.pythonhosted.org, port: 443 }
-          - { host: github.com, port: 443 }
-          - { host: objects.githubusercontent.com, port: 443 }
-          - { host: api.github.com, port: 443 }
-          - { host: downloads.python.org, port: 443 }
-        binaries:
-          - { path: /sandbox/.venv/bin/python }
-          - { path: /sandbox/.venv/bin/python3 }
-          - { path: /sandbox/.venv/bin/pip }
-          - { path: /app/.venv/bin/python }
-          - { path: /app/.venv/bin/python3 }
-          - { path: /app/.venv/bin/pip }
-          - { path: /usr/local/bin/uv }
-          - { path: "/sandbox/.uv/python/**" }
+  # ── GitHub: REST API ─────────────────────────────────────────
 
-      # ── VS Code Remote ──────────────────────────────────────────
+  github_api:
+    name: github-api
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          # GraphQL API (used by gh CLI)
+          - allow:
+              method: POST
+              path: "/graphql"
+          # Full read-write access to the repository
+          - allow:
+              method: "*"
+              path: "/repos/<org>/<repo>/**"
+    binaries:
+      - { path: /usr/local/bin/claude }
+      - { path: /usr/local/bin/opencode }
+      - { path: /usr/bin/gh }
+      - { path: /usr/bin/curl }
 
-      vscode:
-        name: vscode
-        endpoints:
-          - { host: update.code.visualstudio.com, port: 443 }
-          - { host: "*.vo.msecnd.net", port: 443 }
-          - { host: vscode.download.prss.microsoft.com, port: 443 }
-          - { host: marketplace.visualstudio.com, port: 443 }
-          - { host: "*.gallerycdn.vsassets.io", port: 443 }
-        binaries:
-          - { path: /usr/bin/curl }
-          - { path: /usr/bin/wget }
-          - { path: "/sandbox/.vscode-server/**" }
-          - { path: "/sandbox/.vscode-remote-containers/**" }
-    ```
+  # ── Package managers ─────────────────────────────────────────
 
-    The following table summarizes the two GitHub-specific blocks:
+  pypi:
+    name: pypi
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+      - { host: github.com, port: 443 }
+      - { host: objects.githubusercontent.com, port: 443 }
+      - { host: api.github.com, port: 443 }
+      - { host: downloads.python.org, port: 443 }
+    binaries:
+      - { path: /sandbox/.venv/bin/python }
+      - { path: /sandbox/.venv/bin/python3 }
+      - { path: /sandbox/.venv/bin/pip }
+      - { path: /app/.venv/bin/python }
+      - { path: /app/.venv/bin/python3 }
+      - { path: /app/.venv/bin/pip }
+      - { path: /usr/local/bin/uv }
+      - { path: "/sandbox/.uv/python/**" }
 
-    | Block | Endpoint | Behavior |
-    |---|---|---|
-    | `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch), `git-upload-pack` (fetch data), and `git-receive-pack` (push) for the specified repository. Denies all operations on unlisted repositories. |
-    | `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories. |
+  # ── VS Code Remote ──────────────────────────────────────────
 
-    The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
+  vscode:
+    name: vscode
+    endpoints:
+      - { host: update.code.visualstudio.com, port: 443 }
+      - { host: "*.vo.msecnd.net", port: 443 }
+      - { host: vscode.download.prss.microsoft.com, port: 443 }
+      - { host: marketplace.visualstudio.com, port: 443 }
+      - { host: "*.gallerycdn.vsassets.io", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: "/sandbox/.vscode-server/**" }
+      - { path: "/sandbox/.vscode-remote-containers/**" }
+```
 
-    For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
-    :::
-4. Applies the policy to the running sandbox by running the following command:
+The following table summarizes the two GitHub-specific blocks:
 
-    ```console
-    $ openshell policy set <sandbox-name> --policy /tmp/sandbox-policy-update.yaml --wait
-    ```
-    :::{note}
-    Network policies are hot-reloadable. The `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
-    :::
+| Block | Endpoint | Behavior |
+|---|---|---|
+| `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch), `git-upload-pack` (fetch data), and `git-receive-pack` (push) for the specified repository. Denies all operations on unlisted repositories. |
+| `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories. |
+
+The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
+
+For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+:::
+
+## Apply the Policy
+
+After you have reviewed the generated policy, apply it to the running sandbox:
+
+```console
+$ openshell policy set <sandbox-name> --policy /tmp/sandbox-policy-update.yaml --wait
+```
+
+Network policies are hot-reloadable. The `--wait` flag blocks until the policy engine confirms the new revision loaded, and the update takes effect immediately without restarting the sandbox or reconnecting Claude Code.
 
 ## Retry the Push
 
