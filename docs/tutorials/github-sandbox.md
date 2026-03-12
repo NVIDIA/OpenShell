@@ -44,18 +44,6 @@ This tutorial requires the following:
 
 - Completed the {doc}`Quickstart </get-started/quickstart>` tutorial.
 - A GitHub personal access token (PAT) with `repo` scope. To create one, go to [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens), select **Generate new token (classic)**, check the `repo` scope, and copy the token.
-
-  :::{tip}
-  Instead of pasting the token into Claude during the tutorial, use a {doc}`credential provider </sandboxes/providers>` to inject it into the sandbox automatically at startup:
-
-  ```console
-  $ openshell provider create --name my-github --type github --from-existing
-  $ openshell sandbox create --provider my-github --keep -- claude
-  ```
-
-  The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox so Claude can use it directly.
-  :::
-
 - Your own [Anthropic account](https://console.anthropic.com/) for Claude Code. OpenShell provides the sandbox, not the agent — you need your own account to log in to Claude Code.
 - A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can [create a new repository](https://github.com/new) with a README if you do not have one handy.
 
@@ -70,11 +58,34 @@ Each section below indicates which terminal to use.
 
 ## Launch the Sandbox
 
-**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically:
+**Terminal 1 (sandbox)** — Create a sandbox and start Claude Code. No custom policy is needed yet — the {doc}`default policy </reference/default-policy>` is applied automatically.
+
+::::{tab-set}
+
+:::{tab-item} Starting a new sandbox
+
+Create a {doc}`credential provider </sandboxes/providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
 
 ```console
-$ openshell sandbox create --keep -- claude
+$ GITHUB_TOKEN=<your-token>
+$ openshell provider create --name my-github --type github --from-existing
+$ openshell sandbox create --provider my-github --keep -- claude
 ```
+
+:::
+
+:::{tab-item} Using an existing sandbox
+
+Connect to a sandbox that is already running and set your GitHub token as an environment variable:
+
+```console
+$ openshell sandbox connect <sandbox-name>
+$ export GITHUB_TOKEN=<your-token>
+```
+
+:::
+
+::::
 
 The `--keep` flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.
 
@@ -135,9 +146,11 @@ Claude reads the deny entries and identifies the root cause. It explains that th
 
 Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.
 
+Copy the deny reason from Claude's response — you will paste it into your laptop agent in the next step.
+
 ## Update the Policy from Your Laptop
 
-**Terminal 2 (laptop)** — Ask your coding agent (for example, Claude Code or Cursor running on your laptop) to recommend a policy update based on the denied requests and apply it to the running sandbox.
+**Terminal 2 (laptop)** — Paste the deny reason from the previous step into your coding agent (for example, Claude Code or Cursor running on your laptop) and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
 
 The agent inspects the deny reasons, writes an updated policy that adds `github_git` and `github_api` blocks for your repository, and runs `openshell policy set` to apply it:
 
