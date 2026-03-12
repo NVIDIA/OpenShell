@@ -31,6 +31,7 @@
 
 ARG K3S_VERSION=v1.35.2-k3s1
 ARG K9S_VERSION=v0.50.18
+ARG HELM_VERSION=v3.17.3
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 
 # ---------------------------------------------------------------------------
@@ -48,6 +49,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
     curl -fsSL "https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_${TARGETARCH}.tar.gz" \
       | tar xz -C /tmp k9s && \
     chmod +x /tmp/k9s && \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# Stage 1c: Download helm binary for in-container chart upgrades
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS helm
+ARG HELM_VERSION
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL "https://get.helm.sh/helm-${HELM_VERSION}-linux-${TARGETARCH}.tar.gz" \
+      | tar xz --strip-components=1 -C /tmp "linux-${TARGETARCH}/helm" && \
+    chmod +x /tmp/helm && \
     rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -98,6 +111,9 @@ COPY --from=k3s /bin/ /bin/
 
 # Copy k9s binary for interactive cluster debugging via `openshell doctor exec -- k9s`
 COPY --from=k9s /tmp/k9s /usr/local/bin/k9s
+
+# Copy helm binary for in-container chart upgrades (used by cluster-deploy-fast.sh)
+COPY --from=helm /tmp/helm /usr/local/bin/helm
 
 # Copy iptables/nftables tooling (xtables-nft-multi, iptables-detect.sh, etc.)
 # These are in /bin/aux/ in the k3s image and must be on PATH.
