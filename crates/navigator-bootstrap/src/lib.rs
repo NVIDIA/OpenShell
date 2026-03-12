@@ -241,7 +241,6 @@ where
     let disable_gateway_auth = options.disable_gateway_auth;
     let registry_token = options.registry_token;
     let gpu = options.gpu;
-    let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
