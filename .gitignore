@@ -184,6 +184,9 @@ _build/
 # Docker build artifacts (image tarballs, packaged helm charts)
 deploy/docker/.build/
 
+# SBOM generated output (JSON, CSV) — release artifacts, not committed
+deploy/sbom/output/
+
 # Local mise settings
 mise.local.toml
 

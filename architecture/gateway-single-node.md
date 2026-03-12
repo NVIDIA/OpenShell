@@ -50,7 +50,7 @@ All gateway lifecycle commands live under `openshell gateway`:
 | `openshell gateway tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
 | `openshell status` | Show gateway health via gRPC/HTTP |
 | `openshell gateway select <name>` | Set the active gateway |
-| `openshell gateway select` | List all gateways with metadata |
+| `openshell gateway select` | Open an interactive chooser on a TTY, or list all gateways in non-interactive mode |
 
 The `--name` flag defaults to `"openshell"`. When omitted on commands that accept it, the CLI resolves the active gateway via: `--gateway` flag, then `OPENSHELL_GATEWAY` env, then `~/.config/openshell/active_gateway` file.
 
@@ -289,7 +289,7 @@ Copies bundled manifests from `/opt/navigator/manifests/` to `/var/lib/rancher/k
 When environment variables are set, the entrypoint modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml`:
 
 - `IMAGE_REPO_BASE`: Rewrites `repository:`, `sandboxImage:`, and `jobImage:` in the HelmChart.
-- `PUSH_IMAGE_REFS`: In push mode, parses comma-separated image refs and rewrites the exact gateway, sandbox, and pki-job image references (matching on path component `/server:`, `/sandbox:`, `/pki-job:`).
+- `PUSH_IMAGE_REFS`: In push mode, parses comma-separated image refs and rewrites the exact gateway, sandbox, and pki-job image references (matching on path component `/gateway:`, `/sandbox:`, `/pki-job:`).
 - `IMAGE_TAG`: Replaces `:latest` tags with the specified tag on gateway, sandbox, and pki-job images. Handles both quoted and unquoted `tag: latest` formats.
 - `IMAGE_PULL_POLICY`: Replaces `pullPolicy: Always` with the specified policy (e.g., `IfNotPresent`).
 - `SSH_GATEWAY_HOST` / `SSH_GATEWAY_PORT`: Replaces `__SSH_GATEWAY_HOST__` and `__SSH_GATEWAY_PORT__` placeholders.
@@ -303,6 +303,29 @@ When environment variables are set, the entrypoint modifies the HelmChart manife
 2. **OpenShell StatefulSet**: Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
 3. **Gateway**: Checks that `gateway/navigator-gateway` in namespace `navigator` has the `Programmed` condition.
 4. **mTLS secret** (conditional): If `NAV_GATEWAY_TLS_ENABLED` is true (or inferred from the HelmChart manifest using the same two-path detection logic as the bootstrap code), checks that secret `navigator-cli-client` exists with non-empty `ca.crt`, `tls.crt`, and `tls.key` data.
+
+## GPU Enablement
+
+GPU support is part of the single-node gateway bootstrap path rather than a separate architecture.
+
+- `openshell gateway start --gpu` threads a boolean deploy option through `crates/navigator-cli`, `crates/navigator-bootstrap`, and `crates/navigator-bootstrap/src/docker.rs`.
+- When enabled, the cluster container is created with Docker `DeviceRequests`, which is the API equivalent of `docker run --gpus all`.
+- `deploy/docker/Dockerfile.cluster` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
+- `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
+- `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`, along with GPU Feature Discovery and Node Feature Discovery.
+- k3s auto-detects `nvidia-container-runtime` on `PATH`, registers the `nvidia` containerd runtime, and creates the `nvidia` `RuntimeClass` automatically.
+
+The runtime chain is:
+
+```text
+Host GPU drivers & NVIDIA Container Toolkit
+    └─ Docker: --gpus all (DeviceRequests in bollard API)
+        └─ k3s/containerd: nvidia-container-runtime on PATH -> auto-detected
+            └─ k8s: nvidia-device-plugin DaemonSet advertises nvidia.com/gpu
+                └─ Pods: request nvidia.com/gpu in resource limits
+```
+
+The expected smoke test is a plain pod requesting `nvidia.com/gpu: 1` with `runtimeClassName: nvidia` and running `nvidia-smi`.
 
 ## Remote Image Transfer
 

@@ -132,6 +132,21 @@ If `/readyz` fails, k3s is still starting or has crashed. Check container logs (
 
 If pods are in `CrashLoopBackOff`, `ImagePullBackOff`, or `Pending`, investigate those pods specifically.
 
+Also check for node pressure conditions that cause the kubelet to evict pods and reject scheduling:
+
+```bash
+# Check node conditions (DiskPressure, MemoryPressure, PIDPressure)
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get nodes -o jsonpath="{range .items[*]}{.metadata.name}{range .status.conditions[*]} {.type}={.status}{end}{\"\n\"}{end}"'
+
+# Check disk usage inside the container
+docker exec openshell-cluster-<name> df -h /
+
+# Check memory usage
+docker exec openshell-cluster-<name> free -h
+```
+
+If any pressure condition is `True`, pods will be evicted and new ones rejected. The bootstrap now detects `HEALTHCHECK_NODE_PRESSURE` markers from the health-check script and aborts early with a clear diagnosis. To fix: free disk/memory on the host, then recreate the gateway.
+
 ### Step 4: Check OpenShell Server StatefulSet
 
 The OpenShell server is deployed via a HelmChart CR as a StatefulSet with persistent storage. Check its status:
@@ -215,7 +230,7 @@ docker save <image-ref> | docker exec -i openshell-cluster-<name> ctr -a /run/k3
 docker exec openshell-cluster-<name> cat /etc/rancher/k3s/registries.yaml
 
 # Test pulling an image manually from inside the cluster
-docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/openshell/server:latest'
+docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml crictl pull ghcr.io/nvidia/openshell/gateway:latest'
 ```
 
 If `registries.yaml` is missing or has wrong values, verify env wiring (`OPENSHELL_REGISTRY_HOST`, `OPENSHELL_REGISTRY_INSECURE`, username/password for authenticated registries).
@@ -305,6 +320,8 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Port conflict | Another service on 6443 or the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
 | DNS failures inside container | Entrypoint DNS detection failed | Check `/etc/rancher/k3s/resolv.conf` and container startup logs |
+| Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources. Bootstrap auto-detects via `HEALTHCHECK_NODE_PRESSURE` marker |
+| Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
 | Stale NotReady nodes from previous deploys | Volume reused across container recreations | The deploy flow now auto-cleans stale nodes; if it still fails, manually delete NotReady nodes (see Step 3) or choose "Recreate" when prompted |
 | gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `navigator-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
@@ -362,6 +379,12 @@ run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get --raw='/readyz'" 2>&1
 
 echo "=== Nodes ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get nodes -o wide" 2>&1
+
+echo "=== Node Conditions ==="
+run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{range .status.conditions[*]} {.type}={.status}{end}{\"\n\"}{end}'" 2>&1
+
+echo "=== Disk Usage ==="
+run docker exec "${CONTAINER}" df -h / 2>&1
 
 echo "=== All Pods ==="
 run docker exec "${CONTAINER}" sh -lc "${KCFG} kubectl get pods -A -o wide" 2>&1

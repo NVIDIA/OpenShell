@@ -5,7 +5,7 @@
 //!
 //! When the CLI runs `gateway add` or `gateway login`, it opens the user's
 //! browser to `GET /auth/connect?callback_port=<port>`. The edge proxy
-//! (e.g., Cloudflare Access) intercepts the request and shows its IdP login
+//! (e.g., Cloudflare Access) intercepts the request and shows its `IdP` login
 //! page. After authentication, the proxy sets the `CF_Authorization` cookie
 //! and proxies the request to this endpoint.
 //!
@@ -66,8 +66,7 @@ async fn auth_connect(
         .get("x-forwarded-host")
         .or_else(|| headers.get("host"))
         .and_then(|v| v.to_str().ok())
-        .map(String::from)
-        .unwrap_or_else(|| state.config.bind_address.to_string());
+        .map_or_else(|| state.config.bind_address.to_string(), String::from);
 
     match cf_token {
         Some(token) => Html(render_connect_page(
@@ -312,11 +311,6 @@ fn render_connect_page(
     </script>
 </body>
 </html>"#,
-        gateway_addr = gateway_addr,
-        version = version,
-        escaped_token = escaped_token,
-        escaped_code = escaped_code,
-        callback_port = callback_port,
     )
 }
 
@@ -408,8 +402,6 @@ fn render_waiting_page(callback_port: u16, code: &str) -> String {
     </div>
 </body>
 </html>"#,
-        callback_port = callback_port,
-        safe_code = safe_code,
     )
 }
 

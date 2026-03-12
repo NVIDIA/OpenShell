@@ -85,19 +85,19 @@ Secret names are defined as constants in `crates/navigator-bootstrap/src/constan
 
 ### Gateway Mounts
 
-The Helm StatefulSet (`deploy/helm/navigator/templates/statefulset.yaml`) mounts:
+The Helm StatefulSet (`deploy/helm/openshell/templates/statefulset.yaml`) mounts:
 
 | Volume | Mount Path | Source Secret |
 |---|---|---|
-| `tls-cert` | `/etc/navigator-tls/server/` (read-only) | `navigator-server-tls` |
-| `tls-client-ca` | `/etc/navigator-tls/client-ca/` (read-only) | `navigator-server-client-ca` |
+| `tls-cert` | `/etc/openshell-tls/server/` (read-only) | `navigator-server-tls` |
+| `tls-client-ca` | `/etc/openshell-tls/client-ca/` (read-only) | `navigator-server-client-ca` |
 
 Environment variables point the gateway binary to these paths:
 
 ```
-OPENSHELL_TLS_CERT=/etc/navigator-tls/server/tls.crt
-OPENSHELL_TLS_KEY=/etc/navigator-tls/server/tls.key
-OPENSHELL_TLS_CLIENT_CA=/etc/navigator-tls/client-ca/ca.crt
+OPENSHELL_TLS_CERT=/etc/openshell-tls/server/tls.crt
+OPENSHELL_TLS_KEY=/etc/openshell-tls/server/tls.key
+OPENSHELL_TLS_CLIENT_CA=/etc/openshell-tls/client-ca/ca.crt
 ```
 
 ### Sandbox Pod Mounts
@@ -105,13 +105,13 @@ OPENSHELL_TLS_CLIENT_CA=/etc/navigator-tls/client-ca/ca.crt
 When the gateway creates a sandbox pod (`crates/navigator-server/src/sandbox/mod.rs:681`), it injects:
 
 - A volume backed by the `navigator-client-tls` secret.
-- A read-only mount at `/etc/navigator-tls/client/` on the agent container.
+- A read-only mount at `/etc/openshell-tls/client/` on the agent container.
 - Environment variables for the sandbox gRPC client:
 
 ```
-OPENSHELL_TLS_CA=/etc/navigator-tls/client/ca.crt
-OPENSHELL_TLS_CERT=/etc/navigator-tls/client/tls.crt
-OPENSHELL_TLS_KEY=/etc/navigator-tls/client/tls.key
+OPENSHELL_TLS_CA=/etc/openshell-tls/client/ca.crt
+OPENSHELL_TLS_CERT=/etc/openshell-tls/client/tls.crt
+OPENSHELL_TLS_KEY=/etc/openshell-tls/client/tls.key
 OPENSHELL_ENDPOINT=https://navigator.navigator.svc.cluster.local:8080
 ```
 
@@ -120,7 +120,7 @@ OPENSHELL_ENDPOINT=https://navigator.navigator.svc.cluster.local:8080
 The CLI's copy of the client certificate bundle is written to:
 
 ```
-$XDG_CONFIG_HOME/openshell/clusters/<cluster-name>/mtls/
+$XDG_CONFIG_HOME/openshell/gateways/<gateway-name>/mtls/
 ├── ca.crt
 ├── tls.crt
 └── tls.key
@@ -221,9 +221,9 @@ Sandbox pods connect back to the gateway at startup to fetch their policy and pr
 
 | Env Var | Value |
 |---|---|
-| `OPENSHELL_TLS_CA` | `/etc/navigator-tls/client/ca.crt` |
-| `OPENSHELL_TLS_CERT` | `/etc/navigator-tls/client/tls.crt` |
-| `OPENSHELL_TLS_KEY` | `/etc/navigator-tls/client/tls.key` |
+| `OPENSHELL_TLS_CA` | `/etc/openshell-tls/client/ca.crt` |
+| `OPENSHELL_TLS_CERT` | `/etc/openshell-tls/client/tls.crt` |
+| `OPENSHELL_TLS_KEY` | `/etc/openshell-tls/client/tls.key` |
 
 These are used to build a `tonic::transport::ClientTlsConfig` with:
 - `ca_certificate()` -- verifies the server's certificate against the cluster CA.

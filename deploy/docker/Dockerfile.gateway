@@ -3,7 +3,7 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# OpenShell Server Docker image
+# OpenShell Gateway Docker image
 # Multi-stage build with cross-compilation support for multi-arch
 
 # Stage 1: Rust builder (runs on build platform, cross-compiles for target)
@@ -52,9 +52,9 @@ COPY proto/ proto/
 # sccache uses memcached in CI (SCCACHE_MEMCACHED_ENDPOINT) or the local
 # disk cache mount for local dev builds. The cargo-target mount gives cargo
 # a persistent target/ dir for true incremental rebuilds on source changes.
-RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-server-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
+RUN --mount=type=cache,id=cargo-registry-gateway-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-gateway-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-gateway-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p navigator-server 2>/dev/null || true
 
 # Copy actual source code
@@ -68,9 +68,9 @@ RUN touch crates/navigator-server/src/main.rs \
     proto/*.proto
 
 # Build the actual application
-RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=cargo-target-server-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    --mount=type=cache,id=sccache-server-${TARGETARCH},sharing=locked,target=/tmp/sccache \
+RUN --mount=type=cache,id=cargo-registry-gateway-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
+    --mount=type=cache,id=cargo-target-gateway-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
+    --mount=type=cache,id=sccache-gateway-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
@@ -79,8 +79,8 @@ RUN --mount=type=cache,id=cargo-registry-server-${TARGETARCH},sharing=locked,tar
     cp "$(cross_output_dir release)/navigator-server" /build/navigator-server
 
 # Stage 2: Runtime (uses target platform)
-# Pin to specific Debian point release for reproducible builds.
-FROM debian:bookworm-20260223-slim AS runtime
+# NVIDIA hardened Ubuntu base for supply chain consistency.
+FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS runtime
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/*

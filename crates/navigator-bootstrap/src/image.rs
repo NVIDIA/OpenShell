@@ -200,9 +200,7 @@ pub async fn pull_remote_image(
         "Pulling image {} on remote host from {}",
         registry_image, DEFAULT_REGISTRY
     );
-    on_progress(format!(
-        "[status] Pulling openshell/cluster:{tag} ({platform_str}) on remote host"
-    ));
+    on_progress(format!("[progress] Pulling {platform_str} image"));
 
     let credentials = ghcr_credentials(registry_token);
 
@@ -228,7 +226,7 @@ pub async fn pull_remote_image(
         {
             let current_mb = current / (1024 * 1024);
             let total_mb = total / (1024 * 1024);
-            on_progress(format!("[status] {status}: {current_mb}/{total_mb} MB"));
+            on_progress(format!("[progress] {status}: {current_mb}/{total_mb} MB"));
         }
     }
 
@@ -279,7 +277,7 @@ pub async fn pull_remote_image(
         actual_arch
     );
 
-    on_progress(format!("[status] Image {image_ref} ready on remote host"));
+    on_progress("[progress] Image ready".to_string());
     info!("Remote image pull and tag complete: {}", image_ref);
 
     Ok(())

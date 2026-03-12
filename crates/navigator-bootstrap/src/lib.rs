@@ -3,6 +3,7 @@
 
 pub mod build;
 pub mod edge_token;
+pub mod errors;
 pub mod image;
 
 mod constants;
@@ -31,8 +32,9 @@ use crate::constants::{
     volume_name,
 };
 use crate::docker::{
-    check_existing_gateway, create_ssh_docker_client, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
+    check_existing_gateway, check_port_conflicts, create_ssh_docker_client,
+    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
+    start_container, stop_container,
 };
 use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
 use crate::metadata::{
@@ -122,6 +124,10 @@ pub struct DeployOptions {
     /// scope) used to pull images from ghcr.io both during the initial
     /// bootstrap pull and inside the k3s cluster at runtime.
     pub registry_token: Option<String>,
+    /// Enable NVIDIA GPU passthrough. When true, the Docker container is
+    /// created with GPU device requests (`--gpus all`) and the NVIDIA
+    /// k8s-device-plugin is deployed inside the k3s cluster.
+    pub gpu: bool,
 }
 
 impl DeployOptions {
@@ -136,6 +142,7 @@ impl DeployOptions {
             disable_tls: false,
             disable_gateway_auth: false,
             registry_token: None,
+            gpu: false,
         }
     }
 
@@ -186,6 +193,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_registry_token(mut self, token: impl Into<String>) -> Self {
         self.registry_token = Some(token.into());
+        self
+    }
+
+    /// Enable NVIDIA GPU passthrough for the cluster container.
+    #[must_use]
+    pub fn with_gpu(mut self, gpu: bool) -> Self {
+        self.gpu = gpu;
         self
     }
 }
@@ -253,6 +267,7 @@ where
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
     let registry_token = options.registry_token;
+    let gpu = options.gpu;
     let kubeconfig_path = stored_kubeconfig_path(&name)?;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
@@ -280,7 +295,7 @@ where
 
     // Ensure the image is available on the target Docker daemon
     if remote_opts.is_some() {
-        log("[status] Pulling gateway image".to_string());
+        log("[status] Downloading gateway".to_string());
         let on_log_clone = Arc::clone(&on_log);
         let progress_cb = move |msg: String| {
             if let Ok(mut f) = on_log_clone.lock() {
@@ -296,15 +311,13 @@ where
         .await?;
     } else {
         // Local deployment: ensure image exists (pull if needed)
-        log("[status] Pulling gateway image".to_string());
+        log("[status] Downloading gateway".to_string());
         ensure_image(&target_docker, &image_ref, registry_token.as_deref()).await?;
     }
 
     // All subsequent operations use the target Docker (remote or local)
-    log("[status] Preparing gateway".to_string());
-    log("[progress] Creating gateway network".to_string());
+    log("[status] Initializing environment".to_string());
     ensure_network(&target_docker).await?;
-    log("[progress] Preparing gateway volume".to_string());
     ensure_volume(&target_docker, &volume_name(&name)).await?;
 
     // Compute extra TLS SANs for remote deployments so the gateway and k3s
@@ -341,7 +354,34 @@ where
             (sans, gateway_host)
         };
 
-    log("[progress] Creating gateway container".to_string());
+    // Check for port conflicts before creating/starting the container.
+    // Docker silently fails to attach networking when a host port is already
+    // bound by another container, leaving the new container with only loopback
+    // and no default route.  Detecting this up-front avoids a confusing 30s
+    // timeout followed by a misleading "Docker networking issue" diagnostic.
+    let conflicts = check_port_conflicts(&target_docker, &name, port, kube_port).await?;
+    if !conflicts.is_empty() {
+        let details: Vec<String> = conflicts
+            .iter()
+            .map(|c| {
+                format!(
+                    "port {} is held by container \"{}\"",
+                    c.host_port, c.container_name
+                )
+            })
+            .collect();
+        return Err(miette::miette!(
+            "cannot start gateway: {}\n\nStop or remove the conflicting container(s) first, \
+             then retry:\n{}",
+            details.join(", "),
+            conflicts
+                .iter()
+                .map(|c| format!("  docker stop {}", c.container_name))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ));
+    }
+
     ensure_container(
         &target_docker,
         &name,
@@ -353,12 +393,10 @@ where
         disable_tls,
         disable_gateway_auth,
         registry_token.as_deref(),
+        gpu,
     )
     .await?;
-    log("[status] Starting gateway".to_string());
     start_container(&target_docker, &name).await?;
-
-    log("[progress] Waiting for kubeconfig".to_string());
     let raw_kubeconfig = wait_for_kubeconfig(&target_docker, &name).await?;
 
     // Rewrite kubeconfig based on deployment mode
@@ -366,15 +404,13 @@ where
         || rewrite_kubeconfig(&raw_kubeconfig, &name, kube_port),
         |opts| rewrite_kubeconfig_remote(&raw_kubeconfig, &name, &opts.destination, kube_port),
     );
-    log("[progress] Writing kubeconfig".to_string());
     store_kubeconfig(&kubeconfig_path, &rewritten)?;
     // Clean up stale k3s nodes left over from previous container instances that
     // used the same persistent volume. Without this, pods remain scheduled on
     // NotReady ghost nodes and the health check will time out.
-    log("[progress] Cleaning stale nodes".to_string());
     match clean_stale_nodes(&target_docker, &name).await {
         Ok(0) => {}
-        Ok(n) => log(format!("[progress] Removed {n} stale node(s)")),
+        Ok(n) => tracing::debug!("removed {n} stale node(s)"),
         Err(err) => {
             tracing::debug!("stale node cleanup failed (non-fatal): {err}");
         }
@@ -391,7 +427,6 @@ where
     // cluster, secrets are always newly generated and a restart is unnecessary.
     // Restarting only when workload pre-existed avoids extra rollout latency.
     let workload_existed_before_pki = openshell_workload_exists(&target_docker, &name).await?;
-    log("[progress] Reconciling TLS certificates".to_string());
     let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
 
     if rotated && workload_existed_before_pki {
@@ -399,11 +434,9 @@ where
         // it picks up the new TLS secrets before we write CLI-side certs.
         // A failed rollout is a hard error — CLI certs must not be persisted
         // if the server cannot come up with the new PKI.
-        log("[progress] PKI rotated — restarting openshell workload".to_string());
         restart_openshell_deployment(&target_docker, &name).await?;
     }
 
-    log("[progress] Storing CLI mTLS credentials".to_string());
     store_pki_bundle(&name, &pki_bundle)?;
 
     // Push locally-built component images into the k3s containerd runtime.
@@ -419,10 +452,7 @@ where
             .filter(|s| !s.is_empty())
             .collect();
         if !images.is_empty() {
-            log(format!(
-                "[progress] Importing {} local image(s) into gateway",
-                images.len()
-            ));
+            log("[status] Deploying components".to_string());
             let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
             let container = container_name(&name);
             let on_log_ref = Arc::clone(&on_log);
@@ -440,12 +470,11 @@ where
             )
             .await?;
 
-            log("[progress] Restarting openshell deployment".to_string());
             restart_openshell_deployment(&target_docker, &name).await?;
         }
     }
 
-    log("[status] Waiting for gateway".to_string());
+    log("[status] Starting gateway".to_string());
     {
         // Create a short-lived closure that locks on each call rather than holding
         // the MutexGuard across await points.
@@ -459,7 +488,6 @@ where
     }
 
     // Create and store gateway metadata.
-    log("[progress] Persisting gateway metadata".to_string());
     let metadata = create_gateway_metadata_with_host(
         &name,
         remote_opts.as_ref(),
@@ -741,9 +769,41 @@ async fn load_existing_pki_bundle(
 
 /// Wait for a K8s namespace to exist inside the cluster container.
 ///
-/// The Helm controller creates the `navigator` namespace when it processes
+/// The Helm controller creates the `openshell` namespace when it processes
 /// the `HelmChart` manifest, but there's a race between kubeconfig being ready
 /// and the namespace being created. We poll briefly.
+/// Check whether DNS resolution is working inside the container.
+///
+/// Probes the configured `REGISTRY_HOST` (falling back to `ghcr.io`) since
+/// that is the primary registry the cluster needs to reach for image pulls.
+///
+/// Returns `Ok(true)` if DNS is functional, `Ok(false)` if the probe ran but
+/// resolution failed, and `Err` if the exec itself failed.
+async fn probe_container_dns(docker: &Docker, container_name: &str) -> Result<bool> {
+    // The probe must handle IP-literal registry hosts (e.g. 127.0.0.1:5000)
+    // which don't need DNS resolution. Strip the port suffix since nslookup
+    // doesn't understand host:port, and skip the probe entirely for IP
+    // literals.
+    let (output, exit_code) = exec_capture_with_exit(
+        docker,
+        container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            concat!(
+                "host=\"${REGISTRY_HOST:-ghcr.io}\"; ",
+                "host=\"${host%%:*}\"; ",
+                "echo \"$host\" | grep -qE '^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+$' && { echo DNS_OK; exit 0; }; ",
+                "echo \"$host\" | grep -qE '^\\[?[0-9a-fA-F:]+\\]?$' && { echo DNS_OK; exit 0; }; ",
+                "nslookup \"$host\" >/dev/null 2>&1 && echo DNS_OK || echo DNS_FAIL",
+            )
+            .to_string(),
+        ],
+    )
+    .await?;
+    Ok(exit_code == 0 && output.contains("DNS_OK"))
+}
+
 async fn wait_for_namespace(
     docker: &Docker,
     container_name: &str,
@@ -756,7 +816,42 @@ async fn wait_for_namespace(
     let max_backoff = std::time::Duration::from_secs(2);
     let mut backoff = std::time::Duration::from_millis(200);
 
+    // Track consecutive DNS failures. We start probing early (iteration 3,
+    // giving k3s a few seconds to boot) and probe every 3 iterations after
+    // that. Two consecutive failures are enough to abort — the nslookup
+    // timeout already provides a built-in retry window.
+    let dns_probe_start = 3; // skip the first few iterations while k3s boots
+    let dns_probe_interval = 3; // probe every N iterations after start
+    let dns_failure_threshold: u32 = 2; // consecutive probe failures to abort
+    let mut dns_consecutive_failures: u32 = 0;
+
     for attempt in 0..attempts {
+        // --- Periodic DNS health probe ---
+        if attempt >= dns_probe_start && (attempt - dns_probe_start) % dns_probe_interval == 0 {
+            match probe_container_dns(docker, container_name).await {
+                Ok(true) => {
+                    dns_consecutive_failures = 0;
+                }
+                Ok(false) => {
+                    dns_consecutive_failures += 1;
+                    if dns_consecutive_failures >= dns_failure_threshold {
+                        let logs = fetch_recent_logs(docker, container_name, 40).await;
+                        return Err(miette::miette!(
+                            "dial tcp: lookup registry: Try again\n\
+                             DNS resolution is failing inside the gateway container. \
+                             The cluster cannot pull images or create the '{namespace}' namespace \
+                             until DNS is fixed.\n{logs}"
+                        ))
+                        .wrap_err("K8s namespace not ready");
+                    }
+                }
+                Err(_) => {
+                    // Exec failed — container may be restarting; don't count
+                    // as a DNS failure.
+                }
+            }
+        }
+
         let exec_result = exec_capture_with_exit(
             docker,
             container_name,

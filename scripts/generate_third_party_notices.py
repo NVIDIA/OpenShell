@@ -3,13 +3,16 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Generate THIRD-PARTY-NOTICES from Rust and Python dependency metadata.
+"""Generate THIRD-PARTY-NOTICES with full license texts.
+
+Uses cargo-about (Rust) and pip-licenses (Python) to collect third-party
+dependency licenses and produce a single attribution file at the repo root.
 
 Usage:
-    python scripts/generate_third_party_notices.py
+    uv run python scripts/generate_third_party_notices.py
+    mise run notices
 
-Writes THIRD-PARTY-NOTICES to the repo root. Requires `cargo` on PATH
-for Rust deps. Python deps are read from pyproject.toml.
+Requires cargo-about (installed via mise) and pip-licenses (fetched via uv).
 """
 
 from __future__ import annotations
@@ -17,7 +20,33 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from pathlib import Path
+
+# Our own workspace crates and packages — excluded from notices.
+WORKSPACE_CRATES = frozenset(
+    {
+        "navigator-bootstrap",
+        "navigator-cli",
+        "navigator-core",
+        "navigator-policy",
+        "navigator-providers",
+        "navigator-router",
+        "navigator-sandbox",
+        "navigator-server",
+        "navigator-tui",
+        "openshell-e2e",
+    }
+)
+
+OWN_PYTHON_PACKAGES = frozenset(
+    {
+        "openshell",
+    }
+)
+
+SEPARATOR = "=" * 80
+THIN_SEP = "-" * 80
 
 
 def find_repo_root() -> Path:
@@ -30,193 +59,216 @@ def find_repo_root() -> Path:
     return Path.cwd()
 
 
-# Workspace member crate names to exclude (these are ours, not third-party).
-WORKSPACE_PREFIXES = ("navigator-",)
+# ---------------------------------------------------------------------------
+# Rust dependencies via cargo-about
+# ---------------------------------------------------------------------------
 
 
-def get_rust_deps_from_cargo_metadata() -> list[dict[str, str]] | None:
-    """Try to extract third-party Rust deps via `cargo metadata`."""
+def get_rust_notices() -> list[dict]:
+    """Run cargo-about and return structured license groups.
+
+    Each entry: {id, crates: [{name, version, repository, description}], text}
+    """
+    print("  Running cargo-about generate --format json ...")
     try:
         result = subprocess.run(
-            ["cargo", "metadata", "--format-version", "1"],
+            ["cargo-about", "generate", "--format", "json"],
             capture_output=True,
             text=True,
             check=True,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError):
-        return None
-
-    meta = json.loads(result.stdout)
-    workspace_members = set(meta.get("workspace_members", []))
-
-    deps = []
-    for pkg in meta["packages"]:
-        if pkg["id"] in workspace_members:
-            continue
-        if any(pkg["name"].startswith(p) for p in WORKSPACE_PREFIXES):
-            continue
-        deps.append({
-            "name": pkg["name"],
-            "version": pkg["version"],
-            "license": pkg.get("license") or "Unknown",
-            "repository": pkg.get("repository") or "",
-        })
-
-    return sorted(deps, key=lambda d: d["name"].lower())
-
-
-def get_rust_deps_from_lockfile(root: Path) -> list[dict[str, str]]:
-    """Fallback: parse Cargo.lock for name+version (no license info)."""
-    lockfile = root / "Cargo.lock"
-    if not lockfile.exists():
+    except FileNotFoundError:
+        print(
+            "  WARNING: cargo-about not found, skipping Rust notices", file=sys.stderr
+        )
+        return []
+    except subprocess.CalledProcessError as e:
+        print(f"  WARNING: cargo-about failed: {e.stderr[:200]}", file=sys.stderr)
         return []
 
-    deps = []
-    content = lockfile.read_text()
-    name = None
-    version = None
-    for line in content.splitlines():
-        if line.startswith("name = "):
-            name = line.split('"')[1]
-        elif line.startswith("version = ") and '"' in line:
-            version = line.split('"')[1]
-        elif line == "[[package]]" or line == "":
-            if name and version:
-                if not any(name.startswith(p) for p in WORKSPACE_PREFIXES):
-                    deps.append({
-                        "name": name,
-                        "version": version,
-                        "license": "See crates.io",
-                        "repository": f"https://crates.io/crates/{name}",
-                    })
-            name = None
-            version = None
+    data = json.loads(result.stdout)
+    groups: list[dict] = []
 
-    # Catch the last entry.
-    if name and version:
-        if not any(name.startswith(p) for p in WORKSPACE_PREFIXES):
-            deps.append({
-                "name": name,
-                "version": version,
-                "license": "See crates.io",
-                "repository": f"https://crates.io/crates/{name}",
-            })
+    for lic in data.get("licenses", []):
+        crates = []
+        for entry in lic.get("used_by", []):
+            crate = entry.get("crate", {})
+            name = crate.get("name", "")
+            if name in WORKSPACE_CRATES:
+                continue
+            crates.append(
+                {
+                    "name": name,
+                    "version": crate.get("version", ""),
+                    "repository": crate.get("repository", ""),
+                    "description": crate.get("description", ""),
+                }
+            )
 
-    return sorted(deps, key=lambda d: d["name"].lower())
+        if not crates:
+            continue
+
+        groups.append(
+            {
+                "id": lic.get("id", "Unknown"),
+                "crates": sorted(crates, key=lambda c: c["name"].lower()),
+                "text": (lic.get("text") or "").rstrip(),
+            }
+        )
+
+    return groups
 
 
-def get_rust_deps(root: Path) -> list[dict[str, str]]:
-    """Extract third-party Rust dependencies.
+# ---------------------------------------------------------------------------
+# Python dependencies via pip-licenses
+# ---------------------------------------------------------------------------
 
-    Prefers `cargo metadata` for full license info. Falls back to parsing
-    Cargo.lock when cargo is not available.
+
+def get_python_notices() -> list[dict]:
+    """Run pip-licenses and return structured package notices.
+
+    Each entry: {name, version, license_id, text}
     """
-    deps = get_rust_deps_from_cargo_metadata()
-    if deps is not None:
-        return deps
-
-    print("  cargo not found, falling back to Cargo.lock parsing", file=sys.stderr)
-    return get_rust_deps_from_lockfile(root)
-
-
-def get_python_deps(root: Path) -> list[dict[str, str]]:
-    """Extract Python dependencies from pyproject.toml [project.dependencies]."""
-    pyproject = root / "pyproject.toml"
-    if not pyproject.exists():
+    print("  Running pip-licenses ...")
+    try:
+        result = subprocess.run(
+            [
+                "uv",
+                "run",
+                "--with",
+                "pip-licenses",
+                "pip-licenses",
+                "--format=json",
+                "--with-license-file",
+                "--no-license-path",
+            ],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+    except FileNotFoundError:
+        print("  WARNING: uv not found, skipping Python notices", file=sys.stderr)
+        return []
+    except subprocess.CalledProcessError as e:
+        print(f"  WARNING: pip-licenses failed: {e.stderr[:200]}", file=sys.stderr)
         return []
 
-    # Simple parser: read the dependencies list without a TOML library.
-    content = pyproject.read_text()
-    deps = []
-    in_deps = False
-    for line in content.splitlines():
-        stripped = line.strip()
-        if stripped.startswith("dependencies = ["):
-            in_deps = True
+    packages: list[dict] = []
+    for pkg in json.loads(result.stdout):
+        name = pkg.get("Name", "")
+        if name.lower() in OWN_PYTHON_PACKAGES:
             continue
-        if in_deps:
-            if stripped == "]":
-                break
-            # Parse "package>=version" style.
-            dep = stripped.strip('",').strip()
-            if dep:
-                # Split on first version specifier.
-                for sep in (">=", "==", "~=", "!=", "<", ">"):
-                    if sep in dep:
-                        name = dep[:dep.index(sep)].strip()
-                        deps.append({
-                            "name": name,
-                            "version": dep[dep.index(sep):].strip(),
-                            "license": "See PyPI",
-                            "repository": f"https://pypi.org/project/{name}/",
-                        })
-                        break
-                else:
-                    deps.append({
-                        "name": dep,
-                        "version": "",
-                        "license": "See PyPI",
-                        "repository": f"https://pypi.org/project/{dep}/",
-                    })
+        # Skip pip/setuptools/wheel (installer tools, not shipped deps)
+        if name.lower() in {"pip", "wheel"}:
+            continue
 
-    return sorted(deps, key=lambda d: d["name"].lower())
+        packages.append(
+            {
+                "name": name,
+                "version": pkg.get("Version", ""),
+                "license_id": pkg.get("License", "Unknown"),
+                "text": (pkg.get("LicenseText") or "").rstrip(),
+            }
+        )
+
+    return sorted(packages, key=lambda p: p["name"].lower())
 
 
-def format_notices(rust_deps: list[dict], python_deps: list[dict]) -> str:
-    """Format the THIRD-PARTY-NOTICES file content."""
-    lines = [
-        "THIRD-PARTY SOFTWARE NOTICES",
+# ---------------------------------------------------------------------------
+# Output formatting
+# ---------------------------------------------------------------------------
+
+
+def format_notices(
+    rust_groups: list[dict],
+    python_packages: list[dict],
+) -> str:
+    """Format the complete THIRD-PARTY-NOTICES file."""
+    lines: list[str] = [
+        "THIRD-PARTY SOFTWARE NOTICES AND INFORMATION",
         "",
-        "This file lists the third-party software packages used by OpenShell,",
-        "along with their respective licenses.",
+        "This product includes third-party software components. The following",
+        "notices and licenses are provided in compliance with the terms of the",
+        "respective licenses.",
         "",
-        "To regenerate: uv run python scripts/generate_third_party_notices.py",
+        "To regenerate: mise run notices",
         "",
     ]
 
-    if rust_deps:
-        lines.append("=" * 80)
-        lines.append("Rust Dependencies")
-        lines.append("=" * 80)
+    # --- Rust section ---
+    if rust_groups:
+        rust_crate_count = sum(len(g["crates"]) for g in rust_groups)
+        lines.append(SEPARATOR)
+        lines.append(f"Rust Dependencies ({rust_crate_count} packages)")
+        lines.append(SEPARATOR)
         lines.append("")
-        for dep in rust_deps:
-            lines.append(f"Package: {dep['name']} {dep['version']}")
-            lines.append(f"License: {dep['license']}")
-            if dep["repository"]:
-                lines.append(f"Repository: {dep['repository']}")
+
+        for group in rust_groups:
+            lines.append(SEPARATOR)
+            lines.append(f"License: {group['id']}")
+            lines.append(THIN_SEP)
+            lines.append("")
+            lines.append("Used by:")
+            for crate in group["crates"]:
+                repo = f"  ({crate['repository']})" if crate["repository"] else ""
+                lines.append(f"  - {crate['name']} {crate['version']}{repo}")
             lines.append("")
 
-    if python_deps:
-        lines.append("=" * 80)
-        lines.append("Python Dependencies")
-        lines.append("=" * 80)
+            if group["text"]:
+                lines.append(group["text"])
+            lines.append("")
+
+    # --- Python section ---
+    if python_packages:
+        lines.append(SEPARATOR)
+        lines.append(f"Python Dependencies ({len(python_packages)} packages)")
+        lines.append(SEPARATOR)
         lines.append("")
-        for dep in python_deps:
-            version_str = f" {dep['version']}" if dep["version"] else ""
-            lines.append(f"Package: {dep['name']}{version_str}")
-            lines.append(f"License: {dep['license']}")
-            if dep["repository"]:
-                lines.append(f"Repository: {dep['repository']}")
+
+        for pkg in python_packages:
+            lines.append(SEPARATOR)
+            lines.append(f"{pkg['name']} {pkg['version']}")
+            lines.append(f"License: {pkg['license_id']}")
+            lines.append(THIN_SEP)
+            lines.append("")
+            if pkg["text"]:
+                lines.append(pkg["text"])
             lines.append("")
 
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+
 def main() -> int:
     root = find_repo_root()
+    t0 = time.monotonic()
+
+    print("Generating third-party notices...")
+    print()
 
     print("Collecting Rust dependencies...")
-    rust_deps = get_rust_deps(root)
-    print(f"  Found {len(rust_deps)} Rust dependencies")
+    rust_groups = get_rust_notices()
+    rust_count = sum(len(g["crates"]) for g in rust_groups)
+    print(f"  {rust_count} Rust packages across {len(rust_groups)} license groups")
+    print()
 
     print("Collecting Python dependencies...")
-    python_deps = get_python_deps(root)
-    print(f"  Found {len(python_deps)} Python dependencies")
+    python_packages = get_python_notices()
+    print(f"  {len(python_packages)} Python packages")
+    print()
 
-    notices = format_notices(rust_deps, python_deps)
+    notices = format_notices(rust_groups, python_packages)
     output = root / "THIRD-PARTY-NOTICES"
     output.write_text(notices)
-    print(f"Wrote {output}")
+
+    elapsed = time.monotonic() - t0
+    line_count = notices.count("\n") + 1
+    print(f"Wrote {output.name} ({line_count} lines, {len(notices)} bytes)")
+    print(f"Done in {elapsed:.1f}s")
     return 0
 
 

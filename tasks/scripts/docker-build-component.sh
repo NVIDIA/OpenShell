@@ -12,7 +12,7 @@
 #   docker-build-component.sh sandbox nvidia   -> Dockerfile.nvidia -> openshell/sandbox-nvidia:dev
 #
 # Components without a subdirectory use the flat layout:
-#   docker-build-component.sh server           -> Dockerfile.server -> openshell/server:dev
+#   docker-build-component.sh gateway           -> Dockerfile.gateway -> openshell/gateway:dev
 #
 # Environment:
 #   IMAGE_TAG          - Image tag (default: dev)
@@ -87,7 +87,7 @@ if [[ ! -f "${DOCKERFILE}" ]]; then
   exit 1
 fi
 
-# Prefix with registry when set (e.g. ghcr.io/org/repo/server:tag).
+# Prefix with registry when set (e.g. ghcr.io/org/repo/gateway:tag).
 # Replaces the default "openshell/" prefix with the registry path.
 if [[ -n "${IMAGE_REGISTRY:-}" ]]; then
   _suffix="${IMAGE_NAME#openshell/}"
@@ -141,7 +141,7 @@ fi
 VERSION_ARGS=()
 if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
   VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${OPENSHELL_CARGO_VERSION}")
-elif [[ "${COMPONENT}" == "server" ]]; then
+elif [[ "${COMPONENT}" == "gateway" ]]; then
   CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
   VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}")
 fi

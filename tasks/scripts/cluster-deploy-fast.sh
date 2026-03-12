@@ -36,28 +36,28 @@ if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" 
   exit 1
 fi
 
-build_server=0
+build_gateway=0
 build_sandbox=0
 needs_helm_upgrade=0
 explicit_target=0
 
-previous_server_fingerprint=""
+previous_gateway_fingerprint=""
 previous_sandbox_fingerprint=""
 previous_helm_fingerprint=""
-current_server_fingerprint=""
+current_gateway_fingerprint=""
 current_sandbox_fingerprint=""
 current_helm_fingerprint=""
 
 if [[ "$#" -gt 0 ]]; then
   explicit_target=1
-  build_server=0
+  build_gateway=0
   build_sandbox=0
   needs_helm_upgrade=0
 
   for target in "$@"; do
     case "${target}" in
-      server)
-        build_server=1
+      gateway)
+        build_gateway=1
         ;;
       sandbox)
         build_sandbox=1
@@ -66,12 +66,12 @@ if [[ "$#" -gt 0 ]]; then
         needs_helm_upgrade=1
         ;;
       all)
-        build_server=1
+        build_gateway=1
         build_sandbox=1
         needs_helm_upgrade=1
         ;;
       *)
-        echo "Unknown target '${target}'. Use server, sandbox, chart, or all."
+        echo "Unknown target '${target}'. Use gateway, sandbox, chart, or all."
         exit 1
         ;;
     esac
@@ -105,8 +105,8 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
       container_id)
         previous_container_id=${value}
         ;;
-      server)
-        previous_server_fingerprint=${value}
+      gateway)
+        previous_gateway_fingerprint=${value}
         ;;
       sandbox)
         previous_sandbox_fingerprint=${value}
@@ -118,7 +118,7 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   done < "${DEPLOY_FAST_STATE_FILE}"
 
   if [[ "${previous_cluster_name:-}" != "${CLUSTER_NAME}" ]]; then
-    previous_server_fingerprint=""
+    previous_gateway_fingerprint=""
     previous_sandbox_fingerprint=""
     previous_helm_fingerprint=""
   fi
@@ -127,13 +127,13 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   # changed (recreated or replaced).  The new k3s instance has no pushed
   # images so everything must be rebuilt.
   if [[ -n "${current_container_id}" && "${current_container_id}" != "${previous_container_id:-}" ]]; then
-    previous_server_fingerprint=""
+    previous_gateway_fingerprint=""
     previous_sandbox_fingerprint=""
     previous_helm_fingerprint=""
   fi
 fi
 
-matches_server() {
+matches_gateway() {
   local path=$1
   case "${path}" in
     Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
@@ -145,7 +145,7 @@ matches_server() {
     crates/navigator-router/*)
       return 0
       ;;
-    crates/navigator-server/*|deploy/docker/Dockerfile.server)
+    crates/navigator-server/*|deploy/docker/Dockerfile.gateway)
       return 0
       ;;
     *)
@@ -195,8 +195,8 @@ compute_fingerprint() {
   # or amend) are detected even when there are no uncommitted edits.
   local committed_trees=""
   case "${component}" in
-    server)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-router/ crates/navigator-server/ deploy/docker/Dockerfile.server 2>/dev/null || true)
+    gateway)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-router/ crates/navigator-server/ deploy/docker/Dockerfile.gateway 2>/dev/null || true)
       ;;
     sandbox)
       committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-providers/ crates/navigator-sandbox/ deploy/docker/sandbox/ python/ pyproject.toml uv.lock 2>/dev/null || true)
@@ -212,8 +212,8 @@ compute_fingerprint() {
   # Layer uncommitted changes on top so dirty files trigger a rebuild too.
   for path in "${changed_files[@]}"; do
     case "${component}" in
-      server)
-        if ! matches_server "${path}"; then
+      gateway)
+        if ! matches_gateway "${path}"; then
           continue
         fi
         ;;
@@ -244,17 +244,17 @@ compute_fingerprint() {
   fi
 }
 
-current_server_fingerprint=$(compute_fingerprint server)
+current_gateway_fingerprint=$(compute_fingerprint gateway)
 current_sandbox_fingerprint=$(compute_fingerprint sandbox)
 current_helm_fingerprint=$(compute_fingerprint helm)
 
 if [[ "${explicit_target}" == "0" && "${DEPLOY_FAST_MODE}" == "full" ]]; then
-  build_server=1
+  build_gateway=1
   build_sandbox=1
   needs_helm_upgrade=1
 elif [[ "${explicit_target}" == "0" ]]; then
-  if [[ "${current_server_fingerprint}" != "${previous_server_fingerprint}" ]]; then
-    build_server=1
+  if [[ "${current_gateway_fingerprint}" != "${previous_gateway_fingerprint}" ]]; then
+    build_gateway=1
   fi
   if [[ "${current_sandbox_fingerprint}" != "${previous_sandbox_fingerprint}" ]]; then
     build_sandbox=1
@@ -271,16 +271,16 @@ fi
 # Always run helm upgrade when images are rebuilt so that the
 # OPENSHELL_SANDBOX_IMAGE env var on the server pod is set correctly
 # and image pull policy is Always (not IfNotPresent from bootstrap).
-if [[ "${build_server}" == "1" || "${build_sandbox}" == "1" ]]; then
+if [[ "${build_gateway}" == "1" || "${build_sandbox}" == "1" ]]; then
   needs_helm_upgrade=1
 fi
 
 echo "Fast deploy plan:"
-echo "  build server:  ${build_server}"
+echo "  build gateway: ${build_gateway}"
 echo "  build sandbox: ${build_sandbox}"
 echo "  helm upgrade:  ${needs_helm_upgrade}"
 
-if [[ "${explicit_target}" == "0" && "${build_server}" == "0" && "${build_sandbox}" == "0" && "${needs_helm_upgrade}" == "0" && "${DEPLOY_FAST_MODE}" != "full" ]]; then
+if [[ "${explicit_target}" == "0" && "${build_gateway}" == "0" && "${build_sandbox}" == "0" && "${needs_helm_upgrade}" == "0" && "${DEPLOY_FAST_MODE}" != "full" ]]; then
   echo "No new local changes since last deploy."
 fi
 
@@ -290,21 +290,21 @@ build_start=$(date +%s)
 # from the k3s containerd cache after pushing.
 declare -a built_components=()
 
-server_pid=""
+gateway_pid=""
 sandbox_pid=""
 build_failed=0
 
-if [[ "${build_server}" == "1" ]]; then
+if [[ "${build_gateway}" == "1" ]]; then
   if [[ "${build_sandbox}" == "1" ]]; then
-    tasks/scripts/docker-build-component.sh server &
-    server_pid=$!
+    tasks/scripts/docker-build-component.sh gateway &
+    gateway_pid=$!
   else
-    tasks/scripts/docker-build-component.sh server
+    tasks/scripts/docker-build-component.sh gateway
   fi
 fi
 
 if [[ "${build_sandbox}" == "1" ]]; then
-  if [[ -n "${server_pid}" ]]; then
+  if [[ -n "${gateway_pid}" ]]; then
     tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE} &
     sandbox_pid=$!
   else
@@ -314,25 +314,25 @@ fi
 
 # Wait for parallel builds and fail fast: if either build fails, kill the
 # other one immediately instead of letting it run to completion.
-if [[ -n "${server_pid}" && -n "${sandbox_pid}" ]]; then
+if [[ -n "${gateway_pid}" && -n "${sandbox_pid}" ]]; then
   # Both running in parallel — wait for either to finish first.
-  if ! wait -n "${server_pid}" "${sandbox_pid}" 2>/dev/null; then
+  if ! wait -n "${gateway_pid}" "${sandbox_pid}" 2>/dev/null; then
     build_failed=1
   fi
   # Whichever finished, wait for the other (or kill it on failure).
   if [[ "${build_failed}" == "1" ]]; then
     echo "Error: a parallel image build failed. Killing remaining build..." >&2
-    kill "${server_pid}" "${sandbox_pid}" 2>/dev/null || true
-    wait "${server_pid}" "${sandbox_pid}" 2>/dev/null || true
+    kill "${gateway_pid}" "${sandbox_pid}" 2>/dev/null || true
+    wait "${gateway_pid}" "${sandbox_pid}" 2>/dev/null || true
     exit 1
   fi
   # First build succeeded; wait for the second.
-  if ! wait -n "${server_pid}" "${sandbox_pid}" 2>/dev/null; then
+  if ! wait -n "${gateway_pid}" "${sandbox_pid}" 2>/dev/null; then
     echo "Error: a parallel image build failed." >&2
     exit 1
   fi
-elif [[ -n "${server_pid}" ]]; then
-  wait "${server_pid}"
+elif [[ -n "${gateway_pid}" ]]; then
+  wait "${gateway_pid}"
 elif [[ -n "${sandbox_pid}" ]]; then
   wait "${sandbox_pid}"
 fi
@@ -342,7 +342,7 @@ log_duration "Image builds" "${build_start}" "${build_end}"
 
 declare -a pushed_images=()
 
-for component in server sandbox; do
+for component in gateway sandbox; do
   var="build_${component//-/_}"
   if [[ "${!var}" == "1" ]]; then
     # Tag may fail with AlreadyExists when the image digest hasn't changed;
@@ -394,7 +394,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
 
   helm upgrade openshell deploy/helm/openshell \
     --namespace openshell \
-    --set image.repository=${IMAGE_REPO_BASE}/server \
+    --set image.repository=${IMAGE_REPO_BASE}/gateway \
     --set image.tag=${IMAGE_TAG} \
     --set image.pullPolicy=Always \
     --set-string server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
@@ -431,7 +431,7 @@ if [[ "${explicit_target}" == "0" ]]; then
   cat > "${DEPLOY_FAST_STATE_FILE}" <<EOF
 cluster_name=${CLUSTER_NAME}
 container_id=${current_container_id}
-server=${current_server_fingerprint}
+gateway=${current_gateway_fingerprint}
 sandbox=${current_sandbox_fingerprint}
 helm=${current_helm_fingerprint}
 EOF

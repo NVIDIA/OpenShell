@@ -53,7 +53,7 @@ openshell
 │   ├── create
 │   ├── get [name]
 │   ├── list
-│   ├── delete <name...>
+│   ├── delete <name...> [--all]
 │   ├── connect [name]
 │   ├── upload [name]
 │   ├── download [name]
@@ -115,7 +115,7 @@ Create and manage isolated agent execution environments.
 | `openshell sandbox create` | Create a new sandbox. Refer to the flag reference below. |
 | `openshell sandbox get [name]` | Show detailed information about a sandbox. |
 | `openshell sandbox list` | List all sandboxes in the active cluster. |
-| `openshell sandbox delete <name...>` | Delete one or more sandboxes by name. |
+| `openshell sandbox delete <name...>` | Delete one or more sandboxes by name. Use `--all` to delete every sandbox in the active gateway. |
 | `openshell sandbox connect [name]` | Open an interactive SSH session into a running sandbox. |
 | `openshell sandbox upload [name]` | Upload files from the host into a sandbox. |
 | `openshell sandbox download [name]` | Download files from a sandbox to the host. |
@@ -243,3 +243,5 @@ $ openshell sandbox --help
 $ openshell sandbox create --help
 $ openshell gateway --help
 ```
+
+Help output groups flags under distinct headings: `FLAGS` for command-specific options, `GATEWAY FLAGS` for `--gateway` and `--gateway-endpoint`, and `GLOBAL FLAGS` for `--verbose`, `--help`, and `--version`.

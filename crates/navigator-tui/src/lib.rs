@@ -1163,14 +1163,13 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             None
         };
 
+        // For custom images, provide a restrictive default policy so the
+        // server has a baseline. The server ensures process identity is set
+        // to "sandbox". For the default image, let the server apply the
+        // sandbox's own default policy.
         let policy = if has_custom_image {
-            // Custom images may lack the default "sandbox" user/group, so
-            // use a restrictive default with cleared process identity.
-            let mut p = navigator_policy::restrictive_default_policy();
-            navigator_policy::clear_process_identity(&mut p);
-            Some(p)
+            Some(navigator_policy::restrictive_default_policy())
         } else {
-            // Let the server apply the sandbox's own default policy.
             None
         };
 

@@ -10,12 +10,13 @@ use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
-    VolumeCreateRequest,
+    ContainerCreateBody, DeviceRequest, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest,
+    PortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
-    RemoveContainerOptions, RemoveImageOptions, RemoveVolumeOptions, StartContainerOptions,
+    ListContainersOptionsBuilder, RemoveContainerOptions, RemoveImageOptions, RemoveVolumeOptions,
+    StartContainerOptions,
 };
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
@@ -241,6 +242,7 @@ pub async fn ensure_container(
     disable_tls: bool,
     disable_gateway_auth: bool,
     registry_token: Option<&str>,
+    gpu: bool,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -320,7 +322,7 @@ pub async fn ensure_container(
         exposed_ports.push("6443/tcp".to_string());
     }
 
-    let host_config = HostConfig {
+    let mut host_config = HostConfig {
         privileged: Some(true),
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
@@ -330,6 +332,23 @@ pub async fn ensure_container(
         extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
         ..Default::default()
     };
+
+    // When GPU support is requested, add NVIDIA device requests.
+    // This is the programmatic equivalent of `docker run --gpus all`.
+    // The NVIDIA Container Toolkit runtime hook injects /dev/nvidia* devices
+    // and GPU driver libraries from the host into the container.
+    if gpu {
+        host_config.device_requests = Some(vec![DeviceRequest {
+            driver: Some("nvidia".to_string()),
+            count: Some(-1), // all GPUs
+            capabilities: Some(vec![vec![
+                "gpu".to_string(),
+                "utility".to_string(),
+                "compute".to_string(),
+            ]]),
+            ..Default::default()
+        }]);
+    }
 
     let mut cmd = vec![
         "server".to_string(),
@@ -396,10 +415,9 @@ pub async fn ensure_container(
     // runtime.  Pass community registry credentials as a separate set of
     // env vars so the entrypoint can add a second block to registries.yaml.
     if registry_host != DEFAULT_REGISTRY {
-        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={}", DEFAULT_REGISTRY));
+        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={DEFAULT_REGISTRY}"));
         env_vars.push(format!(
-            "COMMUNITY_REGISTRY_USERNAME={}",
-            DEFAULT_REGISTRY_USERNAME
+            "COMMUNITY_REGISTRY_USERNAME={DEFAULT_REGISTRY_USERNAME}"
         ));
         env_vars.push(format!(
             "COMMUNITY_REGISTRY_PASSWORD={}",
@@ -455,6 +473,12 @@ pub async fn ensure_container(
         env_vars.push("DISABLE_GATEWAY_AUTH=true".to_string());
     }
 
+    // GPU support: tell the entrypoint to deploy the NVIDIA device plugin
+    // HelmChart CR so k8s workloads can request nvidia.com/gpu resources.
+    if gpu {
+        env_vars.push("GPU_ENABLED=true".to_string());
+    }
+
     let env = Some(env_vars);
 
     let config = ContainerCreateBody {
@@ -478,6 +502,77 @@ pub async fn ensure_container(
         .into_diagnostic()
         .wrap_err("failed to create gateway container")?;
     Ok(())
+}
+
+/// Information about a container that is holding a port we need.
+#[derive(Debug, Clone)]
+pub struct PortConflict {
+    /// Name of the container holding the port (without leading `/`).
+    pub container_name: String,
+    /// The host port that conflicts.
+    pub host_port: u16,
+}
+
+/// Check whether any *other* running container already binds the host ports
+/// that the gateway needs.  Returns a list of conflicts (empty if none).
+///
+/// Docker silently fails to attach networking when a port is already bound,
+/// leaving the new container with only a loopback interface.  Detecting this
+/// up-front lets us give a clear error instead of a cryptic "no default route"
+/// failure 30 seconds later.
+pub async fn check_port_conflicts(
+    docker: &Docker,
+    name: &str,
+    gateway_port: u16,
+    kube_port: Option<u16>,
+) -> Result<Vec<PortConflict>> {
+    let our_container = container_name(name);
+    let needed_ports: Vec<u16> = std::iter::once(gateway_port).chain(kube_port).collect();
+
+    let containers = docker
+        .list_containers(Some(
+            ListContainersOptionsBuilder::new()
+                // Only running containers can hold port bindings.
+                .all(false)
+                .build(),
+        ))
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to list containers for port conflict check")?;
+
+    let mut conflicts = Vec::new();
+    for container in &containers {
+        // Skip our own container (it may already exist from a previous run).
+        let names = container.names.as_deref().unwrap_or_default();
+        let is_ours = names
+            .iter()
+            .any(|n| n.trim_start_matches('/') == our_container);
+        if is_ours {
+            continue;
+        }
+
+        let ports = container.ports.as_deref().unwrap_or_default();
+        for port in ports {
+            if let Some(public) = port.public_port {
+                if needed_ports.contains(&public) {
+                    let cname = names
+                        .first()
+                        .map(|n| n.trim_start_matches('/').to_string())
+                        .unwrap_or_else(|| {
+                            container
+                                .id
+                                .clone()
+                                .unwrap_or_else(|| "<unknown>".to_string())
+                        });
+                    conflicts.push(PortConflict {
+                        container_name: cname,
+                        host_port: public,
+                    });
+                }
+            }
+        }
+    }
+    Ok(conflicts)
 }
 
 pub async fn start_container(docker: &Docker, name: &str) -> Result<()> {

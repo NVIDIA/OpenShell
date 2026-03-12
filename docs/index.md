@@ -196,7 +196,7 @@ Release Notes <about/release-notes>
 :hidden:
 
 Quickstart <get-started/quickstart>
-GitHub Sandbox <tutorials/github-sandbox>
+Tutorial: GitHub Policy Iteration <tutorials/github-sandbox>
 ```
 
 ```{toctree}
