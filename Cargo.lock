@@ -2719,6 +2719,7 @@ dependencies = [
  "navigator-policy",
  "navigator-providers",
  "navigator-tui",
+ "nix",
  "owo-colors",
  "prost-types",
  "rcgen",

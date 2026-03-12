@@ -62,6 +62,7 @@ tokio-tungstenite = { workspace = true }
 
 # Streams
 futures = { workspace = true }
+nix = { workspace = true }
 
 # URL parsing
 url = { workspace = true }

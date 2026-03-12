@@ -141,9 +141,9 @@ The following flags control sandbox creation:
 | `--provider` | Attach a credential provider. Repeatable for multiple providers. |
 | `--policy` | Path to a policy YAML file to apply at creation time. |
 | `--upload` | Upload local files into the sandbox before running. |
-| `--keep` | Keep the sandbox alive after the trailing command exits. |
+| `--keep` | Keep the sandbox alive after the initial command or shell exits. |
 | `--editor` | Launch `vscode` or `cursor` into `/sandbox`; installs OpenShell-managed SSH config and implies `--keep`. |
-| `--forward` | Forward a local port into the sandbox at startup. |
+| `--forward` | Forward a local port into the sandbox at startup. Implies `--keep`. |
 | `--from` | Build from a community sandbox name, local Dockerfile directory, or container image reference. |
 | `-- <command>` | The command to run inside the sandbox. Everything after `--` is passed as the agent command. |
 

@@ -1038,7 +1038,7 @@ enum SandboxCommands {
         #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
         no_git_ignore: bool,
 
-        /// Keep the sandbox alive after non-interactive commands.
+        /// Keep the sandbox alive after the initial command or shell exits.
         #[arg(long)]
         keep: bool,
 
@@ -1066,8 +1066,8 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
-        /// Forward a local port to the sandbox after the command finishes.
-        /// Implies --keep for non-interactive commands.
+        /// Forward a local port to the sandbox before the initial command or shell starts.
+        /// Implies --keep.
         #[arg(long)]
         forward: Option<u16>,
 

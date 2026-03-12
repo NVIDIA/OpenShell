@@ -58,7 +58,7 @@ $ openshell sandbox create \
 ```
 
 :::{tip}
-Use `--keep` to keep the sandbox running after the trailing command exits.
+Use `--keep` to keep the sandbox running after the initial command or shell exits.
 This is especially useful when you are iterating on a policy or want to
 reconnect later from another terminal or VS Code.
 :::

@@ -137,7 +137,7 @@ sequenceDiagram
    - `-tt -o RequestTTY=force` (force PTY allocation)
    - `-o SetEnv=TERM=xterm-256color` (terminal type)
    - `sandbox` as the SSH user
-4. If stdin is a terminal (interactive), the CLI calls `exec()` (Unix) to replace itself with the `ssh` process, giving SSH direct terminal ownership. Otherwise it spawns and waits.
+4. Direct `sandbox connect` calls `exec()` (Unix) when stdin is a terminal so SSH gets direct terminal ownership. `sandbox create` only does that for persistent sessions; ephemeral create sessions stay in-process so the CLI can delete the sandbox after the shell exits.
 5. When SSH starts, it spawns the `ssh-proxy` subprocess as its `ProxyCommand`.
 6. `crates/navigator-cli/src/ssh.rs` -- `sandbox_ssh_proxy()`:
    - Parses the gateway URL, connects via TCP (plain) or TLS (mTLS)
@@ -152,6 +152,7 @@ The `sandbox exec` path is identical to interactive connect except:
 - The SSH command uses `-T -o RequestTTY=no` (no PTY) when `tty=false`
 - The command string is passed as the final SSH argument
 - The sandbox daemon routes it through `exec_request()` instead of `shell_request()`, spawning `/bin/bash -lc <command>`
+- When `openshell sandbox create` launched the command without `--keep`, the CLI waits for SSH to exit and then deletes the sandbox. `--keep` and `--forward` leave it running.
 
 ### Port Forwarding (`forward start`)
 
