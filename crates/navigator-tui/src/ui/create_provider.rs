@@ -7,19 +7,19 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, CreateProviderPhase, ProviderKeyField};
-use crate::theme::styles;
 
 /// Draw the create provider modal overlay.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let Some(form) = &app.create_provider_form else {
         return;
     };
 
     match form.phase {
-        CreateProviderPhase::SelectType => draw_select_type(frame, form, area),
-        CreateProviderPhase::ChooseMethod => draw_choose_method(frame, form, area),
-        CreateProviderPhase::EnterKey => draw_enter_key(frame, form, area),
-        CreateProviderPhase::Creating => draw_creating(frame, form, area),
+        CreateProviderPhase::SelectType => draw_select_type(frame, form, area, t),
+        CreateProviderPhase::ChooseMethod => draw_choose_method(frame, form, area, t),
+        CreateProviderPhase::EnterKey => draw_enter_key(frame, form, area, t),
+        CreateProviderPhase::Creating => draw_creating(frame, form, area, t),
     }
 }
 
@@ -27,7 +27,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // Phase 1: Select provider type
 // ---------------------------------------------------------------------------
 
-fn draw_select_type(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, area: Rect) {
+fn draw_select_type(
+    frame: &mut Frame<'_>,
+    form: &crate::app::CreateProviderForm,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let modal_width = 50u16.min(area.width.saturating_sub(4));
     #[allow(clippy::cast_possible_truncation)]
     let type_rows = form.types.len().clamp(1, 10) as u16;
@@ -39,9 +45,9 @@ fn draw_select_type(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Create Provider ", styles::HEADING))
+        .title(Span::styled(" Create Provider ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -60,10 +66,7 @@ fn draw_select_type(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm
         .split(inner);
 
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            "Select provider type:",
-            styles::TEXT,
-        ))),
+        Paragraph::new(Line::from(Span::styled("Select provider type:", t.text))),
         chunks[0],
     );
 
@@ -71,29 +74,25 @@ fn draw_select_type(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm
         .types
         .iter()
         .enumerate()
-        .map(|(i, t)| {
+        .map(|(i, ty)| {
             let is_cursor = i == form.type_cursor;
             let marker = if is_cursor { ">" } else { " " };
-            let style = if is_cursor {
-                styles::ACCENT
-            } else {
-                styles::TEXT
-            };
+            let style = if is_cursor { t.accent } else { t.text };
             Line::from(vec![
                 Span::styled(format!("  {marker} "), style),
-                Span::styled(t.as_str(), style),
+                Span::styled(ty.as_str(), style),
             ])
         })
         .collect();
     frame.render_widget(Paragraph::new(lines), chunks[2]);
 
     let hint = Line::from(vec![
-        Span::styled("[j/k]", styles::KEY_HINT),
-        Span::styled(" Navigate ", styles::MUTED),
-        Span::styled("[Enter]", styles::KEY_HINT),
-        Span::styled(" Select ", styles::MUTED),
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Cancel", styles::MUTED),
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Navigate ", t.muted),
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Select ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Cancel", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[4]);
 }
@@ -102,7 +101,13 @@ fn draw_select_type(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm
 // Phase 2: Choose method (autodetect vs manual)
 // ---------------------------------------------------------------------------
 
-fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, area: Rect) {
+fn draw_choose_method(
+    frame: &mut Frame<'_>,
+    form: &crate::app::CreateProviderForm,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let modal_width = 55u16.min(area.width.saturating_sub(4));
     // header(1) + spacer(1) + type_label(1) + spacer(1) + 2 options + spacer(1) + hint(1)
     let content_height = 1 + 1 + 1 + 1 + 2 + 1 + 1;
@@ -112,9 +117,9 @@ fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderFo
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Create Provider ", styles::HEADING))
+        .title(Span::styled(" Create Provider ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -137,7 +142,7 @@ fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderFo
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "How would you like to provide credentials?",
-            styles::TEXT,
+            t.text,
         ))),
         chunks[0],
     );
@@ -145,8 +150,8 @@ fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderFo
     let selected_type = &form.types[form.type_cursor];
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Type: ", styles::MUTED),
-            Span::styled(selected_type.as_str(), styles::HEADING),
+            Span::styled("Type: ", t.muted),
+            Span::styled(selected_type.as_str(), t.heading),
         ])),
         chunks[2],
     );
@@ -158,11 +163,7 @@ fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderFo
         .map(|(i, label)| {
             let is_cursor = i == form.method_cursor;
             let marker = if is_cursor { ">" } else { " " };
-            let style = if is_cursor {
-                styles::ACCENT
-            } else {
-                styles::TEXT
-            };
+            let style = if is_cursor { t.accent } else { t.text };
             Line::from(vec![
                 Span::styled(format!("  {marker} "), style),
                 Span::styled(*label, style),
@@ -172,12 +173,12 @@ fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderFo
     frame.render_widget(Paragraph::new(lines), chunks[4]);
 
     let hint = Line::from(vec![
-        Span::styled("[j/k]", styles::KEY_HINT),
-        Span::styled(" Navigate ", styles::MUTED),
-        Span::styled("[Enter]", styles::KEY_HINT),
-        Span::styled(" Select ", styles::MUTED),
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Back", styles::MUTED),
+        Span::styled("[j/k]", t.key_hint),
+        Span::styled(" Navigate ", t.muted),
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Select ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Back", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[6]);
 }
@@ -186,7 +187,13 @@ fn draw_choose_method(frame: &mut Frame<'_>, form: &crate::app::CreateProviderFo
 // Phase 3: Enter key manually (BYO)
 // ---------------------------------------------------------------------------
 
-fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, area: Rect) {
+fn draw_enter_key(
+    frame: &mut Frame<'_>,
+    form: &crate::app::CreateProviderForm,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let modal_width = 64u16.min(area.width.saturating_sub(4));
 
     let has_warning = form.warning.is_some();
@@ -207,9 +214,9 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Create Provider ", styles::HEADING))
+        .title(Span::styled(" Create Provider ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -249,8 +256,8 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
     if let Some(ref warning) = form.warning {
         frame.render_widget(
             Paragraph::new(Line::from(vec![
-                Span::styled("⚠ ", styles::STATUS_WARN),
-                Span::styled(warning.as_str(), styles::STATUS_WARN),
+                Span::styled("⚠ ", t.status_warn),
+                Span::styled(warning.as_str(), t.status_warn),
             ])),
             chunks[idx],
         );
@@ -261,8 +268,8 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
     let selected_type = &form.types[form.type_cursor];
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Type: ", styles::MUTED),
-            Span::styled(selected_type.as_str(), styles::HEADING),
+            Span::styled("Type: ", t.muted),
+            Span::styled(selected_type.as_str(), t.heading),
         ])),
         chunks[idx],
     );
@@ -277,6 +284,7 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
         &name_placeholder,
         form.key_field == ProviderKeyField::Name,
         chunks[idx],
+        t,
     );
     idx += 1;
 
@@ -292,6 +300,7 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
             "e.g. MY_API_KEY",
             form.key_field == ProviderKeyField::EnvVarName,
             chunks[idx],
+            t,
         );
         idx += 1;
 
@@ -302,6 +311,7 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
             &form.generic_value,
             form.key_field == ProviderKeyField::GenericValue,
             chunks[idx],
+            t,
         );
         idx += 1;
     } else {
@@ -321,30 +331,22 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
                 let is_focused =
                     form.key_field == ProviderKeyField::Credential && i == form.cred_cursor;
                 let padded = format!("{:width$}", env_name, width = max_name_len);
-                let name_style = if is_focused {
-                    styles::ACCENT_BOLD
-                } else {
-                    styles::TEXT
-                };
+                let name_style = if is_focused { t.accent_bold } else { t.text };
                 let mut spans = vec![Span::styled(format!("  {padded}: "), name_style)];
                 if value.is_empty() {
                     if is_focused {
-                        spans.push(Span::styled("_", styles::ACCENT));
+                        spans.push(Span::styled("_", t.accent));
                     } else {
-                        spans.push(Span::styled("-", styles::MUTED));
+                        spans.push(Span::styled("-", t.muted));
                     }
                 } else {
                     let masked = mask_input_value(value);
                     spans.push(Span::styled(
                         masked,
-                        if is_focused {
-                            styles::ACCENT
-                        } else {
-                            styles::MUTED
-                        },
+                        if is_focused { t.accent } else { t.muted },
                     ));
                     if is_focused {
-                        spans.push(Span::styled("_", styles::ACCENT));
+                        spans.push(Span::styled("_", t.accent));
                     }
                 }
                 Line::from(spans)
@@ -360,9 +362,9 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
     // Submit button.
     let submit_focused = form.key_field == ProviderKeyField::Submit;
     let submit_style = if submit_focused {
-        styles::ACCENT_BOLD
+        t.accent_bold
     } else {
-        styles::MUTED
+        t.muted
     };
     let submit_label = if submit_focused {
         "  > Create Provider"
@@ -381,9 +383,9 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
             || status.contains("failed")
             || status.contains("Failed")
         {
-            styles::STATUS_ERR
+            t.status_err
         } else {
-            styles::STATUS_OK
+            t.status_ok
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
@@ -394,14 +396,14 @@ fn draw_enter_key(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, 
 
     // Hint.
     let hint = Line::from(vec![
-        Span::styled("[Tab]", styles::KEY_HINT),
-        Span::styled(" Next ", styles::MUTED),
-        Span::styled("[S-Tab]", styles::KEY_HINT),
-        Span::styled(" Prev ", styles::MUTED),
-        Span::styled("[Enter]", styles::KEY_HINT),
-        Span::styled(" Submit ", styles::MUTED),
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Back", styles::MUTED),
+        Span::styled("[Tab]", t.key_hint),
+        Span::styled(" Next ", t.muted),
+        Span::styled("[S-Tab]", t.key_hint),
+        Span::styled(" Prev ", t.muted),
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Submit ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Back", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[idx]);
 }
@@ -420,7 +422,13 @@ fn mask_input_value(value: &str) -> String {
 // Phase 4: Creating (pacman animation + result)
 // ---------------------------------------------------------------------------
 
-fn draw_creating(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, area: Rect) {
+fn draw_creating(
+    frame: &mut Frame<'_>,
+    form: &crate::app::CreateProviderForm,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let modal_width = 55u16.min(area.width.saturating_sub(4));
     // header(1) + spacer(1) + animation(1)
     let content_height = 1 + 1 + 1;
@@ -430,9 +438,9 @@ fn draw_creating(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, a
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Creating Provider ", styles::HEADING))
+        .title(Span::styled(" Creating Provider ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -449,9 +457,9 @@ fn draw_creating(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, a
         .split(inner);
 
     let (header, header_style) = match &form.create_result {
-        Some(Ok(name)) => (format!("Created provider: {name}"), styles::STATUS_OK),
-        Some(Err(msg)) => (format!("Failed: {msg}"), styles::STATUS_ERR),
-        None => ("Creating provider...".to_string(), styles::TEXT),
+        Some(Ok(name)) => (format!("Created provider: {name}"), t.status_ok),
+        Some(Err(msg)) => (format!("Failed: {msg}"), t.status_err),
+        None => ("Creating provider...".to_string(), t.text),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(header, header_style))),
@@ -460,7 +468,7 @@ fn draw_creating(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, a
 
     let elapsed_ms = form.anim_start.map_or(0, |s| s.elapsed().as_millis());
     let track_width = chunks[2].width.saturating_sub(1) as usize;
-    let anim_line = super::create_sandbox::render_chase(track_width, elapsed_ms);
+    let anim_line = super::create_sandbox::render_chase(track_width, elapsed_ms, t);
     frame.render_widget(Paragraph::new(anim_line), chunks[2]);
 }
 
@@ -469,6 +477,7 @@ fn draw_creating(frame: &mut Frame<'_>, form: &crate::app::CreateProviderForm, a
 // ---------------------------------------------------------------------------
 
 pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let Some(detail) = &app.provider_detail else {
         return;
     };
@@ -482,9 +491,9 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Provider Detail ", styles::HEADING))
+        .title(Span::styled(" Provider Detail ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -506,39 +515,39 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Name: ", styles::MUTED),
-            Span::styled(&detail.name, styles::HEADING),
+            Span::styled("Name: ", t.muted),
+            Span::styled(&detail.name, t.heading),
         ])),
         chunks[0],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Type: ", styles::MUTED),
-            Span::styled(&detail.provider_type, styles::TEXT),
+            Span::styled("Type: ", t.muted),
+            Span::styled(&detail.provider_type, t.text),
         ])),
         chunks[1],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Credential: ", styles::MUTED),
-            Span::styled(&detail.credential_key, styles::TEXT),
+            Span::styled("Credential: ", t.muted),
+            Span::styled(&detail.credential_key, t.text),
         ])),
         chunks[3],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Value: ", styles::MUTED),
-            Span::styled(&detail.masked_value, styles::MUTED),
+            Span::styled("Value: ", t.muted),
+            Span::styled(&detail.masked_value, t.muted),
         ])),
         chunks[4],
     );
 
     let hint = Line::from(vec![
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Close", styles::MUTED),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Close", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[6]);
 }
@@ -548,6 +557,7 @@ pub fn draw_detail(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let Some(form) = &app.update_provider_form else {
         return;
     };
@@ -561,9 +571,9 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Update Provider ", styles::HEADING))
+        .title(Span::styled(" Update Provider ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -587,16 +597,16 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Name: ", styles::MUTED),
-            Span::styled(&form.provider_name, styles::HEADING),
+            Span::styled("Name: ", t.muted),
+            Span::styled(&form.provider_name, t.heading),
         ])),
         chunks[0],
     );
 
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("Type: ", styles::MUTED),
-            Span::styled(&form.provider_type, styles::TEXT),
+            Span::styled("Type: ", t.muted),
+            Span::styled(&form.provider_type, t.text),
         ])),
         chunks[1],
     );
@@ -609,7 +619,7 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             format!("{key_label}:"),
-            styles::ACCENT_BOLD,
+            t.accent_bold,
         ))),
         chunks[3],
     );
@@ -618,8 +628,8 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let masked: String = "*".repeat(form.new_value.len());
     frame.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled(format!("  {masked}"), styles::ACCENT),
-            Span::styled("_", styles::ACCENT),
+            Span::styled(format!("  {masked}"), t.accent),
+            Span::styled("_", t.accent),
         ])),
         chunks[4],
     );
@@ -627,7 +637,7 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
             "  Type the new credential value",
-            styles::MUTED,
+            t.muted,
         ))),
         chunks[5],
     );
@@ -637,9 +647,9 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
             || status.contains("failed")
             || status.contains("Failed")
         {
-            styles::STATUS_ERR
+            t.status_err
         } else {
-            styles::STATUS_OK
+            t.status_ok
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
@@ -648,10 +658,10 @@ pub fn draw_update(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     let hint = Line::from(vec![
-        Span::styled("[Enter]", styles::KEY_HINT),
-        Span::styled(" Update ", styles::MUTED),
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Cancel", styles::MUTED),
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Update ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Cancel", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[8]);
 }
@@ -667,7 +677,9 @@ fn draw_text_field(
     placeholder: &str,
     focused: bool,
     area: Rect,
+    theme: &crate::theme::Theme,
 ) {
+    let t = theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -676,31 +688,35 @@ fn draw_text_field(
         ])
         .split(area);
 
-    let label_style = if focused {
-        styles::ACCENT_BOLD
-    } else {
-        styles::TEXT
-    };
+    let label_style = if focused { t.accent_bold } else { t.text };
     let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
     if !placeholder.is_empty() {
-        label_spans.push(Span::styled(format!("  {placeholder}"), styles::MUTED));
+        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
     }
     frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
 
     let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", styles::MUTED))
+        Line::from(Span::styled("  -", t.muted))
     } else if focused {
         Line::from(vec![
-            Span::styled(format!("  {value}"), styles::ACCENT),
-            Span::styled("_", styles::ACCENT),
+            Span::styled(format!("  {value}"), t.accent),
+            Span::styled("_", t.accent),
         ])
     } else {
-        Line::from(Span::styled(format!("  {value}"), styles::TEXT))
+        Line::from(Span::styled(format!("  {value}"), t.text))
     };
     frame.render_widget(Paragraph::new(display), chunks[1]);
 }
 
-fn draw_secret_field(frame: &mut Frame<'_>, label: &str, value: &str, focused: bool, area: Rect) {
+fn draw_secret_field(
+    frame: &mut Frame<'_>,
+    label: &str,
+    value: &str,
+    focused: bool,
+    area: Rect,
+    theme: &crate::theme::Theme,
+) {
+    let t = theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -709,11 +725,7 @@ fn draw_secret_field(frame: &mut Frame<'_>, label: &str, value: &str, focused: b
         ])
         .split(area);
 
-    let label_style = if focused {
-        styles::ACCENT_BOLD
-    } else {
-        styles::TEXT
-    };
+    let label_style = if focused { t.accent_bold } else { t.text };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(format!("{label}:"), label_style))),
         chunks[0],
@@ -721,14 +733,14 @@ fn draw_secret_field(frame: &mut Frame<'_>, label: &str, value: &str, focused: b
 
     let masked: String = "*".repeat(value.len());
     let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", styles::MUTED))
+        Line::from(Span::styled("  -", t.muted))
     } else if focused {
         Line::from(vec![
-            Span::styled(format!("  {masked}"), styles::ACCENT),
-            Span::styled("_", styles::ACCENT),
+            Span::styled(format!("  {masked}"), t.accent),
+            Span::styled("_", t.accent),
         ])
     } else {
-        Line::from(Span::styled(format!("  {masked}"), styles::MUTED))
+        Line::from(Span::styled(format!("  {masked}"), t.muted))
     };
     frame.render_widget(Paragraph::new(display), chunks[1]);
 }

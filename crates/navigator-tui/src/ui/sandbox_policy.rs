@@ -7,12 +7,12 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Padding, Paragraph};
 
 use crate::app::App;
-use crate::theme::styles;
 
 /// Draw the scrollable policy viewer pane (bottom ~80% of the sandbox screen).
 ///
 /// Always focused when visible (the metadata pane above is non-interactive).
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let version = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
 
     let title = format!(" Policy (v{version}) ");
@@ -21,11 +21,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
 
     if app.policy_lines.is_empty() {
-        let lines = vec![Line::from(Span::styled("Loading...", styles::MUTED))];
+        let lines = vec![Line::from(Span::styled("Loading...", t.muted))];
         let block = Block::default()
-            .title(Span::styled(title, styles::HEADING))
+            .title(Span::styled(title, t.heading))
             .borders(Borders::ALL)
-            .border_style(styles::BORDER_FOCUSED)
+            .border_style(t.border_focused)
             .padding(Padding::horizontal(1));
         frame.render_widget(Paragraph::new(lines).block(block), area);
         return;
@@ -47,10 +47,10 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let scroll_info = format!(" [{pos}/{total}] ");
 
     let block = Block::default()
-        .title(Span::styled(title, styles::HEADING))
-        .title_bottom(Line::from(Span::styled(scroll_info, styles::MUTED)).right_aligned())
+        .title(Span::styled(title, t.heading))
+        .title_bottom(Line::from(Span::styled(scroll_info, t.muted)).right_aligned())
         .borders(Borders::ALL)
-        .border_style(styles::BORDER_FOCUSED)
+        .border_style(t.border_focused)
         .padding(Padding::horizontal(1));
 
     frame.render_widget(Paragraph::new(visible_lines).block(block), area);

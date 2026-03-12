@@ -7,7 +7,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 
 use crate::app::{App, Focus};
-use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -25,12 +24,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 }
 
 fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let focused = app.focus == Focus::Gateways;
 
     let header = Row::new(vec![
-        Cell::from(Span::styled("  NAME", styles::MUTED)),
-        Cell::from(Span::styled("TYPE", styles::MUTED)),
-        Cell::from(Span::styled("STATUS", styles::MUTED)),
+        Cell::from(Span::styled("  NAME", t.muted)),
+        Cell::from(Span::styled("TYPE", t.muted)),
+        Cell::from(Span::styled("STATUS", t.muted)),
     ])
     .bottom_margin(1);
 
@@ -44,18 +44,10 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
             let cursor = if is_cursor { ">" } else { " " };
             let dot = if is_active { "* " } else { "  " };
-            let dot_style = if is_active {
-                styles::STATUS_OK
-            } else {
-                styles::MUTED
-            };
-            let name_style = if is_active {
-                styles::HEADING
-            } else {
-                styles::TEXT
-            };
+            let dot_style = if is_active { t.status_ok } else { t.muted };
+            let name_style = if is_active { t.heading } else { t.text };
             let name_cell = Cell::from(Line::from(vec![
-                Span::styled(cursor, styles::ACCENT),
+                Span::styled(cursor, t.accent),
                 Span::styled(dot, dot_style),
                 Span::styled(&entry.name, name_style),
             ]));
@@ -64,35 +56,31 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
             let status_cell = if is_active {
                 let status_style = if app.status_text.contains("Healthy") {
-                    styles::STATUS_OK
+                    t.status_ok
                 } else if app.status_text.contains("Degraded") {
-                    styles::STATUS_WARN
+                    t.status_warn
                 } else if app.status_text.contains("Unhealthy") {
-                    styles::STATUS_ERR
+                    t.status_err
                 } else {
-                    styles::MUTED
+                    t.muted
                 };
                 Cell::from(Span::styled(&app.status_text, status_style))
             } else {
-                Cell::from(Span::styled("-", styles::MUTED))
+                Cell::from(Span::styled("-", t.muted))
             };
 
             Row::new(vec![
                 name_cell,
-                Cell::from(Span::styled(type_label, styles::MUTED)),
+                Cell::from(Span::styled(type_label, t.muted)),
                 status_cell,
             ])
         })
         .collect();
 
-    let border_style = if focused {
-        styles::BORDER_FOCUSED
-    } else {
-        styles::BORDER
-    };
+    let border_style = if focused { t.border_focused } else { t.border };
 
     let block = Block::default()
-        .title(Span::styled(" Gateways ", styles::HEADING))
+        .title(Span::styled(" Gateways ", t.heading))
         .borders(Borders::ALL)
         .border_style(border_style)
         .padding(Padding::horizontal(1));
@@ -114,7 +102,7 @@ fn draw_gateway_list(frame: &mut Frame<'_>, app: &App, area: Rect) {
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(3),
         };
-        let msg = Paragraph::new(Span::styled(" No gateways found.", styles::MUTED));
+        let msg = Paragraph::new(Span::styled(" No gateways found.", t.muted));
         frame.render_widget(msg, inner);
     }
 }

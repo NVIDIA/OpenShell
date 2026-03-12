@@ -7,7 +7,6 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph};
 
 use crate::app::{App, CreateFormField, CreatePhase};
-use crate::theme::styles;
 
 /// Draw the create sandbox modal overlay.
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
@@ -26,6 +25,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let Some(form) = &app.create_form else {
         return;
     };
@@ -42,9 +42,9 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Create Sandbox ", styles::HEADING))
+        .title(Span::styled(" Create Sandbox ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -80,6 +80,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "optional — auto-generated if empty",
         form.focused_field == CreateFormField::Name,
         chunks[0],
+        t,
     );
 
     // --- Image ---
@@ -90,6 +91,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "optional — server default if empty",
         form.focused_field == CreateFormField::Image,
         chunks[1],
+        t,
     );
 
     // --- Command ---
@@ -100,19 +102,20 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         "optional — runs /bin/bash if empty",
         form.focused_field == CreateFormField::Command,
         chunks[2],
+        t,
     );
 
     // --- Providers label ---
     let providers_focused = form.focused_field == CreateFormField::Providers;
     let prov_label_style = if providers_focused {
-        styles::ACCENT_BOLD
+        t.accent_bold
     } else {
-        styles::TEXT
+        t.text
     };
     let prov_hint = if providers_focused {
-        Span::styled("  [Space] toggle  [j/k] navigate", styles::MUTED)
+        Span::styled("  [Space] toggle  [j/k] navigate", t.muted)
     } else {
-        Span::styled("", styles::MUTED)
+        Span::styled("", t.muted)
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -127,7 +130,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "  (none — create providers first)",
-                styles::MUTED,
+                t.muted,
             ))),
             chunks[5],
         );
@@ -141,11 +144,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 let checkbox = if p.selected { "[x]" } else { "[ ]" };
                 let is_cursor = providers_focused && i == form.provider_cursor;
                 let marker = if is_cursor { ">" } else { " " };
-                let style = if is_cursor {
-                    styles::ACCENT
-                } else {
-                    styles::TEXT
-                };
+                let style = if is_cursor { t.accent } else { t.text };
                 let type_display = if p.provider_type.is_empty() {
                     String::new()
                 } else {
@@ -154,7 +153,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Line::from(vec![
                     Span::styled(format!("  {marker} {checkbox} "), style),
                     Span::styled(&p.name, style),
-                    Span::styled(type_display, styles::MUTED),
+                    Span::styled(type_display, t.muted),
                 ])
             })
             .collect();
@@ -163,22 +162,18 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // --- Ports (single-line: label + inline input) ---
     let ports_focused = form.focused_field == CreateFormField::Ports;
-    let ports_label_style = if ports_focused {
-        styles::ACCENT_BOLD
-    } else {
-        styles::TEXT
-    };
+    let ports_label_style = if ports_focused { t.accent_bold } else { t.text };
     let ports_display = if form.ports.is_empty() && !ports_focused {
-        Span::styled(" -", styles::MUTED)
+        Span::styled(" -", t.muted)
     } else if ports_focused {
-        Span::styled(format!(" {}█", form.ports), styles::ACCENT)
+        Span::styled(format!(" {}█", form.ports), t.accent)
     } else {
-        Span::styled(format!(" {}", form.ports), styles::TEXT)
+        Span::styled(format!(" {}", form.ports), t.text)
     };
     let ports_hint = if ports_focused {
-        Span::styled("", styles::MUTED)
+        Span::styled("", t.muted)
     } else {
-        Span::styled("  (comma-separated, e.g. 8080,3000)", styles::MUTED)
+        Span::styled("  (comma-separated, e.g. 8080,3000)", t.muted)
     };
     frame.render_widget(
         Paragraph::new(Line::from(vec![
@@ -192,9 +187,9 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // --- Submit ---
     let submit_focused = form.focused_field == CreateFormField::Submit;
     let submit_style = if submit_focused {
-        styles::ACCENT_BOLD
+        t.accent_bold
     } else {
-        styles::MUTED
+        t.muted
     };
     let submit_label = if submit_focused {
         "  ▶ Create Sandbox"
@@ -209,11 +204,11 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // --- Status ---
     if let Some(ref status) = form.status {
         let style = if status.contains("failed") || status.contains("error") {
-            styles::STATUS_ERR
+            t.status_err
         } else if status.contains("Created") {
-            styles::STATUS_OK
+            t.status_ok
         } else {
-            styles::MUTED
+            t.muted
         };
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(format!("  {status}"), style))),
@@ -223,14 +218,14 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // --- Nav hint ---
     let hint = Line::from(vec![
-        Span::styled("[Tab]", styles::KEY_HINT),
-        Span::styled(" Next ", styles::MUTED),
-        Span::styled("[S-Tab]", styles::KEY_HINT),
-        Span::styled(" Prev ", styles::MUTED),
-        Span::styled("[Enter]", styles::KEY_HINT),
-        Span::styled(" Submit ", styles::MUTED),
-        Span::styled("[Esc]", styles::KEY_HINT),
-        Span::styled(" Cancel", styles::MUTED),
+        Span::styled("[Tab]", t.key_hint),
+        Span::styled(" Next ", t.muted),
+        Span::styled("[S-Tab]", t.key_hint),
+        Span::styled(" Prev ", t.muted),
+        Span::styled("[Enter]", t.key_hint),
+        Span::styled(" Submit ", t.muted),
+        Span::styled("[Esc]", t.key_hint),
+        Span::styled(" Cancel", t.muted),
     ]);
     frame.render_widget(Paragraph::new(hint), chunks[12]);
 }
@@ -244,6 +239,7 @@ fn draw_form(frame: &mut Frame<'_>, app: &App, area: Rect) {
 // ---------------------------------------------------------------------------
 
 fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
+    let t = &app.theme;
     let Some(form) = &app.create_form else {
         return;
     };
@@ -258,9 +254,9 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
     frame.render_widget(Clear, popup_area);
 
     let block = Block::default()
-        .title(Span::styled(" Creating Sandbox ", styles::HEADING))
+        .title(Span::styled(" Creating Sandbox ", t.heading))
         .borders(Borders::ALL)
-        .border_style(styles::ACCENT)
+        .border_style(t.accent)
         .padding(Padding::new(2, 2, 1, 1));
 
     let inner = block.inner(popup_area);
@@ -278,9 +274,9 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     // Header — changes once result arrives.
     let (header, header_style) = match &form.create_result {
-        Some(Ok(name)) => (format!("Created sandbox: {name}"), styles::STATUS_OK),
-        Some(Err(msg)) => (format!("Failed: {msg}"), styles::STATUS_ERR),
-        None => ("Creating sandbox...".to_string(), styles::TEXT),
+        Some(Ok(name)) => (format!("Created sandbox: {name}"), t.status_ok),
+        Some(Err(msg)) => (format!("Failed: {msg}"), t.status_err),
+        None => ("Creating sandbox...".to_string(), t.text),
     };
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(header, header_style))),
@@ -290,16 +286,21 @@ fn draw_creating(frame: &mut Frame<'_>, app: &App, area: Rect) {
     // Pacman chase animation.
     let elapsed_ms = form.anim_start.map_or(0, |s| s.elapsed().as_millis());
     let track_width = chunks[2].width.saturating_sub(1) as usize;
-    let anim_line = render_chase(track_width, elapsed_ms);
+    let anim_line = render_chase(track_width, elapsed_ms, t);
     frame.render_widget(Paragraph::new(anim_line), chunks[2]);
 }
 
 /// Render the NVIDIA pacman chasing a maroon claw across a dot track.
 ///
 /// The sprite scrolls right across `track_width`, wrapping around.
-pub fn render_chase(track_width: usize, elapsed_ms: u128) -> Line<'static> {
+pub fn render_chase(
+    track_width: usize,
+    elapsed_ms: u128,
+    theme: &crate::theme::Theme,
+) -> Line<'static> {
+    let t = theme;
     if track_width < 10 {
-        return Line::from(Span::styled("...", styles::MUTED));
+        return Line::from(Span::styled("...", t.muted));
     }
 
     let frame = (elapsed_ms / 140) as usize;
@@ -323,7 +324,7 @@ pub fn render_chase(track_width: usize, elapsed_ms: u128) -> Line<'static> {
 
     // Build character-by-character: a track_width buffer of (content, style) slots.
     // We'll collect spans by walking the sprite across the track.
-    let mut buf: Vec<(char, ratatui::style::Style)> = vec![(' ', styles::MUTED); track_width];
+    let mut buf: Vec<(char, ratatui::style::Style)> = vec![(' ', t.muted); track_width];
 
     // Helper: place a character if it's within bounds.
     let mut place = |col: usize, ch: char, style: ratatui::style::Style| {
@@ -337,20 +338,20 @@ pub fn render_chase(track_width: usize, elapsed_ms: u128) -> Line<'static> {
     let pac_col = pos;
     // Place pacman.
     for (i, ch) in pac.chars().enumerate() {
-        place(pac_col.wrapping_add(i), ch, styles::ACCENT_BOLD);
+        place(pac_col.wrapping_add(i), ch, t.accent_bold);
     }
 
     // Dots after pacman.
     for d in 0..num_dots {
         let col = pac_col + 1 + d * 2;
-        place(col, ' ', styles::MUTED);
-        place(col + 1, dot_char, styles::MUTED);
+        place(col, ' ', t.muted);
+        place(col + 1, dot_char, t.muted);
     }
 
     // Claw after the dots.
     let claw_col = pac_col + 1 + num_dots * 2 + 1;
     for (i, ch) in claw.chars().enumerate() {
-        place(claw_col + i, ch, styles::CLAW);
+        place(claw_col + i, ch, t.claw);
     }
 
     // Convert buffer to spans (group consecutive same-style chars).
@@ -388,7 +389,9 @@ fn draw_text_field(
     placeholder: &str,
     focused: bool,
     area: Rect,
+    theme: &crate::theme::Theme,
 ) {
+    let t = theme;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -398,26 +401,22 @@ fn draw_text_field(
         ])
         .split(area);
 
-    let label_style = if focused {
-        styles::ACCENT_BOLD
-    } else {
-        styles::TEXT
-    };
+    let label_style = if focused { t.accent_bold } else { t.text };
     let mut label_spans = vec![Span::styled(format!("{label}:"), label_style)];
     if !placeholder.is_empty() {
-        label_spans.push(Span::styled(format!("  {placeholder}"), styles::MUTED));
+        label_spans.push(Span::styled(format!("  {placeholder}"), t.muted));
     }
     frame.render_widget(Paragraph::new(Line::from(label_spans)), chunks[0]);
 
     let display = if value.is_empty() && !focused {
-        Line::from(Span::styled("  -", styles::MUTED))
+        Line::from(Span::styled("  -", t.muted))
     } else if focused {
         Line::from(vec![
-            Span::styled(format!("  {value}"), styles::ACCENT),
-            Span::styled("█", styles::ACCENT),
+            Span::styled(format!("  {value}"), t.accent),
+            Span::styled("█", t.accent),
         ])
     } else {
-        Line::from(Span::styled(format!("  {value}"), styles::TEXT))
+        Line::from(Span::styled(format!("  {value}"), t.text))
     };
     frame.render_widget(Paragraph::new(display), chunks[1]);
 }

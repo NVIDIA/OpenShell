@@ -7,13 +7,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 
 use crate::app::App;
-use crate::theme::styles;
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
+    let t = &app.theme;
     let header = Row::new(vec![
-        Cell::from(Span::styled("  NAME", styles::MUTED)),
-        Cell::from(Span::styled("TYPE", styles::MUTED)),
-        Cell::from(Span::styled("CRED KEY", styles::MUTED)),
+        Cell::from(Span::styled("  NAME", t.muted)),
+        Cell::from(Span::styled("TYPE", t.muted)),
+        Cell::from(Span::styled("CRED KEY", t.muted)),
     ])
     .bottom_margin(1);
 
@@ -26,20 +26,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             let selected = focused && i == app.provider_selected;
             let name_cell = if selected {
                 Cell::from(Line::from(vec![
-                    Span::styled("> ", styles::ACCENT),
-                    Span::styled(name, styles::TEXT),
+                    Span::styled("> ", t.accent),
+                    Span::styled(name, t.text),
                 ]))
             } else {
                 Cell::from(Line::from(vec![
                     Span::raw("  "),
-                    Span::styled(name, styles::TEXT),
+                    Span::styled(name, t.text),
                 ]))
             };
 
             Row::new(vec![
                 name_cell,
-                Cell::from(Span::styled(ptype, styles::MUTED)),
-                Cell::from(Span::styled(cred_key, styles::MUTED)),
+                Cell::from(Span::styled(ptype, t.muted)),
+                Cell::from(Span::styled(cred_key, t.muted)),
             ])
         })
         .collect();
@@ -50,11 +50,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
         Constraint::Percentage(35),
     ];
 
-    let border_style = if focused {
-        styles::BORDER_FOCUSED
-    } else {
-        styles::BORDER
-    };
+    let border_style = if focused { t.border_focused } else { t.border };
 
     // Show delete confirmation in the title area if active.
     let title = if focused && app.confirm_provider_delete {
@@ -63,16 +59,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             .get(app.provider_selected)
             .map_or("-", String::as_str);
         Line::from(vec![
-            Span::styled(" Delete '", styles::STATUS_ERR),
-            Span::styled(name, styles::STATUS_ERR),
-            Span::styled("'? [y/n] ", styles::STATUS_ERR),
+            Span::styled(" Delete '", t.status_err),
+            Span::styled(name, t.status_err),
+            Span::styled("'? [y/n] ", t.status_err),
         ])
     } else {
         Line::from(vec![
-            Span::styled(" Providers ", styles::HEADING),
-            Span::styled("- ", styles::BORDER),
-            Span::styled(&app.gateway_name, styles::MUTED),
-            Span::styled(" ", styles::MUTED),
+            Span::styled(" Providers ", t.heading),
+            Span::styled("- ", t.border),
+            Span::styled(&app.gateway_name, t.muted),
+            Span::styled(" ", t.muted),
         ])
     };
 
@@ -93,10 +89,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(3),
         };
-        let msg = Paragraph::new(Span::styled(
-            " No providers. Press [c] to create.",
-            styles::MUTED,
-        ));
+        let msg = Paragraph::new(Span::styled(" No providers. Press [c] to create.", t.muted));
         frame.render_widget(msg, inner);
     }
 }
