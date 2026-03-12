@@ -137,7 +137,7 @@ sequenceDiagram
    - `-tt -o RequestTTY=force` (force PTY allocation)
    - `-o SetEnv=TERM=xterm-256color` (terminal type)
    - `sandbox` as the SSH user
-4. Direct `sandbox connect` calls `exec()` (Unix) when stdin is a terminal so SSH gets direct terminal ownership.
+4. If stdin is a terminal (interactive), the CLI calls `exec()` (Unix) to replace itself with the `ssh` process, giving SSH direct terminal ownership. Otherwise it spawns and waits.
 5. When SSH starts, it spawns the `ssh-proxy` subprocess as its `ProxyCommand`.
 6. `crates/navigator-cli/src/ssh.rs` -- `sandbox_ssh_proxy()`:
    - Parses the gateway URL, connects via TCP (plain) or TLS (mTLS)
