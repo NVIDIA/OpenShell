@@ -851,26 +851,6 @@ enum GatewayCommands {
         #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
-
-    /// Print or start an SSH tunnel for kubectl access to a remote gateway.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Tunnel {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
-
-        /// Override SSH destination (auto-resolved from gateway metadata).
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
-        /// Only print the SSH command instead of running it.
-        #[arg(long)]
-        print_command: bool,
-    },
 }
 
 // -----------------------------------------------------------------------
@@ -1405,7 +1385,9 @@ async fn main() -> Result<()> {
         // -----------------------------------------------------------
         // Doctor (diagnostic) commands
         // -----------------------------------------------------------
-        Some(Commands::Doctor { command: Some(command) }) => match command {
+        Some(Commands::Doctor {
+            command: Some(command),
+        }) => match command {
             DoctorCommands::Logs {
                 name,
                 lines,

@@ -1184,14 +1184,6 @@ pub async fn gateway_admin_deploy(
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu);
-    if let Some(kp) = kube_port {
-        let resolved_kp = if kp == 0 {
-            navigator_bootstrap::pick_available_port()?
-        } else {
-            kp
-        };
-        options = options.with_kube_port(resolved_kp);
-    }
     if let Some(dest) = remote {
         let mut remote_opts = RemoteOptions::new(dest);
         if let Some(key) = ssh_key {
@@ -4042,7 +4034,6 @@ mod tests {
                 gateway_endpoint: "http://127.0.0.1:8080".to_string(),
                 is_remote: false,
                 gateway_port: 8080,
-                kube_port: None,
                 remote_host: None,
                 resolved_host: None,
                 auth_mode: None,
