@@ -47,3 +47,11 @@ hide = true
 description = "Build and publish multi-arch cluster image to ECR"
 run = "tasks/scripts/docker-publish-multiarch.sh --mode ecr"
 hide = true
+
+["docker:cleanup"]
+description = "Remove stale images, volumes, and build cache not used by the current cluster"
+run = "scripts/docker-cleanup.sh --force"
+
+["docker:cleanup:dry-run"]
+description = "Preview what docker:cleanup would remove without deleting anything"
+run = "scripts/docker-cleanup.sh --dry-run"
