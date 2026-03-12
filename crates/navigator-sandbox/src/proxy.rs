@@ -164,9 +164,10 @@ impl ProxyHandle {
                         let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, tls, inf, resolver, dtx)
-                                    .await
+                            if let Err(err) = handle_tcp_connection(
+                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                            )
+                            .await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
