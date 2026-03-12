@@ -808,31 +808,44 @@ enum GatewayCommands {
         ssh_key: Option<String>,
     },
 
-    /// Add an edge-authenticated gateway.
+    /// Add an existing gateway.
     ///
-    /// Registers an external gateway endpoint that is fronted by an
-    /// edge proxy (e.g., Cloudflare Access). Opens a browser for
-    /// authentication and stores the token locally. After adding, the
-    /// gateway appears in `openshell gateway select`.
+    /// Registers a gateway endpoint so it appears in `openshell gateway select`.
+    ///
+    /// Without extra flags the gateway is treated as an edge-authenticated
+    /// (cloud) gateway and a browser is opened for authentication.
+    ///
+    /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway whose
+    /// Docker daemon is reachable over SSH. Pass `--local` to register a
+    /// local mTLS gateway running in Docker on this machine. In both cases
+    /// the CLI extracts mTLS certificates from the running container
+    /// automatically.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
-        /// Gateway endpoint URL (e.g., `https://8080-3vdegyusg.brevlab.com`).
+        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080`).
         endpoint: String,
 
         /// Gateway name (auto-derived from the endpoint hostname when omitted).
         #[arg(long)]
         name: Option<String>,
 
-        /// Skip browser authentication (authenticate later with `gateway login`).
-        #[arg(long)]
-        no_auth: bool,
+        /// Register a remote mTLS gateway accessible via SSH.
+        #[arg(long, conflicts_with = "local")]
+        remote: Option<String>,
+
+        /// SSH private key for the remote host.
+        #[arg(long, requires = "remote", value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+
+        /// Register a local mTLS gateway running in Docker on this machine.
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
     },
 
     /// Authenticate with an edge-authenticated gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires
-    /// or to authenticate a gateway added with `--no-auth`.
+    /// token locally. Use this to re-authenticate when a token expires.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1427,9 +1440,18 @@ async fn main() -> Result<()> {
             GatewayCommands::Add {
                 endpoint,
                 name,
-                no_auth,
+                remote,
+                ssh_key,
+                local,
             } => {
-                run::gateway_add(&endpoint, name.as_deref(), no_auth).await?;
+                run::gateway_add(
+                    &endpoint,
+                    name.as_deref(),
+                    remote.as_deref(),
+                    ssh_key.as_deref(),
+                    local,
+                )
+                .await?;
             }
             GatewayCommands::Login { name } => {
                 let name = name

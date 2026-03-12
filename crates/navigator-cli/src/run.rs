@@ -17,8 +17,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
     DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
-    get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
-    save_active_gateway, save_last_sandbox, store_gateway_metadata,
+    extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
+    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
+    store_gateway_metadata,
 };
 use navigator_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
@@ -834,12 +835,21 @@ where
     Ok(())
 }
 
-/// Register an external edge-authenticated gateway.
+/// Register an existing gateway.
 ///
-/// Creates local metadata for the given endpoint so it appears in
-/// `gateway select`. When `no_auth` is false, opens a browser for
-/// authentication and stores the bearer token locally.
-pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> Result<()> {
+/// Without extra flags the gateway is treated as an edge-authenticated (cloud)
+/// gateway and a browser is opened for authentication.
+///
+/// Pass `remote` (SSH destination) to register a remote mTLS gateway, or
+/// `local = true` for a local mTLS gateway. In both cases the CLI extracts
+/// mTLS certificates from the running container automatically.
+pub async fn gateway_add(
+    endpoint: &str,
+    name: Option<&str>,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+    local: bool,
+) -> Result<()> {
     // Normalise the endpoint: ensure it has a scheme.
     let endpoint = if endpoint.contains("://") {
         endpoint.to_string()
@@ -860,54 +870,105 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         &derived_name
     };
 
-    // Build metadata for an edge-authenticated remote gateway.
-    let metadata = GatewayMetadata {
-        name: name.to_string(),
-        gateway_endpoint: endpoint.clone(),
-        is_remote: true,
-        gateway_port: 0,
-        remote_host: None,
-        resolved_host: None,
-        auth_mode: Some("cloudflare_jwt".to_string()),
-        edge_team_domain: None,
-        edge_auth_url: None,
-    };
+    // Fail if a gateway with this name already exists.
+    if get_gateway_metadata(name).is_some() {
+        return Err(miette::miette!(
+            "Gateway '{}' already exists.\n\
+             Remove it first with: openshell gateway destroy --name {}\n\
+             Or choose a different name with: --name <name>",
+            name,
+            name,
+        ));
+    }
 
-    store_gateway_metadata(name, &metadata)?;
-    save_active_gateway(name)?;
+    if remote.is_some() || local {
+        // mTLS gateway (remote or local).
+        let remote_opts = remote.map(|dest| {
+            let mut opts = RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                opts = opts.with_ssh_key(key);
+            }
+            opts
+        });
 
-    if no_auth {
+        // Extract certs BEFORE storing metadata — if this fails the gateway
+        // is not registered.
+        eprintln!("• Extracting TLS certificates from gateway container...");
+        navigator_bootstrap::extract_and_store_pki(name, remote_opts.as_ref()).await?;
+
+        let (remote_host, resolved_host) = if let Some(dest) = remote {
+            let ssh_host = extract_host_from_ssh_destination(dest);
+            let resolved = resolve_ssh_hostname(&ssh_host);
+            (Some(dest.to_string()), Some(resolved))
+        } else {
+            (None, None)
+        };
+
+        let metadata = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.clone(),
+            is_remote: !local,
+            gateway_port: 0,
+            remote_host,
+            resolved_host,
+            auth_mode: Some("mtls".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
         eprintln!(
             "{} Gateway '{}' added and set as active",
             "✓".green().bold(),
             name,
         );
-        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!(
+            "  {} {}",
+            "Type:".dimmed(),
+            if local { "local" } else { "remote" },
+        );
+        eprintln!("{} TLS certificates extracted", "✓".green().bold());
+    } else {
+        // Cloud (edge-authenticated) gateway.
+        let metadata = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.clone(),
+            is_remote: true,
+            gateway_port: 0,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: Some("cloudflare_jwt".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
+        eprintln!(
+            "{} Gateway '{}' added and set as active",
+            "✓".green().bold(),
+            name,
+        );
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!("  {} cloud", "Type:".dimmed());
         eprintln!();
-        eprintln!("Authenticate with: {}", "openshell gateway login".dimmed(),);
-        return Ok(());
-    }
 
-    // Run the browser-based auth flow.
-    eprintln!(
-        "{} Gateway '{}' added and set as active",
-        "✓".green().bold(),
-        name,
-    );
-    eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
-    eprintln!();
-
-    match crate::auth::browser_auth_flow(&endpoint).await {
-        Ok(token) => {
-            navigator_bootstrap::edge_token::store_edge_token(name, &token)?;
-            eprintln!("{} Authenticated successfully", "✓".green().bold(),);
-        }
-        Err(e) => {
-            eprintln!("{} Authentication skipped: {e}", "!".yellow(),);
-            eprintln!(
-                "  Authenticate later with: {}",
-                "openshell gateway login".dimmed(),
-            );
+        match crate::auth::browser_auth_flow(&endpoint).await {
+            Ok(token) => {
+                navigator_bootstrap::edge_token::store_edge_token(name, &token)?;
+                eprintln!("{} Authenticated successfully", "✓".green().bold());
+            }
+            Err(e) => {
+                eprintln!("{} Authentication skipped: {e}", "!".yellow());
+                eprintln!(
+                    "  Authenticate later with: {}",
+                    "openshell gateway login".dimmed(),
+                );
+            }
         }
     }
 

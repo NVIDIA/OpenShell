@@ -89,7 +89,7 @@ async fn gateway_help_shows_add_and_login() {
     );
 }
 
-/// `openshell gateway add --help` must show the endpoint arg and `--no-auth` flag.
+/// `openshell gateway add --help` must show the endpoint arg and gateway-type flags.
 #[tokio::test]
 async fn gateway_add_help_shows_flags() {
     let (output, code) = run_isolated(&["gateway", "add", "--help"]).await;
@@ -97,12 +97,20 @@ async fn gateway_add_help_shows_flags() {
 
     let clean = strip_ansi(&output);
     assert!(
-        clean.contains("--no-auth"),
-        "expected '--no-auth' in gateway add --help:\n{clean}"
-    );
-    assert!(
         clean.contains("--name"),
         "expected '--name' in gateway add --help:\n{clean}"
+    );
+    assert!(
+        clean.contains("--remote"),
+        "expected '--remote' in gateway add --help:\n{clean}"
+    );
+    assert!(
+        clean.contains("--ssh-key"),
+        "expected '--ssh-key' in gateway add --help:\n{clean}"
+    );
+    assert!(
+        clean.contains("--local"),
+        "expected '--local' in gateway add --help:\n{clean}"
     );
     assert!(
         // The positional argument for the endpoint
@@ -127,13 +135,13 @@ async fn gateway_login_help_is_recognized() {
 }
 
 // -------------------------------------------------------------------
-// Test 10: `gateway add --no-auth` creates metadata with cloudflare_jwt
+// Test 10: `gateway add` creates metadata with cloudflare_jwt
 // -------------------------------------------------------------------
 
-/// `openshell gateway add <endpoint> --no-auth` should:
+/// `openshell gateway add <endpoint>` (cloud gateway) should:
 /// - Create cluster metadata with auth_mode = "cloudflare_jwt"
 /// - Set the gateway as active
-/// - Not attempt browser authentication
+/// - Attempt browser authentication (which will fail in CI — non-fatal)
 #[tokio::test]
 async fn gateway_add_creates_cf_metadata() {
     let tmpdir = tempfile::tempdir().expect("create config dir");
@@ -146,14 +154,13 @@ async fn gateway_add_creates_cf_metadata() {
             "https://my-gateway.example.com",
             "--name",
             "test-cf-gw",
-            "--no-auth",
         ],
     )
     .await;
 
     assert_eq!(
         code, 0,
-        "gateway add --no-auth should exit 0:\n{output}"
+        "gateway add should exit 0 (auth failure is non-fatal):\n{output}"
     );
 
     // Verify the metadata file was written.
@@ -230,14 +237,13 @@ async fn gateway_add_derives_name_from_hostname() {
             "gateway",
             "add",
             "https://my-special-gateway.brevlab.com",
-            "--no-auth",
         ],
     )
     .await;
 
     assert_eq!(
         code, 0,
-        "gateway add --no-auth should exit 0:\n{output}"
+        "gateway add should exit 0:\n{output}"
     );
 
     // The derived name should be the hostname.
@@ -251,6 +257,94 @@ async fn gateway_add_derives_name_from_hostname() {
         metadata_path.exists(),
         "metadata file should exist with hostname-derived name at {}",
         metadata_path.display()
+    );
+}
+
+// -------------------------------------------------------------------
+// Test 11: `gateway add` flag constraints
+// -------------------------------------------------------------------
+
+/// `--remote` and `--local` are mutually exclusive.
+#[tokio::test]
+async fn gateway_add_remote_and_local_conflict() {
+    let (output, code) = run_isolated(&[
+        "gateway",
+        "add",
+        "https://example.com",
+        "--remote",
+        "user@host",
+        "--local",
+    ])
+    .await;
+
+    assert_ne!(
+        code, 0,
+        "--remote and --local together should fail:\n{output}"
+    );
+}
+
+/// `--ssh-key` requires `--remote`.
+#[tokio::test]
+async fn gateway_add_ssh_key_requires_remote() {
+    let (output, code) = run_isolated(&[
+        "gateway",
+        "add",
+        "https://example.com",
+        "--ssh-key",
+        "/tmp/fake-key",
+    ])
+    .await;
+
+    assert_ne!(
+        code, 0,
+        "--ssh-key without --remote should fail:\n{output}"
+    );
+}
+
+// -------------------------------------------------------------------
+// Test 12: `gateway add` rejects duplicate names
+// -------------------------------------------------------------------
+
+/// Adding a gateway with a name that already exists should fail.
+#[tokio::test]
+async fn gateway_add_rejects_duplicate_name() {
+    let tmpdir = tempfile::tempdir().expect("create config dir");
+
+    // First add should succeed.
+    let (output, code) = run_with_config(
+        tmpdir.path(),
+        &[
+            "gateway",
+            "add",
+            "https://first.example.com",
+            "--name",
+            "my-gw",
+        ],
+    )
+    .await;
+    assert_eq!(code, 0, "first gateway add should succeed:\n{output}");
+
+    // Second add with the same name should fail.
+    let (output, code) = run_with_config(
+        tmpdir.path(),
+        &[
+            "gateway",
+            "add",
+            "https://second.example.com",
+            "--name",
+            "my-gw",
+        ],
+    )
+    .await;
+    assert_ne!(
+        code, 0,
+        "duplicate gateway add should fail:\n{output}"
+    );
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("already exists"),
+        "error should mention 'already exists':\n{clean}"
     );
 }
 
