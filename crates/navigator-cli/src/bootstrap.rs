@@ -9,7 +9,7 @@
 
 use std::time::Duration;
 
-use crate::tls::{grpc_client, TlsOptions};
+use crate::tls::{TlsOptions, grpc_client};
 use miette::Result;
 use owo_colors::OwoColorize;
 
@@ -132,15 +132,9 @@ pub async fn run_bootstrap(
         "ℹ".cyan().bold()
     );
     eprintln!();
-    eprintln!(
-        "  The Gateway provides a secure control plane for OpenShell. It streamlines"
-    );
-    eprintln!(
-        "  access for humans and agents alike — handles sandbox orchestration, and"
-    );
-    eprintln!(
-        "  enables secure, concurrent agent workflows."
-    );
+    eprintln!("  The Gateway provides a secure control plane for OpenShell. It streamlines");
+    eprintln!("  access for humans and agents alike — handles sandbox orchestration, and");
+    eprintln!("  enables secure, concurrent agent workflows.");
     eprintln!();
     eprintln!(
         "  Manage it later with: {} or {}",

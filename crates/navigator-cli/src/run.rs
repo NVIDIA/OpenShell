@@ -1798,8 +1798,7 @@ pub async fn sandbox_create(
                 eprintln!();
                 return Err(err);
             }
-            let (new_tls, new_server, _) =
-                crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+            let (new_tls, new_server, _) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
                 .wrap_err("bootstrap succeeded but failed to connect to gateway")?;
