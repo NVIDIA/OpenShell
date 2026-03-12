@@ -152,10 +152,14 @@ struct ParentSignalGuard {
 
 #[cfg(unix)]
 impl ParentSignalGuard {
+    #[allow(unsafe_code)]
     fn ignore_transient_tty_signals() -> Result<Self> {
         let mut previous = Vec::with_capacity(TRANSIENT_TTY_SIGNALS.len());
         for &signal in TRANSIENT_TTY_SIGNALS {
             let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+            // SAFETY: `sigaction` is the POSIX API for updating process signal
+            // dispositions. We install `SIG_IGN` for a small fixed set of
+            // terminal signals and store the previous handlers for restoration.
             let old = unsafe { sigaction(signal, &action) }.into_diagnostic()?;
             previous.push((signal, old));
         }
@@ -165,15 +169,24 @@ impl ParentSignalGuard {
 
 #[cfg(unix)]
 impl Drop for ParentSignalGuard {
+    #[allow(unsafe_code)]
     fn drop(&mut self) {
         for &(signal, previous) in self.previous.iter().rev() {
+            // SAFETY: these `SigAction` values were returned by `sigaction`
+            // above for this process, so restoring them here returns the parent
+            // signal handlers to their original state.
             let _ = unsafe { sigaction(signal, &previous) };
         }
     }
 }
 
 #[cfg(unix)]
+#[allow(unsafe_code)]
 fn reset_transient_tty_signals(command: &mut Command) {
+    // SAFETY: `pre_exec` runs in the forked child immediately before `exec`.
+    // We only reset a small fixed set of signal handlers to `SIG_DFL`, which is
+    // required so SSH receives terminal signals normally even though the parent
+    // process temporarily ignores them to preserve cleanup.
     unsafe {
         command.pre_exec(|| {
             for &signal in TRANSIENT_TTY_SIGNALS {
