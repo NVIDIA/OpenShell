@@ -25,4 +25,27 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-# No network policies means all outbound connections are denied and only inference.local is allowed.
+# Allow PyPI access so pip can install dependencies inside the sandbox.
+network_policies:
+  pypi:
+    name: PyPI
+    endpoints:
+      - { host: pypi.org, port: 443 }
+      - { host: files.pythonhosted.org, port: 443 }
+    binaries:
+      - path: /usr/bin/python3.12
+
+  # Direct access to the NVIDIA inference API (L7 TLS intercept).
+  # Used to verify that the L7 REST relay path streams responses correctly
+  # (contrast with the inference.local interception path above).
+  nvidia_direct:
+    name: NVIDIA API (L7 intercept)
+    endpoints:
+      - host: integrate.api.nvidia.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/python3.12
