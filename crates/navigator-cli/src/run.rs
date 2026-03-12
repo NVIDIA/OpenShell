@@ -802,12 +802,8 @@ fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
     }
 }
 
-fn gateway_auth_label(gateway: &GatewayMetadata) -> &'static str {
-    match gateway.auth_mode.as_deref() {
-        Some("cloudflare_jwt") => "jwt",
-        Some("mtls") => "mtls",
-        _ => "mtls",
-    }
+fn gateway_auth_label(gateway: &GatewayMetadata) -> &str {
+    gateway.auth_mode.as_deref().unwrap_or("unknown")
 }
 
 fn gateway_select_with<F>(
@@ -958,9 +954,7 @@ pub async fn gateway_add(
         // is not registered.  Pass the endpoint port so the container can be
         // identified by its host port binding when multiple gateways run on
         // the same Docker host.
-        let endpoint_port = url::Url::parse(&endpoint)
-            .ok()
-            .and_then(|u| u.port());
+        let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
         eprintln!("• Extracting TLS certificates from gateway container...");
         navigator_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
             .await?;
@@ -4453,8 +4447,8 @@ mod tests {
 
         assert_eq!(gateway_type_label(&gateways[0]), "cloud");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
-        assert_eq!(gateway_auth_label(&gateways[0]), "jwt");
-        assert_eq!(gateway_auth_label(&gateways[1]), "mtls");
+        assert_eq!(gateway_auth_label(&gateways[0]), "cloudflare_jwt");
+        assert_eq!(gateway_auth_label(&gateways[1]), "unknown");
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
@@ -4462,9 +4456,9 @@ mod tests {
         assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
         assert!(items[0].contains("cloud"));
-        assert!(items[0].contains("jwt"));
+        assert!(items[0].contains("cloudflare_jwt"));
         assert!(items[1].contains("local"));
-        assert!(items[1].contains("mtls"));
+        assert!(items[1].contains("unknown"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
     }
 
