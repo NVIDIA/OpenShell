@@ -68,6 +68,10 @@ server:
   sandboxNamespace: openshell
   dbUrl: "sqlite:/var/openshell/openshell.db"
   sandboxImage: "ghcr.io/nvidia/openshell/sandbox:latest"
+  # Kubernetes imagePullPolicy for sandbox pods.  Empty = Kubernetes default
+  # (Always for :latest, IfNotPresent otherwise).  Set to "Always" for dev
+  # clusters so new images are picked up without manual eviction.
+  sandboxImagePullPolicy: ""
   # gRPC endpoint for sandboxes to callback to OpenShell (must be reachable from pods)
   grpcEndpoint: "https://openshell.openshell.svc.cluster.local:8080"
   # Public host/port returned to CLI clients for SSH proxy CONNECT requests.

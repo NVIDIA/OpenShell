@@ -51,6 +51,10 @@ spec:
               value: {{ .Values.server.sandboxNamespace | quote }}
             - name: OPENSHELL_SANDBOX_IMAGE
               value: {{ .Values.server.sandboxImage | quote }}
+            {{- if .Values.server.sandboxImagePullPolicy }}
+            - name: OPENSHELL_SANDBOX_IMAGE_PULL_POLICY
+              value: {{ .Values.server.sandboxImagePullPolicy | quote }}
+            {{- end }}
             - name: OPENSHELL_GRPC_ENDPOINT
               value: {{ if .Values.server.disableTls }}{{ .Values.server.grpcEndpoint | replace "https://" "http://" | quote }}{{ else }}{{ .Values.server.grpcEndpoint | quote }}{{ end }}
             {{- if .Values.server.sshGatewayHost }}

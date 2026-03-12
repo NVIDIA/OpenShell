@@ -37,6 +37,9 @@ pub struct SandboxClient {
     client: Client,
     namespace: String,
     default_image: String,
+    /// Kubernetes `imagePullPolicy` for sandbox containers.  When empty the
+    /// field is omitted from the pod spec and Kubernetes applies its default.
+    image_pull_policy: String,
     grpc_endpoint: String,
     ssh_listen_addr: String,
     ssh_handshake_secret: String,
@@ -59,6 +62,7 @@ impl SandboxClient {
     pub async fn new(
         namespace: String,
         default_image: String,
+        image_pull_policy: String,
         grpc_endpoint: String,
         ssh_listen_addr: String,
         ssh_handshake_secret: String,
@@ -79,6 +83,7 @@ impl SandboxClient {
             client,
             namespace,
             default_image,
+            image_pull_policy,
             grpc_endpoint,
             ssh_listen_addr,
             ssh_handshake_secret,
@@ -149,6 +154,7 @@ impl SandboxClient {
         obj.data = sandbox_to_k8s_spec(
             sandbox.spec.as_ref(),
             &self.default_image,
+            &self.image_pull_policy,
             &sandbox.id,
             &sandbox.name,
             &self.grpc_endpoint,
@@ -721,6 +727,7 @@ fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_imag
 fn sandbox_to_k8s_spec(
     spec: Option<&SandboxSpec>,
     default_image: &str,
+    image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -746,6 +753,7 @@ fn sandbox_to_k8s_spec(
                 sandbox_template_to_k8s(
                     template,
                     default_image,
+                    image_pull_policy,
                     sandbox_id,
                     sandbox_name,
                     grpc_endpoint,
@@ -777,6 +785,7 @@ fn sandbox_to_k8s_spec(
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
                 default_image,
+                image_pull_policy,
                 sandbox_id,
                 sandbox_name,
                 grpc_endpoint,
@@ -798,6 +807,7 @@ fn sandbox_to_k8s_spec(
 fn sandbox_template_to_k8s(
     template: &SandboxTemplate,
     default_image: &str,
+    image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -812,6 +822,7 @@ fn sandbox_template_to_k8s(
             pod_template,
             template,
             default_image,
+            image_pull_policy,
             sandbox_id,
             sandbox_name,
             grpc_endpoint,
@@ -861,6 +872,12 @@ fn sandbox_template_to_k8s(
     };
     if !image.is_empty() {
         container.insert("image".to_string(), serde_json::json!(image));
+        if !image_pull_policy.is_empty() {
+            container.insert(
+                "imagePullPolicy".to_string(),
+                serde_json::json!(image_pull_policy),
+            );
+        }
     }
 
     // Build environment variables - start with OpenShell-required vars
@@ -945,6 +962,7 @@ fn inject_pod_template(
     mut pod_template: serde_json::Value,
     template: &SandboxTemplate,
     default_image: &str,
+    image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
     grpc_endpoint: &str,
@@ -1005,6 +1023,16 @@ fn inject_pod_template(
             spec_environment,
             !client_tls_secret_name.is_empty(),
         );
+
+        // Inject imagePullPolicy on the agent container.
+        if !image_pull_policy.is_empty() {
+            if let Some(container_obj) = container.as_object_mut() {
+                container_obj.insert(
+                    "imagePullPolicy".to_string(),
+                    serde_json::json!(image_pull_policy),
+                );
+            }
+        }
 
         // Inject TLS volumeMount on the agent container.
         if !client_tls_secret_name.is_empty()

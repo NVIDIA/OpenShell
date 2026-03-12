@@ -49,6 +49,10 @@ struct Args {
     #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE")]
     sandbox_image: Option<String>,
 
+    /// Kubernetes imagePullPolicy for sandbox pods (Always, IfNotPresent, Never).
+    #[arg(long, env = "OPENSHELL_SANDBOX_IMAGE_PULL_POLICY")]
+    sandbox_image_pull_policy: Option<String>,
+
     /// gRPC endpoint for sandboxes to callback to `OpenShell`.
     /// This should be reachable from within the Kubernetes cluster.
     #[arg(long, env = "OPENSHELL_GRPC_ENDPOINT")]
@@ -155,6 +159,10 @@ async fn main() -> Result<()> {
 
     if let Some(image) = args.sandbox_image {
         config = config.with_sandbox_image(image);
+    }
+
+    if let Some(policy) = args.sandbox_image_pull_policy {
+        config = config.with_sandbox_image_pull_policy(policy);
     }
 
     if let Some(endpoint) = args.grpc_endpoint {
