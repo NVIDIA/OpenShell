@@ -5,10 +5,12 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+pub mod denial_aggregator;
 mod grpc_client;
 mod identity;
 pub mod l7;
 pub mod log_push;
+pub mod mechanistic_mapper;
 pub mod opa;
 mod policy;
 mod process;
@@ -165,6 +167,7 @@ pub async fn run_sandbox(
 
     // Load policy and initialize OPA engine
     let navigator_endpoint_for_proxy = navigator_endpoint.clone();
+    let sandbox_name_for_agg = sandbox.clone();
     let (policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         sandbox,
@@ -275,7 +278,7 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let _proxy = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let (_proxy, denial_rx) = if matches!(policy.network.mode, NetworkMode::Proxy) {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
@@ -307,21 +310,29 @@ pub async fn run_sandbox(
         )
         .await?;
 
-        Some(
-            ProxyHandle::start_with_bind_addr(
-                proxy_policy,
-                bind_addr,
-                engine,
-                cache,
-                entrypoint_pid.clone(),
-                tls_state,
-                inference_ctx,
-                secret_resolver.clone(),
-            )
-            .await?,
+        // Create denial aggregator channel if in gRPC mode (sandbox_id present).
+        let (denial_tx, denial_rx) = if sandbox_id.is_some() {
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            (Some(tx), Some(rx))
+        } else {
+            (None, None)
+        };
+
+        let proxy_handle = ProxyHandle::start_with_bind_addr(
+            proxy_policy,
+            bind_addr,
+            engine,
+            cache,
+            entrypoint_pid.clone(),
+            tls_state,
+            inference_ctx,
+            secret_resolver.clone(),
+            denial_tx,
         )
+        .await?;
+        (Some(proxy_handle), denial_rx)
     } else {
-        None
+        (None, None)
     };
 
     // Compute the proxy URL and netns fd for SSH sessions.
@@ -527,7 +538,7 @@ pub async fn run_sandbox(
         let poll_interval_secs: u64 = std::env::var("OPENSHELL_POLICY_POLL_INTERVAL_SECS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(30);
+            .unwrap_or(10);
 
         tokio::spawn(async move {
             if let Err(e) =
@@ -537,6 +548,36 @@ pub async fn run_sandbox(
                 warn!(error = %e, "Policy poll loop exited with error");
             }
         });
+
+        // Spawn denial aggregator (gRPC mode only, when proxy is active).
+        if let Some(rx) = denial_rx {
+            // SubmitPolicyAnalysis resolves by sandbox *name*, not UUID.
+            let agg_name = sandbox_name_for_agg.clone().unwrap_or_else(|| id.clone());
+            let agg_endpoint = endpoint.clone();
+            let flush_interval_secs: u64 = std::env::var("OPENSHELL_DENIAL_FLUSH_INTERVAL_SECS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10);
+
+            let aggregator = denial_aggregator::DenialAggregator::new(rx, flush_interval_secs);
+
+            tokio::spawn(async move {
+                aggregator
+                    .run(|summaries| {
+                        let endpoint = agg_endpoint.clone();
+                        let sandbox_name = agg_name.clone();
+                        async move {
+                            if let Err(e) =
+                                flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries)
+                                    .await
+                            {
+                                warn!(error = %e, "Failed to flush denial summaries to gateway");
+                            }
+                        }
+                    })
+                    .await;
+            });
+        }
     }
 
     // Wait for process with optional timeout
@@ -1129,6 +1170,69 @@ fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 /// Background loop that polls the server for policy updates.
 ///
 /// When a new version is detected, attempts to reload the OPA engine via
+/// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
+async fn flush_proposals_to_gateway(
+    endpoint: &str,
+    sandbox_name: &str,
+    summaries: Vec<denial_aggregator::FlushableDenialSummary>,
+) -> Result<()> {
+    use crate::grpc_client::CachedNavigatorClient;
+    use navigator_core::proto::{DenialSummary, L7RequestSample};
+
+    let client = CachedNavigatorClient::connect(endpoint).await?;
+
+    // Convert FlushableDenialSummary to proto DenialSummary.
+    let proto_summaries: Vec<DenialSummary> = summaries
+        .into_iter()
+        .map(|s| DenialSummary {
+            sandbox_id: String::new(),
+            host: s.host,
+            port: s.port as u32,
+            binary: s.binary,
+            ancestors: s.ancestors,
+            deny_reason: s.deny_reason,
+            first_seen_ms: s.first_seen_ms,
+            last_seen_ms: s.last_seen_ms,
+            count: s.count,
+            suppressed_count: 0,
+            total_count: s.count,
+            sample_cmdlines: s.sample_cmdlines,
+            binary_sha256: String::new(),
+            persistent: false,
+            denial_stage: s.denial_stage,
+            l7_request_samples: s
+                .l7_samples
+                .into_iter()
+                .map(|l| L7RequestSample {
+                    method: l.method,
+                    path: l.path,
+                    decision: "deny".to_string(),
+                    count: l.count,
+                })
+                .collect(),
+            l7_inspection_active: false,
+        })
+        .collect();
+
+    // Run the mechanistic mapper sandbox-side to generate proposals.
+    // The gateway is a thin persistence + validation layer — it never
+    // generates proposals itself.
+    let proposals = mechanistic_mapper::generate_proposals(&proto_summaries).await;
+
+    info!(
+        sandbox_name = %sandbox_name,
+        summaries = proto_summaries.len(),
+        proposals = proposals.len(),
+        "Flushed denial analysis to gateway"
+    );
+
+    client
+        .submit_policy_analysis(sandbox_name, proto_summaries, proposals, "mechanistic")
+        .await?;
+
+    Ok(())
+}
+
 /// `reload_from_proto()`. Reports load success/failure back to the server.
 /// On failure, the previous engine is untouched (LKG behavior).
 async fn run_policy_poll_loop(

@@ -396,6 +396,13 @@ enum Commands {
         command: Option<PolicyCommands>,
     },
 
+    /// Manage network rules for a sandbox.
+    #[command(visible_alias = "rl", hide = true, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Rule {
+        #[command(subcommand)]
+        command: Option<DraftCommands>,
+    },
+
     /// Manage provider configuration.
     #[command(after_help = PROVIDER_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Provider {
@@ -1188,6 +1195,71 @@ enum SandboxCommands {
 }
 
 #[derive(Subcommand, Debug)]
+enum DraftCommands {
+    /// Show network rules for a sandbox.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Filter by status (pending, approved, rejected).
+        #[arg(long)]
+        status: Option<String>,
+    },
+
+    /// Approve a network rule.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Approve {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to approve.
+        #[arg(long)]
+        chunk_id: String,
+    },
+
+    /// Reject a network rule.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Reject {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Chunk ID to reject.
+        #[arg(long)]
+        chunk_id: String,
+
+        /// Reason for rejection.
+        #[arg(long, default_value = "")]
+        reason: String,
+    },
+
+    /// Approve all pending network rules.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    ApproveAll {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+
+        /// Also approve security-flagged rules.
+        #[arg(long)]
+        include_security_flagged: bool,
+    },
+
+    /// Clear all pending network rules.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Clear {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+    },
+
+    /// Show network rule history.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    History {
+        /// Sandbox name (defaults to last-used sandbox).
+        name: Option<String>,
+    },
+}
+
+#[derive(Subcommand, Debug)]
 enum PolicyCommands {
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
@@ -1575,6 +1647,58 @@ async fn main() -> Result<()> {
                 PolicyCommands::List { name, limit } => {
                     let name = resolve_sandbox_name(name, &ctx.name)?;
                     run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Network rules
+        // -----------------------------------------------------------
+        Some(Commands::Rule {
+            command: Some(draft_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_edge_auth(&mut tls, &ctx.name);
+            match draft_cmd {
+                DraftCommands::Get { name, status } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_get(&ctx.endpoint, &name, status.as_deref(), &tls).await?;
+                }
+                DraftCommands::Approve { name, chunk_id } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_approve(&ctx.endpoint, &name, &chunk_id, &tls).await?;
+                }
+                DraftCommands::Reject {
+                    name,
+                    chunk_id,
+                    reason,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_reject(&ctx.endpoint, &name, &chunk_id, &reason, &tls)
+                        .await?;
+                }
+                DraftCommands::ApproveAll {
+                    name,
+                    include_security_flagged,
+                } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_approve_all(
+                        &ctx.endpoint,
+                        &name,
+                        include_security_flagged,
+                        &tls,
+                    )
+                    .await?;
+                }
+
+                DraftCommands::Clear { name } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_clear(&ctx.endpoint, &name, &tls).await?;
+                }
+                DraftCommands::History { name } => {
+                    let name = resolve_sandbox_name(name, &ctx.name)?;
+                    run::sandbox_draft_history(&ctx.endpoint, &name, &tls).await?;
                 }
             }
         }
@@ -2009,6 +2133,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("inference")
                 .expect("inference subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Rule { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("rule")
+                .expect("rule subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -2467,5 +2598,47 @@ mod tests {
 
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
         });
+    }
+
+    /// Verify the flag names the TUI uses to build its ProxyCommand are
+    /// accepted by the `SshProxy` subcommand and land in the right fields.
+    /// This catches drift when CLI flags are renamed or restructured.
+    #[test]
+    fn ssh_proxy_token_mode_flags_match_tui_proxy_command() {
+        // This is the exact flag pattern constructed by the TUI in lib.rs
+        // (handle_shell_connect, handle_exec, handle_port_forward).
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "ssh-proxy",
+            "--gateway",
+            "https://gw.example.com:8080/proxy/connect",
+            "--sandbox-id",
+            "sbx-123",
+            "--token",
+            "tok-abc",
+            "--gateway-name",
+            "my-gateway",
+        ])
+        .expect("TUI proxy command flags must be accepted by the CLI");
+
+        match cli.command {
+            Some(Commands::SshProxy {
+                gateway,
+                sandbox_id,
+                token,
+                gateway_name,
+                ..
+            }) => {
+                assert_eq!(
+                    gateway.as_deref(),
+                    Some("https://gw.example.com:8080/proxy/connect"),
+                    "gateway URL must land in SshProxy.gateway, not the global flag"
+                );
+                assert_eq!(sandbox_id.as_deref(), Some("sbx-123"));
+                assert_eq!(token.as_deref(), Some("tok-abc"));
+                assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
+            }
+            other => panic!("expected SshProxy, got: {other:?}"),
+        }
     }
 }

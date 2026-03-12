@@ -234,6 +234,20 @@ These RPCs are called by sandbox pods at startup to bootstrap themselves.
 | `GetSandboxPolicy` | Returns the `SandboxPolicy` from a sandbox's spec, looked up by sandbox ID. |
 | `GetSandboxProviderEnvironment` | Resolves provider credentials into environment variables for a sandbox. Iterates the sandbox's `spec.providers` list, fetches each `Provider`, and collects credential key-value pairs. First provider wins on duplicate keys. Skips credential keys that do not match `^[A-Za-z_][A-Za-z0-9_]*$`. |
 
+#### Policy Recommendation (Network Rules)
+
+These RPCs support the sandbox-initiated policy recommendation pipeline. The sandbox generates proposals via its mechanistic mapper and submits them; the gateway validates, persists, and manages the approval workflow. See [architecture/policy-advisor.md](policy-advisor.md) for the full pipeline design.
+
+| RPC | Description |
+|-----|-------------|
+| `SubmitPolicyAnalysis` | Receives pre-formed `PolicyChunk` proposals from a sandbox. Validates each chunk, persists via upsert on `(sandbox_id, host, port, binary)` dedup key, notifies watch bus. |
+| `GetDraftPolicy` | Returns all draft chunks for a sandbox with current draft version. |
+| `ApproveDraftChunk` | Approves a pending or rejected chunk. Merges the proposed rule into the active policy (appends binary to existing rule or inserts new rule). |
+| `RejectDraftChunk` | Rejects a pending chunk or revokes an approved chunk. If revoking, removes the binary from the active policy rule. |
+| `ApproveAllDraftChunks` | Bulk approves all pending chunks for a sandbox. |
+| `EditDraftChunk` | Updates the proposed rule on a pending chunk. |
+| `GetDraftHistory` | Returns all chunks (including rejected) for audit trail. |
+
 ### Inference Service
 
 Defined in `proto/inference.proto`, implemented in `crates/navigator-server/src/inference.rs` as `InferenceService`.

@@ -89,6 +89,42 @@ service Navigator {
   // - Navigator server process logs correlated by sandbox_id
   // - Platform events correlated to the sandbox
   rpc WatchSandbox(WatchSandboxRequest) returns (stream SandboxStreamEvent);
+
+  // ---------------------------------------------------------------------------
+  // Draft policy recommendation RPCs
+  // ---------------------------------------------------------------------------
+
+  // Submit denial analysis results from sandbox (summaries + proposed chunks).
+  rpc SubmitPolicyAnalysis(SubmitPolicyAnalysisRequest)
+      returns (SubmitPolicyAnalysisResponse);
+
+  // Get draft policy recommendations for a sandbox.
+  rpc GetDraftPolicy(GetDraftPolicyRequest) returns (GetDraftPolicyResponse);
+
+  // Approve a single draft policy chunk (merges into active policy).
+  rpc ApproveDraftChunk(ApproveDraftChunkRequest)
+      returns (ApproveDraftChunkResponse);
+
+  // Reject a single draft policy chunk.
+  rpc RejectDraftChunk(RejectDraftChunkRequest)
+      returns (RejectDraftChunkResponse);
+
+  // Approve all pending draft chunks (skips security-flagged unless forced).
+  rpc ApproveAllDraftChunks(ApproveAllDraftChunksRequest)
+      returns (ApproveAllDraftChunksResponse);
+
+  // Edit a pending draft chunk in-place (e.g. narrow allowed_ips).
+  rpc EditDraftChunk(EditDraftChunkRequest) returns (EditDraftChunkResponse);
+
+  // Reverse an approval (remove merged rule from active policy).
+  rpc UndoDraftChunk(UndoDraftChunkRequest) returns (UndoDraftChunkResponse);
+
+  // Clear all pending draft chunks for a sandbox.
+  rpc ClearDraftChunks(ClearDraftChunksRequest)
+      returns (ClearDraftChunksResponse);
+
+  // Get decision history for a sandbox's draft policy.
+  rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
 }
 
 // Health check request.
@@ -303,6 +339,8 @@ message SandboxStreamEvent {
     PlatformEvent event = 3;
     // Warning from the server (e.g. missed messages due to lag).
     SandboxStreamWarning warning = 4;
+    // Draft policy update notification.
+    DraftPolicyUpdate draft_policy_update = 5;
   }
 }
 
@@ -537,4 +575,253 @@ enum ServiceStatus {
   SERVICE_STATUS_HEALTHY = 1;
   SERVICE_STATUS_DEGRADED = 2;
   SERVICE_STATUS_UNHEALTHY = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Draft policy recommendation messages
+// ---------------------------------------------------------------------------
+
+// Observed HTTP method+path pattern from L7 inspection.
+message L7RequestSample {
+  // HTTP method: GET, POST, PUT, DELETE, etc.
+  string method = 1;
+  // HTTP path: /v1/models, /repos/myorg/issues
+  string path = 2;
+  // L7 decision: "audit" or "deny" (allowed requests not collected).
+  string decision = 3;
+  // Number of times this (method, path) was observed.
+  uint32 count = 4;
+}
+
+// Structured denial summary from sandbox aggregator.
+message DenialSummary {
+  // Sandbox ID that produced this summary.
+  string sandbox_id = 1;
+  // Denied destination host.
+  string host = 2;
+  // Denied destination port.
+  uint32 port = 3;
+  // Binary that attempted the connection.
+  string binary = 4;
+  // Process ancestor chain.
+  repeated string ancestors = 5;
+  // Denial reason from OPA evaluation.
+  string deny_reason = 6;
+  // First denial timestamp (ms since epoch).
+  int64 first_seen_ms = 7;
+  // Most recent denial timestamp (ms since epoch).
+  int64 last_seen_ms = 8;
+  // Number of denials in the current window.
+  uint32 count = 9;
+  // Events dropped during aggregator cooldown.
+  uint32 suppressed_count = 10;
+  // Cumulative lifetime count (never resets).
+  uint32 total_count = 11;
+  // Distinct cmdline strings observed (sanitized of credentials).
+  repeated string sample_cmdlines = 12;
+  // SHA-256 of the binary for audit trail.
+  string binary_sha256 = 13;
+  // True if emitted by stale-flush rather than threshold.
+  bool persistent = 14;
+  // Denial category: "l4_deny", "l7_deny", "l7_audit", "ssrf".
+  string denial_stage = 15;
+  // Observed HTTP request patterns (from L7 inspection).
+  repeated L7RequestSample l7_request_samples = 16;
+  // True if L7 inspection was active during observation window.
+  bool l7_inspection_active = 17;
+}
+
+// A proposed policy rule with rationale and approval status.
+message PolicyChunk {
+  // Unique chunk identifier.
+  string id = 1;
+  // Approval status: "pending", "approved", "rejected".
+  string status = 2;
+  // Proposed network_policies map key.
+  string rule_name = 3;
+  // The proposed network policy rule.
+  navigator.sandbox.v1.NetworkPolicyRule proposed_rule = 4;
+  // Human-readable explanation of why this rule is proposed.
+  string rationale = 5;
+  // Security concerns flagged by analysis (empty if none).
+  string security_notes = 6;
+  // Analysis confidence (0.0-1.0). 0 for mechanistic mode.
+  float confidence = 7;
+  // IDs of denial summaries that led to this chunk.
+  repeated string denial_summary_ids = 8;
+  // Creation timestamp (ms since epoch).
+  int64 created_at_ms = 9;
+  // When the user approved/rejected (ms since epoch). 0 if undecided.
+  int64 decided_at_ms = 10;
+  // Recommendation stage: "initial" or "refined" (progressive L7 visibility).
+  string stage = 11;
+  // For stage="refined": the initial chunk this replaces.
+  string supersedes_chunk_id = 12;
+  // How many times this endpoint has been seen across denial flush cycles.
+  int32 hit_count = 13;
+  // First time this endpoint was proposed (ms since epoch).
+  int64 first_seen_ms = 14;
+  // Most recent time this endpoint was re-proposed (ms since epoch).
+  int64 last_seen_ms = 15;
+  // Binary path that triggered the denial (denormalized for display convenience).
+  string binary = 16;
+}
+
+// Notification that the draft policy was updated.
+message DraftPolicyUpdate {
+  // Current draft version.
+  uint64 draft_version = 1;
+  // Number of new chunks added in this update.
+  uint32 new_chunks = 2;
+  // Total pending chunks awaiting approval.
+  uint32 total_pending = 3;
+  // Brief description of what changed.
+  string summary = 4;
+}
+
+// Submit analysis results from sandbox to gateway.
+message SubmitPolicyAnalysisRequest {
+  // Aggregated denial summaries.
+  repeated DenialSummary summaries = 1;
+  // Proposed policy chunks (validated by sandbox OPA engine).
+  repeated PolicyChunk proposed_chunks = 2;
+  // Analysis mode: "mechanistic" or "llm".
+  string analysis_mode = 3;
+  // Sandbox name.
+  string name = 4;
+}
+
+message SubmitPolicyAnalysisResponse {
+  // Number of chunks accepted by the gateway.
+  uint32 accepted_chunks = 1;
+  // Number of chunks rejected by gateway validation.
+  uint32 rejected_chunks = 2;
+  // Reasons for each rejected chunk.
+  repeated string rejection_reasons = 3;
+}
+
+// Get draft policy for a sandbox.
+message GetDraftPolicyRequest {
+  // Sandbox name.
+  string name = 1;
+  // Optional status filter: "pending", "approved", "rejected", or "" for all.
+  string status_filter = 2;
+}
+
+message GetDraftPolicyResponse {
+  // Draft policy chunks.
+  repeated PolicyChunk chunks = 1;
+  // LLM-generated summary of all analysis (empty in mechanistic mode).
+  string rolling_summary = 2;
+  // Current draft version.
+  uint64 draft_version = 3;
+  // When the last analysis completed (ms since epoch).
+  int64 last_analyzed_at_ms = 4;
+}
+
+// Approve a single draft chunk.
+message ApproveDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to approve.
+  string chunk_id = 2;
+}
+
+message ApproveDraftChunkResponse {
+  // New policy version after merge.
+  uint32 policy_version = 1;
+  // SHA-256 hash of the new policy.
+  string policy_hash = 2;
+}
+
+// Reject a single draft chunk.
+message RejectDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to reject.
+  string chunk_id = 2;
+  // Optional reason for rejection (fed to LLM context in future analysis).
+  string reason = 3;
+}
+
+message RejectDraftChunkResponse {}
+
+// Approve all pending chunks.
+message ApproveAllDraftChunksRequest {
+  // Sandbox name.
+  string name = 1;
+  // Include chunks with security_notes (default false: skips them).
+  bool include_security_flagged = 2;
+}
+
+message ApproveAllDraftChunksResponse {
+  // New policy version after merge.
+  uint32 policy_version = 1;
+  // SHA-256 hash of the new policy.
+  string policy_hash = 2;
+  // Number of chunks approved.
+  uint32 chunks_approved = 3;
+  // Number of chunks skipped (security-flagged).
+  uint32 chunks_skipped = 4;
+}
+
+// Edit a pending chunk in-place.
+message EditDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to edit.
+  string chunk_id = 2;
+  // The modified rule (replaces existing proposed_rule).
+  navigator.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
+}
+
+message EditDraftChunkResponse {}
+
+// Reverse an approval (remove merged rule from active policy).
+message UndoDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to undo.
+  string chunk_id = 2;
+}
+
+message UndoDraftChunkResponse {
+  // New policy version after removal.
+  uint32 policy_version = 1;
+  // SHA-256 hash of the updated policy.
+  string policy_hash = 2;
+}
+
+// Clear all pending draft chunks for a sandbox.
+message ClearDraftChunksRequest {
+  // Sandbox name.
+  string name = 1;
+}
+
+message ClearDraftChunksResponse {
+  // Number of chunks cleared.
+  uint32 chunks_cleared = 1;
+}
+
+// Get decision history for a sandbox's draft policy.
+message GetDraftHistoryRequest {
+  // Sandbox name.
+  string name = 1;
+}
+
+message DraftHistoryEntry {
+  // Event timestamp (ms since epoch).
+  int64 timestamp_ms = 1;
+  // Event type: "denial_detected", "analysis_cycle", "approved",
+  // "rejected", "edited", "undone", "cleared".
+  string event_type = 2;
+  // Human-readable description.
+  string description = 3;
+  // Associated chunk ID (if applicable).
+  string chunk_id = 4;
+}
+
+message GetDraftHistoryResponse {
+  // Chronological decision history.
+  repeated DraftHistoryEntry entries = 1;
 }

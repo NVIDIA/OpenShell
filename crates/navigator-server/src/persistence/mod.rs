@@ -298,6 +298,111 @@ impl Store {
             .map(Some)
             .map_err(|e| Error::execution(format!("protobuf decode error: {e}")))
     }
+
+    // -----------------------------------------------------------------------
+    // Draft policy chunk operations
+    // -----------------------------------------------------------------------
+
+    /// Insert a new draft policy chunk.
+    pub async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> Result<()> {
+        match self {
+            Self::Postgres(store) => store.put_draft_chunk(chunk).await,
+            Self::Sqlite(store) => store.put_draft_chunk(chunk).await,
+        }
+    }
+
+    /// Fetch a single draft chunk by id.
+    pub async fn get_draft_chunk(&self, id: &str) -> Result<Option<DraftChunkRecord>> {
+        match self {
+            Self::Postgres(store) => store.get_draft_chunk(id).await,
+            Self::Sqlite(store) => store.get_draft_chunk(id).await,
+        }
+    }
+
+    /// List draft chunks for a sandbox, optionally filtered by status.
+    pub async fn list_draft_chunks(
+        &self,
+        sandbox_id: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DraftChunkRecord>> {
+        match self {
+            Self::Postgres(store) => store.list_draft_chunks(sandbox_id, status_filter).await,
+            Self::Sqlite(store) => store.list_draft_chunks(sandbox_id, status_filter).await,
+        }
+    }
+
+    /// Update the status of a draft chunk.
+    pub async fn update_draft_chunk_status(
+        &self,
+        id: &str,
+        status: &str,
+        decided_at_ms: Option<i64>,
+    ) -> Result<bool> {
+        match self {
+            Self::Postgres(store) => {
+                store
+                    .update_draft_chunk_status(id, status, decided_at_ms)
+                    .await
+            }
+            Self::Sqlite(store) => {
+                store
+                    .update_draft_chunk_status(id, status, decided_at_ms)
+                    .await
+            }
+        }
+    }
+
+    /// Update the proposed rule on a pending draft chunk.
+    pub async fn update_draft_chunk_rule(&self, id: &str, proposed_rule: &[u8]) -> Result<bool> {
+        match self {
+            Self::Postgres(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
+            Self::Sqlite(store) => store.update_draft_chunk_rule(id, proposed_rule).await,
+        }
+    }
+
+    /// Delete all draft chunks for a sandbox with a given status.
+    pub async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> Result<u64> {
+        match self {
+            Self::Postgres(store) => store.delete_draft_chunks(sandbox_id, status).await,
+            Self::Sqlite(store) => store.delete_draft_chunks(sandbox_id, status).await,
+        }
+    }
+
+    /// Get the current maximum draft version for a sandbox.
+    pub async fn get_draft_version(&self, sandbox_id: &str) -> Result<i64> {
+        match self {
+            Self::Postgres(store) => store.get_draft_version(sandbox_id).await,
+            Self::Sqlite(store) => store.get_draft_version(sandbox_id).await,
+        }
+    }
+}
+
+/// Stored draft policy chunk record.
+#[derive(Debug, Clone)]
+pub struct DraftChunkRecord {
+    pub id: String,
+    pub sandbox_id: String,
+    pub draft_version: i64,
+    pub status: String,
+    pub rule_name: String,
+    pub proposed_rule: Vec<u8>,
+    pub rationale: String,
+    pub security_notes: String,
+    pub confidence: f64,
+    pub created_at_ms: i64,
+    pub decided_at_ms: Option<i64>,
+    /// Denormalized endpoint host (lowercase) for DB-level dedup.
+    pub host: String,
+    /// Denormalized endpoint port for DB-level dedup.
+    pub port: i32,
+    /// Binary path that triggered the denial (for per-binary dedup).
+    pub binary: String,
+    /// How many times this endpoint has been seen across denial flush cycles.
+    pub hit_count: i32,
+    /// First time this endpoint was proposed (ms since epoch).
+    pub first_seen_ms: i64,
+    /// Most recent time this endpoint was re-proposed (ms since epoch).
+    pub last_seen_ms: i64,
 }
 
 fn current_time_ms() -> Result<i64> {

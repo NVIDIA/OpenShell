@@ -100,6 +100,20 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                     handle_shell_connect(&mut app, &mut terminal, &events).await;
                     refresh_data(&mut app).await;
                 }
+                // --- Draft actions ---
+                if app.pending_draft_approve {
+                    app.pending_draft_approve = false;
+                    spawn_draft_approve(&app, events.sender());
+                }
+                if app.pending_draft_reject {
+                    app.pending_draft_reject = false;
+                    spawn_draft_reject(&app, events.sender());
+                }
+                if app.pending_draft_approve_all {
+                    app.pending_draft_approve_all = false;
+                    let snapshot = std::mem::take(&mut app.approve_all_confirm_chunks);
+                    spawn_draft_approve_all(&app, snapshot, events.sender());
+                }
             }
             Some(Event::LogLines(lines)) => {
                 app.sandbox_log_lines.extend(lines);
@@ -174,6 +188,19 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                     app.status_text = format!("delete provider failed: {msg}");
                 }
             },
+            Some(Event::DraftActionResult(result)) => {
+                match result {
+                    Ok(msg) => {
+                        app.status_text = msg;
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("draft action failed: {msg}");
+                    }
+                }
+                // Refresh draft chunks + counts immediately after any action.
+                refresh_draft_chunks(&mut app).await;
+                refresh_sandbox_draft_counts(&mut app).await;
+            }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
                     app.scroll_logs(-3);
@@ -202,6 +229,9 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                 refresh_gateway_list(&mut app);
                 refresh_data(&mut app).await;
 
+                // Refresh per-sandbox draft counts for badges (dashboard + detail).
+                refresh_sandbox_draft_counts(&mut app).await;
+
                 // Auto-refresh the policy view when a new version is detected.
                 if app.screen == Screen::Sandbox {
                     let displayed = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
@@ -213,6 +243,9 @@ pub async fn run(channel: Channel, gateway_name: &str, endpoint: &str) -> Result
                     if listed > 0 && listed != displayed {
                         refresh_sandbox_policy(&mut app).await;
                     }
+
+                    // Refresh draft chunks when on sandbox screen.
+                    refresh_draft_chunks(&mut app).await;
                 }
             }
             Some(Event::Redraw) => {
@@ -735,7 +768,7 @@ async fn handle_shell_connect(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let gateway = shell_escape(&app.gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
     // Step 5: Build the SSH command.
@@ -877,7 +910,7 @@ async fn handle_exec_command(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let gateway = shell_escape(&app.gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
 
@@ -1302,7 +1335,7 @@ async fn start_port_forwards(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let gateway = shell_escape(gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
 
@@ -1545,6 +1578,144 @@ fn spawn_delete_provider(app: &App, tx: mpsc::UnboundedSender<Event>) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Draft approval / rejection
+// ---------------------------------------------------------------------------
+
+/// Approve the currently selected draft chunk.
+fn spawn_draft_approve(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let abs = app.draft_scroll + app.draft_selected;
+    let chunk_id = match app.draft_chunks.get(abs) {
+        Some(c) => c.id.clone(),
+        None => return,
+    };
+    let rule_name = app
+        .draft_chunks
+        .get(abs)
+        .map_or_else(String::new, |c| c.rule_name.clone());
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::ApproveDraftChunkRequest { name, chunk_id };
+        match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req)).await {
+            Ok(Ok(resp)) => {
+                let inner = resp.into_inner();
+                let _ = tx.send(Event::DraftActionResult(Ok(format!(
+                    "Approved '{}' -> policy v{}",
+                    rule_name, inner.policy_version
+                ))));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(Err(
+                    "approve timed out".to_string()
+                )));
+            }
+        }
+    });
+}
+
+/// Reject the currently selected draft chunk.
+fn spawn_draft_reject(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+    let abs = app.draft_scroll + app.draft_selected;
+    let chunk_id = match app.draft_chunks.get(abs) {
+        Some(c) => c.id.clone(),
+        None => return,
+    };
+    let rule_name = app
+        .draft_chunks
+        .get(abs)
+        .map_or_else(String::new, |c| c.rule_name.clone());
+
+    tokio::spawn(async move {
+        let req = navigator_core::proto::RejectDraftChunkRequest {
+            name,
+            chunk_id,
+            reason: String::new(),
+        };
+        match tokio::time::timeout(Duration::from_secs(5), client.reject_draft_chunk(req)).await {
+            Ok(Ok(_)) => {
+                let _ = tx.send(Event::DraftActionResult(Ok(format!(
+                    "Rejected '{rule_name}'"
+                ))));
+            }
+            Ok(Err(e)) => {
+                let _ = tx.send(Event::DraftActionResult(Err(e.message().to_string())));
+            }
+            Err(_) => {
+                let _ = tx.send(Event::DraftActionResult(
+                    Err("reject timed out".to_string()),
+                ));
+            }
+        }
+    });
+}
+
+/// Approve the snapshotted draft chunks one by one.
+///
+/// Only the chunks captured when `[A]` was pressed are approved — any new
+/// chunks that arrived while the confirmation modal was open are skipped.
+fn spawn_draft_approve_all(
+    app: &App,
+    snapshot: Vec<navigator_core::proto::PolicyChunk>,
+    tx: mpsc::UnboundedSender<Event>,
+) {
+    let mut client = app.client.clone();
+    let name = match app.selected_sandbox_name() {
+        Some(n) => n.to_string(),
+        None => return,
+    };
+
+    tokio::spawn(async move {
+        let total = snapshot.len();
+        let mut approved = 0u32;
+        let mut last_version = 0u32;
+        let mut errors: Vec<String> = Vec::new();
+
+        for chunk in &snapshot {
+            let req = navigator_core::proto::ApproveDraftChunkRequest {
+                name: name.clone(),
+                chunk_id: chunk.id.clone(),
+            };
+            match tokio::time::timeout(Duration::from_secs(5), client.approve_draft_chunk(req))
+                .await
+            {
+                Ok(Ok(resp)) => {
+                    approved += 1;
+                    last_version = resp.into_inner().policy_version;
+                }
+                Ok(Err(e)) => {
+                    errors.push(format!("{}: {}", chunk.rule_name, e.message()));
+                }
+                Err(_) => {
+                    errors.push(format!("{}: timed out", chunk.rule_name));
+                }
+            }
+        }
+
+        let msg = if errors.is_empty() {
+            format!("Approved {approved}/{total} chunks -> policy v{last_version}")
+        } else {
+            format!(
+                "Approved {approved}/{total} chunks (errors: {})",
+                errors.join("; ")
+            )
+        };
+        let _ = tx.send(Event::DraftActionResult(Ok(msg)));
+    });
+}
+
 /// Mask a secret value, showing only the first and last 2 chars.
 fn mask_secret(value: &str) -> String {
     let len = value.len();
@@ -1716,6 +1887,56 @@ async fn refresh_sandbox_policy(app: &mut App) {
             tracing::warn!("sandbox policy refresh timed out");
         }
     }
+}
+
+async fn refresh_draft_chunks(app: &mut App) {
+    let sandbox_name = match app.selected_sandbox_name() {
+        Some(name) => name.to_string(),
+        None => return,
+    };
+
+    let req = navigator_core::proto::GetDraftPolicyRequest {
+        name: sandbox_name,
+        status_filter: String::new(),
+    };
+
+    match tokio::time::timeout(Duration::from_secs(5), app.client.get_draft_policy(req)).await {
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            app.draft_chunks = inner.chunks;
+            app.draft_version = inner.draft_version;
+            if app.draft_selected >= app.draft_chunks.len() && !app.draft_chunks.is_empty() {
+                app.draft_selected = app.draft_chunks.len() - 1;
+            }
+        }
+        Ok(Err(e)) => {
+            tracing::debug!("draft chunks refresh: {}", e.message());
+        }
+        Err(_) => {
+            tracing::debug!("draft chunks refresh timed out");
+        }
+    }
+}
+
+/// Fetch the count of pending draft recommendations for every sandbox.
+///
+/// This runs on the Dashboard tick so the sandbox list can show notification
+/// badges without entering the sandbox detail view.
+async fn refresh_sandbox_draft_counts(app: &mut App) {
+    let names: Vec<String> = app.sandbox_names.clone();
+    let mut counts = vec![0usize; names.len()];
+    for (i, name) in names.iter().enumerate() {
+        let req = navigator_core::proto::GetDraftPolicyRequest {
+            name: name.clone(),
+            status_filter: "pending".to_string(),
+        };
+        if let Ok(Ok(resp)) =
+            tokio::time::timeout(Duration::from_secs(2), app.client.get_draft_policy(req)).await
+        {
+            counts[i] = resp.into_inner().chunks.len();
+        }
+    }
+    app.sandbox_draft_counts = counts;
 }
 
 fn phase_label(phase: i32) -> String {

@@ -21,12 +21,14 @@ use navigator_bootstrap::{
     save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
 use navigator_core::proto::{
+    ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    GetClusterInferenceRequest, GetProviderRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
-    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider, Sandbox,
-    SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest,
-    UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
+    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetProviderRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    SetClusterInferenceRequest, UpdateProviderRequest, UpdateSandboxPolicyRequest,
+    WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
@@ -1917,6 +1919,9 @@ pub async fn sandbox_create(
                     eprintln!("  {} {} {}", ts.dimmed(), "WARN".yellow(), w.message);
                 }
             }
+            Some(navigator_core::proto::sandbox_stream_event::Payload::DraftPolicyUpdate(_)) => {
+                // Draft policy updates are handled in the draft panel, not during provisioning.
+            }
             None => {}
         }
     }
@@ -3722,6 +3727,269 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
             "[{secs}.{millis:03}] [{source:<7}] [{:<5}] [{}] {} {}",
             log.level, log.target, log.message, fields_str
         );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Network rule commands
+// ---------------------------------------------------------------------------
+
+/// Show network rules for a sandbox.
+pub async fn sandbox_draft_get(
+    server: &str,
+    name: &str,
+    status_filter: Option<&str>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let response = client
+        .get_draft_policy(GetDraftPolicyRequest {
+            name: name.to_string(),
+            status_filter: status_filter.unwrap_or("").to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+
+    if inner.chunks.is_empty() {
+        println!("No network rules for sandbox '{name}'");
+        return Ok(());
+    }
+
+    println!(
+        "{}  (version {}, {} chunk{})",
+        "Network Rules:".cyan().bold(),
+        inner.draft_version,
+        inner.chunks.len(),
+        if inner.chunks.len() == 1 { "" } else { "s" }
+    );
+    println!();
+
+    for chunk in &inner.chunks {
+        let status_colored = match chunk.status.as_str() {
+            "pending" => chunk.status.yellow().to_string(),
+            "approved" => chunk.status.green().to_string(),
+            "rejected" => chunk.status.red().to_string(),
+            _ => chunk.status.clone(),
+        };
+
+        println!("  {} {}", "Chunk:".dimmed(), chunk.id);
+        println!("  {} {}", "Status:".dimmed(), status_colored);
+        println!("  {} {}", "Rule:".dimmed(), chunk.rule_name);
+        if !chunk.binary.is_empty() {
+            println!("  {} {}", "Binary:".dimmed(), chunk.binary);
+        }
+        println!(
+            "  {} {:.0}%",
+            "Confidence:".dimmed(),
+            chunk.confidence * 100.0
+        );
+        println!("  {} {}", "Rationale:".dimmed(), chunk.rationale);
+
+        if !chunk.security_notes.is_empty() {
+            println!(
+                "  {} {}",
+                "Security:".dimmed(),
+                chunk.security_notes.yellow()
+            );
+        }
+
+        if let Some(ref rule) = chunk.proposed_rule {
+            println!("  {} {}", "Endpoints:".dimmed(), format_endpoints(rule));
+            if !rule.binaries.is_empty() {
+                let bins: Vec<&str> = rule.binaries.iter().map(|b| b.path.as_str()).collect();
+                println!("  {} {}", "Binaries:".dimmed(), bins.join(", "));
+            }
+        }
+
+        if chunk.hit_count > 1 {
+            println!(
+                "  {} {} (first seen {}, last seen {})",
+                "Hits:".dimmed(),
+                chunk.hit_count,
+                format_epoch_ms(chunk.first_seen_ms),
+                format_epoch_ms(chunk.last_seen_ms),
+            );
+        }
+        println!();
+    }
+
+    Ok(())
+}
+
+/// Approve a network rule.
+pub async fn sandbox_draft_approve(
+    server: &str,
+    name: &str,
+    chunk_id: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let response = client
+        .approve_draft_chunk(ApproveDraftChunkRequest {
+            name: name.to_string(),
+            chunk_id: chunk_id.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+    println!(
+        "{} Chunk approved. Policy version: {}, hash: {}",
+        "OK".green().bold(),
+        inner.policy_version,
+        &inner.policy_hash[..12.min(inner.policy_hash.len())]
+    );
+
+    Ok(())
+}
+
+/// Reject a network rule.
+pub async fn sandbox_draft_reject(
+    server: &str,
+    name: &str,
+    chunk_id: &str,
+    reason: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    client
+        .reject_draft_chunk(RejectDraftChunkRequest {
+            name: name.to_string(),
+            chunk_id: chunk_id.to_string(),
+            reason: reason.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    println!("{} Chunk rejected.", "OK".green().bold());
+
+    Ok(())
+}
+
+/// Approve all pending network rules.
+pub async fn sandbox_draft_approve_all(
+    server: &str,
+    name: &str,
+    include_security_flagged: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let response = client
+        .approve_all_draft_chunks(ApproveAllDraftChunksRequest {
+            name: name.to_string(),
+            include_security_flagged,
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+    println!(
+        "{} {} chunk(s) approved, {} skipped. Policy version: {}",
+        "OK".green().bold(),
+        inner.chunks_approved,
+        inner.chunks_skipped,
+        inner.policy_version,
+    );
+
+    Ok(())
+}
+
+/// Clear all pending network rules.
+pub async fn sandbox_draft_clear(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let response = client
+        .clear_draft_chunks(ClearDraftChunksRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+    println!(
+        "{} {} pending chunk(s) cleared.",
+        "OK".green().bold(),
+        inner.chunks_cleared,
+    );
+
+    Ok(())
+}
+
+/// Show network rule history.
+pub async fn sandbox_draft_history(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let response = client
+        .get_draft_history(GetDraftHistoryRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = response.into_inner();
+
+    if inner.entries.is_empty() {
+        println!("No rule history for sandbox '{name}'");
+        return Ok(());
+    }
+
+    println!("{}", "Rule History:".cyan().bold());
+    println!();
+
+    for entry in &inner.entries {
+        let event_colored = match entry.event_type.as_str() {
+            "proposed" => entry.event_type.yellow().to_string(),
+            "approved" => entry.event_type.green().to_string(),
+            "rejected" => entry.event_type.red().to_string(),
+            _ => entry.event_type.clone(),
+        };
+
+        println!(
+            "  {} {} [{}] {}",
+            format_timestamp_ms(entry.timestamp_ms).dimmed(),
+            event_colored,
+            entry.chunk_id.get(..8).unwrap_or(&entry.chunk_id),
+            entry.description,
+        );
+    }
+
+    Ok(())
+}
+
+/// Format a `NetworkPolicyRule`'s endpoints as a compact string.
+fn format_endpoints(rule: &navigator_core::proto::NetworkPolicyRule) -> String {
+    rule.endpoints
+        .iter()
+        .map(|e| {
+            if e.port > 0 {
+                format!("{}:{}", e.host, e.port)
+            } else {
+                e.host.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Format a millisecond timestamp into a readable string.
+fn format_timestamp_ms(ms: i64) -> String {
+    if ms <= 0 {
+        return "-".to_string();
+    }
+    let secs = ms / 1000;
+    let mins = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    let days = secs / 86400;
+    if days > 0 {
+        format!("{days}d {hours:02}:{mins:02}")
+    } else {
+        format!("{hours:02}:{mins:02}")
     }
 }
 

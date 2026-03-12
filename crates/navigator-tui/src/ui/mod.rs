@@ -6,6 +6,7 @@ pub(crate) mod create_sandbox;
 mod dashboard;
 pub(crate) mod providers;
 pub(crate) mod sandbox_detail;
+mod sandbox_draft;
 pub(crate) mod sandbox_logs;
 mod sandbox_policy;
 pub(crate) mod sandboxes;
@@ -79,6 +80,7 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     match app.focus {
         Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
+        Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
         _ => sandbox_policy::draw(frame, app, chunks[1]),
     }
 
@@ -90,6 +92,19 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 sandbox_logs::draw_detail_popup(frame, log, frame.size());
             }
         }
+    }
+
+    // Draft detail popup renders over the full frame.
+    if app.focus == Focus::SandboxDraft && app.draft_detail_open {
+        let abs = app.draft_scroll + app.draft_selected;
+        if let Some(chunk) = app.draft_chunks.get(abs) {
+            sandbox_draft::draw_detail_popup(frame, chunk, frame.size());
+        }
+    }
+
+    // Approve-all confirmation popup renders over everything.
+    if app.approve_all_confirm_open && !app.approve_all_confirm_chunks.is_empty() {
+        sandbox_draft::draw_approve_all_popup(frame, &app.approve_all_confirm_chunks, frame.size());
     }
 }
 
@@ -236,6 +251,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled("  ", styles::TEXT),
                     Span::styled("[s]", styles::KEY_HINT),
                     Span::styled(format!(" Source: {filter_label}"), styles::TEXT),
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[r]", styles::KEY_HINT),
+                    Span::styled(" Rules", styles::TEXT),
                     Span::styled("  |  ", styles::BORDER),
                     Span::styled("[Esc]", styles::MUTED),
                     Span::styled(" Policy", styles::MUTED),
@@ -243,6 +261,67 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                     Span::styled("[q]", styles::MUTED),
                     Span::styled(" Quit", styles::MUTED),
                 ]
+            }
+            Focus::SandboxDraft => {
+                // Build state-aware action hints based on selected chunk.
+                let selected_status = app
+                    .draft_chunks
+                    .get(app.draft_scroll + app.draft_selected)
+                    .map(|c| c.status.as_str())
+                    .unwrap_or("");
+                let mut spans = vec![
+                    Span::styled(" ", styles::TEXT),
+                    Span::styled("[j/k]", styles::KEY_HINT),
+                    Span::styled(" Navigate", styles::TEXT),
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[Enter]", styles::KEY_HINT),
+                    Span::styled(" Detail", styles::TEXT),
+                ];
+                match selected_status {
+                    "pending" => {
+                        spans.extend([
+                            Span::styled("  ", styles::TEXT),
+                            Span::styled("[a]", styles::KEY_HINT),
+                            Span::styled(" Approve", styles::TEXT),
+                            Span::styled("  ", styles::TEXT),
+                            Span::styled("[x]", styles::KEY_HINT),
+                            Span::styled(" Reject", styles::TEXT),
+                            Span::styled("  ", styles::TEXT),
+                            Span::styled("[A]", styles::KEY_HINT),
+                            Span::styled(" Approve All", styles::TEXT),
+                        ]);
+                    }
+                    "approved" => {
+                        spans.extend([
+                            Span::styled("  ", styles::TEXT),
+                            Span::styled("[x]", styles::KEY_HINT),
+                            Span::styled(" Revoke", styles::TEXT),
+                        ]);
+                    }
+                    "rejected" => {
+                        spans.extend([
+                            Span::styled("  ", styles::TEXT),
+                            Span::styled("[a]", styles::KEY_HINT),
+                            Span::styled(" Approve", styles::TEXT),
+                        ]);
+                    }
+                    _ => {}
+                }
+                spans.extend([
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[p]", styles::KEY_HINT),
+                    Span::styled(" Policy", styles::TEXT),
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[l]", styles::KEY_HINT),
+                    Span::styled(" Logs", styles::TEXT),
+                    Span::styled("  |  ", styles::BORDER),
+                    Span::styled("[Esc]", styles::MUTED),
+                    Span::styled(" Back", styles::MUTED),
+                    Span::styled("  ", styles::TEXT),
+                    Span::styled("[q]", styles::MUTED),
+                    Span::styled(" Quit", styles::MUTED),
+                ]);
+                spans
             }
             _ => vec![
                 Span::styled(" ", styles::TEXT),
@@ -257,6 +336,9 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[l]", styles::KEY_HINT),
                 Span::styled(" Logs", styles::TEXT),
+                Span::styled("  ", styles::TEXT),
+                Span::styled("[r]", styles::KEY_HINT),
+                Span::styled(" Rules", styles::TEXT),
                 Span::styled("  ", styles::TEXT),
                 Span::styled("[d]", styles::KEY_HINT),
                 Span::styled(" Delete", styles::TEXT),

@@ -62,24 +62,33 @@ deny_reason := "network connections not allowed by policy" if {
 }
 
 # --- Matched policy name (for audit logging) ---
+#
+# Collects all matching policy names into a set, then deterministically picks
+# the lexicographically smallest.  This avoids a "complete rule conflict" when
+# multiple policies cover the same endpoint (e.g. after draft approval adds an
+# overlapping rule).
 
-matched_network_policy := name if {
+_matching_policy_names contains name if {
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
 	binary_allowed(policy, input.exec)
 }
 
+matched_network_policy := min(_matching_policy_names) if {
+	count(_matching_policy_names) > 0
+}
+
 # --- Core matching logic ---
 
-# Find a policy where both endpoint and binary match the request.
-# Note: if multiple policies match, OPA will error (complete rule conflict).
-# This is intentional — well-authored policies should have disjoint coverage.
-network_policy_for_request := policy if {
+# True when at least one network policy matches the request (endpoint + binary).
+# Expressed as a boolean so that multiple matching policies don't cause a
+# "complete rule conflict".
+network_policy_for_request if {
 	some name
-	policy := data.network_policies[name]
-	endpoint_allowed(policy, input.network)
-	binary_allowed(policy, input.exec)
+	data.network_policies[name]
+	endpoint_allowed(data.network_policies[name], input.network)
+	binary_allowed(data.network_policies[name], input.exec)
 }
 
 # Endpoint matching: host (case-insensitive) + port.
@@ -228,7 +237,9 @@ command_matches(actual, expected) if {
 # Used by Rust to extract L7 config (protocol, tls, enforcement) and/or
 # allowed_ips for SSRF allowlist validation.
 
-matched_endpoint_config := ep if {
+# Collect all matching endpoint configs into an array to avoid complete-rule
+# conflicts when multiple policies cover the same endpoint.  Return the first.
+_matching_endpoint_configs := [ep |
 	some name
 	policy := data.network_policies[name]
 	endpoint_allowed(policy, input.network)
@@ -237,6 +248,10 @@ matched_endpoint_config := ep if {
 	ep := policy.endpoints[_]
 	endpoint_matches_request(ep, input.network)
 	endpoint_has_extended_config(ep)
+]
+
+matched_endpoint_config := _matching_endpoint_configs[0] if {
+	count(_matching_endpoint_configs) > 0
 }
 
 # Hosted endpoint: match on host (case-insensitive) + port.

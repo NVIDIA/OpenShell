@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_core::proto::{
-    GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxPolicyRequest,
+    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxPolicyRequest,
     GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, UpdateSandboxPolicyRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateSandboxPolicyRequest,
     inference_client::InferenceClient, navigator_client::NavigatorClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -250,6 +250,28 @@ impl CachedNavigatorClient {
             version: inner.version,
             policy_hash: inner.policy_hash,
         })
+    }
+
+    /// Submit denial summaries for policy analysis.
+    pub async fn submit_policy_analysis(
+        &self,
+        sandbox_name: &str,
+        summaries: Vec<DenialSummary>,
+        proposed_chunks: Vec<navigator_core::proto::PolicyChunk>,
+        analysis_mode: &str,
+    ) -> Result<()> {
+        self.client
+            .clone()
+            .submit_policy_analysis(SubmitPolicyAnalysisRequest {
+                name: sandbox_name.to_string(),
+                summaries,
+                proposed_chunks,
+                analysis_mode: analysis_mode.to_string(),
+            })
+            .await
+            .into_diagnostic()?;
+
+        Ok(())
     }
 
     /// Report policy load status back to the server.

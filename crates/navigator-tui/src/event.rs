@@ -30,6 +30,8 @@ pub enum Event {
     ProviderUpdateResult(Result<String, String>),
     /// Provider delete result: `Ok(deleted)` or `Err(message)`.
     ProviderDeleteResult(Result<bool, String>),
+    /// Draft action result: `Ok(status_message)` or `Err(error_message)`.
+    DraftActionResult(Result<String, String>),
 }
 
 pub struct EventHandler {
