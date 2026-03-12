@@ -517,7 +517,10 @@ async fn handle_applied(
         .map_err(|e| e.to_string())?;
 
     let mut status = status_from_object(&obj);
-    rewrite_user_facing_conditions(&mut status, existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()));
+    rewrite_user_facing_conditions(
+        &mut status,
+        existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
+    );
     let phase = derive_phase(&status, deletion_timestamp);
 
     // If the record doesn't exist yet, the `create_sandbox` handler may
