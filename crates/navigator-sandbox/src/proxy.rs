@@ -8,6 +8,7 @@ use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
+use crate::secrets::{SecretResolver, rewrite_header_line};
 use miette::{IntoDiagnostic, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
@@ -130,6 +131,7 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
+        secret_resolver: Option<Arc<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
@@ -159,10 +161,13 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
+                        let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
                         tokio::spawn(async move {
-                            if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, tls, inf, dtx).await
+                            if let Err(err) = handle_tcp_connection(
+                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                            )
+                            .await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -259,6 +264,7 @@ async fn handle_tcp_connection(
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
+    secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
@@ -302,6 +308,7 @@ async fn handle_tcp_connection(
             opa_engine,
             identity_cache,
             entrypoint_pid,
+            secret_resolver,
             denial_tx.as_ref(),
         )
         .await;
@@ -518,6 +525,7 @@ async fn handle_tcp_connection(
                 .iter()
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
+            secret_resolver: secret_resolver.clone(),
         };
 
         if l7_config.tls == crate::l7::TlsMode::Terminate {
@@ -1402,7 +1410,12 @@ fn parse_proxy_uri(uri: &str) -> Result<(String, String, u16, String)> {
 /// strips proxy hop-by-hop headers, injects `Connection: close` and `Via`.
 ///
 /// Returns the rewritten request bytes (headers + any overflow body bytes).
-fn rewrite_forward_request(raw: &[u8], used: usize, path: &str) -> Vec<u8> {
+fn rewrite_forward_request(
+    raw: &[u8],
+    used: usize,
+    path: &str,
+    secret_resolver: Option<&SecretResolver>,
+) -> Vec<u8> {
     let header_end = raw[..used]
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -1454,8 +1467,12 @@ fn rewrite_forward_request(raw: &[u8], used: usize, path: &str) -> Vec<u8> {
             continue;
         }
 
-        // Pass through other headers
-        output.extend_from_slice(line.as_bytes());
+        let rewritten_line = match secret_resolver {
+            Some(resolver) => rewrite_header_line(line, resolver),
+            None => line.to_string(),
+        };
+
+        output.extend_from_slice(rewritten_line.as_bytes());
         output.extend_from_slice(b"\r\n");
 
         if lower.starts_with("via:") {
@@ -1497,6 +1514,7 @@ async fn handle_forward_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI
@@ -1716,8 +1734,8 @@ async fn handle_forward_proxy(
         "FORWARD",
     );
 
-    // 7. Rewrite request and forward to upstream
-    let rewritten = rewrite_forward_request(buf, used, &path);
+    // 9. Rewrite request and forward to upstream
+    let rewritten = rewrite_forward_request(buf, used, &path, secret_resolver.as_deref());
     upstream.write_all(&rewritten).await.into_diagnostic()?;
 
     // 8. Relay remaining traffic bidirectionally (supports streaming)
@@ -2336,7 +2354,7 @@ mod tests {
     fn test_rewrite_get_request() {
         let raw =
             b"GET http://10.0.0.1:8000/api HTTP/1.1\r\nHost: 10.0.0.1:8000\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/api");
+        let result = rewrite_forward_request(raw, raw.len(), "/api", None);
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.starts_with("GET /api HTTP/1.1\r\n"));
         assert!(result_str.contains("Host: 10.0.0.1:8000"));
@@ -2347,7 +2365,7 @@ mod tests {
     #[test]
     fn test_rewrite_strips_proxy_headers() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nProxy-Authorization: Basic abc\r\nProxy-Connection: keep-alive\r\nAccept: */*\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", None);
         let result_str = String::from_utf8_lossy(&result);
         assert!(
             !result_str
@@ -2361,7 +2379,7 @@ mod tests {
     #[test]
     fn test_rewrite_replaces_connection_header() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nConnection: keep-alive\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", None);
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Connection: close"));
         assert!(!result_str.contains("keep-alive"));
@@ -2370,7 +2388,7 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_body_overflow() {
         let raw = b"POST http://host/api HTTP/1.1\r\nHost: host\r\nContent-Length: 13\r\n\r\n{\"key\":\"val\"}";
-        let result = rewrite_forward_request(raw, raw.len(), "/api");
+        let result = rewrite_forward_request(raw, raw.len(), "/api", None);
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("{\"key\":\"val\"}"));
         assert!(result_str.contains("POST /api HTTP/1.1"));
@@ -2379,11 +2397,25 @@ mod tests {
     #[test]
     fn test_rewrite_preserves_existing_via() {
         let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nVia: 1.0 upstream\r\n\r\n";
-        let result = rewrite_forward_request(raw, raw.len(), "/p");
+        let result = rewrite_forward_request(raw, raw.len(), "/p", None);
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
         assert!(!result_str.contains("Via: 1.1 navigator-sandbox"));
+    }
+
+    #[test]
+    fn test_rewrite_resolves_placeholder_auth_headers() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
+        let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref());
+        let result_str = String::from_utf8_lossy(&result);
+        assert!(result_str.contains("Authorization: Bearer sk-test"));
+        assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 
     // --- Forward proxy SSRF defence tests ---

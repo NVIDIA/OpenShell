@@ -1,12 +1,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""E2e tests for provider credential injection into sandboxes.
+"""E2E tests for supervisor-managed provider placeholders in sandboxes.
 
 Provider credentials are fetched at runtime by the sandbox supervisor via the
-GetSandboxProviderEnvironment gRPC call.  They should appear as environment
-variables inside the sandbox process, but must NOT be present in the persisted
-sandbox spec's environment map (they are never baked into the K8s pod spec).
+GetSandboxProviderEnvironment gRPC call. Sandboxed child processes should see
+placeholder values (not raw secrets). Credentials must never be present in the
+persisted sandbox spec environment map.
 """
 
 from __future__ import annotations
@@ -25,7 +25,13 @@ if TYPE_CHECKING:
     from openshell import Sandbox, SandboxClient
 
 
+# ---------------------------------------------------------------------------
+# Policy helpers
+# ---------------------------------------------------------------------------
+
+
 def _default_policy() -> sandbox_pb2.SandboxPolicy:
+    """Build a sandbox policy with standard filesystem/process/landlock settings."""
     return sandbox_pb2.SandboxPolicy(
         version=1,
         filesystem=sandbox_pb2.FilesystemPolicy(
@@ -40,6 +46,11 @@ def _default_policy() -> sandbox_pb2.SandboxPolicy:
     )
 
 
+# ---------------------------------------------------------------------------
+# Provider lifecycle helper
+# ---------------------------------------------------------------------------
+
+
 @contextmanager
 def provider(
     stub: object,
@@ -49,7 +60,6 @@ def provider(
     credentials: dict[str, str],
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
-    # Clean up any leftover from a previous run.
     _delete_provider(stub, name)
     stub.CreateProvider(
         navigator_pb2.CreateProviderRequest(
@@ -77,18 +87,16 @@ def _delete_provider(stub: object, name: str) -> None:
             raise
 
 
-# TODO: Once the sandbox supervisor sets provider credentials (rather than the
-# server injecting them via exec environment), these tests will no longer be
-# able to read credential values directly.  Update the assertions to verify
-# that the env vars are *present* (e.g. non-empty) without checking exact
-# values, since the supervisor will be the sole source of truth.
+# ===========================================================================
+# Tests: placeholder visibility
+# ===========================================================================
 
 
 def test_provider_credentials_available_as_env_vars(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Sandbox process can read provider credentials as environment variables."""
+    """Sandbox child processes see provider env vars as placeholders."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-env",
@@ -108,14 +116,16 @@ def test_provider_credentials_available_as_env_vars(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_env_var)
             assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "sk-e2e-test-key-12345"
+            value = result.stdout.strip()
+            assert value == "openshell:resolve:env:ANTHROPIC_API_KEY"
+            assert value != "sk-e2e-test-key-12345"
 
 
 def test_generic_provider_credentials_available_as_env_vars(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Generic provider credentials are injected as arbitrary sandbox env vars."""
+    """Generic provider env vars are placeholders, not raw secrets."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-generic-provider-env",
@@ -142,7 +152,7 @@ def test_generic_provider_credentials_available_as_env_vars(
             assert result.exit_code == 0, result.stderr
             assert (
                 result.stdout.strip()
-                == "token-generic-123|https://internal.example.test/api"
+                == "openshell:resolve:env:CUSTOM_SERVICE_TOKEN|openshell:resolve:env:CUSTOM_SERVICE_URL"
             )
 
 
@@ -150,7 +160,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """NVIDIA provider projects NVIDIA_API_KEY into sandbox process env."""
+    """NVIDIA provider projects a placeholder env value into child processes."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-nvidia-provider-env",
@@ -170,7 +180,26 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "nvapi-e2e-test-key"
+            assert result.stdout.strip() == "openshell:resolve:env:NVIDIA_API_KEY"
+
+
+# ===========================================================================
+# Tests: security & edge cases
+# ===========================================================================
+
+
+def test_ssh_handshake_secret_not_visible_in_exec_environment(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    def read_handshake_secret() -> str:
+        import os
+
+        return os.environ.get("NEMOCLAW_SSH_HANDSHAKE_SECRET", "NOT_SET")
+
+    with sandbox(delete_on_exit=True) as sb:
+        result = sb.exec_python(read_handshake_secret)
+        assert result.exit_code == 0, result.stderr
+        assert result.stdout.strip() == "NOT_SET"
 
 
 def test_create_sandbox_rejects_unknown_provider(
@@ -185,7 +214,7 @@ def test_create_sandbox_rejects_unknown_provider(
         sandbox_client.create(spec=spec)
 
     assert exc_info.value.code() == grpc.StatusCode.FAILED_PRECONDITION
-    assert "nonexistent-provider-xyz" in exc_info.value.details()
+    assert "nonexistent-provider-xyz" in (exc_info.value.details() or "")
 
 
 def test_credentials_not_in_persisted_spec_environment(
@@ -205,7 +234,6 @@ def test_credentials_not_in_persisted_spec_environment(
         )
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            # Fetch the sandbox record from the server and inspect spec.environment.
             fetched = sandbox_client._stub.GetSandbox(
                 navigator_pb2.GetSandboxRequest(name=sb.sandbox.name)
             )
@@ -215,9 +243,9 @@ def test_credentials_not_in_persisted_spec_environment(
             )
 
 
-# ---------------------------------------------------------------------------
-# Provider update merge semantics
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Tests: provider update merge semantics
+# ===========================================================================
 
 
 def test_update_provider_preserves_unset_credentials_and_config(
@@ -240,7 +268,6 @@ def test_update_provider_preserves_unset_credentials_and_config(
             )
         )
 
-        # Update only KEY_A; send empty config map (= no change).
         stub.UpdateProvider(
             navigator_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
@@ -319,7 +346,6 @@ def test_update_provider_merges_config_preserves_credentials(
             )
         )
 
-        # Send only config update, empty credentials map.
         stub.UpdateProvider(
             navigator_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(

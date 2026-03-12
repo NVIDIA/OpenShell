@@ -8,10 +8,10 @@
 //! and either forwards or denies the request.
 
 use crate::l7::provider::L7Provider;
-use crate::l7::rest::RestProvider;
 use crate::l7::{EnforcementMode, L7EndpointConfig, L7Protocol, L7RequestInfo};
+use crate::secrets::SecretResolver;
 use miette::{IntoDiagnostic, Result, miette};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tracing::{debug, info, warn};
 
@@ -29,6 +29,8 @@ pub struct L7EvalContext {
     pub ancestors: Vec<String>,
     /// Cmdline paths.
     pub cmdline_paths: Vec<String>,
+    /// Supervisor-only placeholder resolver for outbound headers.
+    pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -78,11 +80,9 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
-    let provider = RestProvider;
-
     loop {
         // Parse one HTTP request from client
-        let req = match provider.parse_request(client).await {
+        let req = match crate::l7::rest::RestProvider.parse_request(client).await {
             Ok(Some(req)) => req,
             Ok(None) => return Ok(()), // Client closed connection
             Err(e) => {
@@ -134,7 +134,13 @@ where
 
         if allowed || config.enforcement == EnforcementMode::Audit {
             // Forward request to upstream and relay response
-            let reusable = provider.relay(&req, client, upstream).await?;
+            let reusable = crate::l7::rest::relay_http_request_with_resolver(
+                &req,
+                client,
+                upstream,
+                ctx.secret_resolver.as_deref(),
+            )
+            .await?;
             if !reusable {
                 debug!(
                     host = %ctx.host,
@@ -145,7 +151,7 @@ where
             }
         } else {
             // Enforce mode: deny with 403 and close connection
-            provider
+            crate::l7::rest::RestProvider
                 .deny(&req, &ctx.policy_name, &reason, client)
                 .await?;
             return Ok(());

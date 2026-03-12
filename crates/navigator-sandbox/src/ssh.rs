@@ -20,7 +20,7 @@ use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::os::fd::{AsRawFd, RawFd};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -28,6 +28,8 @@ use tokio::net::TcpListener;
 use tracing::{info, warn};
 
 const PREFACE_MAGIC: &str = "NSSH1";
+#[cfg(test)]
+const SSH_HANDSHAKE_SECRET_ENV: &str = "NEMOCLAW_SSH_HANDSHAKE_SECRET";
 
 /// A time-bounded set of nonces used to detect replayed NSSH1 handshakes.
 /// Each entry records the `Instant` it was inserted; a background reaper task
@@ -646,6 +648,46 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
     }
 }
 
+fn apply_child_env(
+    cmd: &mut Command,
+    session_home: &str,
+    session_user: &str,
+    term: &str,
+    proxy_url: Option<&str>,
+    ca_file_paths: Option<&(PathBuf, PathBuf)>,
+    provider_env: &HashMap<String, String>,
+) {
+    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
+
+    cmd.env_clear()
+        .env("OPENSHELL_SANDBOX", "1")
+        .env("HOME", session_home)
+        .env("USER", session_user)
+        .env("SHELL", "/bin/bash")
+        .env("PATH", &path)
+        .env("TERM", term);
+
+    if let Some(url) = proxy_url {
+        cmd.env("HTTP_PROXY", url)
+            .env("HTTPS_PROXY", url)
+            .env("ALL_PROXY", url)
+            .env("http_proxy", url)
+            .env("https_proxy", url)
+            .env("grpc_proxy", url);
+    }
+
+    if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
+        cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
+            .env("SSL_CERT_FILE", combined_bundle_path)
+            .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
+            .env("CURL_CA_BUNDLE", combined_bundle_path);
+    }
+
+    for (key, value) in provider_env {
+        cmd.env(key, value);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_pty_shell(
     policy: &SandboxPolicy,
@@ -695,53 +737,19 @@ fn spawn_pty_shell(
         pty.term.as_str()
     };
 
-    // Inherit PATH from the container (set via Dockerfile ENV) so that
-    // sandbox sessions see the same tool layout without hardcoding paths.
-    // Tool-specific env vars (VIRTUAL_ENV, UV_PYTHON_INSTALL_DIR, etc.) are
-    // set in /sandbox/.bashrc by the Dockerfile and sourced via login shell.
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-
     // Derive USER and HOME from the policy's run_as_user when available,
     // falling back to "sandbox" / "/sandbox" for backward compatibility.
     let (session_user, session_home) = session_user_and_home(policy);
-
-    cmd.env_clear()
-        .stdin(stdin)
-        .stdout(stdout)
-        .stderr(stderr)
-        .env("OPENSHELL_SANDBOX", "1")
-        .env("HOME", &session_home)
-        .env("USER", &session_user)
-        .env("SHELL", "/bin/bash")
-        .env("PATH", &path)
-        .env("TERM", term);
-
-    // Set proxy environment variables so cooperative tools (curl, wget, etc.)
-    // route traffic through the CONNECT proxy for OPA policy evaluation.
-    // Both uppercase and lowercase variants are needed: curl/wget use uppercase,
-    // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy first.
-    if let Some(ref url) = proxy_url {
-        cmd.env("HTTP_PROXY", url)
-            .env("HTTPS_PROXY", url)
-            .env("ALL_PROXY", url)
-            .env("http_proxy", url)
-            .env("https_proxy", url)
-            .env("grpc_proxy", url);
-    }
-
-    // Set TLS trust store env vars so SSH shell processes trust the ephemeral CA
-    if let Some(ref paths) = ca_file_paths {
-        let (ca_cert_path, combined_bundle_path) = paths.as_ref();
-        cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
-            .env("SSL_CERT_FILE", combined_bundle_path)
-            .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
-            .env("CURL_CA_BUNDLE", combined_bundle_path);
-    }
-
-    // Set provider environment variables (credentials fetched at runtime).
-    for (key, value) in provider_env {
-        cmd.env(key, value);
-    }
+    apply_child_env(
+        &mut cmd,
+        &session_home,
+        &session_user,
+        term,
+        proxy_url.as_deref(),
+        ca_file_paths.as_deref(),
+        provider_env,
+    );
+    cmd.stdin(stdin).stdout(stdout).stderr(stderr);
 
     if let Some(dir) = workdir.as_deref() {
         cmd.current_dir(dir);
@@ -865,41 +873,19 @@ fn spawn_pipe_exec(
         },
     );
 
-    let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
-
     let (session_user, session_home) = session_user_and_home(policy);
-
-    cmd.env_clear()
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .env("OPENSHELL_SANDBOX", "1")
-        .env("HOME", &session_home)
-        .env("USER", &session_user)
-        .env("SHELL", "/bin/bash")
-        .env("PATH", &path)
-        .env("TERM", "dumb");
-
-    if let Some(ref url) = proxy_url {
-        cmd.env("HTTP_PROXY", url)
-            .env("HTTPS_PROXY", url)
-            .env("ALL_PROXY", url)
-            .env("http_proxy", url)
-            .env("https_proxy", url)
-            .env("grpc_proxy", url);
-    }
-
-    if let Some(ref paths) = ca_file_paths {
-        let (ca_cert_path, combined_bundle_path) = paths.as_ref();
-        cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
-            .env("SSL_CERT_FILE", combined_bundle_path)
-            .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
-            .env("CURL_CA_BUNDLE", combined_bundle_path);
-    }
-
-    for (key, value) in provider_env {
-        cmd.env(key, value);
-    }
+    apply_child_env(
+        &mut cmd,
+        &session_home,
+        &session_user,
+        "dumb",
+        proxy_url.as_deref(),
+        ca_file_paths.as_deref(),
+        provider_env,
+    );
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
 
     if let Some(dir) = workdir.as_deref() {
         cmd.current_dir(dir);
@@ -1094,6 +1080,7 @@ fn to_u16(value: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::process::Stdio;
 
     /// Verify that dropping the input sender (the operation `channel_eof`
     /// performs) causes the stdin writer loop to exit and close the child's
@@ -1104,8 +1091,8 @@ mod tests {
         let (sender, receiver) = mpsc::channel::<Vec<u8>>();
 
         let mut child = Command::new("cat")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("failed to spawn cat");
 
@@ -1155,8 +1142,8 @@ mod tests {
 
         let mut child = Command::new("wc")
             .arg("-c")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
             .spawn()
             .expect("failed to spawn wc");
 
@@ -1295,5 +1282,36 @@ mod tests {
 
         assert!(verify_preface(&line1, secret, 300, &cache).unwrap());
         assert!(verify_preface(&line2, secret, 300, &cache).unwrap());
+    }
+
+    #[test]
+    fn apply_child_env_keeps_handshake_secret_out_of_ssh_children() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.env(SSH_HANDSHAKE_SECRET_ENV, "should-not-leak")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let provider_env = std::iter::once((
+            "ANTHROPIC_API_KEY".to_string(),
+            "openshell:resolve:env:ANTHROPIC_API_KEY".to_string(),
+        ))
+        .collect();
+
+        apply_child_env(
+            &mut cmd,
+            "/sandbox",
+            "sandbox",
+            "dumb",
+            None,
+            None,
+            &provider_env,
+        );
+
+        let output = cmd.output().expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+        assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
+        assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 }

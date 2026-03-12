@@ -21,6 +21,18 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::{debug, warn};
 
+const SSH_HANDSHAKE_SECRET_ENV: &str = "NEMOCLAW_SSH_HANDSHAKE_SECRET";
+
+fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
+    for (key, value) in provider_env {
+        cmd.env(key, value);
+    }
+}
+
+fn scrub_sensitive_env(cmd: &mut Command) {
+    cmd.env_remove(SSH_HANDSHAKE_SECRET_ENV);
+}
+
 /// Handle to a running process.
 pub struct ProcessHandle {
     child: Child,
@@ -103,10 +115,8 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env("OPENSHELL_SANDBOX", "1");
 
-        // Set provider environment variables (credentials fetched at runtime).
-        for (key, value) in provider_env {
-            cmd.env(key, value);
-        }
+        scrub_sensitive_env(&mut cmd);
+        inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
@@ -215,10 +225,8 @@ impl ProcessHandle {
             .kill_on_drop(true)
             .env("OPENSHELL_SANDBOX", "1");
 
-        // Set provider environment variables (credentials fetched at runtime).
-        for (key, value) in provider_env {
-            cmd.env(key, value);
-        }
+        scrub_sensitive_env(&mut cmd);
+        inject_provider_env(&mut cmd, provider_env);
 
         if let Some(dir) = workdir {
             cmd.current_dir(dir);
@@ -502,6 +510,7 @@ mod tests {
     use crate::policy::{
         FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy, SandboxPolicy,
     };
+    use std::process::Stdio as StdStdio;
 
     /// Helper to create a minimal `SandboxPolicy` with the given process policy.
     fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
@@ -582,5 +591,40 @@ mod tests {
             msg.contains("not found"),
             "expected 'not found' in error: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn scrub_sensitive_env_removes_ssh_handshake_secret() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null())
+            .env(SSH_HANDSHAKE_SECRET_ENV, "super-secret");
+
+        scrub_sensitive_env(&mut cmd);
+
+        let output = cmd.output().await.expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
+    }
+
+    #[tokio::test]
+    async fn inject_provider_env_sets_placeholder_values() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let provider_env = std::iter::once((
+            "ANTHROPIC_API_KEY".to_string(),
+            "openshell:resolve:env:ANTHROPIC_API_KEY".to_string(),
+        ))
+        .collect();
+
+        inject_provider_env(&mut cmd, &provider_env);
+
+        let output = cmd.output().await.expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+        assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 }

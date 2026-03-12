@@ -145,3 +145,17 @@ network_policies:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/wget }
       - { path: "/sandbox/.cursor-server/**" }
+
+  opencode:
+    name: opencode
+    endpoints:
+    - host: registry.npmjs.org
+      port: 443
+    - host: opencode.ai
+      port: 443
+    - host: integrate.api.nvidia.com
+      port: 443
+    binaries:
+    - path: /usr/lib/node_modules/opencode-ai/bin/.opencode
+    - path: /usr/bin/node
+    - path: /usr/local/bin/opencode

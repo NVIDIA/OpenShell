@@ -11,10 +11,12 @@ providers centralize that concern: a user configures a provider once, and any sa
 needs that external service can reference it.
 
 At sandbox creation time, providers are validated and associated with the sandbox. The
-sandbox supervisor then fetches credentials at runtime and injects them as environment
-variables into every child process it spawns. Access is enforced through the sandbox
-policy — the policy decides which outbound requests are allowed or denied based on
-the providers attached to that sandbox.
+sandbox supervisor then fetches credentials at runtime, keeps the real secret values in
+supervisor-only memory, and injects placeholder environment variables into every child
+process it spawns. When outbound traffic is allowed through the sandbox proxy, the
+supervisor rewrites those placeholders back to the real secret values before forwarding.
+Access is enforced through the sandbox policy — the policy decides which outbound
+requests are allowed or denied based on the providers attached to that sandbox.
 
 Core goals:
 
@@ -57,7 +59,8 @@ The gRPC surface is defined in `proto/navigator.proto`:
   - persistence using `object_type = "provider"`.
 - `crates/navigator-sandbox`
   - sandbox supervisor fetches provider credentials via gRPC at startup,
-  - injects credentials as environment variables into entrypoint and SSH child processes.
+  - injects placeholder env vars into entrypoint and SSH child processes,
+  - resolves placeholders back to real secrets in the outbound proxy path.
 
 ## Provider Plugins
 
@@ -242,12 +245,18 @@ In `run_sandbox()` (`crates/navigator-sandbox/src/lib.rs`):
 2. fetches provider credentials via gRPC (`GetSandboxProviderEnvironment`),
 3. if the fetch fails, continues with an empty map (graceful degradation with a warning).
 
-The returned `provider_env` `HashMap<String, String>` is then threaded to both the
-entrypoint process spawner and the SSH server.
+The returned `provider_env` `HashMap<String, String>` is immediately transformed into:
+
+- a child-visible env map with placeholder values such as
+  `openshell:resolve:env:ANTHROPIC_API_KEY`, and
+- a supervisor-only in-memory registry mapping each placeholder back to its real secret.
+
+The placeholder env map is threaded to the entrypoint process spawner and SSH server.
+The registry is threaded to the proxy so it can rewrite outbound headers.
 
 ### Child Process Environment Variable Injection
 
-Provider credentials are injected into child processes in two places, covering all
+Provider placeholders are injected into child processes in two places, covering all
 process spawning paths inside the sandbox:
 
 **1. Entrypoint process** (`crates/navigator-sandbox/src/process.rs`):
@@ -257,14 +266,16 @@ let mut cmd = Command::new(program);
 cmd.args(args)
     .env("OPENSHELL_SANDBOX", "1");
 
-// Set provider environment variables (credentials fetched at runtime).
+// Set provider environment variables (supervisor-managed placeholders).
 for (key, value) in provider_env {
     cmd.env(key, value);
 }
 ```
 
 This uses `tokio::process::Command`. The `.env()` call adds each variable to the child's
-inherited environment without clearing it.
+inherited environment without clearing it. The spawn path also explicitly removes
+`NEMOCLAW_SSH_HANDSHAKE_SECRET` so the handshake secret does not leak into the agent
+entrypoint process.
 
 After provider env vars, proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, etc.)
 are also set when `NetworkMode` is `Proxy`. The child is then launched with namespace
@@ -281,14 +292,30 @@ cmd.env("OPENSHELL_SANDBOX", "1")
     .env("USER", "sandbox")
     .env("TERM", term);
 
-// Set provider environment variables (credentials fetched at runtime).
+// Set provider environment variables (supervisor-managed placeholders).
 for (key, value) in provider_env {
     cmd.env(key, value);
 }
 ```
 
 This uses `std::process::Command`. The `SshHandler` holds the `provider_env` map and
-passes it to `spawn_pty_shell()` for each new shell or exec request.
+passes it to `spawn_pty_shell()` for each new shell or exec request. SSH child processes
+start from `env_clear()`, so the handshake secret is not present there.
+
+### Proxy-Time Secret Resolution
+
+When a sandboxed tool uses one of these placeholder env vars to populate an outbound HTTP
+header (for example `Authorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY`), the
+sandbox proxy rewrites the placeholder to the real secret value immediately before the
+request is forwarded upstream.
+
+This applies to:
+
+- forward-proxy HTTP requests, and
+- L7-inspected REST requests inside CONNECT tunnels.
+
+The real secret value remains in supervisor memory only; it is not re-injected into the
+child process environment.
 
 ### End-to-End Flow
 
@@ -309,13 +336,17 @@ CLI: openshell sandbox create -- claude
                 K8s: pod starts navigator-sandbox binary
                   +-- OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT set in pod env
                   |
-                  Sandbox supervisor: run_sandbox()
-                    +-- Fetches policy via gRPC
-                    +-- Fetches provider env via gRPC
-                    |     +-- Gateway resolves: "claude" -> credentials -> {ANTHROPIC_API_KEY: "sk-..."}
-                    +-- Spawns entrypoint: cmd.env("ANTHROPIC_API_KEY", "sk-...")
-                    +-- SSH server holds provider_env
-                          +-- Each SSH shell: cmd.env("ANTHROPIC_API_KEY", "sk-...")
+                    Sandbox supervisor: run_sandbox()
+                      +-- Fetches policy via gRPC
+                      +-- Fetches provider env via gRPC
+                      |     +-- Gateway resolves: "claude" -> credentials -> {ANTHROPIC_API_KEY: "sk-..."}
+                      +-- Builds placeholder registry
+                      |     +-- child env: {ANTHROPIC_API_KEY: "openshell:resolve:env:ANTHROPIC_API_KEY"}
+                      |     +-- supervisor registry: {"openshell:resolve:env:ANTHROPIC_API_KEY": "sk-..."}
+                      +-- Spawns entrypoint with placeholder env
+                      +-- SSH server holds placeholder env
+                      |     +-- Each SSH shell: cmd.env("ANTHROPIC_API_KEY", "openshell:resolve:env:ANTHROPIC_API_KEY")
+                      +-- Proxy rewrites outbound auth header placeholders -> real secrets
 ```
 
 ## Persistence and Validation
@@ -336,6 +367,10 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 - CLI displays only non-sensitive summaries (counts/key names where relevant).
 - Credentials are never persisted in the sandbox spec — they exist only in the
   provider store and are fetched at runtime by the sandbox supervisor.
+- Child processes never receive the raw provider secret values; they only receive
+  placeholders, and the supervisor resolves those placeholders during outbound proxying.
+- `NEMOCLAW_SSH_HANDSHAKE_SECRET` is required by the supervisor/SSH server path but is
+  explicitly kept out of spawned sandbox child-process environments.
 
 ## Test Strategy
 
@@ -344,3 +379,6 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 - Mocked discovery context tests cover env and path-based behavior.
 - CLI and gateway integration tests validate end-to-end RPC compatibility.
 - `resolve_provider_environment` unit tests in `crates/navigator-server/src/grpc.rs`.
+- sandbox unit tests validate placeholder generation and header rewriting.
+- E2E sandbox tests verify placeholders are visible in child env, outbound proxy traffic
+  is rewritten with the real secret, and the SSH handshake secret is absent from exec env.
