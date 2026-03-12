@@ -130,3 +130,14 @@ network_policies:
       - { path: /usr/bin/wget }
       - { path: "/sandbox/.vscode-server/**" }
       - { path: "/sandbox/.vscode-remote-containers/**" }
+
+  cursor:
+    name: cursor
+    endpoints:
+      - { host: cursor.blob.core.windows.net, port: 443 }
+      - { host: "*.cursor.sh", port: 443 }
+      - { host: cursor.download.prss.microsoft.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+      - { path: /usr/bin/wget }
+      - { path: "/sandbox/.cursor-server/**" }
