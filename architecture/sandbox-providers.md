@@ -248,7 +248,7 @@ In `run_sandbox()` (`crates/navigator-sandbox/src/lib.rs`):
 The returned `provider_env` `HashMap<String, String>` is immediately transformed into:
 
 - a child-visible env map with placeholder values such as
-  `nemo-placeholder:env:ANTHROPIC_API_KEY`, and
+  `openshell:resolve:env:ANTHROPIC_API_KEY`, and
 - a supervisor-only in-memory registry mapping each placeholder back to its real secret.
 
 The placeholder env map is threaded to the entrypoint process spawner and SSH server.
@@ -305,7 +305,7 @@ start from `env_clear()`, so the handshake secret is not present there.
 ### Proxy-Time Secret Resolution
 
 When a sandboxed tool uses one of these placeholder env vars to populate an outbound HTTP
-header (for example `Authorization: Bearer nemo-placeholder:env:ANTHROPIC_API_KEY`), the
+header (for example `Authorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY`), the
 sandbox proxy rewrites the placeholder to the real secret value immediately before the
 request is forwarded upstream.
 
@@ -341,11 +341,11 @@ CLI: openshell sandbox create -- claude
                       +-- Fetches provider env via gRPC
                       |     +-- Gateway resolves: "claude" -> credentials -> {ANTHROPIC_API_KEY: "sk-..."}
                       +-- Builds placeholder registry
-                      |     +-- child env: {ANTHROPIC_API_KEY: "nemo-placeholder:env:ANTHROPIC_API_KEY"}
-                      |     +-- supervisor registry: {"nemo-placeholder:env:ANTHROPIC_API_KEY": "sk-..."}
+                      |     +-- child env: {ANTHROPIC_API_KEY: "openshell:resolve:env:ANTHROPIC_API_KEY"}
+                      |     +-- supervisor registry: {"openshell:resolve:env:ANTHROPIC_API_KEY": "sk-..."}
                       +-- Spawns entrypoint with placeholder env
                       +-- SSH server holds placeholder env
-                      |     +-- Each SSH shell: cmd.env("ANTHROPIC_API_KEY", "nemo-placeholder:env:ANTHROPIC_API_KEY")
+                      |     +-- Each SSH shell: cmd.env("ANTHROPIC_API_KEY", "openshell:resolve:env:ANTHROPIC_API_KEY")
                       +-- Proxy rewrites outbound auth header placeholders -> real secrets
 ```
 

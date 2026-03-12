@@ -2298,10 +2298,10 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer nemo-placeholder:env:ANTHROPIC_API_KEY\r\n\r\n";
+        let raw = b"GET http://host/p HTTP/1.1\r\nHost: host\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\n\r\n";
         let result = rewrite_forward_request(raw, raw.len(), "/p", resolver.as_ref());
         let result_str = String::from_utf8_lossy(&result);
         assert!(result_str.contains("Authorization: Bearer sk-test"));
-        assert!(!result_str.contains("nemo-placeholder:env:ANTHROPIC_API_KEY"));
+        assert!(!result_str.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 }

@@ -949,13 +949,13 @@ mod tests {
                 .into_iter()
                 .collect(),
         );
-        let raw = b"GET /v1/messages HTTP/1.1\r\nAuthorization: Bearer nemo-placeholder:env:ANTHROPIC_API_KEY\r\nHost: example.com\r\n\r\n";
+        let raw = b"GET /v1/messages HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY\r\nHost: example.com\r\n\r\n";
 
         let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
         let rewritten = String::from_utf8(rewritten).expect("utf8");
 
         assert!(rewritten.contains("Authorization: Bearer sk-test\r\n"));
-        assert!(!rewritten.contains("nemo-placeholder:env:ANTHROPIC_API_KEY"));
+        assert!(!rewritten.contains("openshell:resolve:env:ANTHROPIC_API_KEY"));
     }
 
     /// Verifies that `relay_http_request_with_resolver` rewrites credential
@@ -966,7 +966,7 @@ mod tests {
     /// and replaces placeholder tokens with real secrets.
     ///
     /// Without this test, a misconfigured endpoint (missing `tls: terminate`)
-    /// silently leaks placeholder strings like `nemo-placeholder:env:NVIDIA_API_KEY`
+    /// silently leaks placeholder strings like `openshell:resolve:env:NVIDIA_API_KEY`
     /// to the upstream API, causing 401 Unauthorized errors.
     #[tokio::test]
     async fn relay_request_with_resolver_rewrites_credential_placeholders() {
@@ -1043,7 +1043,7 @@ mod tests {
         );
         // The placeholder must NOT appear
         assert!(
-            !forwarded.contains("nemo-placeholder:env:"),
+            !forwarded.contains("openshell:resolve:env:"),
             "Placeholder leaked to upstream: {forwarded}"
         );
         // Other headers must be preserved
@@ -1122,7 +1122,7 @@ mod tests {
         // Without a resolver, the placeholder LEAKS to upstream — this is the
         // documented behavior that causes 401s when `tls: terminate` is missing.
         assert!(
-            forwarded.contains("nemo-placeholder:env:NVIDIA_API_KEY"),
+            forwarded.contains("openshell:resolve:env:NVIDIA_API_KEY"),
             "Expected placeholder to leak without resolver, got: {forwarded}"
         );
         assert!(

@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-const PLACEHOLDER_PREFIX: &str = "nemo-placeholder:env:";
+const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SecretResolver {
@@ -110,13 +110,13 @@ mod tests {
 
         assert_eq!(
             child_env.get("ANTHROPIC_API_KEY"),
-            Some(&"nemo-placeholder:env:ANTHROPIC_API_KEY".to_string())
+            Some(&"openshell:resolve:env:ANTHROPIC_API_KEY".to_string())
         );
         assert_eq!(
             resolver
                 .as_ref()
                 .and_then(|resolver| resolver
-                    .resolve_placeholder("nemo-placeholder:env:ANTHROPIC_API_KEY")),
+                    .resolve_placeholder("openshell:resolve:env:ANTHROPIC_API_KEY")),
             Some("sk-test")
         );
     }
@@ -131,7 +131,7 @@ mod tests {
         let resolver = resolver.expect("resolver");
 
         assert_eq!(
-            rewrite_header_line("x-api-key: nemo-placeholder:env:CUSTOM_TOKEN", &resolver),
+            rewrite_header_line("x-api-key: openshell:resolve:env:CUSTOM_TOKEN", &resolver),
             "x-api-key: secret-token"
         );
     }
@@ -147,7 +147,7 @@ mod tests {
 
         assert_eq!(
             rewrite_header_line(
-                "Authorization: Bearer nemo-placeholder:env:ANTHROPIC_API_KEY",
+                "Authorization: Bearer openshell:resolve:env:ANTHROPIC_API_KEY",
                 &resolver,
             ),
             "Authorization: Bearer sk-test"
@@ -162,7 +162,7 @@ mod tests {
                 .collect(),
         );
 
-        let raw = b"POST /v1 HTTP/1.1\r\nAuthorization: Bearer nemo-placeholder:env:CUSTOM_TOKEN\r\nContent-Length: 5\r\n\r\nhello";
+        let raw = b"POST /v1 HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:CUSTOM_TOKEN\r\nContent-Length: 5\r\n\r\nhello";
         let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
         let rewritten = String::from_utf8(rewritten).expect("utf8");
 
@@ -222,7 +222,7 @@ mod tests {
 
         // Placeholders must not appear
         assert!(
-            !rewritten.contains("nemo-placeholder:env:"),
+            !rewritten.contains("openshell:resolve:env:"),
             "Placeholder leaked into rewritten request: {rewritten}"
         );
 

@@ -159,7 +159,6 @@ def _echo_server_via_forward_proxy():
         import os
         import socket
         import threading
-        import time
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         class Handler(BaseHTTPRequestHandler):
@@ -175,8 +174,14 @@ def _echo_server_via_forward_proxy():
                 pass
 
         server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
-        threading.Thread(target=server.handle_request, daemon=True).start()
-        time.sleep(0.5)
+        ready = threading.Event()
+
+        def serve_once():
+            ready.set()
+            server.handle_request()
+
+        threading.Thread(target=serve_once, daemon=True).start()
+        assert ready.wait(timeout=2.0), "echo server thread did not start"
 
         token = os.environ["ANTHROPIC_API_KEY"]
         conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
@@ -214,7 +219,6 @@ def _echo_server_via_connect_l7(env_vars: dict[str, str] | None = None):
         import os
         import socket
         import threading
-        import time
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
         captured_env_vars = _env_vars  # noqa: F841 -- used by Handler
@@ -235,8 +239,14 @@ def _echo_server_via_connect_l7(env_vars: dict[str, str] | None = None):
                 pass
 
         server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
-        threading.Thread(target=server.handle_request, daemon=True).start()
-        time.sleep(0.5)
+        ready = threading.Event()
+
+        def serve_once():
+            ready.set()
+            server.handle_request()
+
+        threading.Thread(target=serve_once, daemon=True).start()
+        assert ready.wait(timeout=2.0), "echo server thread did not start"
 
         # Build request headers from placeholder env vars
         header_lines = [
@@ -325,7 +335,7 @@ def test_provider_credentials_available_as_env_vars(
             result = sb.exec_python(read_env_var)
             assert result.exit_code == 0, result.stderr
             value = result.stdout.strip()
-            assert value == "nemo-placeholder:env:ANTHROPIC_API_KEY"
+            assert value == "openshell:resolve:env:ANTHROPIC_API_KEY"
             assert value != "sk-e2e-test-key-12345"
 
 
@@ -360,7 +370,7 @@ def test_generic_provider_credentials_available_as_env_vars(
             assert result.exit_code == 0, result.stderr
             assert (
                 result.stdout.strip()
-                == "nemo-placeholder:env:CUSTOM_SERVICE_TOKEN|nemo-placeholder:env:CUSTOM_SERVICE_URL"
+                == "openshell:resolve:env:CUSTOM_SERVICE_TOKEN|openshell:resolve:env:CUSTOM_SERVICE_URL"
             )
 
 
@@ -388,7 +398,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
-            assert result.stdout.strip() == "nemo-placeholder:env:NVIDIA_API_KEY"
+            assert result.stdout.strip() == "openshell:resolve:env:NVIDIA_API_KEY"
 
 
 # ===========================================================================
@@ -420,7 +430,7 @@ def test_provider_placeholder_is_resolved_by_proxy_on_outbound_request(
             assert result.exit_code == 0, result.stderr
             assert "200 OK" in result.stdout
             assert "Bearer sk-proxy-rewrite-12345" in result.stdout
-            assert "nemo-placeholder:env:ANTHROPIC_API_KEY" not in result.stdout
+            assert "openshell:resolve:env:ANTHROPIC_API_KEY" not in result.stdout
 
 
 def test_provider_secret_resolved_via_connect_l7_proxy(
@@ -449,7 +459,7 @@ def test_provider_secret_resolved_via_connect_l7_proxy(
             assert "Authorization=Bearer sk-connect-l7-secret-99" in result.stdout, (
                 f"Real secret not found: {result.stdout}"
             )
-            assert "nemo-placeholder:env:" not in result.stdout
+            assert "openshell:resolve:env:" not in result.stdout
 
 
 def test_provider_multiple_secrets_resolved_via_connect_l7_proxy(
@@ -487,7 +497,7 @@ def test_provider_multiple_secrets_resolved_via_connect_l7_proxy(
             assert "Authorization=Bearer real-api-key-abc" in result.stdout
             assert "x-api-key=real-api-key-abc" in result.stdout
             assert "x-custom-token=real-custom-token-xyz" in result.stdout
-            assert "nemo-placeholder:env:" not in result.stdout
+            assert "openshell:resolve:env:" not in result.stdout
 
 
 # ===========================================================================

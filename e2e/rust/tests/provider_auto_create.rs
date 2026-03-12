@@ -18,12 +18,14 @@
 //! - The `openshell` binary (built automatically from the workspace)
 
 use std::process::Stdio;
+use std::sync::Mutex;
 
 use openshell_e2e::harness::binary::openshell_cmd;
 use openshell_e2e::harness::output::{extract_field, strip_ansi};
 
 const TEST_API_KEY: &str = "sk-e2e-auto-provider-test-key";
-const TEST_API_KEY_PLACEHOLDER: &str = "nemo-placeholder:env:ANTHROPIC_API_KEY";
+const TEST_API_KEY_PLACEHOLDER: &str = "openshell:resolve:env:ANTHROPIC_API_KEY";
+static CLAUDE_PROVIDER_LOCK: Mutex<()> = Mutex::new(());
 
 /// Helper: delete a provider by name, ignoring errors.
 async fn delete_provider(name: &str) {
@@ -34,6 +36,17 @@ async fn delete_provider(name: &str) {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     let _ = cmd.status().await;
+}
+
+/// Helper: check whether a provider already exists.
+async fn provider_exists(name: &str) -> bool {
+    let mut cmd = openshell_cmd();
+    cmd.arg("provider")
+        .arg("get")
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    cmd.status().await.is_ok_and(|status| status.success())
 }
 
 /// Helper: delete a sandbox by name, ignoring errors.
@@ -51,6 +64,15 @@ async fn delete_sandbox(name: &str) {
 /// auto-create a "claude" provider and inject a placeholder into the sandbox.
 #[tokio::test]
 async fn auto_created_provider_credential_available_in_sandbox() {
+    let _provider_lock = CLAUDE_PROVIDER_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    if provider_exists("claude").await {
+        eprintln!("Skipping test: existing provider 'claude' would make shared state unsafe");
+        return;
+    }
+
     // Clean up any leftover from a previous run.
     delete_provider("claude").await;
 
