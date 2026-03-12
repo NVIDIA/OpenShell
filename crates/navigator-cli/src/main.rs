@@ -812,31 +812,47 @@ enum GatewayCommands {
         ssh_key: Option<String>,
     },
 
-    /// Add an edge-authenticated gateway.
+    /// Add an existing gateway.
     ///
-    /// Registers an external gateway endpoint that is fronted by an
-    /// edge proxy (e.g., Cloudflare Access). Opens a browser for
-    /// authentication and stores the token locally. After adding, the
-    /// gateway appears in `openshell gateway select`.
+    /// Registers a gateway endpoint so it appears in `openshell gateway select`.
+    ///
+    /// Without extra flags the gateway is treated as an edge-authenticated
+    /// (cloud) gateway and a browser is opened for authentication.
+    ///
+    /// Pass `--remote <ssh-dest>` to register a remote mTLS gateway whose
+    /// Docker daemon is reachable over SSH. Pass `--local` to register a
+    /// local mTLS gateway running in Docker on this machine. In both cases
+    /// the CLI extracts mTLS certificates from the running container
+    /// automatically.
+    ///
+    /// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand
+    /// for `--remote user@host` with the endpoint derived from the URL.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
-        /// Gateway endpoint URL (e.g., `https://8080-3vdegyusg.brevlab.com`).
+        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080` or `ssh://user@host:8080`).
         endpoint: String,
 
         /// Gateway name (auto-derived from the endpoint hostname when omitted).
         #[arg(long)]
         name: Option<String>,
 
-        /// Skip browser authentication (authenticate later with `gateway login`).
-        #[arg(long)]
-        no_auth: bool,
+        /// Register a remote mTLS gateway accessible via SSH.
+        #[arg(long, conflicts_with = "local")]
+        remote: Option<String>,
+
+        /// SSH private key for the remote host (used with `--remote` or `ssh://`).
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+
+        /// Register a local mTLS gateway running in Docker on this machine.
+        #[arg(long, conflicts_with = "remote")]
+        local: bool,
     },
 
     /// Authenticate with an edge-authenticated gateway.
     ///
     /// Opens a browser for the edge proxy's login flow and stores the
-    /// token locally. Use this to re-authenticate when a token expires
-    /// or to authenticate a gateway added with `--no-auth`.
+    /// token locally. Use this to re-authenticate when a token expires.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Login {
         /// Gateway name (defaults to the active gateway).
@@ -1066,14 +1082,12 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
-        /// Auto-bootstrap a gateway if none is available.
-        ///
-        /// Without this flag, an interactive prompt asks whether to bootstrap;
-        /// in non-interactive mode the command errors.
+        /// Auto-bootstrap a gateway if none is available (this is the default).
         #[arg(
             long,
             overrides_with = "no_bootstrap",
-            help_heading = "BOOTSTRAP FLAGS"
+            help_heading = "BOOTSTRAP FLAGS",
+            hide = true
         )]
         bootstrap: bool,
 
@@ -1431,9 +1445,18 @@ async fn main() -> Result<()> {
             GatewayCommands::Add {
                 endpoint,
                 name,
-                no_auth,
+                remote,
+                ssh_key,
+                local,
             } => {
-                run::gateway_add(&endpoint, name.as_deref(), no_auth).await?;
+                run::gateway_add(
+                    &endpoint,
+                    name.as_deref(),
+                    remote.as_deref(),
+                    ssh_key.as_deref(),
+                    local,
+                )
+                .await?;
             }
             GatewayCommands::Login { name } => {
                 let name = name
@@ -1786,12 +1809,13 @@ async fn main() -> Result<()> {
                     };
 
                     // Resolve --bootstrap / --no-bootstrap into an Option<bool>.
+                    // Bootstrap is the default; --no-bootstrap opts out.
                     let bootstrap_override = if no_bootstrap {
                         Some(false)
                     } else if bootstrap {
                         Some(true)
                     } else {
-                        None // prompt or auto-detect
+                        None // auto-bootstrap (default)
                     };
 
                     // Resolve --auto-providers / --no-auto-providers.
@@ -1828,6 +1852,10 @@ async fn main() -> Result<()> {
                             let endpoint = &ctx.endpoint;
                             let mut tls = tls.with_gateway_name(&ctx.name);
                             apply_edge_auth(&mut tls, &ctx.name);
+                            // The user already has a configured gateway. Disable
+                            // auto-bootstrap in the retry path so we don't
+                            // silently replace their selected gateway with a new
+                            // "openshell" gateway if the connection fails.
                             Box::pin(run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
@@ -1843,7 +1871,7 @@ async fn main() -> Result<()> {
                                 forward,
                                 &command,
                                 tty_override,
-                                bootstrap_override,
+                                Some(false),
                                 auto_providers_override,
                                 &tls,
                             ))

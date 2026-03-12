@@ -33,8 +33,7 @@ use crate::docker::{
     ensure_image, ensure_network, ensure_volume, start_container, stop_container,
 };
 use crate::metadata::{
-    create_gateway_metadata, create_gateway_metadata_with_host, extract_host_from_ssh_destination,
-    local_gateway_host, resolve_ssh_hostname,
+    create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
 };
 use crate::mtls::store_pki_bundle;
 use crate::pki::generate_pki;
@@ -46,9 +45,10 @@ use crate::runtime::{
 pub use crate::constants::container_name;
 pub use crate::docker::{ExistingGatewayInfo, create_ssh_docker_client};
 pub use crate::metadata::{
-    GatewayMetadata, clear_active_gateway, get_gateway_metadata, list_gateways,
-    load_active_gateway, load_gateway_metadata, load_last_sandbox, remove_gateway_metadata,
-    save_active_gateway, save_last_sandbox, store_gateway_metadata,
+    GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
+    list_gateways, load_active_gateway, load_gateway_metadata, load_last_sandbox,
+    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
+    store_gateway_metadata,
 };
 
 /// Options for remote SSH deployment.
@@ -477,6 +477,30 @@ pub async fn gateway_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
         metadata,
         docker,
     })
+}
+
+/// Extract mTLS certificates from an existing gateway container and store
+/// them locally so the CLI can connect.
+///
+/// Connects to Docker (local or remote via SSH), auto-discovers the running
+/// gateway container by image name (narrowed by `port` when provided), reads
+/// the PKI bundle from Kubernetes secrets inside it, and writes the client
+/// materials (ca.crt, tls.crt, tls.key) to the gateway config directory.
+pub async fn extract_and_store_pki(
+    name: &str,
+    remote: Option<&RemoteOptions>,
+    port: Option<u16>,
+) -> Result<()> {
+    let docker = match remote {
+        Some(r) => create_ssh_docker_client(r).await?,
+        None => Docker::connect_with_local_defaults().into_diagnostic()?,
+    };
+    let cname = docker::find_gateway_container(&docker, port).await?;
+    let bundle = load_existing_pki_bundle(&docker, &cname, constants::KUBECONFIG_PATH)
+        .await
+        .map_err(|e| miette::miette!("Failed to extract TLS certificates: {e}"))?;
+    store_pki_bundle(name, &bundle)?;
+    Ok(())
 }
 
 pub async fn ensure_gateway_image(version: &str, registry_token: Option<&str>) -> Result<String> {

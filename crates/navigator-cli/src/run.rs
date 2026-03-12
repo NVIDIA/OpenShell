@@ -17,8 +17,9 @@ use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
     DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
-    get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
-    save_active_gateway, save_last_sandbox, store_gateway_metadata,
+    extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
+    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
+    store_gateway_metadata,
 };
 use navigator_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
@@ -743,32 +744,34 @@ pub fn gateway_select(name: Option<&str>, gateway_flag: &Option<String>) -> Resu
 }
 
 fn format_gateway_select_header(gateways: &[GatewayMetadata]) -> String {
-    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+    let (name_width, endpoint_width, type_width) = gateway_select_column_widths(gateways);
     format!(
-        "  {:<name_width$}  {:<endpoint_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "AUTH".bold(),
     )
 }
 
 fn format_gateway_select_items(gateways: &[GatewayMetadata]) -> Vec<String> {
-    let (name_width, endpoint_width) = gateway_select_column_widths(gateways);
+    let (name_width, endpoint_width, type_width) = gateway_select_column_widths(gateways);
 
     gateways
         .iter()
         .map(|gateway| {
             format!(
-                "{:<name_width$}  {:<endpoint_width$}  {}",
+                "{:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
                 gateway.name,
                 gateway.gateway_endpoint,
                 gateway_type_label(gateway),
+                gateway_auth_label(gateway),
             )
         })
         .collect()
 }
 
-fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) {
+fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize, usize) {
     let name_width = gateways
         .iter()
         .map(|gateway| gateway.name.len())
@@ -781,16 +784,26 @@ fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) 
         .max()
         .unwrap_or(8)
         .max(8);
+    let type_width = gateways
+        .iter()
+        .map(|gateway| gateway_type_label(gateway).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
-    (name_width, endpoint_width)
+    (name_width, endpoint_width, type_width)
 }
 
 fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
     match gateway.auth_mode.as_deref() {
-        Some("cloudflare_jwt") => "edge",
+        Some("cloudflare_jwt") => "cloud",
         _ if gateway.is_remote => "remote",
         _ => "local",
     }
+}
+
+fn gateway_auth_label(gateway: &GatewayMetadata) -> &str {
+    gateway.auth_mode.as_deref().unwrap_or("unknown")
 }
 
 fn gateway_select_with<F>(
@@ -834,18 +847,79 @@ where
     Ok(())
 }
 
-/// Register an external edge-authenticated gateway.
+/// Register an existing gateway.
 ///
-/// Creates local metadata for the given endpoint so it appears in
-/// `gateway select`. When `no_auth` is false, opens a browser for
-/// authentication and stores the bearer token locally.
-pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> Result<()> {
-    // Normalise the endpoint: ensure it has a scheme.
-    let endpoint = if endpoint.contains("://") {
-        endpoint.to_string()
+/// Without extra flags the gateway is treated as an edge-authenticated (cloud)
+/// gateway and a browser is opened for authentication.
+///
+/// Pass `remote` (SSH destination) to register a remote mTLS gateway, or
+/// `local = true` for a local mTLS gateway. In both cases the CLI extracts
+/// mTLS certificates from the running container automatically.
+///
+/// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand for
+/// `--remote user@host` with the gateway endpoint derived from the URL.
+pub async fn gateway_add(
+    endpoint: &str,
+    name: Option<&str>,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+    local: bool,
+) -> Result<()> {
+    // If the endpoint starts with ssh://, parse it into an SSH destination
+    // and a gateway endpoint automatically.  The host is resolved via
+    // `ssh -G` so that SSH config aliases map to the real hostname/IP.
+    // e.g. ssh://drew@spark:8080 -> remote="drew@spark", endpoint="https://<resolved>:8080"
+    let (endpoint, remote) = if endpoint.starts_with("ssh://") {
+        if local {
+            return Err(miette::miette!(
+                "Cannot use --local with an ssh:// endpoint.\n\
+                 ssh:// implies a remote gateway."
+            ));
+        }
+        if remote.is_some() {
+            return Err(miette::miette!(
+                "Cannot use --remote with an ssh:// endpoint.\n\
+                 The SSH destination is already embedded in the URL."
+            ));
+        }
+        let parsed = url::Url::parse(endpoint)
+            .map_err(|e| miette::miette!("Invalid ssh:// URL '{endpoint}': {e}"))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| miette::miette!("ssh:// URL must include a hostname: {endpoint}"))?;
+        let port = parsed
+            .port()
+            .ok_or_else(|| miette::miette!("ssh:// URL must include a port: {endpoint}"))?;
+
+        let ssh_dest = if parsed.username().is_empty() {
+            host.to_string()
+        } else {
+            format!("{}@{host}", parsed.username())
+        };
+        // Resolve the SSH host alias (e.g. ~/.ssh/config HostName) so the
+        // endpoint uses the actual hostname/IP that matches the TLS certificate
+        // SANs — consistent with the `gateway start` path.
+        let resolved = resolve_ssh_hostname(host);
+        let https_endpoint = format!("https://{resolved}:{port}");
+
+        (https_endpoint, Some(ssh_dest))
     } else {
-        format!("https://{endpoint}")
+        // Normalise the endpoint: ensure it has a scheme.
+        let endpoint = if endpoint.contains("://") {
+            endpoint.to_string()
+        } else {
+            format!("https://{endpoint}")
+        };
+        (endpoint, remote.map(String::from))
     };
+    let remote = remote.as_deref();
+
+    // Validate --ssh-key requires a remote gateway context.
+    if ssh_key.is_some() && remote.is_none() {
+        return Err(miette::miette!(
+            "--ssh-key requires --remote or an ssh:// endpoint"
+        ));
+    }
 
     // Derive a gateway name from the hostname when none is provided.
     let derived_name;
@@ -860,54 +934,109 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         &derived_name
     };
 
-    // Build metadata for an edge-authenticated remote gateway.
-    let metadata = GatewayMetadata {
-        name: name.to_string(),
-        gateway_endpoint: endpoint.clone(),
-        is_remote: true,
-        gateway_port: 0,
-        remote_host: None,
-        resolved_host: None,
-        auth_mode: Some("cloudflare_jwt".to_string()),
-        edge_team_domain: None,
-        edge_auth_url: None,
-    };
+    // Fail if a gateway with this name already exists.
+    if get_gateway_metadata(name).is_some() {
+        return Err(miette::miette!(
+            "Gateway '{}' already exists.\n\
+             Remove it first with: openshell gateway destroy --name {}\n\
+             Or choose a different name with: --name <name>",
+            name,
+            name,
+        ));
+    }
 
-    store_gateway_metadata(name, &metadata)?;
-    save_active_gateway(name)?;
+    if remote.is_some() || local {
+        // mTLS gateway (remote or local).
+        let remote_opts = remote.map(|dest| {
+            let mut opts = RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                opts = opts.with_ssh_key(key);
+            }
+            opts
+        });
 
-    if no_auth {
+        // Extract certs BEFORE storing metadata — if this fails the gateway
+        // is not registered.  Pass the endpoint port so the container can be
+        // identified by its host port binding when multiple gateways run on
+        // the same Docker host.
+        let endpoint_port = url::Url::parse(&endpoint).ok().and_then(|u| u.port());
+        eprintln!("• Extracting TLS certificates from gateway container...");
+        navigator_bootstrap::extract_and_store_pki(name, remote_opts.as_ref(), endpoint_port)
+            .await?;
+
+        let (remote_host, resolved_host) = if let Some(dest) = remote {
+            let ssh_host = extract_host_from_ssh_destination(dest);
+            let resolved = resolve_ssh_hostname(&ssh_host);
+            (Some(dest.to_string()), Some(resolved))
+        } else {
+            (None, None)
+        };
+
+        let metadata = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.clone(),
+            is_remote: !local,
+            gateway_port: 0,
+            remote_host,
+            resolved_host,
+            auth_mode: Some("mtls".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
         eprintln!(
             "{} Gateway '{}' added and set as active",
             "✓".green().bold(),
             name,
         );
-        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!(
+            "  {} {}",
+            "Type:".dimmed(),
+            if local { "local" } else { "remote" },
+        );
+        eprintln!("{} TLS certificates extracted", "✓".green().bold());
+    } else {
+        // Cloud (edge-authenticated) gateway.
+        let metadata = GatewayMetadata {
+            name: name.to_string(),
+            gateway_endpoint: endpoint.clone(),
+            is_remote: true,
+            gateway_port: 0,
+            remote_host: None,
+            resolved_host: None,
+            auth_mode: Some("cloudflare_jwt".to_string()),
+            edge_team_domain: None,
+            edge_auth_url: None,
+        };
+
+        store_gateway_metadata(name, &metadata)?;
+        save_active_gateway(name)?;
+
+        eprintln!(
+            "{} Gateway '{}' added and set as active",
+            "✓".green().bold(),
+            name,
+        );
+        eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint);
+        eprintln!("  {} cloud", "Type:".dimmed());
         eprintln!();
-        eprintln!("Authenticate with: {}", "openshell gateway login".dimmed(),);
-        return Ok(());
-    }
 
-    // Run the browser-based auth flow.
-    eprintln!(
-        "{} Gateway '{}' added and set as active",
-        "✓".green().bold(),
-        name,
-    );
-    eprintln!("  {} {}", "Endpoint:".dimmed(), endpoint,);
-    eprintln!();
-
-    match crate::auth::browser_auth_flow(&endpoint).await {
-        Ok(token) => {
-            navigator_bootstrap::edge_token::store_edge_token(name, &token)?;
-            eprintln!("{} Authenticated successfully", "✓".green().bold(),);
-        }
-        Err(e) => {
-            eprintln!("{} Authentication skipped: {e}", "!".yellow(),);
-            eprintln!(
-                "  Authenticate later with: {}",
-                "openshell gateway login".dimmed(),
-            );
+        match crate::auth::browser_auth_flow(&endpoint).await {
+            Ok(token) => {
+                navigator_bootstrap::edge_token::store_edge_token(name, &token)?;
+                eprintln!("{} Authenticated successfully", "✓".green().bold());
+            }
+            Err(e) => {
+                eprintln!("{} Authentication skipped: {e}", "!".yellow());
+                eprintln!(
+                    "  Authenticate later with: {}",
+                    "openshell gateway login".dimmed(),
+                );
+            }
         }
     }
 
@@ -968,23 +1097,31 @@ pub fn gateway_list(gateway_flag: &Option<String>) -> Result<()> {
         .max()
         .unwrap_or(8)
         .max(8);
+    let type_width = gateways
+        .iter()
+        .map(|g| gateway_type_label(g).len())
+        .max()
+        .unwrap_or(4)
+        .max(4);
 
     // Print header
     println!(
-        "  {:<name_width$}  {:<endpoint_width$}  {}",
+        "  {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {}",
         "NAME".bold(),
         "ENDPOINT".bold(),
         "TYPE".bold(),
+        "AUTH".bold(),
     );
 
     // Print rows
     for gateway in &gateways {
         let is_active = active.as_deref() == Some(&gateway.name);
         let marker = if is_active { "*" } else { " " };
-        let gateway_type = gateway_type_label(gateway);
+        let gw_type = gateway_type_label(gateway);
+        let gw_auth = gateway_auth_label(gateway);
         let line = format!(
-            "{marker} {:<name_width$}  {:<endpoint_width$}  {gateway_type}",
-            gateway.name, gateway.gateway_endpoint,
+            "{marker} {:<name_width$}  {:<endpoint_width$}  {:<type_width$}  {gw_auth}",
+            gateway.name, gateway.gateway_endpoint, gw_type,
         );
         if is_active {
             println!("{}", line.green());
@@ -1556,7 +1693,7 @@ fn shell_escape(s: &str) -> String {
 
 /// Create a sandbox when no gateway is configured.
 ///
-/// Offers to bootstrap a new gateway first, then delegates to [`sandbox_create`].
+/// Bootstraps a new gateway first, then delegates to [`sandbox_create`].
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create_with_bootstrap(
     name: Option<&str>,
@@ -1581,14 +1718,14 @@ pub async fn sandbox_create_with_bootstrap(
              Or deploy a new gateway: openshell gateway start"
         ));
     }
-    let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
-    // The bootstrap flow always creates a gateway named "openshell".
-    let gateway_name = "openshell";
+    let (tls, server, gateway_name) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+    // Disable bootstrap inside sandbox_create so that a transient connection
+    // failure right after deploy does not trigger a second bootstrap attempt.
     sandbox_create(
         &server,
         name,
         from,
-        gateway_name,
+        &gateway_name,
         upload,
         keep,
         editor,
@@ -1599,7 +1736,7 @@ pub async fn sandbox_create_with_bootstrap(
         forward,
         command,
         tty_override,
-        bootstrap_override,
+        Some(false),
         auto_providers_override,
         &tls,
     )
@@ -1633,8 +1770,13 @@ pub async fn sandbox_create(
         ));
     }
 
-    // Try connecting to the gateway. If it fails due to an unreachable gateway,
-    // offer to bootstrap a local one and retry.
+    // Try connecting to the gateway. If the connection fails due to a
+    // connectivity error and bootstrap is allowed, start a new gateway.
+    //
+    // bootstrap_override is Some(false) when:
+    //   - the user passed --no-bootstrap
+    //   - an existing gateway was already resolved (don't replace it)
+    //   - we already bootstrapped once (don't double-bootstrap)
     let (mut client, effective_server, effective_tls) = match grpc_client(server, tls).await {
         Ok(c) => (c, server.to_string(), tls.clone()),
         Err(err) => {
@@ -1642,9 +1784,26 @@ pub async fn sandbox_create(
                 return Err(err);
             }
             if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
+                // The gateway is configured but not reachable. Give the user
+                // actionable recovery steps instead of a raw connection error.
+                eprintln!();
+                eprintln!(
+                    "{} Gateway '{}' is not reachable.",
+                    "!".yellow(),
+                    gateway_name,
+                );
+                eprintln!();
+                eprintln!("  To destroy and recreate the gateway:");
+                eprintln!();
+                eprintln!(
+                    "    {} && {}",
+                    format!("openshell gateway destroy {gateway_name}").cyan(),
+                    "openshell gateway start".cyan(),
+                );
+                eprintln!();
                 return Err(err);
             }
-            let (new_tls, new_server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+            let (new_tls, new_server, _) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
                 .wrap_err("bootstrap succeeded but failed to connect to gateway")?;
@@ -3997,8 +4156,8 @@ fn format_timestamp_ms(ms: i64) -> String {
 mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
-        format_gateway_select_items, gateway_select_with, gateway_type_label, git_sync_files,
-        http_health_check, inferred_provider_type, parse_credential_pairs,
+        format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
+        git_sync_files, http_health_check, inferred_provider_type, parse_credential_pairs,
         resolve_gateway_control_target_from,
     };
     use crate::TEST_ENV_LOCK;
@@ -4313,15 +4472,20 @@ mod tests {
         let items = format_gateway_select_items(&gateways);
         let header = format_gateway_select_header(&gateways);
 
-        assert_eq!(gateway_type_label(&gateways[0]), "edge");
+        assert_eq!(gateway_type_label(&gateways[0]), "cloud");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
+        assert_eq!(gateway_auth_label(&gateways[0]), "cloudflare_jwt");
+        assert_eq!(gateway_auth_label(&gateways[1]), "unknown");
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
+        assert!(header.contains("AUTH"));
         assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
-        assert!(items[0].contains("edge"));
+        assert!(items[0].contains("cloud"));
+        assert!(items[0].contains("cloudflare_jwt"));
         assert!(items[1].contains("local"));
+        assert!(items[1].contains("unknown"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
     }
 
