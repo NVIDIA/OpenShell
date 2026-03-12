@@ -180,7 +180,7 @@ pub async fn find_gateway_container(docker: &Docker, port: Option<u16>) -> Resul
         1 => Ok(matches.into_iter().next().unwrap()),
         _ => Err(miette::miette!(
             "Found multiple openshell gateway containers: {}\n\
-             Pass --name <gateway-name> to select one.",
+             Specify the port in the endpoint URL to select one (e.g. https://host:8080).",
             matches.join(", ")
         )),
     }

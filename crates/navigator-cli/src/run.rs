@@ -866,8 +866,9 @@ pub async fn gateway_add(
     local: bool,
 ) -> Result<()> {
     // If the endpoint starts with ssh://, parse it into an SSH destination
-    // and a gateway endpoint automatically.
-    // e.g. ssh://drew@spark:8080 -> remote="drew@spark", endpoint="https://spark:8080"
+    // and a gateway endpoint automatically.  The host is resolved via
+    // `ssh -G` so that SSH config aliases map to the real hostname/IP.
+    // e.g. ssh://drew@spark:8080 -> remote="drew@spark", endpoint="https://<resolved>:8080"
     let (endpoint, remote) = if endpoint.starts_with("ssh://") {
         if local {
             return Err(miette::miette!(
@@ -895,7 +896,11 @@ pub async fn gateway_add(
         } else {
             format!("{}@{host}", parsed.username())
         };
-        let https_endpoint = format!("https://{host}:{port}");
+        // Resolve the SSH host alias (e.g. ~/.ssh/config HostName) so the
+        // endpoint uses the actual hostname/IP that matches the TLS certificate
+        // SANs — consistent with the `gateway start` path.
+        let resolved = resolve_ssh_hostname(host);
+        let https_endpoint = format!("https://{resolved}:{port}");
 
         (https_endpoint, Some(ssh_dest))
     } else {
