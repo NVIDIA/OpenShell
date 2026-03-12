@@ -440,6 +440,37 @@ impl russh::server::Handler for SshHandler {
         Ok(())
     }
 
+    async fn subsystem_request(
+        &mut self,
+        channel: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if name == "sftp" {
+            session.channel_success(channel)?;
+            // sftp-server speaks the SFTP binary protocol over stdin/stdout,
+            // which is exactly what spawn_pipe_exec wires up.  This enables
+            // modern scp (SFTP-based, OpenSSH 9.0+) and SFTP clients to
+            // transfer files into and out of the sandbox.
+            let input_sender = spawn_pipe_exec(
+                &self.policy,
+                self.workdir.clone(),
+                Some("/usr/lib/openssh/sftp-server".to_string()),
+                session.handle(),
+                channel,
+                self.netns_fd,
+                self.proxy_url.clone(),
+                self.ca_file_paths.clone(),
+                &self.provider_env,
+            )?;
+            self.input_sender = Some(input_sender);
+        } else {
+            warn!(subsystem = name, "unsupported subsystem requested");
+            session.channel_failure(channel)?;
+        }
+        Ok(())
+    }
+
     async fn env_request(
         &mut self,
         channel: ChannelId,

@@ -14,22 +14,30 @@ extension so you get a full IDE experience inside the sandbox environment.
 
 ## Quick start
 
-### 1. Create a sandbox
+### 1. Create and open the sandbox in VS Code
 
 ```bash
-openshell sandbox create --keep --name my-sandbox
+openshell sandbox create --editor vscode --name my-sandbox
 ```
 
-`--keep` prevents the sandbox from being cleaned up when the shell exits so
-VSCode can reconnect to it later.
+This launches VS Code directly into `/sandbox`, keeps the sandbox alive for the
+remote session, and installs an OpenShell-managed SSH include file so your main
+`~/.ssh/config` stays clean.
 
-### 2. Generate an SSH config entry
+### 2. Reconnect later
+
+To reopen an existing sandbox in VS Code:
 
 ```bash
-openshell sandbox ssh-config my-sandbox >> ~/.ssh/config
+openshell sandbox connect my-sandbox --editor vscode
 ```
 
-This will append a block like:
+OpenShell maintains the generated `Host openshell-my-sandbox` entry in its own
+managed SSH config include file.
+
+### 3. Optional manual workflow
+
+If you want to inspect the generated SSH stanza directly:
 
 ```text
 Host openshell-my-sandbox
@@ -41,7 +49,13 @@ Host openshell-my-sandbox
     ProxyCommand openshell ssh-proxy --gateway <gateway-name> --name my-sandbox
 ```
 
-### 3. Open VSCode
+You can still print it manually with:
+
+```bash
+openshell sandbox ssh-config my-sandbox
+```
+
+### 4. Open VS Code manually
 
 Open VSCode and run **Remote-SSH: Connect to Host...** from the command
 palette (`Cmd+Shift+P` / `Ctrl+Shift+P`). Select `openshell-my-sandbox` from the
@@ -53,7 +67,7 @@ Alternatively, from the terminal:
 code --remote ssh-remote+openshell-my-sandbox /sandbox
 ```
 
-### 4. Clean up
+### 5. Clean up
 
 When you are done, delete the sandbox:
 

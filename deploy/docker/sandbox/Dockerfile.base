@@ -101,7 +101,7 @@ WORKDIR /sandbox
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3.12 python3.12-venv python3.12-dev python3-pip \
     curl dnsutils iproute2 iputils-ping \
-    net-tools netcat-openbsd traceroute \
+    net-tools netcat-openbsd openssh-sftp-server procps traceroute \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python3 \
     && ln -sf /usr/bin/python3.12 /usr/local/bin/python \
     && rm -rf /var/lib/apt/lists/*

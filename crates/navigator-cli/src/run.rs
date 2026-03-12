@@ -41,10 +41,10 @@ use std::time::{Duration, Instant};
 use tonic::Code;
 
 // Re-export SSH functions for backward compatibility
-pub use crate::ssh::print_ssh_config;
+pub use crate::ssh::{Editor, print_ssh_config};
 pub use crate::ssh::{
-    sandbox_connect, sandbox_exec, sandbox_forward, sandbox_ssh_proxy, sandbox_ssh_proxy_by_name,
-    sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
+    sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
+    sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
 pub use navigator_core::forward::{list_forwards, stop_forward, stop_forwards_for_sandbox};
 
@@ -1518,6 +1518,7 @@ pub async fn sandbox_create_with_bootstrap(
     from: Option<&str>,
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
+    editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
@@ -1545,6 +1546,7 @@ pub async fn sandbox_create_with_bootstrap(
         gateway_name,
         upload,
         keep,
+        editor,
         remote,
         ssh_key,
         providers,
@@ -1568,6 +1570,7 @@ pub async fn sandbox_create(
     gateway_name: &str,
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
+    editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     providers: &[String],
@@ -1579,6 +1582,12 @@ pub async fn sandbox_create(
     auto_providers_override: Option<bool>,
     tls: &TlsOptions,
 ) -> Result<()> {
+    if editor.is_some() && !command.is_empty() {
+        return Err(miette::miette!(
+            "--editor cannot be used with a trailing command; use `openshell sandbox connect <name> --editor ...` after the sandbox is ready"
+        ));
+    }
+
     // Try connecting to the gateway. If it fails due to an unreachable gateway,
     // offer to bootstrap a local one and retry.
     let (mut client, effective_server, effective_tls) = match grpc_client(server, tls).await {
@@ -1939,6 +1948,19 @@ pub async fn sandbox_create(
                 );
                 eprintln!("  Access at: http://127.0.0.1:{port}/");
                 eprintln!("  Stop with: openshell forward stop {port} {sandbox_name}",);
+            }
+
+            if let Some(editor) = editor {
+                let ssh_gateway_name = effective_tls.gateway_name().unwrap_or(gateway_name);
+                sandbox_connect_editor(
+                    &effective_server,
+                    ssh_gateway_name,
+                    &sandbox_name,
+                    editor,
+                    &effective_tls,
+                )
+                .await?;
+                return Ok(());
             }
 
             if command.is_empty() {

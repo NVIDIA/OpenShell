@@ -119,7 +119,7 @@ Create and manage isolated agent execution environments.
 | `openshell sandbox connect [name]` | Open an interactive SSH session into a running sandbox. |
 | `openshell sandbox upload [name]` | Upload files from the host into a sandbox. |
 | `openshell sandbox download [name]` | Download files from a sandbox to the host. |
-| `openshell sandbox ssh-config <name>` | Print SSH config for a sandbox. Append to `~/.ssh/config` for VS Code Remote-SSH. |
+| `openshell sandbox ssh-config <name>` | Print the generated SSH config block for a sandbox. |
 
 ### Sandbox Create Flags
 
@@ -132,6 +132,7 @@ The following flags control sandbox creation:
 | `--policy` | Path to a policy YAML file to apply at creation time. |
 | `--upload` | Upload local files into the sandbox before running. |
 | `--keep` | Keep the sandbox alive after the trailing command exits. |
+| `--editor` | Launch `vscode` or `cursor` into `/sandbox`; installs OpenShell-managed SSH config and implies `--keep`. |
 | `--forward` | Forward a local port into the sandbox at startup. |
 | `--from` | Build from a community sandbox name, local Dockerfile directory, or container image reference. |
 | `-- <command>` | The command to run inside the sandbox. Everything after `--` is passed as the agent command. |
