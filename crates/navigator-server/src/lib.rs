@@ -13,7 +13,6 @@ mod auth;
 mod grpc;
 mod http;
 mod inference;
-pub mod mechanistic_mapper;
 mod multiplex;
 mod persistence;
 mod sandbox;

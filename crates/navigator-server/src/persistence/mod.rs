@@ -375,38 +375,6 @@ impl Store {
             Self::Sqlite(store) => store.get_draft_version(sandbox_id).await,
         }
     }
-
-    // -----------------------------------------------------------------------
-    // Denial summary operations
-    // -----------------------------------------------------------------------
-
-    /// Upsert a denial summary (insert or update by sandbox+host+port+binary).
-    pub async fn upsert_denial_summary(&self, summary: &DenialSummaryRecord) -> Result<()> {
-        match self {
-            Self::Postgres(store) => store.upsert_denial_summary(summary).await,
-            Self::Sqlite(store) => store.upsert_denial_summary(summary).await,
-        }
-    }
-
-    /// List denial summaries for a sandbox, optionally filtered by status.
-    pub async fn list_denial_summaries(
-        &self,
-        sandbox_id: &str,
-        status_filter: Option<&str>,
-    ) -> Result<Vec<DenialSummaryRecord>> {
-        match self {
-            Self::Postgres(store) => store.list_denial_summaries(sandbox_id, status_filter).await,
-            Self::Sqlite(store) => store.list_denial_summaries(sandbox_id, status_filter).await,
-        }
-    }
-
-    /// Update denial summary status (e.g. new → analyzed → resolved).
-    pub async fn update_denial_summary_status(&self, id: &str, status: &str) -> Result<bool> {
-        match self {
-            Self::Postgres(store) => store.update_denial_summary_status(id, status).await,
-            Self::Sqlite(store) => store.update_denial_summary_status(id, status).await,
-        }
-    }
 }
 
 /// Stored draft policy chunk record.
@@ -416,56 +384,25 @@ pub struct DraftChunkRecord {
     pub sandbox_id: String,
     pub draft_version: i64,
     pub status: String,
-    pub stage: String,
     pub rule_name: String,
     pub proposed_rule: Vec<u8>,
     pub rationale: String,
     pub security_notes: String,
     pub confidence: f64,
-    pub denial_refs: String,
-    pub supersedes_chunk_id: String,
-    pub analysis_mode: String,
     pub created_at_ms: i64,
     pub decided_at_ms: Option<i64>,
-    pub decided_by: String,
     /// Denormalized endpoint host (lowercase) for DB-level dedup.
     pub host: String,
     /// Denormalized endpoint port for DB-level dedup.
     pub port: i32,
+    /// Binary path that triggered the denial (for per-binary dedup).
+    pub binary: String,
     /// How many times this endpoint has been seen across denial flush cycles.
     pub hit_count: i32,
     /// First time this endpoint was proposed (ms since epoch).
     pub first_seen_ms: i64,
     /// Most recent time this endpoint was re-proposed (ms since epoch).
     pub last_seen_ms: i64,
-}
-
-/// Stored denial summary record.
-#[derive(Debug, Clone)]
-pub struct DenialSummaryRecord {
-    pub id: String,
-    pub sandbox_id: String,
-    pub host: String,
-    pub port: i32,
-    pub binary: String,
-    pub ancestors: String,
-    pub deny_reason: String,
-    pub first_seen_ms: i64,
-    pub last_seen_ms: i64,
-    pub count: i32,
-    pub suppressed_count: i32,
-    pub total_count: i32,
-    pub sample_cmdlines: String,
-    pub binary_sha256: String,
-    pub persistent: bool,
-    pub denial_stage: String,
-    pub resolved_ips: String,
-    pub is_private_ip: bool,
-    pub l7_request_samples: String,
-    pub l7_inspection_active: bool,
-    pub status: String,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
 }
 
 fn current_time_ms() -> Result<i64> {

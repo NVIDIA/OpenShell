@@ -663,6 +663,8 @@ message PolicyChunk {
   int64 first_seen_ms = 14;
   // Most recent time this endpoint was re-proposed (ms since epoch).
   int64 last_seen_ms = 15;
+  // Binary path that triggered the denial (denormalized for display convenience).
+  string binary = 16;
 }
 
 // Notification that the draft policy was updated.

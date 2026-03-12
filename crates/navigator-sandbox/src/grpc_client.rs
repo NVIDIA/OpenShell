@@ -257,6 +257,7 @@ impl CachedNavigatorClient {
         &self,
         sandbox_name: &str,
         summaries: Vec<DenialSummary>,
+        proposed_chunks: Vec<navigator_core::proto::PolicyChunk>,
         analysis_mode: &str,
     ) -> Result<()> {
         self.client
@@ -264,7 +265,7 @@ impl CachedNavigatorClient {
             .submit_policy_analysis(SubmitPolicyAnalysisRequest {
                 name: sandbox_name.to_string(),
                 summaries,
-                proposed_chunks: vec![],
+                proposed_chunks,
                 analysis_mode: analysis_mode.to_string(),
             })
             .await

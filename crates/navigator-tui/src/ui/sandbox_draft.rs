@@ -106,6 +106,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
                 spans.push(Span::styled("  ", styles::MUTED));
                 spans.push(Span::styled(endpoint_str, styles::ACCENT));
             }
+            // Show binary name (just the filename, not full path) if present.
+            if !chunk.binary.is_empty() {
+                let bin_short = chunk.binary.rsplit('/').next().unwrap_or(&chunk.binary);
+                spans.push(Span::styled("  ", styles::MUTED));
+                spans.push(Span::styled(format!("({bin_short})"), styles::MUTED));
+            }
             spans.push(Span::raw("  "));
             spans.push(Span::styled(format!("[{}]", chunk.status), status_style));
             spans.push(Span::styled(
@@ -176,27 +182,36 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
             Span::styled("Confidence: ", styles::MUTED),
             Span::styled(format!("{:.0}%", chunk.confidence * 100.0), styles::TEXT),
         ]),
-        Line::from(vec![
-            Span::styled("Stage:      ", styles::MUTED),
-            Span::styled(&chunk.stage, styles::TEXT),
-        ]),
     ];
 
-    // Hit count and first/last seen.
-    if chunk.hit_count > 1 {
+    // Binary (denormalized from the denial).
+    if !chunk.binary.is_empty() {
         lines.push(Line::from(vec![
-            Span::styled("Hits:       ", styles::MUTED),
-            Span::styled(format!("{}", chunk.hit_count), styles::ACCENT),
-            Span::styled(
-                format!(
-                    "  (first {} / last {})",
-                    format_short_time(chunk.first_seen_ms),
-                    format_short_time(chunk.last_seen_ms),
-                ),
-                styles::MUTED,
-            ),
+            Span::styled("Binary:     ", styles::MUTED),
+            Span::styled(&chunk.binary, styles::TEXT),
         ]));
     }
+
+    // Hit count (accumulated real denial count) and first/last seen.
+    lines.push(Line::from(vec![
+        Span::styled("Denied:     ", styles::MUTED),
+        Span::styled(
+            format!(
+                "{} connection{}",
+                chunk.hit_count,
+                if chunk.hit_count == 1 { "" } else { "s" }
+            ),
+            styles::ACCENT,
+        ),
+        Span::styled(
+            format!(
+                "  (first {} / last {})",
+                format_short_time(chunk.first_seen_ms),
+                format_short_time(chunk.last_seen_ms),
+            ),
+            styles::MUTED,
+        ),
+    ]));
 
     // Endpoints.
     if let Some(ref rule) = chunk.proposed_rule {
@@ -363,12 +378,18 @@ pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], are
             (chunk.rule_name.clone(), endpoint_str)
         };
 
-        lines.push(Line::from(vec![
+        let mut row_spans = vec![
             Span::styled("  -> ", styles::MUTED),
             Span::styled(name_str, styles::TEXT),
             Span::styled("  ", styles::MUTED),
             Span::styled(ep_str, styles::ACCENT),
-        ]));
+        ];
+        if !chunk.binary.is_empty() {
+            let bin_short = chunk.binary.rsplit('/').next().unwrap_or(&chunk.binary);
+            row_spans.push(Span::styled("  ", styles::MUTED));
+            row_spans.push(Span::styled(format!("({bin_short})"), styles::MUTED));
+        }
+        lines.push(Line::from(row_spans));
     }
 
     lines.push(Line::from(""));

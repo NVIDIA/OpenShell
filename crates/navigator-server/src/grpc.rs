@@ -6,8 +6,7 @@
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
 use crate::persistence::{
-    DenialSummaryRecord, DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord,
-    generate_name,
+    DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, generate_name,
 };
 use futures::future;
 use navigator_core::proto::{
@@ -1355,54 +1354,6 @@ impl Navigator for NavigatorService {
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         let sandbox_id = sandbox.id.clone();
 
-        let analysis_mode = if req.analysis_mode.is_empty() {
-            "mechanistic"
-        } else {
-            &req.analysis_mode
-        };
-
-        // Persist denial summaries.
-        for summary in &req.summaries {
-            let id = uuid::Uuid::new_v4().to_string();
-            let now_ms =
-                current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
-            let record = DenialSummaryRecord {
-                id,
-                sandbox_id: sandbox_id.clone(),
-                host: summary.host.clone(),
-                port: summary.port as i32,
-                binary: summary.binary.clone(),
-                ancestors: summary.ancestors.join(","),
-                deny_reason: summary.deny_reason.clone(),
-                first_seen_ms: summary.first_seen_ms,
-                last_seen_ms: summary.last_seen_ms,
-                count: summary.count as i32,
-                suppressed_count: summary.suppressed_count as i32,
-                total_count: summary.total_count as i32,
-                sample_cmdlines: summary.sample_cmdlines.join("\n"),
-                binary_sha256: summary.binary_sha256.clone(),
-                persistent: summary.persistent,
-                denial_stage: summary.denial_stage.clone(),
-                resolved_ips: String::new(),
-                is_private_ip: false,
-                l7_request_samples: summary
-                    .l7_request_samples
-                    .iter()
-                    .map(|s| format!("{}:{}:{}:{}", s.method, s.path, s.decision, s.count))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-                l7_inspection_active: summary.l7_inspection_active,
-                status: "new".to_string(),
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            };
-            self.state
-                .store
-                .upsert_denial_summary(&record)
-                .await
-                .map_err(|e| Status::internal(format!("persist denial summary failed: {e}")))?;
-        }
-
         // Get the next draft version.
         let current_version = self
             .state
@@ -1412,35 +1363,19 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("get draft version failed: {e}")))?;
         let draft_version = current_version + 1;
 
-        // If no proposed chunks were submitted, auto-generate mechanistic
-        // proposals from the denial summaries.
-        let chunks_to_persist = if req.proposed_chunks.is_empty() && !req.summaries.is_empty() {
-            // Get existing rule names to avoid collisions.
-            let existing_chunks = self
-                .state
-                .store
-                .list_draft_chunks(&sandbox_id, None)
-                .await
-                .map_err(|e| Status::internal(format!("list draft chunks failed: {e}")))?;
-            let existing_names: Vec<String> = existing_chunks
-                .iter()
-                .map(|c| c.rule_name.clone())
-                .collect();
-
-            crate::mechanistic_mapper::generate_proposals(&req.summaries, &existing_names).await
-        } else {
-            req.proposed_chunks.clone()
-        };
-
-        // Persist proposed chunks and validate them.
+        // Validate and persist proposed chunks from the sandbox.
+        // The sandbox runs the mechanistic mapper (or future LLM advisor)
+        // and sends pre-formed chunks. The gateway is a thin persistence +
+        // validation layer — it never generates proposals itself.
+        //
         // Dedup is handled at the DB level: the unique partial index on
-        // (sandbox_id, host, port) WHERE status IN ('pending','approved')
-        // triggers an upsert that increments hit_count + updates last_seen_ms.
+        // (sandbox_id, host, port, binary) triggers an upsert that
+        // increments hit_count + updates last_seen_ms.
         let mut accepted: u32 = 0;
         let mut rejected: u32 = 0;
         let mut rejection_reasons: Vec<String> = Vec::new();
 
-        for chunk in &chunks_to_persist {
+        for chunk in &req.proposed_chunks {
             // Basic validation: rule_name and proposed_rule are required.
             if chunk.rule_name.is_empty() {
                 rejected += 1;
@@ -1463,12 +1398,15 @@ impl Navigator for NavigatorService {
                 .map(|r| r.encode_to_vec())
                 .unwrap_or_default();
 
-            // Extract host:port from the proposed rule for the denormalized columns.
-            let (ep_host, ep_port) = chunk
-                .proposed_rule
-                .as_ref()
+            // Extract host:port and binary from the proposed rule for denormalized columns.
+            let rule_ref = chunk.proposed_rule.as_ref();
+            let (ep_host, ep_port) = rule_ref
                 .and_then(|r| r.endpoints.first())
                 .map(|ep| (ep.host.to_lowercase(), ep.port as i32))
+                .unwrap_or_default();
+            let ep_binary = rule_ref
+                .and_then(|r| r.binaries.first())
+                .map(|b| b.path.clone())
                 .unwrap_or_default();
 
             let record = DraftChunkRecord {
@@ -1476,23 +1414,31 @@ impl Navigator for NavigatorService {
                 sandbox_id: sandbox_id.clone(),
                 draft_version,
                 status: "pending".to_string(),
-                stage: chunk.stage.clone(),
                 rule_name: chunk.rule_name.clone(),
                 proposed_rule: proposed_rule_bytes,
                 rationale: chunk.rationale.clone(),
                 security_notes: chunk.security_notes.clone(),
                 confidence: f64::from(chunk.confidence),
-                denial_refs: chunk.denial_summary_ids.join(","),
-                supersedes_chunk_id: chunk.supersedes_chunk_id.clone(),
-                analysis_mode: analysis_mode.to_string(),
                 created_at_ms: now_ms,
                 decided_at_ms: None,
-                decided_by: String::new(),
                 host: ep_host,
                 port: ep_port,
-                hit_count: 1,
-                first_seen_ms: now_ms,
-                last_seen_ms: now_ms,
+                binary: ep_binary,
+                hit_count: if chunk.hit_count > 0 {
+                    chunk.hit_count
+                } else {
+                    1
+                },
+                first_seen_ms: if chunk.first_seen_ms > 0 {
+                    chunk.first_seen_ms
+                } else {
+                    now_ms
+                },
+                last_seen_ms: if chunk.last_seen_ms > 0 {
+                    chunk.last_seen_ms
+                } else {
+                    now_ms
+                },
             };
             self.state
                 .store
@@ -1510,7 +1456,7 @@ impl Navigator for NavigatorService {
             accepted = accepted,
             rejected = rejected,
             draft_version = draft_version,
-            analysis_mode = %analysis_mode,
+            summaries = req.summaries.len(),
             "SubmitPolicyAnalysis: persisted draft chunks"
         );
 
@@ -2095,18 +2041,13 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
         rationale: record.rationale.clone(),
         security_notes: record.security_notes.clone(),
         confidence: record.confidence as f32,
-        denial_summary_ids: if record.denial_refs.is_empty() {
-            vec![]
-        } else {
-            record.denial_refs.split(',').map(String::from).collect()
-        },
         created_at_ms: record.created_at_ms,
         decided_at_ms: record.decided_at_ms.unwrap_or(0),
-        stage: record.stage.clone(),
-        supersedes_chunk_id: record.supersedes_chunk_id.clone(),
         hit_count: record.hit_count,
         first_seen_ms: record.first_seen_ms,
         last_seen_ms: record.last_seen_ms,
+        binary: record.binary.clone(),
+        ..Default::default()
     })
 }
 
@@ -2146,10 +2087,30 @@ async fn merge_chunk_into_policy(
 
         let base_version = latest.as_ref().map_or(0, |r| r.version);
 
-        // Insert or replace the network policy rule.
-        policy
-            .network_policies
-            .insert(chunk.rule_name.clone(), rule.clone());
+        // Merge: if a rule for this endpoint already exists, add the binary
+        // to its binaries list. Otherwise insert the whole proposed rule.
+        if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
+            // Add the chunk's binary if not already present.
+            for b in &rule.binaries {
+                if !existing.binaries.iter().any(|eb| eb.path == b.path) {
+                    existing.binaries.push(b.clone());
+                }
+            }
+            // Also merge endpoints and L7 rules in case they differ.
+            for ep in &rule.endpoints {
+                if !existing
+                    .endpoints
+                    .iter()
+                    .any(|e| e.host == ep.host && e.port == ep.port)
+                {
+                    existing.endpoints.push(ep.clone());
+                }
+            }
+        } else {
+            policy
+                .network_policies
+                .insert(chunk.rule_name.clone(), rule.clone());
+        }
 
         // Persist as a new version.
         let payload = policy.encode_to_vec();
@@ -2229,8 +2190,18 @@ async fn remove_chunk_from_policy(
         let mut policy = ProtoSandboxPolicy::decode(latest.policy_payload.as_slice())
             .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
 
-        // Remove the rule by name.
-        policy.network_policies.remove(&chunk.rule_name);
+        // Remove this chunk's binary from the rule. If no binaries remain,
+        // remove the entire rule.
+        let should_remove =
+            if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
+                existing.binaries.retain(|b| b.path != chunk.binary);
+                existing.binaries.is_empty()
+            } else {
+                false
+            };
+        if should_remove {
+            policy.network_policies.remove(&chunk.rule_name);
+        }
 
         // Persist as a new version.
         let payload = policy.encode_to_vec();

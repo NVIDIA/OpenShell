@@ -11,7 +11,8 @@ TUI to approve mechanistic recommendations and unlock each gate.
 
 Gate 1 tests the basic HTTPS flow (CONNECT tunnel).
 Gate 2 tests plain HTTP (forward proxy path).
-Gates 3-5 fire concurrently to test batch approval.
+Gate 3 uses curl to hit an endpoint only it accesses (per-binary tracking).
+Gates 4-6 fire concurrently to test batch approval.
 
 Usage:
     python3 ctf.py            # run all gates
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -78,7 +80,7 @@ GATES: list[dict] = [
         "hint": "A simple HTTPS echo to prove the CONNECT tunnel works.",
         "extract": lambda d: f"origin = {json.loads(d).get('origin', '?')}",
     },
-    # -- Gate 2: plain HTTP on 80 (forward proxy) -----------------------------
+    # -- Gate 2: plain HTTP on 80 (forward proxy, python) ----------------------
     {
         "num": 2,
         "name": "The Cartographer",
@@ -88,16 +90,30 @@ GATES: list[dict] = [
         "method": "GET",
         "headers": {},
         "body": None,
-        "hint": "Navigate the unencrypted waters of port 80.",
+        "hint": "Navigate the unencrypted waters of port 80 (python).",
         "extract": lambda d: (
             "{city}, {country} ({query})".format_map(json.loads(d))
             if json.loads(d).get("status") == "success"
             else json.loads(d).get("message", "?")
         ),
     },
-    # -- Gates 3-5: concurrent HTTPS requests (batch approval) ----------------
+    # -- Gate 3: curl-only endpoint (per-binary granularity) -----------------
     {
         "num": 3,
+        "name": "The Cartographer's Apprentice",
+        "host": "ifconfig.me",
+        "port": 80,
+        "url": "http://ifconfig.me",
+        "method": "GET",
+        "headers": {},
+        "body": None,
+        "hint": "curl charts its own course -- a different endpoint only it can reach.",
+        "use_curl": True,
+        "extract": lambda d: f"public IP = {d.strip()}",
+    },
+    # -- Gates 4-6: concurrent HTTPS requests (batch approval) ----------------
+    {
+        "num": 4,
         "name": "The Oracle",
         "host": "api.github.com",
         "port": 443,
@@ -112,7 +128,7 @@ GATES: list[dict] = [
         "extract": lambda d: d.strip()[:80],
     },
     {
-        "num": 4,
+        "num": 5,
         "name": "The Jester",
         "host": "icanhazdadjoke.com",
         "port": 443,
@@ -124,7 +140,7 @@ GATES: list[dict] = [
         "extract": lambda d: json.loads(d).get("joke", "?")[:120],
     },
     {
-        "num": 5,
+        "num": 6,
         "name": "The Sphinx",
         "host": "catfact.ninja",
         "port": 443,
@@ -135,9 +151,9 @@ GATES: list[dict] = [
         "hint": "Answer the Sphinx's riddle.",
         "extract": lambda d: json.loads(d).get("fact", "?")[:120],
     },
-    # -- Gate 6: HTTPS to internal IP (allowed_ips SSRF override) -------------
+    # -- Gate 7: HTTPS to internal IP (allowed_ips SSRF override) -------------
     {
-        "num": 6,
+        "num": 7,
         "name": "The Vault",
         "host": "gitlab-master.nvidia.com",
         "port": 443,
@@ -163,6 +179,41 @@ def _is_proxy_block(exc: Exception) -> bool:
     )
 
 
+def attempt_gate_curl(gate: dict) -> tuple[str, str]:
+    """Try to pass through a gate using curl as the binary.
+
+    Returns the same tuple convention as ``attempt_gate``.
+    """
+    try:
+        result = subprocess.run(
+            ["curl", "-sS", "--max-time", "15", gate["url"]],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        if result.returncode == 0 and result.stdout:
+            flag = gate["extract"](result.stdout)
+            return "pass", flag
+        stderr = result.stderr.strip().lower()
+        if any(tok in stderr for tok in ("403", "forbidden", "refused", "reset")):
+            return (
+                "blocked",
+                f"blocked by sandbox proxy (curl: {result.stderr.strip()[:80]})",
+            )
+        if result.returncode != 0:
+            return (
+                "blocked",
+                f"curl failed (rc={result.returncode}: {result.stderr.strip()[:80]})",
+            )
+        return "blocked", "curl returned empty response"
+    except subprocess.TimeoutExpired:
+        return "blocked", "curl timed out"
+    except FileNotFoundError:
+        return "error", "curl not found in sandbox"
+    except Exception as exc:  # noqa: BLE001
+        return "error", f"unexpected curl error ({exc})"
+
+
 def attempt_gate(gate: dict) -> tuple[str, str]:
     """Try to pass through a gate.
 
@@ -170,6 +221,8 @@ def attempt_gate(gate: dict) -> tuple[str, str]:
     proxy denied the connection (retryable), or ``("error", detail)`` for a
     real upstream failure (not retryable).
     """
+    if gate.get("use_curl"):
+        return attempt_gate_curl(gate)
     try:
         req = urllib.request.Request(
             gate["url"],
@@ -215,12 +268,13 @@ BANNER = f"""
   +============================================================+
   |                                                            |
   |  Your sandbox blocks all traffic except api.anthropic.com  |
-  |  6 gates stand between you and victory.                    |
+  |  7 gates stand between you and victory.                    |
   |                                                            |
   |  Gate 1   HTTPS endpoint (CONNECT tunnel)                  |
-  |  Gate 2   HTTP endpoint  (forward proxy)                   |
-  |  Gate 3-5 Concurrent requests (batch approval)             |
-  |  Gate 6   Internal IP endpoint (allowed_ips SSRF override) |
+  |  Gate 2   HTTP endpoint  (forward proxy, python)           |
+  |  Gate 3   curl-only endpoint (per-binary granularity)      |
+  |  Gate 4-6 Concurrent requests (batch approval)             |
+  |  Gate 7   Internal IP endpoint (allowed_ips SSRF override) |
   |                                                            |
   +============================================================+\
 {RESET}
@@ -230,16 +284,16 @@ VICTORY = f"""
 {GREEN}{BOLD}\
   +============================================================+
   |                                                            |
-  |              *  ALL 6 GATES UNLOCKED  *                    |
+  |              *  ALL 7 GATES UNLOCKED  *                    |
   |                                                            |
   |  You've mastered mechanistic policy recommendations.       |
   |                                                            |
   |  Each denied connection was detected by the sandbox        |
-  |  proxy, aggregated into a denial summary, transported      |
-   |  to the gateway, and mapped into a NetworkPolicyRule       |
-   |  for your approval.                                        |
-   |                                                            |
-   +============================================================+\
+  |  proxy, analyzed by the sandbox-side mechanistic mapper,   |
+  |  and submitted to the gateway as a NetworkPolicyRule       |
+  |  for your approval.                                        |
+  |                                                            |
+  +============================================================+\
 {RESET}
 """
 
@@ -254,7 +308,7 @@ def dry_run() -> None:
     print()
     for g in GATES:
         proto = "HTTPS" if g["port"] == 443 else "HTTP"
-        concurrent = "  (concurrent)" if g["num"] >= 3 else ""
+        concurrent = "  (concurrent)" if 4 <= g["num"] <= 6 else ""
         print(
             f"  {CYAN}Gate {g['num']}{RESET}  "
             f"{BOLD}{g['name']}{RESET}  "
@@ -447,16 +501,21 @@ def run_ctf() -> int:
         return 1
     completed += 1
 
-    # Gate 2: single HTTP endpoint
+    # Gate 2: HTTP endpoint (python)
     if not run_gate(GATES[1]):
         return 1
     completed += 1
 
-    # Gates 3-5: concurrent
-    completed += run_gates_concurrent(GATES[2:5])
+    # Gate 3: same endpoint via curl (per-binary granularity)
+    if not run_gate(GATES[2]):
+        return 1
+    completed += 1
 
-    # Gate 6: internal IP endpoint (allowed_ips SSRF override)
-    if not run_gate(GATES[5]):
+    # Gates 4-6: concurrent
+    completed += run_gates_concurrent(GATES[3:6])
+
+    # Gate 7: internal IP endpoint (allowed_ips SSRF override)
+    if not run_gate(GATES[6]):
         return 1
     completed += 1
 

@@ -3606,6 +3606,9 @@ pub async fn sandbox_draft_get(
         println!("  {} {}", "Chunk:".dimmed(), chunk.id);
         println!("  {} {}", "Status:".dimmed(), status_colored);
         println!("  {} {}", "Rule:".dimmed(), chunk.rule_name);
+        if !chunk.binary.is_empty() {
+            println!("  {} {}", "Binary:".dimmed(), chunk.binary);
+        }
         println!(
             "  {} {:.0}%",
             "Confidence:".dimmed(),

@@ -10,6 +10,7 @@ mod grpc_client;
 mod identity;
 pub mod l7;
 pub mod log_push;
+pub mod mechanistic_mapper;
 pub mod opa;
 mod policy;
 mod process;
@@ -561,7 +562,8 @@ pub async fn run_sandbox(
                         let sandbox_name = agg_name.clone();
                         async move {
                             if let Err(e) =
-                                flush_denials_to_gateway(&endpoint, &sandbox_name, summaries).await
+                                flush_proposals_to_gateway(&endpoint, &sandbox_name, summaries)
+                                    .await
                             {
                                 warn!(error = %e, "Failed to flush denial summaries to gateway");
                             }
@@ -1163,7 +1165,7 @@ fn prepare_filesystem(_policy: &SandboxPolicy) -> Result<()> {
 ///
 /// When a new version is detected, attempts to reload the OPA engine via
 /// Flush aggregated denial summaries to the gateway via `SubmitPolicyAnalysis`.
-async fn flush_denials_to_gateway(
+async fn flush_proposals_to_gateway(
     endpoint: &str,
     sandbox_name: &str,
     summaries: Vec<denial_aggregator::FlushableDenialSummary>,
@@ -1206,14 +1208,21 @@ async fn flush_denials_to_gateway(
         })
         .collect();
 
-    client
-        .submit_policy_analysis(sandbox_name, proto_summaries, "mechanistic")
-        .await?;
+    // Run the mechanistic mapper sandbox-side to generate proposals.
+    // The gateway is a thin persistence + validation layer — it never
+    // generates proposals itself.
+    let proposals = mechanistic_mapper::generate_proposals(&proto_summaries).await;
 
     info!(
         sandbox_name = %sandbox_name,
-        "Flushed denial summaries to gateway"
+        summaries = proto_summaries.len(),
+        proposals = proposals.len(),
+        "Flushed denial analysis to gateway"
     );
+
+    client
+        .submit_policy_analysis(sandbox_name, proto_summaries, proposals, "mechanistic")
+        .await?;
 
     Ok(())
 }

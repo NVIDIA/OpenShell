@@ -42,44 +42,43 @@ const WELL_KNOWN_PORTS: &[(u16, &str)] = &[
 
 /// Generate draft `PolicyChunk` proposals from denial summaries.
 ///
-/// Groups denials by `(host, port)`, then for each group generates a
-/// `PolicyChunk` with a `NetworkPolicyRule` allowing that endpoint for the
-/// observed binaries.
+/// Groups denials by `(host, port, binary)`, then for each group generates a
+/// `PolicyChunk` with a `NetworkPolicyRule` allowing that endpoint for that
+/// single binary. This produces one proposal per binary so each
+/// `(sandbox_id, host, port, binary)` maps to exactly one DB row.
 ///
 /// When a host resolves to a private IP (RFC 1918, loopback, link-local),
 /// the proposed endpoint includes `allowed_ips` so the proxy's SSRF override
 /// accepts the connection. Public IPs do not need `allowed_ips`.
 ///
 /// Returns an empty vec if there are no actionable denials.
-pub async fn generate_proposals(
-    summaries: &[DenialSummary],
-    existing_rule_names: &[String],
-) -> Vec<PolicyChunk> {
-    // Group denials by (host, port).
-    let mut groups: HashMap<(String, u32), Vec<&DenialSummary>> = HashMap::new();
+pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk> {
+    // Group denials by (host, port, binary).
+    let mut groups: HashMap<(String, u32, String), Vec<&DenialSummary>> = HashMap::new();
+
     for summary in summaries {
+        let binary_key = if summary.binary.is_empty() {
+            String::new()
+        } else {
+            summary.binary.clone()
+        };
         groups
-            .entry((summary.host.clone(), summary.port))
+            .entry((summary.host.clone(), summary.port, binary_key))
             .or_default()
             .push(summary);
     }
 
     let mut proposals = Vec::new();
 
-    for ((host, port), denials) in &groups {
-        let rule_name = generate_rule_name(host, *port, existing_rule_names);
+    for ((host, port, binary), denials) in &groups {
+        let rule_name = generate_rule_name(host, *port);
 
-        // Collect unique binaries.
-        let mut binary_set: HashMap<String, u32> = HashMap::new();
         let mut total_count: u32 = 0;
         let mut first_seen_ms: i64 = i64::MAX;
         let mut last_seen_ms: i64 = 0;
         let mut is_ssrf = false;
 
         for denial in denials {
-            if !denial.binary.is_empty() {
-                *binary_set.entry(denial.binary.clone()).or_insert(0) += denial.count;
-            }
             total_count += denial.count;
             first_seen_ms = first_seen_ms.min(denial.first_seen_ms);
             last_seen_ms = last_seen_ms.max(denial.last_seen_ms);
@@ -129,13 +128,14 @@ pub async fn generate_proposals(
             }
         };
 
-        let binaries: Vec<NetworkBinary> = binary_set
-            .keys()
-            .map(|b| NetworkBinary {
-                path: b.clone(),
+        let binaries: Vec<NetworkBinary> = if binary.is_empty() {
+            vec![]
+        } else {
+            vec![NetworkBinary {
+                path: binary.clone(),
                 ..Default::default()
-            })
-            .collect();
+            }]
+        };
 
         let proposed_rule = NetworkPolicyRule {
             name: rule_name.clone(),
@@ -148,14 +148,10 @@ pub async fn generate_proposals(
         let confidence = compute_confidence(total_count, *port as u16, is_ssrf);
 
         // Generate rationale.
-        let binary_list = if binary_set.is_empty() {
+        let binary_list = if binary.is_empty() {
             "unknown binary".to_string()
         } else {
-            binary_set
-                .keys()
-                .map(|b| short_binary_name(b))
-                .collect::<Vec<_>>()
-                .join(", ")
+            short_binary_name(binary)
         };
 
         #[allow(clippy::cast_possible_truncation)]
@@ -175,18 +171,20 @@ pub async fn generate_proposals(
             String::new()
         };
 
+        // Note: hit_count in the DB accumulates across flush cycles, so we
+        // don't bake a denial count into the rationale text (it would go stale).
         let rationale = if has_l7 && !l7_methods.is_empty() {
             let paths: Vec<String> = l7_methods.keys().map(|(m, p)| format!("{m} {p}")).collect();
             format!(
                 "Allow {binary_list} to connect to {host}:{port}{port_name} \
-                 with L7 inspection. Observed {total_count} denied connection(s). \
+                 with L7 inspection. \
                  Allowed paths: {}.{private_ip_note}",
                 paths.join(", ")
             )
         } else {
             format!(
-                "Allow {binary_list} to connect to {host}:{port}{port_name}. \
-                 Observed {total_count} denied connection(s).{private_ip_note}"
+                "Allow {binary_list} to connect to \
+                 {host}:{port}{port_name}.{private_ip_note}"
             )
         };
 
@@ -200,21 +198,22 @@ pub async fn generate_proposals(
             .map_or_else(|| "connect".to_string(), |d| d.denial_stage.clone());
 
         proposals.push(PolicyChunk {
-            id: String::new(), // Assigned by the server on persist
+            id: String::new(), // Assigned by the gateway on persist
             status: "pending".to_string(),
             rule_name,
             proposed_rule: Some(proposed_rule),
             rationale,
             security_notes,
             confidence,
-            denial_summary_ids: vec![], // Linked on persist
-            created_at_ms: 0,           // Set on persist
+            denial_summary_ids: vec![],
+            created_at_ms: 0, // Set by gateway on persist
             decided_at_ms: 0,
             stage,
             supersedes_chunk_id: String::new(),
-            hit_count: 0,     // Set on persist
-            first_seen_ms: 0, // Set on persist
-            last_seen_ms: 0,  // Set on persist
+            hit_count: total_count as i32,
+            first_seen_ms,
+            last_seen_ms,
+            binary: binary.clone(),
         });
     }
 
@@ -229,30 +228,19 @@ pub async fn generate_proposals(
 }
 
 /// Generate a rule name that doesn't conflict with existing rules.
-fn generate_rule_name(host: &str, port: u32, existing: &[String]) -> String {
-    // Sanitize host: replace dots and dashes with underscores.
+/// Generate a deterministic, idempotent rule name from host and port.
+///
+/// The same `(host, port)` always produces the same name. DB-level dedup on
+/// `(sandbox_id, host, port, binary)` handles collisions — no need to check
+/// existing rule names.
+fn generate_rule_name(host: &str, port: u32) -> String {
     let sanitized = host
         .replace(['.', '-'], "_")
         .chars()
         .filter(|c| c.is_alphanumeric() || *c == '_')
         .collect::<String>();
 
-    let base = format!("allow_{sanitized}_{port}");
-
-    if !existing.contains(&base) {
-        return base;
-    }
-
-    // Append a suffix to avoid collisions.
-    for i in 2..100 {
-        let candidate = format!("{base}_{i}");
-        if !existing.contains(&candidate) {
-            return candidate;
-        }
-    }
-
-    // Fallback.
-    format!("{base}_{}", uuid::Uuid::new_v4().as_simple())
+    format!("allow_{sanitized}_{port}")
 }
 
 /// Compute a confidence score (0.0 to 1.0) for a proposed rule.
@@ -493,15 +481,13 @@ mod tests {
 
     #[test]
     fn test_generate_rule_name() {
-        let existing = vec!["allow_example_com_443".to_string()];
-        let name = generate_rule_name("example.com", 443, &existing);
-        assert_eq!(name, "allow_example_com_443_2");
+        let name = generate_rule_name("example.com", 443);
+        assert_eq!(name, "allow_example_com_443");
     }
 
     #[test]
-    fn test_generate_rule_name_no_conflict() {
-        let existing: Vec<String> = vec![];
-        let name = generate_rule_name("api.github.com", 443, &existing);
+    fn test_generate_rule_name_subdomain() {
+        let name = generate_rule_name("api.github.com", 443);
         assert_eq!(name, "allow_api_github_com_443");
     }
 
@@ -524,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_generate_proposals_empty() {
-        let proposals = generate_proposals(&[], &[]).await;
+        let proposals = generate_proposals(&[]).await;
         assert!(proposals.is_empty());
     }
 
@@ -550,7 +536,7 @@ mod tests {
             l7_inspection_active: false,
         }];
 
-        let proposals = generate_proposals(&summaries, &[]).await;
+        let proposals = generate_proposals(&summaries).await;
         assert_eq!(proposals.len(), 1);
         assert_eq!(proposals[0].rule_name, "allow_api_example_com_443");
         assert!(proposals[0].proposed_rule.is_some());
@@ -610,7 +596,7 @@ mod tests {
             l7_inspection_active: true,
         }];
 
-        let proposals = generate_proposals(&summaries, &[]).await;
+        let proposals = generate_proposals(&summaries).await;
         assert_eq!(proposals.len(), 1);
 
         let rule = proposals[0].proposed_rule.as_ref().unwrap();
