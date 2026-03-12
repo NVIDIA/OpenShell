@@ -100,13 +100,14 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut lines = vec![Line::from(""), row1, row2, row3, row4];
 
-    // Show pending policy requests prompt.
-    if pending_count > 0 {
+    // Show pending network rules prompt — but not when delete confirmation is
+    // active, since it would push the confirmation off the bottom of the pane.
+    if pending_count > 0 && !app.confirm_delete {
         lines.push(Line::from(vec![
             Span::styled("  ", styles::TEXT),
             Span::styled(
                 format!(
-                    "{pending_count} pending policy request{}",
+                    "{pending_count} pending network rule{}",
                     if pending_count == 1 { "" } else { "s" }
                 ),
                 styles::ACCENT,
@@ -118,6 +119,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     }
 
     // Delete confirmation in title area (same pattern as provider delete).
+    // Takes priority over the pending-policy prompt so it isn't pushed off-screen.
     if app.confirm_delete {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![

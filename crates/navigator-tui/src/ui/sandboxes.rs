@@ -47,12 +47,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
                 vec![Span::raw("  "), Span::styled(name, styles::TEXT)]
             };
 
-            // Append notification badge when there are pending draft recommendations.
+            // Append notification badge when there are pending network rules.
             if draft_count > 0 {
                 name_spans.push(Span::raw(" "));
                 name_spans.push(Span::styled(
                     format!(
-                        " {draft_count} policy request{} pending ",
+                        " {draft_count} pending rule{} ",
                         if draft_count == 1 { "" } else { "s" }
                     ),
                     styles::BADGE,

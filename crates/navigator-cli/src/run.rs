@@ -28,8 +28,8 @@ use navigator_core::proto::{
     GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
     ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, UndoDraftChunkRequest, UpdateProviderRequest,
-    UpdateSandboxPolicyRequest, WatchSandboxRequest,
+    SetClusterInferenceRequest, UpdateProviderRequest, UpdateSandboxPolicyRequest,
+    WatchSandboxRequest,
 };
 use navigator_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
@@ -3559,10 +3559,10 @@ fn print_log_line(log: &navigator_core::proto::SandboxLogLine) {
 }
 
 // ---------------------------------------------------------------------------
-// Draft policy recommendation commands
+// Network rule commands
 // ---------------------------------------------------------------------------
 
-/// Show pending draft policy recommendations for a sandbox.
+/// Show network rules for a sandbox.
 pub async fn sandbox_draft_get(
     server: &str,
     name: &str,
@@ -3582,13 +3582,13 @@ pub async fn sandbox_draft_get(
     let inner = response.into_inner();
 
     if inner.chunks.is_empty() {
-        println!("No draft recommendations for sandbox '{name}'");
+        println!("No network rules for sandbox '{name}'");
         return Ok(());
     }
 
     println!(
         "{}  (version {}, {} chunk{})",
-        "Draft Recommendations:".cyan().bold(),
+        "Network Rules:".cyan().bold(),
         inner.draft_version,
         inner.chunks.len(),
         if inner.chunks.len() == 1 { "" } else { "s" }
@@ -3644,7 +3644,7 @@ pub async fn sandbox_draft_get(
     Ok(())
 }
 
-/// Approve a single draft chunk.
+/// Approve a network rule.
 pub async fn sandbox_draft_approve(
     server: &str,
     name: &str,
@@ -3672,7 +3672,7 @@ pub async fn sandbox_draft_approve(
     Ok(())
 }
 
-/// Reject a single draft chunk.
+/// Reject a network rule.
 pub async fn sandbox_draft_reject(
     server: &str,
     name: &str,
@@ -3696,7 +3696,7 @@ pub async fn sandbox_draft_reject(
     Ok(())
 }
 
-/// Approve all pending draft chunks.
+/// Approve all pending network rules.
 pub async fn sandbox_draft_approve_all(
     server: &str,
     name: &str,
@@ -3725,34 +3725,7 @@ pub async fn sandbox_draft_approve_all(
     Ok(())
 }
 
-/// Undo an approved chunk.
-pub async fn sandbox_draft_undo(
-    server: &str,
-    name: &str,
-    chunk_id: &str,
-    tls: &TlsOptions,
-) -> Result<()> {
-    let mut client = grpc_client(server, tls).await?;
-
-    let response = client
-        .undo_draft_chunk(UndoDraftChunkRequest {
-            name: name.to_string(),
-            chunk_id: chunk_id.to_string(),
-        })
-        .await
-        .into_diagnostic()?;
-
-    let inner = response.into_inner();
-    println!(
-        "{} Chunk undone. Policy version: {}",
-        "OK".green().bold(),
-        inner.policy_version,
-    );
-
-    Ok(())
-}
-
-/// Clear all pending draft chunks.
+/// Clear all pending network rules.
 pub async fn sandbox_draft_clear(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -3773,7 +3746,7 @@ pub async fn sandbox_draft_clear(server: &str, name: &str, tls: &TlsOptions) -> 
     Ok(())
 }
 
-/// Show draft policy history.
+/// Show network rule history.
 pub async fn sandbox_draft_history(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -3787,11 +3760,11 @@ pub async fn sandbox_draft_history(server: &str, name: &str, tls: &TlsOptions) -
     let inner = response.into_inner();
 
     if inner.entries.is_empty() {
-        println!("No draft history for sandbox '{name}'");
+        println!("No rule history for sandbox '{name}'");
         return Ok(());
     }
 
-    println!("{}", "Draft History:".cyan().bold());
+    println!("{}", "Rule History:".cyan().bold());
     println!();
 
     for entry in &inner.entries {

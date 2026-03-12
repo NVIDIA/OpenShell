@@ -373,9 +373,9 @@ enum Commands {
         command: Option<PolicyCommands>,
     },
 
-    /// Review and approve draft policy recommendations.
-    #[command(visible_alias = "dr", hide = true, help_template = SUBCOMMAND_HELP_TEMPLATE)]
-    Draft {
+    /// Manage network rules for a sandbox.
+    #[command(visible_alias = "rl", hide = true, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Rule {
         #[command(subcommand)]
         command: Option<DraftCommands>,
     },
@@ -1088,7 +1088,7 @@ enum SandboxCommands {
 
 #[derive(Subcommand, Debug)]
 enum DraftCommands {
-    /// Show pending draft policy recommendations.
+    /// Show network rules for a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1099,7 +1099,7 @@ enum DraftCommands {
         status: Option<String>,
     },
 
-    /// Approve a single draft chunk.
+    /// Approve a network rule.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Approve {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1110,7 +1110,7 @@ enum DraftCommands {
         chunk_id: String,
     },
 
-    /// Reject a single draft chunk.
+    /// Reject a network rule.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Reject {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1125,36 +1125,25 @@ enum DraftCommands {
         reason: String,
     },
 
-    /// Approve all pending draft chunks.
+    /// Approve all pending network rules.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     ApproveAll {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
 
-        /// Also approve security-flagged chunks.
+        /// Also approve security-flagged rules.
         #[arg(long)]
         include_security_flagged: bool,
     },
 
-    /// Undo an approved chunk (revert to pending, remove from policy).
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Undo {
-        /// Sandbox name (defaults to last-used sandbox).
-        name: Option<String>,
-
-        /// Chunk ID to undo.
-        #[arg(long)]
-        chunk_id: String,
-    },
-
-    /// Clear all pending draft chunks.
+    /// Clear all pending network rules.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Clear {
         /// Sandbox name (defaults to last-used sandbox).
         name: Option<String>,
     },
 
-    /// Show draft policy history.
+    /// Show network rule history.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     History {
         /// Sandbox name (defaults to last-used sandbox).
@@ -1543,9 +1532,9 @@ async fn main() -> Result<()> {
         }
 
         // -----------------------------------------------------------
-        // Draft policy recommendations
+        // Network rules
         // -----------------------------------------------------------
-        Some(Commands::Draft {
+        Some(Commands::Rule {
             command: Some(draft_cmd),
         }) => {
             let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
@@ -1582,10 +1571,7 @@ async fn main() -> Result<()> {
                     )
                     .await?;
                 }
-                DraftCommands::Undo { name, chunk_id } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_draft_undo(&ctx.endpoint, &name, &chunk_id, &tls).await?;
-                }
+
                 DraftCommands::Clear { name } => {
                     let name = resolve_sandbox_name(name, &ctx.name)?;
                     run::sandbox_draft_clear(&ctx.endpoint, &name, &tls).await?;
@@ -2016,10 +2002,10 @@ async fn main() -> Result<()> {
                 .print_help()
                 .expect("Failed to print help");
         }
-        Some(Commands::Draft { command: None }) => {
+        Some(Commands::Rule { command: None }) => {
             Cli::command()
-                .find_subcommand_mut("draft")
-                .expect("draft subcommand exists")
+                .find_subcommand_mut("rule")
+                .expect("rule subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }

@@ -635,7 +635,7 @@ message DenialSummary {
 message PolicyChunk {
   // Unique chunk identifier.
   string id = 1;
-  // Approval status: "pending", "approved", "rejected", "superseded".
+  // Approval status: "pending", "approved", "rejected".
   string status = 2;
   // Proposed network_policies map key.
   string rule_name = 3;

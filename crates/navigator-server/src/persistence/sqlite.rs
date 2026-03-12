@@ -365,7 +365,7 @@ INSERT INTO "draft_policy_chunks"
 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
         ?17, ?18, ?19, ?20, ?21)
 ON CONFLICT ("sandbox_id", "host", "port")
-    WHERE "status" IN ('pending', 'approved')
+    WHERE "status" IN ('pending', 'approved', 'rejected')
 DO UPDATE SET
     "hit_count"    = "draft_policy_chunks"."hit_count" + 1,
     "last_seen_ms" = excluded."last_seen_ms",

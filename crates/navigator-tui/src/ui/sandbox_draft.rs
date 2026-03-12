@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Draft policy recommendations panel for the sandbox screen.
+//! Network rules panel for the sandbox screen.
 
 use crate::app::App;
 use crate::theme::styles;
@@ -12,7 +12,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
 
-/// Draw the draft recommendations panel (list view with highlight bar).
+/// Draw the network rules panel (list view with highlight bar).
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     let pending_count = app
         .draft_chunks
@@ -22,12 +22,12 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     let title = if pending_count > 0 {
         Line::from(vec![
-            Span::styled(" Draft Recommendations ", styles::HEADING),
+            Span::styled(" Network Rules ", styles::HEADING),
             Span::styled(format!(" {pending_count} pending "), styles::BADGE),
             Span::raw(" "),
         ])
     } else {
-        Line::from(Span::styled(" Draft Recommendations ", styles::HEADING))
+        Line::from(Span::styled(" Network Rules ", styles::HEADING))
     };
 
     let block = Block::default()
@@ -38,8 +38,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
     if app.draft_chunks.is_empty() {
         let msg = Paragraph::new(
-            "No draft recommendations yet. Denied connections will \
-             generate suggestions automatically.",
+            "No network rules yet. Denied connections will \
+             generate rules automatically.",
         )
         .block(block)
         .style(styles::MUTED);
@@ -78,6 +78,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
 
             let name_style = if is_selected {
                 styles::SELECTED
+            } else if chunk.status == "rejected" {
+                styles::MUTED
             } else {
                 styles::TEXT
             };
@@ -241,23 +243,37 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
         )]));
     }
 
-    // Action hints.
+    // Action hints — state-aware toggle keys.
     lines.push(Line::from(""));
-    if chunk.status == "pending" {
-        lines.push(Line::from(vec![
-            Span::styled("[a]", styles::KEY_HINT),
-            Span::styled(" Approve  ", styles::TEXT),
-            Span::styled("[x]", styles::KEY_HINT),
-            Span::styled(" Reject  ", styles::TEXT),
-            Span::styled("[Esc]", styles::MUTED),
-            Span::styled(" Close", styles::MUTED),
-        ]));
-    } else {
-        lines.push(Line::from(Span::styled(
-            "Press Esc or Enter to close",
-            styles::MUTED,
-        )));
+    let mut hint_spans: Vec<Span<'_>> = Vec::new();
+    match chunk.status.as_str() {
+        "pending" => {
+            hint_spans.extend([
+                Span::styled("[a]", styles::KEY_HINT),
+                Span::styled(" Approve  ", styles::TEXT),
+                Span::styled("[x]", styles::KEY_HINT),
+                Span::styled(" Reject  ", styles::TEXT),
+            ]);
+        }
+        "approved" => {
+            hint_spans.extend([
+                Span::styled("[x]", styles::KEY_HINT),
+                Span::styled(" Revoke  ", styles::TEXT),
+            ]);
+        }
+        "rejected" => {
+            hint_spans.extend([
+                Span::styled("[a]", styles::KEY_HINT),
+                Span::styled(" Approve  ", styles::TEXT),
+            ]);
+        }
+        _ => {}
     }
+    hint_spans.extend([
+        Span::styled("[Esc]", styles::MUTED),
+        Span::styled(" Close", styles::MUTED),
+    ]);
+    lines.push(Line::from(hint_spans));
 
     frame.render_widget(
         Paragraph::new(lines)

@@ -1605,7 +1605,7 @@ impl Navigator for NavigatorService {
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         let sandbox_id = sandbox.id.clone();
 
-        // Fetch the chunk and validate it's pending.
+        // Fetch the chunk — accept pending or rejected (re-approve toggle).
         let chunk = self
             .state
             .store
@@ -1614,9 +1614,9 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
             .ok_or_else(|| Status::not_found("chunk not found"))?;
 
-        if chunk.status != "pending" {
+        if chunk.status != "pending" && chunk.status != "rejected" {
             return Err(Status::failed_precondition(format!(
-                "chunk status is '{}', expected 'pending'",
+                "chunk status is '{}', expected 'pending' or 'rejected'",
                 chunk.status
             )));
         }
@@ -1628,6 +1628,7 @@ impl Navigator for NavigatorService {
             host = %chunk.host,
             port = chunk.port,
             hit_count = chunk.hit_count,
+            prev_status = %chunk.status,
             "ApproveDraftChunk: merging rule into active policy"
         );
 
@@ -1683,7 +1684,7 @@ impl Navigator for NavigatorService {
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
         let sandbox_id = sandbox.id.clone();
 
-        // Fetch the chunk and validate it's pending.
+        // Fetch the chunk — accept pending or approved (revoke toggle).
         let chunk = self
             .state
             .store
@@ -1692,12 +1693,14 @@ impl Navigator for NavigatorService {
             .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
             .ok_or_else(|| Status::not_found("chunk not found"))?;
 
-        if chunk.status != "pending" {
+        if chunk.status != "pending" && chunk.status != "approved" {
             return Err(Status::failed_precondition(format!(
-                "chunk status is '{}', expected 'pending'",
+                "chunk status is '{}', expected 'pending' or 'approved'",
                 chunk.status
             )));
         }
+
+        let was_approved = chunk.status == "approved";
 
         info!(
             sandbox_id = %sandbox_id,
@@ -1706,8 +1709,14 @@ impl Navigator for NavigatorService {
             host = %chunk.host,
             port = chunk.port,
             reason = %req.reason,
+            prev_status = %chunk.status,
             "RejectDraftChunk: rejecting chunk"
         );
+
+        // If the chunk was approved, remove its rule from the active policy.
+        if was_approved {
+            remove_chunk_from_policy(&self.state, &sandbox_id, &chunk).await?;
+        }
 
         // Mark chunk as rejected.
         let now_ms =

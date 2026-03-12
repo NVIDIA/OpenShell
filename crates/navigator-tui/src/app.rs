@@ -737,19 +737,25 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter => {
                     self.draft_detail_open = false;
                 }
-                // Allow approve/reject from within the popup.
+                // Allow approve/reject toggle from within the popup.
                 KeyCode::Char('a') => {
                     let abs = self.draft_scroll + self.draft_selected;
-                    if abs < self.draft_chunks.len() && self.draft_chunks[abs].status == "pending" {
-                        self.pending_draft_approve = true;
-                        self.draft_detail_open = false;
+                    if abs < self.draft_chunks.len() {
+                        let st = self.draft_chunks[abs].status.as_str();
+                        if st == "pending" || st == "rejected" {
+                            self.pending_draft_approve = true;
+                            self.draft_detail_open = false;
+                        }
                     }
                 }
                 KeyCode::Char('x') => {
                     let abs = self.draft_scroll + self.draft_selected;
-                    if abs < self.draft_chunks.len() && self.draft_chunks[abs].status == "pending" {
-                        self.pending_draft_reject = true;
-                        self.draft_detail_open = false;
+                    if abs < self.draft_chunks.len() {
+                        let st = self.draft_chunks[abs].status.as_str();
+                        if st == "pending" || st == "approved" {
+                            self.pending_draft_reject = true;
+                            self.draft_detail_open = false;
+                        }
                     }
                 }
                 _ => {}
@@ -814,23 +820,25 @@ impl App {
                     self.draft_selected = visible.saturating_sub(1);
                 }
             }
-            // Approve selected chunk.
+            // Approve selected chunk (pending → approved, rejected → approved).
             KeyCode::Char('a') => {
                 if !self.draft_chunks.is_empty() {
                     let abs = self.draft_scroll + self.draft_selected;
                     if abs < total {
-                        if self.draft_chunks[abs].status == "pending" {
+                        let st = self.draft_chunks[abs].status.as_str();
+                        if st == "pending" || st == "rejected" {
                             self.pending_draft_approve = true;
                         }
                     }
                 }
             }
-            // Reject selected chunk.
+            // Reject selected chunk (pending → rejected, approved → rejected).
             KeyCode::Char('x') => {
                 if !self.draft_chunks.is_empty() {
                     let abs = self.draft_scroll + self.draft_selected;
                     if abs < total {
-                        if self.draft_chunks[abs].status == "pending" {
+                        let st = self.draft_chunks[abs].status.as_str();
+                        if st == "pending" || st == "approved" {
                             self.pending_draft_reject = true;
                         }
                     }
