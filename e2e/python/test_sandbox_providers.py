@@ -26,7 +26,26 @@ if TYPE_CHECKING:
     from openshell import Sandbox, SandboxClient
 
 
-def _default_policy() -> sandbox_pb2.SandboxPolicy:
+# ---------------------------------------------------------------------------
+# Shared constants
+# ---------------------------------------------------------------------------
+
+_SANDBOX_IP = "10.200.0.2"
+_PROXY_HOST = "10.200.0.1"
+_PROXY_PORT = 3128
+_FORWARD_PROXY_PORT = 19879
+_CONNECT_L7_PORT = 19880
+
+
+# ---------------------------------------------------------------------------
+# Policy helpers
+# ---------------------------------------------------------------------------
+
+
+def _base_policy(
+    network_policies: dict[str, sandbox_pb2.NetworkPolicyRule] | None = None,
+) -> sandbox_pb2.SandboxPolicy:
+    """Build a sandbox policy with standard filesystem/process/landlock settings."""
     return sandbox_pb2.SandboxPolicy(
         version=1,
         filesystem=sandbox_pb2.FilesystemPolicy(
@@ -38,7 +57,53 @@ def _default_policy() -> sandbox_pb2.SandboxPolicy:
         process=sandbox_pb2.ProcessPolicy(
             run_as_user="sandbox", run_as_group="sandbox"
         ),
+        network_policies=network_policies or {},
     )
+
+
+def _forward_proxy_policy() -> sandbox_pb2.SandboxPolicy:
+    return _base_policy(
+        network_policies={
+            "internal_http": sandbox_pb2.NetworkPolicyRule(
+                name="internal_http",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    )
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            )
+        },
+    )
+
+
+def _connect_l7_policy() -> sandbox_pb2.SandboxPolicy:
+    """Policy with a CONNECT-eligible endpoint using L7 REST inspection."""
+    return _base_policy(
+        network_policies={
+            "internal_l7": sandbox_pb2.NetworkPolicyRule(
+                name="internal_l7",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_CONNECT_L7_PORT,
+                        protocol="rest",
+                        enforcement="enforce",
+                        access="full",
+                        allowed_ips=["10.200.0.0/24"],
+                    )
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            )
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
+# Provider lifecycle helper
+# ---------------------------------------------------------------------------
 
 
 @contextmanager
@@ -50,7 +115,6 @@ def provider(
     credentials: dict[str, str],
 ) -> Iterator[str]:
     """Create a provider for the duration of the block, then delete it."""
-    # Clean up any leftover from a previous run.
     _delete_provider(stub, name)
     stub.CreateProvider(
         navigator_pb2.CreateProviderRequest(
@@ -78,72 +142,19 @@ def _delete_provider(stub: object, name: str) -> None:
             raise
 
 
-_SANDBOX_IP = "10.200.0.2"
-_FORWARD_PROXY_PORT = 19879
-_CONNECT_L7_PORT = 19880
+# ---------------------------------------------------------------------------
+# In-sandbox echo server + proxy request helpers
+#
+# These closures are serialized via cloudpickle and run *inside* the sandbox.
+# They share a common pattern: start a tiny HTTP server, send a request
+# through the proxy, and return the raw response.
+# ---------------------------------------------------------------------------
 
 
-def _proxy_policy() -> sandbox_pb2.SandboxPolicy:
-    return sandbox_pb2.SandboxPolicy(
-        version=1,
-        filesystem=sandbox_pb2.FilesystemPolicy(
-            include_workdir=True,
-            read_only=["/usr", "/lib", "/etc", "/app"],
-            read_write=["/sandbox", "/tmp"],
-        ),
-        landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
-        process=sandbox_pb2.ProcessPolicy(
-            run_as_user="sandbox", run_as_group="sandbox"
-        ),
-        network_policies={
-            "internal_http": sandbox_pb2.NetworkPolicyRule(
-                name="internal_http",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(
-                        host=_SANDBOX_IP,
-                        port=_FORWARD_PROXY_PORT,
-                        allowed_ips=["10.200.0.0/24"],
-                    )
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
-            )
-        },
-    )
+def _echo_server_via_forward_proxy():
+    """Return a closure that sends a forward-proxy (plain HTTP) request
+    through the sandbox proxy and returns the raw response."""
 
-
-def _connect_l7_policy() -> sandbox_pb2.SandboxPolicy:
-    """Policy with a CONNECT-eligible endpoint using L7 REST inspection."""
-    return sandbox_pb2.SandboxPolicy(
-        version=1,
-        filesystem=sandbox_pb2.FilesystemPolicy(
-            include_workdir=True,
-            read_only=["/usr", "/lib", "/etc", "/app"],
-            read_write=["/sandbox", "/tmp"],
-        ),
-        landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
-        process=sandbox_pb2.ProcessPolicy(
-            run_as_user="sandbox", run_as_group="sandbox"
-        ),
-        network_policies={
-            "internal_l7": sandbox_pb2.NetworkPolicyRule(
-                name="internal_l7",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(
-                        host=_SANDBOX_IP,
-                        port=_CONNECT_L7_PORT,
-                        protocol="rest",
-                        enforcement="enforce",
-                        access="full",
-                        allowed_ips=["10.200.0.0/24"],
-                    )
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
-            )
-        },
-    )
-
-
-def _forward_proxy_reads_env_and_returns_auth_header():
     def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
         import os
         import socket
@@ -160,35 +171,23 @@ def _forward_proxy_reads_env_and_returns_auth_header():
                 self.end_headers()
                 self.wfile.write(body)
 
-            def log_message(self, format, *args):
+            def log_message(self, *a):
                 pass
 
         server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
-        thread = threading.Thread(target=server.handle_request, daemon=True)
-        thread.start()
+        threading.Thread(target=server.handle_request, daemon=True).start()
         time.sleep(0.5)
 
         token = os.environ["ANTHROPIC_API_KEY"]
         conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
         try:
-            request = (
+            conn.sendall(
                 f"GET http://{target_host}:{target_port}/ HTTP/1.1\r\n"
                 f"Host: {target_host}:{target_port}\r\n"
                 f"Authorization: Bearer {token}\r\n"
-                "Connection: close\r\n\r\n"
+                f"Connection: close\r\n\r\n".encode()
             )
-            conn.sendall(request.encode())
-            data = b""
-            conn.settimeout(5)
-            while True:
-                try:
-                    chunk = conn.recv(4096)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-                data += chunk
-            return data.decode("latin1")
+            return _recv_all(conn)
         finally:
             conn.close()
             server.server_close()
@@ -196,9 +195,20 @@ def _forward_proxy_reads_env_and_returns_auth_header():
     return fn
 
 
-def _connect_l7_echo_server_returns_auth_header():
-    """Return a closure that starts an echo HTTP server and sends a CONNECT
-    request through the proxy, returning what the server received."""
+def _echo_server_via_connect_l7(env_vars: dict[str, str] | None = None):
+    """Return a closure that sends a CONNECT + L7 request through the proxy.
+
+    *env_vars* maps header names to environment variable names.  Defaults to
+    ``{"Authorization": "ANTHROPIC_API_KEY"}`` for the single-secret case.
+    For multi-secret tests pass e.g.
+    ``{"Authorization": "MY_API_KEY", "x-api-key": "MY_API_KEY",
+       "x-custom-token": "CUSTOM_SERVICE_TOKEN"}``.
+    """
+    if env_vars is None:
+        env_vars = {"Authorization": "ANTHROPIC_API_KEY"}
+
+    # Capture into the closure so cloudpickle serializes the value.
+    _env_vars = dict(env_vars)
 
     def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
         import os
@@ -207,161 +217,87 @@ def _connect_l7_echo_server_returns_auth_header():
         import time
         from http.server import BaseHTTPRequestHandler, HTTPServer
 
-        class EchoHandler(BaseHTTPRequestHandler):
-            """Echoes back the Authorization header received from the proxy."""
+        captured_env_vars = _env_vars  # noqa: F841 -- used by Handler
 
+        class Handler(BaseHTTPRequestHandler):
             def do_GET(self):
-                auth = self.headers.get("Authorization", "MISSING")
-                # Also include x-api-key for multi-header testing
-                api_key = self.headers.get("x-api-key", "MISSING")
-                body = f"auth={auth}\nx-api-key={api_key}".encode()
+                parts = []
+                for hdr_name in captured_env_vars:
+                    parts.append(f"{hdr_name}={self.headers.get(hdr_name, 'MISSING')}")
+                body = "\n".join(parts).encode()
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Connection", "close")
                 self.end_headers()
                 self.wfile.write(body)
 
-            def log_message(self, format, *args):
+            def log_message(self, *a):
                 pass
 
-        server = HTTPServer(("0.0.0.0", int(target_port)), EchoHandler)
-        thread = threading.Thread(target=server.handle_request, daemon=True)
-        thread.start()
+        server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
+        threading.Thread(target=server.handle_request, daemon=True).start()
         time.sleep(0.5)
 
-        # Read the placeholder env var (the child process only sees placeholders)
-        token = os.environ.get("ANTHROPIC_API_KEY", "NOT_SET")
+        # Build request headers from placeholder env vars
+        header_lines = [
+            f"GET / HTTP/1.1",
+            f"Host: {target_host}:{target_port}",
+        ]
+        for hdr_name, env_name in captured_env_vars.items():
+            val = os.environ.get(env_name, "NOT_SET")
+            if hdr_name == "Authorization":
+                header_lines.append(f"Authorization: Bearer {val}")
+            else:
+                header_lines.append(f"{hdr_name}: {val}")
+        header_lines.append("Connection: close")
+        request = "\r\n".join(header_lines) + "\r\n\r\n"
 
         conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
         try:
-            # 1. CONNECT through the proxy
-            connect_req = (
+            # CONNECT tunnel
+            conn.sendall(
                 f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n\r\n"
+                f"Host: {target_host}:{target_port}\r\n\r\n".encode()
             )
-            conn.sendall(connect_req.encode())
-
-            # Read CONNECT response
             connect_resp = b""
             while b"\r\n\r\n" not in connect_resp:
                 chunk = conn.recv(256)
                 if not chunk:
                     break
                 connect_resp += chunk
-            connect_status = connect_resp.decode("latin1")
-
-            if "200" not in connect_status:
-                return f"CONNECT failed: {connect_status.strip()}"
-
-            # 2. Send HTTP request through the established tunnel
-            # The proxy will do L7 inspection and rewrite placeholders
-            request = (
-                f"GET / HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n"
-                f"Authorization: Bearer {token}\r\n"
-                f"Connection: close\r\n\r\n"
-            )
-            conn.sendall(request.encode())
-
-            # 3. Read the response from the echo server
-            data = b""
-            conn.settimeout(5)
-            while True:
-                try:
-                    chunk = conn.recv(4096)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-                data += chunk
-            return data.decode("latin1")
-        finally:
-            conn.close()
-            server.server_close()
-
-    return fn
-
-
-def _connect_l7_echo_multiple_secrets():
-    """Return a closure that tests multiple provider secrets are rewritten
-    through the CONNECT L7 proxy path."""
-
-    def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
-        import os
-        import socket
-        import threading
-        import time
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        class EchoHandler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                auth = self.headers.get("Authorization", "MISSING")
-                api_key = self.headers.get("x-api-key", "MISSING")
-                custom = self.headers.get("x-custom-token", "MISSING")
-                body = f"auth={auth}\nx-api-key={api_key}\nx-custom-token={custom}".encode()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, format, *args):
-                pass
-
-        server = HTTPServer(("0.0.0.0", int(target_port)), EchoHandler)
-        thread = threading.Thread(target=server.handle_request, daemon=True)
-        thread.start()
-        time.sleep(0.5)
-
-        # Read placeholder env vars
-        api_key = os.environ.get("MY_API_KEY", "NOT_SET")
-        custom_token = os.environ.get("CUSTOM_SERVICE_TOKEN", "NOT_SET")
-
-        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
-        try:
-            connect_req = (
-                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n\r\n"
-            )
-            conn.sendall(connect_req.encode())
-
-            connect_resp = b""
-            while b"\r\n\r\n" not in connect_resp:
-                chunk = conn.recv(256)
-                if not chunk:
-                    break
-                connect_resp += chunk
-
             if "200" not in connect_resp.decode("latin1"):
                 return f"CONNECT failed: {connect_resp.decode('latin1').strip()}"
 
-            # Send request with multiple placeholder headers
-            request = (
-                f"GET / HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n"
-                f"Authorization: Bearer {api_key}\r\n"
-                f"x-api-key: {api_key}\r\n"
-                f"x-custom-token: {custom_token}\r\n"
-                f"Connection: close\r\n\r\n"
-            )
+            # HTTP request through the tunnel
             conn.sendall(request.encode())
-
-            data = b""
-            conn.settimeout(5)
-            while True:
-                try:
-                    chunk = conn.recv(4096)
-                except socket.timeout:
-                    break
-                if not chunk:
-                    break
-                data += chunk
-            return data.decode("latin1")
+            return _recv_all(conn)
         finally:
             conn.close()
             server.server_close()
 
     return fn
+
+
+def _recv_all(conn, timeout: float = 5.0) -> str:
+    """Read all available data from a socket until EOF or timeout."""
+    import socket as _socket
+
+    data = b""
+    conn.settimeout(timeout)
+    while True:
+        try:
+            chunk = conn.recv(4096)
+        except (_socket.timeout, TimeoutError):
+            break
+        if not chunk:
+            break
+        data += chunk
+    return data.decode("latin1")
+
+
+# ===========================================================================
+# Tests: placeholder visibility
+# ===========================================================================
 
 
 def test_provider_credentials_available_as_env_vars(
@@ -376,7 +312,7 @@ def test_provider_credentials_available_as_env_vars(
         credentials={"ANTHROPIC_API_KEY": "sk-e2e-test-key-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_default_policy(),
+            policy=_base_policy(),
             providers=[provider_name],
         )
 
@@ -408,7 +344,7 @@ def test_generic_provider_credentials_available_as_env_vars(
         },
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_default_policy(),
+            policy=_base_policy(),
             providers=[provider_name],
         )
 
@@ -440,7 +376,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         credentials={"NVIDIA_API_KEY": "nvapi-e2e-test-key"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_default_policy(),
+            policy=_base_policy(),
             providers=[provider_name],
         )
 
@@ -455,10 +391,16 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
             assert result.stdout.strip() == "nemo-placeholder:env:NVIDIA_API_KEY"
 
 
+# ===========================================================================
+# Tests: proxy credential rewriting
+# ===========================================================================
+
+
 def test_provider_placeholder_is_resolved_by_proxy_on_outbound_request(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
+    """Forward-proxy path: placeholder in Authorization header is rewritten."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-provider-proxy-rewrite",
@@ -466,14 +408,14 @@ def test_provider_placeholder_is_resolved_by_proxy_on_outbound_request(
         credentials={"ANTHROPIC_API_KEY": "sk-proxy-rewrite-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_proxy_policy(),
+            policy=_forward_proxy_policy(),
             providers=[provider_name],
         )
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(
-                _forward_proxy_reads_env_and_returns_auth_header(),
-                args=("10.200.0.1", 3128, _SANDBOX_IP, _FORWARD_PROXY_PORT),
+                _echo_server_via_forward_proxy(),
+                args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
             )
             assert result.exit_code == 0, result.stderr
             assert "200 OK" in result.stdout
@@ -485,16 +427,7 @@ def test_provider_secret_resolved_via_connect_l7_proxy(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Real secret reaches the destination through a CONNECT tunnel with L7 REST
-    inspection.
-
-    A dummy HTTP echo server runs inside the sandbox. The child process sends a
-    CONNECT request through the proxy and then an HTTP request carrying the
-    placeholder env var in the Authorization header. The proxy performs L7
-    inspection and rewrites the placeholder to the real credential before
-    forwarding. The echo server reflects the received header back so we can
-    assert the *real* secret arrived at the destination.
-    """
+    """CONNECT + L7 path: placeholder is rewritten before reaching upstream."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-connect-l7-rewrite",
@@ -508,32 +441,22 @@ def test_provider_secret_resolved_via_connect_l7_proxy(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(
-                _connect_l7_echo_server_returns_auth_header(),
-                args=("10.200.0.1", 3128, _SANDBOX_IP, _CONNECT_L7_PORT),
+                _echo_server_via_connect_l7(),
+                args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _CONNECT_L7_PORT),
             )
             assert result.exit_code == 0, result.stderr
-            # The echo server should have received the real secret
-            assert "200 OK" in result.stdout, (
-                f"Expected 200 OK in response, got: {result.stdout}"
+            assert "200 OK" in result.stdout, f"Expected 200 OK, got: {result.stdout}"
+            assert "Authorization=Bearer sk-connect-l7-secret-99" in result.stdout, (
+                f"Real secret not found: {result.stdout}"
             )
-            assert "auth=Bearer sk-connect-l7-secret-99" in result.stdout, (
-                f"Real secret not found in echo response: {result.stdout}"
-            )
-            # The placeholder must NOT appear in the response
-            assert "nemo-placeholder:env:ANTHROPIC_API_KEY" not in result.stdout
+            assert "nemo-placeholder:env:" not in result.stdout
 
 
 def test_provider_multiple_secrets_resolved_via_connect_l7_proxy(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """Multiple provider secrets are rewritten through CONNECT L7 proxy.
-
-    Verifies that when a request carries several headers each containing a
-    different provider placeholder, every placeholder is resolved to the
-    corresponding real credential by the time the request reaches the
-    destination.
-    """
+    """Multiple provider secrets are rewritten through CONNECT + L7 proxy."""
     with provider(
         sandbox_client._stub,
         name="e2e-test-connect-l7-multi",
@@ -550,27 +473,26 @@ def test_provider_multiple_secrets_resolved_via_connect_l7_proxy(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             result = sb.exec_python(
-                _connect_l7_echo_multiple_secrets(),
-                args=("10.200.0.1", 3128, _SANDBOX_IP, _CONNECT_L7_PORT),
+                _echo_server_via_connect_l7(
+                    env_vars={
+                        "Authorization": "MY_API_KEY",
+                        "x-api-key": "MY_API_KEY",
+                        "x-custom-token": "CUSTOM_SERVICE_TOKEN",
+                    }
+                ),
+                args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _CONNECT_L7_PORT),
             )
             assert result.exit_code == 0, result.stderr
-            assert "200 OK" in result.stdout, (
-                f"Expected 200 OK in response, got: {result.stdout}"
-            )
-            # Bearer prefix + exact match for Authorization header
-            assert "auth=Bearer real-api-key-abc" in result.stdout, (
-                f"API key not rewritten in Authorization header: {result.stdout}"
-            )
-            # Exact match for x-api-key (no Bearer prefix)
-            assert "x-api-key=real-api-key-abc" in result.stdout, (
-                f"API key not rewritten in x-api-key header: {result.stdout}"
-            )
-            # Exact match for x-custom-token
-            assert "x-custom-token=real-custom-token-xyz" in result.stdout, (
-                f"Custom token not rewritten in x-custom-token header: {result.stdout}"
-            )
-            # No placeholders should appear
+            assert "200 OK" in result.stdout, f"Expected 200 OK, got: {result.stdout}"
+            assert "Authorization=Bearer real-api-key-abc" in result.stdout
+            assert "x-api-key=real-api-key-abc" in result.stdout
+            assert "x-custom-token=real-custom-token-xyz" in result.stdout
             assert "nemo-placeholder:env:" not in result.stdout
+
+
+# ===========================================================================
+# Tests: security & edge cases
+# ===========================================================================
 
 
 def test_ssh_handshake_secret_not_visible_in_exec_environment(
@@ -592,7 +514,7 @@ def test_create_sandbox_rejects_unknown_provider(
 ) -> None:
     """CreateSandbox fails fast when a provider name does not exist."""
     spec = datamodel_pb2.SandboxSpec(
-        policy=_default_policy(),
+        policy=_base_policy(),
         providers=["nonexistent-provider-xyz"],
     )
     with pytest.raises(grpc.RpcError) as exc_info:
@@ -614,12 +536,11 @@ def test_credentials_not_in_persisted_spec_environment(
         credentials={"ANTHROPIC_API_KEY": "sk-should-not-persist"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_default_policy(),
+            policy=_base_policy(),
             providers=[provider_name],
         )
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
-            # Fetch the sandbox record from the server and inspect spec.environment.
             fetched = sandbox_client._stub.GetSandbox(
                 navigator_pb2.GetSandboxRequest(name=sb.sandbox.name)
             )
@@ -629,9 +550,9 @@ def test_credentials_not_in_persisted_spec_environment(
             )
 
 
-# ---------------------------------------------------------------------------
-# Provider update merge semantics
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Tests: provider update merge semantics
+# ===========================================================================
 
 
 def test_update_provider_preserves_unset_credentials_and_config(
@@ -654,7 +575,6 @@ def test_update_provider_preserves_unset_credentials_and_config(
             )
         )
 
-        # Update only KEY_A; send empty config map (= no change).
         stub.UpdateProvider(
             navigator_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
@@ -733,7 +653,6 @@ def test_update_provider_merges_config_preserves_credentials(
             )
         )
 
-        # Send only config update, empty credentials map.
         stub.UpdateProvider(
             navigator_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
