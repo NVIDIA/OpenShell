@@ -11,7 +11,7 @@ When an endpoint in the sandbox policy includes an `allowed_ips` field, the
 proxy validates the resolved IP against that CIDR allowlist instead of
 blanket-blocking. Loopback and link-local remain always-blocked regardless.
 
-The dev sandbox policy (`deploy/docker/sandbox/dev-sandbox-policy.yaml`) includes a `cluster_pods`
+The default sandbox policy (baked into the community base image) includes a `cluster_pods`
 entry that allows any binary to reach port 8080 on the k3s pod network:
 
 ```yaml

@@ -34,34 +34,34 @@ When `--from` points to a Dockerfile or directory, the CLI:
 
 ## How It Works
 
-When the resolved image differs from the server's default sandbox image, the server activates **supervisor bootstrap mode**. The supervisor binary is side-loaded from the default sandbox image via a Kubernetes init container:
+The supervisor binary (`navigator-sandbox`) is **always side-loaded** from the k3s node filesystem via a read-only `hostPath` volume. It is never baked into sandbox images. This applies to all sandbox pods — whether using the default community base image, a custom image, or a user-built Dockerfile.
 
 ```mermaid
 flowchart TB
+    subgraph node["K3s Node"]
+        bin["/opt/openshell/bin/navigator-sandbox
+        (built into cluster image, updatable via docker cp)"]
+    end
+
+    node -- "hostPath (readOnly)" --> agent
+
     subgraph pod["Pod"]
-        subgraph init["Init Container · copy-supervisor"]
-            init_desc["Image: default sandbox image
-            Copies /usr/local/bin/navigator-sandbox
-            into shared emptyDir volume"]
-        end
-
-        init -- "emptyDir: navigator-supervisor-bin" --> agent
-
         subgraph agent["Agent Container"]
-            agent_desc["Image: user-selected workload image
+            agent_desc["Image: community base or custom image
             Command: /opt/navigator/bin/navigator-sandbox
-            Mounts shared volume read-only at /opt/navigator/bin/
+            Volume: /opt/navigator/bin (ro hostPath)
             Env: OPENSHELL_SANDBOX_ID, OPENSHELL_ENDPOINT, ...
             Caps: SYS_ADMIN, NET_ADMIN, SYS_PTRACE"]
         end
     end
 ```
 
-The server applies three transforms to the pod template (`sandbox/mod.rs`):
+The server applies these transforms to every sandbox pod template (`sandbox/mod.rs`):
 
-1. Adds an `emptyDir` volume named `navigator-supervisor-bin`.
-2. Injects a `copy-supervisor` init container that uses the default sandbox image and runs `cp /usr/local/bin/navigator-sandbox /opt/navigator/bin/navigator-sandbox`.
-3. Overrides the agent container's `command` to `/opt/navigator/bin/navigator-sandbox` and adds a read-only volume mount for the supervisor binary.
+1. Adds a `hostPath` volume named `navigator-supervisor-bin` pointing to `/opt/openshell/bin` on the node.
+2. Mounts it read-only at `/opt/navigator/bin` in the agent container.
+3. Overrides the agent container's `command` to `/opt/navigator/bin/navigator-sandbox`.
+4. Sets `runAsUser: 0` so the supervisor has root privileges for namespace creation, proxy setup, and Landlock/seccomp.
 
 These transforms apply to both generated templates and user-provided `pod_template` overrides.
 
@@ -104,8 +104,7 @@ The `navigator-sandbox` supervisor adapts to arbitrary environments:
 | Community name resolution | Bare names like `openclaw` expand to the GHCR community registry, making the common case simple |
 | Auto build+push for Dockerfiles | Eliminates the two-step `image push` + `create` workflow for local development |
 | `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
-| Init container side-load | Avoids rebuilding every workload image with the supervisor binary baked in |
-| `emptyDir` shared volume | Zero-config, no PVC needed, ephemeral by design |
+| hostPath side-load | Supervisor binary lives on the node filesystem — no init container, no emptyDir, no extra image pull. Faster pod startup. |
 | Read-only mount in agent | Supervisor binary cannot be tampered with by the workload |
 | Command override | Ensures `navigator-sandbox` is the entrypoint regardless of the image's default CMD |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
@@ -114,6 +113,6 @@ The `navigator-sandbox` supervisor adapts to arbitrary environments:
 
 ## Limitations
 
-- Distroless / `FROM scratch` images are not supported (the supervisor needs glibc, `/proc`, and a shell for the init container `cp`)
+- Distroless / `FROM scratch` images are not supported (the supervisor needs glibc and `/proc`)
 - Missing `iproute2` (or required capabilities) blocks startup in proxy mode because namespace isolation is mandatory
-- The init container assumes the supervisor binary is at `/usr/local/bin/navigator-sandbox` in the default sandbox image
+- The supervisor binary must be present on the k3s node at `/opt/openshell/bin/navigator-sandbox` (embedded in the cluster image at build time)

@@ -340,23 +340,22 @@ fi
 HELMCHART="/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml"
 
 if [ -n "${IMAGE_REPO_BASE:-}" ] && [ -f "$HELMCHART" ]; then
-    target_tag="${IMAGE_TAG:-latest}"
     echo "Setting image repository base: ${IMAGE_REPO_BASE}"
     sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${IMAGE_REPO_BASE}/gateway|" "$HELMCHART"
-    sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${IMAGE_REPO_BASE}/sandbox:${target_tag}|" "$HELMCHART"
+    # Sandbox images come from the community registry — do not override
 fi
 
 # In push mode, use the exact image references that were imported into cluster
 # containerd so the Helm release cannot drift back to remote ":latest" tags.
+# Only the gateway image is pushed; sandbox images are pulled from the
+# community registry at runtime.
 if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
     server_image=""
-    sandbox_image=""
     old_ifs="$IFS"
     IFS=','
     for ref in $PUSH_IMAGE_REFS; do
         case "$ref" in
             */gateway:*) server_image="$ref" ;;
-            */sandbox:*) sandbox_image="$ref" ;;
         esac
     done
     IFS="$old_ifs"
@@ -369,20 +368,13 @@ if [ -n "${PUSH_IMAGE_REFS:-}" ] && [ -f "$HELMCHART" ]; then
         sed -i -E "s|repository:[[:space:]]*[^[:space:]]+|repository: ${server_repo}|" "$HELMCHART"
         sed -i -E "s|tag:[[:space:]]*\"?[^\"[:space:]]+\"?|tag: \"${server_tag}\"|" "$HELMCHART"
     fi
-
-    if [ -n "$sandbox_image" ]; then
-        echo "Setting sandbox image: ${sandbox_image}"
-        sed -i -E "s|sandboxImage:[[:space:]]*[^[:space:]]+|sandboxImage: ${sandbox_image}|" "$HELMCHART"
-    fi
 fi
 
 if [ -n "${IMAGE_TAG:-}" ] && [ -f "$HELMCHART" ]; then
-    echo "Overriding component image tag to: ${IMAGE_TAG}"
+    echo "Overriding gateway image tag to: ${IMAGE_TAG}"
     # server image tag (standalone value field)
     # Handle both quoted and unquoted defaults: tag: "latest" / tag: latest
     sed -i -E "s|tag:[[:space:]]*\"?latest\"?|tag: \"${IMAGE_TAG}\"|" "$HELMCHART"
-    # sandbox image (inline tag in image reference)
-    sed -i "s|sandbox:latest|sandbox:${IMAGE_TAG}|" "$HELMCHART"
 fi
 
 if [ -n "${IMAGE_PULL_POLICY:-}" ] && [ -f "$HELMCHART" ]; then

@@ -4,15 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # Generic Docker image builder for OpenShell components.
-# Usage: docker-build-component.sh <component> [variant] [extra docker build args...]
+# Usage: docker-build-component.sh <component> [extra docker build args...]
 #
-# Components with a subdirectory layout (e.g. deploy/docker/sandbox/) support
-# an optional variant argument:
-#   docker-build-component.sh sandbox          -> Dockerfile.base  -> openshell/sandbox:dev
-#   docker-build-component.sh sandbox nvidia   -> Dockerfile.nvidia -> openshell/sandbox-nvidia:dev
-#
-# Components without a subdirectory use the flat layout:
 #   docker-build-component.sh gateway           -> Dockerfile.gateway -> openshell/gateway:dev
+#   docker-build-component.sh cluster           -> Dockerfile.cluster -> openshell/cluster:dev
 #
 # Environment:
 #   IMAGE_TAG          - Image tag (default: dev)

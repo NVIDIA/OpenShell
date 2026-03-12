@@ -32,7 +32,7 @@ The following software must be installed on the host before using the OpenShell 
 
 ## Sandbox Runtime Versions
 
-The base sandbox container image ships the following components. These versions apply to sandboxes created with the default image (`ghcr.io/nvidia/openshell/sandbox`).
+The base sandbox container image ships the following components. These versions apply to sandboxes created with the default community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base`).
 
 | Component | Version |
 |---|---|
@@ -53,10 +53,10 @@ OpenShell uses several container images that are pulled automatically during gat
 |---|---|---|---|
 | Cluster | ghcr.io | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start` |
 | Gateway | ghcr.io | `ghcr.io/nvidia/openshell/gateway:latest` | Cluster startup (via Helm chart) |
-| Sandbox | ghcr.io | `ghcr.io/nvidia/openshell/sandbox:latest` | First sandbox creation (via Helm chart) |
+| Sandbox (default) | GHCR | `ghcr.io/nvidia/openshell-community/sandboxes/base:latest` | First sandbox creation |
 | Community sandboxes | GHCR | `ghcr.io/nvidia/openshell-community/sandboxes/{name}:latest` | `openshell sandbox create --from <name>` |
 
-The cluster image is based on `rancher/k3s:v1.35.2-k3s1` and bundles the Helm charts and Kubernetes manifests required to bootstrap the control plane. The server and sandbox images are pulled separately at runtime.
+The cluster image is based on `rancher/k3s:v1.35.2-k3s1` and bundles the Helm charts, Kubernetes manifests, and the `navigator-sandbox` supervisor binary required to bootstrap the control plane. Gateway images are pulled at runtime from the registry. Sandbox images (including the default `base` image) are pulled from the community registry.
 
 To override the default image references, set the following environment variables:
 

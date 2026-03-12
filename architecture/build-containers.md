@@ -8,9 +8,8 @@ This document describes how the project's container images are built, organized,
 deploy/
   docker/
     .dockerignore
-    Dockerfile.sandbox             # Sandbox container (runs agent code in isolation)
     Dockerfile.gateway             # Gateway container (orchestration / control plane)
-    Dockerfile.cluster             # Airgapped k3s cluster with Helm charts and manifests
+    Dockerfile.cluster             # k3s cluster with supervisor binary, Helm charts and manifests
     Dockerfile.ci                  # CI runner image with pre-installed toolchain
     Dockerfile.python-wheels       # Multi-arch Linux wheel builder for the Python CLI package
     Dockerfile.python-wheels-macos # macOS arm64 wheel builder (cross-compilation via osxcross)
@@ -54,25 +53,7 @@ tasks/
 
 ## Container Images
 
-The project produces three runtime container images and two build-only wheel images.
-
-### Sandbox Image (`openshell/sandbox`)
-
-The sandbox container runs inside each sandbox pod. It contains the sandbox supervisor binary, Python runtime, AI agent tooling, and a virtual environment for the Python SDK.
-
-**Build stages** (5 stages in `deploy/docker/Dockerfile.sandbox`):
-
-1. **rust-builder** -- Cross-compiles the `navigator-sandbox` binary from Rust. Uses `deploy/docker/cross-build.sh` for multi-arch support (amd64/arm64). Build profile is controlled by the `RUST_BUILD_PROFILE` arg (default: `debug`).
-2. **base** -- Python 3.12 slim with system dependencies (`iproute2` for network namespace management, `dnsutils`, `curl`, etc.) and two users: `supervisor` (privileged) and `sandbox` (restricted).
-3. **builder** -- Installs Python dependencies via `uv` into `/app/.venv`. Includes the SDK dependencies (`cloudpickle`, `grpcio`, `protobuf`).
-4. **coding-agents** -- Installs AI agent CLIs: Claude (via native installer), OpenCode (`opencode-ai` npm package), and Codex (`@openai/codex` npm package). Requires Node.js and npm.
-5. **final** -- Combines the Rust binary, Python venv, SDK source, and coding agents. Creates `/var/navigator` for policy files and `/sandbox` owned by the `sandbox` user. Entrypoint is `navigator-sandbox`.
-
-**Key details:**
-
-- Multi-user isolation: `supervisor` (runs the sandbox supervisor) and `sandbox` (runs the restricted agent process).
-- Policy files are mounted at `/var/navigator/policy.rego` (rules) and `/var/navigator/data.yaml` (data) when running in file-based policy mode.
-- The Python SDK is copied directly into the venv's site-packages at `/app/.venv/lib/python3.12/site-packages/openshell/`.
+The project produces two runtime container images and two build-only wheel images. Sandbox images are maintained in the community repository (`NVIDIA/OpenShell-Community`) and pulled from `ghcr.io/nvidia/openshell-community/sandboxes/` at runtime.
 
 ### Gateway Image (`openshell/gateway`)
 
@@ -95,7 +76,7 @@ The gateway container runs the control plane / orchestration service.
 
 ### Cluster Image (`openshell/cluster`)
 
-A k3s image with bundled Helm charts and Kubernetes manifests for single-container deployment. Component images (sandbox, gateway) are **pulled at runtime** from the distribution registry -- they are not bundled as tarballs in this image.
+A k3s image with the `navigator-sandbox` supervisor binary, bundled Helm charts, and Kubernetes manifests for single-container deployment. The gateway image is **pulled at runtime** from the distribution registry. Sandbox images are pulled from the community registry (`ghcr.io/nvidia/openshell-community/sandboxes/`).
 
 **Defined in** `deploy/docker/Dockerfile.cluster`.
 
@@ -103,10 +84,11 @@ A k3s image with bundled Helm charts and Kubernetes manifests for single-contain
 
 **Layers added:**
 
-1. Custom entrypoint: `cluster-entrypoint.sh` at `/usr/local/bin/`.
-2. Healthcheck script: `cluster-healthcheck.sh` at `/usr/local/bin/`.
-3. Packaged Helm charts: `deploy/docker/.build/charts/*.tgz` at `/var/lib/rancher/k3s/server/static/charts/`.
-4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` at `/opt/navigator/manifests/`.
+1. **Supervisor binary**: `navigator-sandbox` at `/opt/openshell/bin/navigator-sandbox`, cross-compiled from Rust source in a `supervisor-builder` stage. Exposed to sandbox pods via a read-only `hostPath` volume mount.
+2. Custom entrypoint: `cluster-entrypoint.sh` at `/usr/local/bin/`.
+3. Healthcheck script: `cluster-healthcheck.sh` at `/usr/local/bin/`.
+4. Packaged Helm charts: `deploy/docker/.build/charts/*.tgz` at `/var/lib/rancher/k3s/server/static/charts/`.
+5. Kubernetes manifests: `deploy/kube/manifests/*.yaml` at `/opt/openshell/manifests/`.
 
 **Bundled manifests:**
 
@@ -236,7 +218,7 @@ server:
   logLevel: info
   sandboxNamespace: navigator
   dbUrl: "sqlite:/var/navigator/navigator.db"
-  sandboxImage: "ghcr.io/nvidia/openshell/sandbox:latest"
+  sandboxImage: "ghcr.io/nvidia/openshell-community/sandboxes/base:latest"
   grpcEndpoint: "https://navigator.navigator.svc.cluster.local:8080"
   sshGatewayHost: ""     # Public host for SSH proxy CONNECT (default: 127.0.0.1)
   sshGatewayPort: 0      # Public port for SSH proxy CONNECT (default: 8080)
@@ -304,10 +286,9 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 
 | Task | Description |
 |---|---|
-| `mise run docker:build` | Build all runtime images (sandbox, gateway, cluster) |
-| `mise run docker:build:sandbox` | Build sandbox image |
+| `mise run docker:build` | Build all runtime images (gateway, cluster) |
 | `mise run docker:build:gateway` | Build gateway image |
-| `mise run docker:build:cluster` | Build k3s cluster image (packages Helm charts first) |
+| `mise run docker:build:cluster` | Build k3s cluster image (includes supervisor binary, packages Helm charts) |
 | `mise run docker:build:ci` | Build CI runner image |
 | `mise run docker:build:cluster:multiarch` | Build multi-arch cluster image and push to a registry |
 | `mise run docker:publish:cluster:multiarch` | Build and publish multi-arch cluster image to ECR |
@@ -333,24 +314,23 @@ All builds use mise tasks defined in `tasks/*.toml` (included from `mise.toml`).
 
 | Changed Path | Triggers |
 |---|---|
-| `Cargo.toml`, `Cargo.lock`, `proto/*`, `deploy/docker/cross-build.sh` | Gateway + sandbox rebuild |
-| `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway + sandbox rebuild |
+| `Cargo.toml`, `Cargo.lock`, `proto/*`, `deploy/docker/cross-build.sh` | Gateway + supervisor rebuild |
+| `crates/navigator-core/*`, `crates/navigator-providers/*` | Gateway rebuild |
 | `crates/navigator-router/*` | Gateway rebuild |
 | `crates/navigator-server/*`, `deploy/docker/Dockerfile.gateway` | Gateway rebuild |
-| `crates/navigator-sandbox/*`, `deploy/docker/sandbox/*`, `python/*`, `pyproject.toml`, `uv.lock`, `crates/navigator-sandbox/data/sandbox-policy.rego` | Sandbox rebuild |
-| `deploy/helm/navigator/*` | Helm upgrade |
+| `crates/navigator-core/*`, `crates/navigator-policy/*`, `crates/navigator-router/*`, `crates/navigator-sandbox/*` | Supervisor rebuild |
+| `deploy/helm/openshell/*` | Helm upgrade |
 
-**Explicit target mode** (arguments: `gateway`, `sandbox`, `chart`, `all`): Rebuilds only the specified components.
+**Explicit target mode** (arguments: `gateway`, `supervisor`, `chart`, `all`): Rebuilds only the specified components.
 
 Auto mode persists the last deployed fingerprints in `.cache/cluster-deploy-fast.state` (or `$DEPLOY_FAST_STATE_FILE`). Re-running `mise run cluster` without new local changes prints `No new local changes since last deploy.` and skips rebuild/upgrade work.
 
 After building, the script:
 
-1. Tags images with the `IMAGE_REPO_BASE` prefix and pushes to the local registry.
-2. Detects if the sandbox image content-addressable ID changed; if so, evicts the stale copy from k3s's containerd store via `crictl rmi` so new sandbox pods pull the updated image.
+1. For gateway changes: tags the image and pushes to the local registry, evicts the stale copy from k3s containerd, and restarts the gateway StatefulSet.
+2. For supervisor changes: builds the supervisor binary via `docker buildx` (cross-compiling for the cluster architecture) and `docker cp`s it to `/opt/openshell/bin/navigator-sandbox` on the running k3s container. New sandbox pods immediately use the updated binary via hostPath mount.
 3. Runs `helm upgrade` if chart changes were detected (or `FORCE_HELM_UPGRADE=1`).
-4. Restarts the gateway StatefulSet (or Deployment, if present) and waits for rollout completion.
-5. On success, updates the local deploy fingerprint state file for the next incremental deploy.
+4. On success, updates the local deploy fingerprint state file for the next incremental deploy.
 
 ### How `mise run cluster` Bootstrap Works
 
@@ -409,9 +389,9 @@ In CI pipelines:
 
 **Process:**
 
-1. Builds and pushes sandbox and gateway images as multi-arch manifests using cross-compilation.
+1. Builds and pushes the gateway image as a multi-arch manifest using cross-compilation.
 2. Packages the Helm chart.
-3. Builds and pushes the multi-arch cluster image.
+3. Builds and pushes the multi-arch cluster image (includes supervisor binary).
 4. Applies additional tags (`:latest` if `TAG_LATEST=true`, plus any `EXTRA_DOCKER_TAGS`) by copying manifests with `docker buildx imagetools create --prefer-index=false`.
 
 **Default platforms:** `linux/amd64,linux/arm64` (overridable via `DOCKER_PLATFORMS`).
@@ -460,9 +440,8 @@ When the cluster container starts, k3s automatically deploys these HelmChart CRs
 
 ## Implementation References
 
-- `deploy/docker/Dockerfile.sandbox` -- Sandbox image (5-stage multi-arch build)
 - `deploy/docker/Dockerfile.gateway` -- Gateway image (2-stage with dependency caching)
-- `deploy/docker/Dockerfile.cluster` -- Cluster image (k3s base + charts + manifests)
+- `deploy/docker/Dockerfile.cluster` -- Cluster image (k3s base + supervisor binary + charts + manifests)
 - `deploy/docker/Dockerfile.ci` -- CI runner image (Ubuntu + full toolchain)
 - `deploy/docker/Dockerfile.python-wheels` -- Linux wheel builder
 - `deploy/docker/Dockerfile.python-wheels-macos` -- macOS wheel builder
