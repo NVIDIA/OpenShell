@@ -7,7 +7,7 @@ use miette::{IntoDiagnostic, Result, WrapErr};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-/// Gateway metadata stored alongside the kubeconfig.
+/// Gateway metadata stored alongside deployment info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GatewayMetadata {
     /// The gateway name.
@@ -18,11 +18,6 @@ pub struct GatewayMetadata {
     pub is_remote: bool,
     /// Host port mapped to the gateway `NodePort`.
     pub gateway_port: u16,
-    /// Host port mapped to the k3s Kubernetes control plane (6443 inside the container).
-    /// `None` means the control plane is not exposed on the host.
-    /// Old metadata files without this field are deserialized as `None`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub kube_port: Option<u16>,
     /// For remote gateways, the SSH destination (e.g., `user@hostname`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub remote_host: Option<String>,
@@ -55,9 +50,8 @@ pub fn create_gateway_metadata(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
-    kube_port: Option<u16>,
 ) -> GatewayMetadata {
-    create_gateway_metadata_with_host(name, remote, port, kube_port, None, false)
+    create_gateway_metadata_with_host(name, remote, port, None, false)
 }
 
 /// Create gateway metadata, optionally overriding the gateway host.
@@ -73,7 +67,6 @@ pub fn create_gateway_metadata_with_host(
     name: &str,
     remote: Option<&RemoteOptions>,
     port: u16,
-    kube_port: Option<u16>,
     gateway_host: Option<&str>,
     disable_tls: bool,
 ) -> GatewayMetadata {
@@ -108,7 +101,6 @@ pub fn create_gateway_metadata_with_host(
         gateway_endpoint,
         is_remote,
         gateway_port: port,
-        kube_port,
         remote_host,
         resolved_host,
         auth_mode: None,
@@ -379,11 +371,10 @@ mod tests {
 
     #[test]
     fn local_gateway_metadata() {
-        let meta = create_gateway_metadata("test", None, 8080, None);
+        let meta = create_gateway_metadata("test", None, 8080);
         assert_eq!(meta.name, "test");
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
         assert_eq!(meta.gateway_port, 8080);
-        assert!(meta.kube_port.is_none());
         assert!(!meta.is_remote);
         assert!(meta.remote_host.is_none());
         assert!(meta.resolved_host.is_none());
@@ -391,21 +382,9 @@ mod tests {
 
     #[test]
     fn local_gateway_metadata_custom_port() {
-        let meta = create_gateway_metadata("test", None, 9090, None);
+        let meta = create_gateway_metadata("test", None, 9090);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:9090");
         assert_eq!(meta.gateway_port, 9090);
-    }
-
-    #[test]
-    fn local_gateway_metadata_with_kube_port() {
-        let meta = create_gateway_metadata("test", None, 8080, Some(7443));
-        assert_eq!(meta.kube_port, Some(7443));
-    }
-
-    #[test]
-    fn local_gateway_metadata_without_kube_port() {
-        let meta = create_gateway_metadata("test", None, 8080, None);
-        assert!(meta.kube_port.is_none());
     }
 
     #[test]
@@ -429,7 +408,7 @@ mod tests {
     #[test]
     fn remote_gateway_metadata_has_resolved_host() {
         let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta = create_gateway_metadata("test", Some(&opts), 8080, Some(6443));
+        let meta = create_gateway_metadata("test", Some(&opts), 8080);
         assert!(meta.is_remote);
         assert_eq!(meta.remote_host.as_deref(), Some("user@10.0.0.5"));
         // When the host is a plain IP, ssh -G should resolve it to itself
@@ -439,17 +418,15 @@ mod tests {
             format!("https://{}:8080", meta.resolved_host.as_ref().unwrap())
         );
         assert_eq!(meta.gateway_port, 8080);
-        assert_eq!(meta.kube_port, Some(6443));
     }
 
     #[test]
-    fn metadata_roundtrip_with_kube_port() {
+    fn metadata_roundtrip() {
         let meta = GatewayMetadata {
             name: "test".to_string(),
             gateway_endpoint: "https://10.0.0.5:8080".to_string(),
             is_remote: true,
             gateway_port: 8080,
-            kube_port: Some(7443),
             remote_host: Some("user@openshell-dev".to_string()),
             resolved_host: Some("10.0.0.5".to_string()),
             auth_mode: None,
@@ -461,35 +438,11 @@ mod tests {
         assert_eq!(parsed.resolved_host.as_deref(), Some("10.0.0.5"));
         assert_eq!(parsed.gateway_endpoint, "https://10.0.0.5:8080");
         assert_eq!(parsed.gateway_port, 8080);
-        assert_eq!(parsed.kube_port, Some(7443));
-    }
-
-    #[test]
-    fn metadata_roundtrip_without_kube_port() {
-        let meta = GatewayMetadata {
-            name: "test".to_string(),
-            gateway_endpoint: "https://10.0.0.5:8080".to_string(),
-            is_remote: true,
-            gateway_port: 8080,
-            kube_port: None,
-            remote_host: Some("user@openshell-dev".to_string()),
-            resolved_host: Some("10.0.0.5".to_string()),
-            auth_mode: None,
-            edge_team_domain: None,
-            edge_auth_url: None,
-        };
-        let json = serde_json::to_string(&meta).unwrap();
-        assert!(
-            !json.contains("kube_port"),
-            "None should be omitted from JSON"
-        );
-        let parsed: GatewayMetadata = serde_json::from_str(&json).unwrap();
-        assert!(parsed.kube_port.is_none());
     }
 
     #[test]
     fn metadata_deserialize_without_resolved_host() {
-        // Existing metadata files won't have the resolved_host or kube_port fields.
+        // Existing metadata files won't have the resolved_host field.
         // Ensure backwards compatibility via serde(default).
         let json = r#"{
             "name": "test",
@@ -500,8 +453,6 @@ mod tests {
         }"#;
         let parsed: GatewayMetadata = serde_json::from_str(json).unwrap();
         assert!(parsed.resolved_host.is_none());
-        // kube_port should default to None when not present in JSON
-        assert!(parsed.kube_port.is_none());
     }
 
     #[test]
@@ -510,7 +461,6 @@ mod tests {
             "test",
             None,
             8080,
-            None,
             Some("host.docker.internal"),
             false,
         );
@@ -525,13 +475,13 @@ mod tests {
     #[test]
     fn local_gateway_metadata_with_no_gateway_host_override() {
         // When gateway_host is None, behaviour matches create_gateway_metadata.
-        let meta = create_gateway_metadata_with_host("test", None, 8080, None, None, false);
+        let meta = create_gateway_metadata_with_host("test", None, 8080, None, false);
         assert_eq!(meta.gateway_endpoint, "https://127.0.0.1:8080");
     }
 
     #[test]
     fn local_gateway_metadata_with_tls_disabled() {
-        let meta = create_gateway_metadata_with_host("test", None, 8080, None, None, true);
+        let meta = create_gateway_metadata_with_host("test", None, 8080, None, true);
         assert_eq!(meta.gateway_endpoint, "http://127.0.0.1:8080");
     }
 
@@ -541,7 +491,6 @@ mod tests {
             "test",
             None,
             8080,
-            None,
             Some("host.docker.internal"),
             true,
         );
@@ -551,8 +500,7 @@ mod tests {
     #[test]
     fn remote_gateway_metadata_with_tls_disabled() {
         let opts = RemoteOptions::new("user@10.0.0.5");
-        let meta =
-            create_gateway_metadata_with_host("test", Some(&opts), 8080, Some(6443), None, true);
+        let meta = create_gateway_metadata_with_host("test", Some(&opts), 8080, None, true);
         assert!(meta.is_remote);
         assert!(meta.gateway_endpoint.starts_with("http://"));
         assert!(!meta.gateway_endpoint.starts_with("https://"));

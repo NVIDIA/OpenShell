@@ -51,6 +51,24 @@ openshell --help
 openshell sandbox create -- codex
 ```
 
+### Cluster debugging helpers
+
+Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for cluster debugging:
+
+| Script | What it does |
+|--------|-------------|
+| `kubectl` | Runs `kubectl` inside the active gateway's k3s container via `openshell doctor exec` |
+| `k9s` | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec` |
+
+These work for both local and remote gateways (SSH is handled automatically). Examples:
+
+```bash
+kubectl get pods -A
+kubectl logs -n navigator statefulset/navigator
+k9s
+k9s -n navigator
+```
+
 ## Main Tasks
 
 These are the primary `mise` tasks for day-to-day development:

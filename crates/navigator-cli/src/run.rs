@@ -16,10 +16,9 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use navigator_bootstrap::{
-    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway,
-    default_local_kubeconfig_path, get_gateway_metadata, list_gateways, load_active_gateway,
-    print_kubeconfig, remove_gateway_metadata, save_active_gateway, save_last_sandbox,
-    store_gateway_metadata, update_local_kubeconfig,
+    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
+    get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
+    save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
 use navigator_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
@@ -865,7 +864,6 @@ pub async fn gateway_add(endpoint: &str, name: Option<&str>, no_auth: bool) -> R
         gateway_endpoint: endpoint.clone(),
         is_remote: true,
         gateway_port: 0,
-        kube_port: None,
         remote_host: None,
         resolved_host: None,
         auth_mode: Some("cloudflare_jwt".to_string()),
@@ -1169,13 +1167,10 @@ fn print_failure_diagnosis(diagnosis: &navigator_bootstrap::errors::GatewayFailu
 /// Provision or start a gateway (local or remote).
 pub async fn gateway_admin_deploy(
     name: &str,
-    update_kube_config: bool,
-    get_kubeconfig: bool,
     remote: Option<&str>,
     ssh_key: Option<&str>,
     port: u16,
     gateway_host: Option<&str>,
-    kube_port: Option<u16>,
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
@@ -1247,20 +1242,6 @@ pub async fn gateway_admin_deploy(
     }
 
     let handle = deploy_gateway_with_panel(options, name, location).await?;
-
-    if update_kube_config {
-        let target_path = default_local_kubeconfig_path()?;
-        update_local_kubeconfig(name, &target_path)?;
-        eprintln!(
-            "{} Updated kubeconfig at {}",
-            "✓".green().bold(),
-            target_path.display()
-        );
-    }
-
-    if get_kubeconfig {
-        print_kubeconfig(name)?;
-    }
 
     print_deploy_summary(name, &handle);
 
@@ -1354,13 +1335,6 @@ fn cleanup_gateway_metadata(name: &str) {
     }
 }
 
-fn resolve_remote(name: &str, remote_override: Option<&str>) -> Option<String> {
-    match resolve_gateway_control_target(name, remote_override) {
-        GatewayControlTarget::Remote(dest) => Some(dest),
-        GatewayControlTarget::Local | GatewayControlTarget::ExternalRegistration => None,
-    }
-}
-
 /// Stop a gateway.
 pub async fn gateway_admin_stop(
     name: &str,
@@ -1416,8 +1390,6 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
         )
     })?;
 
-    let kubeconfig_path = navigator_bootstrap::stored_kubeconfig_path(name)?;
-
     println!("{}", "Gateway Info".cyan().bold());
     println!();
     println!("  {} {}", "Gateway:".dimmed(), metadata.name);
@@ -1426,15 +1398,6 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
         "Gateway endpoint:".dimmed(),
         metadata.gateway_endpoint
     );
-    println!(
-        "  {} {}",
-        "Stored kubeconfig:".dimmed(),
-        kubeconfig_path.display()
-    );
-
-    if let Some(kube_port) = metadata.kube_port {
-        println!("  {} {kube_port}", "Kube port:".dimmed());
-    }
 
     if metadata.is_remote {
         if let Some(ref host) = metadata.remote_host {
@@ -1445,68 +1408,156 @@ pub fn gateway_admin_info(name: &str) -> Result<()> {
         if let Some(ref resolved) = metadata.resolved_host {
             println!("  {} {resolved}", "Resolved host:".dimmed());
         }
-
-        if let (Some(host), Some(kube_port)) = (&metadata.remote_host, metadata.kube_port) {
-            println!();
-            println!("{}", "SSH tunnel for kubectl access:".dimmed());
-            println!("  openshell gateway tunnel --name {name}");
-            println!("Or manually:");
-            println!("  ssh -L {kube_port}:127.0.0.1:6443 {host}");
-        }
     }
 
     Ok(())
 }
 
-/// Print or start an SSH tunnel for kubectl access to a remote gateway.
-pub fn gateway_admin_tunnel(
+/// Fetch logs from the gateway Docker container.
+///
+/// Connects to the Docker daemon (local or remote via SSH) and retrieves
+/// logs from the `openshell-cluster-{name}` container.
+pub async fn doctor_logs(
     name: &str,
-    remote_override: Option<&str>,
+    lines: Option<usize>,
+    tail: bool,
+    remote: Option<&str>,
     ssh_key: Option<&str>,
-    print_command: bool,
 ) -> Result<()> {
-    let remote = resolve_remote(name, remote_override).ok_or_else(|| {
-        miette::miette!(
-            "Gateway '{name}' is not a remote gateway (no SSH destination found).\n\
-             SSH tunnels are only needed for remote gateways."
-        )
-    })?;
+    // Build remote options: explicit --remote flag, or auto-resolve from metadata
+    let remote_opts = if let Some(dest) = remote {
+        let mut opts = RemoteOptions::new(dest);
+        if let Some(key) = ssh_key {
+            opts = opts.with_ssh_key(key);
+        }
+        Some(opts)
+    } else if let Some(metadata) = get_gateway_metadata(name)
+        && metadata.is_remote
+        && let Some(ref host) = metadata.remote_host
+    {
+        let mut opts = RemoteOptions::new(host.clone());
+        if let Some(key) = ssh_key {
+            opts = opts.with_ssh_key(key);
+        }
+        Some(opts)
+    } else {
+        None
+    };
 
-    let kube_port = get_gateway_metadata(name)
-        .and_then(|m| m.kube_port)
-        .ok_or_else(|| {
-            miette::miette!(
-                "Gateway '{name}' was deployed without --kube-port.\n\
-                 Redeploy with --kube-port <port> to enable kubectl access via SSH tunnel."
-            )
-        })?;
+    let stdout = std::io::stdout().lock();
+    navigator_bootstrap::gateway_container_logs(remote_opts.as_ref(), name, lines, tail, stdout)
+        .await
+}
 
-    let ssh_cmd = ssh_key.map_or_else(
-        || format!("ssh -L {kube_port}:127.0.0.1:6443 -N {remote}"),
-        |key| format!("ssh -i {key} -L {kube_port}:127.0.0.1:6443 -N {remote}"),
-    );
+/// Run a command inside the gateway Docker container.
+///
+/// Spawns `docker exec` (or `ssh <host> docker exec` for remote gateways)
+/// as a child process with the user's terminal attached, so interactive
+/// tools like `k9s` and `kubectl` work natively.
+pub fn doctor_exec(
+    name: &str,
+    remote: Option<&str>,
+    ssh_key: Option<&str>,
+    command: &[String],
+) -> Result<()> {
+    let container = container_name(name);
+    let is_tty = std::io::stdin().is_terminal();
 
-    if print_command {
-        println!("{ssh_cmd}");
-        return Ok(());
-    }
+    // Wrap the user command with KUBECONFIG set
+    let inner_cmd = if command.is_empty() {
+        "KUBECONFIG=/etc/rancher/k3s/k3s.yaml sh".to_string()
+    } else {
+        let escaped: Vec<String> = command.iter().map(|a| shell_escape(a)).collect();
+        format!("KUBECONFIG=/etc/rancher/k3s/k3s.yaml {}", escaped.join(" "))
+    };
 
-    eprintln!("Starting SSH tunnel to {remote}...");
-    eprintln!("Press Ctrl+C to stop the tunnel.");
-    eprintln!();
+    // Resolve remote destination: explicit --remote flag, or auto-resolve from metadata
+    let remote_host = if let Some(dest) = remote {
+        Some(dest.to_string())
+    } else if let Some(metadata) = get_gateway_metadata(name)
+        && metadata.is_remote
+    {
+        metadata.remote_host.clone()
+    } else {
+        None
+    };
 
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(&ssh_cmd)
+    let mut cmd = if let Some(ref host) = remote_host {
+        // Remote: ssh <host> docker exec [-it] <container> sh -lc '<inner_cmd>'
+        let mut c = Command::new("ssh");
+        if let Some(key) = ssh_key {
+            c.args(["-i", key]);
+        }
+        // -t forces TTY allocation over SSH when we have a local TTY
+        if is_tty {
+            c.arg("-t");
+        }
+        c.arg(host);
+        c.arg("docker");
+        c.arg("exec");
+        if is_tty {
+            c.args(["-it"]);
+        } else {
+            c.arg("-i");
+        }
+        c.args([&container, "sh", "-lc", &inner_cmd]);
+        c
+    } else {
+        // Local: docker exec [-it] <container> sh -lc '<inner_cmd>'
+        let mut c = Command::new("docker");
+        c.arg("exec");
+        if is_tty {
+            c.args(["-it"]);
+        } else {
+            c.arg("-i");
+        }
+        c.args([&container, "sh", "-lc", &inner_cmd]);
+        c
+    };
+
+    let status = cmd
         .status()
         .into_diagnostic()
-        .wrap_err("failed to start SSH tunnel")?;
+        .wrap_err("failed to execute docker exec")?;
 
     if !status.success() {
-        return Err(miette::miette!("SSH tunnel exited with status: {}", status));
+        let code = status.code().unwrap_or(1);
+        std::process::exit(code);
     }
 
     Ok(())
+}
+
+/// Print the LLM diagnostic prompt to stdout.
+///
+/// Outputs a system prompt that a coding agent can use to autonomously
+/// diagnose gateway issues using `openshell doctor logs` and
+/// `openshell doctor exec`.
+pub fn doctor_llm() -> Result<()> {
+    use std::io::Write;
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    handle
+        .write_all(include_bytes!("doctor_llm_prompt.md"))
+        .into_diagnostic()
+        .wrap_err("failed to write LLM prompt to stdout")?;
+    Ok(())
+}
+
+/// Shell-escape a single argument for safe inclusion in a `sh -c` string.
+fn shell_escape(s: &str) -> String {
+    if s.is_empty() {
+        return "''".to_string();
+    }
+    // If the string is clean (alphanumeric, hyphens, underscores, dots, slashes, colons, equals),
+    // no quoting needed.
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./,:=@".contains(c))
+    {
+        return s.to_string();
+    }
+    // Otherwise, single-quote it (escaping embedded single quotes)
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 /// Create a sandbox when no gateway is configured.
@@ -3759,7 +3810,6 @@ mod tests {
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
             gateway_port: 0,
-            kube_port: None,
             remote_host: None,
             resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),

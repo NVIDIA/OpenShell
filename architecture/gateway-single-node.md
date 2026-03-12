@@ -8,7 +8,7 @@ This document describes how OpenShell bootstraps a single-node k3s gateway insid
 - Keep Docker as the only runtime dependency for provisioning and lifecycle operations.
 - Package the OpenShell gateway as one container image, transferred to the target host via registry pull.
 - Support idempotent `deploy` behavior (safe to re-run).
-- Persist gateway access artifacts (kubeconfig, metadata, mTLS certs) in the local XDG config directory.
+- Persist gateway access artifacts (metadata, mTLS certs) in the local XDG config directory.
 - Track the active gateway so most CLI commands resolve their target automatically.
 
 Out of scope:
@@ -18,13 +18,12 @@ Out of scope:
 ## Components
 
 - `crates/navigator-cli/src/main.rs`: CLI entry point; `clap`-based command parsing.
-- `crates/navigator-cli/src/run.rs`: CLI command implementations (`gateway_start`, `gateway_stop`, `gateway_destroy`, `gateway_info`, `gateway_tunnel`).
+- `crates/navigator-cli/src/run.rs`: CLI command implementations (`gateway_start`, `gateway_stop`, `gateway_destroy`, `gateway_info`, `doctor_logs`).
 - `crates/navigator-cli/src/bootstrap.rs`: Auto-bootstrap helpers for `sandbox create` (offers to deploy a gateway when one is unreachable).
 - `crates/navigator-bootstrap/src/lib.rs`: Gateway lifecycle orchestration (`deploy_gateway`, `deploy_gateway_with_logs`, `gateway_handle`, `check_existing_deployment`).
 - `crates/navigator-bootstrap/src/docker.rs`: Docker API wrappers (network, volume, container, image operations).
 - `crates/navigator-bootstrap/src/image.rs`: Remote image registry pull with XOR-obfuscated distribution credentials.
-- `crates/navigator-bootstrap/src/runtime.rs`: In-container operations via `docker exec` (kubeconfig readiness, health polling, stale node cleanup, deployment restart).
-- `crates/navigator-bootstrap/src/kubeconfig.rs`: Kubeconfig rewriting, storage, and merge into local `~/.kube/config`.
+- `crates/navigator-bootstrap/src/runtime.rs`: In-container operations via `docker exec` (health polling, stale node cleanup, deployment restart).
 - `crates/navigator-bootstrap/src/metadata.rs`: Gateway metadata creation, storage, and active gateway tracking.
 - `crates/navigator-bootstrap/src/mtls.rs`: Gateway TLS detection and CLI mTLS bundle extraction.
 - `crates/navigator-bootstrap/src/push.rs`: Local development image push into k3s containerd.
@@ -45,10 +44,11 @@ All gateway lifecycle commands live under `openshell gateway`:
 |---|---|
 | `openshell gateway start [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a gateway |
 | `openshell gateway stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `openshell gateway destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, kubeconfig directory, metadata, and network |
-| `openshell gateway info [--name NAME]` | Show deployment details (endpoint, kubeconfig path, SSH host) |
-| `openshell gateway tunnel [--name NAME] [--remote user@host] [--print-command]` | Start or print SSH tunnel for kubectl access |
+| `openshell gateway destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, metadata, and network |
+| `openshell gateway info [--name NAME]` | Show deployment details (endpoint, SSH host) |
 | `openshell status` | Show gateway health via gRPC/HTTP |
+| `openshell doctor logs [--name NAME] [--remote user@host] [--tail N]` | Fetch gateway container logs |
+| `openshell doctor exec [--name NAME] [--remote user@host] -- <command>` | Run a command inside the gateway container |
 | `openshell gateway select <name>` | Set the active gateway |
 | `openshell gateway select` | Open an interactive chooser on a TTY, or list all gateways in non-interactive mode |
 
@@ -95,8 +95,6 @@ sequenceDiagram
   B->>R: ensure_volume
   B->>R: ensure_container (privileged, k3s server)
   B->>R: start_container
-  B->>R: wait_for_kubeconfig (30 attempts, 2s apart)
-  B->>B: rewrite and store kubeconfig
   B->>R: clean_stale_nodes (kubectl delete node)
   B->>R: wait_for_gateway_ready (180 attempts, 2s apart)
   B->>R: poll for secret navigator-cli-client (90 attempts, 2s apart)
@@ -104,7 +102,7 @@ sequenceDiagram
   B->>B: atomically store mTLS bundle
   B->>B: create and persist gateway metadata JSON
   B->>B: save_active_gateway
-  B-->>C: GatewayHandle (kubeconfig_path, metadata, docker client)
+  B-->>C: GatewayHandle (metadata, docker client)
 ```
 
 ## End-State Connectivity Diagram
@@ -113,29 +111,20 @@ sequenceDiagram
 flowchart LR
   subgraph WS[User workstation]
     NAV[navigator-cli]
-    KUBECTL[kubectl]
-    KC[stored kubeconfig ~/.config/openshell/gateways/NAME/kubeconfig]
     MTLS[mTLS bundle ca.crt, tls.crt, tls.key]
-    TUN[ssh -L 6443:127.0.0.1:6443 user@host]
   end
 
   subgraph HOST[Target host]
     DOCKER[Docker daemon]
     K3S[openshell-cluster-NAME single k3s container]
-    KAPI[Kubernetes API :6443]
     G8080[Gateway :port -> :30051 mTLS default 8080]
     SBX[Sandbox runtime]
   end
-
-  KC --> KUBECTL
-  KUBECTL --> KAPI
-  TUN -. remote mode .-> KAPI
 
   NAV --> G8080
   MTLS -. client cert auth .-> G8080
 
   DOCKER --> K3S
-  K3S --> KAPI
   K3S --> G8080
   K3S --> G80
   K3S --> G443
@@ -183,10 +172,9 @@ For the target daemon (local or remote):
    - Extra host: `host.docker.internal:host-gateway`.
    - Port mappings:
 
-     | Container Port | Host Port | Purpose |
-     |---|---|---|
-     | 6443/tcp | 6443 | Kubernetes API |
-     | 30051/tcp | configurable (default 8080) | OpenShell service NodePort (mTLS) |
+      | Container Port | Host Port | Purpose |
+      |---|---|---|
+      | 30051/tcp | configurable (default 8080) | OpenShell service NodePort (mTLS) |
 
    - Container environment variables (see [Container Environment Variables](#container-environment-variables) below).
    - If the container exists with a different image ID (compared by inspecting the content-addressable ID), it is stopped, force-removed, and recreated. If the image matches, the existing container is reused.
@@ -196,12 +184,9 @@ For the target daemon (local or remote):
 
 After the container starts:
 
-1. **Poll kubeconfig**: `wait_for_kubeconfig()` runs `cat /etc/rancher/k3s/k3s.yaml` via `docker exec` up to 30 times, 2 seconds apart (60s total). Each attempt first checks that the container is still running. Validates the output contains `apiVersion:` and `clusters:`.
-2. **Rewrite kubeconfig**: Replace the server address with `https://127.0.0.1:6443`. Rename `default` entries (cluster, context, user) to the gateway name. Remote mode appends `-remote` suffix (e.g., `{name}-remote`) to avoid collisions with local contexts.
-3. **Store kubeconfig** at `~/.config/openshell/gateways/{name}/kubeconfig` (or `$XDG_CONFIG_HOME/openshell/gateways/{name}/kubeconfig`).
-4. **Clean stale nodes**: `clean_stale_nodes()` finds `NotReady` nodes via `kubectl get nodes` and deletes them. This is needed when a container is recreated but reuses the persistent volume -- k3s registers a new node (using the container ID as hostname) while old node entries persist in etcd. Non-fatal on error; returns the count of removed nodes.
-5. **Push local images** (optional, local deploy only): If `OPENSHELL_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/navigator -n navigator` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/navigator-bootstrap/src/push.rs`.
-6. **Wait for gateway health**: `wait_for_gateway_ready()` polls the Docker HEALTHCHECK status up to 180 times, 2 seconds apart (6 min total). A background task streams container logs during this wait. Failure modes:
+1. **Clean stale nodes**: `clean_stale_nodes()` finds `NotReady` nodes via `kubectl get nodes` and deletes them. This is needed when a container is recreated but reuses the persistent volume -- k3s registers a new node (using the container ID as hostname) while old node entries persist in etcd. Non-fatal on error; returns the count of removed nodes.
+2. **Push local images** (optional, local deploy only): If `OPENSHELL_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/navigator -n navigator` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/navigator-bootstrap/src/push.rs`.
+3. **Wait for gateway health**: `wait_for_gateway_ready()` polls the Docker HEALTHCHECK status up to 180 times, 2 seconds apart (6 min total). A background task streams container logs during this wait. Failure modes:
    - Container exits during polling: error includes recent log lines.
    - Container has no HEALTHCHECK instruction: fails immediately.
    - HEALTHCHECK reports unhealthy on final attempt: error includes recent logs.
@@ -234,7 +219,7 @@ Metadata fields:
 
 Metadata location: `~/.config/openshell/gateways/{name}_metadata.json`
 
-Note: metadata is stored at the `gateways/` level (not nested inside `{name}/` like kubeconfig and mTLS).
+Note: metadata is stored at the `gateways/` level (not nested inside `{name}/` like mTLS).
 
 After deploy, the CLI calls `save_active_gateway(name)`, writing the gateway name to `~/.config/openshell/active_gateway`. Subsequent commands that don't specify `--gateway` or `OPENSHELL_GATEWAY` resolve to this active gateway.
 
@@ -344,23 +329,6 @@ flowchart LR
 
 ## Access Model
 
-### Kubernetes API access
-
-- Kubeconfig always targets `https://127.0.0.1:6443`.
-- For remote gateways, the user must open an SSH local-forward tunnel:
-
-```bash
-ssh -L 6443:127.0.0.1:6443 -N user@host
-```
-
-CLI helper:
-
-```bash
-openshell gateway tunnel --name <name>
-```
-
-The `--remote` flag is optional; the CLI resolves the SSH destination from stored gateway metadata. Pass `--print-command` to print the SSH command without executing it.
-
 ### Gateway endpoint exposure
 
 - Local: `https://127.0.0.1:{port}` (or `https://{docker_host}:{port}` when `DOCKER_HOST` is a non-loopback TCP endpoint). Default port is 8080.
@@ -380,8 +348,7 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 1. Stop the container.
 2. Remove the container (`force=true`). Tolerates 404.
 3. Remove the volume (`force=true`). Tolerates 404.
-4. Remove the stored kubeconfig file.
-5. Remove the network if no containers remain attached (`cleanup_network_if_unused()`).
+4. Remove the network if no containers remain attached (`cleanup_network_if_unused()`).
 
 **CLI layer** (`gateway_destroy()` in `run.rs` additionally):
 
@@ -398,9 +365,8 @@ The `--remote` flag is optional; the CLI resolves the SSH destination from store
 - Error handling surfaces:
   - Docker API failures from inspect/create/start/remove.
   - SSH connection failures when creating the remote Docker client.
-  - Kubeconfig readiness timeout (60s) with recent container logs in the error message.
   - Health check timeout (6 min) with recent container logs.
-  - Container exit during any polling phase (kubeconfig, health, mTLS) with diagnostic information (exit code, OOM status, recent logs).
+   - Container exit during any polling phase (health, mTLS) with diagnostic information (exit code, OOM status, recent logs).
    - mTLS secret polling timeout (3 min).
   - Local image ref without registry prefix: clear error with build instructions rather than a failed Docker Hub pull.
 
@@ -442,7 +408,6 @@ Environment variables that affect bootstrap behavior when set on the host:
 | `IMAGE_TAG` | Sets image tag (default: `"dev"`) when `OPENSHELL_CLUSTER_IMAGE` is not set |
 | `NAV_GATEWAY_TLS_ENABLED` | Overrides HelmChart manifest for TLS enabled check (`true`/`1`/`yes`/`false`/`0`/`no`) |
 | `XDG_CONFIG_HOME` | Base config directory (default: `$HOME/.config`) |
-| `KUBECONFIG` | Target kubeconfig path for merge (first colon-separated path; default: `$HOME/.kube/config`) |
 | `DOCKER_HOST` | When `tcp://` and non-loopback, the host is added as a TLS SAN and used as the gateway endpoint |
 | `OPENSHELL_PUSH_IMAGES` | Comma-separated image refs to push into the gateway's containerd (local deploy only) |
 | `OPENSHELL_REGISTRY_HOST` | Override the distribution registry host |
@@ -464,7 +429,6 @@ openshell/
   gateways/
     {name}_metadata.json                   # GatewayMetadata JSON
     {name}/
-      kubeconfig                           # rewritten kubeconfig
       mtls/                                # mTLS bundle (when TLS enabled)
         ca.crt
         tls.crt
@@ -477,7 +441,6 @@ openshell/
 - `crates/navigator-bootstrap/src/docker.rs` -- Docker API wrappers
 - `crates/navigator-bootstrap/src/image.rs` -- registry pull, XOR credentials
 - `crates/navigator-bootstrap/src/runtime.rs` -- exec, health polling, stale node cleanup
-- `crates/navigator-bootstrap/src/kubeconfig.rs` -- kubeconfig rewrite and merge
 - `crates/navigator-bootstrap/src/metadata.rs` -- metadata CRUD, active gateway, SSH resolution
 - `crates/navigator-bootstrap/src/mtls.rs` -- TLS detection, secret extraction, atomic write
 - `crates/navigator-bootstrap/src/push.rs` -- local image push into k3s containerd

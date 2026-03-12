@@ -34,8 +34,8 @@
 
 ## Bootstrap Crate Details
 - `docker.rs`: `ensure_container()` sets ~12 env vars (REGISTRY_*, IMAGE_*, PUSH_IMAGE_REFS, etc.)
-- `runtime.rs`: Polling params: kubeconfig 30x2s, health 180x2s, mTLS 90x2s
-- `metadata.rs`: Metadata at `clusters/{name}_metadata.json` (flat), kubeconfig/mTLS at `clusters/{name}/` (nested)
+- `runtime.rs`: Polling params: health 180x2s, mTLS 90x2s
+- `metadata.rs`: Metadata at `gateways/{name}/metadata.json` (nested), mTLS at `gateways/{name}/mtls/` (nested)
 - `push.rs`: Uses `ctr` (not `k3s ctr`) with k3s containerd socket, `k8s.io` namespace
 - IMPORTANT: `ClusterHandle::destroy()` does NOT remove metadata; only CLI `cluster_admin_destroy()` in run.rs does
 - `ensure_image()`: Local-only refs (no `/`) get error with build instructions, not a Docker Hub pull attempt

@@ -8,7 +8,6 @@ pub mod image;
 
 mod constants;
 mod docker;
-mod kubeconfig;
 mod metadata;
 mod mtls;
 mod paths;
@@ -24,19 +23,15 @@ pub(crate) static XDG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 use bollard::Docker;
 use miette::{IntoDiagnostic, Result};
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use crate::constants::{
-    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME, container_name,
-    volume_name,
+    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME, volume_name,
 };
 use crate::docker::{
-    check_existing_gateway, check_port_conflicts, create_ssh_docker_client,
-    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
-    start_container, stop_container,
+    check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
+    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
 };
-use crate::kubeconfig::{rewrite_kubeconfig, rewrite_kubeconfig_remote, store_kubeconfig};
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, extract_host_from_ssh_destination,
     local_gateway_host, resolve_ssh_hostname,
@@ -45,14 +40,11 @@ use crate::mtls::store_pki_bundle;
 use crate::pki::generate_pki;
 use crate::runtime::{
     clean_stale_nodes, exec_capture_with_exit, fetch_recent_logs, openshell_workload_exists,
-    restart_openshell_deployment, wait_for_gateway_ready, wait_for_kubeconfig,
+    restart_openshell_deployment, wait_for_gateway_ready,
 };
 
-pub use crate::docker::ExistingGatewayInfo;
-pub use crate::kubeconfig::{
-    default_local_kubeconfig_path, print_kubeconfig, stored_kubeconfig_path,
-    update_local_kubeconfig,
-};
+pub use crate::constants::container_name;
+pub use crate::docker::{ExistingGatewayInfo, create_ssh_docker_client};
 pub use crate::metadata::{
     GatewayMetadata, clear_active_gateway, get_gateway_metadata, list_gateways,
     load_active_gateway, load_gateway_metadata, load_last_sandbox, remove_gateway_metadata,
@@ -111,10 +103,6 @@ pub struct DeployOptions {
     /// Useful in CI where `127.0.0.1` is not reachable from the test runner
     /// (e.g., `host.docker.internal`).
     pub gateway_host: Option<String>,
-    /// Host port to expose the k3s Kubernetes control plane on.
-    /// When `None`, the control plane port (6443) is not exposed on the host,
-    /// allowing multiple clusters to run simultaneously without port conflicts.
-    pub kube_port: Option<u16>,
     /// Disable TLS entirely — the server listens on plaintext HTTP.
     pub disable_tls: bool,
     /// Disable gateway authentication (mTLS client certificate requirement).
@@ -138,7 +126,6 @@ impl DeployOptions {
             remote: None,
             port: DEFAULT_GATEWAY_PORT,
             gateway_host: None,
-            kube_port: None,
             disable_tls: false,
             disable_gateway_auth: false,
             registry_token: None,
@@ -164,14 +151,6 @@ impl DeployOptions {
     #[must_use]
     pub fn with_gateway_host(mut self, host: impl Into<String>) -> Self {
         self.gateway_host = Some(host.into());
-        self
-    }
-
-    /// Set the host port for the k3s Kubernetes control plane.
-    /// When set, the control plane is accessible via `kubectl` at this port.
-    #[must_use]
-    pub fn with_kube_port(mut self, kube_port: u16) -> Self {
-        self.kube_port = Some(kube_port);
         self
     }
 
@@ -207,16 +186,11 @@ impl DeployOptions {
 #[derive(Debug, Clone)]
 pub struct GatewayHandle {
     name: String,
-    kubeconfig_path: PathBuf,
     metadata: GatewayMetadata,
     docker: Docker,
 }
 
 impl GatewayHandle {
-    pub fn kubeconfig_path(&self) -> &Path {
-        &self.kubeconfig_path
-    }
-
     /// Get the gateway metadata.
     pub fn metadata(&self) -> &GatewayMetadata {
         &self.metadata
@@ -232,7 +206,7 @@ impl GatewayHandle {
     }
 
     pub async fn destroy(&self) -> Result<()> {
-        destroy_gateway_resources(&self.docker, &self.name, &self.kubeconfig_path).await
+        destroy_gateway_resources(&self.docker, &self.name).await
     }
 }
 
@@ -263,7 +237,6 @@ where
     let image_ref = options.image_ref.unwrap_or_else(default_gateway_image_ref);
     let port = options.port;
     let gateway_host = options.gateway_host;
-    let kube_port = options.kube_port;
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
     let registry_token = options.registry_token;
@@ -359,7 +332,7 @@ where
     // bound by another container, leaving the new container with only loopback
     // and no default route.  Detecting this up-front avoids a confusing 30s
     // timeout followed by a misleading "Docker networking issue" diagnostic.
-    let conflicts = check_port_conflicts(&target_docker, &name, port, kube_port).await?;
+    let conflicts = check_port_conflicts(&target_docker, &name, port).await?;
     if !conflicts.is_empty() {
         let details: Vec<String> = conflicts
             .iter()
@@ -389,7 +362,6 @@ where
         &extra_sans,
         ssh_gateway_host.as_deref(),
         port,
-        kube_port,
         disable_tls,
         disable_gateway_auth,
         registry_token.as_deref(),
@@ -397,14 +369,7 @@ where
     )
     .await?;
     start_container(&target_docker, &name).await?;
-    let raw_kubeconfig = wait_for_kubeconfig(&target_docker, &name).await?;
 
-    // Rewrite kubeconfig based on deployment mode
-    let rewritten = remote_opts.as_ref().map_or_else(
-        || rewrite_kubeconfig(&raw_kubeconfig, &name, kube_port),
-        |opts| rewrite_kubeconfig_remote(&raw_kubeconfig, &name, &opts.destination, kube_port),
-    );
-    store_kubeconfig(&kubeconfig_path, &rewritten)?;
     // Clean up stale k3s nodes left over from previous container instances that
     // used the same persistent volume. Without this, pods remain scheduled on
     // NotReady ghost nodes and the health check will time out.
@@ -420,8 +385,8 @@ where
     // valid; only generate fresh PKI when secrets are missing, incomplete,
     // malformed, or expiring within MIN_REMAINING_VALIDITY_DAYS.
     //
-    // Ordering is: kubeconfig ready -> reconcile secrets -> (if rotated and
-    // workload exists: rollout restart and wait) -> persist CLI-side bundle.
+    // Ordering is: reconcile secrets -> (if rotated and workload exists:
+    // rollout restart and wait) -> persist CLI-side bundle.
     //
     // We check workload presence before reconciliation. On a fresh/recreated
     // cluster, secrets are always newly generated and a restart is unnecessary.
@@ -492,7 +457,6 @@ where
         &name,
         remote_opts.as_ref(),
         port,
-        kube_port,
         ssh_gateway_host.as_deref(),
         disable_tls,
     );
@@ -500,7 +464,6 @@ where
 
     Ok(GatewayHandle {
         name,
-        kubeconfig_path,
         metadata,
         docker: target_docker,
     })
@@ -515,14 +478,12 @@ pub async fn gateway_handle(name: &str, remote: Option<&RemoteOptions>) -> Resul
         Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
         None => Docker::connect_with_local_defaults().into_diagnostic()?,
     };
-    let kubeconfig_path = stored_kubeconfig_path(name)?;
     // Try to load existing metadata, fall back to creating new metadata
     // with the default ports (the actual ports are only known at deploy time).
     let metadata = load_gateway_metadata(name)
-        .unwrap_or_else(|_| create_gateway_metadata(name, remote, DEFAULT_GATEWAY_PORT, None));
+        .unwrap_or_else(|_| create_gateway_metadata(name, remote, DEFAULT_GATEWAY_PORT));
     Ok(GatewayHandle {
         name: name.to_string(),
-        kubeconfig_path,
         metadata,
         docker,
     })
@@ -533,6 +494,74 @@ pub async fn ensure_gateway_image(version: &str, registry_token: Option<&str>) -
     let image_ref = format!("{}:{version}", image::DEFAULT_GATEWAY_IMAGE);
     ensure_image(&docker, &image_ref, registry_token).await?;
     Ok(image_ref)
+}
+
+/// Fetch logs from the gateway Docker container.
+///
+/// Connects to Docker (local or remote), retrieves logs from
+/// `openshell-cluster-{name}`, and writes them to the provided writer.
+///
+/// When `follow` is true, streams logs in real-time (blocks until cancelled).
+/// When `lines` is `Some(n)`, returns the last `n` lines; when `None`,
+/// returns all available logs.
+pub async fn gateway_container_logs<W: std::io::Write>(
+    remote: Option<&RemoteOptions>,
+    name: &str,
+    lines: Option<usize>,
+    follow: bool,
+    mut writer: W,
+) -> Result<()> {
+    use bollard::container::LogOutput;
+    use bollard::query_parameters::LogsOptionsBuilder;
+    use futures::StreamExt;
+    use miette::WrapErr;
+
+    let docker = match remote {
+        Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
+        None => Docker::connect_with_local_defaults().into_diagnostic()?,
+    };
+
+    let container = container_name(name);
+
+    let tail_value = match (follow, lines) {
+        (true, _) => "0".to_string(),
+        (false, Some(n)) => n.to_string(),
+        (false, None) => "all".to_string(),
+    };
+
+    let options = LogsOptionsBuilder::new()
+        .follow(follow)
+        .stdout(true)
+        .stderr(true)
+        .tail(&tail_value)
+        .timestamps(true)
+        .build();
+
+    let mut stream = docker.logs(&container, Some(options));
+
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(log) => {
+                let text = match log {
+                    LogOutput::StdOut { message }
+                    | LogOutput::StdErr { message }
+                    | LogOutput::Console { message } => {
+                        String::from_utf8_lossy(&message).to_string()
+                    }
+                    LogOutput::StdIn { .. } => continue,
+                };
+                writer
+                    .write_all(text.as_bytes())
+                    .into_diagnostic()
+                    .wrap_err("failed to write log output")?;
+            }
+            Err(err) => {
+                return Err(miette::miette!("error reading container logs: {err}"));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn default_gateway_image_ref() -> String {

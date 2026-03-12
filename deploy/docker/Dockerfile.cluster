@@ -8,6 +8,7 @@
 #
 # This image includes:
 # - k3s binary and all supporting binaries (containerd-shim, runc, CNI, etc.)
+# - k9s for interactive cluster debugging (via `openshell doctor exec -- k9s`)
 # - Packaged OpenShell Helm chart
 # - HelmChart CR for auto-deploying OpenShell
 # - Custom entrypoint for DNS configuration in Docker environments
@@ -81,6 +82,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # containerd-shim-runc-v2, runc, cni plugins, busybox, coreutils,
 # ip, ipset, conntrack, nsenter, pigz, etc.)
 COPY --from=k3s /bin/ /bin/
+
+# Copy k9s binary for interactive cluster debugging via `openshell doctor exec -- k9s`
+COPY --from=k9s /tmp/k9s /usr/local/bin/k9s
 
 # Copy iptables/nftables tooling (xtables-nft-multi, iptables-detect.sh, etc.)
 # These are in /bin/aux/ in the k3s image and must be on PATH.

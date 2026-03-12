@@ -20,7 +20,6 @@ Options:
   --remote-dir DIR            Remote checkout directory (default: openshell)
   --name NAME                 Cluster name (default: openshell)
   --port PORT                 Gateway port (default: 8080)
-  --kube-port [PORT]          Expose kube-apiserver on a host port; omit value to auto-pick
   --ssh-key PATH              SSH private key for ssh/rsync
   --skip-sync                 Skip rsync and use the existing remote checkout
   --recreate                  Destroy and recreate the gateway from scratch
@@ -54,7 +53,6 @@ REMOTE_HOST=""
 REMOTE_DIR=${REMOTE_DIR:-openshell}
 CLUSTER_NAME=${CLUSTER_NAME:-openshell}
 GATEWAY_PORT=${GATEWAY_PORT:-8080}
-KUBE_PORT="${KUBE_PORT:-}"
 SSH_KEY="${SSH_KEY:-}"
 IMAGE_TAG=${IMAGE_TAG:-dev}
 CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-0.0.0-dev}
@@ -79,15 +77,6 @@ while [[ $# -gt 0 ]]; do
       require_value "$1" "${2-}"
       GATEWAY_PORT="$2"
       shift 2
-      ;;
-    --kube-port)
-      if [[ $# -gt 1 && ! "$2" =~ ^-- ]]; then
-        KUBE_PORT="$2"
-        shift 2
-      else
-        KUBE_PORT="auto"
-        shift
-      fi
       ;;
     --ssh-key)
       require_value "$1" "${2-}"
@@ -202,8 +191,7 @@ ssh -t "${SSH_ARGS[@]}" "${REMOTE_HOST}" \
   "${CARGO_VERSION}" \
   "${RECREATE}" \
   "${PLAINTEXT}" \
-  "${DISABLE_GATEWAY_AUTH}" \
-  "${KUBE_PORT}" <<'REMOTE_EOF'
+  "${DISABLE_GATEWAY_AUTH}" <<'REMOTE_EOF'
 set -euo pipefail
 
 REMOTE_DIR="$1"
@@ -214,7 +202,6 @@ CARGO_VERSION="$5"
 RECREATE="$6"
 PLAINTEXT="$7"
 DISABLE_GATEWAY_AUTH="$8"
-KUBE_PORT="${9:-}"
 
 cd "${REMOTE_DIR}"
 
@@ -270,13 +257,6 @@ if [[ "${PLAINTEXT}" == "true" ]]; then
 fi
 if [[ "${DISABLE_GATEWAY_AUTH}" == "true" ]]; then
   start_args+=(--disable-gateway-auth)
-fi
-if [[ -n "${KUBE_PORT}" ]]; then
-  if [[ "${KUBE_PORT}" == "auto" ]]; then
-    start_args+=(--kube-port)
-  else
-    start_args+=(--kube-port "${KUBE_PORT}")
-  fi
 fi
 
 echo "==> Starting gateway..."

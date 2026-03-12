@@ -133,7 +133,7 @@ Files are written atomically using a temp-dir -> validate -> rename strategy wit
 PKI provisioning occurs during `deploy_cluster_with_logs()` (`crates/navigator-bootstrap/src/lib.rs:284`). The full sequence:
 
 1. **Cluster container launched** -- a k3s container is created via Docker with a persistent volume.
-2. **Kubeconfig extracted** -- the bootstrap waits for k3s readiness and retrieves the kubeconfig.
+2. **k3s readiness** -- the bootstrap waits for k3s to become ready inside the container.
 3. **Extra SANs computed** -- for remote deployments, the SSH destination hostname and its resolved IP are added to the server certificate's SANs. For local deployments, the detected gateway host (if any) is added.
 4. **`reconcile_pki()` called** (`crates/navigator-bootstrap/src/lib.rs:515`):
    1. Wait for the `navigator` namespace to exist (created by the Helm controller).
@@ -150,7 +150,6 @@ sequenceDiagram
     participant K8s as k3s / K8s API
 
     CLI->>Docker: Create container, wait for k3s
-    CLI->>Docker: Extract kubeconfig
     CLI->>K8s: Wait for navigator namespace
     CLI->>K8s: Read existing TLS secrets
     alt Secrets valid

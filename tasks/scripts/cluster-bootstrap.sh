@@ -243,7 +243,7 @@ if [ -z "${OPENSHELL_CLUSTER_IMAGE:-}" ]; then
   export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"
 fi
 
-DEPLOY_CMD=(openshell gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}" --update-kube-config)
+DEPLOY_CMD=(openshell gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}")
 
 if [ -n "${GATEWAY_HOST:-}" ]; then
   DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")
@@ -261,14 +261,6 @@ if [ -n "${GATEWAY_HOST:-}" ]; then
   fi
 fi
 
-if [ -n "${KUBE_PORT:-}" ]; then
-  # Explicit port requested — pass it through.
-  DEPLOY_CMD+=(--kube-port "${KUBE_PORT}")
-else
-  # Auto-select a free port so kubectl works during local development.
-  DEPLOY_CMD+=(--kube-port)
-fi
-
 "${DEPLOY_CMD[@]}"
 
 # Clear the fast-deploy state file so the next incremental deploy
@@ -280,4 +272,3 @@ rm -f "${DEPLOY_FAST_STATE_FILE}"
 
 echo ""
 echo "Cluster '${CLUSTER_NAME}' is ready."
-echo "KUBECONFIG has been updated."
