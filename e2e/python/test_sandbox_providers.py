@@ -5,9 +5,8 @@
 
 Provider credentials are fetched at runtime by the sandbox supervisor via the
 GetSandboxProviderEnvironment gRPC call. Sandboxed child processes should see
-placeholder values, while the supervisor proxy resolves those placeholders back
-to the real credentials on outbound requests. Credentials must still never be
-present in the persisted sandbox spec environment map.
+placeholder values (not raw secrets). Credentials must never be present in the
+persisted sandbox spec environment map.
 """
 
 from __future__ import annotations
@@ -27,24 +26,11 @@ if TYPE_CHECKING:
 
 
 # ---------------------------------------------------------------------------
-# Shared constants
-# ---------------------------------------------------------------------------
-
-_SANDBOX_IP = "10.200.0.2"
-_PROXY_HOST = "10.200.0.1"
-_PROXY_PORT = 3128
-_FORWARD_PROXY_PORT = 19879
-_CONNECT_L7_PORT = 19880
-
-
-# ---------------------------------------------------------------------------
 # Policy helpers
 # ---------------------------------------------------------------------------
 
 
-def _base_policy(
-    network_policies: dict[str, sandbox_pb2.NetworkPolicyRule] | None = None,
-) -> sandbox_pb2.SandboxPolicy:
+def _default_policy() -> sandbox_pb2.SandboxPolicy:
     """Build a sandbox policy with standard filesystem/process/landlock settings."""
     return sandbox_pb2.SandboxPolicy(
         version=1,
@@ -57,47 +43,6 @@ def _base_policy(
         process=sandbox_pb2.ProcessPolicy(
             run_as_user="sandbox", run_as_group="sandbox"
         ),
-        network_policies=network_policies or {},
-    )
-
-
-def _forward_proxy_policy() -> sandbox_pb2.SandboxPolicy:
-    return _base_policy(
-        network_policies={
-            "internal_http": sandbox_pb2.NetworkPolicyRule(
-                name="internal_http",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(
-                        host=_SANDBOX_IP,
-                        port=_FORWARD_PROXY_PORT,
-                        allowed_ips=["10.200.0.0/24"],
-                    )
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
-            )
-        },
-    )
-
-
-def _connect_l7_policy() -> sandbox_pb2.SandboxPolicy:
-    """Policy with a CONNECT-eligible endpoint using L7 REST inspection."""
-    return _base_policy(
-        network_policies={
-            "internal_l7": sandbox_pb2.NetworkPolicyRule(
-                name="internal_l7",
-                endpoints=[
-                    sandbox_pb2.NetworkEndpoint(
-                        host=_SANDBOX_IP,
-                        port=_CONNECT_L7_PORT,
-                        protocol="rest",
-                        enforcement="enforce",
-                        access="full",
-                        allowed_ips=["10.200.0.0/24"],
-                    )
-                ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
-            )
-        },
     )
 
 
@@ -142,169 +87,6 @@ def _delete_provider(stub: object, name: str) -> None:
             raise
 
 
-# ---------------------------------------------------------------------------
-# In-sandbox echo server + proxy request helpers
-#
-# These closures are serialized via cloudpickle and run *inside* the sandbox.
-# They share a common pattern: start a tiny HTTP server, send a request
-# through the proxy, and return the raw response.
-# ---------------------------------------------------------------------------
-
-
-def _echo_server_via_forward_proxy():
-    """Return a closure that sends a forward-proxy (plain HTTP) request
-    through the sandbox proxy and returns the raw response."""
-
-    def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
-        import os
-        import socket
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                auth = self.headers.get("Authorization", "MISSING")
-                body = auth.encode()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *a):
-                pass
-
-        server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
-        ready = threading.Event()
-
-        def serve_once():
-            ready.set()
-            server.handle_request()
-
-        threading.Thread(target=serve_once, daemon=True).start()
-        assert ready.wait(timeout=2.0), "echo server thread did not start"
-
-        token = os.environ["ANTHROPIC_API_KEY"]
-        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
-        try:
-            conn.sendall(
-                f"GET http://{target_host}:{target_port}/ HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n"
-                f"Authorization: Bearer {token}\r\n"
-                f"Connection: close\r\n\r\n".encode()
-            )
-            return _recv_all(conn)
-        finally:
-            conn.close()
-            server.server_close()
-
-    return fn
-
-
-def _echo_server_via_connect_l7(env_vars: dict[str, str] | None = None):
-    """Return a closure that sends a CONNECT + L7 request through the proxy.
-
-    *env_vars* maps header names to environment variable names.  Defaults to
-    ``{"Authorization": "ANTHROPIC_API_KEY"}`` for the single-secret case.
-    For multi-secret tests pass e.g.
-    ``{"Authorization": "MY_API_KEY", "x-api-key": "MY_API_KEY",
-       "x-custom-token": "CUSTOM_SERVICE_TOKEN"}``.
-    """
-    if env_vars is None:
-        env_vars = {"Authorization": "ANTHROPIC_API_KEY"}
-
-    # Capture into the closure so cloudpickle serializes the value.
-    _env_vars = dict(env_vars)
-
-    def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
-        import os
-        import socket
-        import threading
-        from http.server import BaseHTTPRequestHandler, HTTPServer
-
-        captured_env_vars = _env_vars  # noqa: F841 -- used by Handler
-
-        class Handler(BaseHTTPRequestHandler):
-            def do_GET(self):
-                parts = []
-                for hdr_name in captured_env_vars:
-                    parts.append(f"{hdr_name}={self.headers.get(hdr_name, 'MISSING')}")
-                body = "\n".join(parts).encode()
-                self.send_response(200)
-                self.send_header("Content-Length", str(len(body)))
-                self.send_header("Connection", "close")
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *a):
-                pass
-
-        server = HTTPServer(("0.0.0.0", int(target_port)), Handler)
-        ready = threading.Event()
-
-        def serve_once():
-            ready.set()
-            server.handle_request()
-
-        threading.Thread(target=serve_once, daemon=True).start()
-        assert ready.wait(timeout=2.0), "echo server thread did not start"
-
-        # Build request headers from placeholder env vars
-        header_lines = [
-            f"GET / HTTP/1.1",
-            f"Host: {target_host}:{target_port}",
-        ]
-        for hdr_name, env_name in captured_env_vars.items():
-            val = os.environ.get(env_name, "NOT_SET")
-            if hdr_name == "Authorization":
-                header_lines.append(f"Authorization: Bearer {val}")
-            else:
-                header_lines.append(f"{hdr_name}: {val}")
-        header_lines.append("Connection: close")
-        request = "\r\n".join(header_lines) + "\r\n\r\n"
-
-        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
-        try:
-            # CONNECT tunnel
-            conn.sendall(
-                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
-                f"Host: {target_host}:{target_port}\r\n\r\n".encode()
-            )
-            connect_resp = b""
-            while b"\r\n\r\n" not in connect_resp:
-                chunk = conn.recv(256)
-                if not chunk:
-                    break
-                connect_resp += chunk
-            if "200" not in connect_resp.decode("latin1"):
-                return f"CONNECT failed: {connect_resp.decode('latin1').strip()}"
-
-            # HTTP request through the tunnel
-            conn.sendall(request.encode())
-            return _recv_all(conn)
-        finally:
-            conn.close()
-            server.server_close()
-
-    return fn
-
-
-def _recv_all(conn, timeout: float = 5.0) -> str:
-    """Read all available data from a socket until EOF or timeout."""
-    import socket as _socket
-
-    data = b""
-    conn.settimeout(timeout)
-    while True:
-        try:
-            chunk = conn.recv(4096)
-        except (_socket.timeout, TimeoutError):
-            break
-        if not chunk:
-            break
-        data += chunk
-    return data.decode("latin1")
-
-
 # ===========================================================================
 # Tests: placeholder visibility
 # ===========================================================================
@@ -322,7 +104,7 @@ def test_provider_credentials_available_as_env_vars(
         credentials={"ANTHROPIC_API_KEY": "sk-e2e-test-key-12345"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_base_policy(),
+            policy=_default_policy(),
             providers=[provider_name],
         )
 
@@ -354,7 +136,7 @@ def test_generic_provider_credentials_available_as_env_vars(
         },
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_base_policy(),
+            policy=_default_policy(),
             providers=[provider_name],
         )
 
@@ -386,7 +168,7 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
         credentials={"NVIDIA_API_KEY": "nvapi-e2e-test-key"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_base_policy(),
+            policy=_default_policy(),
             providers=[provider_name],
         )
 
@@ -399,105 +181,6 @@ def test_nvidia_provider_injects_nvidia_api_key_env_var(
             result = sb.exec_python(read_nvidia_key)
             assert result.exit_code == 0, result.stderr
             assert result.stdout.strip() == "openshell:resolve:env:NVIDIA_API_KEY"
-
-
-# ===========================================================================
-# Tests: proxy credential rewriting
-# ===========================================================================
-
-
-def test_provider_placeholder_is_resolved_by_proxy_on_outbound_request(
-    sandbox: Callable[..., Sandbox],
-    sandbox_client: SandboxClient,
-) -> None:
-    """Forward-proxy path: placeholder in Authorization header is rewritten."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-provider-proxy-rewrite",
-        provider_type="claude",
-        credentials={"ANTHROPIC_API_KEY": "sk-proxy-rewrite-12345"},
-    ) as provider_name:
-        spec = datamodel_pb2.SandboxSpec(
-            policy=_forward_proxy_policy(),
-            providers=[provider_name],
-        )
-
-        with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(
-                _echo_server_via_forward_proxy(),
-                args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
-            )
-            assert result.exit_code == 0, result.stderr
-            assert "200 OK" in result.stdout
-            assert "Bearer sk-proxy-rewrite-12345" in result.stdout
-            assert "openshell:resolve:env:ANTHROPIC_API_KEY" not in result.stdout
-
-
-def test_provider_secret_resolved_via_connect_l7_proxy(
-    sandbox: Callable[..., Sandbox],
-    sandbox_client: SandboxClient,
-) -> None:
-    """CONNECT + L7 path: placeholder is rewritten before reaching upstream."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-connect-l7-rewrite",
-        provider_type="claude",
-        credentials={"ANTHROPIC_API_KEY": "sk-connect-l7-secret-99"},
-    ) as provider_name:
-        spec = datamodel_pb2.SandboxSpec(
-            policy=_connect_l7_policy(),
-            providers=[provider_name],
-        )
-
-        with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(
-                _echo_server_via_connect_l7(),
-                args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _CONNECT_L7_PORT),
-            )
-            assert result.exit_code == 0, result.stderr
-            assert "200 OK" in result.stdout, f"Expected 200 OK, got: {result.stdout}"
-            assert "Authorization=Bearer sk-connect-l7-secret-99" in result.stdout, (
-                f"Real secret not found: {result.stdout}"
-            )
-            assert "openshell:resolve:env:" not in result.stdout
-
-
-def test_provider_multiple_secrets_resolved_via_connect_l7_proxy(
-    sandbox: Callable[..., Sandbox],
-    sandbox_client: SandboxClient,
-) -> None:
-    """Multiple provider secrets are rewritten through CONNECT + L7 proxy."""
-    with provider(
-        sandbox_client._stub,
-        name="e2e-test-connect-l7-multi",
-        provider_type="generic",
-        credentials={
-            "MY_API_KEY": "real-api-key-abc",
-            "CUSTOM_SERVICE_TOKEN": "real-custom-token-xyz",
-        },
-    ) as provider_name:
-        spec = datamodel_pb2.SandboxSpec(
-            policy=_connect_l7_policy(),
-            providers=[provider_name],
-        )
-
-        with sandbox(spec=spec, delete_on_exit=True) as sb:
-            result = sb.exec_python(
-                _echo_server_via_connect_l7(
-                    env_vars={
-                        "Authorization": "MY_API_KEY",
-                        "x-api-key": "MY_API_KEY",
-                        "x-custom-token": "CUSTOM_SERVICE_TOKEN",
-                    }
-                ),
-                args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _CONNECT_L7_PORT),
-            )
-            assert result.exit_code == 0, result.stderr
-            assert "200 OK" in result.stdout, f"Expected 200 OK, got: {result.stdout}"
-            assert "Authorization=Bearer real-api-key-abc" in result.stdout
-            assert "x-api-key=real-api-key-abc" in result.stdout
-            assert "x-custom-token=real-custom-token-xyz" in result.stdout
-            assert "openshell:resolve:env:" not in result.stdout
 
 
 # ===========================================================================
@@ -524,7 +207,7 @@ def test_create_sandbox_rejects_unknown_provider(
 ) -> None:
     """CreateSandbox fails fast when a provider name does not exist."""
     spec = datamodel_pb2.SandboxSpec(
-        policy=_base_policy(),
+        policy=_default_policy(),
         providers=["nonexistent-provider-xyz"],
     )
     with pytest.raises(grpc.RpcError) as exc_info:
@@ -546,7 +229,7 @@ def test_credentials_not_in_persisted_spec_environment(
         credentials={"ANTHROPIC_API_KEY": "sk-should-not-persist"},
     ) as provider_name:
         spec = datamodel_pb2.SandboxSpec(
-            policy=_base_policy(),
+            policy=_default_policy(),
             providers=[provider_name],
         )
 
