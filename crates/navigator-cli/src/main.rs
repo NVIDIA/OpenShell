@@ -2352,4 +2352,46 @@ mod tests {
             assert_eq!(tls.edge_token.as_deref(), Some("token-123"));
         });
     }
+
+    /// Verify the flag names the TUI uses to build its ProxyCommand are
+    /// accepted by the `SshProxy` subcommand and land in the right fields.
+    /// This catches drift when CLI flags are renamed or restructured.
+    #[test]
+    fn ssh_proxy_token_mode_flags_match_tui_proxy_command() {
+        // This is the exact flag pattern constructed by the TUI in lib.rs
+        // (handle_shell_connect, handle_exec, handle_port_forward).
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "ssh-proxy",
+            "--gateway",
+            "https://gw.example.com:8080/proxy/connect",
+            "--sandbox-id",
+            "sbx-123",
+            "--token",
+            "tok-abc",
+            "--gateway-name",
+            "my-gateway",
+        ])
+        .expect("TUI proxy command flags must be accepted by the CLI");
+
+        match cli.command {
+            Some(Commands::SshProxy {
+                gateway,
+                sandbox_id,
+                token,
+                gateway_name,
+                ..
+            }) => {
+                assert_eq!(
+                    gateway.as_deref(),
+                    Some("https://gw.example.com:8080/proxy/connect"),
+                    "gateway URL must land in SshProxy.gateway, not the global flag"
+                );
+                assert_eq!(sandbox_id.as_deref(), Some("sbx-123"));
+                assert_eq!(token.as_deref(), Some("tok-abc"));
+                assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
+            }
+            other => panic!("expected SshProxy, got: {other:?}"),
+        }
+    }
 }

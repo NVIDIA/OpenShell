@@ -767,7 +767,7 @@ async fn handle_shell_connect(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let gateway = shell_escape(&app.gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
     // Step 5: Build the SSH command.
@@ -909,7 +909,7 @@ async fn handle_exec_command(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let gateway = shell_escape(&app.gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
 
@@ -1334,7 +1334,7 @@ async fn start_port_forwards(
     let exe_str = shell_escape(&exe.to_string_lossy());
     let gateway = shell_escape(gateway_name);
     let proxy_command = format!(
-        "{exe_str} ssh-proxy --gateway-endpoint {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
+        "{exe_str} ssh-proxy --gateway {gateway_url} --sandbox-id {} --token {} --gateway-name {gateway}",
         session.sandbox_id, session.token,
     );
 
