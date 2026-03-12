@@ -1715,7 +1715,6 @@ async fn main() -> Result<()> {
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
-                            let _ = save_last_sandbox(&ctx.name, &name);
                             if let Some(editor) = editor.map(Into::into) {
                                 run::sandbox_connect_editor(
                                     endpoint, &ctx.name, &name, editor, &tls,
@@ -1724,6 +1723,7 @@ async fn main() -> Result<()> {
                             } else {
                                 run::sandbox_connect(endpoint, &name, &tls).await?;
                             }
+                            let _ = save_last_sandbox(&ctx.name, &name);
                         }
                         SandboxCommands::SshConfig { name } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;

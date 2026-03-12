@@ -177,12 +177,24 @@ pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Resu
 }
 
 pub async fn sandbox_connect_editor(
-    _server: &str,
+    server: &str,
     gateway: &str,
     name: &str,
     editor: Editor,
-    _tls: &TlsOptions,
+    tls: &TlsOptions,
 ) -> Result<()> {
+    // Verify the sandbox exists before writing SSH config / launching the editor.
+    let mut client = grpc_client(server, tls).await?;
+    client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found: {name}"))?;
+
     let host_alias = host_alias(name);
     install_ssh_config(gateway, name)?;
     launch_editor(editor, &host_alias)?;
