@@ -36,6 +36,14 @@ if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" 
   exit 1
 fi
 
+# Run a command inside the cluster container with KUBECONFIG pre-configured.
+cluster_exec() {
+  docker exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
+}
+
+# Path inside the container where the chart is copied for helm upgrades.
+CONTAINER_CHART_DIR=/tmp/openshell-chart
+
 build_gateway=0
 build_sandbox=0
 needs_helm_upgrade=0
@@ -376,10 +384,14 @@ fi
 if [[ "${needs_helm_upgrade}" == "1" ]]; then
   helm_start=$(date +%s)
   echo "Upgrading helm release..."
-  helm_wait_args=()
+  helm_wait_args=""
   if [[ "${DEPLOY_FAST_HELM_WAIT}" == "1" ]]; then
-    helm_wait_args+=(--wait)
+    helm_wait_args="--wait"
   fi
+
+  # Copy the local chart source into the container so helm can read it.
+  docker exec "${CONTAINER_NAME}" rm -rf "${CONTAINER_CHART_DIR}"
+  docker cp deploy/helm/openshell "${CONTAINER_NAME}:${CONTAINER_CHART_DIR}"
 
   # grpcEndpoint must be explicitly set to https:// because the chart always
   # terminates mTLS (there is no server.tls.enabled toggle). Without this,
@@ -387,12 +399,12 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   # sandbox callbacks to plaintext.
   # Retrieve the existing handshake secret from the running release, or generate
   # a new one if this is the first deploy with the mandatory secret.
-  EXISTING_SECRET=$(helm get values openshell -n openshell -o json 2>/dev/null \
-    | grep -o '"sshHandshakeSecret":"[^"]*"' \
-    | cut -d'"' -f4) || true
+  EXISTING_SECRET=$(cluster_exec "helm get values openshell -n openshell -o json 2>/dev/null \
+    | grep -o '\"sshHandshakeSecret\":\"[^\"]*\"' \
+    | cut -d'\"' -f4") || true
   SSH_HANDSHAKE_SECRET="${EXISTING_SECRET:-$(openssl rand -hex 32)}"
 
-  helm upgrade openshell deploy/helm/openshell \
+  cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \
     --namespace openshell \
     --set image.repository=${IMAGE_REPO_BASE}/gateway \
     --set image.tag=${IMAGE_TAG} \
@@ -403,7 +415,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
     --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
-    "${helm_wait_args[@]}"
+    ${helm_wait_args}"
   helm_end=$(date +%s)
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"
 fi
@@ -411,12 +423,12 @@ fi
 if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   rollout_start=$(date +%s)
   echo "Restarting deployment to pick up updated images..."
-  if kubectl get statefulset/openshell -n openshell >/dev/null 2>&1; then
-    kubectl rollout restart statefulset/openshell -n openshell
-    kubectl rollout status statefulset/openshell -n openshell
-  elif kubectl get deployment/openshell -n openshell >/dev/null 2>&1; then
-    kubectl rollout restart deployment/openshell -n openshell
-    kubectl rollout status deployment/openshell -n openshell
+  if cluster_exec "kubectl get statefulset/openshell -n openshell" >/dev/null 2>&1; then
+    cluster_exec "kubectl rollout restart statefulset/openshell -n openshell"
+    cluster_exec "kubectl rollout status statefulset/openshell -n openshell"
+  elif cluster_exec "kubectl get deployment/openshell -n openshell" >/dev/null 2>&1; then
+    cluster_exec "kubectl rollout restart deployment/openshell -n openshell"
+    cluster_exec "kubectl rollout status deployment/openshell -n openshell"
   else
     echo "Warning: no openshell workload found to roll out in namespace 'openshell'."
   fi
