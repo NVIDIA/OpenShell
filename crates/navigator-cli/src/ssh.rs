@@ -932,12 +932,7 @@ impl<T> ProxyStream for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    use crate::TEST_ENV_LOCK;
 
     #[test]
     fn upsert_host_block_appends_when_missing() {
@@ -962,7 +957,9 @@ mod tests {
 
     #[test]
     fn install_ssh_config_adds_include_once_and_updates_managed_file() {
-        let _guard = env_lock().lock().unwrap();
+        let _guard = TEST_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let home = tempfile::tempdir().unwrap();
         let xdg = tempfile::tempdir().unwrap();
         let old_home = std::env::var("HOME").ok();
