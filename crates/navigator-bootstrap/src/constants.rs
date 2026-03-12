@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 pub const NETWORK_NAME: &str = "openshell-cluster";
+
+/// Path to the kubeconfig inside the k3s container.
+/// Used by in-container kubectl operations (node cleanup, PKI reconciliation, etc.).
 pub const KUBECONFIG_PATH: &str = "/etc/rancher/k3s/k3s.yaml";
 
 /// K8s secret holding the server's TLS certificate and private key.

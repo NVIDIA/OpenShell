@@ -97,7 +97,6 @@ openshell/
   clusters/
     <name>_metadata.json                  # ClusterMetadata JSON
     <name>/
-      kubeconfig                          # rewritten kubeconfig for kubectl
       mtls/                               # mTLS bundle (when TLS enabled)
         ca.crt                            # cluster CA certificate
         tls.crt                           # client certificate

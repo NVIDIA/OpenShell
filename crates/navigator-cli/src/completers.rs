@@ -176,7 +176,6 @@ mod tests {
                     gateway_endpoint: "https://alpha.example.com".to_string(),
                     is_remote: true,
                     gateway_port: 0,
-                    kube_port: None,
                     remote_host: None,
                     resolved_host: None,
                     auth_mode: Some("cloudflare_jwt".to_string()),

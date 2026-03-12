@@ -47,7 +47,6 @@ openshell
 │   ├── destroy
 │   ├── info
 │   ├── add <url>
-│   ├── tunnel
 │   └── select [name]
 ├── sandbox
 │   ├── create
@@ -72,6 +71,9 @@ openshell
 │   ├── set
 │   ├── update
 │   └── get
+├── doctor
+│   ├── logs
+│   └── exec
 └── completions <shell>
 ```
 
@@ -102,9 +104,17 @@ Manage the OpenShell runtime cluster.
 | `openshell gateway destroy` | Permanently remove the cluster and all its data. |
 | `openshell gateway info` | Show detailed information about the cluster. |
 | `openshell gateway add <url>` | Register an existing remote gateway by URL. |
-| `openshell gateway tunnel` | Set up a kubectl tunnel to a remote cluster. |
 | `openshell gateway select <name>` | Set the active cluster. All subsequent commands target this cluster. |
 | `openshell gateway select` | List all registered clusters (when called without a name). |
+
+## Diagnostic Commands
+
+Troubleshoot gateway issues.
+
+| Command | Description |
+|---|---|
+| `openshell doctor logs` | Fetch logs from the gateway Docker container. Use `--tail` for streaming, `-n` to limit line count. |
+| `openshell doctor exec -- <command>` | Run a command inside the gateway container (e.g., `kubectl get pods -A`, `k9s`, `sh`). |
 
 ## Sandbox Commands
 

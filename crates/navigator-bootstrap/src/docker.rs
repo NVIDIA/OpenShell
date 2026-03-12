@@ -21,7 +21,6 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
-use std::path::Path;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 
@@ -230,7 +229,6 @@ pub async fn ensure_image(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 pub async fn ensure_container(
     docker: &Docker,
     name: &str,
@@ -238,7 +236,6 @@ pub async fn ensure_container(
     extra_sans: &[String],
     ssh_gateway_host: Option<&str>,
     gateway_port: u16,
-    kube_port: Option<u16>,
     disable_tls: bool,
     disable_gateway_auth: bool,
     registry_token: Option<&str>,
@@ -301,15 +298,6 @@ pub async fn ensure_container(
     }
 
     let mut port_bindings = HashMap::new();
-    if let Some(kp) = kube_port {
-        port_bindings.insert(
-            "6443/tcp".to_string(),
-            Some(vec![PortBinding {
-                host_ip: Some("0.0.0.0".to_string()),
-                host_port: Some(kp.to_string()),
-            }]),
-        );
-    }
     port_bindings.insert(
         "30051/tcp".to_string(),
         Some(vec![PortBinding {
@@ -317,10 +305,7 @@ pub async fn ensure_container(
             host_port: Some(gateway_port.to_string()),
         }]),
     );
-    let mut exposed_ports = vec!["30051/tcp".to_string()];
-    if kube_port.is_some() {
-        exposed_ports.push("6443/tcp".to_string());
-    }
+    let exposed_ports = vec!["30051/tcp".to_string()];
 
     let mut host_config = HostConfig {
         privileged: Some(true),
@@ -524,10 +509,9 @@ pub async fn check_port_conflicts(
     docker: &Docker,
     name: &str,
     gateway_port: u16,
-    kube_port: Option<u16>,
 ) -> Result<Vec<PortConflict>> {
     let our_container = container_name(name);
-    let needed_ports: Vec<u16> = std::iter::once(gateway_port).chain(kube_port).collect();
+    let needed_ports: Vec<u16> = vec![gateway_port];
 
     let containers = docker
         .list_containers(Some(
@@ -616,11 +600,7 @@ pub async fn stop_container(docker: &Docker, container_name: &str) -> Result<()>
     }
 }
 
-pub async fn destroy_gateway_resources(
-    docker: &Docker,
-    name: &str,
-    kubeconfig_path: &Path,
-) -> Result<()> {
+pub async fn destroy_gateway_resources(docker: &Docker, name: &str) -> Result<()> {
     let container_name = container_name(name);
     let volume_name = volume_name(name);
 
@@ -717,8 +697,6 @@ pub async fn destroy_gateway_resources(
     {
         return Err(err).into_diagnostic();
     }
-
-    let _ = std::fs::remove_file(kubeconfig_path);
 
     // Force-remove the network during a full destroy.  First disconnect any
     // stale endpoints that Docker may still report (race between container

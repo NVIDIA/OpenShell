@@ -72,17 +72,12 @@ openshell sandbox create --name remote-test -- echo "running on remote host"
 openshell sandbox connect remote-test
 ```
 
-### 3. Access the Kubernetes API (optional)
+### 3. View gateway logs (optional)
 
-The Kubernetes API on a remote cluster is only reachable through an
-SSH tunnel:
+To inspect the gateway container logs:
 
 ```bash
-# Start a tunnel in the background
-openshell gateway tunnel
-
-# In another terminal
-kubectl get pods -n navigator
+openshell doctor logs
 ```
 
 ### 4. Clean up

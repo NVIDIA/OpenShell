@@ -232,7 +232,7 @@ For more detail, see [Policy Language](security-policy.md).
 
 The CLI is the primary way users interact with the platform. It provides commands organized into four groups:
 
-- **Gateway management** (`openshell gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets. Includes a tunnel command for accessing the Kubernetes API on remote clusters.
+- **Gateway management** (`openshell gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets.
 - **Sandbox management** (`openshell sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
 - **Top-level commands**: `openshell status` (cluster health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management).
 - **Provider management** (`openshell provider`): Create, update, list, and delete external service credentials.

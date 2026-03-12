@@ -1,13 +1,30 @@
----
-name: debug-navigator-cluster
-description: Debug why a openshell cluster failed to start or is unhealthy. Use when the user has a failed `openshell gateway start`, cluster health check failure, or wants to diagnose cluster infrastructure issues. Trigger keywords - debug cluster, cluster failing, cluster not starting, deploy failed, cluster troubleshoot, cluster health, cluster diagnose, why won't my cluster start, health check failed, gateway start failed, gateway not starting.
----
+<!-- Derived from .agents/skills/debug-navigator-cluster/SKILL.md -->
+<!-- Keep in sync when updating cluster debug procedures -->
 
-# Debug OpenShell Cluster
+# Debug OpenShell Gateway
 
-Diagnose why a openshell cluster failed to start after `openshell gateway start`.
+You are diagnosing an OpenShell gateway cluster. Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere. Run diagnostics automatically through the steps below in order. Stop and report findings as soon as a root cause is identified.
 
-Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere.
+## Tools Available
+
+All diagnostics go through three `openshell` commands. They auto-resolve local vs remote gateways — the same commands work for both:
+
+```bash
+# Quick connectivity check (run this first)
+openshell status
+
+# Fetch container logs
+openshell doctor logs --lines 100
+openshell doctor logs --tail          # stream live
+
+# Run any command inside the gateway container (KUBECONFIG is pre-configured)
+openshell doctor exec -- kubectl get pods -A
+openshell doctor exec -- kubectl -n openshell logs statefulset/openshell --tail=100
+openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
+openshell doctor exec -- df -h /
+openshell doctor exec -- free -h
+openshell doctor exec -- sh           # interactive shell
+```
 
 ## Overview
 
@@ -27,7 +44,7 @@ Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor log
     - `openshell` statefulset ready in `openshell` namespace
     - TLS secrets `openshell-server-tls` and `openshell-client-tls` exist in `openshell` namespace
 
-For local deploys, metadata endpoint selection now depends on Docker connectivity:
+For local deploys, metadata endpoint selection depends on Docker connectivity:
 
 - default local Docker socket (`unix:///var/run/docker.sock`): `https://127.0.0.1:{port}` (default port 8080)
 - TCP Docker daemon (`DOCKER_HOST=tcp://<host>:<port>`): `https://<host>:{port}` for non-loopback hosts
@@ -38,36 +55,7 @@ The TCP host is also added as an extra gateway TLS SAN so mTLS hostname validati
 
 The default cluster name is `openshell`. The container is `openshell-cluster-{name}`.
 
-## Prerequisites
-
-- Docker must be running (locally or on the remote host)
-- The `openshell` CLI must be available
-- For remote clusters: SSH access to the remote host
-
-## Tools Available
-
-All diagnostics go through three `openshell` commands. They auto-resolve local vs remote gateways — the same commands work for both:
-
-```bash
-# Quick connectivity check
-openshell status
-
-# Fetch container logs
-openshell doctor logs --lines 100
-openshell doctor logs --tail          # stream live
-
-# Run any command inside the gateway container (KUBECONFIG is pre-configured)
-openshell doctor exec -- kubectl get pods -A
-openshell doctor exec -- kubectl -n openshell logs statefulset/openshell --tail=100
-openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
-openshell doctor exec -- df -h /
-openshell doctor exec -- free -h
-openshell doctor exec -- sh           # interactive shell
-```
-
 ## Workflow
-
-When the user asks to debug a cluster failure, **run diagnostics automatically** through the steps below in order. Stop and report findings as soon as a root cause is identified. Do not ask the user to choose which checks to run.
 
 ### Determine Context
 
@@ -136,7 +124,7 @@ openshell doctor exec -- df -h /
 openshell doctor exec -- free -h
 ```
 
-If any pressure condition is `True`, pods will be evicted and new ones rejected. The bootstrap now detects `HEALTHCHECK_NODE_PRESSURE` markers from the health-check script and aborts early with a clear diagnosis. To fix: free disk/memory on the host, then recreate the gateway.
+If any pressure condition is `True`, pods will be evicted and new ones rejected. The bootstrap detects `HEALTHCHECK_NODE_PRESSURE` markers from the health-check script and aborts early with a clear diagnosis. To fix: free disk/memory on the host, then recreate the gateway.
 
 ### Step 3: Check OpenShell Server StatefulSet
 
@@ -295,8 +283,8 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
 | OpenShell pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | `openshell doctor exec -- kubectl describe pod -n openshell` and `openshell doctor exec -- kubectl get pvc -n openshell` |
 | OpenShell pods `CrashLoopBackOff` | Server application error | `openshell doctor exec -- kubectl -n openshell logs statefulset/openshell` |
-| OpenShell pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images ls` (Step 5) |
-| OpenShell pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml` and DNS (Step 8) |
+| OpenShell pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | `openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images ls` (Step 5) |
+| OpenShell pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | `openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml` and DNS (Step 8) |
 | Image import fails | Corrupt tar stream or containerd not ready | Retry after k3s is fully started; check container logs |
 | Push mode images not found by kubelet | Imported into wrong containerd namespace | Must use `k3s ctr -n k8s.io images import`, not `k3s ctr images import` |
 | mTLS secrets missing | Bootstrap couldn't apply secrets (namespace not ready) | Check deploy logs and verify `openshell` namespace exists (Step 6) |
@@ -306,10 +294,10 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
 | gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
 | DNS failures inside container | Entrypoint DNS detection failed | `openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf` and `openshell doctor logs --lines 20` |
-| Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources. Bootstrap auto-detects via `HEALTHCHECK_NODE_PRESSURE` marker |
+| Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources |
 | Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
-| Stale NotReady nodes from previous deploys | Volume reused across container recreations | The deploy flow now auto-cleans stale nodes; if it still fails, manually delete NotReady nodes (see Step 2) or choose "Recreate" when prompted |
+| Stale NotReady nodes from previous deploys | Volume reused across container recreations | Deploy flow auto-cleans stale nodes; if it still fails, manually delete NotReady nodes or choose "Recreate" when prompted |
 | gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `openshell-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
 
 ## Full Diagnostic Dump

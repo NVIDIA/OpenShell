@@ -95,7 +95,7 @@ graph TB
     TUI -- "gRPC polling (mTLS)<br/>every 2s" --> Gateway
     SDK -- "gRPC over HTTPS (mTLS)" --> Gateway
     CLI -- "HTTP CONNECT upgrade<br/>/connect/ssh (mTLS)" --> Gateway
-    CLI -. "reads certs &<br/>kubeconfig" .-> LocalConfig
+    CLI -. "reads mTLS certs" .-> LocalConfig
 
     %% ============================================================
     %% CONNECTIONS: Gateway internals

@@ -13,44 +13,6 @@ use std::collections::VecDeque;
 use std::time::Duration;
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 
-pub async fn wait_for_kubeconfig(docker: &Docker, name: &str) -> Result<String> {
-    let container_name = container_name(name);
-    let attempts = 30;
-    for attempt in 0..attempts {
-        // Check if the container is still running before trying to exec into it
-        if let Err(status_err) =
-            crate::docker::check_container_running(docker, &container_name).await
-        {
-            let logs = fetch_recent_logs(docker, &container_name, 20).await;
-            return Err(miette::miette!(
-                "gateway container is not running while waiting for kubeconfig: {status_err}\n{logs}"
-            ));
-        }
-
-        match exec_capture(
-            docker,
-            &container_name,
-            vec!["cat".to_string(), KUBECONFIG_PATH.to_string()],
-        )
-        .await
-        {
-            Ok(output) if is_valid_kubeconfig(&output) => return Ok(output),
-            Ok(_) => {}
-            Err(err) if attempt + 1 < attempts => {
-                let _ = err;
-            }
-            Err(err) => {
-                let logs = fetch_recent_logs(docker, &container_name, 20).await;
-                return Err(err.wrap_err(format!("failed waiting for kubeconfig\n{logs}")));
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-
-    let logs = fetch_recent_logs(docker, &container_name, 20).await;
-    Err(miette::miette!("timed out waiting for kubeconfig\n{logs}"))
-}
-
 /// Log markers emitted by the entrypoint and health-check scripts when DNS
 /// resolution fails inside the container. Detecting these early lets us
 /// short-circuit the 6-minute polling loop and surface a clear diagnosis.
@@ -540,19 +502,6 @@ async fn detect_openshell_workload_kind(docker: &Docker, container_name: &str) -
     Err(miette::miette!(
         "no openshell workload (statefulset or deployment) found in namespace 'openshell'"
     ))
-}
-
-fn is_valid_kubeconfig(output: &str) -> bool {
-    output.contains("apiVersion:") && output.contains("clusters:")
-}
-
-pub async fn exec_capture(
-    docker: &Docker,
-    container_name: &str,
-    cmd: Vec<String>,
-) -> Result<String> {
-    let (output, _status) = exec_capture_with_exit(docker, container_name, cmd).await?;
-    Ok(output)
 }
 
 pub async fn exec_capture_with_exit(

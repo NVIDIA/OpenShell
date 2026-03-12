@@ -29,7 +29,6 @@ openshell
 │   ├── stop [opts]
 │   ├── destroy [opts]
 │   ├── info [--name]
-│   ├── tunnel [opts]
 │   └── select [name]
 ├── status
 ├── inference
@@ -62,6 +61,9 @@ openshell
 │   ├── list [opts]
 │   ├── update <name> --type [opts]
 │   └── delete <name>...
+├── doctor
+│   ├── logs [--name] [-n] [--tail] [--remote] [--ssh-key]
+│   └── exec [--name] [--remote] [--ssh-key] -- <command...>
 ├── term
 ├── completions <shell>
 └── ssh-proxy [opts]
@@ -82,9 +84,6 @@ Provision or start a cluster (local or remote).
 | `--ssh-key <PATH>` | none | SSH private key for remote deployment |
 | `--port <PORT>` | 8080 | Host port mapped to gateway |
 | `--gateway-host <HOST>` | none | Override gateway host in metadata |
-| `--kube-port [PORT]` | none | Expose K8s control plane on host port |
-| `--update-kube-config` | false | Write kubeconfig into `~/.kube/config` |
-| `--get-kubeconfig` | false | Print kubeconfig to stdout |
 | `--recreate` | false | Destroy and recreate from scratch if a gateway already exists (skips interactive prompt) |
 
 ### `openshell gateway stop`
@@ -103,26 +102,47 @@ Destroy a cluster and all its state. Same flags as `stop`.
 
 ### `openshell gateway info`
 
-Show deployment details: endpoint, kubeconfig path, kube port, remote host.
+Show deployment details: endpoint and remote host.
 
 | Flag | Description |
 |------|-------------|
 | `--name <NAME>` | Cluster name (defaults to active) |
-
-### `openshell gateway tunnel`
-
-Print or start an SSH tunnel for kubectl access to a remote cluster.
-
-| Flag | Description |
-|------|-------------|
-| `--name <NAME>` | Cluster name (defaults to active) |
-| `--remote <USER@HOST>` | SSH destination |
-| `--ssh-key <PATH>` | SSH private key |
-| `--print-command` | Only print the SSH command, don't execute |
 
 ### `openshell gateway select [name]`
 
 Set the active gateway. Writes to `~/.config/openshell/active_gateway`. When called without arguments, lists all provisioned gateways with the active one marked with `*`.
+
+---
+
+## Doctor Commands
+
+### `openshell doctor logs`
+
+Fetch logs from the gateway Docker container.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name <NAME>` | active gateway | Gateway name |
+| `-n, --lines <N>` | all | Number of log lines to return |
+| `--tail` | false | Stream live logs (follow mode) |
+| `--remote <USER@HOST>` | auto-resolved | SSH destination for remote gateways |
+| `--ssh-key <PATH>` | none | SSH private key for remote gateways |
+
+### `openshell doctor exec -- <COMMAND...>`
+
+Run a command inside the gateway container with KUBECONFIG pre-configured.
+Launches an interactive `docker exec` session (tunnelled over SSH for remote gateways).
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--name <NAME>` | active gateway | Gateway name |
+| `--remote <USER@HOST>` | auto-resolved | SSH destination for remote gateways |
+| `--ssh-key <PATH>` | none | SSH private key for remote gateways |
+
+Examples:
+- `openshell doctor exec -- kubectl get pods -A`
+- `openshell doctor exec -- k9s`
+- `openshell doctor exec -- sh` (interactive shell)
 
 ---
 

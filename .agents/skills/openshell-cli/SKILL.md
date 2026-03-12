@@ -497,8 +497,11 @@ openshell gateway destroy                               # Destroy permanently
 # Deploy to remote host
 openshell gateway start --remote user@host --ssh-key ~/.ssh/id_rsa --name remote-cluster
 
-# Set up kubectl access
-openshell gateway tunnel --name remote-cluster
+# View gateway container logs
+openshell doctor logs --name remote-cluster
+
+# Run kubectl inside the remote gateway container
+openshell doctor exec --name remote-cluster -- kubectl get pods -A
 
 # Get cluster info
 openshell gateway info --name remote-cluster

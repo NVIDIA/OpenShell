@@ -170,6 +170,7 @@ const HELP_TEMPLATE: &str = "\
   gateway:     Manage the gateway lifecycle
   status:      Show gateway status and information
   inference:   Manage inference configuration
+  doctor:      Diagnose gateway issues
 
 \x1b[1mADDITIONAL COMMANDS\x1b[0m
   term:        Launch the OpenShell interactive TUI
@@ -274,6 +275,24 @@ const INFERENCE_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell inference set --provider openai --model gpt-4
   $ openshell inference get
   $ openshell inference update --model gpt-4-turbo
+";
+
+const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
+  dr
+
+\x1b[1mEXAMPLES\x1b[0m
+  $ openshell doctor logs --lines 100
+  $ openshell doctor exec -- kubectl get pods -A
+  $ openshell doctor llm.txt
+
+\x1b[1mAI AGENT USAGE\x1b[0m
+  If you are a coding agent (LLM) diagnosing a gateway issue, run:
+
+    openshell doctor llm.txt
+
+  This prints a detailed diagnostic prompt with step-by-step instructions
+  for debugging gateway clusters using `openshell doctor logs` and
+  `openshell doctor exec`.
 ";
 
 /// `OpenShell` CLI - agent execution and management.
@@ -403,6 +422,20 @@ enum Commands {
     Inference {
         #[command(subcommand)]
         command: Option<InferenceCommands>,
+    },
+
+    // ===================================================================
+    // DIAGNOSTIC COMMANDS
+    // ===================================================================
+    /// Diagnose gateway issues.
+    ///
+    /// Inspect logs, run commands inside the gateway container, and get
+    /// AI-assisted debugging guidance. If you are a coding agent, run
+    /// `openshell doctor llm.txt` for a full diagnostic prompt.
+    #[command(visible_alias = "dr", hide = true, after_help = DOCTOR_HELP, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Doctor {
+        #[command(subcommand)]
+        command: Option<DoctorCommands>,
     },
 
     // ===================================================================
@@ -673,14 +706,6 @@ enum GatewayCommands {
         #[arg(long, default_value = "openshell", env = "OPENSHELL_GATEWAY")]
         name: String,
 
-        /// Write stored kubeconfig into local kubeconfig.
-        #[arg(long)]
-        update_kube_config: bool,
-
-        /// Print stored kubeconfig to stdout.
-        #[arg(long)]
-        get_kubeconfig: bool,
-
         /// SSH destination for remote deployment (e.g., user@hostname).
         #[arg(long)]
         remote: Option<String>,
@@ -701,13 +726,6 @@ enum GatewayCommands {
         /// `host.docker.internal`.
         #[arg(long)]
         gateway_host: Option<String>,
-
-        /// Expose the Kubernetes control plane on a host port for kubectl access.
-        /// Pass without a value to auto-select a free port, or pass a specific
-        /// port number. When omitted entirely, the control plane is not exposed,
-        /// allowing multiple clusters to coexist without port conflicts.
-        #[arg(long, num_args = 0..=1, default_missing_value = "0")]
-        kube_port: Option<u16>,
 
         /// Destroy and recreate the gateway from scratch if one already exists.
         ///
@@ -833,26 +851,6 @@ enum GatewayCommands {
         #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
         name: Option<String>,
     },
-
-    /// Print or start an SSH tunnel for kubectl access to a remote gateway.
-    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
-    Tunnel {
-        /// Gateway name (defaults to active gateway).
-        #[arg(long, env = "OPENSHELL_GATEWAY", add = ArgValueCompleter::new(completers::complete_gateway_names))]
-        name: Option<String>,
-
-        /// Override SSH destination (auto-resolved from gateway metadata).
-        #[arg(long)]
-        remote: Option<String>,
-
-        /// Path to SSH private key.
-        #[arg(long, value_hint = ValueHint::FilePath)]
-        ssh_key: Option<String>,
-
-        /// Only print the SSH command instead of running it.
-        #[arg(long)]
-        print_command: bool,
-    },
 }
 
 // -----------------------------------------------------------------------
@@ -903,6 +901,78 @@ enum InferenceCommands {
         #[arg(long)]
         system: bool,
     },
+}
+
+// -----------------------------------------------------------------------
+// Doctor (diagnostic) commands
+// -----------------------------------------------------------------------
+
+#[derive(Subcommand, Debug)]
+enum DoctorCommands {
+    /// Fetch logs from the gateway container.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Logs {
+        /// Gateway name (defaults to active gateway).
+        #[arg(long, env = "OPENSHELL_GATEWAY")]
+        name: Option<String>,
+
+        /// Number of log lines to return (default: all).
+        #[arg(short, long)]
+        lines: Option<usize>,
+
+        /// Stream live logs (follow mode).
+        #[arg(long)]
+        tail: bool,
+
+        /// Override SSH destination for remote gateways.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote gateways.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+    },
+
+    /// Run a command inside the gateway container.
+    ///
+    /// Launches an interactive `docker exec` session in the gateway's k3s
+    /// container with KUBECONFIG pre-configured.  When the gateway is remote,
+    /// the session is tunnelled over SSH automatically.
+    ///
+    /// Examples:
+    ///   openshell doctor exec -- kubectl get pods -A
+    ///   openshell doctor exec -- k9s
+    ///   openshell doctor exec -- sh
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Exec {
+        /// Gateway name (defaults to active gateway).
+        #[arg(long, env = "OPENSHELL_GATEWAY")]
+        name: Option<String>,
+
+        /// Override SSH destination for remote gateways.
+        #[arg(long)]
+        remote: Option<String>,
+
+        /// Path to SSH private key for remote gateways.
+        #[arg(long, value_hint = ValueHint::FilePath)]
+        ssh_key: Option<String>,
+
+        /// Command and arguments to run inside the container.
+        #[arg(trailing_var_arg = true, required = true)]
+        command: Vec<String>,
+    },
+
+    /// Print a diagnostic prompt for AI-assisted gateway debugging.
+    ///
+    /// Outputs a system prompt that a coding agent can use to autonomously
+    /// diagnose gateway issues using `openshell doctor logs` and
+    /// `openshell doctor exec`.
+    ///
+    /// Examples:
+    ///   openshell doctor llm.txt
+    ///   openshell doctor llm.txt | pbcopy
+    #[command(name = "llm.txt", help_template = LEAF_HELP_TEMPLATE)]
+    LlmTxt,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1238,13 +1308,10 @@ async fn main() -> Result<()> {
         }) => match command {
             GatewayCommands::Start {
                 name,
-                update_kube_config,
-                get_kubeconfig,
                 remote,
                 ssh_key,
                 port,
                 gateway_host,
-                kube_port,
                 recreate,
                 plaintext,
                 disable_gateway_auth,
@@ -1253,13 +1320,10 @@ async fn main() -> Result<()> {
             } => {
                 run::gateway_admin_deploy(
                     &name,
-                    update_kube_config,
-                    get_kubeconfig,
                     remote.as_deref(),
                     ssh_key.as_deref(),
                     port,
                     gateway_host.as_deref(),
-                    kube_port,
                     recreate,
                     plaintext,
                     disable_gateway_auth,
@@ -1316,23 +1380,48 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "openshell".to_string());
                 run::gateway_admin_info(&name)?;
             }
-            GatewayCommands::Tunnel {
+        },
+
+        // -----------------------------------------------------------
+        // Doctor (diagnostic) commands
+        // -----------------------------------------------------------
+        Some(Commands::Doctor {
+            command: Some(command),
+        }) => match command {
+            DoctorCommands::Logs {
                 name,
+                lines,
+                tail,
                 remote,
                 ssh_key,
-                print_command,
             } => {
                 let name = name
                     .or_else(|| resolve_gateway_name(&cli.gateway))
                     .unwrap_or_else(|| "openshell".to_string());
-                run::gateway_admin_tunnel(
-                    &name,
-                    remote.as_deref(),
-                    ssh_key.as_deref(),
-                    print_command,
-                )?;
+                run::doctor_logs(&name, lines, tail, remote.as_deref(), ssh_key.as_deref()).await?;
+            }
+            DoctorCommands::Exec {
+                name,
+                remote,
+                ssh_key,
+                command,
+            } => {
+                let name = name
+                    .or_else(|| resolve_gateway_name(&cli.gateway))
+                    .unwrap_or_else(|| "openshell".to_string());
+                run::doctor_exec(&name, remote.as_deref(), ssh_key.as_deref(), &command)?;
+            }
+            DoctorCommands::LlmTxt => {
+                run::doctor_llm()?;
             }
         },
+        Some(Commands::Doctor { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("doctor")
+                .expect("doctor subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
 
         // -----------------------------------------------------------
         // Top-level status
@@ -1988,7 +2077,6 @@ mod tests {
             gateway_endpoint: endpoint.to_string(),
             is_remote: true,
             gateway_port: 0,
-            kube_port: None,
             remote_host: None,
             resolved_host: None,
             auth_mode: Some("cloudflare_jwt".to_string()),
