@@ -283,12 +283,12 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell doctor logs --lines 100
   $ openshell doctor exec -- kubectl get pods -A
-  $ openshell doctor llm-help
+  $ openshell doctor llm.txt
 
 \x1b[1mAI AGENT USAGE\x1b[0m
   If you are a coding agent (LLM) diagnosing a gateway issue, run:
 
-    openshell doctor llm-help
+    openshell doctor llm.txt
 
   This prints a detailed diagnostic prompt with step-by-step instructions
   for debugging gateway clusters using `openshell doctor logs` and
@@ -431,7 +431,7 @@ enum Commands {
     ///
     /// Inspect logs, run commands inside the gateway container, and get
     /// AI-assisted debugging guidance. If you are a coding agent, run
-    /// `openshell doctor llm-help` for a full diagnostic prompt.
+    /// `openshell doctor llm.txt` for a full diagnostic prompt.
     #[command(visible_alias = "dr", hide = true, after_help = DOCTOR_HELP, help_template = SUBCOMMAND_HELP_TEMPLATE)]
     Doctor {
         #[command(subcommand)]
@@ -969,10 +969,10 @@ enum DoctorCommands {
     /// `openshell doctor exec`.
     ///
     /// Examples:
-    ///   openshell doctor llm-help
-    ///   openshell doctor llm-help | pbcopy
-    #[command(help_template = LEAF_HELP_TEMPLATE)]
-    LlmHelp,
+    ///   openshell doctor llm.txt
+    ///   openshell doctor llm.txt | pbcopy
+    #[command(name = "llm.txt", help_template = LEAF_HELP_TEMPLATE)]
+    LlmTxt,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1411,7 +1411,7 @@ async fn main() -> Result<()> {
                     .unwrap_or_else(|| "openshell".to_string());
                 run::doctor_exec(&name, remote.as_deref(), ssh_key.as_deref(), &command)?;
             }
-            DoctorCommands::LlmHelp => {
+            DoctorCommands::LlmTxt => {
                 run::doctor_llm()?;
             }
         },
