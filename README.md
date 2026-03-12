@@ -44,6 +44,37 @@ The sandbox container includes the following tools by default:
 | Developer  | `gh`, `git`, `vim`, `nano`                               |
 | Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
 
+### See network policy in action
+
+Every sandbox starts in **default-deny** — all outbound traffic is blocked. You open access with a short YAML policy that the proxy enforces at the HTTP method and path level, without restarting anything.
+
+```bash
+# 1. Create a sandbox (all outbound traffic denied by default)
+openshell sandbox create --name demo --keep --no-auto-providers
+
+# 2. Inside the sandbox — blocked
+sandbox$ curl -s https://api.github.com/zen
+curl: (56) Received HTTP code 403 from proxy after CONNECT
+
+# 3. Back on the host — apply a read-only GitHub API policy
+sandbox$ exit
+openshell policy set demo --policy examples/sandbox-policy-quickstart/policy.yaml --wait
+
+# 4. Reconnect — GET allowed, POST blocked by L7
+openshell sandbox connect demo
+sandbox$ curl -s https://api.github.com/zen
+Anything added dilutes everything else.
+
+sandbox$ curl -s -X POST https://api.github.com/repos/octocat/hello-world/issues -d '{"title":"oops"}'
+{"error":"policy_denied","detail":"POST /repos/octocat/hello-world/issues not permitted by policy"}
+```
+
+See the [full walkthrough](examples/sandbox-policy-quickstart/) or run the automated demo:
+
+```bash
+bash examples/sandbox-policy-quickstart/demo.sh
+```
+
 ## Protection Layers
 
 OpenShell applies defense in depth across four policy domains:
