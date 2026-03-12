@@ -411,6 +411,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set image.pullPolicy=Always \
     --set-string server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
     --set server.sandboxImage=${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG} \
+    --set server.sandboxImagePullPolicy=Always \
     --set server.tls.certSecretName=openshell-server-tls \
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \

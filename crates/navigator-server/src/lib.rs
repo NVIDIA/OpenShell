@@ -113,6 +113,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
     let sandbox_client = SandboxClient::new(
         config.sandbox_namespace.clone(),
         config.sandbox_image.clone(),
+        config.sandbox_image_pull_policy.clone(),
         config.grpc_endpoint.clone(),
         format!("0.0.0.0:{}", config.sandbox_ssh_port),
         config.ssh_handshake_secret.clone(),

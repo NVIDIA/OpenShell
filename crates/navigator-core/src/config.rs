@@ -32,6 +32,13 @@ pub struct Config {
     #[serde(default)]
     pub sandbox_image: String,
 
+    /// Kubernetes `imagePullPolicy` for sandbox pods (e.g. `Always`,
+    /// `IfNotPresent`, `Never`).  Defaults to empty, which lets Kubernetes
+    /// apply its own default (`:latest` → `Always`, anything else →
+    /// `IfNotPresent`).
+    #[serde(default)]
+    pub sandbox_image_pull_policy: String,
+
     /// gRPC endpoint for sandboxes to connect back to OpenShell.
     /// Used by sandbox pods to fetch their policy at startup.
     #[serde(default)]
@@ -108,6 +115,7 @@ impl Config {
             database_url: String::new(),
             sandbox_namespace: default_sandbox_namespace(),
             sandbox_image: String::new(),
+            sandbox_image_pull_policy: String::new(),
             grpc_endpoint: String::new(),
             ssh_gateway_host: default_ssh_gateway_host(),
             ssh_gateway_port: default_ssh_gateway_port(),
@@ -152,6 +160,13 @@ impl Config {
     #[must_use]
     pub fn with_sandbox_image(mut self, image: impl Into<String>) -> Self {
         self.sandbox_image = image.into();
+        self
+    }
+
+    /// Create a new configuration with a sandbox image pull policy.
+    #[must_use]
+    pub fn with_sandbox_image_pull_policy(mut self, policy: impl Into<String>) -> Self {
+        self.sandbox_image_pull_policy = policy.into();
         self
     }
 
