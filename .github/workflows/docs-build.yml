@@ -26,6 +26,8 @@ jobs:
             credentials:
                 username: ${{ github.actor }}
                 password: ${{ secrets.GITHUB_TOKEN }}
+        permissions:
+            contents: read
         steps:
             - name: Checkout
               uses: actions/checkout@v4
@@ -50,7 +52,7 @@ jobs:
                   retention-days: 1
 
     publish:
-        if: false # disabled until GitHub Pages is configured
+        if: github.repository_owner == 'NVIDIA'
         needs: [build]
         runs-on: build-arm64
         container:
@@ -58,40 +60,15 @@ jobs:
             credentials:
                 username: ${{ github.actor }}
                 password: ${{ secrets.GITHUB_TOKEN }}
+        permissions:
+            contents: write
+            pages: read
         steps:
-            - uses: actions/checkout@v4
-              with:
-                  ref: "gh-pages"
-
-            - name: Initialize Git configuration
-              run: |
-                  git config --global --add safe.directory "$GITHUB_WORKSPACE"
-                  git config --global user.name "github-actions[bot]"
-                  git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
             - name: Download artifacts
               uses: actions/download-artifact@v4
               with:
                   name: html-build-artifact
-                  path: ${{ github.ref_name }}
-
-            - name: Copy HTML directories
-              run: |
-                  ls -asl
-                  for i in `ls -d *`
-                  do
-                    echo "Git adding ${i}"
-                    git add "${i}"
-                  done
-            - name: Check or create dot-no-jekyll file
-
-              run: |
-                  if [ -f ".nojekyll" ]; then
-                    echo "The dot-no-jekyll file already exists."
-                    exit 0
-                  fi
-                  touch .nojekyll
-                  git add .nojekyll
+                  path: ./_site
 
             - name: Check or create redirect page
               env:
@@ -124,11 +101,15 @@ jobs:
                   echo '</html>'                                                                                >> index.html
                   git add index.html
 
-            - name: Commit changes to the GitHub Pages branch
-              run: |
-                  git status
-                  if git commit -m 'Pushing changes to GitHub Pages.'; then
-                    git push -f
-                  else
-                   echo "Nothing changed."
-                  fi
+
+            - name: Deploy to GitHub Pages
+              uses: peaceiris/actions-gh-pages@v4
+              with:
+                github_token: ${{ secrets.GITHUB_TOKEN }}
+                publish_dir: ./_site
+                destination_dir: ${{ github.ref_name }}
+                keep_files: true
+                enable_jekyll: false
+                commit_message: "Deploy to GitHub Pages"
+                user_name: "github-actions[bot]"
+                user_email: "github-actions[bot]@users.noreply.github.com"
