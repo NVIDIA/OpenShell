@@ -372,6 +372,11 @@ pub struct App {
     pub pending_draft_approve: bool,
     pub pending_draft_reject: bool,
     pub pending_draft_approve_all: bool,
+
+    /// When true, the approve-all confirmation modal is shown.
+    pub approve_all_confirm_open: bool,
+    /// Snapshot of pending chunks captured when `[A]` was pressed.
+    pub approve_all_confirm_chunks: Vec<navigator_core::proto::PolicyChunk>,
 }
 
 impl App {
@@ -445,6 +450,8 @@ impl App {
             pending_draft_approve: false,
             pending_draft_reject: false,
             pending_draft_approve_all: false,
+            approve_all_confirm_open: false,
+            approve_all_confirm_chunks: Vec::new(),
         }
     }
 
@@ -706,6 +713,24 @@ impl App {
     }
 
     fn handle_draft_key(&mut self, key: KeyEvent) {
+        // Approve-all confirmation modal intercepts all keys when open.
+        if self.approve_all_confirm_open {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    self.pending_draft_approve_all = true;
+                    self.approve_all_confirm_open = false;
+                    // Don't clear chunks here — the event loop takes them
+                    // via std::mem::take when it processes the flag.
+                }
+                KeyCode::Esc | KeyCode::Char('n') => {
+                    self.approve_all_confirm_open = false;
+                    self.approve_all_confirm_chunks.clear();
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Detail popup intercepts most keys when open.
         if self.draft_detail_open {
             match key.code {
@@ -811,10 +836,17 @@ impl App {
                     }
                 }
             }
-            // Approve all pending chunks.
+            // Approve all pending chunks — show confirmation modal.
             KeyCode::Char('A') => {
-                if self.draft_chunks.iter().any(|c| c.status == "pending") {
-                    self.pending_draft_approve_all = true;
+                let pending: Vec<_> = self
+                    .draft_chunks
+                    .iter()
+                    .filter(|c| c.status == "pending")
+                    .cloned()
+                    .collect();
+                if !pending.is_empty() {
+                    self.approve_all_confirm_chunks = pending;
+                    self.approve_all_confirm_open = true;
                 }
             }
             KeyCode::Char('q') => self.running = false,

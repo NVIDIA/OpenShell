@@ -101,6 +101,11 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
             sandbox_draft::draw_detail_popup(frame, chunk, frame.size());
         }
     }
+
+    // Approve-all confirmation popup renders over everything.
+    if app.approve_all_confirm_open && !app.approve_all_confirm_chunks.is_empty() {
+        sandbox_draft::draw_approve_all_popup(frame, &app.approve_all_confirm_chunks, frame.size());
+    }
 }
 
 // ---------------------------------------------------------------------------

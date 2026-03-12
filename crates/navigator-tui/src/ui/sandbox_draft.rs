@@ -6,11 +6,11 @@
 use crate::app::App;
 use crate::theme::styles;
 use navigator_core::proto::PolicyChunk;
-use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::Frame;
 
 /// Draw the draft recommendations panel (list view with highlight bar).
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
@@ -265,6 +265,118 @@ pub fn draw_detail_popup(frame: &mut Frame<'_>, chunk: &PolicyChunk, area: Rect)
             .wrap(Wrap { trim: false }),
         popup_area,
     );
+}
+
+// ---------------------------------------------------------------------------
+// Approve-all confirmation popup ([A] key)
+// ---------------------------------------------------------------------------
+
+pub fn draw_approve_all_popup(frame: &mut Frame<'_>, chunks: &[PolicyChunk], area: Rect) {
+    let count = chunks.len();
+    // Height: header(1) + blank(1) + chunks(count, capped at 12) + blank(1) + hints(1) + borders(2) + padding(1)
+    let list_lines = count.min(12);
+    let popup_height = (7 + list_lines) as u16;
+    let popup_height = popup_height.min(area.height.saturating_sub(4));
+    let popup_width = (area.width * 4 / 5).min(area.width.saturating_sub(4));
+    let popup_area = centered_rect(popup_width, popup_height, area);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .title(Span::styled(
+            " Approve All ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(styles::ACCENT)
+        .padding(Padding::new(1, 1, 0, 0));
+
+    // Usable width inside borders + padding.
+    let inner_width = popup_width.saturating_sub(4) as usize;
+
+    let mut lines: Vec<Line<'_>> = Vec::new();
+
+    lines.push(Line::from(vec![
+        Span::styled("Approve ", styles::TEXT),
+        Span::styled(
+            format!("{count}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(
+                " pending policy request{}?",
+                if count == 1 { "" } else { "s" }
+            ),
+            styles::TEXT,
+        ),
+    ]));
+    lines.push(Line::from(""));
+
+    for (i, chunk) in chunks.iter().enumerate() {
+        if i >= 12 {
+            lines.push(Line::from(Span::styled(
+                format!("  ... and {} more", count - 12),
+                styles::MUTED,
+            )));
+            break;
+        }
+        let endpoint_str = chunk
+            .proposed_rule
+            .as_ref()
+            .and_then(|r| r.endpoints.first())
+            .map(|ep| format!("{}:{}", ep.host, ep.port))
+            .unwrap_or_default();
+
+        // Truncate to fit within the popup width.
+        // "  -> " (5) + rule_name + "  " (2) + endpoint
+        let prefix_len = 5;
+        let sep_len = 2;
+        let budget = inner_width.saturating_sub(prefix_len + sep_len);
+        let (name_str, ep_str) = if chunk.rule_name.len() + endpoint_str.len() > budget {
+            let ep_budget = endpoint_str.len().min(budget / 2);
+            let name_budget = budget.saturating_sub(ep_budget);
+            (
+                truncate_str(&chunk.rule_name, name_budget),
+                truncate_str(&endpoint_str, ep_budget),
+            )
+        } else {
+            (chunk.rule_name.clone(), endpoint_str)
+        };
+
+        lines.push(Line::from(vec![
+            Span::styled("  -> ", styles::MUTED),
+            Span::styled(name_str, styles::TEXT),
+            Span::styled("  ", styles::MUTED),
+            Span::styled(ep_str, styles::ACCENT),
+        ]));
+    }
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("[y/Enter]", styles::KEY_HINT),
+        Span::styled(" Approve all  ", styles::TEXT),
+        Span::styled("[n/Esc]", styles::KEY_HINT),
+        Span::styled(" Cancel", styles::TEXT),
+    ]));
+
+    frame.render_widget(Paragraph::new(lines).block(block), popup_area);
+}
+
+/// Truncate a string to `max_len` chars, appending "..." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() <= max_len {
+        s.to_string()
+    } else if max_len <= 3 {
+        s.chars().take(max_len).collect()
+    } else {
+        let mut out: String = s.chars().take(max_len - 3).collect();
+        out.push_str("...");
+        out
+    }
 }
 
 fn format_short_time(epoch_ms: i64) -> String {

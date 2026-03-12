@@ -236,12 +236,10 @@ VICTORY = f"""
   |                                                            |
   |  Each denied connection was detected by the sandbox        |
   |  proxy, aggregated into a denial summary, transported      |
-  |  to the gateway, and mapped into a NetworkPolicyRule       |
-  |  for your approval.                                        |
-  |                                                            |
-  |  Next up: AI-assisted mode (issue #205).                   |
-  |                                                            |
-  +============================================================+\
+   |  to the gateway, and mapped into a NetworkPolicyRule       |
+   |  for your approval.                                        |
+   |                                                            |
+   +============================================================+\
 {RESET}
 """
 
