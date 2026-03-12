@@ -30,12 +30,25 @@
 # Bump K3S_VERSION when a release with updated dependencies ships.
 
 ARG K3S_VERSION=v1.35.2-k3s1
+ARG K9S_VERSION=v0.50.18
 ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 
 # ---------------------------------------------------------------------------
 # Stage 1: Extract k3s artifacts from upstream rancher image (Alpine-based)
 # ---------------------------------------------------------------------------
 FROM rancher/k3s:${K3S_VERSION} AS k3s
+
+# ---------------------------------------------------------------------------
+# Stage 1b: Download k9s binary for interactive cluster debugging
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04 AS k9s
+ARG K9S_VERSION
+ARG TARGETARCH
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates && \
+    curl -fsSL "https://github.com/derailed/k9s/releases/download/${K9S_VERSION}/k9s_Linux_${TARGETARCH}.tar.gz" \
+      | tar xz -C /tmp k9s && \
+    chmod +x /tmp/k9s && \
+    rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
 # Stage 2: Install NVIDIA container toolkit on Ubuntu
