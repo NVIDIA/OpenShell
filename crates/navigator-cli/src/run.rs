@@ -4356,13 +4356,13 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_should_persist_defaults_to_ephemeral() {
-        assert!(!sandbox_should_persist(false, None));
+    fn sandbox_should_persist_defaults_to_persistent() {
+        assert!(sandbox_should_persist(true, None));
     }
 
     #[test]
-    fn sandbox_should_persist_when_keep_is_set() {
-        assert!(sandbox_should_persist(true, None));
+    fn sandbox_should_not_persist_when_no_keep_is_set() {
+        assert!(!sandbox_should_persist(false, None));
     }
 
     #[test]

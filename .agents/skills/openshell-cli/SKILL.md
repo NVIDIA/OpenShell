@@ -147,8 +147,8 @@ Key flags:
 - `--provider`: Attach one or more providers (repeatable)
 - `--policy`: Custom policy YAML (otherwise uses built-in default or `OPENSHELL_SANDBOX_POLICY` env var)
 - `--upload <PATH>[:<DEST>]`: Upload local files into the sandbox (default dest: `/sandbox`)
-- `--keep`: Keep sandbox alive after the command exits (useful for non-interactive commands)
-- `--forward <PORT>`: Forward a local port (implies `--keep`)
+- `--no-keep`: Delete the sandbox after the initial command or shell exits
+- `--forward <PORT>`: Forward a local port and keep the sandbox alive
 
 ### List and inspect sandboxes
 
@@ -236,10 +236,10 @@ Create sandbox with initial policy
 ### Step 1: Create sandbox with initial policy
 
 ```bash
-openshell sandbox create --name dev --policy ./initial-policy.yaml --keep -- claude
+openshell sandbox create --name dev --policy ./initial-policy.yaml -- claude
 ```
 
-Use `--keep` so the sandbox stays alive for iteration. The user can work in the sandbox via a separate shell.
+Sandboxes stay alive by default for iteration. Add `--no-keep` only when the sandbox should be deleted automatically after the initial session.
 
 ### Step 2: Monitor logs for denied actions
 
@@ -320,7 +320,7 @@ Build a custom container image and run it as a sandbox.
 ### Step 1: Create a sandbox from a Dockerfile
 
 ```bash
-openshell sandbox create --from ./Dockerfile --keep --name my-app
+openshell sandbox create --from ./Dockerfile --name my-app
 ```
 
 The `--from` flag accepts a Dockerfile path, a directory containing a Dockerfile, a full image reference (e.g. `myregistry.com/img:tag`), or a community sandbox name (e.g. `openclaw`).
@@ -359,13 +359,13 @@ To update the container:
 
 ```bash
 openshell sandbox delete my-app
-openshell sandbox create --from ./Dockerfile --keep --name my-app --forward 8080
+openshell sandbox create --from ./Dockerfile --name my-app --forward 8080
 ```
 
 ### Shortcut: Create with port forward in one command
 
 ```bash
-openshell sandbox create --from ./Dockerfile --forward 8080 --keep -- ./start-server.sh
+openshell sandbox create --from ./Dockerfile --forward 8080 -- ./start-server.sh
 ```
 
 The `--forward` flag starts a background port forward before the command runs, so the service is reachable immediately.
@@ -389,7 +389,7 @@ openshell sandbox create \
   --provider github \
   --provider claude \
   --policy ./dev-policy.yaml \
-  --keep
+  # sandbox create keeps the sandbox alive by default
 ```
 
 ### Step 2: User connects in a separate shell
@@ -540,13 +540,13 @@ $ openshell sandbox upload --help
 | List/switch gateways | `openshell gateway select [name]` |
 | Create sandbox (interactive) | `openshell sandbox create` |
 | Create sandbox with tool | `openshell sandbox create -- claude` |
-| Create with custom policy | `openshell sandbox create --policy ./p.yaml --keep` |
+| Create with custom policy | `openshell sandbox create --policy ./p.yaml` |
 | Connect to sandbox | `openshell sandbox connect <name>` |
 | Stream live logs | `openshell logs <name> --tail` |
 | Pull current policy | `openshell policy get <name> --full > p.yaml` |
 | Push updated policy | `openshell policy set <name> --policy p.yaml --wait` |
 | Policy revision history | `openshell policy list <name>` |
-| Create sandbox from Dockerfile | `openshell sandbox create --from ./Dockerfile --keep` |
+| Create sandbox from Dockerfile | `openshell sandbox create --from ./Dockerfile` |
 | Forward a port | `openshell forward start <port> <name> -d` |
 | Upload files to sandbox | `openshell sandbox upload <name> <path>` |
 | Download files from sandbox | `openshell sandbox download <name> <path>` |

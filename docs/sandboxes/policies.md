@@ -33,16 +33,16 @@ Use this page to apply and iterate policy changes on running sandboxes. For a fu
 Pass a policy YAML file when creating the sandbox:
 
 ```console
-$ openshell sandbox create --policy ./my-policy.yaml --keep -- claude
+$ openshell sandbox create --policy ./my-policy.yaml -- claude
 ```
 
-The `--keep` flag keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy.
+`openshell sandbox create` keeps the sandbox running after the initial command exits, which is useful when you plan to iterate on the policy. Add `--no-keep` if you want the sandbox deleted automatically instead.
 
 To avoid passing `--policy` every time, set a default policy with an environment variable:
 
 ```console
 $ export OPENSHELL_SANDBOX_POLICY=./my-policy.yaml
-$ openshell sandbox create --keep -- claude
+$ openshell sandbox create -- claude
 ```
 
 The CLI uses the policy from `OPENSHELL_SANDBOX_POLICY` whenever `--policy` is not explicitly provided.

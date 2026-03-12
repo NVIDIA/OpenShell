@@ -454,7 +454,46 @@ fn test_tls(server: &TestServer) -> TlsOptions {
 }
 
 #[tokio::test]
-async fn sandbox_create_deletes_ephemeral_command_sessions() {
+async fn sandbox_create_keeps_command_sessions_by_default() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+    install_fake_ssh(&fake_ssh_dir);
+
+    run::sandbox_create(
+        &server.endpoint,
+        Some("default-command"),
+        None,
+        "openshell",
+        None,
+        true,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        &["echo".to_string(), "OK".to_string()],
+        Some(false),
+        Some(false),
+        Some(false),
+        &tls,
+    )
+    .await
+    .expect("sandbox create should succeed");
+
+    assert!(deleted_names(&server).await.is_empty());
+    assert_eq!(
+        load_last_sandbox("openshell").as_deref(),
+        Some("default-command"),
+        "default sandboxes should be persisted as last-used"
+    );
+}
+
+#[tokio::test]
+async fn sandbox_create_deletes_command_sessions_with_no_keep() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -491,12 +530,12 @@ async fn sandbox_create_deletes_ephemeral_command_sessions() {
     assert_eq!(
         load_last_sandbox("openshell"),
         None,
-        "ephemeral sandboxes should not be persisted as last-used"
+        "no-keep sandboxes should not be persisted as last-used"
     );
 }
 
 #[tokio::test]
-async fn sandbox_create_deletes_ephemeral_shell_sessions() {
+async fn sandbox_create_deletes_shell_sessions_with_no_keep() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();
@@ -533,12 +572,12 @@ async fn sandbox_create_deletes_ephemeral_shell_sessions() {
     assert_eq!(
         load_last_sandbox("openshell"),
         None,
-        "ephemeral shell sessions should not be persisted as last-used"
+        "no-keep shell sessions should not be persisted as last-used"
     );
 }
 
 #[tokio::test]
-async fn sandbox_create_keeps_sandbox_with_keep_flag() {
+async fn sandbox_create_keeps_sandbox_with_hidden_keep_flag() {
     let server = run_server().await;
     let fake_ssh_dir = tempfile::tempdir().unwrap();
     let xdg_dir = tempfile::tempdir().unwrap();

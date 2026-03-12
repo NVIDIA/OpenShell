@@ -153,7 +153,7 @@ The `sandbox exec` path is identical to interactive connect except:
 - The command string is passed as the final SSH argument
 - The sandbox daemon routes it through `exec_request()` instead of `shell_request()`, spawning `/bin/bash -lc <command>`
 
-When `openshell sandbox create` launches an ephemeral command or shell, it keeps the CLI process alive instead of `exec()`-ing into SSH so it can delete the sandbox after SSH exits. Persistent create flows such as `--keep` and `--forward` still use the long-lived behavior.
+When `openshell sandbox create` launches a `--no-keep` command or shell, it keeps the CLI process alive instead of `exec()`-ing into SSH so it can delete the sandbox after SSH exits. The default create flow, along with `--forward`, keeps the sandbox running.
 
 ### Port Forwarding (`forward start`)
 
