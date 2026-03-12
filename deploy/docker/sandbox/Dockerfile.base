@@ -135,8 +135,14 @@ FROM base AS coding-agents
 # Include a minimal native toolchain so npm can compile optional native
 # dependencies on platforms where prebuilt artifacts are unavailable.
 # Pin to a specific patch version for reproducible builds.
-# CVE-2026-21637, CVE-2025-59466, CVE-2025-59465, CVE-2025-55131 affect
-# Node.js <= 22.22.1. Update to 22.23.0+ when a patched release ships.
+# Jan 2026 Node.js security release (22.22.0) fixed:
+#   CVE-2025-55130  - symlink permission bypass       (High)   - fixed 22.22.0
+#   CVE-2025-55131  - buffer alloc race condition      (High)   - fixed 22.22.0
+#   CVE-2025-59465  - HTTP/2 HEADERS crash             (High)   - fixed 22.22.0
+#   CVE-2025-59466  - async_hooks stack overflow DoS   (Medium) - fixed 22.22.0
+#   CVE-2026-21637  - TLS PSK/ALPN callback DoS        (Medium) - fixed 22.22.0
+# Current pin (22.22.1) includes all fixes. Scanner reports matching the
+# Debian source tracker (which tracks its own rebuild) are false positives.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends build-essential git nodejs=22.22.1-1nodesource1 nano && \
     rm -rf /var/lib/apt/lists/*
