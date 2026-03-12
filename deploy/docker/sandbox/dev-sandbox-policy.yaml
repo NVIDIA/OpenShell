@@ -72,14 +72,27 @@ network_policies:
     binaries:
       - { path: /usr/bin/git }
 
+  opencode:
+    name: opencode
+    endpoints:
+      - { host: models.dev, port: 443 }
+      - { host: registry.npmjs.org, port: 443 }
+      - { host: opencode.ai, port: 443 }
+    binaries:
+      - { path: /usr/lib/node_modules/opencode-ai/bin/.opencode }
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/opencode }
+
   nvidia_inference:
     name: nvidia-inference
     endpoints:
-      - { host: integrate.api.nvidia.com, port: 443 }
+      - { host: integrate.api.nvidia.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
     binaries:
+      - { path: /usr/lib/node_modules/opencode-ai/bin/.opencode }
+      - { path: /usr/bin/node }
+      - { path: /usr/local/bin/opencode }
       - { path: /usr/bin/curl }
       - { path: /bin/bash }
-      - { path: /usr/local/bin/opencode }
 
   # --- GitHub REST API (read-only) ---
   github_rest_api:
