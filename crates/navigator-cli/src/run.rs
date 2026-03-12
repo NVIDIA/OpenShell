@@ -787,7 +787,7 @@ fn gateway_select_column_widths(gateways: &[GatewayMetadata]) -> (usize, usize) 
 
 fn gateway_type_label(gateway: &GatewayMetadata) -> &'static str {
     match gateway.auth_mode.as_deref() {
-        Some("cloudflare_jwt") => "edge",
+        Some("cloudflare_jwt") => "cloud",
         _ if gateway.is_remote => "remote",
         _ => "local",
     }
@@ -4313,14 +4313,14 @@ mod tests {
         let items = format_gateway_select_items(&gateways);
         let header = format_gateway_select_header(&gateways);
 
-        assert_eq!(gateway_type_label(&gateways[0]), "edge");
+        assert_eq!(gateway_type_label(&gateways[0]), "cloud");
         assert_eq!(gateway_type_label(&gateways[1]), "local");
         assert!(header.contains("NAME"));
         assert!(header.contains("ENDPOINT"));
         assert!(header.contains("TYPE"));
         assert!(items[0].contains("alpha"));
         assert!(items[0].contains("https://edge.example.com"));
-        assert!(items[0].contains("edge"));
+        assert!(items[0].contains("cloud"));
         assert!(items[1].contains("local"));
         assert!(items[1].contains("http://127.0.0.1:8080"));
     }
