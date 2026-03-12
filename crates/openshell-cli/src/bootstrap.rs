@@ -122,6 +122,7 @@ fn resolve_bootstrap_name() -> String {
 pub async fn run_bootstrap(
     remote: Option<&str>,
     ssh_key: Option<&str>,
+    gpu: bool,
 ) -> Result<(TlsOptions, String, String)> {
     let gateway_name = resolve_bootstrap_name();
     let location = if remote.is_some() { "remote" } else { "local" };
@@ -159,6 +160,7 @@ pub async fn run_bootstrap(
     {
         options = options.with_registry_token(token);
     }
+    options = options.with_gpu(gpu);
 
     let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
     let server = handle.gateway_endpoint().to_string();

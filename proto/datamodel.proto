@@ -31,6 +31,8 @@ message SandboxSpec {
   openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Provider names to attach to this sandbox.
   repeated string providers = 8;
+  // Request NVIDIA GPU resources for this sandbox.
+  bool gpu = 9;
 }
 
 // Sandbox template mapped onto Kubernetes pod template inputs.

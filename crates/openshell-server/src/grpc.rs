@@ -171,6 +171,17 @@ impl OpenShell for OpenShellService {
             template.image = self.state.sandbox_client.default_image().to_string();
         }
 
+        if spec.gpu {
+            self.state
+                .sandbox_client
+                .validate_gpu_support()
+                .await
+                .map_err(|status| {
+                    warn!(error = %status, "Rejecting GPU sandbox request");
+                    status
+                })?;
+        }
+
         // Ensure process identity defaults to "sandbox" when missing or
         // empty, then validate policy safety before persisting.
         if let Some(ref mut policy) = spec.policy {
@@ -4266,6 +4277,16 @@ mod tests {
 
     fn default_spec() -> SandboxSpec {
         SandboxSpec::default()
+    }
+
+    #[test]
+    fn validate_sandbox_spec_accepts_gpu_flag() {
+        let spec = SandboxSpec {
+            gpu: true,
+            ..Default::default()
+        };
+
+        assert!(validate_sandbox_spec("gpu-sandbox", &spec).is_ok());
     }
 
     #[test]

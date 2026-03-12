@@ -11,6 +11,7 @@ import grpc
 import pytest
 
 from openshell import InferenceRouteClient, Sandbox, SandboxClient
+from openshell._proto import datamodel_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -91,3 +92,15 @@ def run_python() -> Callable[[Sandbox, str], tuple[int, str, str]]:
         return result.exit_code, result.stdout, result.stderr
 
     return _run
+
+
+@pytest.fixture(scope="session")
+def gpu_sandbox_spec() -> datamodel_pb2.SandboxSpec:
+    image = os.environ.get(
+        "OPENSHELL_E2E_GPU_IMAGE",
+        "ghcr.io/nvidia/openshell-community/sandboxes/nvidia-gpu:latest",
+    )
+    return datamodel_pb2.SandboxSpec(
+        gpu=True,
+        template=datamodel_pb2.SandboxTemplate(image=image),
+    )

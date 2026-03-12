@@ -64,7 +64,7 @@ module-name = "openshell"
 [tool.ruff]
 target-version = "py312"
 line-length = 88
-exclude = ["python/openshell/_proto"]
+exclude = ["python/openshell/_proto", "python/navigator/_proto"]
 
 [tool.ruff.lint]
 select = [
@@ -100,6 +100,9 @@ python_files = ["*_test.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 asyncio_mode = "auto"
+markers = [
+    "gpu: requires a GPU-capable gateway and GPU-enabled sandbox image",
+]
 
 [tool.coverage.run]
 source = ["python"]

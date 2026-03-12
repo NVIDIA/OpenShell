@@ -1051,6 +1051,14 @@ enum SandboxCommands {
         #[arg(long, value_enum, conflicts_with = "no_keep")]
         editor: Option<CliEditor>,
 
+        /// Request GPU resources for the sandbox.
+        ///
+        /// When no gateway is running, auto-bootstrap starts a GPU-enabled
+        /// gateway. GPU intent is also inferred automatically for known
+        /// GPU-designated image names such as `nvidia-gpu`.
+        #[arg(long)]
+        gpu: bool,
+
         /// SSH destination for remote bootstrap (e.g., user@hostname).
         /// Only used when no cluster exists yet; ignored if a cluster is
         /// already active.
@@ -1791,6 +1799,7 @@ async fn main() -> Result<()> {
                     keep,
                     no_keep,
                     editor,
+                    gpu,
                     remote,
                     ssh_key,
                     providers,
@@ -1869,6 +1878,8 @@ async fn main() -> Result<()> {
                                 upload_spec.as_ref(),
                                 keep,
                                 editor,
+                                gpu,
+                                editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),
                                 &providers,
@@ -1889,6 +1900,8 @@ async fn main() -> Result<()> {
                                 from.as_deref(),
                                 upload_spec.as_ref(),
                                 keep,
+                                editor,
+                                gpu,
                                 editor,
                                 remote.as_deref(),
                                 ssh_key.as_deref(),

@@ -24,6 +24,10 @@ The CLI classifies the value in this order:
 
 The community registry prefix defaults to `ghcr.io/nvidia/openshell-community/sandboxes` and can be overridden with the `OPENSHELL_COMMUNITY_REGISTRY` environment variable.
 
+### GPU image-name detection
+
+`sandbox create` also infers GPU intent from the final image name. The current rule matches when the last image name component contains `gpu` (for example `ghcr.io/nvidia/openshell-community/sandboxes/nvidia-gpu:latest` or `registry.example.com/team/my-gpu-image:latest`). When that rule matches, the sandbox request is treated the same as passing `--gpu`.
+
 ### Dockerfile build flow
 
 When `--from` points to a Dockerfile or directory, the CLI:
