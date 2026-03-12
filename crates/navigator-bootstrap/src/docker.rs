@@ -121,6 +121,46 @@ pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> 
         .wrap_err("failed to negotiate Docker API version with remote daemon")
 }
 
+/// Find the running openshell gateway container by image name.
+///
+/// Lists all running containers and returns the name of the one whose image
+/// contains `openshell/cluster`. Fails if zero or multiple containers match.
+pub async fn find_gateway_container(docker: &Docker) -> Result<String> {
+    let containers = docker
+        .list_containers(Some(ListContainersOptionsBuilder::new().all(false).build()))
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to list Docker containers")?;
+
+    let matches: Vec<String> = containers
+        .iter()
+        .filter(|c| {
+            c.image
+                .as_deref()
+                .is_some_and(|img| img.contains("openshell/cluster"))
+        })
+        .filter_map(|c| {
+            c.names
+                .as_ref()
+                .and_then(|n| n.first())
+                .map(|n| n.trim_start_matches('/').to_string())
+        })
+        .collect();
+
+    match matches.len() {
+        0 => Err(miette::miette!(
+            "No openshell gateway container found.\n\
+             Is the gateway running? Check with: docker ps"
+        )),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => Err(miette::miette!(
+            "Found multiple openshell gateway containers: {}\n\
+             Pass --name <gateway-name> to select one.",
+            matches.join(", ")
+        )),
+    }
+}
+
 pub async fn ensure_network(docker: &Docker) -> Result<()> {
     // Always remove and recreate the network to guarantee a clean state.
     // Stale Docker networks (e.g., from a previous interrupted destroy or
