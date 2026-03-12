@@ -80,6 +80,7 @@ def _delete_provider(stub: object, name: str) -> None:
 
 _SANDBOX_IP = "10.200.0.2"
 _FORWARD_PROXY_PORT = 19879
+_CONNECT_L7_PORT = 19880
 
 
 def _proxy_policy() -> sandbox_pb2.SandboxPolicy:
@@ -101,6 +102,38 @@ def _proxy_policy() -> sandbox_pb2.SandboxPolicy:
                     sandbox_pb2.NetworkEndpoint(
                         host=_SANDBOX_IP,
                         port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    )
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            )
+        },
+    )
+
+
+def _connect_l7_policy() -> sandbox_pb2.SandboxPolicy:
+    """Policy with a CONNECT-eligible endpoint using L7 REST inspection."""
+    return sandbox_pb2.SandboxPolicy(
+        version=1,
+        filesystem=sandbox_pb2.FilesystemPolicy(
+            include_workdir=True,
+            read_only=["/usr", "/lib", "/etc", "/app"],
+            read_write=["/sandbox", "/tmp"],
+        ),
+        landlock=sandbox_pb2.LandlockPolicy(compatibility="best_effort"),
+        process=sandbox_pb2.ProcessPolicy(
+            run_as_user="sandbox", run_as_group="sandbox"
+        ),
+        network_policies={
+            "internal_l7": sandbox_pb2.NetworkPolicyRule(
+                name="internal_l7",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_CONNECT_L7_PORT,
+                        protocol="rest",
+                        enforcement="enforce",
+                        access="full",
                         allowed_ips=["10.200.0.0/24"],
                     )
                 ],
@@ -145,6 +178,174 @@ def _forward_proxy_reads_env_and_returns_auth_header():
                 "Connection: close\r\n\r\n"
             )
             conn.sendall(request.encode())
+            data = b""
+            conn.settimeout(5)
+            while True:
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode("latin1")
+        finally:
+            conn.close()
+            server.server_close()
+
+    return fn
+
+
+def _connect_l7_echo_server_returns_auth_header():
+    """Return a closure that starts an echo HTTP server and sends a CONNECT
+    request through the proxy, returning what the server received."""
+
+    def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
+        import os
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class EchoHandler(BaseHTTPRequestHandler):
+            """Echoes back the Authorization header received from the proxy."""
+
+            def do_GET(self):
+                auth = self.headers.get("Authorization", "MISSING")
+                # Also include x-api-key for multi-header testing
+                api_key = self.headers.get("x-api-key", "MISSING")
+                body = f"auth={auth}\nx-api-key={api_key}".encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("0.0.0.0", int(target_port)), EchoHandler)
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        time.sleep(0.5)
+
+        # Read the placeholder env var (the child process only sees placeholders)
+        token = os.environ.get("ANTHROPIC_API_KEY", "NOT_SET")
+
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            # 1. CONNECT through the proxy
+            connect_req = (
+                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n\r\n"
+            )
+            conn.sendall(connect_req.encode())
+
+            # Read CONNECT response
+            connect_resp = b""
+            while b"\r\n\r\n" not in connect_resp:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                connect_resp += chunk
+            connect_status = connect_resp.decode("latin1")
+
+            if "200" not in connect_status:
+                return f"CONNECT failed: {connect_status.strip()}"
+
+            # 2. Send HTTP request through the established tunnel
+            # The proxy will do L7 inspection and rewrite placeholders
+            request = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                f"Authorization: Bearer {token}\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            conn.sendall(request.encode())
+
+            # 3. Read the response from the echo server
+            data = b""
+            conn.settimeout(5)
+            while True:
+                try:
+                    chunk = conn.recv(4096)
+                except socket.timeout:
+                    break
+                if not chunk:
+                    break
+                data += chunk
+            return data.decode("latin1")
+        finally:
+            conn.close()
+            server.server_close()
+
+    return fn
+
+
+def _connect_l7_echo_multiple_secrets():
+    """Return a closure that tests multiple provider secrets are rewritten
+    through the CONNECT L7 proxy path."""
+
+    def fn(proxy_host: str, proxy_port: int, target_host: str, target_port: int) -> str:
+        import os
+        import socket
+        import threading
+        import time
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class EchoHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                auth = self.headers.get("Authorization", "MISSING")
+                api_key = self.headers.get("x-api-key", "MISSING")
+                custom = self.headers.get("x-custom-token", "MISSING")
+                body = f"auth={auth}\nx-api-key={api_key}\nx-custom-token={custom}".encode()
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Connection", "close")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                pass
+
+        server = HTTPServer(("0.0.0.0", int(target_port)), EchoHandler)
+        thread = threading.Thread(target=server.handle_request, daemon=True)
+        thread.start()
+        time.sleep(0.5)
+
+        # Read placeholder env vars
+        api_key = os.environ.get("MY_API_KEY", "NOT_SET")
+        custom_token = os.environ.get("CUSTOM_SERVICE_TOKEN", "NOT_SET")
+
+        conn = socket.create_connection((proxy_host, int(proxy_port)), timeout=10)
+        try:
+            connect_req = (
+                f"CONNECT {target_host}:{target_port} HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n\r\n"
+            )
+            conn.sendall(connect_req.encode())
+
+            connect_resp = b""
+            while b"\r\n\r\n" not in connect_resp:
+                chunk = conn.recv(256)
+                if not chunk:
+                    break
+                connect_resp += chunk
+
+            if "200" not in connect_resp.decode("latin1"):
+                return f"CONNECT failed: {connect_resp.decode('latin1').strip()}"
+
+            # Send request with multiple placeholder headers
+            request = (
+                f"GET / HTTP/1.1\r\n"
+                f"Host: {target_host}:{target_port}\r\n"
+                f"Authorization: Bearer {api_key}\r\n"
+                f"x-api-key: {api_key}\r\n"
+                f"x-custom-token: {custom_token}\r\n"
+                f"Connection: close\r\n\r\n"
+            )
+            conn.sendall(request.encode())
+
             data = b""
             conn.settimeout(5)
             while True:
@@ -278,6 +479,98 @@ def test_provider_placeholder_is_resolved_by_proxy_on_outbound_request(
             assert "200 OK" in result.stdout
             assert "Bearer sk-proxy-rewrite-12345" in result.stdout
             assert "nemo-placeholder:env:ANTHROPIC_API_KEY" not in result.stdout
+
+
+def test_provider_secret_resolved_via_connect_l7_proxy(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Real secret reaches the destination through a CONNECT tunnel with L7 REST
+    inspection.
+
+    A dummy HTTP echo server runs inside the sandbox. The child process sends a
+    CONNECT request through the proxy and then an HTTP request carrying the
+    placeholder env var in the Authorization header. The proxy performs L7
+    inspection and rewrites the placeholder to the real credential before
+    forwarding. The echo server reflects the received header back so we can
+    assert the *real* secret arrived at the destination.
+    """
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-connect-l7-rewrite",
+        provider_type="claude",
+        credentials={"ANTHROPIC_API_KEY": "sk-connect-l7-secret-99"},
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_connect_l7_policy(),
+            providers=[provider_name],
+        )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(
+                _connect_l7_echo_server_returns_auth_header(),
+                args=("10.200.0.1", 3128, _SANDBOX_IP, _CONNECT_L7_PORT),
+            )
+            assert result.exit_code == 0, result.stderr
+            # The echo server should have received the real secret
+            assert "200 OK" in result.stdout, (
+                f"Expected 200 OK in response, got: {result.stdout}"
+            )
+            assert "auth=Bearer sk-connect-l7-secret-99" in result.stdout, (
+                f"Real secret not found in echo response: {result.stdout}"
+            )
+            # The placeholder must NOT appear in the response
+            assert "nemo-placeholder:env:ANTHROPIC_API_KEY" not in result.stdout
+
+
+def test_provider_multiple_secrets_resolved_via_connect_l7_proxy(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """Multiple provider secrets are rewritten through CONNECT L7 proxy.
+
+    Verifies that when a request carries several headers each containing a
+    different provider placeholder, every placeholder is resolved to the
+    corresponding real credential by the time the request reaches the
+    destination.
+    """
+    with provider(
+        sandbox_client._stub,
+        name="e2e-test-connect-l7-multi",
+        provider_type="generic",
+        credentials={
+            "MY_API_KEY": "real-api-key-abc",
+            "CUSTOM_SERVICE_TOKEN": "real-custom-token-xyz",
+        },
+    ) as provider_name:
+        spec = datamodel_pb2.SandboxSpec(
+            policy=_connect_l7_policy(),
+            providers=[provider_name],
+        )
+
+        with sandbox(spec=spec, delete_on_exit=True) as sb:
+            result = sb.exec_python(
+                _connect_l7_echo_multiple_secrets(),
+                args=("10.200.0.1", 3128, _SANDBOX_IP, _CONNECT_L7_PORT),
+            )
+            assert result.exit_code == 0, result.stderr
+            assert "200 OK" in result.stdout, (
+                f"Expected 200 OK in response, got: {result.stdout}"
+            )
+            # Bearer prefix + exact match for Authorization header
+            assert "auth=Bearer real-api-key-abc" in result.stdout, (
+                f"API key not rewritten in Authorization header: {result.stdout}"
+            )
+            # Exact match for x-api-key (no Bearer prefix)
+            assert "x-api-key=real-api-key-abc" in result.stdout, (
+                f"API key not rewritten in x-api-key header: {result.stdout}"
+            )
+            # Exact match for x-custom-token
+            assert "x-custom-token=real-custom-token-xyz" in result.stdout, (
+                f"Custom token not rewritten in x-custom-token header: {result.stdout}"
+            )
+            # No placeholders should appear
+            assert "nemo-placeholder:env:" not in result.stdout
 
 
 def test_ssh_handshake_secret_not_visible_in_exec_environment(

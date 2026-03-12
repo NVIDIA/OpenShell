@@ -169,4 +169,94 @@ mod tests {
         assert!(rewritten.contains("Authorization: Bearer secret-token\r\n"));
         assert!(rewritten.ends_with("\r\n\r\nhello"));
     }
+
+    /// Simulates the full round-trip: provider env → child placeholders →
+    /// HTTP headers → rewrite. This is the exact flow that occurs when a
+    /// sandbox child process reads placeholder env vars, constructs an HTTP
+    /// request, and the proxy rewrites headers before forwarding upstream.
+    #[test]
+    fn full_round_trip_child_env_to_rewritten_headers() {
+        let provider_env: HashMap<String, String> = [
+            (
+                "ANTHROPIC_API_KEY".to_string(),
+                "sk-real-key-12345".to_string(),
+            ),
+            (
+                "CUSTOM_SERVICE_TOKEN".to_string(),
+                "tok-real-svc-67890".to_string(),
+            ),
+        ]
+        .into_iter()
+        .collect();
+
+        let (child_env, resolver) = SecretResolver::from_provider_env(provider_env);
+
+        // Child process reads placeholders from the environment
+        let auth_value = child_env.get("ANTHROPIC_API_KEY").unwrap();
+        let token_value = child_env.get("CUSTOM_SERVICE_TOKEN").unwrap();
+        assert!(auth_value.starts_with(PLACEHOLDER_PREFIX));
+        assert!(token_value.starts_with(PLACEHOLDER_PREFIX));
+
+        // Child constructs an HTTP request using those placeholders
+        let raw = format!(
+            "GET /v1/messages HTTP/1.1\r\n\
+             Host: api.example.com\r\n\
+             Authorization: Bearer {auth_value}\r\n\
+             x-api-key: {token_value}\r\n\
+             Content-Length: 0\r\n\r\n"
+        );
+
+        // Proxy rewrites headers
+        let rewritten = rewrite_http_header_block(raw.as_bytes(), resolver.as_ref());
+        let rewritten = String::from_utf8(rewritten).expect("utf8");
+
+        // Real secrets must appear in the rewritten headers
+        assert!(
+            rewritten.contains("Authorization: Bearer sk-real-key-12345\r\n"),
+            "Expected rewritten Authorization header, got: {rewritten}"
+        );
+        assert!(
+            rewritten.contains("x-api-key: tok-real-svc-67890\r\n"),
+            "Expected rewritten x-api-key header, got: {rewritten}"
+        );
+
+        // Placeholders must not appear
+        assert!(
+            !rewritten.contains("nemo-placeholder:env:"),
+            "Placeholder leaked into rewritten request: {rewritten}"
+        );
+
+        // Request line and non-secret headers must be preserved
+        assert!(rewritten.starts_with("GET /v1/messages HTTP/1.1\r\n"));
+        assert!(rewritten.contains("Host: api.example.com\r\n"));
+        assert!(rewritten.contains("Content-Length: 0\r\n"));
+    }
+
+    #[test]
+    fn non_secret_headers_are_not_modified() {
+        let (_, resolver) = SecretResolver::from_provider_env(
+            [("API_KEY".to_string(), "secret".to_string())]
+                .into_iter()
+                .collect(),
+        );
+
+        let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: application/json\r\nContent-Type: text/plain\r\n\r\n";
+        let rewritten = rewrite_http_header_block(raw, resolver.as_ref());
+        // The output should be byte-identical since no placeholders are present
+        assert_eq!(raw.as_slice(), rewritten.as_slice());
+    }
+
+    #[test]
+    fn empty_provider_env_produces_no_resolver() {
+        let (child_env, resolver) = SecretResolver::from_provider_env(HashMap::new());
+        assert!(child_env.is_empty());
+        assert!(resolver.is_none());
+    }
+
+    #[test]
+    fn rewrite_with_no_resolver_returns_original() {
+        let raw = b"GET / HTTP/1.1\r\nAuthorization: Bearer my-token\r\n\r\n";
+        let rewritten = rewrite_http_header_block(raw, None);
+        assert_eq!(raw.as_slice(), rewritten.as_slice());
+    }
 }
