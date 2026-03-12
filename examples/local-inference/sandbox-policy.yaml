@@ -25,32 +25,4 @@ process:
   run_as_user: sandbox
   run_as_group: sandbox
 
-network_policies:
-  opencode:
-    name: opencode
-    endpoints:
-    - host: models.dev
-      port: 443
-    - host: registry.npmjs.org
-      port: 443
-    - host: opencode.ai
-      port: 443
-    binaries:
-    - path: /usr/lib/node_modules/opencode-ai/bin/.opencode
-    - path: /usr/bin/node
-    - path: /usr/local/bin/opencode
-  nvidia_inference:
-    name: nvidia-inference
-    endpoints:
-    - host: integrate.api.nvidia.com
-      port: 443
-      protocol: rest
-      tls: terminate
-      enforcement: enforce
-      access: full
-    binaries:
-    - path: /usr/lib/node_modules/opencode-ai/bin/.opencode
-    - path: /usr/bin/node
-    - path: /usr/local/bin/opencode
-    - path: /usr/bin/curl
-    - path: /bin/bash
+# No network policies means all outbound connections are denied and only inference.local is allowed.
