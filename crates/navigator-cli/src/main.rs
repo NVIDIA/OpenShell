@@ -820,9 +820,12 @@ enum GatewayCommands {
     /// local mTLS gateway running in Docker on this machine. In both cases
     /// the CLI extracts mTLS certificates from the running container
     /// automatically.
+    ///
+    /// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand
+    /// for `--remote user@host` with the endpoint derived from the URL.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Add {
-        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080`).
+        /// Gateway endpoint URL (e.g., `https://10.0.0.5:8080` or `ssh://user@host:8080`).
         endpoint: String,
 
         /// Gateway name (auto-derived from the endpoint hostname when omitted).
@@ -833,8 +836,8 @@ enum GatewayCommands {
         #[arg(long, conflicts_with = "local")]
         remote: Option<String>,
 
-        /// SSH private key for the remote host.
-        #[arg(long, requires = "remote", value_hint = ValueHint::FilePath)]
+        /// SSH private key for the remote host (used with `--remote` or `ssh://`).
+        #[arg(long, value_hint = ValueHint::FilePath)]
         ssh_key: Option<String>,
 
         /// Register a local mTLS gateway running in Docker on this machine.

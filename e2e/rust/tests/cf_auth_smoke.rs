@@ -348,4 +348,65 @@ async fn gateway_add_rejects_duplicate_name() {
     );
 }
 
+// -------------------------------------------------------------------
+// Test 13: `gateway add ssh://` shorthand constraints
+// -------------------------------------------------------------------
+
+/// `ssh://` endpoint with `--local` should fail.
+#[tokio::test]
+async fn gateway_add_ssh_url_conflicts_with_local() {
+    let (output, code) = run_isolated(&[
+        "gateway",
+        "add",
+        "ssh://user@host:8080",
+        "--local",
+    ])
+    .await;
+
+    assert_ne!(
+        code, 0,
+        "ssh:// with --local should fail:\n{output}"
+    );
+}
+
+/// `ssh://` endpoint with `--remote` should fail (redundant).
+#[tokio::test]
+async fn gateway_add_ssh_url_conflicts_with_remote() {
+    let (output, code) = run_isolated(&[
+        "gateway",
+        "add",
+        "ssh://user@host:8080",
+        "--remote",
+        "user@host",
+    ])
+    .await;
+
+    assert_ne!(
+        code, 0,
+        "ssh:// with --remote should fail:\n{output}"
+    );
+}
+
+/// `ssh://` endpoint without a port should fail.
+#[tokio::test]
+async fn gateway_add_ssh_url_requires_port() {
+    let (output, code) = run_isolated(&[
+        "gateway",
+        "add",
+        "ssh://user@host",
+    ])
+    .await;
+
+    assert_ne!(
+        code, 0,
+        "ssh:// without port should fail:\n{output}"
+    );
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("port"),
+        "error should mention port:\n{clean}"
+    );
+}
+
 

@@ -859,6 +859,9 @@ where
 /// Pass `remote` (SSH destination) to register a remote mTLS gateway, or
 /// `local = true` for a local mTLS gateway. In both cases the CLI extracts
 /// mTLS certificates from the running container automatically.
+///
+/// An `ssh://` endpoint (e.g., `ssh://user@host:8080`) is shorthand for
+/// `--remote user@host` with the gateway endpoint derived from the URL.
 pub async fn gateway_add(
     endpoint: &str,
     name: Option<&str>,
@@ -866,12 +869,56 @@ pub async fn gateway_add(
     ssh_key: Option<&str>,
     local: bool,
 ) -> Result<()> {
-    // Normalise the endpoint: ensure it has a scheme.
-    let endpoint = if endpoint.contains("://") {
-        endpoint.to_string()
+    // If the endpoint starts with ssh://, parse it into an SSH destination
+    // and a gateway endpoint automatically.
+    // e.g. ssh://drew@spark:8080 -> remote="drew@spark", endpoint="https://spark:8080"
+    let (endpoint, remote) = if endpoint.starts_with("ssh://") {
+        if local {
+            return Err(miette::miette!(
+                "Cannot use --local with an ssh:// endpoint.\n\
+                 ssh:// implies a remote gateway."
+            ));
+        }
+        if remote.is_some() {
+            return Err(miette::miette!(
+                "Cannot use --remote with an ssh:// endpoint.\n\
+                 The SSH destination is already embedded in the URL."
+            ));
+        }
+        let parsed = url::Url::parse(endpoint)
+            .map_err(|e| miette::miette!("Invalid ssh:// URL '{endpoint}': {e}"))?;
+        let host = parsed
+            .host_str()
+            .ok_or_else(|| miette::miette!("ssh:// URL must include a hostname: {endpoint}"))?;
+        let port = parsed
+            .port()
+            .ok_or_else(|| miette::miette!("ssh:// URL must include a port: {endpoint}"))?;
+
+        let ssh_dest = if parsed.username().is_empty() {
+            host.to_string()
+        } else {
+            format!("{}@{host}", parsed.username())
+        };
+        let https_endpoint = format!("https://{host}:{port}");
+
+        (https_endpoint, Some(ssh_dest))
     } else {
-        format!("https://{endpoint}")
+        // Normalise the endpoint: ensure it has a scheme.
+        let endpoint = if endpoint.contains("://") {
+            endpoint.to_string()
+        } else {
+            format!("https://{endpoint}")
+        };
+        (endpoint, remote.map(String::from))
     };
+    let remote = remote.as_deref();
+
+    // Validate --ssh-key requires a remote gateway context.
+    if ssh_key.is_some() && remote.is_none() {
+        return Err(miette::miette!(
+            "--ssh-key requires --remote or an ssh:// endpoint"
+        ));
+    }
 
     // Derive a gateway name from the hostname when none is provided.
     let derived_name;
