@@ -63,7 +63,7 @@ Depending on whether you start a new sandbox or use an existing sandbox, choose 
 
 :::{tab-item} Starting a new sandbox
 
-In terminal 1, create a new sandbox with Claude Code. The {doc}`default policy </reference/default-policy>` is applied automatically, which allows read-only access to GitHub.
+In terminal 2, create a new sandbox with Claude Code. The {doc}`default policy </reference/default-policy>` is applied automatically, which allows read-only access to GitHub.
 
 Create a {doc}`credential provider </sandboxes/providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
 
@@ -80,14 +80,14 @@ Claude Code starts inside the sandbox. It prints an authentication link. Open it
 
 :::{tab-item} Using an existing sandbox
 
-Connect to a sandbox that is already running and set your GitHub token as an environment variable:
+In terminal 1, connect to a sandbox that is already running and set your GitHub token as an environment variable:
 
 ```console
 $ openshell sandbox connect <sandbox-name>
 $ export GITHUB_TOKEN=<your-token>
 ```
 
-To find the name of running sandboxes, run `openshell sandbox list`.
+To find the name of running sandboxes, run `openshell sandbox list` in terminal 2.
 
 :::
 
@@ -186,14 +186,14 @@ The following steps outline the expected process done by the agent:
 
 Refer to the following policy example to compare with the generated policy before applying it. Confirm that the policy grants only the access you expect. In this case, `git push` operations and GitHub REST API access scoped to a single repository.
 
-:::{dropdown} Full reference policy
+::::{dropdown} Full reference policy
 :icon: code
 
 The following YAML shows a complete policy that extends the {doc}`default policy </reference/default-policy>` with GitHub access for a single repository. Replace `<org>` with your GitHub organization or username and `<repo>` with your repository name.
 
 The `filesystem_policy`, `landlock`, and `process` sections are static. They are read once at sandbox creation and cannot be changed by a hot-reload. They are included here for completeness so the file is self-contained, but only the `network_policies` section takes effect when you apply this to a running sandbox.
 
-:::{code-block} yaml
+```{code-block} yaml
 :emphasize-lines: 54-100
 
 version: 1
@@ -345,7 +345,7 @@ The following table summarizes the two GitHub-specific blocks:
 The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
 
 For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
-:::
+::::
 
 ## Apply the Policy
 
