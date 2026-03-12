@@ -184,9 +184,12 @@ impl Theme {
 /// Resolve a [`ThemeMode`] into a concrete [`Theme`].
 ///
 /// - `Dark` / `Light` → returns the corresponding theme directly.
-/// - `Auto` → checks the `COLORFGBG` environment variable (format `fg;bg`
-///   where a background value ≥ 8 indicates a light terminal), then falls
-///   back to [`Theme::dark`].
+/// - `Auto` → queries the terminal background color via OSC 11
+///   (supported by iTerm2, Terminal.app, most modern terminals),
+///   then falls back to [`Theme::dark`] if the query fails.
+///
+/// **Must be called before `enable_raw_mode()`** — the OSC query
+/// temporarily enters raw mode itself and restores it afterward.
 #[must_use]
 pub fn detect(mode: ThemeMode) -> Theme {
     match mode {
@@ -202,20 +205,20 @@ pub fn detect(mode: ThemeMode) -> Theme {
     }
 }
 
-/// Heuristic: check `COLORFGBG` env var for a light background.
+/// Detect whether the terminal has a light background using OSC 11.
 ///
-/// Many terminals (xterm, rxvt, iTerm2, etc.) set `COLORFGBG` to
-/// `<foreground>;<background>` using ANSI color indices. A background
-/// index ≥ 8 (bright colors / white) suggests a light terminal.
+/// Uses `terminal-colorsaurus` to send an OSC 11 query to the terminal,
+/// which returns the actual background RGB color. This works reliably on
+/// iTerm2, Terminal.app, WezTerm, Alacritty, and most modern terminals.
+///
+/// Falls back to `false` (dark) if the terminal doesn't respond to the
+/// query (e.g. `TERM=dumb`, piped output, very old terminals).
 fn is_light_terminal() -> bool {
-    let Ok(val) = std::env::var("COLORFGBG") else {
-        return false;
-    };
-    // Format: "fg;bg" e.g. "0;15" (black on white = light)
-    val.rsplit(';')
-        .next()
-        .and_then(|bg| bg.trim().parse::<u8>().ok())
-        .is_some_and(|bg| bg >= 8)
+    use terminal_colorsaurus::{QueryOptions, ThemeMode as ColorsaurusMode};
+    matches!(
+        terminal_colorsaurus::theme_mode(QueryOptions::default()),
+        Ok(ColorsaurusMode::Light)
+    )
 }
 
 #[cfg(test)]

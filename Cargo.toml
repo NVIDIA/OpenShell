@@ -46,6 +46,7 @@ indicatif = "0.17"
 owo-colors = "4"
 ratatui = "0.26"
 crossterm = "0.28"
+terminal-colorsaurus = "1.0"
 
 # Error handling
 miette = { version = "7", features = ["fancy"] }

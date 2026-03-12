@@ -42,8 +42,9 @@ pub async fn run(
     endpoint: &str,
     theme_mode: ThemeMode,
 ) -> Result<()> {
-    // Detect theme *before* entering raw/alternate-screen mode, because
-    // terminal queries (e.g. COLORFGBG) may not work after that.
+    // Detect theme *before* entering raw/alternate-screen mode.
+    // The OSC 11 query temporarily enters raw mode itself; calling it
+    // after our own enable_raw_mode() would conflict.
     let detected_theme = theme::detect(theme_mode);
 
     let client = NavigatorClient::new(channel);
