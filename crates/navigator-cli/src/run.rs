@@ -1688,7 +1688,7 @@ fn shell_escape(s: &str) -> String {
 
 /// Create a sandbox when no gateway is configured.
 ///
-/// Offers to bootstrap a new gateway first, then delegates to [`sandbox_create`].
+/// Bootstraps a new gateway first, then delegates to [`sandbox_create`].
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create_with_bootstrap(
     name: Option<&str>,
@@ -1713,14 +1713,14 @@ pub async fn sandbox_create_with_bootstrap(
              Or deploy a new gateway: openshell gateway start"
         ));
     }
-    let (tls, server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
-    // The bootstrap flow always creates a gateway named "openshell".
-    let gateway_name = "openshell";
+    let (tls, server, gateway_name) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+    // Disable bootstrap inside sandbox_create so that a transient connection
+    // failure right after deploy does not trigger a second bootstrap attempt.
     sandbox_create(
         &server,
         name,
         from,
-        gateway_name,
+        &gateway_name,
         upload,
         keep,
         editor,
@@ -1731,7 +1731,7 @@ pub async fn sandbox_create_with_bootstrap(
         forward,
         command,
         tty_override,
-        bootstrap_override,
+        Some(false),
         auto_providers_override,
         &tls,
     )
@@ -1765,8 +1765,13 @@ pub async fn sandbox_create(
         ));
     }
 
-    // Try connecting to the gateway. If it fails due to an unreachable gateway,
-    // offer to bootstrap a local one and retry.
+    // Try connecting to the gateway. If the connection fails due to a
+    // connectivity error and bootstrap is allowed, start a new gateway.
+    //
+    // bootstrap_override is Some(false) when:
+    //   - the user passed --no-bootstrap
+    //   - an existing gateway was already resolved (don't replace it)
+    //   - we already bootstrapped once (don't double-bootstrap)
     let (mut client, effective_server, effective_tls) = match grpc_client(server, tls).await {
         Ok(c) => (c, server.to_string(), tls.clone()),
         Err(err) => {
@@ -1774,9 +1779,27 @@ pub async fn sandbox_create(
                 return Err(err);
             }
             if !crate::bootstrap::confirm_bootstrap(bootstrap_override)? {
+                // The gateway is configured but not reachable. Give the user
+                // actionable recovery steps instead of a raw connection error.
+                eprintln!();
+                eprintln!(
+                    "{} Gateway '{}' is not reachable.",
+                    "!".yellow(),
+                    gateway_name,
+                );
+                eprintln!();
+                eprintln!("  To destroy and recreate the gateway:");
+                eprintln!();
+                eprintln!(
+                    "    {} && {}",
+                    format!("openshell gateway destroy {gateway_name}").cyan(),
+                    "openshell gateway start".cyan(),
+                );
+                eprintln!();
                 return Err(err);
             }
-            let (new_tls, new_server) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+            let (new_tls, new_server, _) =
+                crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
                 .wrap_err("bootstrap succeeded but failed to connect to gateway")?;

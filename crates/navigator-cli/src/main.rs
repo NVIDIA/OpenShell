@@ -1078,14 +1078,12 @@ enum SandboxCommands {
         #[arg(long, overrides_with = "tty")]
         no_tty: bool,
 
-        /// Auto-bootstrap a gateway if none is available.
-        ///
-        /// Without this flag, an interactive prompt asks whether to bootstrap;
-        /// in non-interactive mode the command errors.
+        /// Auto-bootstrap a gateway if none is available (this is the default).
         #[arg(
             long,
             overrides_with = "no_bootstrap",
-            help_heading = "BOOTSTRAP FLAGS"
+            help_heading = "BOOTSTRAP FLAGS",
+            hide = true
         )]
         bootstrap: bool,
 
@@ -1807,12 +1805,13 @@ async fn main() -> Result<()> {
                     };
 
                     // Resolve --bootstrap / --no-bootstrap into an Option<bool>.
+                    // Bootstrap is the default; --no-bootstrap opts out.
                     let bootstrap_override = if no_bootstrap {
                         Some(false)
                     } else if bootstrap {
                         Some(true)
                     } else {
-                        None // prompt or auto-detect
+                        None // auto-bootstrap (default)
                     };
 
                     // Resolve --auto-providers / --no-auto-providers.
@@ -1849,6 +1848,10 @@ async fn main() -> Result<()> {
                             let endpoint = &ctx.endpoint;
                             let mut tls = tls.with_gateway_name(&ctx.name);
                             apply_edge_auth(&mut tls, &ctx.name);
+                            // The user already has a configured gateway. Disable
+                            // auto-bootstrap in the retry path so we don't
+                            // silently replace their selected gateway with a new
+                            // "openshell" gateway if the connection fails.
                             Box::pin(run::sandbox_create(
                                 endpoint,
                                 name.as_deref(),
@@ -1864,7 +1867,7 @@ async fn main() -> Result<()> {
                                 forward,
                                 &command,
                                 tty_override,
-                                bootstrap_override,
+                                Some(false),
                                 auto_providers_override,
                                 &tls,
                             ))

@@ -4,14 +4,14 @@
 //! Auto-bootstrap helpers for sandbox creation.
 //!
 //! When `sandbox create` cannot reach a gateway, these helpers determine whether
-//! to offer gateway bootstrap, prompt the user for confirmation, and execute the
-//! local or remote bootstrap flow.
+//! to attempt gateway bootstrap and execute the local or remote bootstrap flow.
+//! Bootstrap proceeds automatically unless the user opts out with `--no-bootstrap`.
 
-use crate::tls::TlsOptions;
-use dialoguer::Confirm;
+use std::time::Duration;
+
+use crate::tls::{grpc_client, TlsOptions};
 use miette::Result;
 use owo_colors::OwoColorize;
-use std::io::IsTerminal;
 
 use crate::run::{deploy_gateway_with_panel, print_deploy_summary};
 
@@ -95,46 +95,61 @@ fn is_connectivity_error(error: &miette::Report) -> bool {
     connectivity_patterns.iter().any(|p| lower.contains(p))
 }
 
-/// Prompt the user to confirm gateway bootstrap.
+/// Decide whether gateway bootstrap should proceed.
 ///
-/// When `override_value` is `Some(true)` or `Some(false)`, the decision is
-/// made immediately (from `--bootstrap` / `--no-bootstrap`). Otherwise,
-/// prompts interactively when stdin is a terminal, or returns an error in
-/// non-interactive mode.
+/// When `override_value` is `Some(false)` (from `--no-bootstrap`), returns
+/// `false` to skip bootstrap. Otherwise returns `true` — a gateway is created
+/// automatically without prompting the user.
 pub fn confirm_bootstrap(override_value: Option<bool>) -> Result<bool> {
-    // Explicit flag takes precedence over interactive detection.
-    if let Some(value) = override_value {
-        return Ok(value);
+    if let Some(false) = override_value {
+        return Ok(false);
     }
+    Ok(true)
+}
 
-    if !std::io::stdin().is_terminal() {
-        return Err(miette::miette!(
-            "Gateway not reachable and bootstrap requires confirmation from an interactive terminal.\n\
-              Pass --bootstrap to auto-confirm, or run 'openshell gateway start' first."
-        ));
-    }
-
-    let confirmed = Confirm::new()
-        .with_prompt(format!(
-            "{} No gateway available to launch sandbox in. Create one now?",
-            "!".yellow()
-        ))
-        .default(true)
-        .interact()
-        .map_err(|e| miette::miette!("failed to read confirmation: {e}"))?;
-
-    Ok(confirmed)
+/// Resolve the gateway name for bootstrap.
+///
+/// Respects `$OPENSHELL_GATEWAY` if set, otherwise falls back to the default.
+fn resolve_bootstrap_name() -> String {
+    std::env::var("OPENSHELL_GATEWAY")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_GATEWAY_NAME.to_string())
 }
 
 /// Bootstrap a local gateway and return refreshed TLS options that pick up the
-/// newly-written mTLS certificates.
+/// newly-written mTLS certificates, along with the gateway name used.
 pub async fn run_bootstrap(
     remote: Option<&str>,
     ssh_key: Option<&str>,
-) -> Result<(TlsOptions, String)> {
+) -> Result<(TlsOptions, String, String)> {
+    let gateway_name = resolve_bootstrap_name();
     let location = if remote.is_some() { "remote" } else { "local" };
 
-    let mut options = navigator_bootstrap::DeployOptions::new(DEFAULT_GATEWAY_NAME);
+    eprintln!();
+    eprintln!(
+        "{} No gateway found — starting one automatically.",
+        "ℹ".cyan().bold()
+    );
+    eprintln!();
+    eprintln!(
+        "  The Gateway provides a secure control plane for OpenShell. It streamlines"
+    );
+    eprintln!(
+        "  access for humans and agents alike — handles sandbox orchestration, and"
+    );
+    eprintln!(
+        "  enables secure, concurrent agent workflows."
+    );
+    eprintln!();
+    eprintln!(
+        "  Manage it later with: {} or {}",
+        "openshell gateway status".bold(),
+        "openshell gateway stop".bold(),
+    );
+    eprintln!();
+
+    let mut options = navigator_bootstrap::DeployOptions::new(&gateway_name);
     if let Some(dest) = remote {
         let mut remote_opts = navigator_bootstrap::RemoteOptions::new(dest);
         if let Some(key) = ssh_key {
@@ -151,23 +166,59 @@ pub async fn run_bootstrap(
         options = options.with_registry_token(token);
     }
 
-    let handle = deploy_gateway_with_panel(options, DEFAULT_GATEWAY_NAME, location).await?;
+    let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
     let server = handle.gateway_endpoint().to_string();
 
-    print_deploy_summary(DEFAULT_GATEWAY_NAME, &handle);
+    print_deploy_summary(&gateway_name, &handle);
 
     // Auto-activate the bootstrapped gateway.
-    if let Err(err) = navigator_bootstrap::save_active_gateway(DEFAULT_GATEWAY_NAME) {
+    if let Err(err) = navigator_bootstrap::save_active_gateway(&gateway_name) {
         tracing::debug!("failed to set active gateway after bootstrap: {err}");
     }
 
     // Build fresh TLS options that resolve the newly-written mTLS certs from
     // the default XDG path for this gateway, using the gateway name directly.
     let tls = TlsOptions::default()
-        .with_gateway_name(DEFAULT_GATEWAY_NAME)
+        .with_gateway_name(&gateway_name)
         .with_default_paths(&server);
 
-    Ok((tls, server))
+    // Wait for the gateway gRPC endpoint to accept connections before
+    // handing back to the caller. The Docker health check may pass before
+    // the gRPC listener is fully ready, so retry with backoff.
+    wait_for_grpc_ready(&server, &tls).await?;
+
+    Ok((tls, server, gateway_name))
+}
+
+/// Retry connecting to the gateway gRPC endpoint until it succeeds or a
+/// timeout is reached. Uses exponential backoff starting at 500 ms, doubling
+/// up to 4 s, with a total deadline of 30 s.
+async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
+    const MAX_WAIT: Duration = Duration::from_secs(30);
+    const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
+
+    let start = std::time::Instant::now();
+    let mut backoff = INITIAL_BACKOFF;
+    let mut last_err = None;
+
+    while start.elapsed() < MAX_WAIT {
+        match grpc_client(server, tls).await {
+            Ok(_client) => return Ok(()),
+            Err(err) => {
+                tracing::debug!(
+                    elapsed = ?start.elapsed(),
+                    "gateway not yet accepting connections: {err:#}"
+                );
+                last_err = Some(err);
+            }
+        }
+        tokio::time::sleep(backoff).await;
+        backoff = (backoff * 2).min(Duration::from_secs(4));
+    }
+
+    Err(last_err
+        .unwrap_or_else(|| miette::miette!("timed out waiting for gateway"))
+        .wrap_err("gateway deployed but not accepting connections after 30 s"))
 }
 
 #[cfg(test)]
