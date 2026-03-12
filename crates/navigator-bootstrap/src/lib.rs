@@ -80,15 +80,6 @@ impl RemoteOptions {
 /// Default host port that maps to the k3s `NodePort` (30051) for the gateway.
 pub const DEFAULT_GATEWAY_PORT: u16 = 8080;
 
-/// Find a random available TCP port by binding to port 0.
-///
-/// Binds to `127.0.0.1:0` and returns the OS-assigned port.
-pub fn pick_available_port() -> Result<u16> {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").into_diagnostic()?;
-    let port = listener.local_addr().into_diagnostic()?.port();
-    Ok(port)
-}
-
 #[derive(Debug, Clone)]
 pub struct DeployOptions {
     pub name: String,
