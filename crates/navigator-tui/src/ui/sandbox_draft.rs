@@ -6,11 +6,11 @@
 use crate::app::App;
 use crate::theme::styles;
 use navigator_core::proto::PolicyChunk;
+use ratatui::Frame;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Padding, Paragraph, Wrap};
-use ratatui::Frame;
 
 /// Draw the draft recommendations panel (list view with highlight bar).
 pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
