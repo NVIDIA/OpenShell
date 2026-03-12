@@ -18,7 +18,10 @@ from openai import OpenAI  # noqa: E402
 
 client = OpenAI(api_key="dummy", base_url="https://inference.local/v1")
 
-PROMPT = "Write a short haiku about computers."
+PROMPT = (
+    "Write a 500-word essay on the history of computing, "
+    "from Charles Babbage's Analytical Engine to modern GPUs."
+)
 MESSAGES = [{"role": "user", "content": PROMPT}]
 
 
@@ -36,8 +39,10 @@ def test_non_streaming():
     elapsed = time.monotonic() - t0
 
     content = (response.choices[0].message.content or "").strip()
+    words = content.split()
     print(f"  model   = {response.model}")
-    print(f"  content = {content}")
+    print(f"  words   = {len(words)}")
+    print(f"  preview = {' '.join(words[:20])}...")
     print(f"  total   = {elapsed:.2f}s")
     print()
 
@@ -70,8 +75,10 @@ def test_streaming():
     elapsed = time.monotonic() - t0
     content = "".join(chunks).strip()
 
+    words = content.split()
     print(f"  model   = {chunk.model}")
-    print(f"  content = {content}")
+    print(f"  words   = {len(words)}")
+    print(f"  preview = {' '.join(words[:20])}...")
     print(f"  total   = {elapsed:.2f}s")
     print()
 
