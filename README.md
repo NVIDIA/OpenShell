@@ -110,7 +110,7 @@ openshell term
 ```
 
 <p align="center">
-  <img src="docs/assets/openshell-terminal.png" alt="OpenShell Terminal UI" width="800">
+  <img src="docs/assets/openshell-terminal.png" alt="OpenShell Terminal UI">
 </p>
 
 The TUI gives you a live, keyboard-driven view of your cluster. Navigate with `Tab` to switch panels, `j`/`k` to move through lists, `Enter` to select, and `:` for command mode. Cluster health and sandbox status auto-refresh every two seconds.
