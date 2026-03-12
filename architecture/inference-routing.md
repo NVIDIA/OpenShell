@@ -25,9 +25,14 @@ sequenceDiagram
     Router->>Router: Select route by protocol
     Router->>Router: Rewrite auth + model
     Router->>Backend: HTTPS request
-    Backend->>Router: Response
-    Router->>Proxy: ProxyResponse
-    Proxy->>Agent: HTTP response over TLS tunnel
+    Backend->>Router: Response headers + body stream
+    Router->>Proxy: StreamingProxyResponse (headers first)
+    Proxy->>Agent: HTTP/1.1 headers (chunked TE)
+    loop Each body chunk
+        Router->>Proxy: chunk via next_chunk()
+        Proxy->>Agent: Chunked-encoded frame
+    end
+    Proxy->>Agent: Chunk terminator (0\r\n\r\n)
 ```
 
 ## Provider Profiles
@@ -149,8 +154,8 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 
 Files:
 
-- `crates/navigator-router/src/lib.rs` -- `Router`, `proxy_with_candidates()`
-- `crates/navigator-router/src/backend.rs` -- `proxy_to_backend()`, URL construction
+- `crates/navigator-router/src/lib.rs` -- `Router`, `proxy_with_candidates()`, `proxy_with_candidates_streaming()`
+- `crates/navigator-router/src/backend.rs` -- `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
 - `crates/navigator-router/src/config.rs` -- `RouteConfig`, `ResolvedRoute`, YAML loading
 
 ### Route selection
@@ -173,6 +178,29 @@ Before forwarding inference requests, the proxy strips sensitive and hop-by-hop 
 
 - **Request**: `authorization`, `x-api-key`, `host`, `content-length`, and hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`).
 - **Response**: `content-length` and hop-by-hop headers.
+
+### Response streaming
+
+The router supports two response modes:
+
+- **Buffered** (`proxy_with_candidates()`): Reads the entire upstream response body into memory before returning a `ProxyResponse { status, headers, body: Bytes }`. Used by mock routes and in-process system inference calls where latency is not a concern.
+- **Streaming** (`proxy_with_candidates_streaming()`): Returns a `StreamingProxyResponse` as soon as response headers arrive from the backend. The body is exposed as a `StreamingBody` enum with a `next_chunk()` method that yields `Option<Bytes>` incrementally.
+
+`StreamingBody` has two variants:
+
+| Variant | Source | Behavior |
+|---------|--------|----------|
+| `Live(reqwest::Response)` | Real HTTP backend | Calls `response.chunk()` to yield each body fragment as it arrives from the network |
+| `Buffered(Option<Bytes>)` | Mock routes or fallback | Yields the entire body on the first call, then `None` |
+
+The sandbox proxy (`route_inference_request()` in `proxy.rs`) uses the streaming path for all inference requests:
+
+1. Calls `proxy_with_candidates_streaming()` to get headers immediately.
+2. Formats and sends the HTTP/1.1 response header with `Transfer-Encoding: chunked` via `format_http_response_header()`.
+3. Loops on `body.next_chunk()`, wrapping each fragment in HTTP chunked encoding via `format_chunk()`.
+4. Sends the chunk terminator (`0\r\n\r\n`) via `format_chunk_terminator()`.
+
+This eliminates full-body buffering for streaming responses (SSE). Time-to-first-byte is determined by the backend's first chunk latency rather than the full generation time.
 
 ### Mock routes
 
