@@ -43,10 +43,10 @@ This tutorial shows example prompts and responses from Claude Code. The exact wo
 
 This tutorial requires the following:
 
-- Completed the {doc}`Quickstart </get-started/quickstart>` tutorial.
-- A GitHub personal access token (PAT) with `repo` scope. To create one, go to [GitHub Settings > Developer settings > Personal access tokens](https://github.com/settings/tokens), select **Generate new token (classic)**, check the `repo` scope, and copy the token.
-- Your own [Anthropic account](https://console.anthropic.com/) for Claude Code. OpenShell provides the sandbox, not the agent — you need your own account to log in to Claude Code.
-- A public GitHub repository you own (used as the push target). A scratch or test repository works well — the tutorial pushes a small file to it. You can [create a new repository](https://github.com/new) with a README if you do not have one handy.
+- A working OpenShell installation. Complete the {doc}`Quickstart </get-started/quickstart>` before proceeding.
+- A GitHub personal access token (PAT) with `repo` scope. Generate one from the [GitHub personal access token settings page](https://github.com/settings/tokens) by selecting **Generate new token (classic)** and enabling the `repo` scope.
+- An [Anthropic account](https://console.anthropic.com/) with access to Claude Code. OpenShell provides the sandbox runtime, not the agent. You must authenticate with your own account.
+- A GitHub repository you own to use as the push target. A scratch repository is sufficient. You can [create one](https://github.com/new) with a README if needed.
 
 This tutorial uses two terminals to demonstrate the iterative policy workflow:
 
@@ -55,7 +55,7 @@ This tutorial uses two terminals to demonstrate the iterative policy workflow:
 
 Each section below indicates which terminal to use.
 
-## Set up a Sandbox with the Default Policy
+## Set up a Sandbox with Your GitHub Token
 
 Depending on whether you are starting a new sandbox or using an existing one, choose the appropriate tab and follow the instructions.
 
@@ -73,6 +73,9 @@ $ openshell provider create --name my-github --type github --from-existing
 $ openshell sandbox create --provider my-github --keep -- claude
 ```
 
+The `--keep` flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.
+
+Claude Code starts inside the sandbox. It prints an authentication link. Open it in your browser, sign in to your Anthropic account, and return to the terminal. When prompted, trust the `/sandbox` workspace to allow Claude Code to read and write files.
 :::
 
 :::{tab-item} Using an existing sandbox
@@ -84,13 +87,11 @@ $ openshell sandbox connect <sandbox-name>
 $ export GITHUB_TOKEN=<your-token>
 ```
 
+To find the name of running sandboxes, run `openshell sandbox list`.
+
 :::
 
 ::::
-
-The `--keep` flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.
-
-Claude Code starts inside the sandbox. It prints an authentication link. Open it in your browser, sign in to your Anthropic account, and return to the terminal. When prompted, trust the `/sandbox` workspace to allow Claude Code to read and write files.
 
 ## Push Code to GitHub
 
@@ -160,11 +161,11 @@ will be blocked until the policy is updated.
 
 Both perspectives confirm the same thing: the proxy is doing its job. The default policy is designed to be restrictive. To allow GitHub pushes, you need to update the network policy.
 
-Copy the deny reason from Claude's response — you will paste it into your laptop agent in the next step.
+Copy the deny reason from Claude's response. You paste it into an agent running on your machine in the next step.
 
 ## Update the Policy from Your Laptop
 
-**Terminal 2 (laptop)** — Paste the deny reason from the previous step into your coding agent (for example, Claude Code or Cursor running on your laptop) and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
+In terminal 2, paste the deny reason from the previous step into your coding agent, such as Claude Code or Cursor, and ask it to update the sandbox policy. The deny reason gives the agent the context it needs to generate the correct policy rules.
 
 1. Inspects the deny reasons.
 2. Writes an updated policy that adds `github_git` and `github_api` blocks that grant write access to your repository.
