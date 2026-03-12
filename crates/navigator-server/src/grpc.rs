@@ -5,23 +5,31 @@
 
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
-use crate::persistence::{ObjectId, ObjectName, ObjectType, PolicyRecord, generate_name};
+use crate::persistence::{
+    DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, generate_name,
+};
 use futures::future;
 use navigator_core::proto::{
+    ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
+    ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
+    ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyRequest,
     GetSandboxPolicyResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PolicyStatus, Provider, ProviderResponse, PushSandboxLogsRequest,
-    PushSandboxLogsResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    ListSandboxesResponse, PolicyChunk, PolicyStatus, Provider, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SshSession, UpdateProviderRequest,
-    UpdateSandboxPolicyRequest, UpdateSandboxPolicyResponse, WatchSandboxRequest,
-    navigator_server::Navigator,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SshSession, SubmitPolicyAnalysisRequest,
+    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
+    UpdateProviderRequest, UpdateSandboxPolicyRequest, UpdateSandboxPolicyResponse,
+    WatchSandboxRequest, navigator_server::Navigator,
 };
 use navigator_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
@@ -1322,6 +1330,932 @@ impl Navigator for NavigatorService {
 
         Ok(Response::new(PushSandboxLogsResponse {}))
     }
+
+    // -----------------------------------------------------------------------
+    // Draft policy recommendation handlers
+    // -----------------------------------------------------------------------
+
+    async fn submit_policy_analysis(
+        &self,
+        request: Request<SubmitPolicyAnalysisRequest>,
+    ) -> Result<Response<SubmitPolicyAnalysisResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        // Resolve sandbox by name.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        // Get the next draft version.
+        let current_version = self
+            .state
+            .store
+            .get_draft_version(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("get draft version failed: {e}")))?;
+        let draft_version = current_version + 1;
+
+        // Validate and persist proposed chunks from the sandbox.
+        // The sandbox runs the mechanistic mapper (or future LLM advisor)
+        // and sends pre-formed chunks. The gateway is a thin persistence +
+        // validation layer — it never generates proposals itself.
+        //
+        // Dedup is handled at the DB level: the unique partial index on
+        // (sandbox_id, host, port, binary) triggers an upsert that
+        // increments hit_count + updates last_seen_ms.
+        let mut accepted: u32 = 0;
+        let mut rejected: u32 = 0;
+        let mut rejection_reasons: Vec<String> = Vec::new();
+
+        for chunk in &req.proposed_chunks {
+            // Basic validation: rule_name and proposed_rule are required.
+            if chunk.rule_name.is_empty() {
+                rejected += 1;
+                rejection_reasons.push("chunk missing rule_name".to_string());
+                continue;
+            }
+            if chunk.proposed_rule.is_none() {
+                rejected += 1;
+                rejection_reasons
+                    .push(format!("chunk '{}' missing proposed_rule", chunk.rule_name));
+                continue;
+            }
+
+            let chunk_id = uuid::Uuid::new_v4().to_string();
+            let now_ms =
+                current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+            let proposed_rule_bytes = chunk
+                .proposed_rule
+                .as_ref()
+                .map(|r| r.encode_to_vec())
+                .unwrap_or_default();
+
+            // Extract host:port and binary from the proposed rule for denormalized columns.
+            let rule_ref = chunk.proposed_rule.as_ref();
+            let (ep_host, ep_port) = rule_ref
+                .and_then(|r| r.endpoints.first())
+                .map(|ep| (ep.host.to_lowercase(), ep.port as i32))
+                .unwrap_or_default();
+            let ep_binary = rule_ref
+                .and_then(|r| r.binaries.first())
+                .map(|b| b.path.clone())
+                .unwrap_or_default();
+
+            let record = DraftChunkRecord {
+                id: chunk_id,
+                sandbox_id: sandbox_id.clone(),
+                draft_version,
+                status: "pending".to_string(),
+                rule_name: chunk.rule_name.clone(),
+                proposed_rule: proposed_rule_bytes,
+                rationale: chunk.rationale.clone(),
+                security_notes: chunk.security_notes.clone(),
+                confidence: f64::from(chunk.confidence),
+                created_at_ms: now_ms,
+                decided_at_ms: None,
+                host: ep_host,
+                port: ep_port,
+                binary: ep_binary,
+                hit_count: if chunk.hit_count > 0 {
+                    chunk.hit_count
+                } else {
+                    1
+                },
+                first_seen_ms: if chunk.first_seen_ms > 0 {
+                    chunk.first_seen_ms
+                } else {
+                    now_ms
+                },
+                last_seen_ms: if chunk.last_seen_ms > 0 {
+                    chunk.last_seen_ms
+                } else {
+                    now_ms
+                },
+            };
+            self.state
+                .store
+                .put_draft_chunk(&record)
+                .await
+                .map_err(|e| Status::internal(format!("persist draft chunk failed: {e}")))?;
+            accepted += 1;
+        }
+
+        // Notify watchers that new draft chunks are available.
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        info!(
+            sandbox_id = %sandbox_id,
+            accepted = accepted,
+            rejected = rejected,
+            draft_version = draft_version,
+            summaries = req.summaries.len(),
+            "SubmitPolicyAnalysis: persisted draft chunks"
+        );
+
+        Ok(Response::new(SubmitPolicyAnalysisResponse {
+            accepted_chunks: accepted,
+            rejected_chunks: rejected,
+            rejection_reasons,
+        }))
+    }
+
+    async fn get_draft_policy(
+        &self,
+        request: Request<GetDraftPolicyRequest>,
+    ) -> Result<Response<GetDraftPolicyResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        // Resolve sandbox by name.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        let status_filter = if req.status_filter.is_empty() {
+            None
+        } else {
+            Some(req.status_filter.as_str())
+        };
+
+        let records = self
+            .state
+            .store
+            .list_draft_chunks(&sandbox_id, status_filter)
+            .await
+            .map_err(|e| Status::internal(format!("list draft chunks failed: {e}")))?;
+
+        let draft_version = self
+            .state
+            .store
+            .get_draft_version(&sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("get draft version failed: {e}")))?;
+
+        let chunks: Vec<PolicyChunk> = records
+            .into_iter()
+            .map(|r| draft_chunk_record_to_proto(&r))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Determine last_analyzed_at_ms from the most recent chunk.
+        let last_analyzed_at_ms = chunks.iter().map(|c| c.created_at_ms).max().unwrap_or(0);
+
+        debug!(
+            sandbox_id = %sandbox_id,
+            chunk_count = chunks.len(),
+            draft_version = draft_version,
+            "GetDraftPolicy: served draft chunks"
+        );
+
+        Ok(Response::new(GetDraftPolicyResponse {
+            chunks,
+            rolling_summary: String::new(),
+            draft_version: u64::try_from(draft_version).unwrap_or(0),
+            last_analyzed_at_ms,
+        }))
+    }
+
+    async fn approve_draft_chunk(
+        &self,
+        request: Request<ApproveDraftChunkRequest>,
+    ) -> Result<Response<ApproveDraftChunkResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.chunk_id.is_empty() {
+            return Err(Status::invalid_argument("chunk_id is required"));
+        }
+
+        // Resolve sandbox.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        // Fetch the chunk — accept pending or rejected (re-approve toggle).
+        let chunk = self
+            .state
+            .store
+            .get_draft_chunk(&req.chunk_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
+            .ok_or_else(|| Status::not_found("chunk not found"))?;
+
+        if chunk.status != "pending" && chunk.status != "rejected" {
+            return Err(Status::failed_precondition(format!(
+                "chunk status is '{}', expected 'pending' or 'rejected'",
+                chunk.status
+            )));
+        }
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            host = %chunk.host,
+            port = chunk.port,
+            hit_count = chunk.hit_count,
+            prev_status = %chunk.status,
+            "ApproveDraftChunk: merging rule into active policy"
+        );
+
+        // Merge the approved rule into the current policy (with optimistic retry).
+        let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, &chunk).await?;
+
+        // Mark chunk as approved.
+        let now_ms =
+            current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+        self.state
+            .store
+            .update_draft_chunk_status(&req.chunk_id, "approved", Some(now_ms))
+            .await
+            .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+        // Notify watchers.
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            version = version,
+            policy_hash = %hash,
+            "ApproveDraftChunk: rule merged successfully"
+        );
+
+        Ok(Response::new(ApproveDraftChunkResponse {
+            policy_version: u32::try_from(version).unwrap_or(0),
+            policy_hash: hash,
+        }))
+    }
+
+    async fn reject_draft_chunk(
+        &self,
+        request: Request<RejectDraftChunkRequest>,
+    ) -> Result<Response<RejectDraftChunkResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.chunk_id.is_empty() {
+            return Err(Status::invalid_argument("chunk_id is required"));
+        }
+
+        // Resolve sandbox.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        // Fetch the chunk — accept pending or approved (revoke toggle).
+        let chunk = self
+            .state
+            .store
+            .get_draft_chunk(&req.chunk_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
+            .ok_or_else(|| Status::not_found("chunk not found"))?;
+
+        if chunk.status != "pending" && chunk.status != "approved" {
+            return Err(Status::failed_precondition(format!(
+                "chunk status is '{}', expected 'pending' or 'approved'",
+                chunk.status
+            )));
+        }
+
+        let was_approved = chunk.status == "approved";
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            host = %chunk.host,
+            port = chunk.port,
+            reason = %req.reason,
+            prev_status = %chunk.status,
+            "RejectDraftChunk: rejecting chunk"
+        );
+
+        // If the chunk was approved, remove its rule from the active policy.
+        if was_approved {
+            remove_chunk_from_policy(&self.state, &sandbox_id, &chunk).await?;
+        }
+
+        // Mark chunk as rejected.
+        let now_ms =
+            current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+        self.state
+            .store
+            .update_draft_chunk_status(&req.chunk_id, "rejected", Some(now_ms))
+            .await
+            .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+        // Notify watchers.
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        Ok(Response::new(RejectDraftChunkResponse {}))
+    }
+
+    async fn approve_all_draft_chunks(
+        &self,
+        request: Request<ApproveAllDraftChunksRequest>,
+    ) -> Result<Response<ApproveAllDraftChunksResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        // Resolve sandbox.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        // List all pending chunks.
+        let pending_chunks = self
+            .state
+            .store
+            .list_draft_chunks(&sandbox_id, Some("pending"))
+            .await
+            .map_err(|e| Status::internal(format!("list draft chunks failed: {e}")))?;
+
+        if pending_chunks.is_empty() {
+            return Err(Status::failed_precondition("no pending chunks to approve"));
+        }
+
+        info!(
+            sandbox_id = %sandbox_id,
+            pending_count = pending_chunks.len(),
+            include_security_flagged = req.include_security_flagged,
+            "ApproveAllDraftChunks: starting bulk approval"
+        );
+
+        let mut chunks_approved: u32 = 0;
+        let mut chunks_skipped: u32 = 0;
+        let mut last_version: i64 = 0;
+        let mut last_hash = String::new();
+
+        for chunk in &pending_chunks {
+            // Skip security-flagged chunks unless explicitly included.
+            if !req.include_security_flagged && !chunk.security_notes.is_empty() {
+                info!(
+                    sandbox_id = %sandbox_id,
+                    chunk_id = %chunk.id,
+                    rule_name = %chunk.rule_name,
+                    security_notes = %chunk.security_notes,
+                    "ApproveAllDraftChunks: skipping security-flagged chunk"
+                );
+                chunks_skipped += 1;
+                continue;
+            }
+
+            info!(
+                sandbox_id = %sandbox_id,
+                chunk_id = %chunk.id,
+                rule_name = %chunk.rule_name,
+                host = %chunk.host,
+                port = chunk.port,
+                "ApproveAllDraftChunks: merging chunk"
+            );
+
+            // Merge each chunk into the policy (with optimistic retry).
+            let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, chunk).await?;
+            last_version = version;
+            last_hash = hash;
+
+            // Mark chunk as approved.
+            let now_ms =
+                current_time_ms().map_err(|e| Status::internal(format!("timestamp error: {e}")))?;
+            self.state
+                .store
+                .update_draft_chunk_status(&chunk.id, "approved", Some(now_ms))
+                .await
+                .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+            chunks_approved += 1;
+        }
+
+        // Notify watchers.
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunks_approved = chunks_approved,
+            chunks_skipped = chunks_skipped,
+            version = last_version,
+            policy_hash = %last_hash,
+            "ApproveAllDraftChunks: bulk approval complete"
+        );
+
+        Ok(Response::new(ApproveAllDraftChunksResponse {
+            policy_version: u32::try_from(last_version).unwrap_or(0),
+            policy_hash: last_hash,
+            chunks_approved,
+            chunks_skipped,
+        }))
+    }
+
+    async fn edit_draft_chunk(
+        &self,
+        request: Request<EditDraftChunkRequest>,
+    ) -> Result<Response<EditDraftChunkResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.chunk_id.is_empty() {
+            return Err(Status::invalid_argument("chunk_id is required"));
+        }
+        let proposed_rule = req
+            .proposed_rule
+            .ok_or_else(|| Status::invalid_argument("proposed_rule is required"))?;
+
+        // Resolve sandbox (validates name exists).
+        let _sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+
+        // Fetch the chunk and validate it's pending.
+        let chunk = self
+            .state
+            .store
+            .get_draft_chunk(&req.chunk_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
+            .ok_or_else(|| Status::not_found("chunk not found"))?;
+
+        if chunk.status != "pending" {
+            return Err(Status::failed_precondition(format!(
+                "chunk status is '{}', expected 'pending'",
+                chunk.status
+            )));
+        }
+
+        // Update the proposed rule.
+        let rule_bytes = proposed_rule.encode_to_vec();
+        self.state
+            .store
+            .update_draft_chunk_rule(&req.chunk_id, &rule_bytes)
+            .await
+            .map_err(|e| Status::internal(format!("update chunk rule failed: {e}")))?;
+
+        info!(
+            chunk_id = %req.chunk_id,
+            "EditDraftChunk: proposed rule updated"
+        );
+
+        Ok(Response::new(EditDraftChunkResponse {}))
+    }
+
+    async fn undo_draft_chunk(
+        &self,
+        request: Request<UndoDraftChunkRequest>,
+    ) -> Result<Response<UndoDraftChunkResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+        if req.chunk_id.is_empty() {
+            return Err(Status::invalid_argument("chunk_id is required"));
+        }
+
+        // Resolve sandbox.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        // Fetch the chunk and validate it's approved.
+        let chunk = self
+            .state
+            .store
+            .get_draft_chunk(&req.chunk_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch chunk failed: {e}")))?
+            .ok_or_else(|| Status::not_found("chunk not found"))?;
+
+        if chunk.status != "approved" {
+            return Err(Status::failed_precondition(format!(
+                "chunk status is '{}', expected 'approved'",
+                chunk.status
+            )));
+        }
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            host = %chunk.host,
+            port = chunk.port,
+            "UndoDraftChunk: removing rule from active policy"
+        );
+
+        // Remove the rule from the current policy (with optimistic retry).
+        let (version, hash) = remove_chunk_from_policy(&self.state, &sandbox_id, &chunk).await?;
+
+        // Mark chunk back to pending.
+        self.state
+            .store
+            .update_draft_chunk_status(&req.chunk_id, "pending", None)
+            .await
+            .map_err(|e| Status::internal(format!("update chunk status failed: {e}")))?;
+
+        // Notify watchers.
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunk_id = %req.chunk_id,
+            rule_name = %chunk.rule_name,
+            version = version,
+            policy_hash = %hash,
+            "UndoDraftChunk: rule removed, chunk reverted to pending"
+        );
+
+        Ok(Response::new(UndoDraftChunkResponse {
+            policy_version: u32::try_from(version).unwrap_or(0),
+            policy_hash: hash,
+        }))
+    }
+
+    async fn clear_draft_chunks(
+        &self,
+        request: Request<ClearDraftChunksRequest>,
+    ) -> Result<Response<ClearDraftChunksResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        // Resolve sandbox.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        let deleted = self
+            .state
+            .store
+            .delete_draft_chunks(&sandbox_id, "pending")
+            .await
+            .map_err(|e| Status::internal(format!("delete draft chunks failed: {e}")))?;
+
+        // Notify watchers.
+        self.state.sandbox_watch_bus.notify(&sandbox_id);
+
+        info!(
+            sandbox_id = %sandbox_id,
+            chunks_cleared = deleted,
+            "ClearDraftChunks: pending chunks cleared"
+        );
+
+        Ok(Response::new(ClearDraftChunksResponse {
+            chunks_cleared: u32::try_from(deleted).unwrap_or(0),
+        }))
+    }
+
+    async fn get_draft_history(
+        &self,
+        request: Request<GetDraftHistoryRequest>,
+    ) -> Result<Response<GetDraftHistoryResponse>, Status> {
+        let req = request.into_inner();
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument("name is required"));
+        }
+
+        // Resolve sandbox by name.
+        let sandbox = self
+            .state
+            .store
+            .get_message_by_name::<Sandbox>(&req.name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let sandbox_id = sandbox.id.clone();
+
+        // Build history from all draft chunks (across all versions).
+        let all_chunks = self
+            .state
+            .store
+            .list_draft_chunks(&sandbox_id, None)
+            .await
+            .map_err(|e| Status::internal(format!("list draft chunks failed: {e}")))?;
+
+        let mut entries: Vec<DraftHistoryEntry> = Vec::new();
+
+        for chunk in &all_chunks {
+            // Creation event.
+            entries.push(DraftHistoryEntry {
+                timestamp_ms: chunk.created_at_ms,
+                event_type: "proposed".to_string(),
+                description: format!(
+                    "Rule '{}' proposed (confidence: {:.0}%)",
+                    chunk.rule_name,
+                    chunk.confidence * 100.0
+                ),
+                chunk_id: chunk.id.clone(),
+            });
+
+            // Decision event (if decided).
+            if let Some(decided_at) = chunk.decided_at_ms {
+                entries.push(DraftHistoryEntry {
+                    timestamp_ms: decided_at,
+                    event_type: chunk.status.clone(),
+                    description: format!("Rule '{}' {}", chunk.rule_name, chunk.status),
+                    chunk_id: chunk.id.clone(),
+                });
+            }
+        }
+
+        // Sort by timestamp ascending.
+        entries.sort_by_key(|e| e.timestamp_ms);
+
+        debug!(
+            sandbox_id = %sandbox_id,
+            entry_count = entries.len(),
+            "GetDraftHistory: served draft history"
+        );
+
+        Ok(Response::new(GetDraftHistoryResponse { entries }))
+    }
+}
+
+/// Convert a `DraftChunkRecord` from the persistence layer into a `PolicyChunk`
+/// proto message.
+fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk, Status> {
+    use navigator_core::proto::NetworkPolicyRule;
+
+    let proposed_rule = if record.proposed_rule.is_empty() {
+        None
+    } else {
+        Some(
+            NetworkPolicyRule::decode(record.proposed_rule.as_slice())
+                .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?,
+        )
+    };
+
+    Ok(PolicyChunk {
+        id: record.id.clone(),
+        status: record.status.clone(),
+        rule_name: record.rule_name.clone(),
+        proposed_rule,
+        rationale: record.rationale.clone(),
+        security_notes: record.security_notes.clone(),
+        confidence: record.confidence as f32,
+        created_at_ms: record.created_at_ms,
+        decided_at_ms: record.decided_at_ms.unwrap_or(0),
+        hit_count: record.hit_count,
+        first_seen_ms: record.first_seen_ms,
+        last_seen_ms: record.last_seen_ms,
+        binary: record.binary.clone(),
+        ..Default::default()
+    })
+}
+
+/// Merge a draft chunk's proposed rule into the current active sandbox policy.
+///
+/// Returns `(new_version, policy_hash)`. This reuses the same persistence
+/// pattern as `update_sandbox_policy`: compute hash, check for no-op,
+/// persist a new revision, supersede older versions, and notify watchers.
+/// Maximum number of optimistic retry attempts for policy version conflicts.
+const MERGE_RETRY_LIMIT: usize = 5;
+
+async fn merge_chunk_into_policy(
+    state: &ServerState,
+    sandbox_id: &str,
+    chunk: &DraftChunkRecord,
+) -> Result<(i64, String), Status> {
+    use navigator_core::proto::NetworkPolicyRule;
+
+    // Decode the proposed rule once — it doesn't change between retries.
+    let rule = NetworkPolicyRule::decode(chunk.proposed_rule.as_slice())
+        .map_err(|e| Status::internal(format!("decode proposed_rule failed: {e}")))?;
+
+    for attempt in 1..=MERGE_RETRY_LIMIT {
+        // Get the current active policy (re-read on each attempt).
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
+
+        let mut policy = if let Some(ref record) = latest {
+            ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+                .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?
+        } else {
+            ProtoSandboxPolicy::default()
+        };
+
+        let base_version = latest.as_ref().map_or(0, |r| r.version);
+
+        // Merge: if a rule for this endpoint already exists, add the binary
+        // to its binaries list. Otherwise insert the whole proposed rule.
+        if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
+            // Add the chunk's binary if not already present.
+            for b in &rule.binaries {
+                if !existing.binaries.iter().any(|eb| eb.path == b.path) {
+                    existing.binaries.push(b.clone());
+                }
+            }
+            // Also merge endpoints and L7 rules in case they differ.
+            for ep in &rule.endpoints {
+                if !existing
+                    .endpoints
+                    .iter()
+                    .any(|e| e.host == ep.host && e.port == ep.port)
+                {
+                    existing.endpoints.push(ep.clone());
+                }
+            }
+        } else {
+            policy
+                .network_policies
+                .insert(chunk.rule_name.clone(), rule.clone());
+        }
+
+        // Persist as a new version.
+        let payload = policy.encode_to_vec();
+        let hash = deterministic_policy_hash(&policy);
+        let next_version = base_version + 1;
+        let policy_id = uuid::Uuid::new_v4().to_string();
+
+        match state
+            .store
+            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
+            .await
+        {
+            Ok(()) => {
+                let _ = state
+                    .store
+                    .supersede_older_policies(sandbox_id, next_version)
+                    .await;
+
+                if attempt > 1 {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        version = next_version,
+                        "merge_chunk_into_policy: succeeded after version conflict retry"
+                    );
+                }
+
+                return Ok((next_version, hash));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                // Check for UNIQUE constraint violation (version conflict).
+                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        conflicting_version = next_version,
+                        "merge_chunk_into_policy: version conflict, retrying"
+                    );
+                    // Brief yield to let the winning write settle.
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(Status::internal(format!(
+                    "persist policy revision failed: {e}"
+                )));
+            }
+        }
+    }
+
+    Err(Status::aborted(format!(
+        "merge_chunk_into_policy: gave up after {} version conflict retries for rule '{}'",
+        MERGE_RETRY_LIMIT, chunk.rule_name
+    )))
+}
+
+/// Remove a previously-approved draft chunk's rule from the current active
+/// sandbox policy.
+///
+/// Returns `(new_version, policy_hash)`.
+async fn remove_chunk_from_policy(
+    state: &ServerState,
+    sandbox_id: &str,
+    chunk: &DraftChunkRecord,
+) -> Result<(i64, String), Status> {
+    for attempt in 1..=MERGE_RETRY_LIMIT {
+        // Get the current active policy (re-read on each attempt).
+        let latest = state
+            .store
+            .get_latest_policy(sandbox_id)
+            .await
+            .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?
+            .ok_or_else(|| Status::internal("no active policy to undo from"))?;
+
+        let mut policy = ProtoSandboxPolicy::decode(latest.policy_payload.as_slice())
+            .map_err(|e| Status::internal(format!("decode current policy failed: {e}")))?;
+
+        // Remove this chunk's binary from the rule. If no binaries remain,
+        // remove the entire rule.
+        let should_remove =
+            if let Some(existing) = policy.network_policies.get_mut(&chunk.rule_name) {
+                existing.binaries.retain(|b| b.path != chunk.binary);
+                existing.binaries.is_empty()
+            } else {
+                false
+            };
+        if should_remove {
+            policy.network_policies.remove(&chunk.rule_name);
+        }
+
+        // Persist as a new version.
+        let payload = policy.encode_to_vec();
+        let hash = deterministic_policy_hash(&policy);
+        let next_version = latest.version + 1;
+        let policy_id = uuid::Uuid::new_v4().to_string();
+
+        match state
+            .store
+            .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
+            .await
+        {
+            Ok(()) => {
+                let _ = state
+                    .store
+                    .supersede_older_policies(sandbox_id, next_version)
+                    .await;
+
+                if attempt > 1 {
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        version = next_version,
+                        "remove_chunk_from_policy: succeeded after version conflict retry"
+                    );
+                }
+
+                return Ok((next_version, hash));
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("UNIQUE") || msg.contains("unique") || msg.contains("duplicate") {
+                    warn!(
+                        sandbox_id = %sandbox_id,
+                        rule_name = %chunk.rule_name,
+                        attempt,
+                        conflicting_version = next_version,
+                        "remove_chunk_from_policy: version conflict, retrying"
+                    );
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+                return Err(Status::internal(format!(
+                    "persist policy revision failed: {e}"
+                )));
+            }
+        }
+    }
+
+    Err(Status::aborted(format!(
+        "remove_chunk_from_policy: gave up after {} version conflict retries for rule '{}'",
+        MERGE_RETRY_LIMIT, chunk.rule_name
+    )))
 }
 
 /// Compute a deterministic SHA-256 hash of a `SandboxPolicy`.

@@ -3,6 +3,7 @@
 
 //! HTTP CONNECT proxy with OPA policy evaluation and process-identity binding.
 
+use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine};
@@ -14,6 +15,7 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -128,6 +130,7 @@ impl ProxyHandle {
         entrypoint_pid: Arc<AtomicU32>,
         tls_state: Option<Arc<ProxyTlsState>>,
         inference_ctx: Option<Arc<InferenceContext>>,
+        denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -156,9 +159,10 @@ impl ProxyHandle {
                         let spid = entrypoint_pid.clone();
                         let tls = tls_state.clone();
                         let inf = inference_ctx.clone();
+                        let dtx = denial_tx.clone();
                         tokio::spawn(async move {
                             if let Err(err) =
-                                handle_tcp_connection(stream, opa, cache, spid, tls, inf).await
+                                handle_tcp_connection(stream, opa, cache, spid, tls, inf, dtx).await
                             {
                                 warn!(error = %err, "Proxy connection error");
                             }
@@ -190,6 +194,64 @@ impl Drop for ProxyHandle {
     }
 }
 
+/// Emit a denial event to the aggregator channel (if configured).
+/// Used by `handle_tcp_connection` which owns `Option<Sender>`.
+fn emit_denial(
+    tx: &Option<mpsc::UnboundedSender<DenialEvent>>,
+    host: &str,
+    port: u16,
+    binary: &str,
+    decision: &ConnectDecision,
+    reason: &str,
+    stage: &str,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(DenialEvent {
+            host: host.to_string(),
+            port,
+            binary: binary.to_string(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            deny_reason: reason.to_string(),
+            denial_stage: stage.to_string(),
+            l7_method: None,
+            l7_path: None,
+        });
+    }
+}
+
+/// Emit a denial event from a borrowed sender reference.
+/// Used by `handle_forward_proxy` which borrows `Option<&Sender>`.
+fn emit_denial_simple(
+    tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    host: &str,
+    port: u16,
+    binary: &str,
+    decision: &ConnectDecision,
+    reason: &str,
+    stage: &str,
+) {
+    if let Some(tx) = tx {
+        let _ = tx.send(DenialEvent {
+            host: host.to_string(),
+            port,
+            binary: binary.to_string(),
+            ancestors: decision
+                .ancestors
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect(),
+            deny_reason: reason.to_string(),
+            denial_stage: stage.to_string(),
+            l7_method: None,
+            l7_path: None,
+        });
+    }
+}
+
 async fn handle_tcp_connection(
     mut client: TcpStream,
     opa_engine: Arc<OpaEngine>,
@@ -197,6 +259,7 @@ async fn handle_tcp_connection(
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -239,6 +302,7 @@ async fn handle_tcp_connection(
             opa_engine,
             identity_cache,
             entrypoint_pid,
+            denial_tx.as_ref(),
         )
         .await;
     }
@@ -329,6 +393,15 @@ async fn handle_tcp_connection(
     );
 
     if matches!(decision.action, NetworkAction::Deny { .. }) {
+        emit_denial(
+            &denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            &deny_reason,
+            "connect",
+        );
         respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
         return Ok(());
     }
@@ -354,6 +427,15 @@ async fn handle_tcp_connection(
                         reason = %reason,
                         "CONNECT blocked: allowed_ips check failed"
                     );
+                    emit_denial(
+                        &denial_tx,
+                        &host_lc,
+                        port,
+                        &binary_str,
+                        &decision,
+                        &reason,
+                        "ssrf",
+                    );
                     respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                     return Ok(());
                 }
@@ -364,6 +446,15 @@ async fn handle_tcp_connection(
                     dst_port = port,
                     reason = %reason,
                     "CONNECT blocked: invalid allowed_ips in policy"
+                );
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
                 );
                 respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                 return Ok(());
@@ -381,6 +472,15 @@ async fn handle_tcp_connection(
                     dst_port = port,
                     reason = %reason,
                     "CONNECT blocked: internal address"
+                );
+                emit_denial(
+                    &denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
                 );
                 respond(&mut client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                 return Ok(());
@@ -1384,9 +1484,10 @@ fn rewrite_forward_request(raw: &[u8], used: usize, path: &str) -> Vec<u8> {
 
 /// Handle a plain HTTP forward proxy request (non-CONNECT).
 ///
-/// Restricted to private IP endpoints with explicit `allowed_ips` policy.
-/// Rewrites the absolute-form request to origin-form, connects upstream,
-/// and relays the response using `copy_bidirectional` for streaming support.
+/// Public IPs are allowed through when the endpoint passes OPA evaluation.
+/// Private IPs require explicit `allowed_ips` on the endpoint config (SSRF
+/// override). Rewrites the absolute-form request to origin-form, connects
+/// upstream, and relays the response using `copy_bidirectional` for streaming.
 async fn handle_forward_proxy(
     method: &str,
     target_uri: &str,
@@ -1396,6 +1497,7 @@ async fn handle_forward_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
+    denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     // 1. Parse the absolute-form URI
     let (scheme, host, port, path) = match parse_proxy_uri(target_uri) {
@@ -1487,89 +1589,99 @@ async fn handle_forward_proxy(
                 reason = %reason,
                 "FORWARD",
             );
+            emit_denial_simple(
+                denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                reason,
+                "forward",
+            );
             respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
             return Ok(());
         }
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
-    // 5. Require allowed_ips (forward proxy only works with explicit SSRF override)
+    // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
+    //    - If allowed_ips is set: validate resolved IPs against the allowlist
+    //      (this is the SSRF override for private IP destinations).
+    //    - If allowed_ips is empty: reject internal IPs, allow public IPs through.
     let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
-    if raw_allowed_ips.is_empty() {
-        info!(
-            src_addr = %peer_addr.ip(),
-            src_port = peer_addr.port(),
-            proxy_addr = %local_addr,
-            dst_host = %host_lc,
-            dst_port = port,
-            method = %method,
-            path = %path,
-            binary = %binary_str,
-            binary_pid = %pid_str,
-            ancestors = %ancestors_str,
-            cmdline = %cmdline_str,
-            action = "deny",
-            engine = "opa",
-            policy = %policy_str,
-            reason = "forward proxy requires allowed_ips on endpoint",
-            "FORWARD",
-        );
-        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
-    }
 
-    // 6. Resolve DNS and validate against allowed_ips
-    let addrs = match parse_allowed_ips(&raw_allowed_ips) {
-        Ok(nets) => match resolve_and_check_allowed_ips(&host, port, &nets).await {
+    let addrs = if !raw_allowed_ips.is_empty() {
+        // allowed_ips mode: validate resolved IPs against CIDR allowlist.
+        match parse_allowed_ips(&raw_allowed_ips) {
+            Ok(nets) => match resolve_and_check_allowed_ips(&host, port, &nets).await {
+                Ok(addrs) => addrs,
+                Err(reason) => {
+                    warn!(
+                        dst_host = %host_lc,
+                        dst_port = port,
+                        reason = %reason,
+                        "FORWARD blocked: allowed_ips check failed"
+                    );
+                    emit_denial_simple(
+                        denial_tx,
+                        &host_lc,
+                        port,
+                        &binary_str,
+                        &decision,
+                        &reason,
+                        "ssrf",
+                    );
+                    respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                    return Ok(());
+                }
+            },
+            Err(reason) => {
+                warn!(
+                    dst_host = %host_lc,
+                    dst_port = port,
+                    reason = %reason,
+                    "FORWARD blocked: invalid allowed_ips in policy"
+                );
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
+                );
+                respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+                return Ok(());
+            }
+        }
+    } else {
+        // No allowed_ips: reject internal IPs, allow public IPs through.
+        match resolve_and_reject_internal(&host, port).await {
             Ok(addrs) => addrs,
             Err(reason) => {
                 warn!(
                     dst_host = %host_lc,
                     dst_port = port,
                     reason = %reason,
-                    "FORWARD blocked: allowed_ips check failed"
+                    "FORWARD blocked: internal IP without allowed_ips"
+                );
+                emit_denial_simple(
+                    denial_tx,
+                    &host_lc,
+                    port,
+                    &binary_str,
+                    &decision,
+                    &reason,
+                    "ssrf",
                 );
                 respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
                 return Ok(());
             }
-        },
-        Err(reason) => {
-            warn!(
-                dst_host = %host_lc,
-                dst_port = port,
-                reason = %reason,
-                "FORWARD blocked: invalid allowed_ips in policy"
-            );
-            respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-            return Ok(());
         }
     };
 
-    // 7. Private-IP gate: forward proxy only to RFC 1918 private addresses
-    if !addrs.iter().all(|a| is_internal_ip(a.ip())) {
-        info!(
-            src_addr = %peer_addr.ip(),
-            src_port = peer_addr.port(),
-            proxy_addr = %local_addr,
-            dst_host = %host_lc,
-            dst_port = port,
-            method = %method,
-            path = %path,
-            binary = %binary_str,
-            binary_pid = %pid_str,
-            ancestors = %ancestors_str,
-            cmdline = %cmdline_str,
-            action = "deny",
-            engine = "opa",
-            policy = %policy_str,
-            reason = "forward proxy restricted to private IP endpoints",
-            "FORWARD",
-        );
-        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
-        return Ok(());
-    }
-
-    // 8. Connect upstream
+    // 6. Connect upstream
     let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
         Ok(s) => s,
         Err(e) => {
@@ -1604,11 +1716,11 @@ async fn handle_forward_proxy(
         "FORWARD",
     );
 
-    // 9. Rewrite request and forward to upstream
+    // 7. Rewrite request and forward to upstream
     let rewritten = rewrite_forward_request(buf, used, &path);
     upstream.write_all(&rewritten).await.into_diagnostic()?;
 
-    // 10. Relay remaining traffic bidirectionally (supports streaming)
+    // 8. Relay remaining traffic bidirectionally (supports streaming)
     let _ = tokio::io::copy_bidirectional(client, &mut upstream)
         .await
         .into_diagnostic()?;
@@ -2272,5 +2384,102 @@ mod tests {
         assert!(result_str.contains("Via: 1.0 upstream"));
         // Should not add a second Via header
         assert!(!result_str.contains("Via: 1.1 navigator-sandbox"));
+    }
+
+    // --- Forward proxy SSRF defence tests ---
+    //
+    // The forward proxy handler uses the same SSRF logic as the CONNECT path:
+    //   - No allowed_ips: resolve_and_reject_internal blocks private IPs, allows public.
+    //   - With allowed_ips: resolve_and_check_allowed_ips validates against allowlist.
+    //
+    // These tests document that contract for the forward proxy path specifically.
+
+    #[tokio::test]
+    async fn test_forward_public_ip_allowed_without_allowed_ips() {
+        // Public IPs (e.g. dns.google -> 8.8.8.8) should pass through
+        // resolve_and_reject_internal without needing allowed_ips.
+        let result = resolve_and_reject_internal("dns.google", 80).await;
+        assert!(
+            result.is_ok(),
+            "Public IP should be allowed without allowed_ips: {result:?}"
+        );
+        let addrs = result.unwrap();
+        assert!(!addrs.is_empty(), "Should resolve to at least one address");
+        // All resolved addresses should be public.
+        for addr in &addrs {
+            assert!(
+                !is_internal_ip(addr.ip()),
+                "dns.google should resolve to public IPs, got {}",
+                addr.ip()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_forward_private_ip_rejected_without_allowed_ips() {
+        // Private IP literals should be rejected by resolve_and_reject_internal.
+        let result = resolve_and_reject_internal("10.0.0.1", 80).await;
+        assert!(
+            result.is_err(),
+            "Private IP should be rejected without allowed_ips"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("internal address"),
+            "expected 'internal address' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_private_ip_accepted_with_allowed_ips() {
+        // Private IP with matching allowed_ips should pass through.
+        let nets = parse_allowed_ips(&["10.0.0.0/8".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets).await;
+        assert!(
+            result.is_ok(),
+            "Private IP with matching allowed_ips should be accepted: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_private_ip_rejected_with_wrong_allowed_ips() {
+        // Private IP not in allowed_ips should be rejected.
+        let nets = parse_allowed_ips(&["192.168.0.0/16".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("10.0.0.1", 80, &nets).await;
+        assert!(
+            result.is_err(),
+            "Private IP not in allowed_ips should be rejected"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("not in allowed_ips"),
+            "expected 'not in allowed_ips' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_loopback_always_blocked_even_with_allowed_ips() {
+        // Loopback addresses are always blocked, even if in allowed_ips.
+        let nets = parse_allowed_ips(&["127.0.0.0/8".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("127.0.0.1", 80, &nets).await;
+        assert!(result.is_err(), "Loopback should be always blocked");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected 'always-blocked' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_forward_link_local_always_blocked_even_with_allowed_ips() {
+        // Link-local / cloud metadata addresses are always blocked.
+        let nets = parse_allowed_ips(&["169.254.0.0/16".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
+        assert!(result.is_err(), "Link-local should be always blocked");
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected 'always-blocked' in error: {err}"
+        );
     }
 }

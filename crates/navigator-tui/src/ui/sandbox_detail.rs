@@ -35,14 +35,36 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         _ => "…",
     };
 
-    // Row 1: Name + Status
-    let row1 = Line::from(vec![
+    // Count pending draft recommendations for this sandbox.
+    let pending_count = app.sandbox_draft_counts.get(idx).copied().unwrap_or(0);
+    // Also check the live draft_chunks when on the sandbox screen (more up-to-date).
+    let pending_count = if pending_count > 0 {
+        pending_count
+    } else {
+        app.draft_chunks
+            .iter()
+            .filter(|c| c.status == "pending")
+            .count()
+    };
+
+    // Row 1: Name + Status + optional draft badge
+    let mut row1_spans = vec![
         Span::styled("  Name: ", styles::MUTED),
         Span::styled(name, styles::HEADING),
+    ];
+    if pending_count > 0 {
+        row1_spans.push(Span::raw(" "));
+        row1_spans.push(Span::styled(
+            format!(" {pending_count} pending "),
+            styles::BADGE,
+        ));
+    }
+    row1_spans.extend([
         Span::styled("              Status: ", styles::MUTED),
         Span::styled(format!("{status_indicator} "), phase_style),
         Span::styled(phase, phase_style),
     ]);
+    let row1 = Line::from(row1_spans);
 
     // Row 2: Image + Created + Age
     let row2 = Line::from(vec![
@@ -78,7 +100,26 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut lines = vec![Line::from(""), row1, row2, row3, row4];
 
+    // Show pending network rules prompt — but not when delete confirmation is
+    // active, since it would push the confirmation off the bottom of the pane.
+    if pending_count > 0 && !app.confirm_delete {
+        lines.push(Line::from(vec![
+            Span::styled("  ", styles::TEXT),
+            Span::styled(
+                format!(
+                    "{pending_count} pending network rule{}",
+                    if pending_count == 1 { "" } else { "s" }
+                ),
+                styles::ACCENT,
+            ),
+            Span::styled(" — press ", styles::MUTED),
+            Span::styled("[r]", styles::KEY_HINT),
+            Span::styled(" to review", styles::MUTED),
+        ]));
+    }
+
     // Delete confirmation in title area (same pattern as provider delete).
+    // Takes priority over the pending-policy prompt so it isn't pushed off-screen.
     if app.confirm_delete {
         lines.push(Line::from(""));
         lines.push(Line::from(vec![
@@ -93,8 +134,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         ]));
     }
 
+    let mut title_spans: Vec<Span<'_>> =
+        vec![Span::styled(format!(" Sandbox: {name} "), styles::HEADING)];
+    if pending_count > 0 {
+        title_spans.push(Span::styled(
+            format!(" {pending_count} pending "),
+            styles::BADGE,
+        ));
+        title_spans.push(Span::raw(" "));
+    }
     let block = Block::default()
-        .title(Span::styled(format!(" Sandbox: {name} "), styles::HEADING))
+        .title(Line::from(title_spans))
         .borders(Borders::ALL)
         .border_style(styles::BORDER) // non-interactive — unfocused border
         .padding(Padding::horizontal(1));

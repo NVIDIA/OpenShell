@@ -18,7 +18,9 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 | `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
-| `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, and log push (`CachedNavigatorClient`) |
+| `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedNavigatorClient`) |
+| `denial_aggregator.rs` | `DenialAggregator` background task -- receives `DenialEvent`s from the proxy, deduplicates by `(host, port, binary)`, drains on flush interval |
+| `mechanistic_mapper.rs` | Deterministic policy recommendation generator -- converts denial summaries to `PolicyChunk` proposals with confidence scores, rationale, and SSRF/private-IP detection |
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
@@ -319,7 +321,7 @@ sequenceDiagram
     GW-->>PL: policy + version + hash
     PL->>PL: Store initial version
 
-    loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 30)
+    loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 10)
         PL->>GW: GetSandboxPolicy(sandbox_id)
         GW-->>PL: policy + version + hash
         alt version > current_version
@@ -389,7 +391,7 @@ Proto messages involved:
 | Initial version fetch fails | Log warning, retry on next interval (poll loop continues) |
 | `reload_from_proto()` fails (L7 validation error) | Log warning, keep last-known-good engine, report FAILED status |
 | Status report RPC fails | Log warning, poll loop continues unaffected |
-| Poll interval env var unparseable | Fall back to default (30 seconds) |
+| Poll interval env var unparseable | Fall back to default (10 seconds) |
 
 ## Linux Enforcement
 

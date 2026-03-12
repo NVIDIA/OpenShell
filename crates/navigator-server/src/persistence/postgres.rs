@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use super::{ObjectRecord, PolicyRecord, current_time_ms, map_db_error, map_migrate_error};
+use super::{
+    DraftChunkRecord, ObjectRecord, PolicyRecord, current_time_ms, map_db_error, map_migrate_error,
+};
 use navigator_core::Result;
 use sqlx::postgres::PgPoolOptions;
 use sqlx::{PgPool, Row};
@@ -321,6 +323,188 @@ WHERE sandbox_id = $1 AND version < $2 AND status IN ('pending', 'loaded')
         .await
         .map_err(|e| map_db_error(&e))?;
         Ok(result.rows_affected())
+    }
+
+    // -------------------------------------------------------------------
+    // Draft policy chunk operations
+    // -------------------------------------------------------------------
+
+    pub async fn put_draft_chunk(&self, chunk: &DraftChunkRecord) -> Result<()> {
+        sqlx::query(
+            r"
+INSERT INTO draft_policy_chunks
+    (id, sandbox_id, draft_version, status, rule_name,
+     proposed_rule, rationale, security_notes, confidence,
+     created_at_ms, decided_at_ms, host, port, binary,
+     hit_count, first_seen_ms, last_seen_ms)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+ON CONFLICT (sandbox_id, host, port, binary)
+    WHERE status IN ('pending', 'approved', 'rejected')
+DO UPDATE SET
+    hit_count    = draft_policy_chunks.hit_count + EXCLUDED.hit_count,
+    last_seen_ms = EXCLUDED.last_seen_ms
+",
+        )
+        .bind(&chunk.id)
+        .bind(&chunk.sandbox_id)
+        .bind(chunk.draft_version)
+        .bind(&chunk.status)
+        .bind(&chunk.rule_name)
+        .bind(&chunk.proposed_rule)
+        .bind(&chunk.rationale)
+        .bind(&chunk.security_notes)
+        .bind(chunk.confidence)
+        .bind(chunk.created_at_ms)
+        .bind(chunk.decided_at_ms)
+        .bind(&chunk.host)
+        .bind(chunk.port)
+        .bind(&chunk.binary)
+        .bind(chunk.hit_count)
+        .bind(chunk.first_seen_ms)
+        .bind(chunk.last_seen_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(())
+    }
+
+    pub async fn get_draft_chunk(&self, id: &str) -> Result<Option<DraftChunkRecord>> {
+        let row = sqlx::query(
+            r"
+SELECT * FROM draft_policy_chunks WHERE id = $1
+",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(row.map(row_to_draft_chunk_record))
+    }
+
+    pub async fn list_draft_chunks(
+        &self,
+        sandbox_id: &str,
+        status_filter: Option<&str>,
+    ) -> Result<Vec<DraftChunkRecord>> {
+        let rows = if let Some(status) = status_filter {
+            sqlx::query(
+                r"
+SELECT * FROM draft_policy_chunks
+WHERE sandbox_id = $1 AND status = $2
+ORDER BY created_at_ms DESC
+",
+            )
+            .bind(sandbox_id)
+            .bind(status)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            sqlx::query(
+                r"
+SELECT * FROM draft_policy_chunks
+WHERE sandbox_id = $1
+ORDER BY created_at_ms DESC
+",
+            )
+            .bind(sandbox_id)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(rows.into_iter().map(row_to_draft_chunk_record).collect())
+    }
+
+    pub async fn update_draft_chunk_status(
+        &self,
+        id: &str,
+        status: &str,
+        decided_at_ms: Option<i64>,
+    ) -> Result<bool> {
+        let result = sqlx::query(
+            r"
+UPDATE draft_policy_chunks
+SET status = $2, decided_at_ms = $3
+WHERE id = $1
+",
+        )
+        .bind(id)
+        .bind(status)
+        .bind(decided_at_ms)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn update_draft_chunk_rule(&self, id: &str, proposed_rule: &[u8]) -> Result<bool> {
+        let result = sqlx::query(
+            r"
+UPDATE draft_policy_chunks
+SET proposed_rule = $2
+WHERE id = $1 AND status = 'pending'
+",
+        )
+        .bind(id)
+        .bind(proposed_rule)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_draft_chunks(&self, sandbox_id: &str, status: &str) -> Result<u64> {
+        let result = sqlx::query(
+            r"
+DELETE FROM draft_policy_chunks
+WHERE sandbox_id = $1 AND status = $2
+",
+        )
+        .bind(sandbox_id)
+        .bind(status)
+        .execute(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+        Ok(result.rows_affected())
+    }
+
+    pub async fn get_draft_version(&self, sandbox_id: &str) -> Result<i64> {
+        let row = sqlx::query(
+            r"
+SELECT COALESCE(MAX(draft_version), 0) as max_version
+FROM draft_policy_chunks
+WHERE sandbox_id = $1
+",
+        )
+        .bind(sandbox_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|e| map_db_error(&e))?;
+
+        Ok(row.get("max_version"))
+    }
+}
+
+fn row_to_draft_chunk_record(row: sqlx::postgres::PgRow) -> DraftChunkRecord {
+    DraftChunkRecord {
+        id: row.get("id"),
+        sandbox_id: row.get("sandbox_id"),
+        draft_version: row.get("draft_version"),
+        status: row.get("status"),
+        rule_name: row.get("rule_name"),
+        proposed_rule: row.get("proposed_rule"),
+        rationale: row.get("rationale"),
+        security_notes: row.get("security_notes"),
+        confidence: row.get("confidence"),
+        created_at_ms: row.get("created_at_ms"),
+        decided_at_ms: row.get("decided_at_ms"),
+        host: row.get("host"),
+        port: row.get("port"),
+        binary: row.get("binary"),
+        hit_count: row.get("hit_count"),
+        first_seen_ms: row.get("first_seen_ms"),
+        last_seen_ms: row.get("last_seen_ms"),
     }
 }
 

@@ -236,6 +236,69 @@ impl Navigator for TestNavigator {
     ) -> Result<Response<navigator_core::proto::PushSandboxLogsResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
+
+    async fn submit_policy_analysis(
+        &self,
+        _request: tonic::Request<navigator_core::proto::SubmitPolicyAnalysisRequest>,
+    ) -> Result<Response<navigator_core::proto::SubmitPolicyAnalysisResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_draft_policy(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetDraftPolicyRequest>,
+    ) -> Result<Response<navigator_core::proto::GetDraftPolicyResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn approve_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ApproveDraftChunkRequest>,
+    ) -> Result<Response<navigator_core::proto::ApproveDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn reject_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::RejectDraftChunkRequest>,
+    ) -> Result<Response<navigator_core::proto::RejectDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn approve_all_draft_chunks(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ApproveAllDraftChunksRequest>,
+    ) -> Result<Response<navigator_core::proto::ApproveAllDraftChunksResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn edit_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::EditDraftChunkRequest>,
+    ) -> Result<Response<navigator_core::proto::EditDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn undo_draft_chunk(
+        &self,
+        _request: tonic::Request<navigator_core::proto::UndoDraftChunkRequest>,
+    ) -> Result<Response<navigator_core::proto::UndoDraftChunkResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn clear_draft_chunks(
+        &self,
+        _request: tonic::Request<navigator_core::proto::ClearDraftChunksRequest>,
+    ) -> Result<Response<navigator_core::proto::ClearDraftChunksResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
+
+    async fn get_draft_history(
+        &self,
+        _request: tonic::Request<navigator_core::proto::GetDraftHistoryRequest>,
+    ) -> Result<Response<navigator_core::proto::GetDraftHistoryResponse>, Status> {
+        Err(Status::unimplemented("not implemented in test"))
+    }
 }
 
 // ---------------------------------------------------------------------------
