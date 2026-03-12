@@ -1,13 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-"""Test inference routing through inference.local (streaming and non-streaming).
+"""Test inference routing through both inference.local and direct endpoint access.
 
-Exercises both modes to surface the response-buffering bug where the proxy
-calls response.bytes().await on a streaming response, inflating TTFB from
-sub-second to the full generation time.
+Exercises four scenarios to verify streaming works correctly:
+  1. inference.local — non-streaming
+  2. inference.local — streaming
+  3. Direct NVIDIA endpoint (L7 TLS intercept) — non-streaming
+  4. Direct NVIDIA endpoint (L7 TLS intercept) — streaming
+
+The direct endpoint tests verify that the L7 REST relay path (relay_chunked /
+relay_until_eof) streams responses incrementally, in contrast with the
+inference.local interception path which previously buffered the entire body.
+
+Usage:
+  # inference.local only (no provider attached):
+  openshell sandbox create --policy sandbox-policy.yaml --upload inference.py \
+    -- python3 /sandbox/inference.py
+
+  # All 4 tests (attach the nvidia provider so NVIDIA_API_KEY is available):
+  openshell sandbox create --provider nvidia --policy sandbox-policy.yaml \
+    --upload inference.py -- python3 /sandbox/inference.py
 """
 
+import os
 import subprocess
 import sys
 import time
@@ -16,8 +32,6 @@ subprocess.check_call([sys.executable, "-m", "pip", "install", "--quiet", "opena
 
 from openai import OpenAI  # noqa: E402
 
-client = OpenAI(api_key="dummy", base_url="https://inference.local/v1")
-
 PROMPT = (
     "Write a 500-word essay on the history of computing, "
     "from Charles Babbage's Analytical Engine to modern GPUs."
@@ -25,14 +39,14 @@ PROMPT = (
 MESSAGES = [{"role": "user", "content": PROMPT}]
 
 
-def test_non_streaming():
+def run_non_streaming(client: OpenAI, label: str, model: str) -> None:
     print("=" * 60)
-    print("NON-STREAMING REQUEST")
+    print(f"NON-STREAMING — {label}")
     print("=" * 60)
 
     t0 = time.monotonic()
     response = client.chat.completions.create(
-        model="router",
+        model=model,
         messages=MESSAGES,
         temperature=0,
     )
@@ -47,9 +61,9 @@ def test_non_streaming():
     print()
 
 
-def test_streaming():
+def run_streaming(client: OpenAI, label: str, model: str) -> None:
     print("=" * 60)
-    print("STREAMING REQUEST")
+    print(f"STREAMING — {label}")
     print("=" * 60)
 
     t0 = time.monotonic()
@@ -57,7 +71,7 @@ def test_streaming():
     chunks = []
 
     stream = client.chat.completions.create(
-        model="router",
+        model=model,
         messages=MESSAGES,
         temperature=0,
         stream=True,
@@ -94,6 +108,32 @@ def test_streaming():
     print()
 
 
+DIRECT_URL = "https://integrate.api.nvidia.com/v1"
+DIRECT_MODEL = "meta/llama-3.1-8b-instruct"
+
+
+def main() -> None:
+    # --- inference.local tests (router injects auth + model) ---
+    local_client = OpenAI(api_key="dummy", base_url="https://inference.local/v1")
+
+    run_non_streaming(local_client, "inference.local", model="router")
+    run_streaming(local_client, "inference.local", model="router")
+
+    # --- Direct endpoint tests (L7 TLS intercept path) ---
+    # The API key is available when the sandbox is started with --provider nvidia.
+    api_key = os.environ.get("NVIDIA_API_KEY")
+    if api_key:
+        direct_client = OpenAI(api_key=api_key, base_url=DIRECT_URL)
+
+        run_non_streaming(direct_client, f"direct ({DIRECT_URL})", model=DIRECT_MODEL)
+        run_streaming(direct_client, f"direct ({DIRECT_URL})", model=DIRECT_MODEL)
+    else:
+        print("=" * 60)
+        print("SKIPPED — direct endpoint tests (NVIDIA_API_KEY not set)")
+        print("=" * 60)
+        print("  Attach the nvidia provider to enable: --provider nvidia")
+        print()
+
+
 if __name__ == "__main__":
-    test_non_streaming()
-    test_streaming()
+    main()
