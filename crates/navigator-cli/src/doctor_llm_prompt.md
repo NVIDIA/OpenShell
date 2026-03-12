@@ -3,49 +3,32 @@
 
 # Debug OpenShell Gateway
 
-You are diagnosing an OpenShell gateway cluster. Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker` or `kubectl` commands directly — always go through the `openshell doctor` interface. Run diagnostics automatically through the steps below in order. Stop and report findings as soon as a root cause is identified.
+You are diagnosing an OpenShell gateway cluster. Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor logs`, `openshell doctor exec`) to inspect and fix the cluster. Do **not** use raw `docker`, `ssh`, or `kubectl` commands directly — always go through the `openshell doctor` interface. The CLI auto-resolves local vs remote gateways, so the same commands work everywhere. Run diagnostics automatically through the steps below in order. Stop and report findings as soon as a root cause is identified.
 
 ## Tools Available
+
+All diagnostics go through three `openshell` commands. They auto-resolve local vs remote gateways — the same commands work for both:
 
 ```bash
 # Quick connectivity check (run this first)
 openshell status
 
-# Fetch container logs (latest 100 lines)
+# Fetch container logs
 openshell doctor logs --lines 100
-
-# Stream live logs
-openshell doctor logs --tail
+openshell doctor logs --tail          # stream live
 
 # Run any command inside the gateway container (KUBECONFIG is pre-configured)
 openshell doctor exec -- kubectl get pods -A
 openshell doctor exec -- kubectl -n openshell logs statefulset/openshell --tail=100
-openshell doctor exec -- sh
-
-# Target a specific gateway by name
-openshell doctor logs --name <name>
-openshell doctor exec --name <name> -- kubectl get pods -A
-
-# Target a remote gateway
-openshell doctor logs --name <name> --remote <host>
-openshell doctor exec --name <name> --remote <host> -- kubectl get pods -A
-```
-
-For operations that `doctor exec` cannot perform (container inspection, host-level Docker commands), use Docker directly:
-
-```bash
-# Local
-docker ps -a --filter name=openshell-cluster-
-docker inspect openshell-cluster-<name>
-docker port openshell-cluster-<name>
-
-# Remote
-ssh <host> docker ps -a --filter name=openshell-cluster-
+openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
+openshell doctor exec -- df -h /
+openshell doctor exec -- free -h
+openshell doctor exec -- sh           # interactive shell
 ```
 
 ## Overview
 
-`openshell gateway start` creates a Docker container running k3s with the OpenShell server and Envoy Gateway deployed via Helm. The deployment stages, in order, are:
+`openshell gateway start` creates a Docker container running k3s with the OpenShell server deployed via Helm. The deployment stages, in order, are:
 
 1. **Pre-deploy check**: `openshell gateway start` in interactive mode prompts to **reuse** (keep volume, clean stale nodes) or **recreate** (destroy everything, fresh start). `mise run cluster` always recreates before deploy.
 2. Ensure cluster image is available (local build or remote pull)
@@ -79,7 +62,7 @@ The default cluster name is `openshell`. The container is `openshell-cluster-{na
 Before running commands, establish:
 
 1. **Cluster name**: Default is `openshell`, giving container name `openshell-cluster-openshell`
-2. **Remote or local**: If the user deployed with `--remote <host>`, pass `--remote <host>` to all `openshell doctor` commands
+2. **Remote or local**: The `openshell doctor` commands auto-resolve this from gateway metadata — no special flags needed for the active gateway
 3. **Config directory**: `~/.config/openshell/gateways/{name}/`
 
 ### Step 0: Quick Connectivity Check
@@ -94,33 +77,7 @@ Common errors at this stage:
 - **`connection refused`**: The container isn't running or port mapping is broken
 - **`No gateway configured`**: No gateway has been deployed yet
 
-### Step 1: Check Docker Container State
-
-First, determine if the container exists and its state:
-
-```bash
-docker ps -a --filter name=openshell-cluster- --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'
-```
-
-If the container does not exist:
-
-```bash
-# Check if the image is available
-docker images 'openshell/cluster*' --format 'table {{.Repository}}\t{{.Tag}}\t{{.Size}}'
-```
-
-If the image is missing, re-deploy so bootstrap can pull the published cluster image (or set `OPENSHELL_CLUSTER_IMAGE` explicitly).
-
-If the container exists but is not running, inspect it:
-
-```bash
-docker inspect openshell-cluster-<name> --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}'
-```
-
-- **OOMKilled=true**: The host doesn't have enough memory.
-- **ExitCode != 0**: k3s crashed. Proceed to Step 2 for logs.
-
-### Step 2: Check Container Logs
+### Step 1: Check Container Logs
 
 Get recent container logs to identify startup failures:
 
@@ -135,7 +92,7 @@ Look for:
 - Manifest copy errors from `/opt/openshell/manifests/`
 - `iptables` or `cgroup` errors (privilege/capability issues)
 
-### Step 3: Check k3s Cluster Health
+### Step 2: Check k3s Cluster Health
 
 Verify k3s itself is functional:
 
@@ -150,7 +107,7 @@ openshell doctor exec -- kubectl get nodes -o wide
 openshell doctor exec -- kubectl get pods -A -o wide
 ```
 
-If `/readyz` fails, k3s is still starting or has crashed. Check container logs (Step 2).
+If `/readyz` fails, k3s is still starting or has crashed. Check container logs (Step 1).
 
 If pods are in `CrashLoopBackOff`, `ImagePullBackOff`, or `Pending`, investigate those pods specifically.
 
@@ -169,7 +126,7 @@ openshell doctor exec -- free -h
 
 If any pressure condition is `True`, pods will be evicted and new ones rejected. The bootstrap detects `HEALTHCHECK_NODE_PRESSURE` markers from the health-check script and aborts early with a clear diagnosis. To fix: free disk/memory on the host, then recreate the gateway.
 
-### Step 4: Check OpenShell Server StatefulSet
+### Step 3: Check OpenShell Server StatefulSet
 
 The OpenShell server is deployed via a HelmChart CR as a StatefulSet named `openshell` in the `openshell` namespace. Check its status:
 
@@ -190,34 +147,24 @@ openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-op
 Common issues:
 
 - **Replicas 0/0**: The StatefulSet has been scaled to zero — no pods are running. This can happen after a failed deploy, manual scale-down, or Helm values misconfiguration. Fix: `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1`
-- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 6). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/`. Ensure a valid `--registry-token` (or `OPENSHELL_REGISTRY_TOKEN`) was provided during deploy.
+- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 5). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/`. Ensure a valid `--registry-token` (or `OPENSHELL_REGISTRY_TOKEN`) was provided during deploy.
 - **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
 - **Pending**: Insufficient resources or scheduling constraints.
 
-### Step 5: Check Networking
+### Step 4: Check Networking
 
 The OpenShell server is exposed via a NodePort service on port `30051`:
 
 ```bash
 # Service status
 openshell doctor exec -- kubectl -n openshell get service/openshell
-
-# Check port bindings on the host
-docker port openshell-cluster-<name>
 ```
 
 Expected port: `30051/tcp` (mapped to configurable host port, default 8080; set via `--port` on deploy).
 
-If ports are missing or conflicting, another process may be using them. Check with:
+### Step 5: Check Image Availability
 
-```bash
-# On the host (or remote host)
-ss -tlnp | grep -E ':8080\s'
-```
-
-### Step 6: Check Image Availability
-
-Component images (server, sandbox, pki-job) can reach kubelet via two paths:
+Component images (server, sandbox) can reach kubelet via two paths:
 
 **Local/external pull mode** (default local via `mise run cluster`): Local images are tagged to the configured local registry base (default `127.0.0.1:5000/openshell/*`), pushed to that registry, and pulled by k3s via `registries.yaml` mirror endpoint (typically `host.docker.internal:5000`). The `cluster` task pushes prebuilt local tags (`openshell/*:dev`, falling back to `localhost:5000/openshell/*:dev` or `127.0.0.1:5000/openshell/*:dev`).
 
@@ -236,12 +183,6 @@ openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
 openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock images ls | grep openshell
 ```
 
-If images are missing, re-import with:
-
-```bash
-docker save <image-ref> | docker exec -i openshell-cluster-<name> ctr -a /run/k3s/containerd/containerd.sock images import -
-```
-
 **External pull mode** (remote deploy, or local with `OPENSHELL_REGISTRY_HOST`/`IMAGE_REPO_BASE` pointing at a non-local registry): Images are pulled from an external registry at runtime. The entrypoint generates `/etc/rancher/k3s/registries.yaml`.
 
 ```bash
@@ -254,7 +195,7 @@ openshell doctor exec -- crictl pull ghcr.io/nvidia/openshell/gateway:latest
 
 If `registries.yaml` is missing or has wrong values, verify env wiring (`OPENSHELL_REGISTRY_HOST`, `OPENSHELL_REGISTRY_INSECURE`, username/password for authenticated registries).
 
-### Step 7: Check mTLS / PKI
+### Step 6: Check mTLS / PKI
 
 TLS certificates are generated by the `navigator-bootstrap` crate (using `rcgen`) and stored as K8s secrets before the Helm release installs. There is no PKI job or cert-manager — certificates are applied directly via `kubectl apply`.
 
@@ -286,7 +227,7 @@ Common mTLS issues:
 - **CLI can't connect after redeploy**: Check that `~/.config/openshell/gateways/<name>/mtls/` contains `ca.crt`, `tls.crt`, `tls.key` and that they were updated at deploy time.
 - **Local mTLS files missing**: The gateway was deployed but CLI credentials weren't persisted (e.g., interrupted deploy). Extract from the cluster secret as shown above.
 
-### Step 8: Check Kubernetes Events
+### Step 7: Check Kubernetes Events
 
 Events catch scheduling failures, image pull errors, and resource issues:
 
@@ -302,7 +243,7 @@ Look for:
 - `OOMKilled` — memory limits too low
 - `FailedMount` — volume issues
 
-### Step 9: Check DNS Resolution
+### Step 8: Check DNS Resolution
 
 DNS misconfiguration is a common root cause, especially on remote/Linux hosts:
 
@@ -333,109 +274,79 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 
 | Symptom | Likely Cause | Fix |
 |---------|-------------|-----|
-| `tls handshake eof` from `openshell status` | Server not running or mTLS credentials missing/mismatched | Check StatefulSet replicas (Step 4) and mTLS files (Step 7) |
+| `tls handshake eof` from `openshell status` | Server not running or mTLS credentials missing/mismatched | Check StatefulSet replicas (Step 3) and mTLS files (Step 6) |
 | StatefulSet `0/0` replicas | StatefulSet scaled to zero (failed deploy, manual scale-down, or Helm misconfiguration) | `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1` |
-| Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 7) |
+| Local mTLS files missing | Deploy was interrupted before credentials were persisted | Extract from cluster secret `openshell-client-tls` (Step 6) |
 | Container not found | Image not built | `mise run docker:build:cluster` (local) or re-deploy (remote) |
 | Container exited, OOMKilled | Insufficient memory | Increase host memory or reduce workload |
-| Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `openshell doctor logs` and `docker inspect` for details |
+| Container exited, non-zero exit | k3s crash, port conflict, privilege issue | Check `openshell doctor logs` for details |
 | `/readyz` fails | k3s still starting or crashed | Wait longer or check container logs for k3s errors |
-| OpenShell pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | Check `openshell doctor exec -- kubectl describe pod` and `kubectl get pvc -n openshell` |
-| OpenShell pods `CrashLoopBackOff` | Server application error | Check `openshell doctor exec -- kubectl -n openshell logs statefulset/openshell` |
-| OpenShell pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | Check `k3s ctr -n k8s.io images ls` for component images (Step 6) |
-| OpenShell pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | Check `/etc/rancher/k3s/registries.yaml` credentials and DNS (Step 8) |
+| OpenShell pods `Pending` | Insufficient CPU/memory for scheduling, or PVC not bound | `openshell doctor exec -- kubectl describe pod -n openshell` and `openshell doctor exec -- kubectl get pvc -n openshell` |
+| OpenShell pods `CrashLoopBackOff` | Server application error | `openshell doctor exec -- kubectl -n openshell logs statefulset/openshell` |
+| OpenShell pods `ImagePullBackOff` (push mode) | Images not imported or wrong containerd namespace | `openshell doctor exec -- ctr -a /run/k3s/containerd/containerd.sock -n k8s.io images ls` (Step 5) |
+| OpenShell pods `ImagePullBackOff` (pull mode) | Registry auth or DNS issue | `openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml` and DNS (Step 8) |
 | Image import fails | Corrupt tar stream or containerd not ready | Retry after k3s is fully started; check container logs |
 | Push mode images not found by kubelet | Imported into wrong containerd namespace | Must use `k3s ctr -n k8s.io images import`, not `k3s ctr images import` |
-| mTLS secrets missing | Bootstrap couldn't apply secrets | Check deploy logs and verify `openshell` namespace exists (Step 7) |
-| mTLS mismatch after redeploy | PKI rotated but workload not restarted | Check TLS secrets exist and openshell pod restarted after cert rotation (Step 7) |
-| Helm install job failed | Chart values error or dependency issue | Check `helm-install-openshell` job logs in `kube-system` |
+| mTLS secrets missing | Bootstrap couldn't apply secrets (namespace not ready) | Check deploy logs and verify `openshell` namespace exists (Step 6) |
+| mTLS mismatch after redeploy | PKI rotated but workload not restarted, or rollout failed | Check that all three TLS secrets exist and that the openshell pod restarted after cert rotation (Step 6) |
+| Helm install job failed | Chart values error or dependency issue | `openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell` |
 | Architecture mismatch (remote) | Built on arm64, deploying to amd64 | Cross-build the image for the target architecture |
-| SSH connection failed (remote) | SSH key/host/Docker issues | Test `ssh <host> docker ps` manually |
-| Port conflict | Another service on gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` |
-| gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote but metadata points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` |
-| DNS failures inside container | Entrypoint DNS detection failed | Check `/etc/rancher/k3s/resolv.conf` and container startup logs |
+| Port conflict | Another service on the configured gateway host port (default 8080) | Stop conflicting service or use `--port` on `openshell gateway start` to pick a different host port |
+| gRPC connect refused to `127.0.0.1:443` in CI | Docker daemon is remote (`DOCKER_HOST=tcp://...`) but metadata still points to loopback | Verify metadata endpoint host matches `DOCKER_HOST` and includes non-loopback host |
+| DNS failures inside container | Entrypoint DNS detection failed | `openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf` and `openshell doctor logs --lines 20` |
 | Node DiskPressure / MemoryPressure / PIDPressure | Insufficient disk, memory, or PIDs on host | Free disk (`docker system prune -a --volumes`), increase memory, or expand host resources |
 | Pods evicted with "The node had condition: [DiskPressure]" | Host disk full, kubelet evicting pods | Free disk space on host, then `openshell gateway destroy <name> && openshell gateway start` |
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
 | Stale NotReady nodes from previous deploys | Volume reused across container recreations | Deploy flow auto-cleans stale nodes; if it still fails, manually delete NotReady nodes or choose "Recreate" when prompted |
-| gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images | Verify rendered `openshell-helmchart.yaml` uses expected push refs |
-
-## Remote Cluster Debugging
-
-For clusters deployed with `--remote <host>`, pass `--remote <host>` to all `openshell doctor` commands:
-
-```bash
-openshell doctor logs --name <name> --remote <host>
-openshell doctor exec --name <name> --remote <host> -- kubectl get pods -A
-```
-
-For direct Docker access on the remote host:
-
-```bash
-ssh <host> docker ps -a
-ssh <host> docker logs openshell-cluster-<name>
-ssh <host> docker exec openshell-cluster-<name> sh -lc 'KUBECONFIG=/etc/rancher/k3s/k3s.yaml kubectl get pods -A'
-```
+| gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `openshell-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
 
 ## Full Diagnostic Dump
 
 Run all diagnostics at once for a comprehensive report:
 
 ```bash
-NAME="openshell"  # cluster name, adjust if needed
-
 echo "=== Connectivity Check ==="
 openshell status
 
-echo "=== Container State ==="
-docker ps -a --filter "name=openshell-cluster-${NAME}" --format 'table {{.ID}}\t{{.Names}}\t{{.Status}}\t{{.Ports}}'
-docker inspect "openshell-cluster-${NAME}" --format '{{.State.Status}} exit={{.State.ExitCode}} oom={{.State.OOMKilled}} error={{.State.Error}}' 2>/dev/null
-
 echo "=== Container Logs (last 50 lines) ==="
-openshell doctor logs --name "$NAME" --lines 50
+openshell doctor logs --lines 50
 
 echo "=== k3s Readiness ==="
-openshell doctor exec --name "$NAME" -- kubectl get --raw='/readyz'
+openshell doctor exec -- kubectl get --raw='/readyz'
 
 echo "=== Nodes ==="
-openshell doctor exec --name "$NAME" -- kubectl get nodes -o wide
+openshell doctor exec -- kubectl get nodes -o wide
 
 echo "=== Node Conditions ==="
-openshell doctor exec --name "$NAME" -- kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{range .status.conditions[*]} {.type}={.status}{end}{"\n"}{end}'
+openshell doctor exec -- kubectl get nodes -o jsonpath='{range .items[*]}{.metadata.name}{range .status.conditions[*]} {.type}={.status}{end}{"\n"}{end}'
 
 echo "=== Disk Usage ==="
-openshell doctor exec --name "$NAME" -- df -h /
+openshell doctor exec -- df -h /
 
 echo "=== All Pods ==="
-openshell doctor exec --name "$NAME" -- kubectl get pods -A -o wide
+openshell doctor exec -- kubectl get pods -A -o wide
 
 echo "=== Failing Pods ==="
-openshell doctor exec --name "$NAME" -- kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
+openshell doctor exec -- kubectl get pods -A --field-selector=status.phase!=Running,status.phase!=Succeeded
 
 echo "=== OpenShell StatefulSet ==="
-openshell doctor exec --name "$NAME" -- kubectl -n openshell get statefulset/openshell -o wide
+openshell doctor exec -- kubectl -n openshell get statefulset/openshell -o wide
 
 echo "=== OpenShell Service ==="
-openshell doctor exec --name "$NAME" -- kubectl -n openshell get service/openshell
+openshell doctor exec -- kubectl -n openshell get service/openshell
 
 echo "=== TLS Secrets ==="
-openshell doctor exec --name "$NAME" -- kubectl -n openshell get secret openshell-server-tls openshell-server-client-ca openshell-client-tls
+openshell doctor exec -- kubectl -n openshell get secret openshell-server-tls openshell-server-client-ca openshell-client-tls
 
 echo "=== Recent Events ==="
-openshell doctor exec --name "$NAME" -- kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
+openshell doctor exec -- kubectl get events -A --sort-by=.lastTimestamp | tail -n 50
 
 echo "=== Helm Install OpenShell Logs ==="
-openshell doctor exec --name "$NAME" -- kubectl -n kube-system logs -l job-name=helm-install-openshell --tail=100
+openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-openshell --tail=100
 
 echo "=== Registry Configuration ==="
-openshell doctor exec --name "$NAME" -- cat /etc/rancher/k3s/registries.yaml
+openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
 
 echo "=== DNS Configuration ==="
-openshell doctor exec --name "$NAME" -- cat /etc/rancher/k3s/resolv.conf
-
-echo "=== Port Bindings ==="
-docker port "openshell-cluster-${NAME}"
-
-echo "=== Local mTLS Credentials ==="
-ls -la ~/.config/openshell/gateways/${NAME}/mtls/ 2>/dev/null || echo "mTLS directory not found"
+openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf
 ```
