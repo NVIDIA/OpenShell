@@ -121,10 +121,11 @@ network_policies:
     name: vscode
     endpoints:
       - { host: update.code.visualstudio.com, port: 443 }
-      - { host: "*.vo.msecnd.net", port: 443 }
+      # NOTE: OPA host matching uses exact equality, not glob — list hosts explicitly.
+      - { host: az764295.vo.msecnd.net, port: 443 }
       - { host: vscode.download.prss.microsoft.com, port: 443 }
       - { host: marketplace.visualstudio.com, port: 443 }
-      - { host: "*.gallerycdn.vsassets.io", port: 443 }
+      - { host: gallerycdn.vsassets.io, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
       - { path: /usr/bin/wget }
@@ -135,7 +136,10 @@ network_policies:
     name: cursor
     endpoints:
       - { host: cursor.blob.core.windows.net, port: 443 }
-      - { host: "*.cursor.sh", port: 443 }
+      # NOTE: OPA host matching uses exact equality, not glob — list hosts explicitly.
+      - { host: api2.cursor.sh, port: 443 }
+      - { host: repo.cursor.sh, port: 443 }
+      - { host: download.cursor.sh, port: 443 }
       - { host: cursor.download.prss.microsoft.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
