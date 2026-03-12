@@ -100,7 +100,7 @@ WORKDIR /sandbox
 # iproute2 is needed for network namespace management (ip netns, veth pairs)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl dnsutils iproute2 iputils-ping \
-    net-tools netcat-openbsd procps traceroute \
+    net-tools netcat-openbsd openssh-sftp-server procps traceroute \
     && rm -rf /var/lib/apt/lists/*
 
 # Create supervisor and sandbox users/groups
