@@ -174,7 +174,7 @@ docker buildx build \
 # ---------------------------------------------------------------------------
 mkdir -p deploy/docker/.build/charts
 echo "Packaging helm chart..."
-helm package deploy/helm/navigator -d deploy/docker/.build/charts/
+helm package deploy/helm/openshell -d deploy/docker/.build/charts/
 
 # ---------------------------------------------------------------------------
 # Step 3: Build and push multi-arch cluster image.

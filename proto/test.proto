@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package navigator.test.v1;
+package openshell.test.v1;
 
 // Simple object for persistence tests.
 message ObjectForTest {

@@ -221,7 +221,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 echo "==> Building openshell CLI..."
-mise exec -- cargo build --release -p navigator-cli
+mise exec -- cargo build --release -p openshell-cli
 mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/openshell "$HOME/.local/bin/openshell"
 

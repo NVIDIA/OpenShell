@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-sandbox"
+description = "OpenShell process sandbox and monitor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-sandbox"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+openshell-policy = { path = "../openshell-policy" }
+openshell-router = { path = "../openshell-router" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# gRPC
+tonic = { workspace = true, features = ["channel", "tls"] }
+tokio-stream = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Error handling
+miette = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+russh = "0.57"
+rand_core = "0.6"
+
+# OPA policy evaluation (no default features — full-opa pulls in opa-runtime which requires git in build)
+regorus = { version = "0.9", default-features = false, features = ["std", "arc", "glob", "yaml"] }
+
+# TLS
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rcgen = { workspace = true }
+webpki-roots = { workspace = true }
+
+# HTTP
+bytes = { workspace = true }
+
+# IP network / CIDR parsing
+ipnet = "2"
+
+# Serialization
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tracing-appender = { workspace = true }
+
+# Unix/Process
+nix = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = "0.4"
+seccompiler = "0.5"
+uuid = { version = "1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3"
+temp-env = "0.3"
+
+[lints]
+workspace = true

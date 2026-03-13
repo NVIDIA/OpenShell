@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, navigator_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -62,7 +62,7 @@ def provider(
     """Create a provider for the duration of the block, then delete it."""
     _delete_provider(stub, name)
     stub.CreateProvider(
-        navigator_pb2.CreateProviderRequest(
+        openshell_pb2.CreateProviderRequest(
             provider=datamodel_pb2.Provider(
                 name=name,
                 type=provider_type,
@@ -79,7 +79,7 @@ def provider(
 def _delete_provider(stub: object, name: str) -> None:
     """Delete a provider, ignoring not-found errors."""
     try:
-        stub.DeleteProvider(navigator_pb2.DeleteProviderRequest(name=name))
+        stub.DeleteProvider(openshell_pb2.DeleteProviderRequest(name=name))
     except grpc.RpcError as exc:
         if hasattr(exc, "code") and exc.code() == grpc.StatusCode.NOT_FOUND:
             pass
@@ -235,7 +235,7 @@ def test_credentials_not_in_persisted_spec_environment(
 
         with sandbox(spec=spec, delete_on_exit=True) as sb:
             fetched = sandbox_client._stub.GetSandbox(
-                navigator_pb2.GetSandboxRequest(name=sb.sandbox.name)
+                openshell_pb2.GetSandboxRequest(name=sb.sandbox.name)
             )
             persisted_env = dict(fetched.sandbox.spec.environment)
             assert "ANTHROPIC_API_KEY" not in persisted_env, (
@@ -258,7 +258,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
     try:
         stub.CreateProvider(
-            navigator_pb2.CreateProviderRequest(
+            openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="generic",
@@ -269,7 +269,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
         )
 
         stub.UpdateProvider(
-            navigator_pb2.UpdateProviderRequest(
+            openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="",
@@ -278,7 +278,7 @@ def test_update_provider_preserves_unset_credentials_and_config(
             )
         )
 
-        got = stub.GetProvider(navigator_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
         assert p.credentials["KEY_A"] == "rotated-a"
         assert p.credentials["KEY_B"] == "val-b", "KEY_B should be preserved"
@@ -299,7 +299,7 @@ def test_update_provider_empty_maps_preserves_all(
 
     try:
         stub.CreateProvider(
-            navigator_pb2.CreateProviderRequest(
+            openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="generic",
@@ -310,7 +310,7 @@ def test_update_provider_empty_maps_preserves_all(
         )
 
         stub.UpdateProvider(
-            navigator_pb2.UpdateProviderRequest(
+            openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="",
@@ -318,7 +318,7 @@ def test_update_provider_empty_maps_preserves_all(
             )
         )
 
-        got = stub.GetProvider(navigator_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
         assert p.credentials["TOKEN"] == "secret"
         assert p.config["URL"] == "https://api.example.com"
@@ -336,7 +336,7 @@ def test_update_provider_merges_config_preserves_credentials(
 
     try:
         stub.CreateProvider(
-            navigator_pb2.CreateProviderRequest(
+            openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="generic",
@@ -347,7 +347,7 @@ def test_update_provider_merges_config_preserves_credentials(
         )
 
         stub.UpdateProvider(
-            navigator_pb2.UpdateProviderRequest(
+            openshell_pb2.UpdateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="",
@@ -356,7 +356,7 @@ def test_update_provider_merges_config_preserves_credentials(
             )
         )
 
-        got = stub.GetProvider(navigator_pb2.GetProviderRequest(name=name))
+        got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
         assert p.credentials["API_KEY"] == "original-key", (
             "credentials should be untouched"
@@ -376,7 +376,7 @@ def test_update_provider_rejects_type_change(
 
     try:
         stub.CreateProvider(
-            navigator_pb2.CreateProviderRequest(
+            openshell_pb2.CreateProviderRequest(
                 provider=datamodel_pb2.Provider(
                     name=name,
                     type="generic",
@@ -387,7 +387,7 @@ def test_update_provider_rejects_type_change(
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateProvider(
-                navigator_pb2.UpdateProviderRequest(
+                openshell_pb2.UpdateProviderRequest(
                     provider=datamodel_pb2.Provider(
                         name=name,
                         type="nvidia",

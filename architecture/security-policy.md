@@ -16,7 +16,7 @@ The sandbox supervisor loads policy through one of two paths, selected at startu
 Provide a Rego rules file and a YAML data file via CLI flags or environment variables:
 
 ```bash
-navigator-sandbox \
+openshell-sandbox \
   --policy-rules sandbox-policy.rego \
   --policy-data dev-sandbox-policy.yaml \
   -- /bin/bash
@@ -27,25 +27,25 @@ navigator-sandbox \
 | `--policy-rules` | `OPENSHELL_POLICY_RULES` | Path to `.rego` file containing evaluation rules |
 | `--policy-data`  | `OPENSHELL_POLICY_DATA`  | Path to YAML file containing policy data         |
 
-The YAML data file is preprocessed before loading into the OPA engine: L7 policies are validated, and `access` presets are expanded into explicit `rules` arrays. See `crates/navigator-sandbox/src/opa.rs` -- `preprocess_yaml_data()`.
+The YAML data file is preprocessed before loading into the OPA engine: L7 policies are validated, and `access` presets are expanded into explicit `rules` arrays. See `crates/openshell-sandbox/src/opa.rs` -- `preprocess_yaml_data()`.
 
 ### gRPC Mode (Production)
 
 When the sandbox runs inside a managed cluster, it fetches its typed protobuf policy from the gateway:
 
 ```bash
-navigator-sandbox \
+openshell-sandbox \
   --sandbox-id abc123 \
-  --navigator-endpoint https://navigator:8080 \
+  --openshell-endpoint https://openshell:8080 \
   -- /bin/bash
 ```
 
 | Flag                     | Environment Variable   | Description                  |
 | ------------------------ | ---------------------- | ---------------------------- |
 | `--sandbox-id`           | `OPENSHELL_SANDBOX_ID` | Sandbox ID for policy lookup |
-| `--navigator-endpoint`   | `OPENSHELL_ENDPOINT`   | Gateway gRPC endpoint        |
+| `--openshell-endpoint`   | `OPENSHELL_ENDPOINT`   | Gateway gRPC endpoint        |
 
-The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`sandbox-policy.rego` compiled via `include_str!`). See `crates/navigator-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
+The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbox.proto`). The sandbox supervisor converts this proto into JSON, validates L7 config, expands presets, and loads it into the OPA engine using baked-in Rego rules (`sandbox-policy.rego` compiled via `include_str!`). See `crates/openshell-sandbox/src/opa.rs` -- `OpaEngine::from_proto()`.
 
 ### Policy Loading Sequence
 
@@ -53,7 +53,7 @@ The gateway returns a `SandboxPolicy` protobuf message (defined in `proto/sandbo
 flowchart TD
     START[Sandbox Startup] --> CHECK{File mode?<br/>--policy-rules +<br/>--policy-data}
     CHECK -->|Yes| FILE[Read .rego + .yaml from disk]
-    CHECK -->|No| OPENSHELL{gRPC mode?<br/>--sandbox-id +<br/>--navigator-endpoint}
+    CHECK -->|No| OPENSHELL{gRPC mode?<br/>--sandbox-id +<br/>--openshell-endpoint}
     OPENSHELL -->|Yes| FETCH[Fetch SandboxPolicy proto via gRPC]
     OPENSHELL -->|No| ERR[Error: no policy source]
 
@@ -69,7 +69,7 @@ flowchart TD
 
 ### Priority
 
-File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--navigator-endpoint` are provided, file mode is used. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`.
+File mode takes precedence. If both `--policy-rules`/`--policy-data` and `--sandbox-id`/`--openshell-endpoint` are provided, file mode is used. See `crates/openshell-sandbox/src/lib.rs` -- `load_policy()`.
 
 ## Live Policy Updates
 
@@ -86,7 +86,7 @@ Policy fields fall into two categories based on when they are enforced:
 | **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
 | **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `openshell policy set` |
 
-Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/navigator-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
+Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/openshell-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
 
 ### Network Mode Immutability
 
@@ -95,7 +95,7 @@ The network mode (Block vs. Proxy) cannot change after sandbox creation. This is
 - **Block to Proxy**: Requires creating a network namespace, veth pair, and starting the CONNECT proxy -- none of which exist if the sandbox started in Block mode.
 - **Proxy to Block**: Requires removing the proxy, veth pair, and network namespace, and applying a stricter seccomp filter that blocks `AF_INET`/`AF_INET6` -- not possible on a running process.
 
-An update that adds `network_policies` to a sandbox created without them (or removes all `network_policies` from a sandbox created with them) is rejected. See `crates/navigator-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
+An update that adds `network_policies` to a sandbox created without them (or removes all `network_policies` from a sandbox created with them) is rejected. See `crates/openshell-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
 
 ### Update Flow
 
@@ -104,9 +104,9 @@ The update mechanism uses a poll-based model with versioned policy revisions and
 ```mermaid
 sequenceDiagram
     participant CLI as nav policy set
-    participant GW as Gateway (navigator-server)
+    participant GW as Gateway (openshell-server)
     participant DB as Persistence (SQLite/Postgres)
-    participant SB as Sandbox (navigator-sandbox)
+    participant SB as Sandbox (openshell-sandbox)
 
     CLI->>GW: UpdateSandboxPolicy(name, new_policy)
     GW->>GW: Validate static fields unchanged
@@ -144,16 +144,16 @@ sequenceDiagram
 
 Each sandbox maintains an independent, monotonically increasing version counter for its policy revisions:
 
-- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxPolicy` call if no explicit revision exists in the policy history table. See `crates/navigator-server/src/grpc.rs` -- `get_sandbox_policy()`.
+- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxPolicy` call if no explicit revision exists in the policy history table. See `crates/openshell-server/src/grpc.rs` -- `get_sandbox_policy()`.
 - Each `UpdateSandboxPolicy` call computes the next version as `latest_version + 1` and persists a new `PolicyRecord` with status `"pending"`.
 - When a new version is persisted, all older revisions still in `"pending"` status are marked `"superseded"` via `supersede_pending_policies()`. This handles rapid successive updates where the sandbox has not yet picked up an intermediate version.
 - The `Sandbox` protobuf object carries a `current_policy_version` field (see `proto/datamodel.proto`) that is updated when the sandbox reports a successful load.
 
-Each revision is stored as a `PolicyRecord` containing the full serialized protobuf payload, a SHA-256 hash of that payload, a status string, and timestamps. See `crates/navigator-server/src/persistence/mod.rs` -- `PolicyRecord`.
+Each revision is stored as a `PolicyRecord` containing the full serialized protobuf payload, a SHA-256 hash of that payload, a status string, and timestamps. See `crates/openshell-server/src/persistence/mod.rs` -- `PolicyRecord`.
 
 ### Deterministic Policy Hashing
 
-Policy hashes use a deterministic function that avoids the non-determinism of protobuf's `encode_to_vec()` on `map` fields. Protobuf `map` fields are backed by `HashMap`, whose iteration order is randomized, so encoding the same logical policy twice can produce different byte sequences. The `deterministic_policy_hash()` function avoids this by hashing each top-level field individually and sorting `network_policies` map entries by key before hashing. See `crates/navigator-server/src/grpc.rs` -- `deterministic_policy_hash()`.
+Policy hashes use a deterministic function that avoids the non-determinism of protobuf's `encode_to_vec()` on `map` fields. Protobuf `map` fields are backed by `HashMap`, whose iteration order is randomized, so encoding the same logical policy twice can produce different byte sequences. The `deterministic_policy_hash()` function avoids this by hashing each top-level field individually and sorting `network_policies` map entries by key before hashing. See `crates/openshell-server/src/grpc.rs` -- `deterministic_policy_hash()`.
 
 The hash is computed as follows:
 
@@ -177,7 +177,7 @@ This guarantees that the same logical policy always produces the same hash regar
 
 ### Sandbox Poll Loop
 
-In gRPC mode, the sandbox spawns a background task that periodically polls the gateway for policy updates. See `crates/navigator-sandbox/src/lib.rs` -- `run_policy_poll_loop()`.
+In gRPC mode, the sandbox spawns a background task that periodically polls the gateway for policy updates. See `crates/openshell-sandbox/src/lib.rs` -- `run_policy_poll_loop()`.
 
 | Parameter | Default | Override |
 |-----------|---------|----------|
@@ -185,20 +185,20 @@ In gRPC mode, the sandbox spawns a background task that periodically polls the g
 
 The poll loop:
 
-1. Connects a reusable gRPC client (`CachedNavigatorClient`) to avoid per-poll TLS handshake overhead.
+1. Connects a reusable gRPC client (`CachedOpenShellClient`) to avoid per-poll TLS handshake overhead.
 2. Fetches the current policy via `GetSandboxPolicy`, which returns the latest version, its policy payload, and a SHA-256 hash.
 3. Compares the returned version against the locally tracked `current_version`. If the server version is not greater, the loop sleeps and retries.
 4. On a new version, calls `OpaEngine::reload_from_proto()` which builds a complete new `regorus::Engine` through the same validated pipeline as the initial load (proto-to-JSON conversion, L7 validation, access preset expansion).
 5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>`. If it fails, the previous engine is untouched.
 6. Reports success or failure back to the server via `ReportPolicyStatus`.
 
-See `crates/navigator-sandbox/src/grpc_client.rs` -- `CachedNavigatorClient`.
+See `crates/openshell-sandbox/src/grpc_client.rs` -- `CachedOpenShellClient`.
 
 ### Last-Known-Good (LKG) Behavior
 
 When a new policy version fails validation during reload, the sandbox keeps the previous policy active. This provides safe rollback semantics:
 
-- `OpaEngine::reload_from_proto()` constructs a complete new engine via `OpaEngine::from_proto()` before touching the existing one. If `from_proto()` returns an error (L7 validation failures, preset expansion errors, malformed proto data), the existing engine's `Mutex<regorus::Engine>` is never locked for replacement. See `crates/navigator-sandbox/src/opa.rs` -- `reload_from_proto()`.
+- `OpaEngine::reload_from_proto()` constructs a complete new engine via `OpaEngine::from_proto()` before touching the existing one. If `from_proto()` returns an error (L7 validation failures, preset expansion errors, malformed proto data), the existing engine's `Mutex<regorus::Engine>` is never locked for replacement. See `crates/openshell-sandbox/src/opa.rs` -- `reload_from_proto()`.
 - The failure error message is reported back to the server via `ReportPolicyStatus` with `PolicyStatus::FAILED` and stored in the `PolicyRecord.load_error` field.
 - The CLI's `--wait` flag polls `GetSandboxPolicyStatus` and surfaces the error to the operator.
 
@@ -245,9 +245,9 @@ nav policy list <sandbox-name> --limit 20
 | `--rev N` | `0` (latest) | Retrieve a specific policy revision by version number instead of the latest. Maps to the `version` field of `GetSandboxPolicyStatusRequest` -- version `0` resolves to the latest revision server-side. |
 | `--full` | off | Print the complete policy as YAML after the metadata summary. The YAML output uses the same schema as the `--policy` input file, so it round-trips: you can save it to a file and pass it back to `nav policy set --policy`. |
 
-When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/navigator-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/navigator-cli/src/run.rs` -- `policy_to_yaml()`, `policy_get()`.
+When `--full` is specified, the server includes the deserialized `SandboxPolicy` protobuf in the `SandboxPolicyRevision.policy` field (see `crates/openshell-server/src/grpc.rs` -- `policy_record_to_revision()` with `include_policy: true`). The CLI converts this proto back to YAML via `policy_to_yaml()`, which uses a `BTreeMap` for `network_policies` to produce deterministic key ordering. See `crates/openshell-cli/src/run.rs` -- `policy_to_yaml()`, `policy_get()`.
 
-See `crates/navigator-cli/src/main.rs` -- `PolicyCommands` enum, `crates/navigator-cli/src/run.rs` -- `policy_set()`, `policy_get()`, `policy_list()`.
+See `crates/openshell-cli/src/main.rs` -- `PolicyCommands` enum, `crates/openshell-cli/src/run.rs` -- `policy_set()`, `policy_get()`, `policy_list()`.
 
 ---
 
@@ -299,11 +299,11 @@ Controls which filesystem paths the sandboxed process can access. Enforced via L
 
 **Enforcement mapping**: Each path becomes a Landlock `PathBeneath` rule. Read-only paths receive `AccessFs::from_read(ABI::V1)` permissions. Read-write paths receive `AccessFs::from_all(ABI::V1)` permissions (read, write, execute, create, delete, rename). All other paths are denied by the Landlock ruleset.
 
-**Filesystem preparation**: Before the child process spawns, the supervisor creates any `read_write` directories that do not exist and sets their ownership to `process.run_as_user`:`process.run_as_group` via `chown()`. See `crates/navigator-sandbox/src/lib.rs` -- `prepare_filesystem()`.
+**Filesystem preparation**: Before the child process spawns, the supervisor creates any `read_write` directories that do not exist and sets their ownership to `process.run_as_user`:`process.run_as_group` via `chown()`. See `crates/openshell-sandbox/src/lib.rs` -- `prepare_filesystem()`.
 
-**Working directory**: When `include_workdir` is `true` and a `--workdir` is specified, the working directory path is appended to `read_write` if not already present. See `crates/navigator-sandbox/src/sandbox/linux/landlock.rs` -- `apply()`.
+**Working directory**: When `include_workdir` is `true` and a `--workdir` is specified, the working directory path is appended to `read_write` if not already present. See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `apply()`.
 
-**TLS directory**: When network proxy mode is active with TLS termination enabled, the directory `/etc/navigator-tls` is automatically appended to `read_only` so sandbox processes can read the ephemeral CA certificate files.
+**TLS directory**: When network proxy mode is active with TLS termination enabled, the directory `/etc/openshell-tls` is automatically appended to `read_only` so sandbox processes can read the ephemeral CA certificate files.
 
 ```yaml
 filesystem_policy:
@@ -338,7 +338,7 @@ Controls Landlock LSM compatibility behavior. **Static field** -- immutable afte
 | `best_effort`      | If Landlock is unavailable (older kernel, unprivileged container), log a warning and continue without filesystem sandboxing |
 | `hard_requirement` | If Landlock is unavailable, abort sandbox startup with an error                                                             |
 
-See `crates/navigator-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`.
+See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `compat_level()`.
 
 ```yaml
 landlock:
@@ -365,7 +365,7 @@ Controls privilege dropping for the sandboxed process. **Static field** -- immut
 5. Verify `geteuid()` matches the target UID
 6. Verify `setuid(0)` fails -- confirms root cannot be re-acquired
 
-This happens before Landlock and seccomp are applied because `initgroups` needs access to `/etc/group` and `/etc/passwd`, which Landlock may subsequently block. The post-condition checks (steps 3, 5, 6) are async-signal-safe and add negligible overhead while guarding against hypothetical kernel-level defects. See `crates/navigator-sandbox/src/process.rs` -- `drop_privileges()`.
+This happens before Landlock and seccomp are applied because `initgroups` needs access to `/etc/group` and `/etc/passwd`, which Landlock may subsequently block. The post-condition checks (steps 3, 5, 6) are async-signal-safe and add negligible overhead while guarding against hypothetical kernel-level defects. See `crates/openshell-sandbox/src/process.rs` -- `drop_privileges()`.
 
 ```yaml
 process:
@@ -461,15 +461,15 @@ The `access` field provides shorthand for common rule sets. During preprocessing
 | `read-write` | `GET/**`, `HEAD/**`, `OPTIONS/**`, `POST/**`, `PUT/**`, `PATCH/**` | Read and write but not delete            |
 | `full`       | `*/**`                                                             | All methods, all paths                   |
 
-See `crates/navigator-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
+See `crates/openshell-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
 
 ---
 
 ### Inference Routing
 
-Inference routing to `inference.local` is handled by the proxy's `InferenceContext`, not by the OPA policy engine or an `inference` block in the policy YAML. The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests (e.g., `POST /v1/chat/completions`, `POST /v1/messages`) through the sandbox-local `navigator-router`. See [Inference Routing](inference-routing.md) for details on route configuration and the router architecture.
+Inference routing to `inference.local` is handled by the proxy's `InferenceContext`, not by the OPA policy engine or an `inference` block in the policy YAML. The proxy intercepts HTTPS CONNECT requests to `inference.local` and routes matching inference API requests (e.g., `POST /v1/chat/completions`, `POST /v1/messages`) through the sandbox-local `openshell-router`. See [Inference Routing](inference-routing.md) for details on route configuration and the router architecture.
 
-The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (cluster mode). See `crates/navigator-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/navigator-sandbox/src/l7/inference.rs`.
+The proxy always runs in proxy mode so that `inference.local` is addressable from within the sandbox's network namespace. Inference route sources are configured separately from policy: via `--inference-routes` (file mode) or fetched from the gateway's inference bundle (cluster mode). See `crates/openshell-sandbox/src/proxy.rs` -- `InferenceContext`, `crates/openshell-sandbox/src/l7/inference.rs`.
 
 ---
 
@@ -479,7 +479,7 @@ Several policy fields trigger fundamentally different enforcement behavior. Unde
 
 ### Network Mode: Always Proxy
 
-The sandbox always runs in **proxy mode**. Both file mode and gRPC mode set `NetworkMode::Proxy` unconditionally. This ensures all egress is evaluated by OPA and the virtual hostname `inference.local` is always addressable for inference routing. See `crates/navigator-sandbox/src/lib.rs` -- `load_policy()`, `crates/navigator-sandbox/src/policy.rs` -- `TryFrom<ProtoSandboxPolicy>`.
+The sandbox always runs in **proxy mode**. Both file mode and gRPC mode set `NetworkMode::Proxy` unconditionally. This ensures all egress is evaluated by OPA and the virtual hostname `inference.local` is always addressable for inference routing. See `crates/openshell-sandbox/src/lib.rs` -- `load_policy()`, `crates/openshell-sandbox/src/policy.rs` -- `TryFrom<ProtoSandboxPolicy>`.
 
 In proxy mode:
 
@@ -490,7 +490,7 @@ In proxy mode:
 
 When `network_policies` is empty, the OPA engine denies all outbound connections (except `inference.local` which is handled separately by the proxy before OPA evaluation).
 
-**Gateway-side validation**: The `validate_network_mode_unchanged()` function on the server still rejects live policy updates that would add `network_policies` to a sandbox created without them or remove all `network_policies` from a sandbox created with them. This prevents unexpected behavioral changes in the OPA allow/deny logic. See `crates/navigator-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
+**Gateway-side validation**: The `validate_network_mode_unchanged()` function on the server still rejects live policy updates that would add `network_policies` to a sandbox created without them or remove all `network_policies` from a sandbox created with them. This prevents unexpected behavioral changes in the OPA allow/deny logic. See `crates/openshell-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
 
 **Proxy sub-modes**: In proxy mode, the proxy handles two distinct request types:
 
@@ -527,9 +527,9 @@ flowchart LR
 
 This is the single most important behavioral trigger in the policy language. An endpoint with no `protocol` field passes traffic opaquely after the L4 (CONNECT) check. Adding `protocol: rest` activates per-request HTTP parsing and policy evaluation inside the proxy.
 
-**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.navigator.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/navigator-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
+**Implementation path**: After L4 CONNECT is allowed, the proxy calls `query_l7_config()` which evaluates the Rego rule `data.openshell.sandbox.matched_endpoint_config`. This rule only matches endpoints that have a `protocol` field set (see `sandbox-policy.rego` line `ep.protocol`). If a config is returned, the proxy enters `relay_with_inspection()` instead of `copy_bidirectional()`. See `crates/openshell-sandbox/src/proxy.rs` -- `handle_tcp_connection()`.
 
-**Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
+**Validation requirement**: When `protocol` is set, either `rules` or `access` must also be present. An endpoint with `protocol` but no rules/access is rejected at validation time because it would deny all traffic (no allow rules means nothing matches). See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
 ### Behavioral Trigger: Forward Proxy Mode
 
@@ -561,12 +561,12 @@ If any condition fails, the proxy returns `403 Forbidden`.
 4. Requires `allowed_ips` on the matched endpoint
 5. Resolves DNS and validates all IPs are private and within `allowed_ips`
 6. Connects to upstream
-7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 navigator-sandbox` and `Connection: close`
+7. Rewrites the request: absolute-form → origin-form (`GET /path HTTP/1.1`), strips hop-by-hop headers, adds `Via: 1.1 openshell-sandbox` and `Connection: close`
 8. Forwards the rewritten request, then relays bidirectionally using `tokio::io::copy_bidirectional` (supports chunked transfer, SSE streams, and other long-lived responses with no idle timeout)
 
 **V1 simplifications**: Forward proxy v1 injects `Connection: close` (no keep-alive) and does not perform L7 inspection on the forwarded traffic. Every forward proxy connection handles exactly one request-response exchange.
 
-**Implementation**: See `crates/navigator-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
+**Implementation**: See `crates/openshell-sandbox/src/proxy.rs` -- `handle_forward_proxy()`, `parse_proxy_uri()`, `rewrite_forward_request()`.
 
 **Logging**: Forward proxy requests are logged distinctly from CONNECT:
 
@@ -631,11 +631,11 @@ resp = httpx.get("http://10.86.8.223:8000/screenshot/",
 **Prerequisites for TLS termination**:
 
 - The `protocol` field must also be set. `tls: terminate` without `protocol` is rejected at validation time.
-- The sandbox supervisor generates an ephemeral CA at startup (`SandboxCa::generate()`) and writes it to `/etc/navigator-tls/`.
+- The sandbox supervisor generates an ephemeral CA at startup (`SandboxCa::generate()`) and writes it to `/etc/openshell-tls/`.
 - Trust store environment variables are set on the child process: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`.
-- A combined CA bundle (system CAs + sandbox CA) is written to `/etc/navigator-tls/ca-bundle.pem` so `SSL_CERT_FILE` replaces the default trust store while still trusting real CAs.
+- A combined CA bundle (system CAs + sandbox CA) is written to `/etc/openshell-tls/ca-bundle.pem` so `SSL_CERT_FILE` replaces the default trust store while still trusting real CAs.
 
-**Certificate caching**: Per-hostname leaf certificates are cached (up to 256 entries, then the entire cache is cleared). See `crates/navigator-sandbox/src/l7/tls.rs` -- `CertCache`.
+**Certificate caching**: Per-hostname leaf certificates are cached (up to 256 entries, then the entire cache is cleared). See `crates/openshell-sandbox/src/l7/tls.rs` -- `CertCache`.
 
 **Validation warning**: When `protocol: rest` is set on port 443 without `tls: terminate`, the validator emits a warning: "L7 rules won't be evaluated on encrypted traffic without `tls: terminate`".
 
@@ -659,7 +659,7 @@ resp = httpx.get("http://10.86.8.223:8000/screenshot/",
 }
 ```
 
-The response includes an `X-Navigator-Policy` header and `Connection: close`. See `crates/navigator-sandbox/src/l7/rest.rs` -- `send_deny_response()`.
+The response includes an `X-OpenShell-Policy` header and `Connection: close`. See `crates/openshell-sandbox/src/l7/rest.rs` -- `send_deny_response()`.
 
 **SQL restriction**: `protocol: sql` + `enforcement: enforce` is rejected at validation time because full SQL parsing is not available in v1. SQL endpoints must use `enforcement: audit`.
 
@@ -690,7 +690,7 @@ Regardless of network mode, certain socket domains are always blocked:
 
 In proxy mode (which is always active), `AF_INET` (2) and `AF_INET6` (10) are allowed so the sandbox process can reach the proxy.
 
-The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs`.
+The seccomp filter uses a default-allow policy (`SeccompAction::Allow`) with specific `socket()` syscall rules that return `EPERM` when the first argument (domain) matches a blocked value. See `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`.
 
 ---
 
@@ -706,7 +706,7 @@ When proxy mode is active (on Linux), the sandbox creates an isolated network na
 | Default route   | via `10.200.0.1`  | All sandbox traffic goes through the host veth |
 | Proxy port      | `3128` (default)  | Configurable                                   |
 
-The child process enters the namespace via `setns(fd, CLONE_NEWNET)` in `pre_exec`. This provides hard network isolation -- even if a process ignores proxy environment variables, it can only reach the host veth IP, where the proxy listens. See `crates/navigator-sandbox/src/sandbox/linux/netns.rs`.
+The child process enters the namespace via `setns(fd, CLONE_NEWNET)` in `pre_exec`. This provides hard network isolation -- even if a process ignores proxy environment variables, it can only reach the host veth IP, where the proxy listens. See `crates/openshell-sandbox/src/sandbox/linux/netns.rs`.
 
 ---
 
@@ -720,7 +720,7 @@ The proxy identifies which binary initiated each CONNECT request using Linux `/p
 4. **Cmdline extraction**: `/proc/{pid}/cmdline` is parsed for absolute paths to capture script names (e.g., when `node` runs `/usr/local/bin/claude`).
 5. **TOFU verification**: SHA256 hash of each binary is computed on first use and cached. Subsequent requests from the same binary path must match the cached hash. A mismatch (binary replaced mid-sandbox) triggers an immediate deny.
 
-See `crates/navigator-sandbox/src/procfs.rs`, `crates/navigator-sandbox/src/identity.rs`.
+See `crates/openshell-sandbox/src/procfs.rs`, `crates/openshell-sandbox/src/identity.rs`.
 
 ---
 
@@ -797,7 +797,7 @@ The following validation rules are enforced during policy loading (both file mod
 
 ### Errors (Live Update Rejection)
 
-These errors are returned by the gateway's `UpdateSandboxPolicy` handler and reject the update before it is persisted. See `crates/navigator-server/src/grpc.rs`.
+These errors are returned by the gateway's `UpdateSandboxPolicy` handler and reject the update before it is persisted. See `crates/openshell-server/src/grpc.rs`.
 
 | Condition | Error Message |
 |-----------|---------------|
@@ -814,7 +814,7 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | `protocol: rest` on port 443 without `tls: terminate`                        | `L7 rules won't be evaluated on encrypted traffic without tls: terminate`                         |
 | Unknown HTTP method in rules (not GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/\*) | `Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS.` |
 
-See `crates/navigator-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
+See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
 
 ---
 
@@ -849,7 +849,7 @@ These ranges are blocked by default but can be selectively allowed via the `allo
 
 ### Implementation
 
-Functions in `crates/navigator-sandbox/src/proxy.rs` implement the SSRF checks:
+Functions in `crates/openshell-sandbox/src/proxy.rs` implement the SSRF checks:
 
 - **`is_internal_ip(ip: IpAddr) -> bool`**: Classifies an IP address as internal or public. Checks loopback, link-local, and RFC 1918 ranges. For IPv6, unwraps IPv4-mapped addresses (`::ffff:x.x.x.x`) via `to_ipv4_mapped()` and applies IPv4 checks. Used in the default (no `allowed_ips`) code path.
 
@@ -1122,7 +1122,7 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
 
-The conversion is performed in `crates/navigator-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
+The conversion is performed in `crates/openshell-sandbox/src/opa.rs` -- `proto_to_opa_data_json()`.
 
 ---
 
@@ -1135,7 +1135,7 @@ The sandbox supervisor applies enforcement mechanisms in a specific order during
 3. **Landlock** -- Filesystem access rules are applied
 4. **Seccomp** -- Socket domain restrictions are applied
 
-This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/passwd` access, which Landlock may subsequently restrict. Network namespace entry must happen before any network operations. See `crates/navigator-sandbox/src/process.rs` -- `spawn_impl()`.
+This ordering is intentional: privilege dropping needs `/etc/group` and `/etc/passwd` access, which Landlock may subsequently restrict. Network namespace entry must happen before any network operations. See `crates/openshell-sandbox/src/process.rs` -- `spawn_impl()`.
 
 ---
 
@@ -1190,7 +1190,7 @@ nav logs my-sandbox --source sandbox
 nav logs my-sandbox --source gateway
 ```
 
-The filter applies to both one-shot mode (`GetSandboxLogs` RPC) and streaming mode (`--tail`, via `WatchSandbox` RPC). In both cases, the server evaluates `source_matches()` before sending each log line to the client. See `crates/navigator-server/src/grpc.rs` -- `source_matches()`, `get_sandbox_logs()`.
+The filter applies to both one-shot mode (`GetSandboxLogs` RPC) and streaming mode (`--tail`, via `WatchSandbox` RPC). In both cases, the server evaluates `source_matches()` before sending each log line to the client. See `crates/openshell-server/src/grpc.rs` -- `source_matches()`, `get_sandbox_logs()`.
 
 ### Level Filter (`--level`)
 
@@ -1214,7 +1214,7 @@ nav logs my-sandbox --level warn
 nav logs my-sandbox --source sandbox --level error
 ```
 
-The filter is applied server-side via `level_matches()` in both one-shot and streaming modes. See `crates/navigator-server/src/grpc.rs` -- `level_matches()`.
+The filter is applied server-side via `level_matches()` in both one-shot and streaming modes. See `crates/openshell-server/src/grpc.rs` -- `level_matches()`.
 
 ### Proto Messages
 
@@ -1225,7 +1225,7 @@ The source and level filters are carried in both log-related RPC messages:
 | `GetSandboxLogs` | `GetSandboxLogsRequest` | `repeated string sources` | `string min_level` |
 | `WatchSandbox` | `WatchSandboxRequest` | `repeated string log_sources` | `string log_min_level` |
 
-An empty `sources`/`log_sources` list means no source filtering (all sources pass). An empty `min_level`/`log_min_level` string means no level filtering (all levels pass). See `proto/navigator.proto`.
+An empty `sources`/`log_sources` list means no source filtering (all sources pass). An empty `min_level`/`log_min_level` string means no level filtering (all levels pass). See `proto/openshell.proto`.
 
 ---
 

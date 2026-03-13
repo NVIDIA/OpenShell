@@ -1,6 +1,6 @@
 ---
 name: tui-development
-description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, navigator-tui, tui development, tui feature, tui bug.
+description: Guide for developing the OpenShell TUI — a ratatui-based terminal UI for the OpenShell platform. Covers architecture, navigation, data fetching, theming, UX conventions, and development workflow. Trigger keywords - term, TUI, terminal UI, ratatui, openshell-tui, tui development, tui feature, tui bug.
 ---
 
 # OpenShell TUI Development Guide
@@ -12,14 +12,14 @@ Comprehensive reference for any agent working on the OpenShell TUI.
 The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It provides a keyboard-driven interface for managing gateways, sandboxes, and logs — the same operations available via the `openshell` CLI, but with a live, interactive dashboard.
 
 - **Launched via:** `openshell term` or `mise run term`
-- **Crate:** `crates/navigator-tui/`
+- **Crate:** `crates/openshell-tui/`
 - **Key dependencies:**
   - `ratatui` (workspace version) — uses `frame.size()` (not `frame.area()`)
   - `crossterm` (workspace version) — terminal backend and event polling
   - `tonic` with TLS — gRPC client for the OpenShell gateway
   - `tokio` — async runtime for event loop, spawned tasks, and mpsc channels
-  - `navigator-core` — proto-generated types (`NavigatorClient`, request/response structs)
-  - `navigator-bootstrap` — cluster discovery (`list_clusters()`)
+  - `openshell-core` — proto-generated types (`OpenShellClient`, request/response structs)
+  - `openshell-bootstrap` — cluster discovery (`list_clusters()`)
 - **Theme:** Adaptive dark/light via `Theme` struct — NVIDIA-branded green accents. Controlled by `--theme` flag, `OPENSHELL_THEME` env var, or auto-detection.
 
 ## 2. Domain Object Hierarchy
@@ -27,12 +27,12 @@ The OpenShell TUI is a ratatui-based terminal UI for the OpenShell platform. It 
 The data model follows a strict hierarchy: **Gateway > Sandboxes > Logs**.
 
 ```
-Gateway (discovered via navigator_bootstrap::list_gateways())
+Gateway (discovered via openshell_bootstrap::list_gateways())
   └── Sandboxes (fetched via gRPC ListSandboxes)
         └── Logs (fetched via GetSandboxLogs + streamed via WatchSandbox)
 ```
 
-- **Gateways** are discovered from on-disk config via `navigator_bootstrap::list_gateways()`. Each gateway has a name, endpoint, and local/remote flag.
+- **Gateways** are discovered from on-disk config via `openshell_bootstrap::list_gateways()`. Each gateway has a name, endpoint, and local/remote flag.
 - **Sandboxes** belong to the active cluster. Fetched via `ListSandboxes` gRPC call with a periodic tick refresh. Each sandbox has: `id`, `name`, `phase`, `created_at_ms`, and `spec.template.image`.
 - **Logs** belong to a single sandbox. Initial batch fetched via `GetSandboxLogs` (500 lines), then live-tailed via `WatchSandbox` with `follow_logs: true`.
 
@@ -174,7 +174,7 @@ tokio::time::timeout(Duration::from_secs(5), client.health(req)).await
 
 ### Theme System (`theme.rs`)
 
-Colors and styles are defined in `crates/navigator-tui/src/theme.rs` via the `Theme` struct. The TUI supports dark and light terminal backgrounds.
+Colors and styles are defined in `crates/openshell-tui/src/theme.rs` via the `Theme` struct. The TUI supports dark and light terminal backgrounds.
 
 #### Theme selection
 
@@ -344,16 +344,16 @@ Same as above.
 
 | File | Purpose |
 | --- | --- |
-| `crates/navigator-tui/Cargo.toml` | Crate manifest — dependencies on `navigator-core`, `navigator-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
-| `crates/navigator-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_health`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building |
-| `crates/navigator-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter` enums, `LogLine` struct, `GatewayEntry`, all key handling logic |
-| `crates/navigator-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Resize`, `LogLines`), `EventHandler` with mpsc channels and crossterm polling |
-| `crates/navigator-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
-| `crates/navigator-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar`, `draw_nav_bar`, `draw_command_bar`, screen routing |
-| `crates/navigator-tui/src/ui/dashboard.rs` | Dashboard screen — gateway list table (top) + sandbox table (bottom) |
-| `crates/navigator-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image |
-| `crates/navigator-tui/src/ui/sandbox_detail.rs` | Sandbox detail view — name, status, image, created, age, delete confirmation dialog |
-| `crates/navigator-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter |
+| `crates/openshell-tui/Cargo.toml` | Crate manifest — dependencies on `openshell-core`, `openshell-bootstrap`, `ratatui`, `crossterm`, `tonic`, `tokio` |
+| `crates/openshell-tui/src/lib.rs` | Entry point. Event loop, gRPC calls (`refresh_health`, `refresh_sandboxes`, `spawn_log_stream`, `handle_sandbox_delete`), gateway switching, mTLS channel building |
+| `crates/openshell-tui/src/app.rs` | `App` state struct, `Screen`/`Focus`/`InputMode`/`LogSourceFilter` enums, `LogLine` struct, `GatewayEntry`, all key handling logic |
+| `crates/openshell-tui/src/event.rs` | `Event` enum (`Key`, `Mouse`, `Tick`, `Resize`, `LogLines`), `EventHandler` with mpsc channels and crossterm polling |
+| `crates/openshell-tui/src/theme.rs` | `colors` module (NVIDIA_GREEN, EVERGLADE, BG, FG) and `styles` module (all `Style` constants) |
+| `crates/openshell-tui/src/ui/mod.rs` | Top-level `draw()` dispatcher, `draw_title_bar`, `draw_nav_bar`, `draw_command_bar`, screen routing |
+| `crates/openshell-tui/src/ui/dashboard.rs` | Dashboard screen — gateway list table (top) + sandbox table (bottom) |
+| `crates/openshell-tui/src/ui/sandboxes.rs` | Reusable sandbox table widget with columns: Name, Status, Created, Age, Image |
+| `crates/openshell-tui/src/ui/sandbox_detail.rs` | Sandbox detail view — name, status, image, created, age, delete confirmation dialog |
+| `crates/openshell-tui/src/ui/sandbox_logs.rs` | Structured log viewer — timestamp, source, level, target, message, key=value fields, scroll position, source filter |
 
 ### Module dependency flow
 
@@ -374,27 +374,27 @@ lib.rs (event loop, gRPC, async tasks)
 
 ### Dependency constraints
 
-- **`navigator-tui` cannot depend on `navigator-cli`** — this would create a circular dependency. TLS channel building for gateway switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
+- **`openshell-tui` cannot depend on `openshell-cli`** — this would create a circular dependency. TLS channel building for gateway switching is done directly in `lib.rs` using `tonic::transport` primitives (`Certificate`, `Identity`, `ClientTlsConfig`, `Endpoint`).
 - mTLS certs are read from `~/.config/openshell/gateways/<name>/mtls/` (ca.crt, tls.crt, tls.key).
 
 ### Proto generated code
 
-Proto types come from `navigator-core` which generates them from `OUT_DIR` via `include!`. They are **not** checked into the repo. Import paths look like:
+Proto types come from `openshell-core` which generates them from `OUT_DIR` via `include!`. They are **not** checked into the repo. Import paths look like:
 
 ```rust
-use navigator_core::proto::navigator_client::NavigatorClient;
-use navigator_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
+use openshell_core::proto::openshell_client::OpenShellClient;
+use openshell_core::proto::{ListSandboxesRequest, GetSandboxLogsRequest, ...};
 ```
 
 ### Proto field gotchas
 
 - `DeleteSandboxRequest` uses the `name` field (not `id`):
   ```rust
-  let req = navigator_core::proto::DeleteSandboxRequest { name: sandbox_name };
+  let req = openshell_core::proto::DeleteSandboxRequest { name: sandbox_name };
   ```
 - `WatchSandboxRequest` has extra fields beyond what you might need — always use `..Default::default()`:
   ```rust
-  let req = navigator_core::proto::WatchSandboxRequest {
+  let req = openshell_core::proto::WatchSandboxRequest {
       id: sandbox_id,
       follow_status: false,
       follow_logs: true,
@@ -441,7 +441,7 @@ The connect timeout for cluster switching is 10 seconds with HTTP/2 keepalive at
 
 ```bash
 # Build the crate
-cargo build -p navigator-tui
+cargo build -p openshell-tui
 
 # Run the TUI against the active cluster
 mise run term
@@ -450,10 +450,10 @@ mise run term
 mise run term:dev
 
 # Format
-cargo fmt -p navigator-tui
+cargo fmt -p openshell-tui
 
 # Lint
-cargo clippy -p navigator-tui
+cargo clippy -p openshell-tui
 ```
 
 ### Pre-commit
@@ -480,7 +480,7 @@ kubectl delete pod <pod-name> -n <namespace>
 
 ### Adding a new gRPC call
 
-1. Check the proto definitions in `navigator-core` for available RPCs and message types.
+1. Check the proto definitions in `openshell-core` for available RPCs and message types.
 2. Add the call in `lib.rs` following the existing pattern (timeout wrapper, error handling, state update).
 3. If the call is triggered by a key press, add a `pending_*` flag to `App` and handle it in the event loop.
 4. If the call returns streaming data, spawn it as a background task and send results via `Event` variants.

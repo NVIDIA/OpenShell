@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, cast
 
-from openshell._proto import navigator_pb2
+from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
@@ -19,17 +19,17 @@ if TYPE_CHECKING:
 
 class _FakeStub:
     def __init__(self) -> None:
-        self.request: navigator_pb2.ExecSandboxRequest | None = None
+        self.request: openshell_pb2.ExecSandboxRequest | None = None
 
     def ExecSandbox(
         self,
-        request: navigator_pb2.ExecSandboxRequest,
+        request: openshell_pb2.ExecSandboxRequest,
         timeout: float | None = None,
     ):
         self.request = request
         _ = timeout
-        yield navigator_pb2.ExecSandboxEvent(
-            exit=navigator_pb2.ExecSandboxExit(exit_code=0)
+        yield openshell_pb2.ExecSandboxEvent(
+            exit=openshell_pb2.ExecSandboxExit(exit_code=0)
         )
 
 

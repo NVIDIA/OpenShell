@@ -1,6 +1,6 @@
 ---
 name: arch-doc-writer
-description: "Use this agent when documentation in the `architecture/` directory needs to be updated or created for a specific file after implementing a feature, fix, refactor, or behavior change. Launch one instance of this agent per file that needs updating. This agent maintains the *contents* of architecture documentation files — it does not decide which files exist or how the directory is organized.\\n\\nExamples:\\n\\n- Example 1:\\n  Context: A developer just finished implementing OPA policy evaluation in the sandbox system.\\n  user: \"I just finished implementing the OPA engine in crates/navigator-sandbox/src/opa.rs. Update architecture/sandbox.md to reflect the new policy evaluation flow.\"\\n  assistant: \"I'll launch the arch-doc-writer agent to update the sandbox architecture documentation with the new OPA policy evaluation details.\"\\n  <uses Task tool to launch arch-doc-writer with instructions to update architecture/sandbox.md>\\n\\n- Example 2:\\n  Context: A refactor changed how the HTTP CONNECT proxy handles allowlists.\\n  user: \"The proxy allowlist logic was refactored. Please update architecture/proxy.md.\"\\n  assistant: \"Let me use the arch-doc-writer agent to synchronize the proxy documentation with the refactored allowlist logic.\"\\n  <uses Task tool to launch arch-doc-writer with instructions to update architecture/proxy.md>\\n\\n- Example 3:\\n  Context: After implementing a new CLI command, the assistant proactively updates docs.\\n  user: \"Add a --rego-policy flag to the CLI.\"\\n  assistant: \"Here is the implementation of the --rego-policy flag.\"\\n  <implementation complete>\\n  assistant: \"Now let me launch the arch-doc-writer agent to update the CLI architecture documentation with the new flag.\"\\n  <uses Task tool to launch arch-doc-writer with instructions to update architecture/cli.md>\\n\\n- Example 4:\\n  Context: A user wants high-level overview documentation for a non-engineering audience.\\n  user: \"Update architecture/overview.md with a non-engineer-friendly explanation of the sandbox system.\"\\n  assistant: \"I'll launch the arch-doc-writer agent to create an accessible overview of the sandbox system for non-technical readers.\"\\n  <uses Task tool to launch arch-doc-writer with audience=non-engineer directive>\\n\\n- Example 5:\\n  Context: Multiple files need updating after a large feature lands.\\n  user: \"I just landed the network namespace isolation feature. Update architecture/sandbox.md and architecture/networking.md.\"\\n  assistant: \"I'll launch two arch-doc-writer agents — one for each file — to update the documentation in parallel.\"\\n  <uses Task tool to launch arch-doc-writer for architecture/sandbox.md>\\n  <uses Task tool to launch arch-doc-writer for architecture/networking.md>"
+description: "Use this agent when documentation in the `architecture/` directory needs to be updated or created for a specific file after implementing a feature, fix, refactor, or behavior change. Launch one instance of this agent per file that needs updating. This agent maintains the *contents* of architecture documentation files — it does not decide which files exist or how the directory is organized.\\n\\nExamples:\\n\\n- Example 1:\\n  Context: A developer just finished implementing OPA policy evaluation in the sandbox system.\\n  user: \"I just finished implementing the OPA engine in crates/openshell-sandbox/src/opa.rs. Update architecture/sandbox.md to reflect the new policy evaluation flow.\"\\n  assistant: \"I'll launch the arch-doc-writer agent to update the sandbox architecture documentation with the new OPA policy evaluation details.\"\\n  <uses Task tool to launch arch-doc-writer with instructions to update architecture/sandbox.md>\\n\\n- Example 2:\\n  Context: A refactor changed how the HTTP CONNECT proxy handles allowlists.\\n  user: \"The proxy allowlist logic was refactored. Please update architecture/proxy.md.\"\\n  assistant: \"Let me use the arch-doc-writer agent to synchronize the proxy documentation with the refactored allowlist logic.\"\\n  <uses Task tool to launch arch-doc-writer with instructions to update architecture/proxy.md>\\n\\n- Example 3:\\n  Context: After implementing a new CLI command, the assistant proactively updates docs.\\n  user: \"Add a --rego-policy flag to the CLI.\"\\n  assistant: \"Here is the implementation of the --rego-policy flag.\"\\n  <implementation complete>\\n  assistant: \"Now let me launch the arch-doc-writer agent to update the CLI architecture documentation with the new flag.\"\\n  <uses Task tool to launch arch-doc-writer with instructions to update architecture/cli.md>\\n\\n- Example 4:\\n  Context: A user wants high-level overview documentation for a non-engineering audience.\\n  user: \"Update architecture/overview.md with a non-engineer-friendly explanation of the sandbox system.\"\\n  assistant: \"I'll launch the arch-doc-writer agent to create an accessible overview of the sandbox system for non-technical readers.\"\\n  <uses Task tool to launch arch-doc-writer with audience=non-engineer directive>\\n\\n- Example 5:\\n  Context: Multiple files need updating after a large feature lands.\\n  user: \"I just landed the network namespace isolation feature. Update architecture/sandbox.md and architecture/networking.md.\"\\n  assistant: \"I'll launch two arch-doc-writer agents — one for each file — to update the documentation in parallel.\"\\n  <uses Task tool to launch arch-doc-writer for architecture/sandbox.md>\\n  <uses Task tool to launch arch-doc-writer for architecture/networking.md>"
 model: opus
 color: yellow
 memory: project
@@ -14,7 +14,7 @@ You maintain the contents of documentation files in the `architecture/` director
 
 ## Project Context
 
-This is the Navigator project — a sandbox/isolation system built in Rust.
+This is the OpenShell project — a sandbox/isolation system built in Rust.
 
 The docs in `architecture/` are structured as subsystem[-component].md. Key sub-systems are:
 
@@ -109,16 +109,16 @@ For practical examples, follow this pattern:
 Example format:
 ```bash
 # User runs:
-navigator sandbox run --policy sandbox.yaml -- /bin/ls
+openshell sandbox run --policy sandbox.yaml -- /bin/ls
 ```
 **Trace:**
-1. `crates/navigator-cli/src/main.rs` → `SandboxRunCmd::execute()`
-2. Policy loaded from YAML via `crates/navigator-sandbox/src/policy.rs` → `Policy::from_yaml()`
+1. `crates/openshell-cli/src/main.rs` → `SandboxRunCmd::execute()`
+2. Policy loaded from YAML via `crates/openshell-sandbox/src/policy.rs` → `Policy::from_yaml()`
 3. ... (continue through the actual code path)
 
 ### Cross-References
 - Link to other architecture docs when referencing related subsystems: `[Proxy Architecture](proxy.md)`
-- Reference source files with relative paths from repo root: `crates/navigator-sandbox/src/lib.rs`
+- Reference source files with relative paths from repo root: `crates/openshell-sandbox/src/lib.rs`
 - When referencing plans, link to `architecture/plans/`
 
 ### What NOT to Include
@@ -129,7 +129,7 @@ navigator sandbox run --policy sandbox.yaml -- /bin/ls
 
 ## System Architecture Diagram
 
-The file `architecture/system-architecture.md` contains a top-level Mermaid diagram of the entire Navigator system — all deployable components, external systems, communication protocols, and security boundaries. It is the single source of truth for the system's visual architecture.
+The file `architecture/system-architecture.md` contains a top-level Mermaid diagram of the entire OpenShell system — all deployable components, external systems, communication protocols, and security boundaries. It is the single source of truth for the system's visual architecture.
 
 **After completing any documentation update**, check whether your changes affect the system-level architecture diagram. You MUST update `architecture/system-architecture.md` if any of the following are true:
 

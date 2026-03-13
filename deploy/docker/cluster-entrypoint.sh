@@ -298,7 +298,7 @@ if [ -d "$BUNDLED_MANIFESTS" ]; then
     # Only clean up files that look like openshell manifests (openshell-* or
     # envoy-gateway-* or agent-*) to avoid removing built-in k3s manifests.
     for existing in "$K3S_MANIFESTS"/openshell-*.yaml \
-                    "$K3S_MANIFESTS"/navigator-*.yaml \
+                    "$K3S_MANIFESTS"/openshell-*.yaml \
                     "$K3S_MANIFESTS"/envoy-gateway-*.yaml \
                     "$K3S_MANIFESTS"/agent-*.yaml; do
         [ ! -f "$existing" ] && continue
@@ -387,7 +387,7 @@ fi
 # to start without it.
 SSH_HANDSHAKE_SECRET="${SSH_HANDSHAKE_SECRET:-$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \n')}"
 
-# Inject SSH gateway host/port into the HelmChart manifest so the navigator
+# Inject SSH gateway host/port into the HelmChart manifest so the openshell
 # server returns the correct address to CLI clients for SSH proxy CONNECT.
 if [ -f "$HELMCHART" ]; then
     if [ -n "$SSH_GATEWAY_HOST" ]; then

@@ -69,6 +69,6 @@ jobs:
 
       - name: Build ${{ inputs.component }} image
         env:
-          DOCKER_BUILDER: navigator
+          DOCKER_BUILDER: openshell
           OPENSHELL_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
         run: mise run --no-prepare docker:build:${{ inputs.component }}

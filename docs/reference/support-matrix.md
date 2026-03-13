@@ -39,7 +39,7 @@ OpenShell publishes two container images. Both are published for `linux/amd64` a
 | Cluster | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start`        |
 | Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Cluster startup (via Helm chart) |
 
-The cluster image bundles the Helm charts, Kubernetes manifests, and the `navigator-sandbox` supervisor binary required to bootstrap the control plane. The supervisor binary is side-loaded into sandbox pods at runtime via a read-only host volume mount. The gateway image is pulled at cluster startup and runs the API server.
+The cluster image bundles the Helm charts, Kubernetes manifests, and the `openshell-sandbox` supervisor binary required to bootstrap the control plane. The supervisor binary is side-loaded into sandbox pods at runtime via a read-only host volume mount. The gateway image is pulled at cluster startup and runs the API server.
 
 Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
 

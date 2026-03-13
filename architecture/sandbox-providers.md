@@ -36,7 +36,7 @@ Provider is defined in `proto/datamodel.proto`:
 - `credentials`: `map<string, string>` for secret values
 - `config`: `map<string, string>` for non-secret settings
 
-The gRPC surface is defined in `proto/navigator.proto`:
+The gRPC surface is defined in `proto/openshell.proto`:
 
 - `CreateProvider`
 - `GetProvider`
@@ -46,29 +46,29 @@ The gRPC surface is defined in `proto/navigator.proto`:
 
 ## Components
 
-- `crates/navigator-providers`
+- `crates/openshell-providers`
   - canonical provider type normalization and command detection,
   - provider registry and per-provider discovery plugins,
   - shared discovery engine and context abstraction for testability.
-- `crates/navigator-cli`
+- `crates/openshell-cli`
   - `openshell provider ...` command handlers,
   - sandbox provider requirement resolution in `sandbox create`.
-- `crates/navigator-server` (gateway)
+- `crates/openshell-server` (gateway)
   - provider CRUD gRPC handlers,
   - `GetSandboxProviderEnvironment` handler resolves credentials at runtime,
   - persistence using `object_type = "provider"`.
-- `crates/navigator-sandbox`
+- `crates/openshell-sandbox`
   - sandbox supervisor fetches provider credentials via gRPC at startup,
   - injects placeholder env vars into entrypoint and SSH child processes,
   - resolves placeholders back to real secrets in the outbound proxy path.
 
 ## Provider Plugins
 
-Each provider has its own module under `crates/navigator-providers/src/providers/`.
+Each provider has its own module under `crates/openshell-providers/src/providers/`.
 
 ### Trait Definition
 
-`ProviderPlugin` (`crates/navigator-providers/src/lib.rs`):
+`ProviderPlugin` (`crates/openshell-providers/src/lib.rs`):
 
 ```rust
 pub trait ProviderPlugin: Send + Sync {
@@ -181,7 +181,7 @@ Also supported:
 
 `openshell sandbox create --provider gitlab -- claude`
 
-Resolution logic (CLI side, `crates/navigator-cli/src/run.rs`):
+Resolution logic (CLI side, `crates/openshell-cli/src/run.rs`):
 
 1. `detect_provider_from_command()` infers provider from command token after `--`
    (for example `claude`),
@@ -194,7 +194,7 @@ Resolution logic (CLI side, `crates/navigator-cli/src/run.rs`):
 6. non-interactive mode fails with a clear missing-provider error,
 7. set resolved provider **names** in `SandboxSpec.providers`.
 
-Gateway-side `create_sandbox()` (`crates/navigator-server/src/grpc.rs`):
+Gateway-side `create_sandbox()` (`crates/openshell-server/src/grpc.rs`):
 
 1. validates all provider names exist by fetching each from the store (fail fast),
 2. creates the `Sandbox` object with `spec.providers` set,
@@ -217,7 +217,7 @@ them at runtime via the `GetSandboxProviderEnvironment` gRPC call.
 
 ### Gateway-side: `resolve_provider_environment()`
 
-`resolve_provider_environment()` (`crates/navigator-server/src/grpc.rs`) builds the
+`resolve_provider_environment()` (`crates/openshell-server/src/grpc.rs`) builds the
 environment map returned by `GetSandboxProviderEnvironment`:
 
 1. for each provider name in `spec.providers`, fetch the provider from the store,
@@ -235,11 +235,11 @@ Key behaviors:
 
 ### Sandbox Supervisor: Fetching Credentials
 
-The sandbox pod runs `navigator-sandbox` (`crates/navigator-sandbox/src/main.rs`). On
+The sandbox pod runs `openshell-sandbox` (`crates/openshell-sandbox/src/main.rs`). On
 startup it receives `OPENSHELL_SANDBOX_ID` and `OPENSHELL_ENDPOINT` as environment
 variables (injected into the pod spec by the gateway's Kubernetes sandbox creation code).
 
-In `run_sandbox()` (`crates/navigator-sandbox/src/lib.rs`):
+In `run_sandbox()` (`crates/openshell-sandbox/src/lib.rs`):
 
 1. loads the sandbox policy via gRPC (`GetSandboxPolicy`),
 2. fetches provider credentials via gRPC (`GetSandboxProviderEnvironment`),
@@ -259,7 +259,7 @@ The registry is threaded to the proxy so it can rewrite outbound headers.
 Provider placeholders are injected into child processes in two places, covering all
 process spawning paths inside the sandbox:
 
-**1. Entrypoint process** (`crates/navigator-sandbox/src/process.rs`):
+**1. Entrypoint process** (`crates/openshell-sandbox/src/process.rs`):
 
 ```rust
 let mut cmd = Command::new(program);
@@ -281,7 +281,7 @@ After provider env vars, proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY
 are also set when `NetworkMode` is `Proxy`. The child is then launched with namespace
 isolation, privilege dropping, seccomp, and Landlock restrictions via `pre_exec`.
 
-**2. SSH shell sessions** (`crates/navigator-sandbox/src/ssh.rs`):
+**2. SSH shell sessions** (`crates/openshell-sandbox/src/ssh.rs`):
 
 When a user connects via `openshell sandbox connect`, a PTY shell is spawned:
 
@@ -333,7 +333,7 @@ CLI: openshell sandbox create -- claude
           +-- Persists Sandbox with spec.providers = ["claude"]
           +-- Creates K8s Sandbox CRD (no credentials in pod spec)
                 |
-                K8s: pod starts navigator-sandbox binary
+                K8s: pod starts openshell-sandbox binary
                   +-- OPENSHELL_SANDBOX_ID and OPENSHELL_ENDPOINT set in pod env
                   |
                     Sandbox supervisor: run_sandbox()
@@ -375,10 +375,10 @@ Providers are stored with `object_type = "provider"` in the shared object store.
 ## Test Strategy
 
 - Per-provider unit tests in each provider module.
-- Shared normalization/command-detection tests in `crates/navigator-providers/src/lib.rs`.
+- Shared normalization/command-detection tests in `crates/openshell-providers/src/lib.rs`.
 - Mocked discovery context tests cover env and path-based behavior.
 - CLI and gateway integration tests validate end-to-end RPC compatibility.
-- `resolve_provider_environment` unit tests in `crates/navigator-server/src/grpc.rs`.
+- `resolve_provider_environment` unit tests in `crates/openshell-server/src/grpc.rs`.
 - sandbox unit tests validate placeholder generation and header rewriting.
 - E2E sandbox tests verify placeholders are visible in child env, outbound proxy traffic
   is rewritten with the real secret, and the SSH handshake secret is absent from exec env.
