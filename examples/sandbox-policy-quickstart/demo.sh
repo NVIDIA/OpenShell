@@ -81,8 +81,8 @@ wait_for_ssh
 # ------------------------------------------------------------------
 
 step "2/7  Attempting to reach api.github.com — should be DENIED"
-printf "  ${BOLD}\$ curl -s https://api.github.com/zen${RESET}\n"
-if sandbox_exec curl -sf --max-time 5 https://api.github.com/zen 2>&1 | sed 's/^/  /'; then
+printf "  ${BOLD}\$ curl -sS https://api.github.com/zen${RESET}\n"
+if sandbox_exec curl -sSf --max-time 5 https://api.github.com/zen 2>&1 | sed 's/^/  /'; then
     printf "  ${RED}✗ Expected request to be denied, but it succeeded.${RESET}\n"
     exit 1
 fi
@@ -106,19 +106,19 @@ run openshell policy set "$SANDBOX_NAME" \
 
 step "5/7  Retrying GET — should be ALLOWED"
 sleep 1
-printf "  ${BOLD}\$ curl -s https://api.github.com/zen${RESET}\n"
-ZEN=$(sandbox_exec curl -s --max-time 10 https://api.github.com/zen)
+printf "  ${BOLD}\$ curl -sS https://api.github.com/zen${RESET}\n"
+ZEN=$(sandbox_exec curl -sS --max-time 10 https://api.github.com/zen)
 printf "  ${GREEN}%s${RESET}\n" "$ZEN"
 
 printf '\n'
-printf "  ${BOLD}\$ curl -s https://api.github.com/octocat${RESET}\n"
-sandbox_exec curl -s --max-time 10 https://api.github.com/octocat | sed 's/^/  /'
+printf "  ${BOLD}\$ curl -sS https://api.github.com/octocat${RESET}\n"
+sandbox_exec curl -sS --max-time 10 https://api.github.com/octocat | sed 's/^/  /'
 
 # ------------------------------------------------------------------
 
 step "6/7  Attempting POST — should be BLOCKED by L7"
-printf "  ${BOLD}\$ curl -s -X POST https://api.github.com/repos/octocat/hello-world/issues -d '{\"title\":\"oops\"}'${RESET}\n"
-RESPONSE=$(sandbox_exec curl -s --max-time 10 -X POST \
+printf "  ${BOLD}\$ curl -sS -X POST https://api.github.com/repos/octocat/hello-world/issues -d '{\"title\":\"oops\"}'${RESET}\n"
+RESPONSE=$(sandbox_exec curl -sS --max-time 10 -X POST \
     https://api.github.com/repos/octocat/hello-world/issues \
     -H "Content-Type: application/json" \
     -d '{"title":"oops"}')
