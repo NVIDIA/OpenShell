@@ -1743,6 +1743,32 @@ pub async fn sandbox_create_with_bootstrap(
     .await
 }
 
+fn sandbox_should_persist(keep: bool, forward: Option<u16>) -> bool {
+    keep || forward.is_some()
+}
+
+async fn finalize_sandbox_create_session(
+    server: &str,
+    sandbox_name: &str,
+    persist: bool,
+    session_result: Result<()>,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if persist {
+        return session_result;
+    }
+
+    let names = [sandbox_name.to_string()];
+    if let Err(err) = sandbox_delete(server, &names, false, tls).await {
+        if session_result.is_ok() {
+            return Err(err);
+        }
+        eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
+    }
+
+    session_result
+}
+
 /// Create a sandbox with default settings.
 #[allow(clippy::too_many_arguments)]
 pub async fn sandbox_create(
@@ -1863,10 +1889,12 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
+    let persist = sandbox_should_persist(keep, forward);
     let sandbox_name = sandbox.name.clone();
 
-    // Record this sandbox as the last-used for the active gateway.
-    if let Some(gateway) = effective_tls.gateway_name() {
+    // Record this sandbox as the last-used for the active gateway only when it
+    // is expected to persist beyond the initial session.
+    if persist && let Some(gateway) = effective_tls.gateway_name() {
         let _ = save_last_sandbox(gateway, &sandbox_name);
     }
 
@@ -2171,7 +2199,25 @@ pub async fn sandbox_create(
             }
 
             if command.is_empty() {
-                return sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await;
+                let connect_result = if persist {
+                    sandbox_connect(&effective_server, &sandbox_name, &effective_tls).await
+                } else {
+                    crate::ssh::sandbox_connect_without_exec(
+                        &effective_server,
+                        &sandbox_name,
+                        &effective_tls,
+                    )
+                    .await
+                };
+
+                return finalize_sandbox_create_session(
+                    &effective_server,
+                    &sandbox_name,
+                    persist,
+                    connect_result,
+                    &effective_tls,
+                )
+                .await;
             }
 
             // Resolve TTY mode: explicit --tty / --no-tty wins, otherwise
@@ -2179,37 +2225,34 @@ pub async fn sandbox_create(
             let tty = tty_override.unwrap_or_else(|| {
                 std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
             });
-            let exec_result = sandbox_exec(
-                &effective_server,
-                &sandbox_name,
-                command,
-                tty,
-                &effective_tls,
-            )
-            .await;
-
-            if forward.is_some() {
-                exec_result?;
-                return Ok(());
-            }
-
-            if !interactive
-                && !keep
-                && let Err(err) = sandbox_delete(
+            let exec_result = if persist {
+                sandbox_exec(
                     &effective_server,
-                    std::slice::from_ref(&sandbox_name),
-                    false,
+                    &sandbox_name,
+                    command,
+                    tty,
                     &effective_tls,
                 )
                 .await
-            {
-                if exec_result.is_ok() {
-                    return Err(err);
-                }
-                eprintln!("Failed to delete sandbox {sandbox_name}: {err}");
-            }
+            } else {
+                crate::ssh::sandbox_exec_without_exec(
+                    &effective_server,
+                    &sandbox_name,
+                    command,
+                    tty,
+                    &effective_tls,
+                )
+                .await
+            };
 
-            exec_result
+            finalize_sandbox_create_session(
+                &effective_server,
+                &sandbox_name,
+                persist,
+                exec_result,
+                &effective_tls,
+            )
+            .await
         }
         SandboxPhase::Error => {
             if last_error_reason.is_empty() {
@@ -4158,7 +4201,7 @@ mod tests {
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
         format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, inferred_provider_type, parse_credential_pairs,
-        resolve_gateway_control_target_from,
+        resolve_gateway_control_target_from, sandbox_should_persist,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -4310,6 +4353,21 @@ mod tests {
     fn inferred_provider_type_handles_full_path() {
         let result = inferred_provider_type(&["/usr/local/bin/claude".to_string()]);
         assert_eq!(result, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn sandbox_should_persist_defaults_to_persistent() {
+        assert!(sandbox_should_persist(true, None));
+    }
+
+    #[test]
+    fn sandbox_should_not_persist_when_no_keep_is_set() {
+        assert!(!sandbox_should_persist(false, None));
+    }
+
+    #[test]
+    fn sandbox_should_persist_when_forward_is_requested() {
+        assert!(sandbox_should_persist(false, Some(8080)));
     }
 
     fn init_git_repo(path: &Path) {

@@ -52,7 +52,7 @@ This collects tracked and untracked (non-ignored) files via
 
 ```bash
 # Create a sandbox and sync your repo
-openshell sandbox create --name dev --sync --keep
+openshell sandbox create --name dev --sync
 
 # Make local changes, then push them
 openshell sandbox upload dev ./src /sandbox/src

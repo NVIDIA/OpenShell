@@ -82,6 +82,80 @@ navigator-sandbox \
   -- python examples/local-inference/inference.py
 ```
 
+The sandbox loads routes from the YAML file at startup and routes inference
+requests locally — no gRPC server or cluster required.
+
+### With a cluster
+
+#### 1. Start a OpenShell cluster
+
+```bash
+mise run cluster
+openshell status
+```
+
+#### 2. Configure cluster inference
+
+First make sure a provider record exists for the backend you want to use:
+
+```bash
+openshell provider list
+```
+
+Then configure the cluster-managed `inference.local` route:
+
+```bash
+# Example: use an existing provider record
+openshell cluster inference set \
+  --provider openai-prod \
+  --model nvidia/nemotron-3-nano-30b-a3b
+```
+
+Verify the active config:
+
+```bash
+openshell cluster inference get
+```
+
+#### 3. Run the example inside a sandbox
+
+```bash
+openshell sandbox create \
+  --policy examples/inference/sandbox-policy.yaml \
+  --name inference-demo \
+  -- python examples/inference/inference.py
+```
+
+The script targets `https://inference.local/v1` directly. OpenShell
+intercepts that connection and routes it to whatever backend cluster
+inference is configured to use.
+
+Expected output:
+
+```
+model=<backend model name>
+content=NAV_OK
+```
+
+#### 4. (Optional) Interactive session
+
+```bash
+openshell sandbox connect inference-demo
+# Inside the sandbox:
+python examples/inference/inference.py
+```
+
+#### 5. Cleanup
+
+```bash
+openshell sandbox delete inference-demo
+```
+
+## Customizing Routes
+
+Edit `routes.yaml` to change which backend endpoint/model standalone mode uses.
+In cluster mode, use `openshell cluster inference set` instead.
+
 ## Supported Protocols
 
 | Pattern | Protocol | Kind |

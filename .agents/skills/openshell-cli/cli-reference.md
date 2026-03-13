@@ -165,10 +165,10 @@ Create a sandbox, wait for readiness, then connect or execute the trailing comma
 | `--name <NAME>` | Sandbox name (auto-generated if omitted) |
 | `--from <SOURCE>` | Sandbox source: community name, Dockerfile path, directory, or image reference (BYOC) |
 | `--upload <PATH>[:<DEST>]` | Upload local files into sandbox (default dest: `/sandbox`) |
-| `--keep` | Keep sandbox alive after non-interactive commands finish |
+| `--no-keep` | Delete sandbox after the initial command or shell exits |
 | `--provider <NAME>` | Provider to attach (repeatable) |
 | `--policy <PATH>` | Path to custom policy YAML |
-| `--forward <PORT>` | Forward local port to sandbox (implies `--keep`) |
+| `--forward <PORT>` | Forward local port to sandbox (keeps the sandbox alive) |
 | `--remote <USER@HOST>` | SSH destination for auto-bootstrap |
 | `--ssh-key <PATH>` | SSH private key for auto-bootstrap |
 | `--tty` | Force pseudo-terminal allocation |

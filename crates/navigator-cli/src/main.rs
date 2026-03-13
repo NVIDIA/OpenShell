@@ -1038,13 +1038,17 @@ enum SandboxCommands {
         #[arg(long, requires = "upload", help_heading = "UPLOAD FLAGS")]
         no_git_ignore: bool,
 
-        /// Keep the sandbox alive after non-interactive commands.
-        #[arg(long)]
+        /// Deprecated compatibility flag. Sandboxes are kept by default.
+        #[arg(long, hide = true, conflicts_with = "no_keep")]
         keep: bool,
 
+        /// Delete the sandbox after the initial command or shell exits.
+        #[arg(long, conflicts_with_all = ["keep", "editor", "forward"])]
+        no_keep: bool,
+
         /// Launch a remote editor after the sandbox is ready.
-        /// Implies `--keep` and installs OpenShell-managed SSH config.
-        #[arg(long, value_enum)]
+        /// Keeps the sandbox alive and installs OpenShell-managed SSH config.
+        #[arg(long, value_enum, conflicts_with = "no_keep")]
         editor: Option<CliEditor>,
 
         /// SSH destination for remote bootstrap (e.g., user@hostname).
@@ -1066,9 +1070,9 @@ enum SandboxCommands {
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: Option<String>,
 
-        /// Forward a local port to the sandbox after the command finishes.
-        /// Implies --keep for non-interactive commands.
-        #[arg(long)]
+        /// Forward a local port to the sandbox before the initial command or shell starts.
+        /// Keeps the sandbox alive.
+        #[arg(long, conflicts_with = "no_keep")]
         forward: Option<u16>,
 
         /// Allocate a pseudo-terminal for the remote command.
@@ -1785,6 +1789,7 @@ async fn main() -> Result<()> {
                     upload,
                     no_git_ignore,
                     keep,
+                    no_keep,
                     editor,
                     remote,
                     ssh_key,
@@ -1834,7 +1839,7 @@ async fn main() -> Result<()> {
                     });
 
                     let editor = editor.map(Into::into);
-                    let keep = keep || editor.is_some();
+                    let keep = keep || !no_keep || editor.is_some() || forward.is_some();
 
                     // For `sandbox create`, a missing cluster is not fatal — the
                     // bootstrap flow inside `sandbox_create` can deploy one.

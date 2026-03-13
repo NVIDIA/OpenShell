@@ -70,10 +70,10 @@ Create a {doc}`credential provider </sandboxes/providers>` that injects your Git
 ```console
 $ GITHUB_TOKEN=<your-token>
 $ openshell provider create --name my-github --type github --from-existing
-$ openshell sandbox create --provider my-github --keep -- claude
+$ openshell sandbox create --provider my-github -- claude
 ```
 
-The `--keep` flag keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment.
+`openshell sandbox create` keeps the sandbox running after Claude Code exits, so you can apply policy updates later without recreating the environment. Add `--no-keep` if you want the sandbox deleted automatically instead.
 
 Claude Code starts inside the sandbox. It prints an authentication link. Open it in your browser, sign in to your Anthropic account, and return to the terminal. When prompted, trust the `/sandbox` workspace to allow Claude Code to read and write files.
 :::

@@ -9,6 +9,8 @@ use navigator_core::forward::{
     find_ssh_forward_pid, resolve_ssh_gateway, shell_escape, write_forward_pid,
 };
 use navigator_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
+#[cfg(unix)]
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use owo_colors::OwoColorize;
 use rustls::pki_types::ServerName;
 use std::fs;
@@ -140,8 +142,94 @@ fn ssh_base_command(proxy_command: &str) -> Command {
     command
 }
 
-/// Connect to a sandbox via SSH.
-pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+#[cfg(unix)]
+const TRANSIENT_TTY_SIGNALS: &[Signal] = &[Signal::SIGINT, Signal::SIGQUIT, Signal::SIGTERM];
+
+#[cfg(unix)]
+struct ParentSignalGuard {
+    previous: Vec<(Signal, SigAction)>,
+}
+
+#[cfg(unix)]
+impl ParentSignalGuard {
+    #[allow(unsafe_code)]
+    fn ignore_transient_tty_signals() -> Result<Self> {
+        let mut previous = Vec::with_capacity(TRANSIENT_TTY_SIGNALS.len());
+        for &signal in TRANSIENT_TTY_SIGNALS {
+            let action = SigAction::new(SigHandler::SigIgn, SaFlags::empty(), SigSet::empty());
+            // SAFETY: `sigaction` is the POSIX API for updating process signal
+            // dispositions. We install `SIG_IGN` for a small fixed set of
+            // terminal signals and store the previous handlers for restoration.
+            let old = unsafe { sigaction(signal, &action) }.into_diagnostic()?;
+            previous.push((signal, old));
+        }
+        Ok(Self { previous })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ParentSignalGuard {
+    #[allow(unsafe_code)]
+    fn drop(&mut self) {
+        for &(signal, previous) in self.previous.iter().rev() {
+            // SAFETY: these `SigAction` values were returned by `sigaction`
+            // above for this process, so restoring them here returns the parent
+            // signal handlers to their original state.
+            let _ = unsafe { sigaction(signal, &previous) };
+        }
+    }
+}
+
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn reset_transient_tty_signals(command: &mut Command) {
+    // SAFETY: `pre_exec` runs in the forked child immediately before `exec`.
+    // We only reset a small fixed set of signal handlers to `SIG_DFL`, which is
+    // required so SSH receives terminal signals normally even though the parent
+    // process temporarily ignores them to preserve cleanup.
+    unsafe {
+        command.pre_exec(|| {
+            for &signal in TRANSIENT_TTY_SIGNALS {
+                let action = SigAction::new(SigHandler::SigDfl, SaFlags::empty(), SigSet::empty());
+                sigaction(signal, &action).map_err(|err| std::io::Error::other(err.to_string()))?;
+            }
+            Ok(())
+        });
+    }
+}
+
+fn exec_or_wait(mut command: Command, replace_process: bool) -> Result<()> {
+    if replace_process && std::io::stdin().is_terminal() {
+        #[cfg(unix)]
+        {
+            let err = command.exec();
+            return Err(miette::miette!("failed to exec ssh: {err}"));
+        }
+    }
+
+    #[cfg(unix)]
+    let _signal_guard = if !replace_process && std::io::stdin().is_terminal() {
+        reset_transient_tty_signals(&mut command);
+        Some(ParentSignalGuard::ignore_transient_tty_signals()?)
+    } else {
+        None
+    };
+
+    let status = command.status().into_diagnostic()?;
+
+    if !status.success() {
+        return Err(miette::miette!("ssh exited with status {status}"));
+    }
+
+    Ok(())
+}
+
+async fn sandbox_connect_with_mode(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+    replace_process: bool,
+) -> Result<()> {
     let session = ssh_session_config(server, name, tls).await?;
 
     let mut command = ssh_base_command(&session.proxy_command);
@@ -156,24 +244,24 @@ pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Resu
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    if std::io::stdin().is_terminal() {
-        #[cfg(unix)]
-        {
-            let err = command.exec();
-            return Err(miette::miette!("failed to exec ssh: {err}"));
-        }
-    }
-
-    let status = tokio::task::spawn_blocking(move || command.status())
+    tokio::task::spawn_blocking(move || exec_or_wait(command, replace_process))
         .await
-        .into_diagnostic()?
-        .into_diagnostic()?;
-
-    if !status.success() {
-        return Err(miette::miette!("ssh exited with status {status}"));
-    }
+        .into_diagnostic()??;
 
     Ok(())
+}
+
+/// Connect to a sandbox via SSH.
+pub async fn sandbox_connect(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    sandbox_connect_with_mode(server, name, tls, true).await
+}
+
+pub(crate) async fn sandbox_connect_without_exec(
+    server: &str,
+    name: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    sandbox_connect_with_mode(server, name, tls, false).await
 }
 
 pub async fn sandbox_connect_editor(
@@ -263,13 +351,13 @@ pub async fn sandbox_forward(
     Ok(())
 }
 
-/// Execute a command in a sandbox via SSH.
-pub async fn sandbox_exec(
+async fn sandbox_exec_with_mode(
     server: &str,
     name: &str,
     command: &[String],
     tty: bool,
     tls: &TlsOptions,
+    replace_process: bool,
 ) -> Result<()> {
     if command.is_empty() {
         return Err(miette::miette!("no command provided"));
@@ -300,27 +388,32 @@ pub async fn sandbox_exec(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    // For interactive TTY sessions, replace this process with SSH via exec()
-    // to avoid signal handling issues (e.g. Ctrl+C killing the parent openshell
-    // process and orphaning the SSH child).
-    if tty && std::io::stdin().is_terminal() {
-        #[cfg(unix)]
-        {
-            let err = ssh.exec();
-            return Err(miette::miette!("failed to exec ssh: {err}"));
-        }
-    }
-
-    let status = tokio::task::spawn_blocking(move || ssh.status())
+    tokio::task::spawn_blocking(move || exec_or_wait(ssh, tty && replace_process))
         .await
-        .into_diagnostic()?
-        .into_diagnostic()?;
-
-    if !status.success() {
-        return Err(miette::miette!("ssh exited with status {status}"));
-    }
+        .into_diagnostic()??;
 
     Ok(())
+}
+
+/// Execute a command in a sandbox via SSH.
+pub async fn sandbox_exec(
+    server: &str,
+    name: &str,
+    command: &[String],
+    tty: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    sandbox_exec_with_mode(server, name, command, tty, tls, true).await
+}
+
+pub(crate) async fn sandbox_exec_without_exec(
+    server: &str,
+    name: &str,
+    command: &[String],
+    tty: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    sandbox_exec_with_mode(server, name, command, tty, tls, false).await
 }
 
 /// Push a list of files from a local directory into a sandbox using tar-over-SSH.
