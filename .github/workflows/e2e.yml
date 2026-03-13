@@ -14,15 +14,20 @@ jobs:
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
+      platform: linux/arm64
+      runner: build-arm64
 
   build-cluster:
     if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
+      platform: linux/arm64
+      runner: build-arm64
 
   e2e:
     needs: [build-gateway, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}
+      runner: build-arm64

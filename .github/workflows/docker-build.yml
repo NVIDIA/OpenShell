@@ -17,6 +17,16 @@ on:
         required: false
         type: boolean
         default: true
+      platform:
+        description: "Target platform(s) for Docker build"
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        type: string
+        default: "build-amd64"
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -29,7 +39,7 @@ permissions:
 jobs:
   build:
     name: Build ${{ inputs.component }}
-    runs-on: build-amd64
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: ${{ inputs.timeout-minutes }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -43,7 +53,7 @@ jobs:
       IMAGE_TAG: ${{ github.sha }}
       IMAGE_REGISTRY: ghcr.io/nvidia/openshell
       DOCKER_PUSH: ${{ inputs.push && '1' || '0' }}
-      DOCKER_PLATFORM: linux/amd64,linux/arm64
+      DOCKER_PLATFORM: ${{ inputs.platform }}
     steps:
       - uses: actions/checkout@v4
         with:
