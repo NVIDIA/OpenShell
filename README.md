@@ -15,13 +15,19 @@ Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchabl
 
 ### Install
 
-**Binary (recommended):**
+**Binary (recommended — requires [GitHub CLI](https://cli.github.com)):**
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-aarch64-apple-darwin.tar.gz" -O - \
+  | tar xz \
+  && sudo install -m 755 openshell /usr/local/bin/openshell
 ```
 
-The install script auto-detects your platform (Linux x86_64, Linux aarch64, macOS Apple Silicon) and places the `openshell` binary in `/usr/local/bin`. See the [releases page](https://github.com/NVIDIA/OpenShell/releases) for manual download options.
+Or use the install script which auto-detects your platform (Linux x86_64, Linux aarch64, macOS Apple Silicon):
+
+```bash
+./install.sh
+```
 
 **From PyPI (requires [uv](https://docs.astral.sh/uv/)):**
 
