@@ -1,0 +1,77 @@
+name: Bug Report
+description: Report a bug. Your agent should investigate first — see CONTRIBUTING.md.
+title: "bug: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Agent-First Troubleshooting
+
+        OpenShell is an agent-first project. Before filing this bug, point your coding agent at the repo and have it investigate using the available skills (`debug-openshell-cluster`, `openshell-cli`, etc.). See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) for the full skills table.
+
+  - type: textarea
+    id: agent-diagnostic
+    attributes:
+      label: Agent Diagnostic
+      description: |
+        Paste the output from your agent's investigation of this bug. What skills did it load? What did it find? What did it try?
+      placeholder: |
+        Example:
+        - Loaded `debug-openshell-cluster` skill
+        - Ran `openshell doctor logs` — found CoreDNS timeout errors
+        - Agent attempted DNS config fix but the issue persists because...
+    validations:
+      required: true
+
+  - type: textarea
+    id: description
+    attributes:
+      label: Description
+      description: What happened? What did you expect to happen?
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction Steps
+      description: Minimal steps to reproduce the issue.
+      placeholder: |
+        1. Run `openshell sandbox create -- claude`
+        2. ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Docker version, OpenShell version, and any other relevant details.
+      placeholder: |
+        - OS: macOS 15.2 / Ubuntu 24.04 / Windows 11 + WSL2
+        - Docker: Docker Desktop 4.x / Docker Engine 27.x
+        - OpenShell: v0.x.x (output of `openshell --version`)
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: Relevant log output, error messages, or stack traces.
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Agent-First Checklist
+      options:
+        - label: I pointed my agent at the repo and had it investigate this issue
+          required: true
+        - label: I loaded relevant skills (e.g., `debug-openshell-cluster`, `openshell-cli`)
+          required: true
+        - label: My agent could not resolve this — the diagnostic above explains why
+          required: true
