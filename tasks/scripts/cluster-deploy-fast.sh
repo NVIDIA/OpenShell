@@ -321,7 +321,7 @@ if [[ "${build_supervisor}" == "1" ]]; then
 
   docker buildx build \
     --file deploy/docker/Dockerfile.cluster \
-    --target supervisor-builder \
+    --target supervisor-out \
     --build-arg "BUILDARCH=$(docker version --format '{{.Server.Arch}}')" \
     --build-arg "TARGETARCH=${CLUSTER_ARCH}" \
     --output "type=local,dest=${SUPERVISOR_BUILD_DIR}" \
@@ -330,7 +330,7 @@ if [[ "${build_supervisor}" == "1" ]]; then
 
   # Copy the built binary into the running k3s container
   docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
-  docker cp "${SUPERVISOR_BUILD_DIR}/build/out/openshell-sandbox" \
+  docker cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
     "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
   docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 

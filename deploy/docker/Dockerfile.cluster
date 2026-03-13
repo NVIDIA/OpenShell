@@ -140,6 +140,14 @@ RUN --mount=type=cache,id=cargo-registry-supervisor-${TARGETARCH},sharing=locked
     cp "$(cross_output_dir release)/openshell-sandbox" /build/out/
 
 # ---------------------------------------------------------------------------
+# Stage 1e: Minimal extraction stage for supervisor binary
+# ---------------------------------------------------------------------------
+# Used by cluster-deploy-fast.sh with --target supervisor-out --output type=local
+# to extract only the ~50MB binary instead of the full ~900MB build tree.
+FROM scratch AS supervisor-out
+COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
+
+# ---------------------------------------------------------------------------
 # Stage 2: Install NVIDIA container toolkit on Ubuntu
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS nvidia-toolkit
