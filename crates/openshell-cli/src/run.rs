@@ -3390,6 +3390,7 @@ pub async fn gateway_inference_set(
     provider_name: &str,
     model_id: &str,
     route_name: &str,
+    skip_validation: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     let mut client = grpc_inference_client(server, tls).await?;
@@ -3398,6 +3399,7 @@ pub async fn gateway_inference_set(
             provider_name: provider_name.to_string(),
             model_id: model_id.to_string(),
             route_name: route_name.to_string(),
+            skip_validation,
         })
         .await
         .into_diagnostic()?;
@@ -3422,6 +3424,7 @@ pub async fn gateway_inference_update(
     provider_name: Option<&str>,
     model_id: Option<&str>,
     route_name: &str,
+    skip_validation: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     if provider_name.is_none() && model_id.is_none() {
@@ -3449,6 +3452,7 @@ pub async fn gateway_inference_update(
             provider_name: provider.to_string(),
             model_id: model.to_string(),
             route_name: route_name.to_string(),
+            skip_validation,
         })
         .await
         .into_diagnostic()?;

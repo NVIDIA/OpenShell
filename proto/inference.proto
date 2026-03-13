@@ -56,6 +56,8 @@ message SetClusterInferenceRequest {
   // Route name to target. Empty string defaults to "inference.local" (user-facing).
   // Use "sandbox-system" for the sandbox system-level inference route.
   string route_name = 3;
+  // Skip synchronous endpoint validation before persistence.
+  bool skip_validation = 4;
 }
 
 message SetClusterInferenceResponse {

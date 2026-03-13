@@ -1,12 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
+use openshell_core::inference::AuthHeader;
 use openshell_core::proto::{
     ClusterInferenceConfig, GetClusterInferenceRequest, GetClusterInferenceResponse,
     GetInferenceBundleRequest, GetInferenceBundleResponse, InferenceRoute, Provider, ResolvedRoute,
     SetClusterInferenceRequest, SetClusterInferenceResponse, inference_server::Inference,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use tonic::{Request, Response, Status};
 
 use crate::{
@@ -81,6 +83,7 @@ impl Inference for InferenceService {
             route_name,
             &req.provider_name,
             &req.model_id,
+            req.skip_validation,
         )
         .await?;
 
@@ -111,7 +114,7 @@ impl Inference for InferenceService {
             .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?
             .ok_or_else(|| {
                 Status::not_found(format!(
-                    "inference route '{route_name}' is not configured; run 'openshell cluster inference set --provider <name> --model <id>'"
+                    "inference route '{route_name}' is not configured; run 'openshell inference set --provider <name> --model <id>'"
                 ))
             })?;
 
@@ -140,6 +143,7 @@ async fn upsert_cluster_inference_route(
     route_name: &str,
     provider_name: &str,
     model_id: &str,
+    skip_validation: bool,
 ) -> Result<InferenceRoute, Status> {
     if provider_name.trim().is_empty() {
         return Err(Status::invalid_argument("provider_name is required"));
@@ -156,9 +160,10 @@ async fn upsert_cluster_inference_route(
             Status::failed_precondition(format!("provider '{provider_name}' not found"))
         })?;
 
-    // Validate provider shape at set time; endpoint/auth are resolved from the
-    // provider record when generating sandbox bundles.
-    let _ = resolve_provider_route(&provider)?;
+    let resolved = resolve_provider_route(&provider)?;
+    if !skip_validation {
+        verify_provider_endpoint(&provider.name, model_id, &resolved).await?;
+    }
 
     let config = build_cluster_inference_config(&provider, model_id);
 
@@ -203,6 +208,13 @@ struct ResolvedProviderRoute {
     base_url: String,
     protocols: Vec<String>,
     api_key: String,
+    auth: AuthHeader,
+    default_headers: Vec<(String, String)>,
+}
+
+struct ValidationProbe {
+    path: &'static str,
+    body: serde_json::Value,
 }
 
 fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, Status> {
@@ -241,7 +253,196 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
         base_url,
         protocols: profile.protocols.iter().map(|p| (*p).to_string()).collect(),
         api_key,
+        auth: profile.auth.clone(),
+        default_headers: profile
+            .default_headers
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect(),
     })
+}
+
+fn validation_probe(
+    route: &ResolvedProviderRoute,
+    model_id: &str,
+) -> Result<ValidationProbe, Status> {
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_chat_completions")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/chat/completions",
+            body: serde_json::json!({
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }),
+        });
+    }
+
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "anthropic_messages")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/messages",
+            body: serde_json::json!({
+                "model": model_id,
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 1,
+            }),
+        });
+    }
+
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_responses")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/responses",
+            body: serde_json::json!({
+                "model": model_id,
+                "input": "ping",
+                "max_output_tokens": 1,
+            }),
+        });
+    }
+
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_completions")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/completions",
+            body: serde_json::json!({
+                "model": model_id,
+                "prompt": "ping",
+                "max_tokens": 1,
+            }),
+        });
+    }
+
+    Err(Status::failed_precondition(format!(
+        "provider type '{}' does not expose a writable inference protocol for validation",
+        route.provider_type
+    )))
+}
+
+fn validation_url(base_url: &str, path: &str) -> String {
+    let base = base_url.trim_end_matches('/');
+    if base.ends_with("/v1") && (path == "/v1" || path.starts_with("/v1/")) {
+        return format!("{base}{}", &path[3..]);
+    }
+
+    format!("{base}{path}")
+}
+
+fn validation_failure(
+    provider_name: &str,
+    model_id: &str,
+    base_url: &str,
+    details: &str,
+    next_steps: &str,
+) -> Status {
+    Status::failed_precondition(format!(
+        "failed to verify inference endpoint for provider '{provider_name}' and model '{model_id}' at '{base_url}': {details}. Next steps: {next_steps}, or retry with '--no-verify' if the endpoint is not up yet"
+    ))
+}
+
+async fn verify_provider_endpoint(
+    provider_name: &str,
+    model_id: &str,
+    route: &ResolvedProviderRoute,
+) -> Result<(), Status> {
+    let probe = validation_probe(route, model_id)?;
+    let url = validation_url(&route.base_url, probe.path);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|err| Status::internal(format!("build validation client failed: {err}")))?;
+
+    let mut request = client
+        .post(&url)
+        .header(reqwest::header::CONTENT_TYPE, "application/json");
+    request = match &route.auth {
+        AuthHeader::Bearer => request.bearer_auth(&route.api_key),
+        AuthHeader::Custom(name) => request.header(*name, &route.api_key),
+    };
+
+    for (name, value) in &route.default_headers {
+        request = request.header(name, value);
+    }
+
+    let response = request.json(&probe.body).send().await.map_err(|err| {
+        let details = if err.is_timeout() {
+            format!("request to {url} timed out")
+        } else if err.is_connect() {
+            format!("failed to connect to {url}: {err}")
+        } else {
+            format!("request to {url} failed: {err}")
+        };
+
+        validation_failure(
+            provider_name,
+            model_id,
+            &route.base_url,
+            &details,
+            "check that the service is running, confirm the base URL and protocol, and verify credentials",
+        )
+    })?;
+
+    if response.status().is_success() {
+        return Ok(());
+    }
+
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    let body = body.trim();
+    let body_suffix = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Response body: {}",
+            body.chars().take(200).collect::<String>()
+        )
+    };
+
+    let (details, next_steps) = match status.as_u16() {
+        400 | 404 | 405 | 422 => (
+            format!("upstream rejected the validation request with HTTP {status}.{body_suffix}"),
+            "confirm the provider type, base URL, and model identifier",
+        ),
+        401 | 403 => (
+            format!("upstream rejected credentials with HTTP {status}.{body_suffix}"),
+            "verify the provider API key and any required auth headers",
+        ),
+        429 => (
+            format!(
+                "upstream rate-limited the validation request with HTTP {status}.{body_suffix}"
+            ),
+            "retry later or verify quota/limits on the upstream provider",
+        ),
+        500..=599 => (
+            format!("upstream returned HTTP {status}.{body_suffix}"),
+            "check whether the endpoint is healthy and serving requests",
+        ),
+        _ => (
+            format!("upstream returned unexpected HTTP {status}.{body_suffix}"),
+            "confirm the endpoint URL, protocol, credentials, and model identifier",
+        ),
+    };
+
+    Err(validation_failure(
+        provider_name,
+        model_id,
+        &route.base_url,
+        &details,
+        next_steps,
+    ))
 }
 
 fn find_provider_api_key(provider: &Provider, preferred_key_names: &[&str]) -> Option<String> {
@@ -369,6 +570,8 @@ async fn resolve_route_by_name(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn make_route(name: &str, provider_name: &str, model_id: &str) -> InferenceRoute {
         InferenceRoute {
@@ -392,6 +595,20 @@ mod tests {
         }
     }
 
+    fn make_provider_with_base_url(
+        name: &str,
+        provider_type: &str,
+        key_name: &str,
+        key_value: &str,
+        base_url_key: &str,
+        base_url: &str,
+    ) -> Provider {
+        Provider {
+            config: std::iter::once((base_url_key.to_string(), base_url.to_string())).collect(),
+            ..make_provider(name, provider_type, key_name, key_value)
+        }
+    }
+
     #[tokio::test]
     async fn upsert_cluster_route_creates_and_increments_version() {
         let store = Store::connect("sqlite::memory:?cache=shared")
@@ -409,6 +626,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4o",
+            true,
         )
         .await
         .expect("first set should succeed");
@@ -420,6 +638,7 @@ mod tests {
             CLUSTER_INFERENCE_ROUTE_NAME,
             "openai-dev",
             "gpt-4.1",
+            true,
         )
         .await
         .expect("second set should succeed");
@@ -630,6 +849,7 @@ mod tests {
             SANDBOX_SYSTEM_ROUTE_NAME,
             "anthropic-dev",
             "claude-sonnet-4-20250514",
+            true,
         )
         .await
         .expect("should succeed");
@@ -715,6 +935,7 @@ mod tests {
             SANDBOX_SYSTEM_ROUTE_NAME,
             "openai-dev",
             "gpt-4o-mini",
+            true,
         )
         .await
         .expect("upsert should succeed");
@@ -728,6 +949,175 @@ mod tests {
         assert_eq!(route.name, SANDBOX_SYSTEM_ROUTE_NAME);
         let config = route.config.as_ref().expect("config");
         assert_eq!(config.model_id, "gpt-4o-mini");
+    }
+
+    #[test]
+    fn openai_validation_probe_uses_lightweight_chat_shape() {
+        let route = ResolvedProviderRoute {
+            provider_type: "openai".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            protocols: vec!["openai_chat_completions".to_string()],
+            api_key: "sk-test".to_string(),
+            auth: AuthHeader::Bearer,
+            default_headers: Vec::new(),
+        };
+
+        let probe = validation_probe(&route, "gpt-4.1").expect("probe should build");
+
+        assert_eq!(probe.path, "/v1/chat/completions");
+        assert_eq!(probe.body["model"], "gpt-4.1");
+        assert_eq!(probe.body["max_tokens"], 1);
+    }
+
+    #[test]
+    fn anthropic_validation_probe_uses_messages_shape() {
+        let route = ResolvedProviderRoute {
+            provider_type: "anthropic".to_string(),
+            base_url: "https://api.anthropic.com/v1".to_string(),
+            protocols: vec!["anthropic_messages".to_string()],
+            api_key: "sk-test".to_string(),
+            auth: AuthHeader::Custom("x-api-key"),
+            default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        };
+
+        let probe =
+            validation_probe(&route, "claude-sonnet-4-20250514").expect("probe should build");
+
+        assert_eq!(probe.path, "/v1/messages");
+        assert_eq!(probe.body["model"], "claude-sonnet-4-20250514");
+        assert_eq!(probe.body["max_tokens"], 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_cluster_route_verifies_endpoint_by_default() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(header("authorization", "Bearer sk-test"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "max_tokens": 1,
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "id": "chatcmpl-123",
+                "object": "chat.completion",
+                "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+                "model": "gpt-4o-mini"
+            })))
+            .mount(&mock_server)
+            .await;
+
+        let provider = make_provider_with_base_url(
+            "openai-dev",
+            "openai",
+            "OPENAI_API_KEY",
+            "sk-test",
+            "OPENAI_BASE_URL",
+            &mock_server.uri(),
+        );
+        store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+
+        let route = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4o-mini",
+            false,
+        )
+        .await
+        .expect("validation should succeed");
+
+        assert_eq!(route.version, 1);
+    }
+
+    #[tokio::test]
+    async fn upsert_cluster_route_rejects_failed_validation() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+        let mock_server = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("bad key"))
+            .mount(&mock_server)
+            .await;
+
+        let provider = make_provider_with_base_url(
+            "openai-dev",
+            "openai",
+            "OPENAI_API_KEY",
+            "sk-test",
+            "OPENAI_BASE_URL",
+            &mock_server.uri(),
+        );
+        store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+
+        let err = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4o-mini",
+            false,
+        )
+        .await
+        .expect_err("validation should fail");
+
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(
+            err.message()
+                .contains("failed to verify inference endpoint")
+        );
+        assert!(err.message().contains("verify the provider API key"));
+        assert!(err.message().contains("--no-verify"));
+
+        let persisted = store
+            .get_message_by_name::<InferenceRoute>(CLUSTER_INFERENCE_ROUTE_NAME)
+            .await
+            .expect("fetch route")
+            .is_none();
+        assert!(persisted, "route should not persist on failed validation");
+    }
+
+    #[tokio::test]
+    async fn upsert_cluster_route_skips_validation_when_requested() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+        let provider = make_provider_with_base_url(
+            "openai-dev",
+            "openai",
+            "OPENAI_API_KEY",
+            "sk-test",
+            "OPENAI_BASE_URL",
+            "http://127.0.0.1:9",
+        );
+        store
+            .put_message(&provider)
+            .await
+            .expect("persist provider");
+
+        let route = upsert_cluster_inference_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            "openai-dev",
+            "gpt-4o-mini",
+            true,
+        )
+        .await
+        .expect("skip validation should persist route");
+
+        assert_eq!(route.version, 1);
     }
 
     #[test]
