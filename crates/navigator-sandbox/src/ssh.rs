@@ -3,6 +3,7 @@
 
 //! Embedded SSH server for sandbox access.
 
+use crate::child_env;
 use crate::policy::SandboxPolicy;
 use crate::process::drop_privileges;
 use crate::sandbox;
@@ -668,19 +669,15 @@ fn apply_child_env(
         .env("TERM", term);
 
     if let Some(url) = proxy_url {
-        cmd.env("HTTP_PROXY", url)
-            .env("HTTPS_PROXY", url)
-            .env("ALL_PROXY", url)
-            .env("http_proxy", url)
-            .env("https_proxy", url)
-            .env("grpc_proxy", url);
+        for (key, value) in child_env::proxy_env_vars(url) {
+            cmd.env(key, value);
+        }
     }
 
     if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
-        cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
-            .env("SSL_CERT_FILE", combined_bundle_path)
-            .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
-            .env("CURL_CA_BUNDLE", combined_bundle_path);
+        for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+            cmd.env(key, value);
+        }
     }
 
     for (key, value) in provider_env {
