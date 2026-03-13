@@ -1,0 +1,51 @@
+instances:
+  - url: https://openshell.docs.buildwithfern.com
+
+title: NVIDIA OpenShell
+
+versions:
+  - display-name: v0.1.0
+    path: versions/v0.1.0.yml
+    slug: v0.1.0
+
+footer: ./components/CustomFooter.tsx
+
+layout:
+  searchbar-placement: header
+  page-width: 1376px
+  sidebar-width: 248px
+  content-width: 812px
+  tabs-placement: header
+  hide-feedback: true
+
+colors:
+  accentPrimary:
+    dark: "#76B900"
+    light: "#76B900"
+  background:
+    light: "#FFFFFF"
+    dark: "#000000"
+
+theme:
+  page-actions: toolbar
+  footer-nav: minimal
+
+logo:
+  dark: ./assets/NVIDIA_dark.svg
+  light: ./assets/NVIDIA_light.svg
+  height: 20
+  href: /
+  right-text: OpenShell
+
+favicon: ./assets/NVIDIA_symbol.svg
+
+css:
+  - ./main.css
+
+navbar-links:
+  - type: github
+    value: https://github.com/NVIDIA/OpenShell
+
+experimental:
+  mdx-components:
+    - ./components

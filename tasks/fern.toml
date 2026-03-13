@@ -1,0 +1,13 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Fern documentation build and preview tasks
+# Requires Node.js (mise installs it). Fern CLI runs via npx fern-api.
+
+["fern:build"]
+description = "Build and publish Fern documentation"
+run = "npx fern-api generate --docs"
+
+["fern:dev"]
+description = "Run Fern docs preview server at localhost:3000"
+run = "npx fern-api docs dev"

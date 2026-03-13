@@ -1,0 +1,5 @@
+{
+  "dependencies": {
+    "@boundaryml/baml-darwin-arm64": "^0.220.0"
+  }
+}

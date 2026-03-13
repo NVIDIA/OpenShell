@@ -1,0 +1,49 @@
+navigation:
+  - section: Home
+    contents:
+      - page: Welcome
+        path: ../v0.1.0/pages/index.mdx
+  - section: About NVIDIA OpenShell
+    contents:
+      - page: Overview
+        path: ../v0.1.0/pages/about/overview.mdx
+      - page: How It Works
+        path: ../v0.1.0/pages/about/architecture.mdx
+      - page: Release Notes
+        path: ../v0.1.0/pages/about/release-notes.mdx
+  - section: Get Started
+    contents:
+      - page: Quickstart
+        path: ../v0.1.0/pages/get-started/quickstart.mdx
+      - page: GitHub Policy Tutorial
+        path: ../v0.1.0/pages/get-started/github-sandbox.mdx
+  - section: Sandboxes
+    contents:
+      - page: About Sandboxes
+        path: ../v0.1.0/pages/sandboxes/index.mdx
+      - page: Create and Manage Sandboxes
+        path: ../v0.1.0/pages/sandboxes/create-and-manage.mdx
+      - page: Providers
+        path: ../v0.1.0/pages/sandboxes/providers.mdx
+      - page: Customize Sandbox Policies
+        path: ../v0.1.0/pages/sandboxes/policies.mdx
+      - page: Community Sandboxes
+        path: ../v0.1.0/pages/sandboxes/community-sandboxes.mdx
+  - section: Inference Routing
+    contents:
+      - page: About Inference Routing
+        path: ../v0.1.0/pages/inference/index.mdx
+      - page: Configure Inference Routing
+        path: ../v0.1.0/pages/inference/configure.mdx
+  - section: Reference
+    contents:
+      - page: Default Policy Reference
+        path: ../v0.1.0/pages/reference/default-policy.mdx
+      - page: Policy Schema Reference
+        path: ../v0.1.0/pages/reference/policy-schema.mdx
+      - page: Support Matrix
+        path: ../v0.1.0/pages/reference/support-matrix.mdx
+  - section: Resources
+    contents:
+      - page: License
+        path: ../v0.1.0/pages/resources/eula.mdx

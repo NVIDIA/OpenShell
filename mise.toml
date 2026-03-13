@@ -12,6 +12,7 @@ redactions = ["*_TOKEN", "*_PASSWORD"]
 experimental = true
 
 [tools]
+node = "22"
 python = "3.13.12"
 rust = "stable"
 kubectl = "1.35.1"

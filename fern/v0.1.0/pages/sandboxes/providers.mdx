@@ -1,0 +1,131 @@
+---
+title: "Providers"
+description: "Create and manage credential providers that inject API keys and tokens into OpenShell sandboxes."
+---
+{/* SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+  SPDX-License-Identifier: Apache-2.0 */}
+
+AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
+
+Create and manage providers that supply credentials to sandboxes.
+
+## Create a Provider
+
+Providers can be created from local environment variables or with explicit credential values.
+
+### From Local Credentials
+
+The fastest way to create a provider is to let the CLI discover credentials from
+your shell environment:
+
+```console
+$ openshell provider create --name my-claude --type claude --from-existing
+```
+
+This reads `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY` from your current environment
+and stores them in the provider.
+
+### With Explicit Credentials
+
+Supply a credential value directly:
+
+```console
+$ openshell provider create --name my-api --type generic --credential API_KEY=sk-abc123
+```
+
+### Bare Key Form
+
+Pass a key name without a value to read the value from the environment variable
+of that name:
+
+```console
+$ openshell provider create --name my-api --type generic --credential API_KEY
+```
+
+This looks up the current value of `$API_KEY` in your shell and stores it.
+
+## Manage Providers
+
+List, inspect, update, and delete providers from the active cluster.
+
+List all providers:
+
+```console
+$ openshell provider list
+```
+
+Inspect a provider:
+
+```console
+$ openshell provider get my-claude
+```
+
+Update a provider's credentials:
+
+```console
+$ openshell provider update my-claude --type claude --from-existing
+```
+
+Delete a provider:
+
+```console
+$ openshell provider delete my-claude
+```
+
+## Attach Providers to Sandboxes
+
+Pass one or more `--provider` flags when creating a sandbox:
+
+```console
+$ openshell sandbox create --provider my-claude --provider my-github -- claude
+```
+
+Each `--provider` flag attaches one provider. The sandbox receives all
+credentials from every attached provider at runtime.
+
+<Warning>
+Providers cannot be added to a running sandbox. If you need to attach an
+additional provider, delete the sandbox and recreate it with all required
+providers specified.
+</Warning>
+
+### Auto-Discovery Shortcut
+
+When the trailing command in `openshell sandbox create` is a recognized tool name (`claude`, `codex`, or `opencode`), the CLI auto-creates the required
+provider from your local credentials if one does not already exist. You do not
+need to create the provider separately:
+
+```console
+$ openshell sandbox create -- claude
+```
+
+This detects `claude` as a known tool, finds your `ANTHROPIC_API_KEY`, creates
+a provider, attaches it to the sandbox, and launches Claude Code.
+
+## Supported Provider Types
+
+The following provider types are supported.
+
+| Type | Environment Variables Injected | Typical Use |
+|---|---|---|
+| `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
+| `codex` | `OPENAI_API_KEY` | OpenAI Codex |
+| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
+| `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to [GitHub Sandbox](/get-started/github-sandbox) |
+| `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
+| `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
+| `generic` | User-defined | Any service with custom credentials |
+| `outlook` | *(none: no auto-discovery)* | Microsoft Outlook integration |
+
+<Tip>
+Use the `generic` type for any service not listed above. You define the
+environment variable names and values yourself with `--credential`.
+</Tip>
+
+## Next Steps
+
+Explore related topics:
+
+- To control what the agent can access, refer to [Policies](/sandboxes/policies).
+- To use a pre-built environment, refer to the [Community Sandboxes](/sandboxes/community-sandboxes) catalog.
+- To view the complete field reference for the policy YAML, refer to the [Policy Schema Reference](/reference/policy-schema).

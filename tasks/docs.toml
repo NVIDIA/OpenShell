@@ -1,35 +1,29 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
-# Documentation build, serve, and check tasks
+# Documentation build and preview tasks (Fern)
+# Requires Node.js (provided by mise). Fern CLI runs via npx.
 
 ["docs"]
-description = "Build HTML documentation"
-run = """
-if ! uv run sphinx-build -b html docs _build/docs; then
-  echo ""
-  echo "Build failed. If this is a dependency issue, try: mise run docs:deps"
-  exit 1
-fi
-echo ""
-echo "Documentation built successfully."
-echo "file://$(pwd)/_build/docs/index.html"
-"""
+description = "Publish Fern documentation to hosted site"
+run = "npx fern-api generate --docs"
 
-["docs:deps"]
-description = "Install documentation dependencies"
-run = "uv sync --group docs"
+["docs:build"]
+description = "Alias for docs"
+depends = ["docs"]
 
 ["docs:build:strict"]
-description = "Build HTML documentation with warnings as errors"
-depends = ["docs:deps"]
-run = "uv run sphinx-build -b html -W --keep-going docs _build/docs"
+description = "Alias for docs (Fern builds are always strict)"
+depends = ["docs"]
 
-["docs:serve"]
-description = "Serve documentation with live reload on port 8000"
-depends = ["docs:deps"]
-run = "uv run sphinx-autobuild docs _build/docs --port 8000 --open-browser"
+["docs:preview"]
+description = "Generate a Fern preview URL for the current docs"
+run = "npx fern-api generate --docs --preview"
+
+["docs:dev"]
+description = "Run Fern docs preview server at localhost:3000"
+run = "npx fern-api docs dev"
 
 ["docs:clean"]
-description = "Remove built documentation"
-run = "rm -rf _build/docs"
+description = "Remove Fern build cache"
+run = "rm -rf .fern/"

@@ -3,16 +3,16 @@ name: docs-preview-pr
 on:
     pull_request:
         branches: [main]
-        types: [opened, reopened, synchronize, closed]
+        types: [opened, reopened, synchronize]
         paths:
-            - "docs/**"
+            - "fern/**"
 
 concurrency:
     group: preview-${{ github.ref }}
     cancel-in-progress: true
 
 permissions:
-    contents: write
+    contents: read
     pull-requests: write
     packages: read
 
@@ -38,20 +38,21 @@ jobs:
             - name: Install tools
               run: mise install
 
-            - name: Build documentation
-              if: github.event.action != 'closed'
-              run: mise run docs:build:strict
-
-            - name: Delete unnecessary files
-              if: github.event.action != 'closed'
+            - name: Generate preview
+              id: preview
+              env:
+                  FERN_TOKEN: ${{ secrets.FERN_TOKEN }}
               run: |
-                  find _build -name .doctrees -prune -exec rm -rf {} \;
-                  find _build -name .buildinfo -exec rm {} \;
+                  OUTPUT=$(mise run docs:preview 2>&1) || true
+                  echo "$OUTPUT"
+                  URL=$(echo "$OUTPUT" | grep -oE 'https://[^ ]+' | tail -1)
+                  echo "url=$URL" >> "$GITHUB_OUTPUT"
 
-            - name: Deploy preview
-              uses: rossjrw/pr-preview-action@v1
-              with:
-                  source-dir: ./_build/docs/
-                  preview-branch: gh-pages
-                  umbrella-dir: pr-preview
-                  action: auto
+            - name: Comment preview URL on PR
+              if: steps.preview.outputs.url != ''
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  gh pr comment "${{ github.event.pull_request.number }}" \
+                    --body "**Docs preview:** ${{ steps.preview.outputs.url }}" \
+                    --repo "${{ github.repository }}"
