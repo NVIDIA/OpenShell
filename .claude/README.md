@@ -1,5 +1,8 @@
-# Why `.claude/` exists alongside `.agents/`
+# `.claude/` — Claude Code-specific configuration
 
-Claude Code doesn't read skills from `.agents/skills/` — it has no built-in discovery for that path and no settings to change this behavior. There is also no cross-tool standard for sub-agent definitions yet.
+Agent skills are canonical in `.agents/skills/` and shared across all harnesses (Claude Code, OpenCode, Cursor, etc.). This directory contains only Claude Code-specific configuration that cannot be made tool-agnostic.
 
-The `.claude/` directory gives us native support for skills (e.g. slash commands) and agents. Without it, Claude can be pointed to a custom location and discover markdown-based skills manually, but that requires extra setup per session. With `.claude/`, skills are loaded automatically at startup — no additional configuration needed.
+## Contents
+
+- `agents/` — Sub-agent persona definitions with Claude Code-specific frontmatter (`model`, `memory`, `color`, `tools`). The same personas exist in `.opencode/agents/` with OpenCode-specific config.
+- `agent-memory/` — Persistent agent memory files. Claude Code runtime state, not portable across tools.
