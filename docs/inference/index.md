@@ -26,7 +26,8 @@ content:
 
 # About Inference Routing
 
-OpenShell handles inference in two ways:
+NVIDIA OpenShell handles inference traffic through two endpoints: `inference.local` and external endpoints.
+The following table summarizes how OpenShell handles inference traffic.
 
 | Path | How It Works |
 |---|---|

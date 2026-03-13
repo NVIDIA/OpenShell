@@ -138,7 +138,7 @@ Install the CLI and create your first sandbox in two commands.
 :link: tutorials/github-sandbox
 :link-type: doc
 
-End-to-end guides: GitHub repo access, custom policies, and more.
+End-to-end guides for GitHub repo access, custom policies, and more.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -148,7 +148,7 @@ End-to-end guides: GitHub repo access, custom policies, and more.
 :link: sandboxes/index
 :link-type: doc
 
-Create, manage, and customize sandboxes. Configure policies, providers, and community images.
+Create, manage, and customize sandboxes. Configure policies, providers, and community images for your AI agents.
 
 +++
 {bdg-secondary}`Concept`
