@@ -1,0 +1,33 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Allow curl to read from the GitHub REST API.
+# POST, PUT, PATCH, and DELETE are blocked by the "read-only" preset.
+
+version: 1
+
+# Default sandbox filesystem and process settings.
+# These static fields are required when using `openshell policy set`
+# because it replaces the entire policy.
+filesystem_policy:
+  include_workdir: true
+  read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
+  read_write: [/sandbox, /tmp, /dev/null]
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  github_api:
+    name: github-api-readonly
+    endpoints:
+      - host: api.github.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
