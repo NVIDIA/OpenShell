@@ -96,7 +96,7 @@ fn provisioning_timeout_message(
 
     if requested_gpu {
         message.push_str(
-            ". Hint: this may be because the gateway's available GPU is already in use by another sandbox.",
+            ". Hint: this may be because the available GPU is already in use by another sandbox.",
         );
     }
 
