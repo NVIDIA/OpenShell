@@ -3,7 +3,7 @@
 
 syntax = "proto3";
 
-package navigator.sandbox.v1;
+package openshell.sandbox.v1;
 
 // Sandbox security policy configuration.
 message SandboxPolicy {

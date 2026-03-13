@@ -19,8 +19,8 @@ from ._proto import (
     datamodel_pb2,
     inference_pb2,
     inference_pb2_grpc,
-    navigator_pb2,
-    navigator_pb2_grpc,
+    openshell_pb2,
+    openshell_pb2_grpc,
 )
 
 if TYPE_CHECKING:
@@ -138,7 +138,7 @@ class SandboxClient:
                 certificate_chain=tls.cert_path.read_bytes(),
             )
             self._channel = grpc.secure_channel(endpoint, credentials)
-        self._stub = navigator_pb2_grpc.NavigatorStub(self._channel)
+        self._stub = openshell_pb2_grpc.OpenShellStub(self._channel)
 
     @classmethod
     def from_active_cluster(
@@ -181,8 +181,8 @@ class SandboxClient:
     def __exit__(self, *args: object) -> None:
         self.close()
 
-    def health(self) -> navigator_pb2.HealthResponse:
-        return self._stub.Health(navigator_pb2.HealthRequest(), timeout=self._timeout)
+    def health(self) -> openshell_pb2.HealthResponse:
+        return self._stub.Health(openshell_pb2.HealthRequest(), timeout=self._timeout)
 
     def create(
         self,
@@ -191,7 +191,7 @@ class SandboxClient:
     ) -> SandboxRef:
         request_spec = spec if spec is not None else _default_spec()
         response = self._stub.CreateSandbox(
-            navigator_pb2.CreateSandboxRequest(spec=request_spec),
+            openshell_pb2.CreateSandboxRequest(spec=request_spec),
             timeout=self._timeout,
         )
         if response.sandbox.id == "":
@@ -207,7 +207,7 @@ class SandboxClient:
 
     def get(self, sandbox_name: str) -> SandboxRef:
         response = self._stub.GetSandbox(
-            navigator_pb2.GetSandboxRequest(name=sandbox_name),
+            openshell_pb2.GetSandboxRequest(name=sandbox_name),
             timeout=self._timeout,
         )
         return _sandbox_ref(response.sandbox)
@@ -217,7 +217,7 @@ class SandboxClient:
 
     def list(self, *, limit: int = 100, offset: int = 0) -> builtins.list[SandboxRef]:
         response = self._stub.ListSandboxes(
-            navigator_pb2.ListSandboxesRequest(limit=limit, offset=offset),
+            openshell_pb2.ListSandboxesRequest(limit=limit, offset=offset),
             timeout=self._timeout,
         )
         return [_sandbox_ref(item) for item in response.sandboxes]
@@ -227,7 +227,7 @@ class SandboxClient:
 
     def delete(self, sandbox_name: str) -> bool:
         response = self._stub.DeleteSandbox(
-            navigator_pb2.DeleteSandboxRequest(name=sandbox_name),
+            openshell_pb2.DeleteSandboxRequest(name=sandbox_name),
             timeout=self._timeout,
         )
         return bool(response.deleted)
@@ -273,7 +273,7 @@ class SandboxClient:
         if not command:
             raise SandboxError("command must not be empty")
 
-        request = navigator_pb2.ExecSandboxRequest(
+        request = openshell_pb2.ExecSandboxRequest(
             sandbox_id=sandbox_id,
             command=list(command),
             workdir=workdir or "",
@@ -585,7 +585,7 @@ def _sandbox_ref(sandbox: datamodel_pb2.Sandbox) -> SandboxRef:
 
 def _default_spec() -> datamodel_pb2.SandboxSpec:
     # Omit the policy field so the sandbox container discovers its policy
-    # from /etc/navigator/policy.yaml (baked into the image at build time).
+    # from /etc/openshell/policy.yaml (baked into the image at build time).
     # This avoids duplicating policy defaults between the SDK and the
     # container image and ensures sandboxes get the full dev-sandbox-policy
     # (including network_policies) out of the box.

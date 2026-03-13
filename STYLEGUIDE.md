@@ -41,7 +41,7 @@ Created sandbox:
 
   Id: cddeeb6d-a4d3-4158-a4d1-bd931f743700
   Name: sandbox-cddeeb6d
-  Namespace: navigator
+  Namespace: openshell
 ```
 
 Bad:
@@ -50,5 +50,5 @@ Bad:
 Created sandbox:
   Id: cddeeb6d-a4d3-4158-a4d1-bd931f743700
   Name: sandbox-cddeeb6d
-  Namespace: navigator
+  Namespace: openshell
 ```

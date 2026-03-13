@@ -10,6 +10,6 @@
 #
 # Usage:
 #   kubectl get pods -A
-#   kubectl logs -n navigator statefulset/navigator
+#   kubectl logs -n openshell statefulset/openshell
 
 exec openshell doctor exec -- kubectl "$@"

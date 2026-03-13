@@ -147,13 +147,13 @@ matches_gateway() {
     Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
       return 0
       ;;
-    crates/navigator-core/*|crates/navigator-providers/*)
+    crates/openshell-core/*|crates/openshell-providers/*)
       return 0
       ;;
-    crates/navigator-router/*)
+    crates/openshell-router/*)
       return 0
       ;;
-    crates/navigator-server/*|deploy/docker/Dockerfile.gateway)
+    crates/openshell-server/*|deploy/docker/Dockerfile.gateway)
       return 0
       ;;
     *)
@@ -168,10 +168,10 @@ matches_supervisor() {
     Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
       return 0
       ;;
-    crates/navigator-core/*|crates/navigator-policy/*|crates/navigator-router/*)
+    crates/openshell-core/*|crates/openshell-policy/*|crates/openshell-router/*)
       return 0
       ;;
-    crates/navigator-sandbox/*)
+    crates/openshell-sandbox/*)
       return 0
       ;;
     *)
@@ -204,10 +204,10 @@ compute_fingerprint() {
   local committed_trees=""
   case "${component}" in
     gateway)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-router/ crates/navigator-server/ deploy/docker/Dockerfile.gateway 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ deploy/docker/Dockerfile.gateway 2>/dev/null || true)
       ;;
     supervisor)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-router/ crates/navigator-sandbox/ 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
       ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
@@ -301,7 +301,7 @@ if [[ "${build_gateway}" == "1" ]]; then
 fi
 
 # Build the supervisor binary and docker cp it into the running k3s cluster.
-# The binary lives at /opt/openshell/bin/navigator-sandbox on the node
+# The binary lives at /opt/openshell/bin/openshell-sandbox on the node
 # filesystem and is mounted into sandbox pods via a hostPath volume.
 if [[ "${build_supervisor}" == "1" ]]; then
   echo "Building supervisor binary..."
@@ -315,7 +315,7 @@ if [[ "${build_supervisor}" == "1" ]]; then
 
   # Build the supervisor binary using docker buildx with a lightweight build.
   # We use the same cross-build.sh helpers as the full cluster image but only
-  # compile navigator-sandbox, then extract the binary via --output.
+  # compile openshell-sandbox, then extract the binary via --output.
   SUPERVISOR_BUILD_DIR=$(mktemp -d)
   trap 'rm -rf "${SUPERVISOR_BUILD_DIR}"' EXIT
 
@@ -330,9 +330,9 @@ if [[ "${build_supervisor}" == "1" ]]; then
 
   # Copy the built binary into the running k3s container
   docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
-  docker cp "${SUPERVISOR_BUILD_DIR}/build/out/navigator-sandbox" \
-    "${CONTAINER_NAME}:/opt/openshell/bin/navigator-sandbox"
-  docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/navigator-sandbox
+  docker cp "${SUPERVISOR_BUILD_DIR}/build/out/openshell-sandbox" \
+    "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
+  docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 
   built_components+=("supervisor")
   supervisor_end=$(date +%s)

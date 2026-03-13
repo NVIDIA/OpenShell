@@ -1,0 +1,827 @@
+// SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+// SPDX-License-Identifier: Apache-2.0
+
+syntax = "proto3";
+
+package openshell.v1;
+
+import "datamodel.proto";
+import "sandbox.proto";
+
+option java_multiple_files = true;
+option java_package = "com.anthropic.openshell.v1";
+
+// OpenShell service provides sandbox, provider, and runtime management capabilities.
+service OpenShell {
+  // Check the health of the service.
+  rpc Health(HealthRequest) returns (HealthResponse);
+
+  // Create a new sandbox.
+  rpc CreateSandbox(CreateSandboxRequest) returns (SandboxResponse);
+
+  // Fetch a sandbox by name.
+  rpc GetSandbox(GetSandboxRequest) returns (SandboxResponse);
+
+  // List sandboxes.
+  rpc ListSandboxes(ListSandboxesRequest) returns (ListSandboxesResponse);
+
+  // Delete a sandbox by name.
+  rpc DeleteSandbox(DeleteSandboxRequest) returns (DeleteSandboxResponse);
+
+  // Create a short-lived SSH session for a sandbox.
+  rpc CreateSshSession(CreateSshSessionRequest) returns (CreateSshSessionResponse);
+
+  // Revoke a previously issued SSH session.
+  rpc RevokeSshSession(RevokeSshSessionRequest) returns (RevokeSshSessionResponse);
+
+  // Execute a command in a ready sandbox and stream output.
+  rpc ExecSandbox(ExecSandboxRequest) returns (stream ExecSandboxEvent);
+
+  // Create a provider.
+  rpc CreateProvider(CreateProviderRequest) returns (ProviderResponse);
+
+  // Fetch a provider by name.
+  rpc GetProvider(GetProviderRequest) returns (ProviderResponse);
+
+  // List providers.
+  rpc ListProviders(ListProvidersRequest) returns (ListProvidersResponse);
+
+  // Update an existing provider by name.
+  rpc UpdateProvider(UpdateProviderRequest) returns (ProviderResponse);
+
+  // Delete a provider by name.
+  rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
+
+  // Get sandbox policy by id (called by sandbox entrypoint and poll loop).
+  rpc GetSandboxPolicy(openshell.sandbox.v1.GetSandboxPolicyRequest)
+      returns (openshell.sandbox.v1.GetSandboxPolicyResponse);
+
+  // Update sandbox policy on a live sandbox.
+  rpc UpdateSandboxPolicy(UpdateSandboxPolicyRequest)
+      returns (UpdateSandboxPolicyResponse);
+
+  // Get the load status of a specific policy version.
+  rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
+      returns (GetSandboxPolicyStatusResponse);
+
+  // List policy history for a sandbox.
+  rpc ListSandboxPolicies(ListSandboxPoliciesRequest)
+      returns (ListSandboxPoliciesResponse);
+
+  // Report policy load result (called by sandbox after reload attempt).
+  rpc ReportPolicyStatus(ReportPolicyStatusRequest)
+      returns (ReportPolicyStatusResponse);
+
+  // Get provider environment for a sandbox (called by sandbox supervisor at startup).
+  rpc GetSandboxProviderEnvironment(GetSandboxProviderEnvironmentRequest)
+      returns (GetSandboxProviderEnvironmentResponse);
+
+  // Fetch recent sandbox logs (one-shot).
+  rpc GetSandboxLogs(GetSandboxLogsRequest) returns (GetSandboxLogsResponse);
+
+  // Push sandbox supervisor logs to the server (client-streaming).
+  rpc PushSandboxLogs(stream PushSandboxLogsRequest) returns (PushSandboxLogsResponse);
+
+  // Watch a sandbox and stream updates.
+  //
+  // This stream can include:
+  // - Sandbox status snapshots (phase/status)
+  // - OpenShell server process logs correlated by sandbox_id
+  // - Platform events correlated to the sandbox
+  rpc WatchSandbox(WatchSandboxRequest) returns (stream SandboxStreamEvent);
+
+  // ---------------------------------------------------------------------------
+  // Draft policy recommendation RPCs
+  // ---------------------------------------------------------------------------
+
+  // Submit denial analysis results from sandbox (summaries + proposed chunks).
+  rpc SubmitPolicyAnalysis(SubmitPolicyAnalysisRequest)
+      returns (SubmitPolicyAnalysisResponse);
+
+  // Get draft policy recommendations for a sandbox.
+  rpc GetDraftPolicy(GetDraftPolicyRequest) returns (GetDraftPolicyResponse);
+
+  // Approve a single draft policy chunk (merges into active policy).
+  rpc ApproveDraftChunk(ApproveDraftChunkRequest)
+      returns (ApproveDraftChunkResponse);
+
+  // Reject a single draft policy chunk.
+  rpc RejectDraftChunk(RejectDraftChunkRequest)
+      returns (RejectDraftChunkResponse);
+
+  // Approve all pending draft chunks (skips security-flagged unless forced).
+  rpc ApproveAllDraftChunks(ApproveAllDraftChunksRequest)
+      returns (ApproveAllDraftChunksResponse);
+
+  // Edit a pending draft chunk in-place (e.g. narrow allowed_ips).
+  rpc EditDraftChunk(EditDraftChunkRequest) returns (EditDraftChunkResponse);
+
+  // Reverse an approval (remove merged rule from active policy).
+  rpc UndoDraftChunk(UndoDraftChunkRequest) returns (UndoDraftChunkResponse);
+
+  // Clear all pending draft chunks for a sandbox.
+  rpc ClearDraftChunks(ClearDraftChunksRequest)
+      returns (ClearDraftChunksResponse);
+
+  // Get decision history for a sandbox's draft policy.
+  rpc GetDraftHistory(GetDraftHistoryRequest) returns (GetDraftHistoryResponse);
+}
+
+// Health check request.
+message HealthRequest {}
+
+// Health check response.
+message HealthResponse {
+  // Service status.
+  ServiceStatus status = 1;
+
+  // Service version.
+  string version = 2;
+}
+
+// Create sandbox request.
+message CreateSandboxRequest {
+  openshell.datamodel.v1.SandboxSpec spec = 1;
+  // Optional user-supplied sandbox name. When empty the server generates one.
+  string name = 2;
+}
+
+// Get sandbox request.
+message GetSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+}
+
+// List sandboxes request.
+message ListSandboxesRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+}
+
+// Delete sandbox request.
+message DeleteSandboxRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+}
+
+// Sandbox response.
+message SandboxResponse {
+  openshell.datamodel.v1.Sandbox sandbox = 1;
+}
+
+// List sandboxes response.
+message ListSandboxesResponse {
+  repeated openshell.datamodel.v1.Sandbox sandboxes = 1;
+}
+
+// Delete sandbox response.
+message DeleteSandboxResponse {
+  bool deleted = 1;
+}
+
+// Create SSH session request.
+message CreateSshSessionRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+}
+
+// Create SSH session response.
+message CreateSshSessionResponse {
+  // Sandbox id.
+  string sandbox_id = 1;
+
+  // Session token for the gateway tunnel.
+  string token = 2;
+
+  // Gateway host for SSH proxy connection.
+  string gateway_host = 3;
+
+  // Gateway port for SSH proxy connection.
+  uint32 gateway_port = 4;
+
+  // Gateway scheme (http or https).
+  string gateway_scheme = 5;
+
+  // HTTP path for the CONNECT/upgrade endpoint.
+  string connect_path = 6;
+
+  // Optional host key fingerprint.
+  string host_key_fingerprint = 7;
+
+  // Expiry timestamp in milliseconds since epoch. 0 means no expiry.
+  int64 expires_at_ms = 8;
+}
+
+// Revoke SSH session request.
+message RevokeSshSessionRequest {
+  // Session token to revoke.
+  string token = 1;
+}
+
+// Revoke SSH session response.
+message RevokeSshSessionResponse {
+  // True when a session was revoked.
+  bool revoked = 1;
+}
+
+// Execute command request.
+message ExecSandboxRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+
+  // Command and arguments.
+  repeated string command = 2;
+
+  // Optional working directory.
+  string workdir = 3;
+
+  // Optional environment overrides.
+  map<string, string> environment = 4;
+
+  // Optional timeout in seconds. 0 means no timeout.
+  uint32 timeout_seconds = 5;
+
+  // Optional stdin payload passed to the command.
+  bytes stdin = 6;
+}
+
+// One stdout chunk from a sandbox exec.
+message ExecSandboxStdout {
+  bytes data = 1;
+}
+
+// One stderr chunk from a sandbox exec.
+message ExecSandboxStderr {
+  bytes data = 1;
+}
+
+// Final exit status for a sandbox exec.
+message ExecSandboxExit {
+  int32 exit_code = 1;
+}
+
+// One event in a sandbox exec stream.
+message ExecSandboxEvent {
+  oneof payload {
+    ExecSandboxStdout stdout = 1;
+    ExecSandboxStderr stderr = 2;
+    ExecSandboxExit exit = 3;
+  }
+}
+
+// SSH session record stored in persistence.
+message SshSession {
+  // Unique id (token).
+  string id = 1;
+
+  // Sandbox id.
+  string sandbox_id = 2;
+
+  // Session token.
+  string token = 3;
+
+  // Creation timestamp in milliseconds since epoch.
+  int64 created_at_ms = 4;
+
+  // Revoked flag.
+  bool revoked = 5;
+
+  // Human-friendly name (auto-generated if not provided).
+  string name = 6;
+
+  // Expiry timestamp in milliseconds since epoch. 0 means no expiry
+  // (backward-compatible default for sessions created before this field existed).
+  int64 expires_at_ms = 7;
+}
+
+// Watch sandbox request.
+message WatchSandboxRequest {
+  // Sandbox id.
+  string id = 1;
+
+  // Stream sandbox status snapshots.
+  bool follow_status = 2;
+
+  // Stream openshell-server process logs correlated to this sandbox.
+  bool follow_logs = 3;
+
+  // Stream platform events correlated to this sandbox.
+  bool follow_events = 4;
+
+  // Replay the last N log lines (best-effort) before following.
+  uint32 log_tail_lines = 5;
+
+  // Replay the last N platform events (best-effort) before following.
+  uint32 event_tail = 6;
+
+  // Stop streaming once the sandbox reaches a terminal phase (READY or ERROR).
+  bool stop_on_terminal = 7;
+
+  // Only include log lines with timestamp >= this value (milliseconds since epoch).
+  // 0 means no time filter. Applies to both tail replay and live streaming.
+  int64 log_since_ms = 8;
+
+  // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
+  repeated string log_sources = 9;
+
+  // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
+  string log_min_level = 10;
+}
+
+// One event in a sandbox watch stream.
+message SandboxStreamEvent {
+  oneof payload {
+    // Latest sandbox snapshot.
+    openshell.datamodel.v1.Sandbox sandbox = 1;
+    // One server log line/event.
+    SandboxLogLine log = 2;
+    // One platform event.
+    PlatformEvent event = 3;
+    // Warning from the server (e.g. missed messages due to lag).
+    SandboxStreamWarning warning = 4;
+    // Draft policy update notification.
+    DraftPolicyUpdate draft_policy_update = 5;
+  }
+}
+
+// Log line correlated to a sandbox.
+message SandboxLogLine {
+  string sandbox_id = 1;
+  int64 timestamp_ms = 2;
+  string level = 3;
+  string target = 4;
+  string message = 5;
+  // Log source: "gateway" (server-side) or "sandbox" (supervisor).
+  // Empty is treated as "gateway" for backward compatibility.
+  string source = 6;
+  // Structured key-value fields from the tracing event (e.g. dst_host, action).
+  map<string, string> fields = 7;
+}
+
+// Platform event correlated to a sandbox.
+message PlatformEvent {
+  // Event timestamp in milliseconds since epoch.
+  int64 timestamp_ms = 1;
+  // Event source (e.g. "kubernetes", "docker", "process").
+  string source = 2;
+  // Event type/severity (e.g. "Normal", "Warning").
+  string type = 3;
+  // Short reason code (e.g. "Started", "Pulled", "Failed").
+  string reason = 4;
+  // Human-readable event message.
+  string message = 5;
+  // Optional metadata as key-value pairs.
+  map<string, string> metadata = 6;
+}
+
+message SandboxStreamWarning {
+  string message = 1;
+}
+
+// Create provider request.
+message CreateProviderRequest {
+  openshell.datamodel.v1.Provider provider = 1;
+}
+
+// Get provider request.
+message GetProviderRequest {
+  string name = 1;
+}
+
+// List providers request.
+message ListProvidersRequest {
+  uint32 limit = 1;
+  uint32 offset = 2;
+}
+
+// Update provider request.
+message UpdateProviderRequest {
+  openshell.datamodel.v1.Provider provider = 1;
+}
+
+// Delete provider request.
+message DeleteProviderRequest {
+  string name = 1;
+}
+
+// Provider response.
+message ProviderResponse {
+  openshell.datamodel.v1.Provider provider = 1;
+}
+
+// List providers response.
+message ListProvidersResponse {
+  repeated openshell.datamodel.v1.Provider providers = 1;
+}
+
+// Delete provider response.
+message DeleteProviderResponse {
+  bool deleted = 1;
+}
+
+// Get sandbox provider environment request.
+message GetSandboxProviderEnvironmentRequest {
+  // The sandbox ID.
+  string sandbox_id = 1;
+}
+
+// Get sandbox provider environment response.
+message GetSandboxProviderEnvironmentResponse {
+  // Provider credential environment variables.
+  map<string, string> environment = 1;
+}
+
+// ---------------------------------------------------------------------------
+// Policy update messages
+// ---------------------------------------------------------------------------
+
+// Update sandbox policy request.
+message UpdateSandboxPolicyRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // The new policy to apply. Only network_policies and inference fields may
+  // differ from the create-time policy; static fields (filesystem, landlock,
+  // process) must match version 1 or the request is rejected.
+  openshell.sandbox.v1.SandboxPolicy policy = 2;
+}
+
+// Update sandbox policy response.
+message UpdateSandboxPolicyResponse {
+  // Assigned policy version (monotonically increasing per sandbox).
+  uint32 version = 1;
+  // SHA-256 hash of the serialized policy payload.
+  string policy_hash = 2;
+}
+
+// Get sandbox policy status request.
+message GetSandboxPolicyStatusRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  // The specific policy version to query. 0 means latest.
+  uint32 version = 2;
+}
+
+// Get sandbox policy status response.
+message GetSandboxPolicyStatusResponse {
+  // The queried policy revision.
+  SandboxPolicyRevision revision = 1;
+  // The currently active (loaded) policy version for this sandbox.
+  uint32 active_version = 2;
+}
+
+// List sandbox policies request.
+message ListSandboxPoliciesRequest {
+  // Sandbox name (canonical lookup key).
+  string name = 1;
+  uint32 limit = 2;
+  uint32 offset = 3;
+}
+
+// List sandbox policies response.
+message ListSandboxPoliciesResponse {
+  repeated SandboxPolicyRevision revisions = 1;
+}
+
+// Report policy load status (called by sandbox runtime after reload attempt).
+message ReportPolicyStatusRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // The policy version that was attempted.
+  uint32 version = 2;
+  // Load result status.
+  PolicyStatus status = 3;
+  // Error message if status is FAILED.
+  string load_error = 4;
+}
+
+// Report policy status response.
+message ReportPolicyStatusResponse {}
+
+// A versioned policy revision with metadata.
+message SandboxPolicyRevision {
+  // Policy version (monotonically increasing per sandbox).
+  uint32 version = 1;
+  // SHA-256 hash of the serialized policy payload.
+  string policy_hash = 2;
+  // Load status of this revision.
+  PolicyStatus status = 3;
+  // Error message if status is FAILED.
+  string load_error = 4;
+  // Milliseconds since epoch when this revision was created.
+  int64 created_at_ms = 5;
+  // Milliseconds since epoch when this revision was loaded by the sandbox.
+  int64 loaded_at_ms = 6;
+  // The full policy (only populated when explicitly requested).
+  openshell.sandbox.v1.SandboxPolicy policy = 7;
+}
+
+// Policy load status.
+enum PolicyStatus {
+  POLICY_STATUS_UNSPECIFIED = 0;
+  // Server received the update; sandbox has not yet loaded it.
+  POLICY_STATUS_PENDING = 1;
+  // Sandbox successfully applied this policy version.
+  POLICY_STATUS_LOADED = 2;
+  // Sandbox attempted to apply but failed; LKG policy remains active.
+  POLICY_STATUS_FAILED = 3;
+  // A newer version was persisted before the sandbox loaded this one.
+  POLICY_STATUS_SUPERSEDED = 4;
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox logs messages
+// ---------------------------------------------------------------------------
+
+// Get sandbox logs request (one-shot fetch).
+message GetSandboxLogsRequest {
+  // Sandbox id.
+  string sandbox_id = 1;
+  // Maximum number of log lines to return. 0 means use default (2000).
+  uint32 lines = 2;
+  // Only include logs with timestamp >= this value (ms since epoch). 0 means no filter.
+  int64 since_ms = 3;
+  // Filter by log source (e.g. "gateway", "sandbox"). Empty means all sources.
+  repeated string sources = 4;
+  // Minimum log level to include (e.g. "INFO", "WARN", "ERROR"). Empty means all levels.
+  string min_level = 5;
+}
+
+// Batch of log lines pushed from sandbox to server.
+message PushSandboxLogsRequest {
+  // The sandbox ID.
+  string sandbox_id = 1;
+  // Log lines to ingest.
+  repeated SandboxLogLine logs = 2;
+}
+
+// Push sandbox logs response.
+message PushSandboxLogsResponse {}
+
+// Get sandbox logs response.
+message GetSandboxLogsResponse {
+  // Log lines in chronological order.
+  repeated SandboxLogLine logs = 1;
+  // Total number of lines in the server's buffer for this sandbox.
+  uint32 buffer_total = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Service status
+// ---------------------------------------------------------------------------
+
+// Service status enum.
+enum ServiceStatus {
+  SERVICE_STATUS_UNSPECIFIED = 0;
+  SERVICE_STATUS_HEALTHY = 1;
+  SERVICE_STATUS_DEGRADED = 2;
+  SERVICE_STATUS_UNHEALTHY = 3;
+}
+
+// ---------------------------------------------------------------------------
+// Draft policy recommendation messages
+// ---------------------------------------------------------------------------
+
+// Observed HTTP method+path pattern from L7 inspection.
+message L7RequestSample {
+  // HTTP method: GET, POST, PUT, DELETE, etc.
+  string method = 1;
+  // HTTP path: /v1/models, /repos/myorg/issues
+  string path = 2;
+  // L7 decision: "audit" or "deny" (allowed requests not collected).
+  string decision = 3;
+  // Number of times this (method, path) was observed.
+  uint32 count = 4;
+}
+
+// Structured denial summary from sandbox aggregator.
+message DenialSummary {
+  // Sandbox ID that produced this summary.
+  string sandbox_id = 1;
+  // Denied destination host.
+  string host = 2;
+  // Denied destination port.
+  uint32 port = 3;
+  // Binary that attempted the connection.
+  string binary = 4;
+  // Process ancestor chain.
+  repeated string ancestors = 5;
+  // Denial reason from OPA evaluation.
+  string deny_reason = 6;
+  // First denial timestamp (ms since epoch).
+  int64 first_seen_ms = 7;
+  // Most recent denial timestamp (ms since epoch).
+  int64 last_seen_ms = 8;
+  // Number of denials in the current window.
+  uint32 count = 9;
+  // Events dropped during aggregator cooldown.
+  uint32 suppressed_count = 10;
+  // Cumulative lifetime count (never resets).
+  uint32 total_count = 11;
+  // Distinct cmdline strings observed (sanitized of credentials).
+  repeated string sample_cmdlines = 12;
+  // SHA-256 of the binary for audit trail.
+  string binary_sha256 = 13;
+  // True if emitted by stale-flush rather than threshold.
+  bool persistent = 14;
+  // Denial category: "l4_deny", "l7_deny", "l7_audit", "ssrf".
+  string denial_stage = 15;
+  // Observed HTTP request patterns (from L7 inspection).
+  repeated L7RequestSample l7_request_samples = 16;
+  // True if L7 inspection was active during observation window.
+  bool l7_inspection_active = 17;
+}
+
+// A proposed policy rule with rationale and approval status.
+message PolicyChunk {
+  // Unique chunk identifier.
+  string id = 1;
+  // Approval status: "pending", "approved", "rejected".
+  string status = 2;
+  // Proposed network_policies map key.
+  string rule_name = 3;
+  // The proposed network policy rule.
+  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 4;
+  // Human-readable explanation of why this rule is proposed.
+  string rationale = 5;
+  // Security concerns flagged by analysis (empty if none).
+  string security_notes = 6;
+  // Analysis confidence (0.0-1.0). 0 for mechanistic mode.
+  float confidence = 7;
+  // IDs of denial summaries that led to this chunk.
+  repeated string denial_summary_ids = 8;
+  // Creation timestamp (ms since epoch).
+  int64 created_at_ms = 9;
+  // When the user approved/rejected (ms since epoch). 0 if undecided.
+  int64 decided_at_ms = 10;
+  // Recommendation stage: "initial" or "refined" (progressive L7 visibility).
+  string stage = 11;
+  // For stage="refined": the initial chunk this replaces.
+  string supersedes_chunk_id = 12;
+  // How many times this endpoint has been seen across denial flush cycles.
+  int32 hit_count = 13;
+  // First time this endpoint was proposed (ms since epoch).
+  int64 first_seen_ms = 14;
+  // Most recent time this endpoint was re-proposed (ms since epoch).
+  int64 last_seen_ms = 15;
+  // Binary path that triggered the denial (denormalized for display convenience).
+  string binary = 16;
+}
+
+// Notification that the draft policy was updated.
+message DraftPolicyUpdate {
+  // Current draft version.
+  uint64 draft_version = 1;
+  // Number of new chunks added in this update.
+  uint32 new_chunks = 2;
+  // Total pending chunks awaiting approval.
+  uint32 total_pending = 3;
+  // Brief description of what changed.
+  string summary = 4;
+}
+
+// Submit analysis results from sandbox to gateway.
+message SubmitPolicyAnalysisRequest {
+  // Aggregated denial summaries.
+  repeated DenialSummary summaries = 1;
+  // Proposed policy chunks (validated by sandbox OPA engine).
+  repeated PolicyChunk proposed_chunks = 2;
+  // Analysis mode: "mechanistic" or "llm".
+  string analysis_mode = 3;
+  // Sandbox name.
+  string name = 4;
+}
+
+message SubmitPolicyAnalysisResponse {
+  // Number of chunks accepted by the gateway.
+  uint32 accepted_chunks = 1;
+  // Number of chunks rejected by gateway validation.
+  uint32 rejected_chunks = 2;
+  // Reasons for each rejected chunk.
+  repeated string rejection_reasons = 3;
+}
+
+// Get draft policy for a sandbox.
+message GetDraftPolicyRequest {
+  // Sandbox name.
+  string name = 1;
+  // Optional status filter: "pending", "approved", "rejected", or "" for all.
+  string status_filter = 2;
+}
+
+message GetDraftPolicyResponse {
+  // Draft policy chunks.
+  repeated PolicyChunk chunks = 1;
+  // LLM-generated summary of all analysis (empty in mechanistic mode).
+  string rolling_summary = 2;
+  // Current draft version.
+  uint64 draft_version = 3;
+  // When the last analysis completed (ms since epoch).
+  int64 last_analyzed_at_ms = 4;
+}
+
+// Approve a single draft chunk.
+message ApproveDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to approve.
+  string chunk_id = 2;
+}
+
+message ApproveDraftChunkResponse {
+  // New policy version after merge.
+  uint32 policy_version = 1;
+  // SHA-256 hash of the new policy.
+  string policy_hash = 2;
+}
+
+// Reject a single draft chunk.
+message RejectDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to reject.
+  string chunk_id = 2;
+  // Optional reason for rejection (fed to LLM context in future analysis).
+  string reason = 3;
+}
+
+message RejectDraftChunkResponse {}
+
+// Approve all pending chunks.
+message ApproveAllDraftChunksRequest {
+  // Sandbox name.
+  string name = 1;
+  // Include chunks with security_notes (default false: skips them).
+  bool include_security_flagged = 2;
+}
+
+message ApproveAllDraftChunksResponse {
+  // New policy version after merge.
+  uint32 policy_version = 1;
+  // SHA-256 hash of the new policy.
+  string policy_hash = 2;
+  // Number of chunks approved.
+  uint32 chunks_approved = 3;
+  // Number of chunks skipped (security-flagged).
+  uint32 chunks_skipped = 4;
+}
+
+// Edit a pending chunk in-place.
+message EditDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to edit.
+  string chunk_id = 2;
+  // The modified rule (replaces existing proposed_rule).
+  openshell.sandbox.v1.NetworkPolicyRule proposed_rule = 3;
+}
+
+message EditDraftChunkResponse {}
+
+// Reverse an approval (remove merged rule from active policy).
+message UndoDraftChunkRequest {
+  // Sandbox name.
+  string name = 1;
+  // Chunk ID to undo.
+  string chunk_id = 2;
+}
+
+message UndoDraftChunkResponse {
+  // New policy version after removal.
+  uint32 policy_version = 1;
+  // SHA-256 hash of the updated policy.
+  string policy_hash = 2;
+}
+
+// Clear all pending draft chunks for a sandbox.
+message ClearDraftChunksRequest {
+  // Sandbox name.
+  string name = 1;
+}
+
+message ClearDraftChunksResponse {
+  // Number of chunks cleared.
+  uint32 chunks_cleared = 1;
+}
+
+// Get decision history for a sandbox's draft policy.
+message GetDraftHistoryRequest {
+  // Sandbox name.
+  string name = 1;
+}
+
+message DraftHistoryEntry {
+  // Event timestamp (ms since epoch).
+  int64 timestamp_ms = 1;
+  // Event type: "denial_detected", "analysis_cycle", "approved",
+  // "rejected", "edited", "undone", "cleared".
+  string event_type = 2;
+  // Human-readable description.
+  string description = 3;
+  // Associated chunk ID (if applicable).
+  string chunk_id = 4;
+}
+
+message GetDraftHistoryResponse {
+  // Chronological decision history.
+  repeated DraftHistoryEntry entries = 1;
+}

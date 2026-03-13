@@ -9,17 +9,17 @@ The gateway runs the control plane API server. It is deployed as a StatefulSet i
 - **Dockerfile**: `deploy/docker/Dockerfile.gateway`
 - **Registry**: `ghcr.io/nvidia/openshell/gateway:latest`
 - **Pulled when**: Cluster startup (the Helm chart triggers the pull)
-- **Entrypoint**: `navigator-server --port 8080` (gRPC + HTTP, mTLS)
+- **Entrypoint**: `openshell-server --port 8080` (gRPC + HTTP, mTLS)
 
 ## Cluster (`openshell/cluster`)
 
-The cluster image is a single-container Kubernetes distribution that bundles the Helm charts, Kubernetes manifests, and the `navigator-sandbox` supervisor binary needed to bootstrap the control plane.
+The cluster image is a single-container Kubernetes distribution that bundles the Helm charts, Kubernetes manifests, and the `openshell-sandbox` supervisor binary needed to bootstrap the control plane.
 
 - **Dockerfile**: `deploy/docker/Dockerfile.cluster`
 - **Registry**: `ghcr.io/nvidia/openshell/cluster:latest`
 - **Pulled when**: `openshell gateway start`
 
-The supervisor binary (`navigator-sandbox`) is cross-compiled in a build stage and placed at `/opt/openshell/bin/navigator-sandbox`. It is exposed to sandbox pods at runtime via a read-only `hostPath` volume mount — it is not baked into sandbox images.
+The supervisor binary (`openshell-sandbox`) is cross-compiled in a build stage and placed at `/opt/openshell/bin/openshell-sandbox`. It is exposed to sandbox pods at runtime via a read-only `hostPath` volume mount — it is not baked into sandbox images.
 
 ## Sandbox Images
 
@@ -42,8 +42,8 @@ The incremental deploy (`cluster-deploy-fast.sh`) fingerprints local Git changes
 | Changed files | Rebuild triggered |
 |---|---|
 | Cargo manifests, proto definitions, cross-build script | Gateway + supervisor |
-| `crates/navigator-server/*`, `Dockerfile.gateway` | Gateway |
-| `crates/navigator-sandbox/*`, `crates/navigator-policy/*` | Supervisor |
+| `crates/openshell-server/*`, `Dockerfile.gateway` | Gateway |
+| `crates/openshell-sandbox/*`, `crates/openshell-policy/*` | Supervisor |
 | `deploy/helm/openshell/*` | Helm upgrade |
 
 When no local changes are detected, the command is a no-op.

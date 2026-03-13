@@ -33,7 +33,7 @@ See [CONTRIBUTING.md](CONTRIBUTING.md) for instructions on how to perform common
 
 ## Cluster Infrastructure Changes
 
-- If you change cluster bootstrap infrastructure (e.g., `navigator-bootstrap` crate, `Dockerfile.cluster`, `cluster-entrypoint.sh`, `cluster-healthcheck.sh`, deploy logic in `navigator-cli`), update the `debug-navigator-cluster` skill in `.agent/skills/debug-navigator-cluster/SKILL.md` to reflect those changes.
+- If you change cluster bootstrap infrastructure (e.g., `openshell-bootstrap` crate, `Dockerfile.cluster`, `cluster-entrypoint.sh`, `cluster-healthcheck.sh`, deploy logic in `openshell-cli`), update the `debug-openshell-cluster` skill in `.agent/skills/debug-openshell-cluster/SKILL.md` to reflect those changes.
 
 ## Documentation
 

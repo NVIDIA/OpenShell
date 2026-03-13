@@ -26,7 +26,7 @@ hide = true
 ["e2e:rust"]
 description = "Run Rust CLI e2e tests (requires a running cluster)"
 depends = ["cluster"]
-run = ["cargo build -p navigator-cli", "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e"]
+run = ["cargo build -p openshell-cli", "cargo test --manifest-path e2e/rust/Cargo.toml --features e2e"]
 
 ["e2e:python"]
 description = "Run Python e2e tests (E2E_PARALLEL=N or 'auto'; default 5)"

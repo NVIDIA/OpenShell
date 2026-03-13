@@ -12,7 +12,7 @@ Verifies that:
 
 All tests use the default dev sandbox policy -- no custom policy overrides.
 The SDK omits the policy field from the spec so the sandbox container discovers
-its policy from /etc/navigator/policy.yaml (the dev-sandbox-policy.yaml baked
+its policy from /etc/openshell/policy.yaml (the dev-sandbox-policy.yaml baked
 into the image), which already includes the pypi network policy.
 """
 

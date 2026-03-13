@@ -21,7 +21,7 @@ from urllib.parse import urlparse
 import grpc
 import pytest
 
-from openshell._proto import navigator_pb2, navigator_pb2_grpc
+from openshell._proto import openshell_pb2, openshell_pb2_grpc
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -146,9 +146,9 @@ class TestServerMtlsEnforcement:
         )
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
-            stub = navigator_pb2_grpc.NavigatorStub(channel)
-            response = stub.Health(navigator_pb2.HealthRequest(), timeout=10)
-            assert response.status == navigator_pb2.SERVICE_STATUS_HEALTHY
+            stub = openshell_pb2_grpc.OpenShellStub(channel)
+            response = stub.Health(openshell_pb2.HealthRequest(), timeout=10)
+            assert response.status == openshell_pb2.SERVICE_STATUS_HEALTHY
         finally:
             channel.close()
 
@@ -165,9 +165,9 @@ class TestServerMtlsEnforcement:
         credentials = grpc.ssl_channel_credentials(root_certificates=ca)
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
-            stub = navigator_pb2_grpc.NavigatorStub(channel)
+            stub = openshell_pb2_grpc.OpenShellStub(channel)
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.Health(navigator_pb2.HealthRequest(), timeout=10)
+                stub.Health(openshell_pb2.HealthRequest(), timeout=10)
             # The server should terminate the TLS handshake or return
             # UNAVAILABLE because the client did not present a certificate.
             assert exc_info.value.code() in (
@@ -200,9 +200,9 @@ class TestServerMtlsEnforcement:
         )
         channel = grpc.secure_channel(f"{host}:{port}", credentials)
         try:
-            stub = navigator_pb2_grpc.NavigatorStub(channel)
+            stub = openshell_pb2_grpc.OpenShellStub(channel)
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.Health(navigator_pb2.HealthRequest(), timeout=10)
+                stub.Health(openshell_pb2.HealthRequest(), timeout=10)
             assert exc_info.value.code() in (
                 grpc.StatusCode.UNAVAILABLE,
                 grpc.StatusCode.UNKNOWN,
@@ -222,9 +222,9 @@ class TestServerMtlsEnforcement:
 
         channel = grpc.insecure_channel(f"{host}:{port}")
         try:
-            stub = navigator_pb2_grpc.NavigatorStub(channel)
+            stub = openshell_pb2_grpc.OpenShellStub(channel)
             with pytest.raises(grpc.RpcError) as exc_info:
-                stub.Health(navigator_pb2.HealthRequest(), timeout=10)
+                stub.Health(openshell_pb2.HealthRequest(), timeout=10)
             # Plaintext to a TLS port will fail at the transport level.
             assert exc_info.value.code() in (
                 grpc.StatusCode.UNAVAILABLE,

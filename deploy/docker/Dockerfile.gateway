@@ -27,23 +27,23 @@ WORKDIR /build
 
 # Copy dependency manifests first for better caching
 COPY Cargo.toml Cargo.lock ./
-COPY crates/navigator-cli/Cargo.toml crates/navigator-cli/Cargo.toml
-COPY crates/navigator-core/Cargo.toml crates/navigator-core/Cargo.toml
-COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
-COPY crates/navigator-router/Cargo.toml crates/navigator-router/Cargo.toml
-COPY crates/navigator-sandbox/Cargo.toml crates/navigator-sandbox/Cargo.toml
-COPY crates/navigator-server/Cargo.toml crates/navigator-server/Cargo.toml
-COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
+COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
+COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
+COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
+COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
+COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
+COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
 
 # Create dummy source files to build dependencies
-RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-providers/src crates/navigator-router/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
-    echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
-    echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
-    echo "fn main() {}" > crates/navigator-server/src/main.rs && \
-    touch crates/navigator-core/src/lib.rs && \
-    touch crates/navigator-providers/src/lib.rs && \
-    touch crates/navigator-router/src/lib.rs && \
-    touch crates/navigator-bootstrap/src/lib.rs
+RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-providers/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src && \
+    echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
+    echo "fn main() {}" > crates/openshell-sandbox/src/main.rs && \
+    echo "fn main() {}" > crates/openshell-server/src/main.rs && \
+    touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-providers/src/lib.rs && \
+    touch crates/openshell-router/src/lib.rs && \
+    touch crates/openshell-bootstrap/src/lib.rs
 
 # Copy proto files needed for build
 COPY proto/ proto/
@@ -55,7 +55,7 @@ COPY proto/ proto/
 RUN --mount=type=cache,id=cargo-registry-gateway-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-gateway-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-gateway-${TARGETARCH},sharing=locked,target=/tmp/sccache \
-    . cross-build.sh && cargo_cross_build --release -p navigator-server 2>/dev/null || true
+    . cross-build.sh && cargo_cross_build --release -p openshell-server 2>/dev/null || true
 
 # Copy actual source code
 COPY crates/ crates/
@@ -63,8 +63,8 @@ COPY crates/ crates/
 # Touch source files to ensure they're rebuilt (not the cached dummy).
 # Touch build.rs and proto files to force proto code regeneration when the
 # cargo target cache mount retains stale OUT_DIR artifacts from prior builds.
-RUN touch crates/navigator-server/src/main.rs \
-    crates/navigator-core/build.rs \
+RUN touch crates/openshell-server/src/main.rs \
+    crates/openshell-core/build.rs \
     proto/*.proto
 
 # Build the actual application
@@ -75,8 +75,8 @@ RUN --mount=type=cache,id=cargo-registry-gateway-${TARGETARCH},sharing=locked,ta
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo_cross_build --release -p navigator-server && \
-    cp "$(cross_output_dir release)/navigator-server" /build/navigator-server
+    cargo_cross_build --release -p openshell-server && \
+    cp "$(cross_output_dir release)/openshell-server" /build/openshell-server
 
 # Stage 2: Runtime (uses target platform)
 # NVIDIA hardened Ubuntu base for supply chain consistency.
@@ -85,21 +85,21 @@ FROM nvcr.io/nvidia/base/ubuntu:noble-20251013 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --create-home --user-group navigator
+RUN useradd --create-home --user-group openshell
 
 WORKDIR /app
 
-COPY --from=builder /build/navigator-server /usr/local/bin/
+COPY --from=builder /build/openshell-server /usr/local/bin/
 
 # Copy migrations to the build-time manifest directory expected by sqlx
-RUN mkdir -p /build/crates/navigator-server
-COPY crates/navigator-server/migrations /build/crates/navigator-server/migrations
+RUN mkdir -p /build/crates/openshell-server
+COPY crates/openshell-server/migrations /build/crates/openshell-server/migrations
 
-USER navigator
+USER openshell
 EXPOSE 8080
 
 # Health checks are handled by Kubernetes liveness/readiness probes (tcpSocket).
 # No Docker HEALTHCHECK is needed since this image runs inside a k3s cluster.
 
-ENTRYPOINT ["navigator-server"]
+ENTRYPOINT ["openshell-server"]
 CMD ["--port", "8080"]

@@ -5,7 +5,7 @@
 //!
 //! Resolves the `openshell` binary at `<workspace>/target/debug/openshell`.
 //! The binary must already be built — the `e2e:rust` mise task handles
-//! this by running `cargo build -p navigator-cli` before the tests.
+//! this by running `cargo build -p openshell-cli` before the tests.
 
 use std::path::{Path, PathBuf};
 
@@ -26,13 +26,13 @@ fn workspace_root() -> PathBuf {
 ///
 /// # Panics
 ///
-/// Panics if the binary is not found. Run `cargo build -p navigator-cli`
+/// Panics if the binary is not found. Run `cargo build -p openshell-cli`
 /// (or `mise run e2e:rust`) first.
 pub fn openshell_bin() -> PathBuf {
     let bin = workspace_root().join("target/debug/openshell");
     assert!(
         bin.is_file(),
-        "openshell binary not found at {bin:?} — run `cargo build -p navigator-cli` first"
+        "openshell binary not found at {bin:?} — run `cargo build -p openshell-cli` first"
     );
     bin
 }

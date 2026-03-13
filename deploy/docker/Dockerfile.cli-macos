@@ -56,37 +56,37 @@ ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
 # build dependencies.  This layer is cached unless Cargo.toml/lock changes.
 # ---------------------------------------------------------------------------
 COPY Cargo.toml Cargo.lock ./
-COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
-COPY crates/navigator-cli/Cargo.toml      crates/navigator-cli/Cargo.toml
-COPY crates/navigator-core/Cargo.toml     crates/navigator-core/Cargo.toml
-COPY crates/navigator-policy/Cargo.toml   crates/navigator-policy/Cargo.toml
-COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
-COPY crates/navigator-tui/Cargo.toml      crates/navigator-tui/Cargo.toml
-COPY crates/navigator-core/build.rs       crates/navigator-core/build.rs
+COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
+COPY crates/openshell-cli/Cargo.toml      crates/openshell-cli/Cargo.toml
+COPY crates/openshell-core/Cargo.toml     crates/openshell-core/Cargo.toml
+COPY crates/openshell-policy/Cargo.toml   crates/openshell-policy/Cargo.toml
+COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
+COPY crates/openshell-tui/Cargo.toml      crates/openshell-tui/Cargo.toml
+COPY crates/openshell-core/build.rs       crates/openshell-core/build.rs
 COPY proto/ proto/
 
 # Scope workspace to CLI crates only — avoids compiling aws-lc-sys (pulled
-# by russh in navigator-sandbox/navigator-server) which is difficult to
+# by russh in openshell-sandbox/openshell-server) which is difficult to
 # cross-compile and unnecessary for the CLI binary.
-RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
+RUN sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
-RUN mkdir -p crates/navigator-cli/src \
-             crates/navigator-core/src \
-             crates/navigator-bootstrap/src \
-             crates/navigator-policy/src \
-             crates/navigator-providers/src \
-             crates/navigator-tui/src && \
-    echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
-    touch crates/navigator-core/src/lib.rs && \
-    touch crates/navigator-bootstrap/src/lib.rs && \
-    touch crates/navigator-policy/src/lib.rs && \
-    touch crates/navigator-providers/src/lib.rs && \
-    touch crates/navigator-tui/src/lib.rs
+RUN mkdir -p crates/openshell-cli/src \
+             crates/openshell-core/src \
+             crates/openshell-bootstrap/src \
+             crates/openshell-policy/src \
+             crates/openshell-providers/src \
+             crates/openshell-tui/src && \
+    echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
+    touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-bootstrap/src/lib.rs && \
+    touch crates/openshell-policy/src/lib.rs && \
+    touch crates/openshell-providers/src/lib.rs && \
+    touch crates/openshell-tui/src/lib.rs
 
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p navigator-cli 2>/dev/null || true
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli 2>/dev/null || true
 
 # ---------------------------------------------------------------------------
 # Stage 2: real build
@@ -94,14 +94,14 @@ RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.
 COPY crates/ crates/
 
 # Touch source files to ensure they're rebuilt (not the cached dummy).
-RUN touch crates/navigator-cli/src/main.rs \
-    crates/navigator-cli/src/lib.rs \
-    crates/navigator-bootstrap/src/lib.rs \
-    crates/navigator-core/src/lib.rs \
-    crates/navigator-policy/src/lib.rs \
-    crates/navigator-providers/src/lib.rs \
-    crates/navigator-tui/src/lib.rs \
-    crates/navigator-core/build.rs \
+RUN touch crates/openshell-cli/src/main.rs \
+    crates/openshell-cli/src/lib.rs \
+    crates/openshell-bootstrap/src/lib.rs \
+    crates/openshell-core/src/lib.rs \
+    crates/openshell-policy/src/lib.rs \
+    crates/openshell-providers/src/lib.rs \
+    crates/openshell-tui/src/lib.rs \
+    crates/openshell-core/build.rs \
     proto/*.proto
 
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
@@ -110,7 +110,7 @@ RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi && \
-    cargo build --release --target aarch64-apple-darwin -p navigator-cli && \
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli && \
     cp target/aarch64-apple-darwin/release/openshell /openshell
 
 FROM scratch AS binary

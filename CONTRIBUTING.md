@@ -41,7 +41,7 @@ mise run sandbox
 
 Inside this repository, `openshell` is a local shortcut script at `scripts/bin/openshell`. The script will
 
-1. Build `navigator-cli` if needed.
+1. Build `openshell-cli` if needed.
 2. Run the local debug CLI binary under `target/debug/openshell`.
 
 Because `mise` adds `scripts/bin` to `PATH` for this project, you can run `openshell` directly from the repo.
@@ -64,9 +64,9 @@ These work for both local and remote gateways (SSH is handled automatically). Ex
 
 ```bash
 kubectl get pods -A
-kubectl logs -n navigator statefulset/navigator
+kubectl logs -n openshell statefulset/openshell
 k9s
-k9s -n navigator
+k9s -n openshell
 ```
 
 ## Main Tasks

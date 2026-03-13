@@ -542,5 +542,5 @@ private_services:
 
 - Full policy schema: [architecture/security-policy.md](../../../architecture/security-policy.md)
 - Default policy: baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`)
-- Rego evaluation rules: [sandbox-policy.rego](../../../crates/navigator-sandbox/data/sandbox-policy.rego)
+- Rego evaluation rules: [sandbox-policy.rego](../../../crates/openshell-sandbox/data/sandbox-policy.rego)
 - For translation examples from real API docs, see [examples.md](examples.md)

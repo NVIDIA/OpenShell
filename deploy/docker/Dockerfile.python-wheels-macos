@@ -47,31 +47,31 @@ ENV CARGO_TARGET_AARCH64_APPLE_DARWIN_AR=aarch64-apple-darwin25.1-ar
 
 # Copy dependency manifests first for better caching.
 COPY Cargo.toml Cargo.lock ./
-COPY crates/navigator-cli/Cargo.toml crates/navigator-cli/Cargo.toml
-COPY crates/navigator-core/Cargo.toml crates/navigator-core/Cargo.toml
-COPY crates/navigator-providers/Cargo.toml crates/navigator-providers/Cargo.toml
-COPY crates/navigator-router/Cargo.toml crates/navigator-router/Cargo.toml
-COPY crates/navigator-sandbox/Cargo.toml crates/navigator-sandbox/Cargo.toml
-COPY crates/navigator-server/Cargo.toml crates/navigator-server/Cargo.toml
-COPY crates/navigator-bootstrap/Cargo.toml crates/navigator-bootstrap/Cargo.toml
-COPY crates/navigator-core/build.rs crates/navigator-core/build.rs
+COPY crates/openshell-cli/Cargo.toml crates/openshell-cli/Cargo.toml
+COPY crates/openshell-core/Cargo.toml crates/openshell-core/Cargo.toml
+COPY crates/openshell-providers/Cargo.toml crates/openshell-providers/Cargo.toml
+COPY crates/openshell-router/Cargo.toml crates/openshell-router/Cargo.toml
+COPY crates/openshell-sandbox/Cargo.toml crates/openshell-sandbox/Cargo.toml
+COPY crates/openshell-server/Cargo.toml crates/openshell-server/Cargo.toml
+COPY crates/openshell-bootstrap/Cargo.toml crates/openshell-bootstrap/Cargo.toml
+COPY crates/openshell-core/build.rs crates/openshell-core/build.rs
 COPY proto/ proto/
 
 # Create dummy source files to build dependencies.
-RUN mkdir -p crates/navigator-cli/src crates/navigator-core/src crates/navigator-providers/src crates/navigator-router/src crates/navigator-sandbox/src crates/navigator-server/src crates/navigator-bootstrap/src && \
-    echo "fn main() {}" > crates/navigator-cli/src/main.rs && \
-    echo "fn main() {}" > crates/navigator-sandbox/src/main.rs && \
-    echo "fn main() {}" > crates/navigator-server/src/main.rs && \
-    touch crates/navigator-core/src/lib.rs && \
-    touch crates/navigator-providers/src/lib.rs && \
-    touch crates/navigator-router/src/lib.rs && \
-    touch crates/navigator-bootstrap/src/lib.rs
+RUN mkdir -p crates/openshell-cli/src crates/openshell-core/src crates/openshell-providers/src crates/openshell-router/src crates/openshell-sandbox/src crates/openshell-server/src crates/openshell-bootstrap/src && \
+    echo "fn main() {}" > crates/openshell-cli/src/main.rs && \
+    echo "fn main() {}" > crates/openshell-sandbox/src/main.rs && \
+    echo "fn main() {}" > crates/openshell-server/src/main.rs && \
+    touch crates/openshell-core/src/lib.rs && \
+    touch crates/openshell-providers/src/lib.rs && \
+    touch crates/openshell-router/src/lib.rs && \
+    touch crates/openshell-bootstrap/src/lib.rs
 
 # Build dependencies only (cached unless Cargo.toml/lock changes).
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-macos-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
-    cargo build --release --target aarch64-apple-darwin -p navigator-cli 2>/dev/null || true
+    cargo build --release --target aarch64-apple-darwin -p openshell-cli 2>/dev/null || true
 
 # Copy actual source code and Python packaging files.
 COPY crates/ crates/
@@ -81,15 +81,15 @@ COPY python/ python/
 # Touch source files to ensure they're rebuilt (not the cached dummy).
 # Touch build.rs and proto files to force proto code regeneration when the
 # cargo target cache mount retains stale OUT_DIR artifacts from prior builds.
-RUN touch crates/navigator-cli/src/main.rs \
-    crates/navigator-cli/src/lib.rs \
-    crates/navigator-bootstrap/src/lib.rs \
-    crates/navigator-core/src/lib.rs \
-    crates/navigator-providers/src/lib.rs \
-    crates/navigator-router/src/lib.rs \
-    crates/navigator-sandbox/src/main.rs \
-    crates/navigator-server/src/main.rs \
-    crates/navigator-core/build.rs \
+RUN touch crates/openshell-cli/src/main.rs \
+    crates/openshell-cli/src/lib.rs \
+    crates/openshell-bootstrap/src/lib.rs \
+    crates/openshell-core/src/lib.rs \
+    crates/openshell-providers/src/lib.rs \
+    crates/openshell-router/src/lib.rs \
+    crates/openshell-sandbox/src/main.rs \
+    crates/openshell-server/src/main.rs \
+    crates/openshell-core/build.rs \
     proto/*.proto
 
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \

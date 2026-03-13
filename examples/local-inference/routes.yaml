@@ -4,7 +4,7 @@
 # Example route configuration for standalone (no-cluster) inference routing.
 #
 # Usage:
-#   navigator-sandbox \
+#   openshell-sandbox \
 #     --inference-routes examples/inference/routes.yaml \
 #     --policy-rules policy.rego \
 #     --policy-data examples/inference/sandbox-policy.yaml \

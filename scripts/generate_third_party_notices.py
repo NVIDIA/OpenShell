@@ -26,15 +26,15 @@ from pathlib import Path
 # Our own workspace crates and packages — excluded from notices.
 WORKSPACE_CRATES = frozenset(
     {
-        "navigator-bootstrap",
-        "navigator-cli",
-        "navigator-core",
-        "navigator-policy",
-        "navigator-providers",
-        "navigator-router",
-        "navigator-sandbox",
-        "navigator-server",
-        "navigator-tui",
+        "openshell-bootstrap",
+        "openshell-cli",
+        "openshell-core",
+        "openshell-policy",
+        "openshell-providers",
+        "openshell-router",
+        "openshell-sandbox",
+        "openshell-server",
+        "openshell-tui",
         "openshell-e2e",
     }
 )

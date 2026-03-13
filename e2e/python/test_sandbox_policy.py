@@ -167,12 +167,12 @@ def _proxy_connect_then_http():
     return fn
 
 
-def _read_navigator_log():
-    """Return a closure that reads the navigator log file."""
+def _read_openshell_log():
+    """Return a closure that reads the openshell log file."""
 
     def fn():
         try:
-            with open("/var/log/navigator.log") as f:
+            with open("/var/log/openshell.log") as f:
                 return f.read()
         except FileNotFoundError:
             return ""
@@ -523,7 +523,7 @@ def test_l4_log_fields(
         # Generate a deny
         sb.exec_python(_proxy_connect(), args=("example.com", 443))
 
-        log_result = sb.exec_python(_read_navigator_log())
+        log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
@@ -613,7 +613,7 @@ def test_ssrf_log_shows_internal_address_block(
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         sb.exec_python(_proxy_connect(), args=("127.0.0.1", 80))
 
-        log_result = sb.exec_python(_read_navigator_log())
+        log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
         assert "internal address" in log.lower(), (
@@ -889,7 +889,7 @@ def test_l7_tls_audit_mode_allows_but_logs(
         assert post_resp["http_status"] != 403
 
         # Log should contain audit decision
-        log_result = sb.exec_python(_read_navigator_log())
+        log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
         assert "l7_decision=audit" in log or 'l7_decision="audit"' in log
@@ -966,8 +966,8 @@ def test_l7_tls_ca_trust_store_injected(
                 "NODE_EXTRA_CA_CERTS": os.environ.get("NODE_EXTRA_CA_CERTS", ""),
                 "REQUESTS_CA_BUNDLE": os.environ.get("REQUESTS_CA_BUNDLE", ""),
                 "CURL_CA_BUNDLE": os.environ.get("CURL_CA_BUNDLE", ""),
-                "ca_cert_exists": os.path.exists("/etc/navigator-tls/navigator-ca.pem"),
-                "bundle_exists": os.path.exists("/etc/navigator-tls/ca-bundle.pem"),
+                "ca_cert_exists": os.path.exists("/etc/openshell-tls/openshell-ca.pem"),
+                "bundle_exists": os.path.exists("/etc/openshell-tls/ca-bundle.pem"),
             }
         )
 
@@ -987,10 +987,10 @@ def test_l7_tls_ca_trust_store_injected(
         result = sb.exec_python(check_ca_env)
         assert result.exit_code == 0, result.stderr
         env = json.loads(result.stdout)
-        assert env["ca_cert_exists"], "navigator-ca.pem should exist"
+        assert env["ca_cert_exists"], "openshell-ca.pem should exist"
         assert env["bundle_exists"], "ca-bundle.pem should exist"
-        assert "navigator-tls" in env["SSL_CERT_FILE"]
-        assert "navigator-tls" in env["NODE_EXTRA_CA_CERTS"]
+        assert "openshell-tls" in env["SSL_CERT_FILE"]
+        assert "openshell-tls" in env["NODE_EXTRA_CA_CERTS"]
 
 
 def test_l7_tls_deny_response_format(
@@ -1026,7 +1026,7 @@ def test_l7_tls_deny_response_format(
         assert resp["http_status"] == 403
 
         # Verify response headers
-        assert "X-Navigator-Policy" in resp["headers"]
+        assert "X-OpenShell-Policy" in resp["headers"]
         assert "application/json" in resp["headers"]
 
         # Verify JSON body structure
@@ -1066,7 +1066,7 @@ def test_l7_tls_log_fields(
             args=("api.anthropic.com", 443, "GET", "/v1/models"),
         )
 
-        log_result = sb.exec_python(_read_navigator_log())
+        log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
 
@@ -1093,7 +1093,7 @@ def test_live_policy_update_and_logs(
     sandbox_client: "SandboxClient",
 ) -> None:
     """End-to-end: live policy update lifecycle with log verification."""
-    from openshell._proto import navigator_pb2, sandbox_pb2
+    from openshell._proto import openshell_pb2, sandbox_pb2
 
     # --- Setup: two distinct policies ---
     # Policy A: python can reach api.anthropic.com
@@ -1136,7 +1136,7 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-1: Initial policy should be version 1 ---
         status_resp = stub.GetSandboxPolicyStatus(
-            navigator_pb2.GetSandboxPolicyStatusRequest(name=sandbox_name, version=0)
+            openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_name, version=0)
         )
         assert status_resp.revision.version >= 1, "Initial policy should be at least v1"
         initial_version = status_resp.revision.version
@@ -1144,7 +1144,7 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-2: Set the same policy -> no new version ---
         update_resp = stub.UpdateSandboxPolicy(
-            navigator_pb2.UpdateSandboxPolicyRequest(
+            openshell_pb2.UpdateSandboxPolicyRequest(
                 name=sandbox_name,
                 policy=policy_a,
             )
@@ -1157,7 +1157,7 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-3: Push policy B -> new version ---
         update_resp = stub.UpdateSandboxPolicy(
-            navigator_pb2.UpdateSandboxPolicyRequest(
+            openshell_pb2.UpdateSandboxPolicyRequest(
                 name=sandbox_name,
                 policy=policy_b,
             )
@@ -1176,15 +1176,15 @@ def test_live_policy_update_and_logs(
         loaded = False
         while time.time() < deadline:
             status_resp = stub.GetSandboxPolicyStatus(
-                navigator_pb2.GetSandboxPolicyStatusRequest(
+                openshell_pb2.GetSandboxPolicyStatusRequest(
                     name=sandbox_name, version=new_version
                 )
             )
             status = status_resp.revision.status
-            if status == navigator_pb2.POLICY_STATUS_LOADED:
+            if status == openshell_pb2.POLICY_STATUS_LOADED:
                 loaded = True
                 break
-            if status == navigator_pb2.POLICY_STATUS_FAILED:
+            if status == openshell_pb2.POLICY_STATUS_FAILED:
                 pytest.fail(
                     f"Policy v{new_version} failed to load: "
                     f"{status_resp.revision.load_error}"
@@ -1201,7 +1201,7 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-4: Push policy B again -> unchanged ---
         update_resp = stub.UpdateSandboxPolicy(
-            navigator_pb2.UpdateSandboxPolicyRequest(
+            openshell_pb2.UpdateSandboxPolicyRequest(
                 name=sandbox_name,
                 policy=policy_b,
             )
@@ -1213,7 +1213,7 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-5: Verify policy history ---
         list_resp = stub.ListSandboxPolicies(
-            navigator_pb2.ListSandboxPoliciesRequest(name=sandbox_name, limit=10)
+            openshell_pb2.ListSandboxPoliciesRequest(name=sandbox_name, limit=10)
         )
         versions = [r.version for r in list_resp.revisions]
         assert new_version in versions
@@ -1223,7 +1223,7 @@ def test_live_policy_update_and_logs(
         loaded_count = sum(
             1
             for r in list_resp.revisions
-            if r.status == navigator_pb2.POLICY_STATUS_LOADED
+            if r.status == openshell_pb2.POLICY_STATUS_LOADED
         )
         assert loaded_count == 1, (
             f"Expected exactly 1 loaded version, got {loaded_count}: "
@@ -1232,11 +1232,11 @@ def test_live_policy_update_and_logs(
 
         # --- LPU-6: Fetch logs (one-shot) and verify both sources ---
         # Resolve sandbox ID for log RPCs
-        get_resp = stub.GetSandbox(navigator_pb2.GetSandboxRequest(name=sandbox_name))
+        get_resp = stub.GetSandbox(openshell_pb2.GetSandboxRequest(name=sandbox_name))
         sandbox_id = get_resp.sandbox.id
 
         logs_resp = stub.GetSandboxLogs(
-            navigator_pb2.GetSandboxLogsRequest(sandbox_id=sandbox_id, lines=500)
+            openshell_pb2.GetSandboxLogsRequest(sandbox_id=sandbox_id, lines=500)
         )
         assert logs_resp.buffer_total > 0, "Expected some logs in the buffer"
 
@@ -1489,7 +1489,7 @@ def test_forward_proxy_log_fields(
             ),
         )
         # Read the log
-        result = sb.exec_python(_read_navigator_log())
+        result = sb.exec_python(_read_openshell_log())
         assert result.exit_code == 0, result.stderr
         log = result.stdout
 
@@ -1542,8 +1542,8 @@ def _verify_sandbox_functional():
             os.unlink(sb_path)
         except Exception as e:
             checks["sandbox_write"] = str(e)
-        # Can read navigator log
-        checks["var_log"] = os.path.exists("/var/log/navigator.log")
+        # Can read openshell log
+        checks["var_log"] = os.path.exists("/var/log/openshell.log")
         return json.dumps(checks)
 
     return fn
@@ -1584,7 +1584,7 @@ def test_baseline_enrichment_missing_filesystem_policy(
         assert checks["sandbox_write"] is True, (
             f"/sandbox not writable: {checks['sandbox_write']}"
         )
-        assert checks["var_log"] is True, "Navigator log not accessible"
+        assert checks["var_log"] is True, "OpenShell log not accessible"
 
 
 def test_baseline_enrichment_incomplete_filesystem_policy(
@@ -1630,4 +1630,4 @@ def test_baseline_enrichment_incomplete_filesystem_policy(
         assert checks["sandbox_write"] is True, (
             f"/sandbox not writable: {checks['sandbox_write']}"
         )
-        assert checks["var_log"] is True, "Navigator log not accessible"
+        assert checks["var_log"] is True, "OpenShell log not accessible"
