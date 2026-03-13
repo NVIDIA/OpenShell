@@ -2890,6 +2890,7 @@ dependencies = [
 name = "navigator-tui"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "crossterm 0.28.1",
  "miette",
  "navigator-bootstrap",

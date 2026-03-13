@@ -71,6 +71,7 @@ pub struct Theme {
 
     // Log viewer
     pub log_cursor: Style,
+    pub log_selection: Style,
 
     // Animation
     pub claw: Style,
@@ -121,6 +122,7 @@ impl Theme {
             key_hint: Style::new().fg(brand::NVIDIA_GREEN),
 
             log_cursor: Style::new().bg(brand::EVERGLADE),
+            log_selection: Style::new().bg(Color::Rgb(30, 60, 45)),
 
             claw: Style::new().fg(brand::MAROON).add_modifier(Modifier::BOLD),
 
@@ -143,6 +145,7 @@ impl Theme {
         let border_color = Color::Rgb(180, 200, 170);
         let title_bg = Color::Rgb(220, 235, 210);
         let cursor_bg = Color::Rgb(230, 245, 220);
+        let selection_bg = Color::Rgb(215, 235, 200);
 
         Self {
             text: Style::new().fg(fg),
@@ -166,6 +169,7 @@ impl Theme {
             key_hint: Style::new().fg(brand::NVIDIA_GREEN_DARK),
 
             log_cursor: Style::new().bg(cursor_bg),
+            log_selection: Style::new().bg(selection_bg),
 
             claw: Style::new().fg(brand::MAROON).add_modifier(Modifier::BOLD),
 
@@ -244,6 +248,10 @@ mod tests {
             dark.log_cursor, light.log_cursor,
             "log_cursor style should differ"
         );
+        assert_ne!(
+            dark.log_selection, light.log_selection,
+            "log_selection style should differ"
+        );
     }
 
     #[test]
@@ -277,6 +285,7 @@ mod tests {
         assert_eq!(d.status_err, Style::new().fg(Color::Red));
         assert_eq!(d.key_hint, Style::new().fg(brand::NVIDIA_GREEN));
         assert_eq!(d.log_cursor, Style::new().bg(brand::EVERGLADE));
+        assert_eq!(d.log_selection, Style::new().bg(Color::Rgb(30, 60, 45)));
         assert_eq!(
             d.claw,
             Style::new().fg(brand::MAROON).add_modifier(Modifier::BOLD)

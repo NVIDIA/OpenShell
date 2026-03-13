@@ -16,6 +16,7 @@ navigator-bootstrap = { path = "../navigator-bootstrap" }
 navigator-policy = { path = "../navigator-policy" }
 navigator-providers = { path = "../navigator-providers" }
 
+base64 = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 terminal-colorsaurus = { workspace = true }
