@@ -100,6 +100,9 @@ python_files = ["*_test.py"]
 python_functions = ["test_*"]
 addopts = "-v --tb=short"
 asyncio_mode = "auto"
+markers = [
+    "gpu: requires a GPU-capable gateway and GPU-enabled sandbox image",
+]
 
 [tool.coverage.run]
 source = ["python"]

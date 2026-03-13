@@ -83,8 +83,8 @@ async fn sandbox_help_shows_upload_download() {
     }
 }
 
-/// `openshell sandbox create --help` must show `--upload`, `--no-git-ignore`,
-/// `--no-bootstrap`, `--editor`, and
+/// `openshell sandbox create --help` must show `--gpu`, `--upload`,
+/// `--no-git-ignore`, `--no-bootstrap`, `--editor`, and
 /// `--auto-providers`/`--no-auto-providers`.
 /// Note: `--bootstrap` is intentionally hidden (it's the default behaviour).
 #[tokio::test]
@@ -94,6 +94,7 @@ async fn sandbox_create_help_shows_new_flags() {
 
     let clean = strip_ansi(&output);
     for flag in [
+        "--gpu",
         "--upload",
         "--no-git-ignore",
         "--no-bootstrap",
@@ -158,4 +159,3 @@ async fn status_without_gateway_prints_friendly_message() {
         "expected hint to run 'openshell gateway start':\n{clean}"
     );
 }
-

@@ -5,8 +5,8 @@
 
 use crate::persistence::{ObjectId, ObjectName, ObjectType, Store};
 use futures::{StreamExt, TryStreamExt};
-use k8s_openapi::api::core::v1::Pod;
-use kube::api::{Api, ApiResource, DeleteParams, PostParams};
+use k8s_openapi::api::core::v1::{Node, Pod};
+use kube::api::{Api, ApiResource, DeleteParams, ListParams, PostParams};
 use kube::core::gvk::GroupVersionKind;
 use kube::core::{DynamicObject, ObjectMeta};
 use kube::runtime::watcher::{self, Event};
@@ -31,6 +31,9 @@ pub const SANDBOX_KIND: &str = "Sandbox";
 const SANDBOX_ID_LABEL: &str = "openshell.ai/sandbox-id";
 const SANDBOX_MANAGED_LABEL: &str = "openshell.ai/managed-by";
 const SANDBOX_MANAGED_VALUE: &str = "openshell";
+const GPU_RUNTIME_CLASS_NAME: &str = "nvidia";
+const GPU_RESOURCE_NAME: &str = "nvidia.com/gpu";
+const GPU_RESOURCE_QUANTITY: &str = "1";
 
 #[derive(Clone)]
 pub struct SandboxClient {
@@ -116,6 +119,47 @@ impl SandboxClient {
         let gvk = GroupVersionKind::gvk(SANDBOX_GROUP, SANDBOX_VERSION, SANDBOX_KIND);
         let resource = ApiResource::from_gvk(&gvk);
         Api::namespaced_with(self.client.clone(), &self.namespace, &resource)
+    }
+
+    pub async fn validate_gpu_support(&self) -> Result<(), tonic::Status> {
+        let runtime_classes: Api<DynamicObject> = Api::all_with(
+            self.client.clone(),
+            &ApiResource::from_gvk(&GroupVersionKind::gvk("node.k8s.io", "v1", "RuntimeClass")),
+        );
+
+        let runtime_class_exists = runtime_classes
+            .get_opt(GPU_RUNTIME_CLASS_NAME)
+            .await
+            .map_err(|err| {
+                tonic::Status::internal(format!("check GPU runtime class failed: {err}"))
+            })?
+            .is_some();
+
+        if !runtime_class_exists {
+            return Err(tonic::Status::failed_precondition(
+                "GPU sandbox requested, but the active gateway is not GPU-enabled. To start a gateway with GPU support run: `openshell gateway start --gpu`",
+            ));
+        }
+
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let node_list = nodes.list(&ListParams::default()).await.map_err(|err| {
+            tonic::Status::internal(format!("check GPU node capacity failed: {err}"))
+        })?;
+
+        let has_gpu_capacity = node_list.items.into_iter().any(|node| {
+            node.status
+                .and_then(|status| status.allocatable)
+                .and_then(|allocatable| allocatable.get(GPU_RESOURCE_NAME).cloned())
+                .is_some_and(|quantity| quantity.0 != "0")
+        });
+
+        if !has_gpu_capacity {
+            return Err(tonic::Status::failed_precondition(
+                "GPU sandbox requested, but the active gateway has no allocatable GPUs. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.",
+            ));
+        }
+
+        Ok(())
     }
 
     pub async fn agent_pod_ip(&self, pod_name: &str) -> Result<Option<IpAddr>, KubeError> {
@@ -467,13 +511,17 @@ async fn handle_applied(
         .unwrap_or_else(|| client.namespace().to_string());
     let deletion_timestamp = obj.metadata.deletion_timestamp.is_some();
 
-    let status = status_from_object(&obj);
-    let phase = derive_phase(&status, deletion_timestamp);
-
     let existing = store
         .get_message::<Sandbox>(&id)
         .await
         .map_err(|e| e.to_string())?;
+
+    let mut status = status_from_object(&obj);
+    rewrite_user_facing_conditions(
+        &mut status,
+        existing.as_ref().and_then(|sandbox| sandbox.spec.as_ref()),
+    );
+    let phase = derive_phase(&status, deletion_timestamp);
 
     // If the record doesn't exist yet, the `create_sandbox` handler may
     // still be in-flight (it creates the k8s resource first, then writes
@@ -728,6 +776,7 @@ fn sandbox_to_k8s_spec(
                 "podTemplate".to_string(),
                 sandbox_template_to_k8s(
                     template,
+                    spec.gpu,
                     default_image,
                     image_pull_policy,
                     sandbox_id,
@@ -760,6 +809,7 @@ fn sandbox_to_k8s_spec(
             "podTemplate".to_string(),
             sandbox_template_to_k8s(
                 &SandboxTemplate::default(),
+                spec.as_ref().is_some_and(|s| s.gpu),
                 default_image,
                 image_pull_policy,
                 sandbox_id,
@@ -782,6 +832,7 @@ fn sandbox_to_k8s_spec(
 #[allow(clippy::too_many_arguments)]
 fn sandbox_template_to_k8s(
     template: &SandboxTemplate,
+    gpu: bool,
     default_image: &str,
     image_pull_policy: &str,
     sandbox_id: &str,
@@ -797,6 +848,8 @@ fn sandbox_template_to_k8s(
         return inject_pod_template(
             pod_template,
             template,
+            gpu,
+            default_image,
             image_pull_policy,
             sandbox_id,
             sandbox_name,
@@ -824,7 +877,12 @@ fn sandbox_template_to_k8s(
     }
 
     let mut spec = serde_json::Map::new();
-    if !template.runtime_class_name.is_empty() {
+    if gpu {
+        spec.insert(
+            "runtimeClassName".to_string(),
+            serde_json::json!(GPU_RUNTIME_CLASS_NAME),
+        );
+    } else if !template.runtime_class_name.is_empty() {
         spec.insert(
             "runtimeClassName".to_string(),
             serde_json::json!(template.runtime_class_name),
@@ -891,7 +949,7 @@ fn sandbox_template_to_k8s(
         );
     }
 
-    if let Some(resources) = struct_to_json(&template.resources) {
+    if let Some(resources) = container_resources(template, gpu) {
         container.insert("resources".to_string(), resources);
     }
     spec.insert(
@@ -928,6 +986,8 @@ fn sandbox_template_to_k8s(
 fn inject_pod_template(
     mut pod_template: serde_json::Value,
     template: &SandboxTemplate,
+    gpu: bool,
+    default_image: &str,
     image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
@@ -944,6 +1004,13 @@ fn inject_pod_template(
     else {
         return pod_template;
     };
+
+    if gpu {
+        spec.insert(
+            "runtimeClassName".to_string(),
+            serde_json::json!(GPU_RUNTIME_CLASS_NAME),
+        );
+    }
 
     // Inject TLS volume at the pod spec level.
     if !client_tls_secret_name.is_empty() {
@@ -1015,12 +1082,61 @@ fn inject_pod_template(
                 }));
             }
         }
+
+        if gpu {
+            apply_gpu_to_container(container);
+        }
     }
 
     // Always side-load the supervisor binary from the node filesystem
     apply_supervisor_sideload(&mut pod_template);
 
     pod_template
+}
+
+fn container_resources(template: &SandboxTemplate, gpu: bool) -> Option<serde_json::Value> {
+    let mut resources =
+        struct_to_json(&template.resources).unwrap_or_else(|| serde_json::json!({}));
+    if gpu {
+        apply_gpu_limit(&mut resources);
+    }
+    if resources
+        .as_object()
+        .is_some_and(|object| object.is_empty())
+    {
+        None
+    } else {
+        Some(resources)
+    }
+}
+
+fn apply_gpu_to_container(container: &mut serde_json::Value) {
+    if let Some(container_obj) = container.as_object_mut() {
+        let resources = container_obj
+            .entry("resources")
+            .or_insert_with(|| serde_json::json!({}));
+        apply_gpu_limit(resources);
+    }
+}
+
+fn apply_gpu_limit(resources: &mut serde_json::Value) {
+    let Some(resources_obj) = resources.as_object_mut() else {
+        *resources = serde_json::json!({});
+        return apply_gpu_limit(resources);
+    };
+
+    let limits = resources_obj
+        .entry("limits")
+        .or_insert_with(|| serde_json::json!({}));
+    let Some(limits_obj) = limits.as_object_mut() else {
+        *limits = serde_json::json!({});
+        return apply_gpu_limit(resources);
+    };
+
+    limits_obj.insert(
+        GPU_RESOURCE_NAME.to_string(),
+        serde_json::json!(GPU_RESOURCE_QUANTITY),
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1241,6 +1357,24 @@ fn condition_from_value(value: &serde_json::Value) -> Option<SandboxCondition> {
     })
 }
 
+fn rewrite_user_facing_conditions(status: &mut Option<SandboxStatus>, spec: Option<&SandboxSpec>) {
+    let gpu_requested = spec.is_some_and(|sandbox_spec| sandbox_spec.gpu);
+    if !gpu_requested {
+        return;
+    }
+
+    if let Some(status) = status {
+        for condition in &mut status.conditions {
+            if condition.r#type == "Ready"
+                && condition.status.eq_ignore_ascii_case("false")
+                && condition.reason.eq_ignore_ascii_case("Unschedulable")
+            {
+                condition.message = "GPU sandbox could not be scheduled on the active gateway. Another GPU sandbox may already be using the available GPU, or the gateway may not currently be able to satisfy GPU placement. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration.".to_string();
+            }
+        }
+    }
+}
+
 fn derive_phase(status: &Option<SandboxStatus>, deleting: bool) -> SandboxPhase {
     if deleting {
         return SandboxPhase::Deleting;
@@ -1287,6 +1421,7 @@ fn is_terminal_failure_condition(condition: &SandboxCondition) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prost_types::{Struct, Value, value::Kind};
 
     fn make_condition(reason: &str, message: &str) -> SandboxCondition {
         SandboxCondition {
@@ -1400,6 +1535,65 @@ mod tests {
         });
 
         assert_eq!(derive_phase(&status, false), SandboxPhase::Error);
+    }
+
+    #[test]
+    fn rewrite_user_facing_conditions_rewrites_gpu_unschedulable_message() {
+        let mut status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: "0/1 nodes are available: 1 Insufficient nvidia.com/gpu.".to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        rewrite_user_facing_conditions(
+            &mut status,
+            Some(&SandboxSpec {
+                gpu: true,
+                ..Default::default()
+            }),
+        );
+
+        let message = &status.unwrap().conditions[0].message;
+        assert_eq!(
+            message,
+            "GPU sandbox could not be scheduled on the active gateway. Another GPU sandbox may already be using the available GPU, or the gateway may not currently be able to satisfy GPU placement. Please refer to documentation and use `openshell doctor` commands to inspect GPU support and gateway configuration."
+        );
+    }
+
+    #[test]
+    fn rewrite_user_facing_conditions_leaves_non_gpu_unschedulable_message_unchanged() {
+        let original = "0/1 nodes are available: 1 Insufficient cpu.";
+        let mut status = Some(SandboxStatus {
+            sandbox_name: "test".to_string(),
+            agent_pod: "test-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: original.to_string(),
+                last_transition_time: String::new(),
+            }],
+        });
+
+        rewrite_user_facing_conditions(
+            &mut status,
+            Some(&SandboxSpec {
+                gpu: false,
+                ..Default::default()
+            }),
+        );
+
+        assert_eq!(status.unwrap().conditions[0].message, original);
     }
 
     #[test]
@@ -1588,6 +1782,143 @@ mod tests {
         assert!(
             tls_key.starts_with(TLS_MOUNT_PATH),
             "OPENSHELL_TLS_KEY path '{tls_key}' must start with mount path '{TLS_MOUNT_PATH}'"
+        );
+    }
+
+    fn string_value(value: &str) -> Value {
+        Value {
+            kind: Some(Kind::StringValue(value.to_string())),
+        }
+    }
+
+    #[test]
+    fn gpu_sandbox_adds_runtime_class_and_gpu_limit() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            true,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!(GPU_RUNTIME_CLASS_NAME)
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
+            serde_json::json!(GPU_RESOURCE_QUANTITY)
+        );
+    }
+
+    #[test]
+    fn gpu_sandbox_preserves_existing_resource_limits() {
+        let template = SandboxTemplate {
+            resources: Some(Struct {
+                fields: [(
+                    "limits".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: [("cpu".to_string(), string_value("2"))]
+                                .into_iter()
+                                .collect(),
+                        })),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            true,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+        );
+
+        let limits = &pod_template["spec"]["containers"][0]["resources"]["limits"];
+        assert_eq!(limits["cpu"], serde_json::json!("2"));
+        assert_eq!(
+            limits[GPU_RESOURCE_NAME],
+            serde_json::json!(GPU_RESOURCE_QUANTITY)
+        );
+    }
+
+    #[test]
+    fn gpu_sandbox_updates_custom_pod_template() {
+        let template = SandboxTemplate {
+            pod_template: Some(Struct {
+                fields: [(
+                    "spec".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: [(
+                                "containers".to_string(),
+                                Value {
+                                    kind: Some(Kind::ListValue(prost_types::ListValue {
+                                        values: vec![Value {
+                                            kind: Some(Kind::StructValue(Struct {
+                                                fields: [(
+                                                    "name".to_string(),
+                                                    string_value("agent"),
+                                                )]
+                                                .into_iter()
+                                                .collect(),
+                                            })),
+                                        }],
+                                    })),
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        })),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            true,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+        );
+
+        assert_eq!(
+            pod_template["spec"]["runtimeClassName"],
+            serde_json::json!(GPU_RUNTIME_CLASS_NAME)
+        );
+        assert_eq!(
+            pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
+            serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
     }
 }

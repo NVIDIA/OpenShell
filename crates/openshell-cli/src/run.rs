@@ -62,6 +62,47 @@ fn phase_name(phase: i32) -> &'static str {
     }
 }
 
+fn ready_false_condition_message(
+    status: Option<&openshell_core::proto::SandboxStatus>,
+) -> Option<String> {
+    let condition = status?.conditions.iter().find(|condition| {
+        condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")
+    })?;
+
+    if condition.message.is_empty() {
+        if condition.reason.is_empty() {
+            None
+        } else {
+            Some(condition.reason.clone())
+        }
+    } else if condition.reason.is_empty() {
+        Some(condition.message.clone())
+    } else {
+        Some(format!("{}: {}", condition.reason, condition.message))
+    }
+}
+
+fn provisioning_timeout_message(
+    timeout_secs: u64,
+    requested_gpu: bool,
+    condition_message: Option<&str>,
+) -> String {
+    let mut message = format!("sandbox provisioning timed out after {timeout_secs}s");
+
+    if let Some(condition_message) = condition_message.filter(|msg| !msg.is_empty()) {
+        message.push_str(". Last reported status: ");
+        message.push_str(condition_message);
+    }
+
+    if requested_gpu {
+        message.push_str(
+            ". Hint: this may be because the available GPU is already in use by another sandbox.",
+        );
+    }
+
+    message
+}
+
 /// Format milliseconds since Unix epoch as a `YYYY-MM-DD HH:MM:SS` UTC string.
 fn format_epoch_ms(ms: i64) -> String {
     use std::time::UNIX_EPOCH;
@@ -294,11 +335,6 @@ impl ProvisioningDisplay {
     /// Print a line above the progress bars (for static header content).
     fn println(&self, msg: &str) {
         let _ = self.mp.println(msg);
-    }
-
-    /// Return a description of the current active step for error messages.
-    fn current_step_description(&self) -> &str {
-        &self.active_label
     }
 
     /// Clear all progress output (spinner, spacer, and completed step lines).
@@ -1700,6 +1736,7 @@ pub async fn sandbox_create_with_bootstrap(
     from: Option<&str>,
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
+    gpu: bool,
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -1718,7 +1755,9 @@ pub async fn sandbox_create_with_bootstrap(
              Or deploy a new gateway: openshell gateway start"
         ));
     }
-    let (tls, server, gateway_name) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+    let requested_gpu = gpu || from.is_some_and(source_requests_gpu);
+    let (tls, server, gateway_name) =
+        crate::bootstrap::run_bootstrap(remote, ssh_key, requested_gpu).await?;
     // Disable bootstrap inside sandbox_create so that a transient connection
     // failure right after deploy does not trigger a second bootstrap attempt.
     sandbox_create(
@@ -1728,6 +1767,7 @@ pub async fn sandbox_create_with_bootstrap(
         &gateway_name,
         upload,
         keep,
+        gpu,
         editor,
         remote,
         ssh_key,
@@ -1778,6 +1818,7 @@ pub async fn sandbox_create(
     gateway_name: &str,
     upload: Option<&(String, Option<String>, bool)>,
     keep: bool,
+    gpu: bool,
     editor: Option<Editor>,
     remote: Option<&str>,
     ssh_key: Option<&str>,
@@ -1829,7 +1870,9 @@ pub async fn sandbox_create(
                 eprintln!();
                 return Err(err);
             }
-            let (new_tls, new_server, _) = crate::bootstrap::run_bootstrap(remote, ssh_key).await?;
+            let requested_gpu = gpu || from.is_some_and(source_requests_gpu);
+            let (new_tls, new_server, _) =
+                crate::bootstrap::run_bootstrap(remote, ssh_key, requested_gpu).await?;
             let c = grpc_client(&new_server, &new_tls)
                 .await
                 .wrap_err("bootstrap succeeded but failed to connect to gateway")?;
@@ -1855,6 +1898,7 @@ pub async fn sandbox_create(
         }
         None => None,
     };
+    let requested_gpu = gpu || image.as_deref().is_some_and(image_requests_gpu);
 
     let inferred_types: Vec<String> = inferred_provider_type(command).into_iter().collect();
     let configured_providers = ensure_required_providers(
@@ -1874,6 +1918,7 @@ pub async fn sandbox_create(
 
     let request = CreateSandboxRequest {
         spec: Some(SandboxSpec {
+            gpu: requested_gpu,
             policy,
             providers: configured_providers,
             template,
@@ -1944,6 +1989,7 @@ pub async fn sandbox_create(
 
     let mut last_phase = sandbox.phase;
     let mut last_error_reason = String::new();
+    let mut last_condition_message = ready_false_condition_message(sandbox.status.as_ref());
     // Track whether we have seen a non-Ready phase during the watch.
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
     let start_time = Instant::now();
@@ -1954,18 +2000,16 @@ pub async fn sandbox_create(
     while let Some(item) = stream.next().await {
         // Check for timeout
         if start_time.elapsed() > provision_timeout {
+            let timeout_message = provisioning_timeout_message(
+                provision_timeout.as_secs(),
+                requested_gpu,
+                last_condition_message.as_deref(),
+            );
             if let Some(d) = display.as_mut() {
-                let step_desc = d.current_step_description().to_string();
-                d.finish_error(&format!(
-                    "Timed out after {}s (stuck at: {step_desc})",
-                    provision_timeout.as_secs()
-                ));
+                d.finish_error(&timeout_message);
             }
             println!();
-            return Err(miette::miette!(
-                "sandbox provisioning timed out after {}s",
-                provision_timeout.as_secs()
-            ));
+            return Err(miette::miette!(timeout_message));
         }
 
         let evt = item.into_diagnostic()?;
@@ -1973,6 +2017,9 @@ pub async fn sandbox_create(
             Some(openshell_core::proto::sandbox_stream_event::Payload::Sandbox(s)) => {
                 let phase = SandboxPhase::try_from(s.phase).unwrap_or(SandboxPhase::Unknown);
                 last_phase = s.phase;
+                if let Some(message) = ready_false_condition_message(s.status.as_ref()) {
+                    last_condition_message = Some(message);
+                }
 
                 if phase != SandboxPhase::Ready {
                     saw_non_ready = true;
@@ -2341,6 +2388,30 @@ fn resolve_from(value: &str) -> Result<ResolvedSource> {
         .unwrap_or_else(|_| DEFAULT_COMMUNITY_REGISTRY.to_string());
     let prefix = prefix.trim_end_matches('/');
     Ok(ResolvedSource::Image(format!("{prefix}/{value}:latest")))
+}
+
+fn source_requests_gpu(source: &str) -> bool {
+    if let Ok(resolved) = resolve_from(source) {
+        match resolved {
+            ResolvedSource::Image(image) => image_requests_gpu(&image),
+            ResolvedSource::Dockerfile { .. } => false,
+        }
+    } else {
+        false
+    }
+}
+
+fn image_requests_gpu(image: &str) -> bool {
+    let image_name = image
+        .rsplit('/')
+        .next()
+        .unwrap_or(image)
+        .split([':', '@'])
+        .next()
+        .unwrap_or(image)
+        .to_ascii_lowercase();
+
+    image_name.contains("gpu")
 }
 
 /// Build a Dockerfile and push the resulting image into the gateway.
@@ -4187,8 +4258,9 @@ mod tests {
     use super::{
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
         format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
-        git_sync_files, http_health_check, inferred_provider_type, parse_credential_pairs,
-        resolve_gateway_control_target_from, sandbox_should_persist,
+        git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
+        parse_credential_pairs, provisioning_timeout_message, ready_false_condition_message,
+        resolve_gateway_control_target_from, sandbox_should_persist, source_requests_gpu,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -4201,6 +4273,7 @@ mod tests {
     use std::thread;
 
     use openshell_bootstrap::GatewayMetadata;
+    use openshell_core::proto::{SandboxCondition, SandboxStatus};
 
     struct EnvVarGuard {
         key: &'static str,
@@ -4355,6 +4428,103 @@ mod tests {
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
         assert!(sandbox_should_persist(false, Some(8080)));
+    }
+
+    #[test]
+    fn image_requests_gpu_matches_known_gpu_image_names() {
+        for image in [
+            "ghcr.io/nvidia/openshell-community/sandboxes/nvidia-gpu:latest",
+            "registry.example.com/team/gpu:dev",
+            "nvcr.io/example/my-gpu-image@sha256:deadbeef",
+        ] {
+            assert!(
+                image_requests_gpu(image),
+                "expected GPU detection for {image}"
+            );
+        }
+    }
+
+    #[test]
+    fn image_requests_gpu_ignores_non_gpu_image_names() {
+        for image in [
+            "ghcr.io/nvidia/openshell-community/sandboxes/base:latest",
+            "registry.example.com/gpu/team/base:latest",
+            "registry.example.com/team/openclaw:latest",
+            "cuda-toolkit:latest",
+            "registry.example.com/team/graphics:latest",
+        ] {
+            assert!(
+                !image_requests_gpu(image),
+                "did not expect GPU detection for {image}"
+            );
+        }
+    }
+
+    #[test]
+    fn source_requests_gpu_detects_known_community_gpu_name() {
+        assert!(source_requests_gpu("nvidia-gpu"));
+        assert!(!source_requests_gpu("base"));
+    }
+
+    #[test]
+    fn ready_false_condition_message_prefers_reason_and_message() {
+        let status = SandboxStatus {
+            sandbox_name: "gpu".to_string(),
+            agent_pod: "gpu-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Ready".to_string(),
+                status: "False".to_string(),
+                reason: "Unschedulable".to_string(),
+                message: "Another GPU sandbox may already be using the available GPU.".to_string(),
+                last_transition_time: String::new(),
+            }],
+        };
+
+        assert_eq!(
+            ready_false_condition_message(Some(&status)).as_deref(),
+            Some("Unschedulable: Another GPU sandbox may already be using the available GPU.")
+        );
+    }
+
+    #[test]
+    fn ready_false_condition_message_ignores_non_ready_conditions() {
+        let status = SandboxStatus {
+            sandbox_name: "gpu".to_string(),
+            agent_pod: "gpu-pod".to_string(),
+            agent_fd: String::new(),
+            sandbox_fd: String::new(),
+            conditions: vec![SandboxCondition {
+                r#type: "Scheduled".to_string(),
+                status: "True".to_string(),
+                reason: "Scheduled".to_string(),
+                message: "Sandbox scheduled".to_string(),
+                last_transition_time: String::new(),
+            }],
+        };
+
+        assert!(ready_false_condition_message(Some(&status)).is_none());
+    }
+
+    #[test]
+    fn provisioning_timeout_message_includes_condition_and_gpu_hint() {
+        let message = provisioning_timeout_message(
+            120,
+            true,
+            Some("DependenciesNotReady: Pod exists with phase: Pending; Service Exists"),
+        );
+
+        assert!(message.contains("sandbox provisioning timed out after 120s"));
+        assert!(message.contains("Last reported status: DependenciesNotReady: Pod exists with phase: Pending; Service Exists"));
+        assert!(message.contains("available GPU is already in use by another sandbox"));
+    }
+
+    #[test]
+    fn provisioning_timeout_message_omits_gpu_hint_for_non_gpu_requests() {
+        let message = provisioning_timeout_message(120, false, None);
+
+        assert_eq!(message, "sandbox provisioning timed out after 120s");
     }
 
     fn init_git_repo(path: &Path) {

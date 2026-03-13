@@ -11,6 +11,10 @@ depends = ["test:rust", "test:python"]
 description = "Run all end-to-end tests (Rust + Python)"
 depends = ["e2e:rust", "e2e:python"]
 
+["e2e:gpu"]
+description = "Run GPU end-to-end tests"
+depends = ["e2e:python:gpu"]
+
 ["test:rust"]
 description = "Run Rust tests"
 run = "cargo test --workspace"
@@ -32,4 +36,10 @@ run = ["cargo build -p openshell-cli", "cargo test --manifest-path e2e/rust/Carg
 description = "Run Python e2e tests (E2E_PARALLEL=N or 'auto'; default 5)"
 depends = ["python:proto", "cluster"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
-run = "uv run pytest -o python_files='test_*.py' -n ${E2E_PARALLEL:-5} e2e/python"
+run = "uv run pytest -o python_files='test_*.py' -m 'not gpu' -n ${E2E_PARALLEL:-5} e2e/python"
+
+["e2e:python:gpu"]
+description = "Run Python GPU e2e tests"
+depends = ["python:proto", "cluster"]
+env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
+run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2e/python"

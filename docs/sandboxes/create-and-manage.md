@@ -44,6 +44,14 @@ $ openshell sandbox create -- claude
 
 If you have an existing gateway, the sandbox is created in it. Otherwise, a gateway is created automatically.
 
+To request GPU resources explicitly, add `--gpu`:
+
+```console
+$ openshell sandbox create --gpu -- claude
+```
+
+If no gateway is running, the auto-bootstrap path starts a GPU-enabled gateway first.
+
 
 A fully specified creation command might look like:
 
@@ -78,6 +86,8 @@ You can also point `--from` at a local directory or a container image reference:
 $ openshell sandbox create --from ./my-sandbox-dir
 $ openshell sandbox create --from my-registry.example.com/my-image:latest
 ```
+
+Images whose final name component contains `gpu` also trigger GPU sandbox requests automatically. For example, `--from nvidia-gpu` behaves like a GPU sandbox request even without `--gpu`.
 
 ## List and Inspect Sandboxes
 
