@@ -27,7 +27,7 @@ content:
 
 # Create and Manage
 
-This page covers setting up gateways, creating sandboxes, and managing both. For background on what sandboxes are and how isolation works, refer to [About Sandboxes](index.md).
+This page covers creating sandboxes and managing them. For background on what sandboxes are and how isolation works, refer to [About Sandboxes](index.md).
 
 :::{warning}
 Docker must be running before you create a gateway or sandbox. If it is not, the CLI
@@ -35,25 +35,29 @@ returns a connection-refused error (`os error 61`) without explaining
 the cause. Start Docker and try again.
 :::
 
-## Set Up a Gateway
-
-Every sandbox requires a gateway. For local use, you can skip this step. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway for you. If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to {doc}`gateways` for deployment options and multi-gateway management.
-
 ## Create a Sandbox
 
-Run a single command to create a sandbox and launch your agent:
+Create a sandbox with a single command. For example, to create a sandbox with Claude, run:
 
 ```console
 $ openshell sandbox create -- claude
 ```
 
-If no gateway is running, the CLI auto-bootstraps a local gateway before creating the sandbox.
+Every sandbox requires a gateway. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway.
+
+### Remote Gateways
+
+If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to {doc}`gateways` for deployment options and multi-gateway management.
+
+### GPU Resources
 
 To request GPU resources, add `--gpu`:
 
 ```console
 $ openshell sandbox create --gpu -- claude
 ```
+
+### Custom Containers
 
 Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
 
@@ -65,7 +69,7 @@ $ openshell sandbox create --from my-registry.example.com/my-image:latest
 
 The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
 
-A fully specified creation command might look like:
+The following is an example of a fully specified creation command:
 
 ```console
 $ openshell sandbox create \
