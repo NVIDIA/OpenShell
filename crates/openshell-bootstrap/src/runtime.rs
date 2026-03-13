@@ -24,6 +24,13 @@ const DNS_FAILURE_MARKERS: &[&str] = &["DNS_PROBE_FAILED", "HEALTHCHECK_DNS_FAIL
 /// new scheduling, so the cluster will never become healthy on its own.
 const NODE_PRESSURE_MARKER: &str = "HEALTHCHECK_NODE_PRESSURE";
 
+/// Log marker emitted by the health-check script when the sandbox supervisor
+/// binary (`/opt/openshell/bin/openshell-sandbox`) is missing from the node
+/// filesystem. Without this binary, every sandbox pod will crash immediately
+/// with "no such file or directory". This is a permanent error that requires
+/// rebuilding or updating the cluster image.
+const MISSING_SUPERVISOR_MARKER: &str = "HEALTHCHECK_MISSING_SUPERVISOR";
+
 /// Number of consecutive polling iterations that must observe DNS failure
 /// markers before we treat the failure as persistent and abort. A small
 /// grace period avoids false positives on transient hiccups during startup.
@@ -114,6 +121,29 @@ where
                 )));
                 break;
             }
+        }
+
+        // -- Missing supervisor binary detection ----------------------------
+        // The health-check script verifies that /opt/openshell/bin/openshell-sandbox
+        // exists on the node filesystem. If missing, every sandbox pod will crash.
+        // This is a permanent error — fail immediately with actionable guidance.
+        if recent_logs
+            .iter()
+            .any(|line| line.contains(MISSING_SUPERVISOR_MARKER))
+        {
+            result = Some(Err(miette::miette!(
+                "The sandbox supervisor binary is missing from the cluster image.\n\
+                 The file /opt/openshell/bin/openshell-sandbox was not found in the gateway \
+                 container. Without it, sandbox pods cannot start.\n\n\
+                 This usually means the cluster image was built or published without the \
+                 supervisor-builder stage.\n\n\
+                 To fix:\n  \
+                 1. Rebuild the cluster image: mise run docker:build:cluster\n  \
+                 2. Or update to a cluster image that includes the supervisor binary\n  \
+                 3. Then recreate the gateway: openshell gateway destroy && openshell gateway start\n\n{}",
+                format_recent_logs(&recent_logs)
+            )));
+            break;
         }
 
         let inspect = docker

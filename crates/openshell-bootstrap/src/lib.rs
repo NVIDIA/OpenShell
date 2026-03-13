@@ -30,7 +30,7 @@ use crate::constants::{
 };
 use crate::docker::{
     check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
+    ensure_image, ensure_volume, start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -107,6 +107,10 @@ pub struct DeployOptions {
     /// created with GPU device requests (`--gpus all`) and the NVIDIA
     /// k8s-device-plugin is deployed inside the k3s cluster.
     pub gpu: bool,
+    /// When true, destroy any existing gateway resources before deploying.
+    /// When false, an existing gateway is left as-is and deployment is
+    /// skipped (the caller is responsible for prompting the user first).
+    pub recreate: bool,
 }
 
 impl DeployOptions {
@@ -121,6 +125,7 @@ impl DeployOptions {
             disable_gateway_auth: false,
             registry_token: None,
             gpu: false,
+            recreate: false,
         }
     }
 
@@ -170,6 +175,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_gpu(mut self, gpu: bool) -> Self {
         self.gpu = gpu;
+        self
+    }
+
+    /// Set whether to destroy and recreate existing gateway resources.
+    #[must_use]
+    pub fn with_recreate(mut self, recreate: bool) -> Self {
+        self.recreate = recreate;
         self
     }
 }
@@ -232,6 +244,7 @@ where
     let disable_gateway_auth = options.disable_gateway_auth;
     let registry_token = options.registry_token;
     let gpu = options.gpu;
+    let recreate = options.recreate;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -255,6 +268,22 @@ where
             None,
         ),
     };
+
+    // If an existing gateway is found, either tear it down (when recreate is
+    // requested) or bail out so the caller can prompt the user / reuse it.
+    if let Some(existing) = check_existing_gateway(&target_docker, &name).await? {
+        if recreate {
+            log("[status] Removing existing gateway".to_string());
+            destroy_gateway_resources(&target_docker, &name).await?;
+        } else {
+            return Err(miette::miette!(
+                "Gateway '{name}' already exists (container_running={}).\n\
+                 Use --recreate to destroy and redeploy, or destroy it first with:\n\n    \
+                 openshell gateway destroy {name}",
+                existing.container_running,
+            ));
+        }
+    }
 
     // Ensure the image is available on the target Docker daemon
     if remote_opts.is_some() {
@@ -280,7 +309,6 @@ where
 
     // All subsequent operations use the target Docker (remote or local)
     log("[status] Initializing environment".to_string());
-    ensure_network(&target_docker).await?;
     ensure_volume(&target_docker, &volume_name(&name)).await?;
 
     // Compute extra TLS SANs for remote deployments so the gateway and k3s

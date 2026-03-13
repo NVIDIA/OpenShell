@@ -740,8 +740,8 @@ enum GatewayCommands {
 
         /// Destroy and recreate the gateway from scratch if one already exists.
         ///
-        /// Without this flag, an interactive prompt asks what to do; in
-        /// non-interactive mode the existing gateway is reused silently.
+        /// Without this flag, an interactive prompt asks whether to recreate;
+        /// in non-interactive mode the existing gateway is reused silently.
         #[arg(long)]
         recreate: bool,
 

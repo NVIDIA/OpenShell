@@ -131,12 +131,14 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
     previous_helm_fingerprint=""
   fi
 
-  # Invalidate all previous fingerprints when the cluster container has
+  # Invalidate gateway and helm fingerprints when the cluster container has
   # changed (recreated or replaced).  The new k3s instance has no pushed
-  # images so everything must be rebuilt.
+  # images so the gateway must be rebuilt and helm must be re-applied.
+  # The supervisor is NOT invalidated here because it is already built into
+  # the cluster image — a fresh cluster already has the correct supervisor
+  # binary, so rebuilding it would be redundant.
   if [[ -n "${current_container_id}" && "${current_container_id}" != "${previous_container_id:-}" ]]; then
     previous_gateway_fingerprint=""
-    previous_supervisor_fingerprint=""
     previous_helm_fingerprint=""
   fi
 fi

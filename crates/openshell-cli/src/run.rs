@@ -1205,40 +1205,6 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     Ok(Some(resp.status()))
 }
 
-/// Prompt the user to choose how to handle an existing gateway deployment.
-///
-/// Returns `true` to recreate (destroy and start fresh), `false` to reuse.
-fn prompt_existing_gateway(
-    name: &str,
-    info: &openshell_bootstrap::ExistingGatewayInfo,
-) -> Result<bool> {
-    let status = if info.container_running {
-        "running"
-    } else if info.container_exists {
-        "stopped"
-    } else {
-        "volume only"
-    };
-
-    eprintln!("• Existing gateway '{name}' detected ({status})");
-    if let Some(image) = &info.container_image {
-        eprintln!("  {} {}", "Image:".dimmed(), image);
-    }
-    eprintln!();
-
-    eprint!("Destroy and recreate gateway from scratch? [y/N] ");
-    std::io::stderr().flush().ok();
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .into_diagnostic()
-        .wrap_err("failed to read user input")?;
-
-    let choice = input.trim().to_lowercase();
-    Ok(choice == "y" || choice == "yes")
-}
-
 /// Deploy a gateway with the rich progress panel (interactive) or simple
 /// logging (non-interactive). Returns the [`GatewayHandle`] on success.
 ///
@@ -1354,58 +1320,65 @@ pub async fn gateway_admin_deploy(
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
+    // Build remote options once so we can reuse them for the existence check
+    // and the deploy options.
+    let remote_opts = remote.map(|dest| {
+        let mut opts = RemoteOptions::new(dest);
+        if let Some(key) = ssh_key {
+            opts = opts.with_ssh_key(key);
+        }
+        opts
+    });
+
+    // Check whether a gateway already exists. If so, prompt the user (unless
+    // --recreate was passed or we're in non-interactive mode).
+    let mut should_recreate = recreate;
+    if let Some(existing) =
+        openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
+    {
+        if !should_recreate {
+            let interactive = std::io::stderr().is_terminal();
+            if interactive {
+                let status = if existing.container_running {
+                    "running"
+                } else {
+                    "stopped"
+                };
+                eprintln!(
+                    "{} Gateway '{name}' already exists ({status}).",
+                    "!".yellow().bold()
+                );
+                should_recreate = Confirm::new()
+                    .with_prompt("Destroy and recreate it?")
+                    .default(false)
+                    .interact()
+                    .into_diagnostic()?;
+                if !should_recreate {
+                    eprintln!("Keeping existing gateway.");
+                    return Ok(());
+                }
+            } else {
+                // Non-interactive mode: reuse existing gateway silently.
+                eprintln!("Gateway '{name}' already exists, reusing.");
+                return Ok(());
+            }
+        }
+    }
+
     let mut options = DeployOptions::new(name)
         .with_port(port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
-        .with_gpu(gpu);
-    if let Some(dest) = remote {
-        let mut remote_opts = RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            remote_opts = remote_opts.with_ssh_key(key);
-        }
-        options = options.with_remote(remote_opts);
+        .with_gpu(gpu)
+        .with_recreate(should_recreate);
+    if let Some(opts) = remote_opts {
+        options = options.with_remote(opts);
     }
     if let Some(host) = gateway_host {
         options = options.with_gateway_host(host);
     }
     if let Some(token) = registry_token {
         options = options.with_registry_token(token);
-    }
-
-    let interactive = std::io::stderr().is_terminal();
-
-    // Check for existing gateway and prompt user if found.
-    // --recreate skips the prompt and always destroys.
-    {
-        let remote_opts = remote.map(|dest| {
-            let mut opts = RemoteOptions::new(dest);
-            if let Some(key) = ssh_key {
-                opts = opts.with_ssh_key(key);
-            }
-            opts
-        });
-        if let Some(info) =
-            openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-        {
-            let should_recreate = if recreate {
-                true
-            } else if interactive {
-                prompt_existing_gateway(name, &info)?
-            } else {
-                false // non-interactive without --recreate: silently reuse
-            };
-
-            if should_recreate {
-                eprintln!("• Destroying existing gateway...");
-                let handle =
-                    openshell_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
-                handle.destroy().await?;
-                eprintln!("{} Gateway destroyed, starting fresh.", "✓".green().bold());
-                eprintln!();
-            }
-            // If reusing, the deploy flow will handle stale node cleanup automatically
-        }
     }
 
     let handle = deploy_gateway_with_panel(options, name, location).await?;
@@ -1993,24 +1966,33 @@ pub async fn sandbox_create(
     // Track whether we have seen a non-Ready phase during the watch.
     let mut saw_non_ready = SandboxPhase::try_from(sandbox.phase) != Ok(SandboxPhase::Ready);
     let start_time = Instant::now();
-    let provision_timeout = Duration::from_secs(120);
+    let provision_timeout = Duration::from_secs(300);
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
-    while let Some(item) = stream.next().await {
-        // Check for timeout
-        if start_time.elapsed() > provision_timeout {
-            let timeout_message = provisioning_timeout_message(
-                provision_timeout.as_secs(),
-                requested_gpu,
-                last_condition_message.as_deref(),
-            );
-            if let Some(d) = display.as_mut() {
-                d.finish_error(&timeout_message);
+    loop {
+        // Compute remaining time so the timeout fires even when the stream
+        // produces no events (e.g. server-side producer died).
+        let remaining = provision_timeout.saturating_sub(start_time.elapsed());
+        let maybe_item = tokio::time::timeout(remaining, stream.next()).await;
+
+        let item = match maybe_item {
+            Ok(Some(item)) => item,
+            Ok(None) => break, // stream ended
+            Err(_elapsed) => {
+                // Timeout fired — the stream was idle for too long.
+                let timeout_message = provisioning_timeout_message(
+                    provision_timeout.as_secs(),
+                    requested_gpu,
+                    last_condition_message.as_deref(),
+                );
+                if let Some(d) = display.as_mut() {
+                    d.finish_error(&timeout_message);
+                }
+                println!();
+                return Err(miette::miette!(timeout_message));
             }
-            println!();
-            return Err(miette::miette!(timeout_message));
-        }
+        };
 
         let evt = item.into_diagnostic()?;
         match evt.payload {

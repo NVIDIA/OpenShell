@@ -139,6 +139,12 @@ const FAILURE_PATTERNS: &[FailurePattern] = &[
         match_mode: MatchMode::Any,
         diagnose: diagnose_node_pressure,
     },
+    // Missing sandbox supervisor binary
+    FailurePattern {
+        matchers: &["HEALTHCHECK_MISSING_SUPERVISOR"],
+        match_mode: MatchMode::Any,
+        diagnose: diagnose_missing_supervisor,
+    },
     // TLS/certificate issues
     FailurePattern {
         matchers: &[
@@ -336,6 +342,33 @@ fn diagnose_node_pressure(gateway_name: &str) -> GatewayFailureDiagnosis {
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway after freeing resources",
                 format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+            ),
+        ],
+        retryable: false,
+    }
+}
+
+fn diagnose_missing_supervisor(gateway_name: &str) -> GatewayFailureDiagnosis {
+    GatewayFailureDiagnosis {
+        summary: "Sandbox supervisor binary missing from cluster image".to_string(),
+        explanation: "The sandbox supervisor binary (/opt/openshell/bin/openshell-sandbox) \
+            was not found in the gateway container. This binary is side-loaded into every \
+            sandbox pod via a hostPath volume mount. Without it, all sandbox pods will \
+            crash immediately with \"no such file or directory\". This typically means the \
+            cluster image was built or published without the supervisor-builder stage."
+            .to_string(),
+        recovery_steps: vec![
+            RecoveryStep::with_command(
+                "Rebuild the cluster image with the supervisor binary included",
+                "mise run docker:build:cluster",
+            ),
+            RecoveryStep::with_command(
+                "Destroy and recreate the gateway with the updated image",
+                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+            ),
+            RecoveryStep::new(
+                "Or set OPENSHELL_CLUSTER_IMAGE to a cluster image version that includes \
+                the supervisor binary",
             ),
         ],
         retryable: false,

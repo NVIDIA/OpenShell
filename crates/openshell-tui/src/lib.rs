@@ -1256,7 +1256,7 @@ fn spawn_create_sandbox(app: &mut App, tx: mpsc::UnboundedSender<Event>) {
             let mut attempts = 0;
             let sandbox_id = loop {
                 attempts += 1;
-                if attempts > 60 {
+                if attempts > 150 {
                     let _ = tx.send(Event::CreateResult(Err(
                         "timed out waiting for sandbox to be ready".to_string(),
                     )));
