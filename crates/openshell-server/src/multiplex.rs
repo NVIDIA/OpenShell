@@ -15,7 +15,9 @@ use hyper_util::{
     rt::{TokioExecutor, TokioIo},
     server::conn::auto::Builder,
 };
-use openshell_core::proto::{inference_server::InferenceServer, open_shell_server::OpenShellServer};
+use openshell_core::proto::{
+    inference_server::InferenceServer, open_shell_server::OpenShellServer,
+};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

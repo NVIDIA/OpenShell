@@ -5,12 +5,12 @@
 
 use crate::tls::{TlsOptions, build_rustls_config, grpc_client, require_tls_materials};
 use miette::{IntoDiagnostic, Result, WrapErr};
+#[cfg(unix)]
+use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use openshell_core::forward::{
     find_ssh_forward_pid, resolve_ssh_gateway, shell_escape, write_forward_pid,
 };
 use openshell_core::proto::{CreateSshSessionRequest, GetSandboxRequest};
-#[cfg(unix)]
-use nix::sys::signal::{SaFlags, SigAction, SigHandler, SigSet, Signal, sigaction};
 use owo_colors::OwoColorize;
 use rustls::pki_types::ServerName;
 use std::fs;
