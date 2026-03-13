@@ -330,6 +330,13 @@ pub fn load_sandbox_policy(cli_path: Option<&str>) -> Result<Option<SandboxPolic
 /// supervisor probes this path before falling back to the restrictive default.
 pub const CONTAINER_POLICY_PATH: &str = "/etc/openshell/policy.yaml";
 
+/// Legacy path used before the navigator → openshell rename.
+///
+/// Existing community sandbox images still ship their policy at this path.
+/// The sandbox supervisor tries [`CONTAINER_POLICY_PATH`] first, then falls
+/// back to this legacy path for backward compatibility.
+pub const LEGACY_CONTAINER_POLICY_PATH: &str = "/etc/navigator/policy.yaml";
+
 /// Return a restrictive default policy suitable for sandboxes that have no
 /// explicit policy configured.
 ///
@@ -759,6 +766,11 @@ network_policies:
         assert_eq!(CONTAINER_POLICY_PATH, "/etc/openshell/policy.yaml");
     }
 
+    #[test]
+    fn legacy_container_policy_path_is_expected() {
+        assert_eq!(LEGACY_CONTAINER_POLICY_PATH, "/etc/navigator/policy.yaml");
+    }
+
     // ---- Policy validation tests ----
 
     #[test]
@@ -798,11 +810,9 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
-        assert!(
-            violations
-                .iter()
-                .all(|v| matches!(v, PolicyViolation::InvalidProcessIdentity { .. }))
-        );
+        assert!(violations
+            .iter()
+            .all(|v| matches!(v, PolicyViolation::InvalidProcessIdentity { .. })));
     }
 
     #[test]
@@ -820,11 +830,9 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::PathTraversal { .. }))
-        );
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::PathTraversal { .. })));
     }
 
     #[test]
@@ -836,11 +844,9 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::RelativePath { .. }))
-        );
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::RelativePath { .. })));
     }
 
     #[test]
@@ -852,11 +858,9 @@ network_policies:
             read_write: vec!["/".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. }))
-        );
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })));
     }
 
     #[test]
@@ -898,11 +902,9 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::TooManyPaths { .. }))
-        );
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::TooManyPaths { .. })));
     }
 
     #[test]
@@ -915,11 +917,9 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(
-            violations
-                .iter()
-                .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. }))
-        );
+        assert!(violations
+            .iter()
+            .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. })));
     }
 
     #[test]

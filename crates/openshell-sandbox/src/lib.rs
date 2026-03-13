@@ -1016,11 +1016,22 @@ async fn load_policy(
 }
 
 /// Try to discover a sandbox policy from the well-known disk path, falling
-/// back to the hardcoded restrictive default if no file is found.
+/// back to the legacy path, then to the hardcoded restrictive default.
 fn discover_policy_from_disk_or_default() -> openshell_core::proto::SandboxPolicy {
-    discover_policy_from_path(std::path::Path::new(
-        openshell_policy::CONTAINER_POLICY_PATH,
-    ))
+    let primary = std::path::Path::new(openshell_policy::CONTAINER_POLICY_PATH);
+    if primary.exists() {
+        return discover_policy_from_path(primary);
+    }
+    let legacy = std::path::Path::new(openshell_policy::LEGACY_CONTAINER_POLICY_PATH);
+    if legacy.exists() {
+        info!(
+            legacy_path = %legacy.display(),
+            new_path = %primary.display(),
+            "Policy found at legacy path; consider moving to the new path"
+        );
+        return discover_policy_from_path(legacy);
+    }
+    discover_policy_from_path(primary)
 }
 
 /// Try to read a sandbox policy YAML from `path`, falling back to the
