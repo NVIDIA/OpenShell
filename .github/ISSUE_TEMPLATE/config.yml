@@ -1,0 +1,14 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Have a question?
+    url: https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#agent-skills-for-contributors
+    about: >
+      Point your agent at the repo. It has skills for CLI usage, cluster
+      debugging, policy generation, and more. See CONTRIBUTING.md for the
+      full skills table.
+  - name: Security vulnerability?
+    url: https://github.com/NVIDIA/OpenShell/blob/main/SECURITY.md
+    about: >
+      Do not report security vulnerabilities through GitHub issues. Follow
+      the disclosure process in SECURITY.md — report through the NVIDIA PSIRT
+      web form or email psirt@nvidia.com.
