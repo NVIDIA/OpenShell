@@ -152,39 +152,68 @@ Default target is `main`. To target a different branch:
 gh pr create --base "release-1.0"
 ```
 
-## PR Description Guidelines
+## PR Description Format
 
-A good PR description includes:
+PR descriptions must follow the project's [PR template](.github/PULL_REQUEST_TEMPLATE.md) structure:
 
-### Summary
+```markdown
+## Summary
+<!-- 1-3 sentences: what this PR does and why -->
 
-Brief description of changes (2-3 bullet points).
+## Related Issue
+<!-- Fixes #NNN or Closes #NNN -->
 
-### Test Plan
+## Changes
+<!-- Bullet list of key changes -->
 
-How the changes were tested:
+## Testing
+<!-- What testing was done? -->
+- [ ] `mise run pre-commit` passes
+- [ ] Unit tests added/updated
+- [ ] E2E tests added/updated (if applicable)
 
-- Unit tests added/updated
-- Manual testing performed
-- Integration tests
+## Checklist
+- [ ] Follows Conventional Commits
+- [ ] Commits are signed off (DCO)
+- [ ] Architecture docs updated (if applicable)
+```
 
-### Related Issues
-
-Link to related issues using `Closes #123` or `Related to #456`.
+Populate the testing checklist based on what was actually run. Check boxes for steps that were completed.
 
 ## Example PR (Complete)
 
 ```bash
 gh pr create \
-  --title "feat(files): add pagination to dataset list endpoint" \
+  --title "feat(cli): add pagination to sandbox list" \
   --assignee "@me" \
-  --milestone "Platform 26.02" \
-  --body "Closes #456
-
+  --body "$(cat <<'EOF'
 ## Summary
-- Added \`offset\` and \`limit\` query parameters to GET /datasets
+
+Add `--limit` and `--offset` flags to `openshell sandbox list` for pagination.
+
+## Related Issue
+
+Closes #456
+
+## Changes
+
+- Added `offset` and `limit` query parameters to the sandbox list API call
 - Default limit is 20, max is 100
-- Response includes \`total_count\` field"
+- Response includes `total_count` field
+
+## Testing
+
+- [x] `mise run pre-commit` passes
+- [x] Unit tests added/updated
+- [ ] E2E tests added/updated (if applicable)
+
+## Checklist
+
+- [x] Follows Conventional Commits
+- [x] Commits are signed off (DCO)
+- [ ] Architecture docs updated (if applicable)
+EOF
+)"
 ```
 
 ## Useful Options
