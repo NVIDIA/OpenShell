@@ -25,7 +25,7 @@ fn extract_sandbox_name(output: &str) -> Option<String> {
 }
 
 /// Default timeout for waiting for a sandbox to become ready.
-const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(120);
+const SANDBOX_READY_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// RAII guard that deletes a sandbox on drop.
 ///
