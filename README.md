@@ -30,7 +30,7 @@ sh -c 'ARCH=$(uname -m); OS=$(uname -s); \
       && sudo install -m 755 openshell /usr/local/bin/openshell'
 ```
 
-Or use the install script from the repo which auto-detects your platform (Linux x86_64, Linux aarch64, macOS Apple Silicon):
+Or use the install script from the repository:
 
 ```bash
 ./install.sh
