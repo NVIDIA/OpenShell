@@ -1205,40 +1205,6 @@ async fn http_health_check(server: &str, tls: &TlsOptions) -> Result<Option<Stat
     Ok(Some(resp.status()))
 }
 
-/// Prompt the user to choose how to handle an existing gateway deployment.
-///
-/// Returns `true` to recreate (destroy and start fresh), `false` to reuse.
-fn prompt_existing_gateway(
-    name: &str,
-    info: &openshell_bootstrap::ExistingGatewayInfo,
-) -> Result<bool> {
-    let status = if info.container_running {
-        "running"
-    } else if info.container_exists {
-        "stopped"
-    } else {
-        "volume only"
-    };
-
-    eprintln!("• Existing gateway '{name}' detected ({status})");
-    if let Some(image) = &info.container_image {
-        eprintln!("  {} {}", "Image:".dimmed(), image);
-    }
-    eprintln!();
-
-    eprint!("Destroy and recreate gateway from scratch? [y/N] ");
-    std::io::stderr().flush().ok();
-
-    let mut input = String::new();
-    std::io::stdin()
-        .read_line(&mut input)
-        .into_diagnostic()
-        .wrap_err("failed to read user input")?;
-
-    let choice = input.trim().to_lowercase();
-    Ok(choice == "y" || choice == "yes")
-}
-
 /// Deploy a gateway with the rich progress panel (interactive) or simple
 /// logging (non-interactive). Returns the [`GatewayHandle`] on success.
 ///
@@ -1346,7 +1312,6 @@ pub async fn gateway_admin_deploy(
     ssh_key: Option<&str>,
     port: u16,
     gateway_host: Option<&str>,
-    recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
     registry_token: Option<&str>,
@@ -1373,41 +1338,9 @@ pub async fn gateway_admin_deploy(
         options = options.with_registry_token(token);
     }
 
-    let interactive = std::io::stderr().is_terminal();
-
-    // Check for existing gateway and prompt user if found.
-    // --recreate skips the prompt and always destroys.
-    {
-        let remote_opts = remote.map(|dest| {
-            let mut opts = RemoteOptions::new(dest);
-            if let Some(key) = ssh_key {
-                opts = opts.with_ssh_key(key);
-            }
-            opts
-        });
-        if let Some(info) =
-            openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-        {
-            let should_recreate = if recreate {
-                true
-            } else if interactive {
-                prompt_existing_gateway(name, &info)?
-            } else {
-                false // non-interactive without --recreate: silently reuse
-            };
-
-            if should_recreate {
-                eprintln!("• Destroying existing gateway...");
-                let handle =
-                    openshell_bootstrap::gateway_handle(name, remote_opts.as_ref()).await?;
-                handle.destroy().await?;
-                eprintln!("{} Gateway destroyed, starting fresh.", "✓".green().bold());
-                eprintln!();
-            }
-            // If reusing, the deploy flow will handle stale node cleanup automatically
-        }
-    }
-
+    // Teardown of any existing resources is handled inside
+    // deploy_gateway_with_logs(), so both `gateway start` and the
+    // auto-bootstrap path in `sandbox create` get the same cleanup.
     let handle = deploy_gateway_with_panel(options, name, location).await?;
 
     print_deploy_summary(name, &handle);
@@ -1997,20 +1930,29 @@ pub async fn sandbox_create(
     // Track whether we saw the gateway become ready (from log messages).
     let mut saw_gateway_ready = false;
 
-    while let Some(item) = stream.next().await {
-        // Check for timeout
-        if start_time.elapsed() > provision_timeout {
-            let timeout_message = provisioning_timeout_message(
-                provision_timeout.as_secs(),
-                requested_gpu,
-                last_condition_message.as_deref(),
-            );
-            if let Some(d) = display.as_mut() {
-                d.finish_error(&timeout_message);
+    loop {
+        // Compute remaining time so the timeout fires even when the stream
+        // produces no events (e.g. server-side producer died).
+        let remaining = provision_timeout.saturating_sub(start_time.elapsed());
+        let maybe_item = tokio::time::timeout(remaining, stream.next()).await;
+
+        let item = match maybe_item {
+            Ok(Some(item)) => item,
+            Ok(None) => break, // stream ended
+            Err(_elapsed) => {
+                // Timeout fired — the stream was idle for too long.
+                let timeout_message = provisioning_timeout_message(
+                    provision_timeout.as_secs(),
+                    requested_gpu,
+                    last_condition_message.as_deref(),
+                );
+                if let Some(d) = display.as_mut() {
+                    d.finish_error(&timeout_message);
+                }
+                println!();
+                return Err(miette::miette!(timeout_message));
             }
-            println!();
-            return Err(miette::miette!(timeout_message));
-        }
+        };
 
         let evt = item.into_diagnostic()?;
         match evt.payload {

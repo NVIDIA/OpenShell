@@ -1420,13 +1420,13 @@ async fn main() -> Result<()> {
                 registry_token,
                 gpu,
             } => {
+                let _ = recreate; // teardown is always performed by deploy
                 run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
                     ssh_key.as_deref(),
                     port,
                     gateway_host.as_deref(),
-                    recreate,
                     plaintext,
                     disable_gateway_auth,
                     registry_token.as_deref(),

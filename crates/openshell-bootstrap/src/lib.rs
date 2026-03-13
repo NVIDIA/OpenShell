@@ -30,7 +30,7 @@ use crate::constants::{
 };
 use crate::docker::{
     check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
+    ensure_image, ensure_volume, start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -256,6 +256,18 @@ where
         ),
     };
 
+    // Tear down any existing gateway resources (container, volume, image) so
+    // we always start from a clean state.  This is the single consolidated
+    // teardown point — both `gateway start` and the auto-bootstrap path in
+    // `sandbox create` flow through here.
+    if check_existing_gateway(&target_docker, &name)
+        .await?
+        .is_some()
+    {
+        log("[status] Removing existing gateway".to_string());
+        destroy_gateway_resources(&target_docker, &name).await?;
+    }
+
     // Ensure the image is available on the target Docker daemon
     if remote_opts.is_some() {
         log("[status] Downloading gateway".to_string());
@@ -280,7 +292,6 @@ where
 
     // All subsequent operations use the target Docker (remote or local)
     log("[status] Initializing environment".to_string());
-    ensure_network(&target_docker).await?;
     ensure_volume(&target_docker, &volume_name(&name)).await?;
 
     // Compute extra TLS SANs for remote deployments so the gateway and k3s
