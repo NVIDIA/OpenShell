@@ -224,43 +224,74 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
         },
         Screen::Sandbox => match app.focus {
             Focus::SandboxLogs => {
-                let filter_label = app.log_source_filter.label();
-                let autoscroll_label = if app.log_autoscroll {
-                    " Autoscroll"
+                if app.log_selection_anchor.is_some() {
+                    // Visual selection mode — reduced hint set.
+                    vec![
+                        Span::styled(" ", t.text),
+                        Span::styled("[j/k]", t.key_hint),
+                        Span::styled(" Extend", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[y]", t.key_hint),
+                        Span::styled(" Yank", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[g/G]", t.key_hint),
+                        Span::styled(" Top/Bottom", t.text),
+                        Span::styled("  |  ", t.border),
+                        Span::styled("[Esc]", t.muted),
+                        Span::styled(" Cancel", t.muted),
+                        Span::styled("  ", t.text),
+                        Span::styled("[q]", t.muted),
+                        Span::styled(" Quit", t.muted),
+                    ]
                 } else {
-                    " Follow"
-                };
-                let autoscroll_style = if app.log_autoscroll {
-                    t.status_ok
-                } else {
-                    t.text
-                };
-                vec![
-                    Span::styled(" ", t.text),
-                    Span::styled("[j/k]", t.key_hint),
-                    Span::styled(" Navigate", t.text),
-                    Span::styled("  ", t.text),
-                    Span::styled("[Enter]", t.key_hint),
-                    Span::styled(" Detail", t.text),
-                    Span::styled("  ", t.text),
-                    Span::styled("[g/G]", t.key_hint),
-                    Span::styled(" Top/Bottom", t.text),
-                    Span::styled("  ", t.text),
-                    Span::styled("[f]", t.key_hint),
-                    Span::styled(autoscroll_label, autoscroll_style),
-                    Span::styled("  ", t.text),
-                    Span::styled("[s]", t.key_hint),
-                    Span::styled(format!(" Source: {filter_label}"), t.text),
-                    Span::styled("  ", t.text),
-                    Span::styled("[r]", t.key_hint),
-                    Span::styled(" Rules", t.text),
-                    Span::styled("  |  ", t.border),
-                    Span::styled("[Esc]", t.muted),
-                    Span::styled(" Policy", t.muted),
-                    Span::styled("  ", t.text),
-                    Span::styled("[q]", t.muted),
-                    Span::styled(" Quit", t.muted),
-                ]
+                    // Normal log viewer mode.
+                    let filter_label = app.log_source_filter.label();
+                    let autoscroll_label = if app.log_autoscroll {
+                        " Autoscroll"
+                    } else {
+                        " Follow"
+                    };
+                    let autoscroll_style = if app.log_autoscroll {
+                        t.status_ok
+                    } else {
+                        t.text
+                    };
+                    vec![
+                        Span::styled(" ", t.text),
+                        Span::styled("[j/k]", t.key_hint),
+                        Span::styled(" Navigate", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[Enter]", t.key_hint),
+                        Span::styled(" Detail", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[g/G]", t.key_hint),
+                        Span::styled(" Top/Bottom", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[f]", t.key_hint),
+                        Span::styled(autoscroll_label, autoscroll_style),
+                        Span::styled("  ", t.text),
+                        Span::styled("[s]", t.key_hint),
+                        Span::styled(format!(" Source: {filter_label}"), t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[y]", t.key_hint),
+                        Span::styled(" Copy", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[Y]", t.key_hint),
+                        Span::styled(" Copy All", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[v]", t.key_hint),
+                        Span::styled(" Select", t.text),
+                        Span::styled("  ", t.text),
+                        Span::styled("[r]", t.key_hint),
+                        Span::styled(" Rules", t.text),
+                        Span::styled("  |  ", t.border),
+                        Span::styled("[Esc]", t.muted),
+                        Span::styled(" Policy", t.muted),
+                        Span::styled("  ", t.text),
+                        Span::styled("[q]", t.muted),
+                        Span::styled(" Quit", t.muted),
+                    ]
+                }
             }
             Focus::SandboxDraft => {
                 // Build state-aware action hints based on selected chunk.

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 mod app;
+mod clipboard;
 mod event;
 pub mod theme;
 mod ui;

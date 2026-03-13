@@ -16,6 +16,7 @@ openshell-bootstrap = { path = "../openshell-bootstrap" }
 openshell-policy = { path = "../openshell-policy" }
 openshell-providers = { path = "../openshell-providers" }
 
+base64 = { workspace = true }
 ratatui = { workspace = true }
 crossterm = { workspace = true }
 terminal-colorsaurus = { workspace = true }
