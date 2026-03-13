@@ -369,9 +369,6 @@ jobs:
           path: release/
           merge-multiple: true
 
-      - name: Stage install script
-        run: cp install.sh release/install.sh
-
       - name: Generate checksums
         run: |
           set -euo pipefail
@@ -389,49 +386,42 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OpenShell Latest Devel
+          name: OpenShell Development Build
           prerelease: true
           tag_name: devel
           target_commitish: ${{ github.sha }}
           body: |
-            This devel build is automatically built on every commit to main that passes CI.
+            This build is automatically built on every commit to main that passes CI.
 
             > **NOTE**: This is a development build, not a tagged release, and may be unstable.
 
             ### Quick install
 
+            Requires the [GitHub CLI (`gh`)](https://cli.github.com) to be installed and authenticated.
+
             ```bash
-            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/install.sh | sh
+            sh -c 'ARCH=$(uname -m); OS=$(uname -s); \
+                case "${OS}-${ARCH}" in \
+                  Linux-x86_64)  ASSET="openshell-x86_64-unknown-linux-musl.tar.gz" ;; \
+                  Linux-aarch64) ASSET="openshell-aarch64-unknown-linux-musl.tar.gz" ;; \
+                  Darwin-arm64)  ASSET="openshell-aarch64-apple-darwin.tar.gz" ;; \
+                  *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;; \
+                esac; \
+                gh release download devel --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
+                  | tar xz \
+                  && sudo install -m 755 openshell /usr/local/bin/openshell'
             ```
 
             ### Assets
 
             | File | Platform | Install |
             |------|----------|---------|
-            | `openshell-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-x86_64-unknown-linux-musl.tar.gz \| tar xz && sudo mv openshell /usr/local/bin/` |
-            | `openshell-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-unknown-linux-musl.tar.gz \| tar xz && sudo mv openshell /usr/local/bin/` |
-            | `openshell-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-apple-darwin.tar.gz \| tar xz && sudo mv openshell /usr/local/bin/` |
-            | `install.sh` | All platforms | `curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/install.sh \| sh` |
+            | `openshell-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-x86_64-unknown-linux-musl.tar.gz" -O - \| tar xz && sudo install -m 755 openshell /usr/local/bin/openshell` |
+            | `openshell-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-aarch64-unknown-linux-musl.tar.gz" -O - \| tar xz && sudo install -m 755 openshell /usr/local/bin/openshell` |
+            | `openshell-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-aarch64-apple-darwin.tar.gz" -O - \| tar xz && sudo install -m 755 openshell /usr/local/bin/openshell` |
             | `openshell-checksums-sha256.txt` | — | SHA256 checksums for all archives |
-
-            ### Manual install
-
-            ```bash
-            # Linux x86_64
-            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-x86_64-unknown-linux-musl.tar.gz | tar xz
-            sudo mv openshell /usr/local/bin/
-
-            # Linux aarch64
-            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-unknown-linux-musl.tar.gz | tar xz
-            sudo mv openshell /usr/local/bin/
-
-            # macOS (Apple Silicon)
-            curl -fsSL https://github.com/NVIDIA/OpenShell/releases/download/devel/openshell-aarch64-apple-darwin.tar.gz | tar xz
-            sudo mv openshell /usr/local/bin/
-            ```
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
             release/openshell-checksums-sha256.txt
-            release/install.sh

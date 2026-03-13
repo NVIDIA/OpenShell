@@ -4,8 +4,11 @@
 #
 # Install the OpenShell CLI binary.
 #
+# Requires the GitHub CLI (gh) to be installed and authenticated, since this
+# repository is internal and public HTTP download links are not available.
+#
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+#   ./install.sh
 #
 # Environment variables:
 #   OPENSHELL_VERSION    - Release tag to install (default: "devel")
@@ -57,24 +60,21 @@ get_target() {
   echo "$target"
 }
 
-download() {
-  url="$1" dest="$2"
-  if command -v curl >/dev/null 2>&1; then
-    curl -fsSL -o "$dest" "$url"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -qO "$dest" "$url"
-  else
-    error "curl or wget is required"
-  fi
-}
-
 verify_checksum() {
   archive="$1" checksums="$2" filename="$3"
+  expected="$(grep "$filename" "$checksums" | awk '{print $1}')"
 
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "$(grep "$filename" "$checksums" | awk '{print $1}')  $archive" | sha256sum -c --quiet 2>/dev/null
-  elif command -v shasum >/dev/null 2>&1; then
-    echo "$(grep "$filename" "$checksums" | awk '{print $1}')  $archive" | shasum -a 256 -c --quiet 2>/dev/null
+  if [ -z "$expected" ]; then
+    info "warning: no checksum found for $filename, skipping verification"
+    return 0
+  fi
+
+  # Prefer shasum (ships with macOS and most Linux); the macOS /sbin/sha256sum
+  # does not support -c / stdin check mode.
+  if command -v shasum >/dev/null 2>&1; then
+    echo "$expected  $archive" | shasum -a 256 -c --quiet 2>/dev/null
+  elif command -v sha256sum >/dev/null 2>&1; then
+    echo "$expected  $archive" | sha256sum -c --quiet 2>/dev/null
   else
     info "warning: sha256sum/shasum not found, skipping checksum verification"
     return 0
@@ -82,18 +82,25 @@ verify_checksum() {
 }
 
 main() {
+  command -v gh >/dev/null 2>&1 || error "the GitHub CLI (gh) is required; install it from https://cli.github.com"
+
   target="$(get_target)"
   filename="openshell-${target}.tar.gz"
-  base_url="https://github.com/${REPO}/releases/download/${VERSION}"
 
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' EXIT
 
   info "downloading ${filename} (${VERSION})..."
-  download "${base_url}/${filename}" "${tmpdir}/${filename}"
+  gh release download "${VERSION}" \
+    --repo "${REPO}" \
+    --pattern "${filename}" \
+    --output "${tmpdir}/${filename}"
 
   info "verifying checksum..."
-  download "${base_url}/openshell-checksums-sha256.txt" "${tmpdir}/checksums.txt"
+  gh release download "${VERSION}" \
+    --repo "${REPO}" \
+    --pattern "openshell-checksums-sha256.txt" \
+    --output "${tmpdir}/checksums.txt"
   if ! verify_checksum "${tmpdir}/${filename}" "${tmpdir}/checksums.txt" "$filename"; then
     error "checksum verification failed"
   fi
@@ -103,11 +110,11 @@ main() {
 
   info "installing to ${INSTALL_DIR}/openshell..."
   if [ -w "$INSTALL_DIR" ]; then
-    mv "${tmpdir}/openshell" "${INSTALL_DIR}/openshell"
+    install -m 755 "${tmpdir}/openshell" "${INSTALL_DIR}/openshell"
   else
-    sudo mv "${tmpdir}/openshell" "${INSTALL_DIR}/openshell"
+    info "sudo access is required to install to ${INSTALL_DIR}"
+    sudo install -m 755 "${tmpdir}/openshell" "${INSTALL_DIR}/openshell"
   fi
-  chmod +x "${INSTALL_DIR}/openshell"
 
   info "installed openshell $(${INSTALL_DIR}/openshell --version 2>/dev/null || echo "${VERSION}") to ${INSTALL_DIR}/openshell"
 }
