@@ -48,10 +48,10 @@ The sandbox container includes the following tools by default:
 
 ### See network policy in action
 
-Every sandbox starts in **default-deny** — all outbound traffic is blocked. You open access with a short YAML policy that the proxy enforces at the HTTP method and path level, without restarting anything.
+Every sandbox starts with **minimal outbound access**. You open additional access with a short YAML policy that the proxy enforces at the HTTP method and path level, without restarting anything.
 
 ```bash
-# 1. Create a sandbox (all outbound traffic denied by default)
+# 1. Create a sandbox (starts with minimal outbound access)
 openshell sandbox create --name demo --keep --no-auto-providers
 
 # 2. Inside the sandbox — blocked
