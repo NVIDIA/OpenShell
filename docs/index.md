@@ -165,10 +165,10 @@ Keep inference traffic private by routing API calls to local or self-hosted back
 :::
 
 :::{grid-item-card} Reference
-:link: reference/cli
+:link: reference/default-policy
 :link-type: doc
 
-CLI commands, policy schema, environment variables, and system architecture.
+Policy schema, environment variables, and system architecture.
 
 +++
 {bdg-secondary}`Reference`
@@ -222,7 +222,6 @@ inference/configure
 :caption: Reference
 :hidden:
 
-reference/cli
 reference/default-policy
 reference/policy-schema
 reference/support-matrix
