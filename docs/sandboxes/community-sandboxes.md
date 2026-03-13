@@ -87,16 +87,16 @@ The `--from` flag also accepts:
 
 Each community sandbox is a directory under `sandboxes/` in the
 [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) repository.
-At minimum, a sandbox directory must contain:
+At minimum, a sandbox directory must contain the following files:
 
-- `Dockerfile`: Defines the container image
-- `README.md`: Describes the sandbox and how to use it
+- `Dockerfile` that defines the container image.
+- `README.md` that describes the sandbox and how to use it.
 
-Optional files:
+You can also include the following optional files:
 
-- `policy.yaml`: Default policy applied when the sandbox launches
-- `skills/`: Agent skill definitions bundled with the sandbox
-- Startup scripts: Any scripts the Dockerfile or entrypoint invokes
+- `policy.yaml` that defines the default policy applied when the sandbox launches.
+- `skills/` that contains agent skill definitions bundled with the sandbox.
+- Startup scripts that are any scripts the Dockerfile or entrypoint invokes.
 
 To contribute, fork the repository, add your sandbox directory, and open a pull
 request. Refer to the repository's
