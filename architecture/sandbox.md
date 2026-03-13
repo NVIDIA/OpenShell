@@ -929,7 +929,7 @@ Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegat
 **Environment setup** (both Linux and non-Linux):
 - `OPENSHELL_SANDBOX=1` (always set)
 - Provider credentials (from `GetSandboxProviderEnvironment` RPC)
-- Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core), `NODE_USE_ENV_PROXY=1` (required for Node.js built-in `fetch`/`http` clients to honor proxy env vars)
+- Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `NO_PROXY=127.0.0.1,localhost,::1` for localhost bypass, `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core), `no_proxy=127.0.0.1,localhost,::1`, `NODE_USE_ENV_PROXY=1` (required for Node.js built-in `fetch`/`http` clients to honor proxy env vars)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
 
 **Pre-exec closure** (runs in child after fork, before exec -- async-signal-safe):

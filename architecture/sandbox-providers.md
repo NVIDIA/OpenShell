@@ -277,8 +277,9 @@ inherited environment without clearing it. The spawn path also explicitly remove
 `NEMOCLAW_SSH_HANDSHAKE_SECRET` so the handshake secret does not leak into the agent
 entrypoint process.
 
-After provider env vars, proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, etc.)
-are also set when `NetworkMode` is `Proxy`. The child is then launched with namespace
+After provider env vars, proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
+`NO_PROXY=127.0.0.1,localhost,::1`, lowercase variants, etc.) are also set when
+`NetworkMode` is `Proxy`. The child is then launched with namespace
 isolation, privilege dropping, seccomp, and Landlock restrictions via `pre_exec`.
 
 **2. SSH shell sessions** (`crates/openshell-sandbox/src/ssh.rs`):
