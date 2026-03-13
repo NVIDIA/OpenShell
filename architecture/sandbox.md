@@ -929,7 +929,7 @@ Wraps `tokio::process::Child` + PID. Platform-specific `spawn()` methods delegat
 **Environment setup** (both Linux and non-Linux):
 - `OPENSHELL_SANDBOX=1` (always set)
 - Provider credentials (from `GetSandboxProviderEnvironment` RPC)
-- Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core)
+- Proxy URLs: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (uppercase for curl/wget), `http_proxy`, `https_proxy`, `grpc_proxy` (lowercase for gRPC C-core), `NODE_USE_ENV_PROXY=1` (required for Node.js built-in `fetch`/`http` clients to honor proxy env vars)
 - TLS trust store: `NODE_EXTRA_CA_CERTS` (standalone CA cert), `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (combined bundle)
 
 **Pre-exec closure** (runs in child after fork, before exec -- async-signal-safe):
@@ -1057,6 +1057,7 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 | `OPENSHELL_SANDBOX` | Always `"1"` -- signals the process is sandboxed |
 | `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` | Proxy URL (uppercase, for curl/wget) |
 | `http_proxy` / `https_proxy` / `grpc_proxy` | Proxy URL (lowercase, for gRPC C-core) |
+| `NODE_USE_ENV_PROXY` | Set to `1` so Node.js built-in `fetch`/`http` clients honor proxy env vars |
 | `NODE_EXTRA_CA_CERTS` | Path to sandbox CA cert PEM (Node.js, additive) |
 | `SSL_CERT_FILE` | Combined CA bundle path (OpenSSL/Python/Go) |
 | `REQUESTS_CA_BUNDLE` | Combined CA bundle path (Python requests) |

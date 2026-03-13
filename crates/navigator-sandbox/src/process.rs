@@ -3,6 +3,7 @@
 
 //! Process management and signal handling.
 
+use crate::child_env;
 use crate::policy::{NetworkMode, SandboxPolicy};
 use crate::sandbox;
 #[cfg(target_os = "linux")]
@@ -135,29 +136,22 @@ impl ProcessHandle {
                 let proxy_url = format!("http://10.200.0.1:{port}");
                 // Both uppercase and lowercase variants: curl/wget use uppercase,
                 // gRPC C-core (libgrpc) checks lowercase http_proxy/https_proxy.
-                cmd.env("ALL_PROXY", &proxy_url)
-                    .env("HTTP_PROXY", &proxy_url)
-                    .env("HTTPS_PROXY", &proxy_url)
-                    .env("http_proxy", &proxy_url)
-                    .env("https_proxy", &proxy_url)
-                    .env("grpc_proxy", &proxy_url);
+                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
+                    cmd.env(key, value);
+                }
             } else if let Some(http_addr) = proxy.http_addr {
                 let proxy_url = format!("http://{http_addr}");
-                cmd.env("ALL_PROXY", &proxy_url)
-                    .env("HTTP_PROXY", &proxy_url)
-                    .env("HTTPS_PROXY", &proxy_url)
-                    .env("http_proxy", &proxy_url)
-                    .env("https_proxy", &proxy_url)
-                    .env("grpc_proxy", &proxy_url);
+                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
+                    cmd.env(key, value);
+                }
             }
         }
 
         // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
-            cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path) // Node.js (additive)
-                .env("SSL_CERT_FILE", combined_bundle_path) // OpenSSL/Python/Go
-                .env("REQUESTS_CA_BUNDLE", combined_bundle_path) // Python requests
-                .env("CURL_CA_BUNDLE", combined_bundle_path); // curl/libcurl
+            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+                cmd.env(key, value);
+            }
         }
 
         // Set up process group for signal handling (non-interactive mode only).
@@ -240,18 +234,17 @@ impl ProcessHandle {
             })?;
             if let Some(http_addr) = proxy.http_addr {
                 let proxy_url = format!("http://{http_addr}");
-                cmd.env("ALL_PROXY", &proxy_url)
-                    .env("HTTP_PROXY", &proxy_url)
-                    .env("HTTPS_PROXY", &proxy_url);
+                for (key, value) in child_env::proxy_env_vars(&proxy_url) {
+                    cmd.env(key, value);
+                }
             }
         }
 
         // Set TLS trust store env vars so sandbox processes trust the ephemeral CA
         if let Some((ca_cert_path, combined_bundle_path)) = ca_paths {
-            cmd.env("NODE_EXTRA_CA_CERTS", ca_cert_path)
-                .env("SSL_CERT_FILE", combined_bundle_path)
-                .env("REQUESTS_CA_BUNDLE", combined_bundle_path)
-                .env("CURL_CA_BUNDLE", combined_bundle_path);
+            for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
+                cmd.env(key, value);
+            }
         }
 
         // Set up process group for signal handling (non-interactive mode only).

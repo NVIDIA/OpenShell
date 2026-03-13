@@ -5,6 +5,7 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+mod child_env;
 pub mod denial_aggregator;
 mod grpc_client;
 mod identity;
@@ -339,8 +340,8 @@ pub async fn run_sandbox(
     // SSH shell processes need both to enforce network policy:
     // - netns_fd: enter the network namespace via setns() so all traffic
     //   goes through the veth pair (hard enforcement, non-bypassable)
-    // - proxy_url: set HTTP_PROXY/HTTPS_PROXY/ALL_PROXY env vars so
-    //   cooperative tools (curl, etc.) route through the CONNECT proxy
+    // - proxy_url: set proxy env vars so cooperative tools route through the
+    //   CONNECT proxy; this also opts Node.js into honoring those vars
     #[cfg(target_os = "linux")]
     let ssh_netns_fd = netns.as_ref().and_then(NetworkNamespace::ns_fd);
 
