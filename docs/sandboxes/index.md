@@ -27,7 +27,7 @@ content:
 
 # About Sandboxes
 
-An OpenShell sandbox is a safe, private execution environment for an AI agent. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+Every OpenShell deployment starts with a **gateway**, the control plane that manages sandboxes, providers, and policies. A **sandbox** is a safe, private execution environment for an AI agent, created using a gateway. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
 
 ## Sandbox Lifecycle
 

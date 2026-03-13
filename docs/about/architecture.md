@@ -26,7 +26,7 @@ content:
 
 # How OpenShell Works
 
-OpenShell runs as a [K3s](https://k3s.io/) Kubernetes cluster inside a Docker container. Each sandbox is an isolated Kubernetes pod managed through the gateway. Four components work together to keep agents secure.
+OpenShell runs inside a Docker container. Each sandbox is an isolated environment managed through the gateway. Four components work together to keep agents secure.
 
 ```{figure} architecture.svg
 :alt: OpenShell architecture diagram showing the component layout
@@ -61,18 +61,20 @@ For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and
 
 ## Deployment Modes
 
-OpenShell can run locally or on a remote host. The architecture is identical in both cases — only the Docker container location changes.
+OpenShell can run locally, on a remote host, or behind a cloud proxy. The architecture is identical in all cases — only the Docker container location and authentication mode change.
 
-- **Local**: the k3s cluster runs inside Docker on your workstation. The CLI provisions it automatically on first use.
-- **Remote**: the cluster runs on a remote host. Deploy with `openshell gateway start --remote user@host`. For example, connect to your DGX Spark.
-  ```console
-  $ openshell gateway start --remote <username>@<spark-ssid>.local
-  $ openshell status
-  ```
+| Mode | Description | Command |
+|---|---|---|
+| **Local** | The gateway runs inside Docker on your workstation. The CLI provisions it automatically on first use. | `openshell gateway start` |
+| **Remote** | The gateway runs on a remote host via SSH. Only Docker is required on the remote machine. | `openshell gateway start --remote user@host` |
+| **Cloud** | A gateway already running behind a reverse proxy (e.g. Cloudflare Access). Register and authenticate via browser. | `openshell gateway add https://gateway.example.com` |
+
+You can register multiple gateways and switch between them with `openshell gateway select`. For the full deployment and management workflow, refer to the [Gateways](../sandboxes/gateways.md) section.
 
 ## Next Steps
 
 Continue with one of the following:
 
+- To deploy or register a gateway, refer to [Gateways](../sandboxes/gateways.md).
 - To create your first sandbox, refer to the [Quickstart](../get-started/quickstart.md).
 - To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](../sandboxes/index.md).

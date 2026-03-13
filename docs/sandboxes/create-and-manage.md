@@ -1,12 +1,13 @@
 ---
 title:
-  page: Create and Manage Sandboxes
+  page: Create and Manage
   nav: Create and Manage
-description: Create, inspect, connect to, monitor, transfer files, and delete OpenShell sandboxes.
+description: Set up gateways, create sandboxes, and manage the full sandbox lifecycle.
 topics:
 - Generative AI
 - Cybersecurity
 tags:
+- Gateway
 - Sandboxing
 - AI Agents
 - Sandbox Management
@@ -24,15 +25,76 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Create and Manage Sandboxes
+# Create and Manage
 
-This page walks you through the full sandbox lifecycle: creating, inspecting, connecting to, monitoring, and deleting sandboxes. For background on what sandboxes are and how the runtime works, refer to [About Sandboxes](index.md).
+This page covers setting up gateways, creating sandboxes, and managing both. For background on what sandboxes are and how isolation works, refer to [About Sandboxes](index.md).
 
 :::{warning}
-Docker must be running before you create a sandbox. If it is not, the CLI
+Docker must be running before you create a gateway or sandbox. If it is not, the CLI
 returns a connection-refused error (`os error 61`) without explaining
 the cause. Start Docker and try again.
 :::
+
+## Set Up a Gateway
+
+The gateway is the control plane for OpenShell. Every sandbox is created using a gateway. If you run `openshell sandbox create` without one, the CLI auto-bootstraps a local gateway. To run sandboxes on a remote machine or a cloud-hosted gateway, set up the gateway first. For details on how authentication and credentials work, refer to {doc}`../reference/gateway-auth`.
+
+### Deploy a local gateway
+
+```console
+$ openshell gateway start
+```
+
+The gateway becomes reachable at `https://127.0.0.1:8080`. To use a different port: `openshell gateway start --port 9090`.
+
+### Deploy a remote gateway
+
+Deploy to a remote machine over SSH. The only dependency on the remote host is Docker.
+
+```console
+$ openshell gateway start --remote user@hostname
+```
+
+:::{note}
+For DGX Spark, use your Spark's mDNS hostname:
+
+```console
+$ openshell gateway start --remote <username>@<spark-ssid>.local
+```
+:::
+
+### Register an existing gateway
+
+Use `openshell gateway add` to register a gateway that is already running.
+
+```console
+$ openshell gateway add https://gateway.example.com                        # cloud (browser login)
+$ openshell gateway add https://remote-host:8080 --remote user@remote-host # remote
+$ openshell gateway add ssh://user@remote-host:8080                        # remote (ssh:// shorthand)
+$ openshell gateway add https://127.0.0.1:8080 --local                     # local
+```
+
+If a cloud gateway token expires, re-authenticate with `openshell gateway login`.
+
+### Manage multiple gateways
+
+One gateway is always the **active gateway**. All CLI commands target it by default.
+
+```console
+$ openshell gateway select                     # list all gateways
+$ openshell gateway select my-remote-cluster   # switch the active gateway
+$ openshell status -g my-other-cluster         # override for a single command
+```
+
+### Stop and destroy gateways
+
+```console
+$ openshell gateway stop                       # preserve state for later restart
+$ openshell gateway destroy                    # permanently remove all state
+$ openshell gateway start --recreate           # destroy and re-deploy from scratch
+```
+
+For cloud gateways, `gateway destroy` removes only the local registration. It does not affect the remote deployment.
 
 ## Create a Sandbox
 
@@ -42,16 +104,23 @@ Run a single command to create a sandbox and launch your agent:
 $ openshell sandbox create -- claude
 ```
 
-If you have an existing gateway, the sandbox is created in it. Otherwise, a gateway is created automatically.
+If no gateway is running, the CLI auto-bootstraps a local gateway before creating the sandbox.
 
-To request GPU resources explicitly, add `--gpu`:
+To request GPU resources, add `--gpu`:
 
 ```console
 $ openshell sandbox create --gpu -- claude
 ```
 
-If no gateway is running, the auto-bootstrap path starts a GPU-enabled gateway first.
+Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
 
+```console
+$ openshell sandbox create --from openclaw
+$ openshell sandbox create --from ./my-sandbox-dir
+$ openshell sandbox create --from my-registry.example.com/my-image:latest
+```
+
+The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
 
 A fully specified creation command might look like:
 
@@ -65,33 +134,29 @@ $ openshell sandbox create \
 ```
 
 :::{tip}
-Sandboxes created with `openshell sandbox create` stay running by default after
-the initial command or shell exits. Use `--no-keep` when you want the sandbox
-deleted automatically instead.
+Sandboxes stay running by default after the initial command or shell exits. Use `--no-keep` when you want the sandbox deleted automatically instead.
 :::
 
-## Create from a Community Sandbox or Custom Image
+## Connect to a Sandbox
 
-Use `--from` to create a sandbox from a pre-built community package, a local directory, or a container image:
-
-```console
-$ openshell sandbox create --from openclaw
-```
-
-The CLI resolves the name against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
-
-You can also point `--from` at a local directory or a container image reference:
+Open an SSH session into a running sandbox:
 
 ```console
-$ openshell sandbox create --from ./my-sandbox-dir
-$ openshell sandbox create --from my-registry.example.com/my-image:latest
+$ openshell sandbox connect my-sandbox
 ```
 
-Images whose final name component contains `gpu` also trigger GPU sandbox requests automatically. For example, `--from nvidia-gpu` behaves like a GPU sandbox request even without `--gpu`.
+Launch VS Code or Cursor directly into the sandbox workspace:
 
-## List and Inspect Sandboxes
+```console
+$ openshell sandbox create --editor vscode --name my-sandbox
+$ openshell sandbox connect my-sandbox --editor cursor
+```
 
-Check the status of your sandboxes and retrieve detailed information about individual ones.
+When `--editor` is used, OpenShell keeps the sandbox alive and installs an
+OpenShell-managed SSH include file instead of cluttering your main
+`~/.ssh/config` with generated host blocks.
+
+## Monitor and Debug
 
 List all sandboxes:
 
@@ -105,42 +170,11 @@ Get detailed information about a specific sandbox:
 $ openshell sandbox get my-sandbox
 ```
 
-## Connect to a Sandbox
-
-Access a running sandbox through an interactive SSH session or VS Code Remote-SSH.
-
-### Interactive SSH
-
-Open an SSH session into a running sandbox:
-
-```console
-$ openshell sandbox connect my-sandbox
-```
-
-### Open in a remote editor
-
-Launch VS Code or Cursor directly into the sandbox workspace:
-
-```console
-$ openshell sandbox create --editor vscode --name my-sandbox
-$ openshell sandbox connect my-sandbox --editor cursor
-```
-
-When `--editor` is used, OpenShell keeps the sandbox alive and installs an
-OpenShell-managed SSH include file instead of cluttering your main
-`~/.ssh/config` with generated host blocks.
-
-## View Logs
-
-Stream and filter sandbox logs to monitor agent activity and diagnose policy decisions.
-
-Stream sandbox logs:
+Stream sandbox logs to monitor agent activity and diagnose policy decisions:
 
 ```console
 $ openshell logs my-sandbox
 ```
-
-Use flags to filter and follow output:
 
 | Flag | Purpose | Example |
 |---|---|---|
@@ -149,25 +183,15 @@ Use flags to filter and follow output:
 | `--level` | Filter by severity | `--level warn` |
 | `--since` | Show logs from a time window | `--since 5m` |
 
-## Monitor Your Sandbox
-
-OpenShell Terminal is a real-time dashboard that combines sandbox status and live logs in a single view.
+OpenShell Terminal combines sandbox status and live logs in a single real-time dashboard:
 
 ```console
 $ openshell term
 ```
 
-The dashboard shows the following information.
-
-- **Sandbox status**: Name, phase, image, attached providers, age, and active port forwards.
-- **Live log stream**: Omutbound connections, policy decisions, and inference interceptions as they happen. Logs are labeled by source: `sandbox` (proxy and policy events) or `gateway` (lifecycle events).
-
-Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy — refer to {doc}`policies` for the workflow.
-
+Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy. Refer to {doc}`policies` for the workflow.
 
 ## Transfer Files
-
-Transfer files between your host machine and a running sandbox.
 
 Upload files from your host into the sandbox:
 
@@ -188,23 +212,14 @@ You can also upload files at creation time with the `--upload` flag on
 
 ## Delete Sandboxes
 
-Remove sandboxes when they are no longer needed. Deleting a sandbox stops all processes, releases cluster resources, and purges injected credentials.
-
-Delete a sandbox by name:
+Deleting a sandbox stops all processes, releases resources, and purges injected credentials.
 
 ```console
 $ openshell sandbox delete my-sandbox
-```
-
-Delete all sandboxes in the active gateway:
-
-```console
 $ openshell sandbox delete --all
 ```
 
 ## Next Steps
-
-Explore related topics:
 
 - To follow a complete end-to-end example, refer to the {doc}`/tutorials/github-sandbox` tutorial.
 - To supply API keys or tokens, refer to {doc}`providers`.

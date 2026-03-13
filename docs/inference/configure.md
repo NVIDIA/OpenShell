@@ -149,7 +149,7 @@ curl https://inference.local/v1/responses \
 A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
 
 :::{note}
-- **Gateway-scoped** — every sandbox on the active gateway sees the same `inference.local` backend.
+- **Gateway-scoped**: every sandbox using the active gateway sees the same `inference.local` backend.
 - **HTTPS only** — `inference.local` is intercepted only for HTTPS traffic.
 :::
 
