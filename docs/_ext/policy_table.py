@@ -5,7 +5,7 @@
 
 Usage in MyST markdown::
 
-    ```{policy-table} deploy/docker/sandbox/dev-sandbox-policy.yaml
+    ```{policy-table} path/to/sandbox-policy.yaml
     ```
 
 The directive reads the YAML relative to the repo root and emits:

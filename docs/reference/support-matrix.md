@@ -1,4 +1,3 @@
-
 <!--
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
@@ -12,67 +11,53 @@ This page lists the platform, software, runtime, and kernel requirements for run
 
 OpenShell publishes multi-architecture container images for `linux/amd64` and `linux/arm64`. The CLI is supported on the following host platforms:
 
-| Platform | Architecture | Status |
-|---|---|---|
-| Linux (Debian/Ubuntu) | x86_64 (amd64) | Supported |
-| Linux (Debian/Ubuntu) | aarch64 (arm64) | Supported |
-| macOS (Docker Desktop) | Apple Silicon (arm64) | Supported |
-| macOS (Docker Desktop) | Intel (amd64) | Supported |
-| Windows (WSL 2 + Docker Desktop) | x86_64 | Untested |
+| Platform                         | Architecture          | Status    |
+| -------------------------------- | --------------------- | --------- |
+| Linux (Debian/Ubuntu)            | x86_64 (amd64)        | Supported |
+| Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
+| macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
+| Windows (WSL 2 + Docker Desktop) | x86_64                | Untested  |
 
 ## Software Prerequisites
 
 The following software must be installed on the host before using the OpenShell CLI:
 
-| Component | Minimum Version | Notes |
-|---|---|---|
-| Python | 3.12 | Python 3.12 and 3.13 are supported. |
-| [uv](https://docs.astral.sh/uv/) | 0.9 | Used to install the CLI (`uv pip install openshell`). |
-| Docker Desktop or Docker Engine | — | Must be running before any `openshell` command. No minimum version is enforced. |
+| Component                       | Minimum Version | Notes                                           |
+| ------------------------------- | --------------- | ----------------------------------------------- |
+| Docker Desktop or Docker Engine | 28.04           | Must be running before any `openshell` command. |
 
 ## Sandbox Runtime Versions
 
-The base sandbox container image ships the following components. These versions apply to sandboxes created with the default image (`ghcr.io/nvidia/openshell/sandbox`).
-
-| Component | Version |
-|---|---|
-| Base OS | Debian Bookworm |
-| Python | 3.12.13 |
-| Node.js | 22.22.1 |
-| npm | 11.11.0 |
-| uv | 0.10.8 |
-| Claude Code | Latest (installed at image build time) |
-| OpenCode | 1.2.18 |
-| Codex | 0.111.0 |
+Sandbox container images are maintained in the [openshell-community](https://github.com/nvidia/openshell-community) repository. Refer to that repository for the current list of installed components and their versions.
 
 ## Container Images
 
-OpenShell uses several container images that are pulled automatically during gateway startup and sandbox creation. All images are published for `linux/amd64` and `linux/arm64`.
+OpenShell publishes two container images. Both are published for `linux/amd64` and `linux/arm64`.
 
-| Image | Registry | Reference | Pulled When |
-|---|---|---|---|
-| Cluster | ghcr.io | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start` |
-| Gateway | ghcr.io | `ghcr.io/nvidia/openshell/gateway:latest` | Cluster startup (via Helm chart) |
-| Sandbox | ghcr.io | `ghcr.io/nvidia/openshell/sandbox:latest` | First sandbox creation (via Helm chart) |
-| Community sandboxes | GHCR | `ghcr.io/nvidia/openshell-community/sandboxes/{name}:latest` | `openshell sandbox create --from <name>` |
+| Image   | Reference                                 | Pulled When                      |
+| ------- | ----------------------------------------- | -------------------------------- |
+| Cluster | `ghcr.io/nvidia/openshell/cluster:latest` | `openshell gateway start`        |
+| Gateway | `ghcr.io/nvidia/openshell/gateway:latest` | Cluster startup (via Helm chart) |
 
-The cluster image is based on `rancher/k3s:v1.35.2-k3s1` and bundles the Helm charts and Kubernetes manifests required to bootstrap the control plane. The server and sandbox images are pulled separately at runtime.
+The cluster image bundles the Helm charts, Kubernetes manifests, and the `navigator-sandbox` supervisor binary required to bootstrap the control plane. The supervisor binary is side-loaded into sandbox pods at runtime via a read-only host volume mount. The gateway image is pulled at cluster startup and runs the API server.
+
+Sandbox images are maintained separately in the [openshell-community](https://github.com/nvidia/openshell-community) repository.
 
 To override the default image references, set the following environment variables:
 
-| Variable | Purpose |
-|---|---|
-| `OPENSHELL_CLUSTER_IMAGE` | Override the cluster image reference. |
+| Variable                       | Purpose                                             |
+| ------------------------------ | --------------------------------------------------- |
+| `OPENSHELL_CLUSTER_IMAGE`      | Override the cluster image reference.               |
 | `OPENSHELL_COMMUNITY_REGISTRY` | Override the registry for community sandbox images. |
 
 ## Kernel Requirements
 
 OpenShell enforces sandbox isolation through two Linux kernel security modules:
 
-| Module | Requirement | Details |
-|---|---|---|
+| Module                                                         | Requirement | Details                                                                                                                                                                                                                                          |
+| -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Recommended | Enforces filesystem access restrictions at the kernel level. The `best_effort` compatibility mode uses the highest Landlock ABI the host kernel supports. The `hard_requirement` mode fails sandbox creation if the required ABI is unavailable. |
-| seccomp | Required | Filters dangerous system calls. Available on all modern Linux kernels (3.17+). |
+| seccomp                                                        | Required    | Filters dangerous system calls. Available on all modern Linux kernels (3.17+).                                                                                                                                                                   |
 
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 

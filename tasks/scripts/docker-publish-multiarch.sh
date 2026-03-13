@@ -136,52 +136,38 @@ fi
 
 # ---------------------------------------------------------------------------
 # Resolve Dockerfile path for a component.
-# Components with a subdirectory layout (e.g. deploy/docker/sandbox/) use
-# Dockerfile.base from that subdirectory; others use the flat
-# deploy/docker/Dockerfile.<component> layout.
 # ---------------------------------------------------------------------------
 resolve_dockerfile() {
   local comp="$1"
-  local comp_dir="deploy/docker/${comp}"
-  if [[ -d "${comp_dir}" ]]; then
-    echo "${comp_dir}/Dockerfile.base"
-  else
-    echo "deploy/docker/Dockerfile.${comp}"
-  fi
+  echo "deploy/docker/Dockerfile.${comp}"
 }
 
 # ---------------------------------------------------------------------------
-# Step 1: Build and push component images as multi-arch manifests.
-# These use cross-compilation in the Dockerfile (BUILDPLATFORM != TARGETPLATFORM)
+# Step 1: Build and push the gateway image as a multi-arch manifest.
+# Uses cross-compilation in the Dockerfile (BUILDPLATFORM != TARGETPLATFORM)
 # so Rust compiles natively and only the final stage runs on the target arch.
+# Sandbox images are maintained in the community repo and not built here.
 # ---------------------------------------------------------------------------
-echo "Building multi-arch component images..."
+echo "Building multi-arch gateway image..."
 LOCK_HASH=$(sha256_16 Cargo.lock)
-for component in sandbox gateway; do
-  echo "Building ${IMAGE_PREFIX}${component} for ${PLATFORMS}..."
-  BUILD_ARGS=""
-  if [ "$component" = "sandbox" ]; then
-    BUILD_ARGS="--build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-release}"
-  fi
-  BUILD_ARGS="${BUILD_ARGS} --build-arg OPENSHELL_CARGO_VERSION=${CARGO_VERSION}"
-  if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
-    BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
-  fi
-  DOCKERFILE=$(resolve_dockerfile "${component}")
-  RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${DOCKERFILE}")}
-  CACHE_SCOPE_INPUT="v1|${component}|base|${LOCK_HASH}|${RUST_SCOPE}"
-  CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
-  BUILD_ARGS="${BUILD_ARGS} --build-arg CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
-  FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}${component}"
-  docker buildx build \
-    --platform "${PLATFORMS}" \
-    -f "${DOCKERFILE}" \
-    -t "${FULL_IMAGE}:${IMAGE_TAG}" \
-    ${EXTRA_BUILD_FLAGS} \
-    ${BUILD_ARGS} \
-    --push \
-    .
-done
+GATEWAY_DOCKERFILE=$(resolve_dockerfile "gateway")
+BUILD_ARGS="--build-arg OPENSHELL_CARGO_VERSION=${CARGO_VERSION}"
+if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
+  BUILD_ARGS="${BUILD_ARGS} --build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
+fi
+RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${GATEWAY_DOCKERFILE}")}
+CACHE_SCOPE_INPUT="v1|gateway|base|${LOCK_HASH}|${RUST_SCOPE}"
+CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "${CACHE_SCOPE_INPUT}" | sha256_16_stdin)
+BUILD_ARGS="${BUILD_ARGS} --build-arg CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
+FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX}gateway"
+docker buildx build \
+  --platform "${PLATFORMS}" \
+  -f "${GATEWAY_DOCKERFILE}" \
+  -t "${FULL_IMAGE}:${IMAGE_TAG}" \
+  ${EXTRA_BUILD_FLAGS} \
+  ${BUILD_ARGS} \
+  --push \
+  .
 
 # ---------------------------------------------------------------------------
 # Step 2: Package helm charts (architecture-independent)
@@ -192,17 +178,28 @@ helm package deploy/helm/navigator -d deploy/docker/.build/charts/
 
 # ---------------------------------------------------------------------------
 # Step 3: Build and push multi-arch cluster image.
-# Component images are no longer bundled — they are pulled at runtime via
-# the distribution registry; credentials are injected at deploy time.
+# The cluster image includes the supervisor binary (built from Rust source)
+# and k3s. Gateway images are pulled at runtime from the registry; sandbox
+# images are pulled from the community registry.
 # ---------------------------------------------------------------------------
 echo ""
 echo "Building multi-arch cluster image..."
+CLUSTER_DOCKERFILE="deploy/docker/Dockerfile.cluster"
+CLUSTER_RUST_SCOPE=${RUST_TOOLCHAIN_SCOPE:-$(detect_rust_scope "${CLUSTER_DOCKERFILE}")}
+CLUSTER_CACHE_SCOPE_INPUT="v1|cluster|base|${LOCK_HASH}|${CLUSTER_RUST_SCOPE}"
+CLUSTER_CARGO_SCOPE=$(printf '%s' "${CLUSTER_CACHE_SCOPE_INPUT}" | sha256_16_stdin)
+CLUSTER_BUILD_ARGS=""
+if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
+  CLUSTER_BUILD_ARGS="--build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
+fi
 CLUSTER_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster"
 docker buildx build \
   --platform "${PLATFORMS}" \
-  -f deploy/docker/Dockerfile.cluster \
+  -f "${CLUSTER_DOCKERFILE}" \
   -t "${CLUSTER_IMAGE}:${IMAGE_TAG}" \
   ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CLUSTER_CARGO_SCOPE}" \
+  ${CLUSTER_BUILD_ARGS} \
   ${EXTRA_BUILD_FLAGS} \
   --push \
   .
@@ -218,7 +215,7 @@ if [ "$TAG_LATEST" = true ]; then
 fi
 
 if [ ${#TAGS_TO_APPLY[@]} -gt 0 ]; then
-  for component in sandbox gateway cluster; do
+  for component in gateway cluster; do
     FULL_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}${component}"
     for tag in "${TAGS_TO_APPLY[@]}"; do
       if [ "${tag}" = "${IMAGE_TAG}" ]; then
@@ -235,7 +232,6 @@ fi
 
 echo ""
 echo "Done! Multi-arch images pushed to ${REGISTRY}:"
-echo "  ${REGISTRY}/${IMAGE_PREFIX}sandbox:${IMAGE_TAG}"
 echo "  ${REGISTRY}/${IMAGE_PREFIX}gateway:${IMAGE_TAG}"
 echo "  ${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster:${IMAGE_TAG}"
 if [ "$TAG_LATEST" = true ]; then

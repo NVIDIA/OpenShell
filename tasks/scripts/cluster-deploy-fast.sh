@@ -45,21 +45,21 @@ cluster_exec() {
 CONTAINER_CHART_DIR=/tmp/openshell-chart
 
 build_gateway=0
-build_sandbox=0
+build_supervisor=0
 needs_helm_upgrade=0
 explicit_target=0
 
 previous_gateway_fingerprint=""
-previous_sandbox_fingerprint=""
+previous_supervisor_fingerprint=""
 previous_helm_fingerprint=""
 current_gateway_fingerprint=""
-current_sandbox_fingerprint=""
+current_supervisor_fingerprint=""
 current_helm_fingerprint=""
 
 if [[ "$#" -gt 0 ]]; then
   explicit_target=1
   build_gateway=0
-  build_sandbox=0
+  build_supervisor=0
   needs_helm_upgrade=0
 
   for target in "$@"; do
@@ -67,19 +67,19 @@ if [[ "$#" -gt 0 ]]; then
       gateway)
         build_gateway=1
         ;;
-      sandbox)
-        build_sandbox=1
+      supervisor|sandbox)
+        build_supervisor=1
         ;;
       chart|helm)
         needs_helm_upgrade=1
         ;;
       all)
         build_gateway=1
-        build_sandbox=1
+        build_supervisor=1
         needs_helm_upgrade=1
         ;;
       *)
-        echo "Unknown target '${target}'. Use gateway, sandbox, chart, or all."
+        echo "Unknown target '${target}'. Use gateway, supervisor, chart, or all."
         exit 1
         ;;
     esac
@@ -116,8 +116,8 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
       gateway)
         previous_gateway_fingerprint=${value}
         ;;
-      sandbox)
-        previous_sandbox_fingerprint=${value}
+      supervisor)
+        previous_supervisor_fingerprint=${value}
         ;;
       helm)
         previous_helm_fingerprint=${value}
@@ -127,7 +127,7 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
 
   if [[ "${previous_cluster_name:-}" != "${CLUSTER_NAME}" ]]; then
     previous_gateway_fingerprint=""
-    previous_sandbox_fingerprint=""
+    previous_supervisor_fingerprint=""
     previous_helm_fingerprint=""
   fi
 
@@ -136,7 +136,7 @@ if [[ -f "${DEPLOY_FAST_STATE_FILE}" ]]; then
   # images so everything must be rebuilt.
   if [[ -n "${current_container_id}" && "${current_container_id}" != "${previous_container_id:-}" ]]; then
     previous_gateway_fingerprint=""
-    previous_sandbox_fingerprint=""
+    previous_supervisor_fingerprint=""
     previous_helm_fingerprint=""
   fi
 fi
@@ -162,16 +162,16 @@ matches_gateway() {
   esac
 }
 
-matches_sandbox() {
+matches_supervisor() {
   local path=$1
   case "${path}" in
     Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
       return 0
       ;;
-    crates/navigator-core/*|crates/navigator-providers/*)
+    crates/navigator-core/*|crates/navigator-policy/*|crates/navigator-router/*)
       return 0
       ;;
-    crates/navigator-policy/*|crates/navigator-sandbox/*|deploy/docker/sandbox/*|python/*|pyproject.toml|uv.lock)
+    crates/navigator-sandbox/*)
       return 0
       ;;
     *)
@@ -206,8 +206,8 @@ compute_fingerprint() {
     gateway)
       committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-providers/ crates/navigator-router/ crates/navigator-server/ deploy/docker/Dockerfile.gateway 2>/dev/null || true)
       ;;
-    sandbox)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-providers/ crates/navigator-sandbox/ deploy/docker/sandbox/ python/ pyproject.toml uv.lock 2>/dev/null || true)
+    supervisor)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/navigator-core/ crates/navigator-policy/ crates/navigator-router/ crates/navigator-sandbox/ 2>/dev/null || true)
       ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
@@ -225,8 +225,8 @@ compute_fingerprint() {
           continue
         fi
         ;;
-      sandbox)
-        if ! matches_sandbox "${path}"; then
+      supervisor)
+        if ! matches_supervisor "${path}"; then
           continue
         fi
         ;;
@@ -253,19 +253,19 @@ compute_fingerprint() {
 }
 
 current_gateway_fingerprint=$(compute_fingerprint gateway)
-current_sandbox_fingerprint=$(compute_fingerprint sandbox)
+current_supervisor_fingerprint=$(compute_fingerprint supervisor)
 current_helm_fingerprint=$(compute_fingerprint helm)
 
 if [[ "${explicit_target}" == "0" && "${DEPLOY_FAST_MODE}" == "full" ]]; then
   build_gateway=1
-  build_sandbox=1
+  build_supervisor=1
   needs_helm_upgrade=1
 elif [[ "${explicit_target}" == "0" ]]; then
   if [[ "${current_gateway_fingerprint}" != "${previous_gateway_fingerprint}" ]]; then
     build_gateway=1
   fi
-  if [[ "${current_sandbox_fingerprint}" != "${previous_sandbox_fingerprint}" ]]; then
-    build_sandbox=1
+  if [[ "${current_supervisor_fingerprint}" != "${previous_supervisor_fingerprint}" ]]; then
+    build_supervisor=1
   fi
   if [[ "${current_helm_fingerprint}" != "${previous_helm_fingerprint}" ]]; then
     needs_helm_upgrade=1
@@ -276,90 +276,80 @@ if [[ "${FORCE_HELM_UPGRADE}" == "1" ]]; then
   needs_helm_upgrade=1
 fi
 
-# Always run helm upgrade when images are rebuilt so that the
-# OPENSHELL_SANDBOX_IMAGE env var on the server pod is set correctly
-# and image pull policy is Always (not IfNotPresent from bootstrap).
-if [[ "${build_gateway}" == "1" || "${build_sandbox}" == "1" ]]; then
+# Always run helm upgrade when the gateway image is rebuilt so that
+# the image tag and pull policy are set correctly.
+if [[ "${build_gateway}" == "1" ]]; then
   needs_helm_upgrade=1
 fi
 
 echo "Fast deploy plan:"
-echo "  build gateway: ${build_gateway}"
-echo "  build sandbox: ${build_sandbox}"
-echo "  helm upgrade:  ${needs_helm_upgrade}"
+echo "  build gateway:    ${build_gateway}"
+echo "  build supervisor: ${build_supervisor}"
+echo "  helm upgrade:     ${needs_helm_upgrade}"
 
-if [[ "${explicit_target}" == "0" && "${build_gateway}" == "0" && "${build_sandbox}" == "0" && "${needs_helm_upgrade}" == "0" && "${DEPLOY_FAST_MODE}" != "full" ]]; then
+if [[ "${explicit_target}" == "0" && "${build_gateway}" == "0" && "${build_supervisor}" == "0" && "${needs_helm_upgrade}" == "0" && "${DEPLOY_FAST_MODE}" != "full" ]]; then
   echo "No new local changes since last deploy."
 fi
 
 build_start=$(date +%s)
 
-# Track which components are being rebuilt so we can evict their images
-# from the k3s containerd cache after pushing.
+# Track which components are being rebuilt for rollout decisions.
 declare -a built_components=()
 
-gateway_pid=""
-sandbox_pid=""
-build_failed=0
-
 if [[ "${build_gateway}" == "1" ]]; then
-  if [[ "${build_sandbox}" == "1" ]]; then
-    tasks/scripts/docker-build-component.sh gateway &
-    gateway_pid=$!
-  else
-    tasks/scripts/docker-build-component.sh gateway
-  fi
+  tasks/scripts/docker-build-component.sh gateway
 fi
 
-if [[ "${build_sandbox}" == "1" ]]; then
-  if [[ -n "${gateway_pid}" ]]; then
-    tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE} &
-    sandbox_pid=$!
-  else
-    tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE}
-  fi
-fi
+# Build the supervisor binary and docker cp it into the running k3s cluster.
+# The binary lives at /opt/openshell/bin/navigator-sandbox on the node
+# filesystem and is mounted into sandbox pods via a hostPath volume.
+if [[ "${build_supervisor}" == "1" ]]; then
+  echo "Building supervisor binary..."
+  supervisor_start=$(date +%s)
 
-# Wait for parallel builds and fail fast: if either build fails, kill the
-# other one immediately instead of letting it run to completion.
-if [[ -n "${gateway_pid}" && -n "${sandbox_pid}" ]]; then
-  # Both running in parallel — wait for either to finish first.
-  if ! wait -n "${gateway_pid}" "${sandbox_pid}" 2>/dev/null; then
-    build_failed=1
-  fi
-  # Whichever finished, wait for the other (or kill it on failure).
-  if [[ "${build_failed}" == "1" ]]; then
-    echo "Error: a parallel image build failed. Killing remaining build..." >&2
-    kill "${gateway_pid}" "${sandbox_pid}" 2>/dev/null || true
-    wait "${gateway_pid}" "${sandbox_pid}" 2>/dev/null || true
-    exit 1
-  fi
-  # First build succeeded; wait for the second.
-  if ! wait -n "${gateway_pid}" "${sandbox_pid}" 2>/dev/null; then
-    echo "Error: a parallel image build failed." >&2
-    exit 1
-  fi
-elif [[ -n "${gateway_pid}" ]]; then
-  wait "${gateway_pid}"
-elif [[ -n "${sandbox_pid}" ]]; then
-  wait "${sandbox_pid}"
+  # Detect the cluster container's architecture so we cross-compile correctly.
+  # Container objects lack an Architecture field (the Go template emits a
+  # stray newline before erroring), so inspect the container's *image* instead.
+  _cluster_image=$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
+  CLUSTER_ARCH=$(docker image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
+
+  # Build the supervisor binary using docker buildx with a lightweight build.
+  # We use the same cross-build.sh helpers as the full cluster image but only
+  # compile navigator-sandbox, then extract the binary via --output.
+  SUPERVISOR_BUILD_DIR=$(mktemp -d)
+  trap 'rm -rf "${SUPERVISOR_BUILD_DIR}"' EXIT
+
+  docker buildx build \
+    --file deploy/docker/Dockerfile.cluster \
+    --target supervisor-builder \
+    --build-arg "BUILDARCH=$(docker version --format '{{.Server.Arch}}')" \
+    --build-arg "TARGETARCH=${CLUSTER_ARCH}" \
+    --output "type=local,dest=${SUPERVISOR_BUILD_DIR}" \
+    --platform "linux/${CLUSTER_ARCH}" \
+    .
+
+  # Copy the built binary into the running k3s container
+  docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
+  docker cp "${SUPERVISOR_BUILD_DIR}/build/out/navigator-sandbox" \
+    "${CONTAINER_NAME}:/opt/openshell/bin/navigator-sandbox"
+  docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/navigator-sandbox
+
+  built_components+=("supervisor")
+  supervisor_end=$(date +%s)
+  log_duration "Supervisor build + deploy" "${supervisor_start}" "${supervisor_end}"
 fi
 
 build_end=$(date +%s)
-log_duration "Image builds" "${build_start}" "${build_end}"
+log_duration "Builds" "${build_start}" "${build_end}"
 
+# Push rebuilt gateway image to local registry.
 declare -a pushed_images=()
 
-for component in gateway sandbox; do
-  var="build_${component//-/_}"
-  if [[ "${!var}" == "1" ]]; then
-    # Tag may fail with AlreadyExists when the image digest hasn't changed;
-    # this is harmless — the registry already has the correct image.
-    docker tag "openshell/${component}:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" 2>/dev/null || true
-    pushed_images+=("${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}")
-    built_components+=("${component}")
-  fi
-done
+if [[ "${build_gateway}" == "1" ]]; then
+  docker tag "openshell/gateway:${IMAGE_TAG}" "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" 2>/dev/null || true
+  pushed_images+=("${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}")
+  built_components+=("gateway")
+fi
 
 if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   push_start=$(date +%s)
@@ -371,14 +361,11 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
   log_duration "Image push" "${push_start}" "${push_end}"
 fi
 
-# Always evict rebuilt images from k3s's containerd store so new pods pull
-# the updated image from the registry.  Without this, k3s may use a cached
-# copy even when the registry has a newer version with the same tag.
-if [[ "${#built_components[@]}" -gt 0 ]]; then
-  echo "Evicting stale images from k3s: ${built_components[*]}"
-  for component in "${built_components[@]}"; do
-    docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/${component}:${IMAGE_TAG}" >/dev/null 2>&1 || true
-  done
+# Evict rebuilt gateway image from k3s containerd cache so new pods pull
+# the updated image from the registry.
+if [[ "${build_gateway}" == "1" ]]; then
+  echo "Evicting stale gateway image from k3s..."
+  docker exec "${CONTAINER_NAME}" crictl rmi "${IMAGE_REPO_BASE}/gateway:${IMAGE_TAG}" >/dev/null 2>&1 || true
 fi
 
 if [[ "${needs_helm_upgrade}" == "1" ]]; then
@@ -410,8 +397,6 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set image.tag=${IMAGE_TAG} \
     --set image.pullPolicy=Always \
     --set-string server.grpcEndpoint=https://openshell.openshell.svc.cluster.local:8080 \
-    --set server.sandboxImage=${IMAGE_REPO_BASE}/sandbox:${IMAGE_TAG} \
-    --set server.sandboxImagePullPolicy=Always \
     --set server.tls.certSecretName=openshell-server-tls \
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
@@ -421,9 +406,9 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"
 fi
 
-if [[ "${#pushed_images[@]}" -gt 0 ]]; then
+if [[ "${build_gateway}" == "1" ]]; then
   rollout_start=$(date +%s)
-  echo "Restarting deployment to pick up updated images..."
+  echo "Restarting gateway to pick up updated image..."
   if cluster_exec "kubectl get statefulset/openshell -n openshell" >/dev/null 2>&1; then
     cluster_exec "kubectl rollout restart statefulset/openshell -n openshell"
     cluster_exec "kubectl rollout status statefulset/openshell -n openshell"
@@ -434,9 +419,13 @@ if [[ "${#pushed_images[@]}" -gt 0 ]]; then
     echo "Warning: no openshell workload found to roll out in namespace 'openshell'."
   fi
   rollout_end=$(date +%s)
-  log_duration "Rollout" "${rollout_start}" "${rollout_end}"
-else
-  echo "No image updates to roll out."
+  log_duration "Gateway rollout" "${rollout_start}" "${rollout_end}"
+fi
+
+if [[ "${build_supervisor}" == "1" ]]; then
+  echo "Supervisor binary updated on cluster node."
+  echo "Existing sandbox pods will use the new binary on next restart."
+  echo "New sandbox pods will use the updated binary immediately (hostPath mount)."
 fi
 
 if [[ "${explicit_target}" == "0" ]]; then
@@ -445,7 +434,7 @@ if [[ "${explicit_target}" == "0" ]]; then
 cluster_name=${CLUSTER_NAME}
 container_id=${current_container_id}
 gateway=${current_gateway_fingerprint}
-sandbox=${current_sandbox_fingerprint}
+supervisor=${current_supervisor_fingerprint}
 helm=${current_helm_fingerprint}
 EOF
 fi

@@ -593,46 +593,28 @@ fn sandbox_id_from_object(obj: &DynamicObject) -> Result<String, String> {
     Err("sandbox id not found on object".to_string())
 }
 
-/// Path where the supervisor binary is mounted inside the agent container
-/// when using supervisor bootstrap mode (custom workload image).
+/// Path where the supervisor binary is mounted inside the agent container.
+/// The supervisor is always side-loaded from the k3s node filesystem via a
+/// read-only hostPath volume — it is never baked into sandbox images.
 const SUPERVISOR_MOUNT_PATH: &str = "/opt/navigator/bin";
 
-/// Name of the shared volume used to side-load the supervisor binary.
+/// Name of the volume used to side-load the supervisor binary.
 const SUPERVISOR_VOLUME_NAME: &str = "navigator-supervisor-bin";
 
-/// Source path of the supervisor binary inside the default sandbox image.
-const SUPERVISOR_SRC_PATH: &str = "/usr/local/bin/navigator-sandbox";
+/// Path on the k3s node filesystem where the supervisor binary lives.
+/// This is baked into the cluster image at build time and can be updated
+/// via `docker cp` during local development.
+const SUPERVISOR_HOST_PATH: &str = "/opt/openshell/bin";
 
-/// Returns `true` when supervisor bootstrap mode is needed: the template
-/// specifies a custom workload image that differs from the server's default
-/// sandbox image.
-fn needs_supervisor_bootstrap(template: &SandboxTemplate, default_image: &str) -> bool {
-    !template.image.is_empty() && template.image != default_image
-}
-
-/// Build the init container JSON that copies the supervisor binary from the
-/// default sandbox image into the shared volume.
-fn supervisor_init_container(default_image: &str) -> serde_json::Value {
-    serde_json::json!({
-        "name": "copy-supervisor",
-        "image": default_image,
-        "command": ["sh", "-c", format!(
-            "cp {src} {dst}/navigator-sandbox && chmod 755 {dst}/navigator-sandbox",
-            src = SUPERVISOR_SRC_PATH,
-            dst = SUPERVISOR_MOUNT_PATH,
-        )],
-        "volumeMounts": [{
-            "name": SUPERVISOR_VOLUME_NAME,
-            "mountPath": SUPERVISOR_MOUNT_PATH
-        }]
-    })
-}
-
-/// Build the emptyDir volume definition for the supervisor binary.
+/// Build the hostPath volume definition that exposes the supervisor binary
+/// from the k3s node filesystem.
 fn supervisor_volume() -> serde_json::Value {
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
-        "emptyDir": {}
+        "hostPath": {
+            "path": SUPERVISOR_HOST_PATH,
+            "type": "DirectoryOrCreate"
+        }
     })
 }
 
@@ -645,23 +627,26 @@ fn supervisor_volume_mount() -> serde_json::Value {
     })
 }
 
-/// Apply supervisor bootstrap transforms to an already-built pod template JSON.
+/// Apply supervisor side-load transforms to an already-built pod template JSON.
 ///
-/// This injects the init container, shared volume, volume mount, command
-/// override, and `runAsUser: 0` into the pod template, targeting the `agent`
-/// container (or the first container if no `agent` is found).
+/// This injects the hostPath volume, volume mount, command override, and
+/// `runAsUser: 0` into the pod template, targeting the `agent` container
+/// (or the first container if no `agent` is found).
 ///
-/// The `runAsUser: 0` override ensures the side-loaded supervisor binary runs
-/// as root regardless of the image's `USER` directive. The supervisor needs
-/// root for network namespace creation, proxy setup, and Landlock/seccomp
-/// configuration. It drops to the appropriate non-root user for child
-/// processes via the policy's `run_as_user`/`run_as_group`.
-fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_image: &str) {
+/// The supervisor binary is always side-loaded from the k3s node filesystem
+/// via a read-only hostPath volume. No init container is needed.
+///
+/// The `runAsUser: 0` override ensures the supervisor binary runs as root
+/// regardless of the image's `USER` directive. The supervisor needs root for
+/// network namespace creation, proxy setup, and Landlock/seccomp configuration.
+/// It drops to the appropriate non-root user for child processes via the
+/// policy's `run_as_user`/`run_as_group`.
+fn apply_supervisor_sideload(pod_template: &mut serde_json::Value) {
     let Some(spec) = pod_template.get_mut("spec").and_then(|v| v.as_object_mut()) else {
         return;
     };
 
-    // 1. Add the shared volume to spec.volumes
+    // 1. Add the hostPath volume to spec.volumes
     let volumes = spec
         .entry("volumes")
         .or_insert_with(|| serde_json::json!([]))
@@ -670,16 +655,7 @@ fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_imag
         volumes.push(supervisor_volume());
     }
 
-    // 2. Add the init container to spec.initContainers
-    let init_containers = spec
-        .entry("initContainers")
-        .or_insert_with(|| serde_json::json!([]))
-        .as_array_mut();
-    if let Some(init_containers) = init_containers {
-        init_containers.push(supervisor_init_container(default_image));
-    }
-
-    // 3. Find the agent container and add volume mount + command override
+    // 2. Find the agent container and add volume mount + command override
     let Some(containers) = spec.get_mut("containers").and_then(|v| v.as_array_mut()) else {
         return;
     };
@@ -700,10 +676,10 @@ fn apply_supervisor_bootstrap(pod_template: &mut serde_json::Value, default_imag
             serde_json::json!([format!("{}/navigator-sandbox", SUPERVISOR_MOUNT_PATH)]),
         );
 
-        // Force the supervisor to run as root (UID 0). Custom/community images
-        // may set a non-root USER directive (e.g. `USER sandbox`), but the
-        // supervisor needs root to create network namespaces, set up the proxy,
-        // and configure Landlock/seccomp. The supervisor itself drops privileges
+        // Force the supervisor to run as root (UID 0). Sandbox images may set
+        // a non-root USER directive (e.g. `USER sandbox`), but the supervisor
+        // needs root to create network namespaces, set up the proxy, and
+        // configure Landlock/seccomp. The supervisor itself drops privileges
         // for child processes via the policy's `run_as_user`/`run_as_group`.
         let security_context = container
             .entry("securityContext")
@@ -821,7 +797,6 @@ fn sandbox_template_to_k8s(
         return inject_pod_template(
             pod_template,
             template,
-            default_image,
             image_pull_policy,
             sandbox_id,
             sandbox_name,
@@ -834,14 +809,8 @@ fn sandbox_template_to_k8s(
         );
     }
 
-    let bootstrap = needs_supervisor_bootstrap(template, default_image);
-    if bootstrap {
-        info!(
-            workload_image = %template.image,
-            supervisor_image = %default_image,
-            "Supervisor bootstrap mode active: side-loading supervisor from default image"
-        );
-    }
+    // The supervisor binary is always side-loaded from the node filesystem
+    // via a hostPath volume, regardless of which sandbox image is used.
 
     let mut metadata = serde_json::Map::new();
     if !template.labels.is_empty() {
@@ -949,10 +918,8 @@ fn sandbox_template_to_k8s(
 
     let mut result = serde_json::Value::Object(template_value);
 
-    // Apply supervisor bootstrap transforms when using a custom workload image
-    if bootstrap {
-        apply_supervisor_bootstrap(&mut result, default_image);
-    }
+    // Always side-load the supervisor binary from the node filesystem
+    apply_supervisor_sideload(&mut result);
 
     result
 }
@@ -961,7 +928,6 @@ fn sandbox_template_to_k8s(
 fn inject_pod_template(
     mut pod_template: serde_json::Value,
     template: &SandboxTemplate,
-    default_image: &str,
     image_pull_policy: &str,
     sandbox_id: &str,
     sandbox_name: &str,
@@ -1051,15 +1017,8 @@ fn inject_pod_template(
         }
     }
 
-    // Apply supervisor bootstrap transforms for custom workload images
-    if needs_supervisor_bootstrap(template, default_image) {
-        info!(
-            workload_image = %template.image,
-            supervisor_image = %default_image,
-            "Supervisor bootstrap mode active for custom pod template"
-        );
-        apply_supervisor_bootstrap(&mut pod_template, default_image);
-    }
+    // Always side-load the supervisor binary from the node filesystem
+    apply_supervisor_sideload(&mut pod_template);
 
     pod_template
 }
@@ -1489,7 +1448,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_bootstrap_injects_run_as_user_zero() {
+    fn supervisor_sideload_injects_run_as_user_zero() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -1504,7 +1463,7 @@ mod tests {
             }
         });
 
-        apply_supervisor_bootstrap(&mut pod_template, "default-image:latest");
+        apply_supervisor_sideload(&mut pod_template);
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(sc["runAsUser"], 0, "runAsUser must be 0 for supervisor");
@@ -1518,7 +1477,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_bootstrap_adds_security_context_when_missing() {
+    fn supervisor_sideload_adds_security_context_when_missing() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -1528,7 +1487,7 @@ mod tests {
             }
         });
 
-        apply_supervisor_bootstrap(&mut pod_template, "default-image:latest");
+        apply_supervisor_sideload(&mut pod_template);
 
         let sc = &pod_template["spec"]["containers"][0]["securityContext"];
         assert_eq!(
@@ -1538,7 +1497,7 @@ mod tests {
     }
 
     #[test]
-    fn supervisor_bootstrap_injects_init_container_and_volume() {
+    fn supervisor_sideload_injects_hostpath_volume_and_mount() {
         let mut pod_template = serde_json::json!({
             "spec": {
                 "containers": [{
@@ -1548,22 +1507,22 @@ mod tests {
             }
         });
 
-        apply_supervisor_bootstrap(&mut pod_template, "default-image:latest");
+        apply_supervisor_sideload(&mut pod_template);
 
-        // Init container should be present
-        let init_containers = pod_template["spec"]["initContainers"]
-            .as_array()
-            .expect("initContainers should exist");
-        assert_eq!(init_containers.len(), 1);
-        assert_eq!(init_containers[0]["name"], "copy-supervisor");
-        assert_eq!(init_containers[0]["image"], "default-image:latest");
+        // No init containers should be present (hostPath, not emptyDir+init)
+        assert!(
+            pod_template["spec"]["initContainers"].is_null(),
+            "hostPath sideload should not create init containers"
+        );
 
-        // Volume should be present
+        // Volume should be a hostPath volume
         let volumes = pod_template["spec"]["volumes"]
             .as_array()
             .expect("volumes should exist");
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
+        assert_eq!(volumes[0]["hostPath"]["path"], SUPERVISOR_HOST_PATH);
+        assert_eq!(volumes[0]["hostPath"]["type"], "DirectoryOrCreate");
 
         // Agent container command should be overridden
         let command = pod_template["spec"]["containers"][0]["command"]
@@ -1573,42 +1532,15 @@ mod tests {
             command[0].as_str().unwrap(),
             format!("{}/navigator-sandbox", SUPERVISOR_MOUNT_PATH)
         );
-    }
 
-    #[test]
-    fn needs_supervisor_bootstrap_true_for_custom_image() {
-        let template = SandboxTemplate {
-            image: "custom-image:latest".to_string(),
-            ..SandboxTemplate::default()
-        };
-        assert!(needs_supervisor_bootstrap(
-            &template,
-            "default-image:latest"
-        ));
-    }
-
-    #[test]
-    fn needs_supervisor_bootstrap_false_for_default_image() {
-        let template = SandboxTemplate {
-            image: "default-image:latest".to_string(),
-            ..SandboxTemplate::default()
-        };
-        assert!(!needs_supervisor_bootstrap(
-            &template,
-            "default-image:latest"
-        ));
-    }
-
-    #[test]
-    fn needs_supervisor_bootstrap_false_for_empty_image() {
-        let template = SandboxTemplate {
-            image: String::new(),
-            ..SandboxTemplate::default()
-        };
-        assert!(!needs_supervisor_bootstrap(
-            &template,
-            "default-image:latest"
-        ));
+        // Volume mount should be read-only
+        let mounts = pod_template["spec"]["containers"][0]["volumeMounts"]
+            .as_array()
+            .expect("volumeMounts should exist");
+        assert_eq!(mounts.len(), 1);
+        assert_eq!(mounts[0]["name"], SUPERVISOR_VOLUME_NAME);
+        assert_eq!(mounts[0]["mountPath"], SUPERVISOR_MOUNT_PATH);
+        assert_eq!(mounts[0]["readOnly"], true);
     }
 
     /// Regression test: TLS mount path must match env var paths.

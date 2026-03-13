@@ -112,7 +112,7 @@ fn civil_from_days(days: u64) -> (i64, u64, u64) {
 enum ProvisioningStep {
     /// Sandbox CRD created, waiting for pod to be scheduled.
     RequestingSandbox,
-    /// Pulling the sandbox container image (the user-facing image, not init containers).
+    /// Pulling the sandbox container image.
     PullingSandboxImage,
     /// Container is starting up.
     StartingSandbox,
@@ -2011,7 +2011,6 @@ pub async fn sandbox_create(
             Some(navigator_core::proto::sandbox_stream_event::Payload::Event(ev)) => {
                 // Map Kubernetes events to provisioning steps.
                 // We simplify the display to: Sandbox allocated -> Pulling image -> Ready
-                // Init container events are ignored; we only show the user's sandbox image.
                 if let Some(reason) = parse_kube_event_reason(&ev.reason) {
                     match reason {
                         KubeEventReason::Scheduled => {
@@ -2032,57 +2031,45 @@ pub async fn sandbox_create(
                                 .message
                                 .strip_prefix("Pulling image ")
                                 .map_or("", |s| s.trim_matches('"'));
-                            // Skip init container image pulls (openshell/sandbox).
-                            // Only show progress for the user's sandbox image.
-                            let is_init_container_image =
-                                image_name.contains("/openshell/sandbox:");
-                            if !is_init_container_image {
-                                if let Some(d) = display.as_mut() {
-                                    d.set_active("Pulling image...");
-                                    if !image_name.is_empty() {
-                                        d.set_active_detail(image_name);
-                                    }
+                            if let Some(d) = display.as_mut() {
+                                d.set_active("Pulling image...");
+                                if !image_name.is_empty() {
+                                    d.set_active_detail(image_name);
+                                }
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                if image_name.is_empty() {
+                                    println!("{} Pulling image...", ts.dimmed());
                                 } else {
-                                    let ts = format_timestamp(provision_start.elapsed());
-                                    if image_name.is_empty() {
-                                        println!("{} Pulling image...", ts.dimmed());
-                                    } else {
-                                        println!("{} Pulling image {image_name}", ts.dimmed());
-                                    }
+                                    println!("{} Pulling image {image_name}", ts.dimmed());
                                 }
                             }
                         }
                         KubeEventReason::Pulled => {
-                            // Skip init container pulls.
-                            let is_init_container_image =
-                                ev.message.contains("/openshell/sandbox:");
-                            if !is_init_container_image {
-                                // Extract image size from message like:
-                                // "Successfully pulled image ... Image size: 620405524 bytes."
-                                let size_label = extract_image_size(&ev.message)
-                                    .map(format_bytes)
-                                    .unwrap_or_default();
-                                let label = if size_label.is_empty() {
-                                    "Image pulled".to_string()
-                                } else {
-                                    format!("Image pulled ({})", size_label)
-                                };
-                                if let Some(d) = display.as_mut() {
-                                    d.complete_step_with_label(
-                                        ProvisioningStep::PullingSandboxImage,
-                                        &label,
-                                    );
-                                    d.set_active_step(ProvisioningStep::StartingSandbox);
-                                } else {
-                                    let ts = format_timestamp(provision_start.elapsed());
-                                    println!("{} {}", ts.dimmed(), label);
-                                }
+                            // Extract image size from message like:
+                            // "Successfully pulled image ... Image size: 620405524 bytes."
+                            let size_label = extract_image_size(&ev.message)
+                                .map(format_bytes)
+                                .unwrap_or_default();
+                            let label = if size_label.is_empty() {
+                                "Image pulled".to_string()
+                            } else {
+                                format!("Image pulled ({})", size_label)
+                            };
+                            if let Some(d) = display.as_mut() {
+                                d.complete_step_with_label(
+                                    ProvisioningStep::PullingSandboxImage,
+                                    &label,
+                                );
+                                d.set_active_step(ProvisioningStep::StartingSandbox);
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                println!("{} {}", ts.dimmed(), label);
                             }
                         }
                         KubeEventReason::Started => {
-                            // Started fires for both init and main containers.
                             // Only complete StartingSandbox if we've already completed
-                            // PullingSandboxImage (meaning this is the main container starting).
+                            // PullingSandboxImage (meaning the container is starting).
                             if let Some(d) = display.as_mut()
                                 && d.completed_steps
                                     .contains(&ProvisioningStep::PullingSandboxImage)

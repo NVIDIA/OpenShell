@@ -223,9 +223,7 @@ fi
 if [ "${SKIP_IMAGE_PUSH:-}" = "1" ]; then
   echo "Skipping image push (SKIP_IMAGE_PUSH=1; images already in registry)."
 elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
-  for component in gateway sandbox; do
-    tasks/scripts/cluster-push-component.sh "${component}"
-  done
+  tasks/scripts/cluster-push-component.sh gateway
 fi
 
 # Build the cluster image so it contains the latest Helm chart, manifests,

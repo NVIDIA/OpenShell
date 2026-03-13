@@ -167,10 +167,10 @@ Key sections to reference:
 - **Private IP Access via `allowed_ips`** — CIDR allowlist for private IP space
 - **Validation Rules** — what combinations are valid/invalid
 
-Also read the example policy for real-world patterns:
+Also read the example policy for real-world patterns. The default policy is baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`). For reference, consult the policy schema documentation:
 
 ```
-Read deploy/docker/sandbox/dev-sandbox-policy.yaml
+Read architecture/security-policy.md
 ```
 
 ## Step 4: Choose Policy Shape
@@ -355,8 +355,8 @@ The policy needs to go somewhere. Determine which mode applies:
 
 | Signal | Mode |
 |--------|------|
-| User names an existing policy file (e.g., "add to deploy/docker/sandbox/dev-sandbox-policy.yaml") | **Update existing file** |
-| User says "update my policy", "add this to my policy file" | **Update existing file** — look for `deploy/docker/sandbox/dev-sandbox-policy.yaml` or ask which file |
+| User names an existing policy file (e.g., "add to my-sandbox-policy.yaml") | **Update existing file** |
+| User says "update my policy", "add this to my policy file" | **Update existing file** — ask which file to update |
 | User asks to modify an existing policy rule by name | **Update existing file** — edit the named policy in place |
 | User says "create a new policy file" or names a file that doesn't exist | **Create new file** |
 | No file context given | **Present only** — show the YAML and ask if the user wants it written to a file |
@@ -414,7 +414,7 @@ network_policies:
 
 The `filesystem_policy`, `landlock`, and `process` sections above are sensible defaults. Tell the user these are defaults and may need adjustment for their environment. Cluster inference is configured separately through `openshell cluster inference set/get`. The generated `network_policies` block is the primary output.
 
-If the user provides a file path, write to it. Otherwise, suggest `deploy/docker/sandbox/dev-sandbox-policy.yaml` for local development or ask where to place it.
+If the user provides a file path, write to it. Otherwise, ask where to place it. A common convention is a project-local policy file (e.g., `sandbox-policy.yaml`) passed to `openshell sandbox create --policy <path>` or set via the `OPENSHELL_SANDBOX_POLICY` env var.
 
 ### Mode C: Present Only (no file write)
 
@@ -423,7 +423,7 @@ Show the generated policy YAML with:
 1. **Summary** — what the policy allows and denies, in plain language
 2. **The YAML** — the complete `network_policies` block, ready to paste
 3. **Integration guidance**:
-   - For local dev: add to `deploy/docker/sandbox/dev-sandbox-policy.yaml` under `network_policies`
+   - Save to a local file and pass via `openshell sandbox create --policy <path>` or set `OPENSHELL_SANDBOX_POLICY=<path>`
    - For production: configure via the gateway
 4. **Caveats** — any assumptions made, anything the user should verify
 
@@ -541,6 +541,6 @@ private_services:
 ## Additional Resources
 
 - Full policy schema: [architecture/security-policy.md](../../../architecture/security-policy.md)
-- Example policy file: [dev-sandbox-policy.yaml](../../../deploy/docker/sandbox/dev-sandbox-policy.yaml)
+- Default policy: baked into the community base image (`ghcr.io/nvidia/openshell-community/sandboxes/base:latest`)
 - Rego evaluation rules: [sandbox-policy.rego](../../../crates/navigator-sandbox/data/sandbox-policy.rego)
 - For translation examples from real API docs, see [examples.md](examples.md)
