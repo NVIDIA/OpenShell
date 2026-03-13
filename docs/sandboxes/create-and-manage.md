@@ -37,64 +37,7 @@ the cause. Start Docker and try again.
 
 ## Set Up a Gateway
 
-The gateway is the control plane for OpenShell. Every sandbox is created using a gateway. If you run `openshell sandbox create` without one, the CLI auto-bootstraps a local gateway. To run sandboxes on a remote machine or a cloud-hosted gateway, set up the gateway first. For details on how authentication and credentials work, refer to {doc}`../reference/gateway-auth`.
-
-### Deploy a local gateway
-
-```console
-$ openshell gateway start
-```
-
-The gateway becomes reachable at `https://127.0.0.1:8080`. To use a different port: `openshell gateway start --port 9090`.
-
-### Deploy a remote gateway
-
-Deploy to a remote machine over SSH. The only dependency on the remote host is Docker.
-
-```console
-$ openshell gateway start --remote user@hostname
-```
-
-:::{note}
-For DGX Spark, use your Spark's mDNS hostname:
-
-```console
-$ openshell gateway start --remote <username>@<spark-ssid>.local
-```
-:::
-
-### Register an existing gateway
-
-Use `openshell gateway add` to register a gateway that is already running.
-
-```console
-$ openshell gateway add https://gateway.example.com                        # cloud (browser login)
-$ openshell gateway add https://remote-host:8080 --remote user@remote-host # remote
-$ openshell gateway add ssh://user@remote-host:8080                        # remote (ssh:// shorthand)
-$ openshell gateway add https://127.0.0.1:8080 --local                     # local
-```
-
-If a cloud gateway token expires, re-authenticate with `openshell gateway login`.
-
-### Manage multiple gateways
-
-One gateway is always the **active gateway**. All CLI commands target it by default.
-
-```console
-$ openshell gateway select                     # list all gateways
-$ openshell gateway select my-remote-cluster   # switch the active gateway
-$ openshell status -g my-other-cluster         # override for a single command
-```
-
-### Stop and destroy gateways
-
-```console
-$ openshell gateway stop                       # preserve state for later restart
-$ openshell gateway destroy                    # permanently remove all state
-$ openshell gateway start --recreate           # destroy and re-deploy from scratch
-```
-
-For cloud gateways, `gateway destroy` removes only the local registration. It does not affect the remote deployment.
+Every sandbox requires a gateway. If you run `openshell sandbox create` without one, the CLI auto-bootstraps a local gateway. To deploy gateways manually, use remote hosts, or manage multiple gateways, refer to {doc}`gateways`.
 
 ## Create a Sandbox
 
@@ -133,9 +76,15 @@ $ openshell sandbox create \
     -- claude
 ```
 
-:::{tip}
-Sandboxes stay running by default after the initial command or shell exits. Use `--no-keep` when you want the sandbox deleted automatically instead.
-:::
+Additional `sandbox create` flags:
+
+| Flag | Purpose |
+|---|---|
+| `--no-keep` | Delete the sandbox automatically after the initial command exits |
+| `--forward <port>` | Forward a local port to the sandbox before running |
+| `--tty` / `--no-tty` | Force or disable pseudo-terminal allocation |
+| `--no-bootstrap` | Error if no gateway is available instead of auto-bootstrapping |
+| `--no-auto-providers` | Error if required providers are missing instead of prompting |
 
 ## Connect to a Sandbox
 
@@ -189,7 +138,41 @@ OpenShell Terminal combines sandbox status and live logs in a single real-time d
 $ openshell term
 ```
 
-Use the terminal to spot blocked connections (`action=deny` entries) and inference interceptions (`action=inspect_for_inference` entries). If a connection is blocked unexpectedly, add the host to your network policy. Refer to {doc}`policies` for the workflow.
+Use the terminal to spot blocked connections marked `action=deny` and inference interceptions marked `action=inspect_for_inference`. If a connection is blocked unexpectedly, add the host to your network policy. Refer to {doc}`policies` for the workflow.
+
+## Port Forwarding
+
+Forward a local port to a running sandbox to access services inside it, such as a web server or database:
+
+```console
+$ openshell forward start 8000 my-sandbox
+$ openshell forward start 8000 my-sandbox -d    # run in background
+```
+
+List and stop active forwards:
+
+```console
+$ openshell forward list
+$ openshell forward stop 8000 my-sandbox
+```
+
+:::{tip}
+You can also forward a port at creation time with `--forward`:
+
+```console
+$ openshell sandbox create --forward 8000 -- claude
+```
+:::
+
+## SSH Config
+
+Generate an SSH config entry for a sandbox so tools like VS Code Remote-SSH can connect directly:
+
+```console
+$ openshell sandbox ssh-config my-sandbox
+```
+
+Append the output to `~/.ssh/config` or use `--editor` on `sandbox create`/`sandbox connect` for automatic setup.
 
 ## Transfer Files
 

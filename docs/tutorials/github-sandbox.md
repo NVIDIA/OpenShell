@@ -1,7 +1,7 @@
 ---
 title:
-  page: Set Up a Sandbox of Claude Code with a Custom GitHub Policy
-  nav: GitHub Sandbox Tutorial
+  page: Grant GitHub Push Access to a Sandboxed Agent
+  nav: GitHub Push Access
 description: Learn the iterative policy workflow by launching a sandbox, diagnosing a GitHub access denial, and applying a custom policy to fix it.
 topics:
 - Generative AI
@@ -24,7 +24,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Set Up a Sandbox of Claude Code with a Custom GitHub Policy
+# Grant GitHub Push Access to a Sandboxed Agent
 
 This tutorial walks through an iterative sandbox policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, and observe the default network policy denying the request.
 You then diagnose the denial from your machine and from inside the sandbox, apply a policy update, and verify that the policy update to the sandbox takes effect.

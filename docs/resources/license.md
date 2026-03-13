@@ -2,12 +2,12 @@
 title:
   page: License
   nav: License
-description: NVIDIA OpenShell license agreement and terms of use.
+description: OpenShell is licensed under the Apache License, Version 2.0.
 topics:
 - Legal
 tags:
 - License
-- EULA
+- Apache 2.0
 content:
   type: reference
   difficulty: technical_beginner
@@ -22,3 +22,8 @@ content:
 -->
 
 # License
+
+OpenShell is licensed under the [Apache License, Version 2.0](https://www.apache.org/licenses/LICENSE-2.0).
+
+```{include} ../../LICENSE
+```

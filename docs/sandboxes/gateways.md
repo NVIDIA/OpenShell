@@ -34,7 +34,7 @@ OpenShell supports three gateway types:
 |---|---|---|
 | **Local** | Docker on your workstation | `openshell gateway start` |
 | **Remote** | Docker on a remote host via SSH | `openshell gateway start --remote user@host` |
-| **Cloud** | Behind a reverse proxy (e.g. Cloudflare Access) | `openshell gateway add https://gateway.example.com` |
+| **Cloud** | Behind a reverse proxy. For example, Cloudflare Access. | `openshell gateway add https://gateway.example.com` |
 
 ## Deploy a Local Gateway
 
@@ -51,7 +51,7 @@ $ openshell status
 ```
 
 :::{tip}
-You don't need to deploy a gateway manually. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway for you.
+You do not need to deploy a gateway manually. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway for you.
 :::
 
 To use a different port or name:
@@ -89,9 +89,9 @@ $ openshell gateway start --remote <username>@<spark-ssid>.local
 
 Use `openshell gateway add` to register a gateway that is already running.
 
-### Cloud gateway
+### Cloud Gateway
 
-Register a gateway behind a reverse proxy (e.g. Cloudflare Access):
+Register a gateway behind a reverse proxy such as Cloudflare Access:
 
 ```console
 $ openshell gateway add https://gateway.example.com
@@ -99,7 +99,7 @@ $ openshell gateway add https://gateway.example.com
 
 This opens your browser for the proxy's login flow. After authentication, the CLI stores a bearer token and sets the gateway as active.
 
-To give the gateway a specific name (otherwise derived from the hostname):
+To give the gateway a specific name instead of deriving it from the hostname, use `--name`:
 
 ```console
 $ openshell gateway add https://gateway.example.com --name production
@@ -111,7 +111,7 @@ If the token expires later, re-authenticate with:
 $ openshell gateway login
 ```
 
-### Remote gateway
+### Remote Gateway
 
 Register a gateway on a remote host you have SSH access to:
 
@@ -125,7 +125,7 @@ Or use the `ssh://` scheme to combine the SSH destination and gateway port:
 $ openshell gateway add ssh://user@remote-host:8080
 ```
 
-### Local gateway
+### Local Gateway
 
 Register a gateway running locally that was started outside the CLI:
 
@@ -135,7 +135,7 @@ $ openshell gateway add https://127.0.0.1:8080 --local
 
 ## Manage Multiple Gateways
 
-One gateway is always the **active gateway**. All CLI commands target it by default.
+One gateway is always the active gateway. All CLI commands target it by default. Both `gateway start` and `gateway add` automatically set the new gateway as active.
 
 List all registered gateways:
 
@@ -154,6 +154,22 @@ Override the active gateway for a single command with `-g`:
 ```console
 $ openshell status -g my-other-cluster
 ```
+
+Show deployment details for a gateway, including endpoint, auth mode, and port:
+
+```console
+$ openshell gateway info
+$ openshell gateway info --name my-remote-cluster
+```
+
+## Advanced Start Options
+
+| Flag | Purpose |
+|---|---|
+| `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. |
+| `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
+| `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |
+| `--registry-token` | GitHub PAT with `read:packages` scope for pulling container images from ghcr.io. Also configurable with `OPENSHELL_REGISTRY_TOKEN`. |
 
 ## Stop and Destroy
 
@@ -190,6 +206,15 @@ View gateway logs:
 
 ```console
 $ openshell doctor logs
+$ openshell doctor logs --tail              # stream live
+$ openshell doctor logs --lines 50          # last 50 lines
+```
+
+Run a command inside the gateway container for deeper inspection:
+
+```console
+$ openshell doctor exec -- kubectl get pods -A
+$ openshell doctor exec -- sh
 ```
 
 If the gateway is in a bad state, recreate it:

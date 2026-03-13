@@ -23,12 +23,31 @@ content:
 
 Hands-on walkthroughs that teach OpenShell concepts by building real configurations. Each tutorial builds on the previous one, starting with core sandbox mechanics and progressing to production workflows.
 
-- **{doc}`sandbox-policy-quickstart`**: Create a sandbox, observe default-deny networking, apply a read-only L7 policy, and inspect audit logs. No AI agent required.
-- **{doc}`github-sandbox`**: Launch Claude Code in a sandbox, diagnose a policy denial, and iterate on a custom GitHub policy from outside the sandbox.
+::::{grid} 1 1 2 2
+:gutter: 3
+
+:::{grid-item-card} First Network Policy
+:link: first-network-policy
+:link-type: doc
+
+Create a sandbox, observe default-deny networking, apply a read-only L7 policy, and inspect audit logs. No AI agent required.
++++
+{bdg-secondary}`Tutorial`
+:::
+
+:::{grid-item-card} GitHub Push Access
+:link: github-sandbox
+:link-type: doc
+
+Launch Claude Code in a sandbox, diagnose a policy denial, and iterate on a custom GitHub policy from outside the sandbox.
++++
+{bdg-secondary}`Tutorial`
+:::
+::::
 
 ```{toctree}
 :hidden:
 
-Basic Walkthrough <sandbox-policy-quickstart>
-GitHub Sandbox <github-sandbox>
+First Network Policy <first-network-policy>
+GitHub Push Access <github-sandbox>
 ```

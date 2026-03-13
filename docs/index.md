@@ -138,7 +138,7 @@ Install the CLI and create your first sandbox in two commands.
 :link: tutorials/index
 :link-type: doc
 
-Hands-on walkthroughs from first sandbox to production-ready policies.
+Hands-on walkthroughs from first sandbox to custom policies.
 
 +++
 {bdg-secondary}`Tutorial`
@@ -196,12 +196,6 @@ Release Notes <about/release-notes>
 :hidden:
 
 Quickstart <get-started/quickstart>
-```
-
-```{toctree}
-:caption: Tutorials
-:hidden:
-
 tutorials/index
 ```
 
@@ -211,6 +205,7 @@ tutorials/index
 
 sandboxes/index
 sandboxes/create-and-manage
+sandboxes/gateways
 sandboxes/providers
 sandboxes/policies
 sandboxes/community-sandboxes
@@ -238,5 +233,5 @@ reference/support-matrix
 :caption: Resources
 :hidden:
 
-resources/eula
+resources/license
 ```
