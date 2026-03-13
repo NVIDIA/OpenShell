@@ -42,6 +42,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Triage | `triage-issue` | Assess, classify, and route community-filed issues |
 | Platform | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs |
 | Platform | `tui-development` | Development guide for the ratatui-based terminal UI |
+| Maintenance | `sync-agent-infra` | Detect and fix drift across agent-first infrastructure files |
 | Reference | `sbom` | Generate SBOMs and resolve dependency licenses |
 
 ### Workflow Chains
