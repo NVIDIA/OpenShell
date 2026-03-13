@@ -606,7 +606,7 @@ network_policies:
         allowed_ips:
           - "10.86.8.223/32"
     binaries:
-      - { path: /usr/local/bin/python3.12 }
+      - { path: /usr/local/bin/python3.13 }
 ```
 
 With this policy, both work:
@@ -1090,7 +1090,7 @@ network_policies:
         allowed_ips:
           - "10.86.8.223/32"
     binaries:
-      - { path: /usr/local/bin/python3.12 }
+      - { path: /usr/local/bin/python3.13 }
 
 inference:
   allowed_routes:

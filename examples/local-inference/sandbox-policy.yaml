@@ -33,7 +33,7 @@ network_policies:
       - { host: pypi.org, port: 443 }
       - { host: files.pythonhosted.org, port: 443 }
     binaries:
-      - path: /usr/bin/python3.12
+      - path: /usr/bin/python3.13
 
   # Direct access to the NVIDIA inference API (L7 TLS intercept).
   # Used to verify that the L7 REST relay path streams responses correctly
@@ -48,4 +48,4 @@ network_policies:
         enforcement: enforce
         access: full
     binaries:
-      - path: /usr/bin/python3.12
+      - path: /usr/bin/python3.13

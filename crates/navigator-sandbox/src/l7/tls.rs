@@ -117,6 +117,7 @@ impl CertCache {
 
         let mut params = CertificateParams::new(vec![hostname.to_string()]).into_diagnostic()?;
         params.distinguished_name.push(DnType::CommonName, hostname);
+        params.use_authority_key_identifier_extension = true;
 
         let leaf_cert = params
             .signed_by(&leaf_key, &self.ca.ca_cert, &self.ca.ca_key)
