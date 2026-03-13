@@ -16,7 +16,7 @@ ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 
-FROM python:3.13-slim AS builder
+FROM python:3.12-slim AS builder
 
 ARG OPENSHELL_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default

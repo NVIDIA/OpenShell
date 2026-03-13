@@ -11,7 +11,7 @@ dynamic = ["version"]
 description = "OpenShell is the runtime environment for autonomous agents"
 license = "Apache-2.0"
 readme = "README.md"
-requires-python = ">=3.13"
+requires-python = ">=3.12"
 dependencies = [
     "cloudpickle>=3.0",
     "grpcio>=1.60",
@@ -21,6 +21,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
 ]

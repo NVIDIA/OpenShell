@@ -5,7 +5,7 @@
 
 
 ARG OSXCROSS_IMAGE=crazymax/osxcross:latest
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.12
 
 FROM ${OSXCROSS_IMAGE} AS osxcross
 

@@ -4,7 +4,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-ARG PYTHON_VERSION=3.13
+ARG PYTHON_VERSION=3.12
 
 FROM --platform=$BUILDPLATFORM python:${PYTHON_VERSION}-slim AS base
 
