@@ -66,7 +66,7 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 1. Validates that both fields are non-empty.
 2. Fetches the named provider record from the store.
 3. Validates the provider by resolving its route (checking that the provider type is supported and has a usable API key).
-4. Unless `skip_validation` is set, performs a lightweight provider-shaped probe against the resolved upstream endpoint (for example, a tiny chat/messages request with `max_tokens: 1`) to confirm the endpoint is reachable and accepts the expected auth/request shape.
+4. By default, performs a lightweight provider-shaped probe against the resolved upstream endpoint (for example, a tiny chat/messages request with `max_tokens: 1`) to confirm the endpoint is reachable and accepts the expected auth/request shape. `--no-verify` disables this probe when the endpoint is not up yet.
 5. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
 6. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
 
@@ -92,7 +92,7 @@ File: `proto/inference.proto`
 
 Key messages:
 
-- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `skip_validation`
+- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `verify` / `no_verify` overrides, with verification enabled by default
 - `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `version`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
 - `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`

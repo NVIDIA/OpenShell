@@ -3390,19 +3390,39 @@ pub async fn gateway_inference_set(
     provider_name: &str,
     model_id: &str,
     route_name: &str,
-    skip_validation: bool,
+    verify: bool,
+    no_verify: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let progress = if std::io::stdout().is_terminal() {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        spinner.set_message("Configuring inference...");
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        Some(spinner)
+    } else {
+        None
+    };
+
     let mut client = grpc_inference_client(server, tls).await?;
     let response = client
         .set_cluster_inference(SetClusterInferenceRequest {
             provider_name: provider_name.to_string(),
             model_id: model_id.to_string(),
             route_name: route_name.to_string(),
-            skip_validation,
+            verify,
+            no_verify,
         })
-        .await
-        .into_diagnostic()?;
+        .await;
+
+    if let Some(progress) = &progress {
+        progress.finish_and_clear();
+    }
+
+    let response = response.into_diagnostic()?;
 
     let configured = response.into_inner();
     let label = if configured.route_name == "sandbox-system" {
@@ -3416,6 +3436,12 @@ pub async fn gateway_inference_set(
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
+    if configured.validation_performed {
+        println!("  {}", "Validated Endpoints:".dimmed());
+        for endpoint in configured.validated_endpoints {
+            println!("    - {} ({})", endpoint.url, endpoint.protocol);
+        }
+    }
     Ok(())
 }
 
@@ -3424,7 +3450,8 @@ pub async fn gateway_inference_update(
     provider_name: Option<&str>,
     model_id: Option<&str>,
     route_name: &str,
-    skip_validation: bool,
+    verify: bool,
+    no_verify: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
     if provider_name.is_none() && model_id.is_none() {
@@ -3447,15 +3474,34 @@ pub async fn gateway_inference_update(
     let provider = provider_name.unwrap_or(&current.provider_name);
     let model = model_id.unwrap_or(&current.model_id);
 
+    let progress = if std::io::stdout().is_terminal() {
+        let spinner = ProgressBar::new_spinner();
+        spinner.set_style(
+            ProgressStyle::with_template("{spinner:.cyan} {msg} ({elapsed})")
+                .unwrap_or_else(|_| ProgressStyle::default_spinner()),
+        );
+        spinner.set_message("Configuring inference...");
+        spinner.enable_steady_tick(Duration::from_millis(120));
+        Some(spinner)
+    } else {
+        None
+    };
+
     let response = client
         .set_cluster_inference(SetClusterInferenceRequest {
             provider_name: provider.to_string(),
             model_id: model.to_string(),
             route_name: route_name.to_string(),
-            skip_validation,
+            verify,
+            no_verify,
         })
-        .await
-        .into_diagnostic()?;
+        .await;
+
+    if let Some(progress) = &progress {
+        progress.finish_and_clear();
+    }
+
+    let response = response.into_diagnostic()?;
 
     let configured = response.into_inner();
     let label = if configured.route_name == "sandbox-system" {
@@ -3469,6 +3515,12 @@ pub async fn gateway_inference_update(
     println!("  {} {}", "Provider:".dimmed(), configured.provider_name);
     println!("  {} {}", "Model:".dimmed(), configured.model_id);
     println!("  {} {}", "Version:".dimmed(), configured.version);
+    if configured.validation_performed {
+        println!("  {}", "Validated Endpoints:".dimmed());
+        for endpoint in configured.validated_endpoints {
+            println!("    - {} ({})", endpoint.url, endpoint.protocol);
+        }
+    }
     Ok(())
 }
 

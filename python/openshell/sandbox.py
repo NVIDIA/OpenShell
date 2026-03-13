@@ -398,13 +398,18 @@ class InferenceRouteClient:
         *,
         provider_name: str,
         model_id: str,
+        verify: bool = False,
         no_verify: bool = False,
     ) -> ClusterInferenceConfig:
+        if verify and no_verify:
+            raise ValueError("verify and no_verify are mutually exclusive")
+
         response = self._stub.SetClusterInference(
             inference_pb2.SetClusterInferenceRequest(
                 provider_name=provider_name,
                 model_id=model_id,
-                skip_validation=no_verify,
+                verify=verify,
+                no_verify=no_verify,
             ),
             timeout=self._timeout,
         )
