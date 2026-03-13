@@ -14,7 +14,7 @@ content:
 
 # Default Policy Reference
 
-The default policy is the policy applied when you create an OpenShell sandbox without `--policy`. It is defined in the [`deploy/docker/sandbox/dev-sandbox-policy.yaml`](https://github.com/NVIDIA/OpenShell/blob/main/deploy/docker/sandbox/dev-sandbox-policy.yaml) file.
+The default policy is the policy applied when you create an OpenShell sandbox without `--policy`. It is baked into the community base image ([`ghcr.io/nvidia/openshell-community/sandboxes/base`](https://github.com/nvidia/openshell-community)) and defined in the community repo's `dev-sandbox-policy.yaml`.
 
 ## Agent Compatibility
 
@@ -32,7 +32,4 @@ If you run a non-Claude agent without a custom policy, the agent's API calls are
 
 ## Default Policy Blocks
 
-The following tables show the default policy blocks pre-configured in the file.
-
-```{policy-table} deploy/docker/sandbox/dev-sandbox-policy.yaml
-```
+The default policy blocks are defined in the community base image. See the [openshell-community repository](https://github.com/nvidia/openshell-community) for the full `dev-sandbox-policy.yaml` source.

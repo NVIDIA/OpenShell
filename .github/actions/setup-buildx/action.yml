@@ -13,7 +13,7 @@ inputs:
     default: tcp://buildkit-arm64.buildkit:1234
   name:
     description: Builder instance name
-    default: navigator
+    default: openshell
 
 runs:
   using: composite

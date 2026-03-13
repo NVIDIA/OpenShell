@@ -10,7 +10,7 @@ STATE_FILE="$PROJECT_ROOT/.cache/openshell-build.state"
 # Fingerprint-based rebuild check
 #
 # Mirrors the approach in tasks/scripts/cluster-deploy-fast.sh: collect dirty
-# files from git, filter to paths in the navigator-cli dependency closure,
+# files from git, filter to paths in the openshell-cli dependency closure,
 # hash their contents, and compare against a persisted state file.  We also
 # track HEAD so that branch switches / pulls are detected.
 # ---------------------------------------------------------------------------
@@ -34,15 +34,15 @@ else
     } | sort -u
   )
 
-  # Filter to paths that can affect the navigator-cli binary
+  # Filter to paths that can affect the openshell-cli binary
   matches_cli() {
     local path=$1
     case "$path" in
       Cargo.toml|Cargo.lock|proto/*)
         return 0 ;;
-      crates/navigator-cli/*|crates/navigator-core/*|crates/navigator-bootstrap/*)
+      crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
         return 0 ;;
-      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*)
+      crates/openshell-policy/*|crates/openshell-providers/*|crates/openshell-tui/*)
         return 0 ;;
       *)
         return 1 ;;
@@ -89,7 +89,7 @@ fi
 
 if [[ "$needs_build" == "1" ]]; then
   echo "Recompiling openshell..." >&2
-  cargo build --package navigator-cli --quiet
+  cargo build --package openshell-cli --quiet
   # Persist state after successful build
   mkdir -p "$(dirname "$STATE_FILE")"
   cd "$PROJECT_ROOT"
@@ -108,9 +108,9 @@ if [[ "$needs_build" == "1" ]]; then
     case "$path" in
       Cargo.toml|Cargo.lock|proto/*)
         return 0 ;;
-      crates/navigator-cli/*|crates/navigator-core/*|crates/navigator-bootstrap/*)
+      crates/openshell-cli/*|crates/openshell-core/*|crates/openshell-bootstrap/*)
         return 0 ;;
-      crates/navigator-policy/*|crates/navigator-providers/*|crates/navigator-tui/*)
+      crates/openshell-policy/*|crates/openshell-providers/*|crates/openshell-tui/*)
         return 0 ;;
       *)
         return 1 ;;

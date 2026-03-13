@@ -23,7 +23,7 @@ else
 fi
 ENV_FILE=.env
 PUBLISHED_IMAGE_REPO_BASE_DEFAULT=ghcr.io/nvidia/openshell
-LOCAL_REGISTRY_CONTAINER=navigator-local-registry
+LOCAL_REGISTRY_CONTAINER=openshell-local-registry
 LOCAL_REGISTRY_ADDR=127.0.0.1:5000
 
 if [ -n "${CI:-}" ] && [ -n "${CI_REGISTRY_IMAGE:-}" ]; then
@@ -177,7 +177,7 @@ ensure_local_registry() {
   fi
 
   echo "Error: local registry is not reachable at ${REGISTRY_HOST}." >&2
-  echo "       Ensure a registry is running on port 5000 (e.g. docker run -d --name navigator-local-registry -p 5000:5000 registry:2)." >&2
+  echo "       Ensure a registry is running on port 5000 (e.g. docker run -d --name openshell-local-registry -p 5000:5000 registry:2)." >&2
   docker ps -a >&2 || true
   docker logs "${LOCAL_REGISTRY_CONTAINER}" >&2 || true
   exit 1
@@ -223,9 +223,7 @@ fi
 if [ "${SKIP_IMAGE_PUSH:-}" = "1" ]; then
   echo "Skipping image push (SKIP_IMAGE_PUSH=1; images already in registry)."
 elif [ "${MODE}" = "build" ] || [ "${MODE}" = "fast" ]; then
-  for component in gateway sandbox; do
-    tasks/scripts/cluster-push-component.sh "${component}"
-  done
+  tasks/scripts/cluster-push-component.sh gateway
 fi
 
 # Build the cluster image so it contains the latest Helm chart, manifests,

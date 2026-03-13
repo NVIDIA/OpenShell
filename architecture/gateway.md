@@ -2,7 +2,7 @@
 
 ## Overview
 
-`navigator-server` is the gateway -- the central control plane for a cluster. It exposes two gRPC services (Navigator and Inference) and HTTP endpoints on a single multiplexed port, manages sandbox lifecycle through Kubernetes CRDs, persists state in SQLite or Postgres, and provides SSH tunneling into sandbox pods. The gateway coordinates all interactions between clients, the Kubernetes cluster, and the persistence layer.
+`openshell-server` is the gateway -- the central control plane for a cluster. It exposes two gRPC services (OpenShell and Inference) and HTTP endpoints on a single multiplexed port, manages sandbox lifecycle through Kubernetes CRDs, persists state in SQLite or Postgres, and provides SSH tunneling into sandbox pods. The gateway coordinates all interactions between clients, the Kubernetes cluster, and the persistence layer.
 
 ## Architecture Diagram
 
@@ -15,7 +15,7 @@ graph TD
     TLS["TLS Acceptor<br/>(optional)"]
     MUX["MultiplexedService"]
     GRPC_ROUTER["GrpcRouter"]
-    NAV["NavigatorServer<br/>(Navigator service)"]
+    NAV["OpenShellServer<br/>(OpenShell service)"]
     INF["InferenceServer<br/>(Inference service)"]
     HTTP["HTTP Router<br/>(Axum)"]
     HEALTH["Health Endpoints"]
@@ -34,7 +34,7 @@ graph TD
     TLS --> MUX
     MUX -->|"content-type: application/grpc"| GRPC_ROUTER
     MUX -->|"other"| HTTP
-    GRPC_ROUTER -->|"/navigator.inference.v1.Inference/*"| INF
+    GRPC_ROUTER -->|"/openshell.inference.v1.Inference/*"| INF
     GRPC_ROUTER -->|"all other paths"| NAV
     HTTP --> HEALTH
     HTTP --> SSH_TUNNEL
@@ -57,42 +57,42 @@ graph TD
 
 | Module | File | Purpose |
 |--------|------|---------|
-| Entry point | `crates/navigator-server/src/main.rs` | CLI argument parsing, config assembly, tracing setup, calls `run_server` |
-| Gateway runtime | `crates/navigator-server/src/lib.rs` | `ServerState` struct, `run_server()` accept loop |
-| Protocol mux | `crates/navigator-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
-| gRPC: Navigator | `crates/navigator-server/src/grpc.rs` | `NavigatorService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
-| gRPC: Inference | `crates/navigator-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
-| HTTP | `crates/navigator-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
-| Browser auth | `crates/navigator-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
-| SSH tunnel | `crates/navigator-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
-| WS tunnel | `crates/navigator-server/src/ws_tunnel.rs` | WebSocket tunnel handler at `/_ws_tunnel` for Cloudflare-fronted clients |
-| TLS | `crates/navigator-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
-| Persistence | `crates/navigator-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
-| Persistence: SQLite | `crates/navigator-server/src/persistence/sqlite.rs` | `SqliteStore` with sqlx |
-| Persistence: Postgres | `crates/navigator-server/src/persistence/postgres.rs` | `PostgresStore` with sqlx |
-| Sandbox K8s | `crates/navigator-server/src/sandbox/mod.rs` | `SandboxClient`, CRD creation/deletion, Kubernetes watcher, phase derivation |
-| Sandbox index | `crates/navigator-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
-| Watch bus | `crates/navigator-server/src/sandbox_watch.rs` | `SandboxWatchBus`, `PlatformEventBus`, Kubernetes event tailer |
-| Tracing bus | `crates/navigator-server/src/tracing_bus.rs` | `TracingLogBus` -- captures tracing events keyed by `sandbox_id` |
+| Entry point | `crates/openshell-server/src/main.rs` | CLI argument parsing, config assembly, tracing setup, calls `run_server` |
+| Gateway runtime | `crates/openshell-server/src/lib.rs` | `ServerState` struct, `run_server()` accept loop |
+| Protocol mux | `crates/openshell-server/src/multiplex.rs` | `MultiplexService`, `MultiplexedService`, `GrpcRouter`, `BoxBody` |
+| gRPC: OpenShell | `crates/openshell-server/src/grpc.rs` | `OpenShellService` -- sandbox CRUD, provider CRUD, watch, exec, SSH sessions, policy delivery |
+| gRPC: Inference | `crates/openshell-server/src/inference.rs` | `InferenceService` -- cluster inference config (set/get) and sandbox inference bundle delivery |
+| HTTP | `crates/openshell-server/src/http.rs` | Health endpoints, merged with SSH tunnel router |
+| Browser auth | `crates/openshell-server/src/auth.rs` | Cloudflare browser login relay at `/auth/connect` |
+| SSH tunnel | `crates/openshell-server/src/ssh_tunnel.rs` | HTTP CONNECT handler at `/connect/ssh` |
+| WS tunnel | `crates/openshell-server/src/ws_tunnel.rs` | WebSocket tunnel handler at `/_ws_tunnel` for Cloudflare-fronted clients |
+| TLS | `crates/openshell-server/src/tls.rs` | `TlsAcceptor` wrapping rustls with ALPN |
+| Persistence | `crates/openshell-server/src/persistence/mod.rs` | `Store` enum (SQLite/Postgres), generic object CRUD, protobuf codec |
+| Persistence: SQLite | `crates/openshell-server/src/persistence/sqlite.rs` | `SqliteStore` with sqlx |
+| Persistence: Postgres | `crates/openshell-server/src/persistence/postgres.rs` | `PostgresStore` with sqlx |
+| Sandbox K8s | `crates/openshell-server/src/sandbox/mod.rs` | `SandboxClient`, CRD creation/deletion, Kubernetes watcher, phase derivation |
+| Sandbox index | `crates/openshell-server/src/sandbox_index.rs` | `SandboxIndex` -- in-memory name/pod-to-id correlation |
+| Watch bus | `crates/openshell-server/src/sandbox_watch.rs` | `SandboxWatchBus`, `PlatformEventBus`, Kubernetes event tailer |
+| Tracing bus | `crates/openshell-server/src/tracing_bus.rs` | `TracingLogBus` -- captures tracing events keyed by `sandbox_id` |
 
 Proto definitions consumed by the gateway:
 
 | Proto file | Package | Defines |
 |------------|---------|---------|
-| `proto/navigator.proto` | `navigator.v1` | `Navigator` service, sandbox/provider/SSH/watch messages |
-| `proto/inference.proto` | `navigator.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
-| `proto/datamodel.proto` | `navigator.datamodel.v1` | `Sandbox`, `SandboxSpec`, `SandboxStatus`, `Provider`, `SandboxPhase` |
-| `proto/sandbox.proto` | `navigator.sandbox.v1` | `SandboxPolicy`, `NetworkPolicyRule` |
+| `proto/openshell.proto` | `openshell.v1` | `OpenShell` service, sandbox/provider/SSH/watch messages |
+| `proto/inference.proto` | `openshell.inference.v1` | `Inference` service: `SetClusterInference`, `GetClusterInference`, `GetInferenceBundle` |
+| `proto/datamodel.proto` | `openshell.datamodel.v1` | `Sandbox`, `SandboxSpec`, `SandboxStatus`, `Provider`, `SandboxPhase` |
+| `proto/sandbox.proto` | `openshell.sandbox.v1` | `SandboxPolicy`, `NetworkPolicyRule` |
 
 ## Startup Sequence
 
-The gateway boots in `main()` (`crates/navigator-server/src/main.rs`) and proceeds through these steps:
+The gateway boots in `main()` (`crates/openshell-server/src/main.rs`) and proceeds through these steps:
 
 1. **Install rustls crypto provider** -- `aws_lc_rs::default_provider().install_default()`.
 2. **Parse CLI arguments** -- `Args::parse()` via `clap`. Every flag has a corresponding environment variable (see [Configuration](#configuration)).
 3. **Initialize tracing** -- Creates a `TracingLogBus` and installs a tracing subscriber that writes to stdout and publishes log events keyed by `sandbox_id` into the bus.
-4. **Build `Config`** -- Assembles a `navigator_core::Config` from the parsed arguments.
-5. **Call `run_server()`** (`crates/navigator-server/src/lib.rs`):
+4. **Build `Config`** -- Assembles a `openshell_core::Config` from the parsed arguments.
+5. **Call `run_server()`** (`crates/openshell-server/src/lib.rs`):
    1. Connect to the persistence store (`Store::connect`), which auto-detects SQLite vs Postgres from the URL prefix and runs migrations.
    2. Create `SandboxClient` (initializes a `kube::Client` from in-cluster or kubeconfig).
    3. Build `ServerState` (shared via `Arc<ServerState>` across all handlers).
@@ -118,7 +118,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 | `--disable-tls` | `OPENSHELL_DISABLE_TLS` | `false` | Listen on plaintext HTTP behind a trusted reverse proxy or tunnel |
 | `--disable-gateway-auth` | `OPENSHELL_DISABLE_GATEWAY_AUTH` | `false` | Keep TLS enabled but allow no-certificate clients and rely on application-layer auth |
 | `--client-tls-secret-name` | `OPENSHELL_CLIENT_TLS_SECRET_NAME` | None | K8s secret name to mount into sandbox pods for mTLS |
-| `--db-url` | `OPENSHELL_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/navigator/navigator.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
+| `--db-url` | `OPENSHELL_DB_URL` | *required* | Database URL (`sqlite:...` or `postgres://...`). The Helm chart defaults to `sqlite:/var/openshell/openshell.db` (persistent volume). In-memory SQLite (`sqlite::memory:?cache=shared`) works for ephemeral/test environments but data is lost on restart. |
 | `--sandbox-namespace` | `OPENSHELL_SANDBOX_NAMESPACE` | `default` | Kubernetes namespace for sandbox CRDs |
 | `--sandbox-image` | `OPENSHELL_SANDBOX_IMAGE` | None | Default container image for sandbox pods |
 | `--grpc-endpoint` | `OPENSHELL_GRPC_ENDPOINT` | None | gRPC endpoint reachable from within the cluster (for sandbox callbacks) |
@@ -131,7 +131,7 @@ All configuration is via CLI flags with environment variable fallbacks. The `--d
 
 ## Shared State
 
-All handlers share an `Arc<ServerState>` (`crates/navigator-server/src/lib.rs`):
+All handlers share an `Arc<ServerState>` (`crates/openshell-server/src/lib.rs`):
 
 ```rust
 pub struct ServerState {
@@ -156,7 +156,7 @@ All traffic (gRPC and HTTP) shares a single TCP port. Multiplexing happens at th
 
 ### Connection Handling
 
-`MultiplexService::serve()` (`crates/navigator-server/src/multiplex.rs`) creates per-connection service instances:
+`MultiplexService::serve()` (`crates/openshell-server/src/multiplex.rs`) creates per-connection service instances:
 
 1. Each accepted TCP stream (optionally TLS-wrapped) is passed to `hyper_util::server::conn::auto::Builder`, which auto-negotiates HTTP/1.1 or HTTP/2.
 2. The builder calls `serve_connection_with_upgrades()`, which supports HTTP upgrades (needed for the SSH tunnel's CONNECT method).
@@ -166,10 +166,10 @@ All traffic (gRPC and HTTP) shares a single TCP port. Multiplexing happens at th
 
 ### gRPC Sub-Routing
 
-`GrpcRouter` (`crates/navigator-server/src/multiplex.rs`) further routes gRPC requests by URI path prefix:
+`GrpcRouter` (`crates/openshell-server/src/multiplex.rs`) further routes gRPC requests by URI path prefix:
 
-- Paths starting with `/navigator.inference.v1.Inference/` go to `InferenceServer`.
-- All other gRPC paths go to `NavigatorServer`.
+- Paths starting with `/openshell.inference.v1.Inference/` go to `InferenceServer`.
+- All other gRPC paths go to `OpenShellServer`.
 
 ### Body Type Normalization
 
@@ -177,22 +177,22 @@ Both gRPC and HTTP handlers produce different response body types. `MultiplexedS
 
 ### TLS + mTLS
 
-When TLS is enabled (`crates/navigator-server/src/tls.rs`):
+When TLS is enabled (`crates/openshell-server/src/tls.rs`):
 
 - `TlsAcceptor::from_files()` loads PEM certificates and keys via `rustls_pemfile`, builds a `rustls::ServerConfig`, and configures ALPN to advertise `h2` and `http/1.1`.
 - When a client CA path is provided (`--tls-client-ca`), the server enforces mutual TLS using `WebPkiClientVerifier` by default. In Cloudflare-fronted deployments, `--disable-gateway-auth` keeps TLS enabled but allows no-certificate clients so the edge can forward a JWT instead.
 - `--disable-tls` removes gateway-side TLS entirely and serves plaintext HTTP behind a trusted reverse proxy or tunnel.
 - Supports PKCS#1, PKCS#8, and SEC1 private key formats.
 - The TLS handshake happens before the stream reaches Hyper's auto builder, so ALPN negotiation and HTTP version detection work together transparently.
-- Certificates are generated at cluster bootstrap time by the `navigator-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `navigator-server-tls` (server cert+key), `navigator-server-client-ca` (CA cert), and `navigator-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
+- Certificates are generated at cluster bootstrap time by the `openshell-bootstrap` crate using `rcgen`, not by a Helm Job. The bootstrap reconciles three K8s secrets: `openshell-server-tls` (server cert+key), `openshell-server-client-ca` (CA cert), and `openshell-client-tls` (client cert+key+CA, shared by CLI and sandbox pods).
 - **Certificate lifetime**: Certificates use `rcgen` defaults (effectively never expire), which is appropriate for an internal dev-cluster PKI where certs are ephemeral to the cluster's lifetime.
-- **Redeploy behavior**: On redeploy, existing cluster TLS secrets are loaded and reused if they are complete and valid PEM. If secrets are missing, incomplete, or malformed, fresh PKI is generated. If rotation occurs and the navigator workload is already running, the bootstrap performs a rollout restart and waits for completion before persisting CLI-side credentials.
+- **Redeploy behavior**: On redeploy, existing cluster TLS secrets are loaded and reused if they are complete and valid PEM. If secrets are missing, incomplete, or malformed, fresh PKI is generated. If rotation occurs and the openshell workload is already running, the bootstrap performs a rollout restart and waits for completion before persisting CLI-side credentials.
 
 ## gRPC Services
 
-### Navigator Service
+### OpenShell Service
 
-Defined in `proto/navigator.proto`, implemented in `crates/navigator-server/src/grpc.rs` as `NavigatorService`.
+Defined in `proto/openshell.proto`, implemented in `crates/openshell-server/src/grpc.rs` as `OpenShellService`.
 
 #### Sandbox Management
 
@@ -250,7 +250,7 @@ These RPCs support the sandbox-initiated policy recommendation pipeline. The san
 
 ### Inference Service
 
-Defined in `proto/inference.proto`, implemented in `crates/navigator-server/src/inference.rs` as `InferenceService`.
+Defined in `proto/inference.proto`, implemented in `crates/openshell-server/src/inference.rs` as `InferenceService`.
 
 The gateway acts as the control plane for inference configuration. It stores a single managed cluster inference route (named `inference.local`) and delivers resolved route bundles to sandbox pods. The gateway does not execute inference requests -- sandboxes connect directly to inference backends using the credentials and endpoints provided in the bundle.
 
@@ -268,7 +268,7 @@ The gateway manages a single cluster-wide inference route that maps to a provide
 
 The `GetInferenceBundle` RPC resolves the managed cluster route into a `GetInferenceBundleResponse` containing fully materialized route data that sandboxes can use directly.
 
-The trait method delegates to `resolve_inference_bundle(store)` (`crates/navigator-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
+The trait method delegates to `resolve_inference_bundle(store)` (`crates/openshell-server/src/inference.rs`), which takes `&Store` instead of `&self`. This extraction decouples bundle resolution from `ServerState`, enabling direct unit testing against an in-memory SQLite store without constructing a full server.
 
 The `GetInferenceBundleResponse` includes:
 
@@ -278,14 +278,14 @@ The `GetInferenceBundleResponse` includes:
 
 #### Provider-Based Route Resolution
 
-Managed route resolution in `resolve_managed_cluster_route()` (`crates/navigator-server/src/inference.rs`):
+Managed route resolution in `resolve_managed_cluster_route()` (`crates/openshell-server/src/inference.rs`):
 
 1. Load the managed route by name (`inference.local`).
 2. Skip (return `None`) if the route does not exist, has no spec, or is disabled.
 3. Validate that `provider_name` and `model_id` are non-empty.
 4. Fetch the referenced provider record from the store.
 5. Resolve the provider into a `ResolvedProviderRoute` via `resolve_provider_route()`:
-   - Look up the `InferenceProviderProfile` for the provider's type via `navigator_core::inference::profile_for()`. Supported types: `openai`, `anthropic`, `nvidia`.
+   - Look up the `InferenceProviderProfile` for the provider's type via `openshell_core::inference::profile_for()`. Supported types: `openai`, `anthropic`, `nvidia`.
    - Search the provider's credentials map for an API key using the profile's preferred key name (e.g., `OPENAI_API_KEY`), falling back to the first non-empty credential in sorted key order.
    - Resolve the base URL from the provider's config map using the profile-specific key (e.g., `OPENAI_BASE_URL`), falling back to the profile's default URL.
    - Derive protocols from the profile (e.g., `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` for OpenAI-compatible providers).
@@ -295,7 +295,7 @@ The `ClusterInferenceConfig` stored in the database contains only `provider_name
 
 ## HTTP Endpoints
 
-The HTTP router (`crates/navigator-server/src/http.rs`) merges two sub-routers:
+The HTTP router (`crates/openshell-server/src/http.rs`) merges two sub-routers:
 
 ### Health Endpoints
 
@@ -322,7 +322,7 @@ See [SSH Tunnel Gateway](#ssh-tunnel-gateway) for details.
 
 ## Watch Sandbox Stream
 
-The `WatchSandbox` RPC (`crates/navigator-server/src/grpc.rs`) provides a multiplexed server-streaming response that can include sandbox status snapshots, gateway log lines, and platform events.
+The `WatchSandbox` RPC (`crates/openshell-server/src/grpc.rs`) provides a multiplexed server-streaming response that can include sandbox status snapshots, gateway log lines, and platform events.
 
 ### Request Options
 
@@ -381,7 +381,7 @@ Broadcast lag is translated to `Status::resource_exhausted` via `broadcast_to_st
 
 ## Remote Exec via SSH
 
-The `ExecSandbox` RPC (`crates/navigator-server/src/grpc.rs`) executes a command inside a sandbox pod over SSH and streams stdout/stderr/exit back to the client.
+The `ExecSandbox` RPC (`crates/openshell-server/src/grpc.rs`) executes a command inside a sandbox pod over SSH and streams stdout/stderr/exit back to the client.
 
 ### Execution Flow
 
@@ -412,7 +412,7 @@ The `ssh_handshake_skew_secs` configuration controls how much clock skew is tole
 
 ## SSH Tunnel Gateway
 
-The SSH tunnel endpoint (`crates/navigator-server/src/ssh_tunnel.rs`) allows external SSH clients to reach sandbox pods through the gateway using HTTP CONNECT upgrades.
+The SSH tunnel endpoint (`crates/openshell-server/src/ssh_tunnel.rs`) allows external SSH clients to reach sandbox pods through the gateway using HTTP CONNECT upgrades.
 
 ### Request Flow
 
@@ -429,12 +429,12 @@ The SSH tunnel endpoint (`crates/navigator-server/src/ssh_tunnel.rs`) allows ext
 
 ### Store Architecture
 
-The `Store` enum (`crates/navigator-server/src/persistence/mod.rs`) dispatches to either `SqliteStore` or `PostgresStore` based on the database URL prefix:
+The `Store` enum (`crates/openshell-server/src/persistence/mod.rs`) dispatches to either `SqliteStore` or `PostgresStore` based on the database URL prefix:
 
 - `sqlite:*` -- uses `sqlx::SqlitePool` (1 connection for in-memory, 5 for file-based).
 - `postgres://` or `postgresql://` -- uses `sqlx::PgPool` (max 10 connections).
 
-Both backends auto-run migrations on connect from `crates/navigator-server/migrations/{sqlite,postgres}/`.
+Both backends auto-run migrations on connect from `crates/openshell-server/migrations/{sqlite,postgres}/`.
 
 ### Schema
 
@@ -476,9 +476,9 @@ The `generate_name()` function produces random 6-character lowercase alphabetic 
 
 ### Deployment Storage
 
-The gateway runs as a Kubernetes **StatefulSet** with a `volumeClaimTemplate` that provisions a 1Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/var/navigator`. On k3s clusters this uses the built-in `local-path-provisioner` StorageClass (the cluster default). The SQLite database file at `/var/navigator/navigator.db` survives pod restarts and rescheduling.
+The gateway runs as a Kubernetes **StatefulSet** with a `volumeClaimTemplate` that provisions a 1Gi `ReadWriteOnce` PersistentVolumeClaim mounted at `/var/openshell`. On k3s clusters this uses the built-in `local-path-provisioner` StorageClass (the cluster default). The SQLite database file at `/var/openshell/openshell.db` survives pod restarts and rescheduling.
 
-The Helm chart template is at `deploy/helm/navigator/templates/statefulset.yaml`.
+The Helm chart template is at `deploy/helm/openshell/templates/statefulset.yaml`.
 
 ### CRUD Semantics
 
@@ -490,15 +490,15 @@ The Helm chart template is at `deploy/helm/navigator/templates/statefulset.yaml`
 
 ### Sandbox CRD Management
 
-`SandboxClient` (`crates/navigator-server/src/sandbox/mod.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs.
+`SandboxClient` (`crates/openshell-server/src/sandbox/mod.rs`) manages `agents.x-k8s.io/v1alpha1/Sandbox` CRDs.
 
-- **Create**: Translates a `Sandbox` proto into a Kubernetes `DynamicObject` with labels (`navigator.ai/sandbox-id`, `navigator.ai/managed-by: navigator`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.).
+- **Create**: Translates a `Sandbox` proto into a Kubernetes `DynamicObject` with labels (`openshell.ai/sandbox-id`, `openshell.ai/managed-by: openshell`) and a spec that includes the pod template, environment variables, and gateway-required env vars (`OPENSHELL_SANDBOX_ID`, `OPENSHELL_ENDPOINT`, `OPENSHELL_SSH_LISTEN_ADDR`, etc.).
 - **Delete**: Calls the Kubernetes API to delete the CRD by name. Returns `false` if already gone (404).
 - **Pod IP resolution**: `agent_pod_ip()` fetches the agent pod and reads `status.podIP`.
 
 ### Sandbox Watcher
 
-`spawn_sandbox_watcher()` (`crates/navigator-server/src/sandbox/mod.rs`) runs a Kubernetes watcher on `Sandbox` CRDs and processes three event types:
+`spawn_sandbox_watcher()` (`crates/openshell-server/src/sandbox/mod.rs`) runs a Kubernetes watcher on `Sandbox` CRDs and processes three event types:
 
 - **Applied**: Extracts the sandbox ID from labels (or falls back to name prefix stripping), reads the CRD status, derives the phase, and upserts the sandbox record in the store. Notifies the watch bus.
 - **Deleted**: Removes the sandbox record from the store and the index. Notifies the watch bus.
@@ -521,7 +521,7 @@ All other `Ready=False` reasons are treated as terminal failures (`Error` phase)
 
 ### Kubernetes Event Tailer
 
-`spawn_kube_event_tailer()` (`crates/navigator-server/src/sandbox_watch.rs`) watches all Kubernetes `Event` objects in the sandbox namespace and correlates them to sandbox IDs using `SandboxIndex`:
+`spawn_kube_event_tailer()` (`crates/openshell-server/src/sandbox_watch.rs`) watches all Kubernetes `Event` objects in the sandbox namespace and correlates them to sandbox IDs using `SandboxIndex`:
 
 - Events involving `kind: Sandbox` are correlated by sandbox name.
 - Events involving `kind: Pod` are correlated by agent pod name.
@@ -531,7 +531,7 @@ Matched events are published to the `PlatformEventBus` as `SandboxStreamEvent::E
 
 ## Sandbox Index
 
-`SandboxIndex` (`crates/navigator-server/src/sandbox_index.rs`) maintains two in-memory maps protected by an `RwLock`:
+`SandboxIndex` (`crates/openshell-server/src/sandbox_index.rs`) maintains two in-memory maps protected by an `RwLock`:
 
 - `sandbox_name_to_id: HashMap<String, String>`
 - `agent_pod_to_id: HashMap<String, String>`

@@ -25,7 +25,7 @@ The key architectural decision: **all analysis runs sandbox-side**. The gateway 
 
 ### Denial Aggregator (Sandbox Side)
 
-The `DenialAggregator` (`crates/navigator-sandbox/src/denial_aggregator.rs`) runs as a background tokio task inside the sandbox supervisor. It:
+The `DenialAggregator` (`crates/openshell-sandbox/src/denial_aggregator.rs`) runs as a background tokio task inside the sandbox supervisor. It:
 
 1. Receives `DenialEvent` structs from the proxy via an unbounded MPSC channel
 2. Deduplicates events by `(host, port, binary)` key with running counters
@@ -48,7 +48,7 @@ L7 (per-request) denials from `l7/relay.rs` are captured via tracing in the curr
 
 ### Mechanistic Mapper (Sandbox Side)
 
-The `mechanistic_mapper` module (`crates/navigator-sandbox/src/mechanistic_mapper.rs`) generates draft policy recommendations deterministically, without requiring an LLM:
+The `mechanistic_mapper` module (`crates/openshell-sandbox/src/mechanistic_mapper.rs`) generates draft policy recommendations deterministically, without requiring an LLM:
 
 1. Groups denial summaries by `(host, port, binary)` — one proposal per unique triple
 2. For each group, generates a `NetworkPolicyRule` allowing that endpoint for that binary
@@ -65,7 +65,7 @@ The mapper runs in `flush_proposals_to_gateway` after the aggregator drains. It 
 
 ### Gateway: Validate and Persist
 
-The gateway's `SubmitPolicyAnalysis` handler (`crates/navigator-server/src/grpc.rs`) is deliberately thin:
+The gateway's `SubmitPolicyAnalysis` handler (`crates/openshell-server/src/grpc.rs`) is deliberately thin:
 
 1. Receives proposed chunks and denial summaries from the sandbox
 2. Validates each chunk (rejects missing `rule_name` or `proposed_rule`)
@@ -106,7 +106,7 @@ CREATE UNIQUE INDEX idx_draft_chunks_endpoint
     WHERE status IN ('pending', 'approved', 'rejected');
 ```
 
-Schema lives in `crates/navigator-server/migrations/{sqlite,postgres}/003_create_policy_recommendations.sql`.
+Schema lives in `crates/openshell-server/migrations/{sqlite,postgres}/003_create_policy_recommendations.sql`.
 
 ### Per-Binary Granularity
 

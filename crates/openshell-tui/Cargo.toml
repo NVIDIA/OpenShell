@@ -1,0 +1,32 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-tui"
+description = "OpenShell interactive TUI"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+openshell-bootstrap = { path = "../openshell-bootstrap" }
+openshell-policy = { path = "../openshell-policy" }
+openshell-providers = { path = "../openshell-providers" }
+
+base64 = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+terminal-colorsaurus = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["tls"] }
+miette = { workspace = true }
+owo-colors = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+
+[lints]
+workspace = true

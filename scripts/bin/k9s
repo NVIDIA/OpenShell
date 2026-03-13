@@ -10,6 +10,6 @@
 #
 # Usage:
 #   k9s
-#   k9s -n navigator
+#   k9s -n openshell
 
 exec openshell doctor exec -- k9s "$@"

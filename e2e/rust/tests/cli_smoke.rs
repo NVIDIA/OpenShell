@@ -84,8 +84,9 @@ async fn sandbox_help_shows_upload_download() {
 }
 
 /// `openshell sandbox create --help` must show `--upload`, `--no-git-ignore`,
-/// `--bootstrap`/`--no-bootstrap`, `--editor`, and
+/// `--no-bootstrap`, `--editor`, and
 /// `--auto-providers`/`--no-auto-providers`.
+/// Note: `--bootstrap` is intentionally hidden (it's the default behaviour).
 #[tokio::test]
 async fn sandbox_create_help_shows_new_flags() {
     let (output, code) = run_isolated(&["sandbox", "create", "--help"]).await;
@@ -95,7 +96,6 @@ async fn sandbox_create_help_shows_new_flags() {
     for flag in [
         "--upload",
         "--no-git-ignore",
-        "--bootstrap",
         "--no-bootstrap",
         "--editor",
         "--auto-providers",

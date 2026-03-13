@@ -4,7 +4,7 @@ This document describes how OpenShell bootstraps a single-node k3s gateway insid
 
 ## Goals and Scope
 
-- Provide a single bootstrap flow through `navigator-bootstrap` for local and remote gateway lifecycle.
+- Provide a single bootstrap flow through `openshell-bootstrap` for local and remote gateway lifecycle.
 - Keep Docker as the only runtime dependency for provisioning and lifecycle operations.
 - Package the OpenShell gateway as one container image, transferred to the target host via registry pull.
 - Support idempotent `deploy` behavior (safe to re-run).
@@ -17,18 +17,18 @@ Out of scope:
 
 ## Components
 
-- `crates/navigator-cli/src/main.rs`: CLI entry point; `clap`-based command parsing.
-- `crates/navigator-cli/src/run.rs`: CLI command implementations (`gateway_start`, `gateway_stop`, `gateway_destroy`, `gateway_info`, `doctor_logs`).
-- `crates/navigator-cli/src/bootstrap.rs`: Auto-bootstrap helpers for `sandbox create` (offers to deploy a gateway when one is unreachable).
-- `crates/navigator-bootstrap/src/lib.rs`: Gateway lifecycle orchestration (`deploy_gateway`, `deploy_gateway_with_logs`, `gateway_handle`, `check_existing_deployment`).
-- `crates/navigator-bootstrap/src/docker.rs`: Docker API wrappers (network, volume, container, image operations).
-- `crates/navigator-bootstrap/src/image.rs`: Remote image registry pull with XOR-obfuscated distribution credentials.
-- `crates/navigator-bootstrap/src/runtime.rs`: In-container operations via `docker exec` (health polling, stale node cleanup, deployment restart).
-- `crates/navigator-bootstrap/src/metadata.rs`: Gateway metadata creation, storage, and active gateway tracking.
-- `crates/navigator-bootstrap/src/mtls.rs`: Gateway TLS detection and CLI mTLS bundle extraction.
-- `crates/navigator-bootstrap/src/push.rs`: Local development image push into k3s containerd.
-- `crates/navigator-bootstrap/src/paths.rs`: XDG path resolution.
-- `crates/navigator-bootstrap/src/constants.rs`: Shared constants (image name, network name, container/volume naming).
+- `crates/openshell-cli/src/main.rs`: CLI entry point; `clap`-based command parsing.
+- `crates/openshell-cli/src/run.rs`: CLI command implementations (`gateway_start`, `gateway_stop`, `gateway_destroy`, `gateway_info`, `doctor_logs`).
+- `crates/openshell-cli/src/bootstrap.rs`: Auto-bootstrap helpers for `sandbox create` (offers to deploy a gateway when one is unreachable).
+- `crates/openshell-bootstrap/src/lib.rs`: Gateway lifecycle orchestration (`deploy_gateway`, `deploy_gateway_with_logs`, `gateway_handle`, `check_existing_deployment`).
+- `crates/openshell-bootstrap/src/docker.rs`: Docker API wrappers (network, volume, container, image operations).
+- `crates/openshell-bootstrap/src/image.rs`: Remote image registry pull with XOR-obfuscated distribution credentials.
+- `crates/openshell-bootstrap/src/runtime.rs`: In-container operations via `docker exec` (health polling, stale node cleanup, deployment restart).
+- `crates/openshell-bootstrap/src/metadata.rs`: Gateway metadata creation, storage, and active gateway tracking.
+- `crates/openshell-bootstrap/src/mtls.rs`: Gateway TLS detection and CLI mTLS bundle extraction.
+- `crates/openshell-bootstrap/src/push.rs`: Local development image push into k3s containerd.
+- `crates/openshell-bootstrap/src/paths.rs`: XDG path resolution.
+- `crates/openshell-bootstrap/src/constants.rs`: Shared constants (image name, network name, container/volume naming).
 - `deploy/docker/Dockerfile.cluster`: Container image definition (k3s base + Helm charts + manifests + entrypoint).
 - `deploy/docker/cluster-entrypoint.sh`: Container entrypoint (DNS proxy, registry config, manifest injection).
 - `deploy/docker/cluster-healthcheck.sh`: Docker HEALTHCHECK script.
@@ -76,8 +76,8 @@ Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures 
 ```mermaid
 sequenceDiagram
   participant U as User
-  participant C as navigator-cli
-  participant B as navigator-bootstrap
+  participant C as openshell-cli
+  participant B as openshell-bootstrap
   participant L as Local Docker daemon
   participant R as Remote Docker daemon (SSH)
 
@@ -97,7 +97,7 @@ sequenceDiagram
   B->>R: start_container
   B->>R: clean_stale_nodes (kubectl delete node)
   B->>R: wait_for_gateway_ready (180 attempts, 2s apart)
-  B->>R: poll for secret navigator-cli-client (90 attempts, 2s apart)
+  B->>R: poll for secret openshell-cli-client (90 attempts, 2s apart)
   R-->>B: ca.crt, tls.crt, tls.key
   B->>B: atomically store mTLS bundle
   B->>B: create and persist gateway metadata JSON
@@ -110,7 +110,7 @@ sequenceDiagram
 ```mermaid
 flowchart LR
   subgraph WS[User workstation]
-    NAV[navigator-cli]
+    NAV[openshell-cli]
     MTLS[mTLS bundle ca.crt, tls.crt, tls.key]
   end
 
@@ -134,7 +134,7 @@ flowchart LR
 
 ### 1) Entry and client selection
 
-`deploy_gateway(DeployOptions)` in `crates/navigator-bootstrap/src/lib.rs` chooses execution mode:
+`deploy_gateway(DeployOptions)` in `crates/openshell-bootstrap/src/lib.rs` chooses execution mode:
 
 - `DeployOptions` fields: `name: String`, `image_ref: Option<String>`, `remote: Option<RemoteOptions>`, `port: u16` (default 8080).
 - `RemoteOptions` fields: `destination: String`, `ssh_key: Option<String>`.
@@ -185,7 +185,7 @@ For the target daemon (local or remote):
 After the container starts:
 
 1. **Clean stale nodes**: `clean_stale_nodes()` finds `NotReady` nodes via `kubectl get nodes` and deletes them. This is needed when a container is recreated but reuses the persistent volume -- k3s registers a new node (using the container ID as hostname) while old node entries persist in etcd. Non-fatal on error; returns the count of removed nodes.
-2. **Push local images** (optional, local deploy only): If `OPENSHELL_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/navigator -n navigator` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/navigator-bootstrap/src/push.rs`.
+2. **Push local images** (optional, local deploy only): If `OPENSHELL_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/openshell openshell` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/openshell-bootstrap/src/push.rs`.
 3. **Wait for gateway health**: `wait_for_gateway_ready()` polls the Docker HEALTHCHECK status up to 180 times, 2 seconds apart (6 min total). A background task streams container logs during this wait. Failure modes:
    - Container exits during polling: error includes recent log lines.
    - Container has no HEALTHCHECK instruction: fails immediately.
@@ -193,7 +193,7 @@ After the container starts:
 
 ### 5) mTLS bundle capture
 
-TLS is always required. `fetch_and_store_cli_mtls()` polls for Kubernetes secret `navigator-cli-client` in namespace `navigator` (90 attempts, 2 seconds apart, 3 min total). Each attempt checks the container is still running. The secret's base64-encoded `ca.crt`, `tls.crt`, and `tls.key` fields are decoded and stored.
+TLS is always required. `fetch_and_store_cli_mtls()` polls for Kubernetes secret `openshell-cli-client` in namespace `openshell` (90 attempts, 2 seconds apart, 3 min total). Each attempt checks the container is still running. The secret's base64-encoded `ca.crt`, `tls.crt`, and `tls.key` fields are decoded and stored.
 
 Storage location: `~/.config/openshell/gateways/{name}/mtls/`
 
@@ -236,10 +236,10 @@ Layers added:
 1. Custom entrypoint: `deploy/docker/cluster-entrypoint.sh` -> `/usr/local/bin/cluster-entrypoint.sh`
 2. Healthcheck script: `deploy/docker/cluster-healthcheck.sh` -> `/usr/local/bin/cluster-healthcheck.sh`
 3. Packaged Helm charts: `deploy/docker/.build/charts/*.tgz` -> `/var/lib/rancher/k3s/server/static/charts/`
-4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` -> `/opt/navigator/manifests/`
+4. Kubernetes manifests: `deploy/kube/manifests/*.yaml` -> `/opt/openshell/manifests/`
 
 Bundled manifests include:
-- `navigator-helmchart.yaml` (OpenShell Helm chart auto-deploy)
+- `openshell-helmchart.yaml` (OpenShell Helm chart auto-deploy)
 - `envoy-gateway-helmchart.yaml` (Envoy Gateway for Gateway API)
 - `agent-sandbox.yaml`
 
@@ -267,11 +267,11 @@ Writes `/etc/rancher/k3s/registries.yaml` from `REGISTRY_HOST`, `REGISTRY_ENDPOI
 
 ### Manifest injection
 
-Copies bundled manifests from `/opt/navigator/manifests/` to `/var/lib/rancher/k3s/server/manifests/`. This is needed because the volume mount on `/var/lib/rancher/k3s` overwrites any files baked into that path at image build time.
+Copies bundled manifests from `/opt/openshell/manifests/` to `/var/lib/rancher/k3s/server/manifests/`. This is needed because the volume mount on `/var/lib/rancher/k3s` overwrites any files baked into that path at image build time.
 
 ### Image configuration overrides
 
-When environment variables are set, the entrypoint modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/navigator-helmchart.yaml`:
+When environment variables are set, the entrypoint modifies the HelmChart manifest at `/var/lib/rancher/k3s/server/manifests/openshell-helmchart.yaml`:
 
 - `IMAGE_REPO_BASE`: Rewrites `repository:`, `sandboxImage:`, and `jobImage:` in the HelmChart.
 - `PUSH_IMAGE_REFS`: In push mode, parses comma-separated image refs and rewrites the exact gateway, sandbox, and pki-job image references (matching on path component `/gateway:`, `/sandbox:`, `/pki-job:`).
@@ -285,15 +285,15 @@ When environment variables are set, the entrypoint modifies the HelmChart manife
 `deploy/docker/cluster-healthcheck.sh` validates cluster readiness through a series of checks:
 
 1. **Kubernetes API**: `kubectl get --raw='/readyz'`
-2. **OpenShell StatefulSet**: Checks that `statefulset/navigator` in namespace `navigator` exists and has 1 ready replica.
-3. **Gateway**: Checks that `gateway/navigator-gateway` in namespace `navigator` has the `Programmed` condition.
-4. **mTLS secret** (conditional): If `NAV_GATEWAY_TLS_ENABLED` is true (or inferred from the HelmChart manifest using the same two-path detection logic as the bootstrap code), checks that secret `navigator-cli-client` exists with non-empty `ca.crt`, `tls.crt`, and `tls.key` data.
+2. **OpenShell StatefulSet**: Checks that `statefulset/openshell` in namespace `openshell` exists and has 1 ready replica.
+3. **Gateway**: Checks that `gateway/openshell-gateway` in namespace `openshell` has the `Programmed` condition.
+4. **mTLS secret** (conditional): If `NAV_GATEWAY_TLS_ENABLED` is true (or inferred from the HelmChart manifest using the same two-path detection logic as the bootstrap code), checks that secret `openshell-cli-client` exists with non-empty `ca.crt`, `tls.crt`, and `tls.key` data.
 
 ## GPU Enablement
 
 GPU support is part of the single-node gateway bootstrap path rather than a separate architecture.
 
-- `openshell gateway start --gpu` threads a boolean deploy option through `crates/navigator-cli`, `crates/navigator-bootstrap`, and `crates/navigator-bootstrap/src/docker.rs`.
+- `openshell gateway start --gpu` threads a boolean deploy option through `crates/openshell-cli`, `crates/openshell-bootstrap`, and `crates/openshell-bootstrap/src/docker.rs`.
 - When enabled, the cluster container is created with Docker `DeviceRequests`, which is the API equivalent of `docker run --gpus all`.
 - `deploy/docker/Dockerfile.cluster` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
 - `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
@@ -374,7 +374,7 @@ flowchart LR
 
 When `openshell sandbox create` cannot connect to a gateway (connection refused, DNS error, missing default TLS certs), the CLI offers to bootstrap one automatically:
 
-1. `should_attempt_bootstrap()` in `crates/navigator-cli/src/bootstrap.rs` checks the error type. It returns `true` for connectivity errors and missing default TLS materials, but `false` for TLS handshake/auth errors.
+1. `should_attempt_bootstrap()` in `crates/openshell-cli/src/bootstrap.rs` checks the error type. It returns `true` for connectivity errors and missing default TLS materials, but `false` for TLS handshake/auth errors.
 2. If running in a terminal, the user is prompted to confirm.
 3. `run_bootstrap()` deploys a gateway named `"openshell"`, sets it as active, and returns fresh `TlsOptions` pointing to the newly-written mTLS certs.
 
@@ -411,7 +411,7 @@ Environment variables that affect bootstrap behavior when set on the host:
 | `DOCKER_HOST` | When `tcp://` and non-loopback, the host is added as a TLS SAN and used as the gateway endpoint |
 | `OPENSHELL_PUSH_IMAGES` | Comma-separated image refs to push into the gateway's containerd (local deploy only) |
 | `OPENSHELL_REGISTRY_HOST` | Override the distribution registry host |
-| `OPENSHELL_REGISTRY_NAMESPACE` | Override the registry namespace (default: `"navigator"`) |
+| `OPENSHELL_REGISTRY_NAMESPACE` | Override the registry namespace (default: `"openshell"`) |
 | `IMAGE_REPO_BASE` / `OPENSHELL_IMAGE_REPO_BASE` | Override the image repository base path |
 | `OPENSHELL_REGISTRY_INSECURE` | Use HTTP instead of HTTPS for registry mirror |
 | `OPENSHELL_REGISTRY_ENDPOINT` | Custom registry mirror endpoint |
@@ -437,20 +437,20 @@ openshell/
 
 ## Implementation References
 
-- `crates/navigator-bootstrap/src/lib.rs` -- public API, deploy orchestration
-- `crates/navigator-bootstrap/src/docker.rs` -- Docker API wrappers
-- `crates/navigator-bootstrap/src/image.rs` -- registry pull, XOR credentials
-- `crates/navigator-bootstrap/src/runtime.rs` -- exec, health polling, stale node cleanup
-- `crates/navigator-bootstrap/src/metadata.rs` -- metadata CRUD, active gateway, SSH resolution
-- `crates/navigator-bootstrap/src/mtls.rs` -- TLS detection, secret extraction, atomic write
-- `crates/navigator-bootstrap/src/push.rs` -- local image push into k3s containerd
-- `crates/navigator-bootstrap/src/constants.rs` -- naming conventions
-- `crates/navigator-bootstrap/src/paths.rs` -- XDG path helpers
-- `crates/navigator-cli/src/main.rs` -- CLI command definitions
-- `crates/navigator-cli/src/run.rs` -- CLI command implementations
-- `crates/navigator-cli/src/bootstrap.rs` -- auto-bootstrap from sandbox create
+- `crates/openshell-bootstrap/src/lib.rs` -- public API, deploy orchestration
+- `crates/openshell-bootstrap/src/docker.rs` -- Docker API wrappers
+- `crates/openshell-bootstrap/src/image.rs` -- registry pull, XOR credentials
+- `crates/openshell-bootstrap/src/runtime.rs` -- exec, health polling, stale node cleanup
+- `crates/openshell-bootstrap/src/metadata.rs` -- metadata CRUD, active gateway, SSH resolution
+- `crates/openshell-bootstrap/src/mtls.rs` -- TLS detection, secret extraction, atomic write
+- `crates/openshell-bootstrap/src/push.rs` -- local image push into k3s containerd
+- `crates/openshell-bootstrap/src/constants.rs` -- naming conventions
+- `crates/openshell-bootstrap/src/paths.rs` -- XDG path helpers
+- `crates/openshell-cli/src/main.rs` -- CLI command definitions
+- `crates/openshell-cli/src/run.rs` -- CLI command implementations
+- `crates/openshell-cli/src/bootstrap.rs` -- auto-bootstrap from sandbox create
 - `deploy/docker/Dockerfile.cluster` -- container image definition
 - `deploy/docker/cluster-entrypoint.sh` -- container entrypoint script
 - `deploy/docker/cluster-healthcheck.sh` -- Docker HEALTHCHECK script
-- `deploy/kube/manifests/navigator-helmchart.yaml` -- OpenShell Helm chart manifest
+- `deploy/kube/manifests/openshell-helmchart.yaml` -- OpenShell Helm chart manifest
 - `deploy/kube/manifests/envoy-gateway-helmchart.yaml` -- Envoy Gateway manifest

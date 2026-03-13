@@ -47,7 +47,7 @@ def ensure_sandbox_persistence_ready(sandbox_client: SandboxClient) -> None:
             raise
 
     pytest.fail(
-        "navigator-server persistence is not initialized (missing sqlite objects table); "
+        "openshell-server persistence is not initialized (missing sqlite objects table); "
         "redeploy the active cluster and rerun e2e sandbox tests"
     )
 

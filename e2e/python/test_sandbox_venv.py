@@ -12,7 +12,7 @@ Verifies that:
 
 All tests use the default dev sandbox policy -- no custom policy overrides.
 The SDK omits the policy field from the spec so the sandbox container discovers
-its policy from /etc/navigator/policy.yaml (the dev-sandbox-policy.yaml baked
+its policy from /etc/openshell/policy.yaml (the dev-sandbox-policy.yaml baked
 into the image), which already includes the pypi network policy.
 """
 
@@ -36,12 +36,6 @@ def test_sandbox_venv_in_path(
         path_dirs = result.stdout.strip().split(":")
         assert "/sandbox/.venv/bin" in path_dirs, (
             f"Expected /sandbox/.venv/bin in PATH, got: {result.stdout.strip()}"
-        )
-        # /sandbox/.venv/bin must come before /app/.venv/bin
-        sandbox_idx = path_dirs.index("/sandbox/.venv/bin")
-        app_idx = path_dirs.index("/app/.venv/bin")
-        assert sandbox_idx < app_idx, (
-            "/sandbox/.venv/bin must precede /app/.venv/bin in PATH"
         )
 
 

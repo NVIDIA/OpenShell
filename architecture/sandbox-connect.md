@@ -16,7 +16,7 @@ There is also a gateway-side `ExecSandbox` gRPC RPC that executes commands insid
 
 ### CLI SSH module
 
-**File**: `crates/navigator-cli/src/ssh.rs`
+**File**: `crates/openshell-cli/src/ssh.rs`
 
 Contains the client-side SSH and editor-launch helpers for sandbox connectivity:
 
@@ -28,17 +28,17 @@ Contains the client-side SSH and editor-launch helpers for sandbox connectivity:
   `~/.ssh/config` and maintain generated `Host openshell-<name>` blocks in a
   separate OpenShell-owned config file for editor workflows
 
-These are re-exported from `crates/navigator-cli/src/run.rs` for backward compatibility.
+These are re-exported from `crates/openshell-cli/src/run.rs` for backward compatibility.
 
 ### CLI `ssh-proxy` subcommand
 
-**File**: `crates/navigator-cli/src/main.rs` (line ~139, `Commands::SshProxy`)
+**File**: `crates/openshell-cli/src/main.rs` (line ~139, `Commands::SshProxy`)
 
 A top-level CLI subcommand (`ssh-proxy`) that the SSH `ProxyCommand` invokes. It receives `--gateway`, `--sandbox-id`, and `--token` flags, then delegates to `sandbox_ssh_proxy()`. This process has no TTY of its own -- it pipes stdin/stdout directly to the gateway tunnel.
 
 ### gRPC session bootstrap
 
-**Files**: `proto/navigator.proto`, `crates/navigator-server/src/grpc.rs`
+**Files**: `proto/openshell.proto`, `crates/openshell-server/src/grpc.rs`
 
 Two RPCs manage SSH session tokens:
 
@@ -47,7 +47,7 @@ Two RPCs manage SSH session tokens:
 
 ### Gateway tunnel handler
 
-**File**: `crates/navigator-server/src/ssh_tunnel.rs`
+**File**: `crates/openshell-server/src/ssh_tunnel.rs`
 
 An Axum route at `/connect/ssh` on the shared gateway port. Handles HTTP CONNECT requests by:
 1. Validating the session token and sandbox readiness
@@ -58,13 +58,13 @@ An Axum route at `/connect/ssh` on the shared gateway port. Handles HTTP CONNECT
 
 ### Gateway multiplexing
 
-**File**: `crates/navigator-server/src/multiplex.rs`
+**File**: `crates/openshell-server/src/multiplex.rs`
 
-The gateway runs a single listener that multiplexes gRPC and HTTP on the same port. `MultiplexedService` routes based on the `content-type` header: requests with `application/grpc` go to the gRPC router; all others (including HTTP CONNECT) go to the HTTP router. The HTTP router (`crates/navigator-server/src/http.rs`) merges health endpoints with the SSH tunnel router.
+The gateway runs a single listener that multiplexes gRPC and HTTP on the same port. `MultiplexedService` routes based on the `content-type` header: requests with `application/grpc` go to the gRPC router; all others (including HTTP CONNECT) go to the HTTP router. The HTTP router (`crates/openshell-server/src/http.rs`) merges health endpoints with the SSH tunnel router.
 
 ### Sandbox SSH daemon
 
-**File**: `crates/navigator-sandbox/src/ssh.rs`
+**File**: `crates/openshell-sandbox/src/ssh.rs`
 
 An embedded SSH server built on `russh` that runs inside each sandbox pod. It:
 - Generates an ephemeral Ed25519 host key on startup (no persistent key material)
@@ -75,7 +75,7 @@ An embedded SSH server built on `russh` that runs inside each sandbox pod. It:
 
 ### Gateway-side exec (gRPC)
 
-**File**: `crates/navigator-server/src/grpc.rs` (functions `stream_exec_over_ssh`, `start_single_use_ssh_proxy`, `run_exec_with_russh`)
+**File**: `crates/openshell-server/src/grpc.rs` (functions `stream_exec_over_ssh`, `start_single_use_ssh_proxy`, `run_exec_with_russh`)
 
 The `ExecSandbox` gRPC RPC provides programmatic command execution without requiring an external SSH client. It:
 1. Spins up a single-use local TCP proxy that performs the NSSH1 handshake
@@ -125,8 +125,8 @@ sequenceDiagram
 
 **Code trace for `sandbox connect`:**
 
-1. `crates/navigator-cli/src/main.rs` -- `SandboxCommands::Connect { name }` dispatches to `run::sandbox_connect()`
-2. `crates/navigator-cli/src/ssh.rs` -- `sandbox_connect()` calls `ssh_session_config()`:
+1. `crates/openshell-cli/src/main.rs` -- `SandboxCommands::Connect { name }` dispatches to `run::sandbox_connect()`
+2. `crates/openshell-cli/src/ssh.rs` -- `sandbox_connect()` calls `ssh_session_config()`:
    - Resolves sandbox name to ID via `GetSandbox` gRPC
    - Creates an SSH session via `CreateSshSession` gRPC
    - Builds a `ProxyCommand` string: `<openshell-exe> ssh-proxy --gateway <url> --sandbox-id <id> --token <token>`
@@ -139,7 +139,7 @@ sequenceDiagram
    - `sandbox` as the SSH user
 4. If stdin is a terminal (interactive), the CLI calls `exec()` (Unix) to replace itself with the `ssh` process, giving SSH direct terminal ownership. Otherwise it spawns and waits.
 5. When SSH starts, it spawns the `ssh-proxy` subprocess as its `ProxyCommand`.
-6. `crates/navigator-cli/src/ssh.rs` -- `sandbox_ssh_proxy()`:
+6. `crates/openshell-cli/src/ssh.rs` -- `sandbox_ssh_proxy()`:
    - Parses the gateway URL, connects via TCP (plain) or TLS (mTLS)
    - Sends a raw HTTP CONNECT request with `X-Sandbox-Id` and `X-Sandbox-Token` headers
    - Reads the response status line; proceeds if 200
@@ -152,6 +152,8 @@ The `sandbox exec` path is identical to interactive connect except:
 - The SSH command uses `-T -o RequestTTY=no` (no PTY) when `tty=false`
 - The command string is passed as the final SSH argument
 - The sandbox daemon routes it through `exec_request()` instead of `shell_request()`, spawning `/bin/bash -lc <command>`
+
+When `openshell sandbox create` launches a `--no-keep` command or shell, it keeps the CLI process alive instead of `exec()`-ing into SSH so it can delete the sandbox after SSH exits. The default create flow, along with `--forward`, keeps the sandbox running.
 
 ### Port Forwarding (`forward start`)
 
@@ -175,7 +177,7 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 
 #### TUI
 
-The TUI (`crates/navigator-tui/`) supports port forwarding through the create sandbox modal. Users
+The TUI (`crates/openshell-tui/`) supports port forwarding through the create sandbox modal. Users
 specify comma-separated ports in the **Ports** field. After sandbox creation:
 
 1. The TUI polls for `Ready` state (up to 30 attempts at 2-second intervals).
@@ -191,7 +193,7 @@ request. PID tracking uses the same `~/.config/openshell/forwards/` directory as
 
 #### Shared forward module
 
-**File**: `crates/navigator-core/src/forward.rs`
+**File**: `crates/openshell-core/src/forward.rs`
 
 Port forwarding PID management and SSH utility functions are shared between the CLI and TUI:
 
@@ -205,7 +207,7 @@ Port forwarding PID management and SSH utility functions are shared between the 
 
 #### Supervisor `direct-tcpip` handling
 
-The sandbox SSH server (`crates/navigator-sandbox/src/ssh.rs`) implements
+The sandbox SSH server (`crates/openshell-sandbox/src/ssh.rs`) implements
 `channel_open_direct_tcpip` from the russh `Handler` trait.
 
 - **Loopback-only**: only `127.0.0.1`, `localhost`, and `::1` destinations are accepted.
@@ -279,7 +281,7 @@ If `timeout_seconds > 0`, the exec is wrapped in `tokio::time::timeout`. On time
 
 File sync uses **tar-over-SSH**: the CLI streams a tar archive through the existing SSH proxy tunnel. No external dependencies (like `rsync`) are required on the client side. The sandbox image provides GNU `tar` for extraction.
 
-**Files**: `crates/navigator-cli/src/ssh.rs`, `crates/navigator-cli/src/run.rs`
+**Files**: `crates/openshell-cli/src/ssh.rs`, `crates/openshell-cli/src/run.rs`
 
 #### `sandbox create --upload`
 
@@ -341,7 +343,7 @@ NSSH1 <token> <timestamp> <nonce> <hmac>\n
 
 ### Validation (sandbox side)
 
-**File**: `crates/navigator-sandbox/src/ssh.rs` -- `verify_preface()`
+**File**: `crates/openshell-sandbox/src/ssh.rs` -- `verify_preface()`
 
 1. Split line on whitespace; reject if not exactly 5 fields or magic is not `NSSH1`
 2. Parse timestamp; compute absolute clock skew `|now - timestamp|`
@@ -358,7 +360,7 @@ The SSH server maintains a per-process `NonceCache` (`HashMap<String, Instant>` 
 
 ### HMAC computation
 
-Both the gateway (`crates/navigator-server/src/ssh_tunnel.rs` -- `build_preface()`) and the gRPC exec path (`crates/navigator-server/src/grpc.rs` -- `build_preface()`) use identical logic:
+Both the gateway (`crates/openshell-server/src/ssh_tunnel.rs` -- `build_preface()`) and the gRPC exec path (`crates/openshell-server/src/grpc.rs` -- `build_preface()`) use identical logic:
 
 ```rust
 let payload = format!("{token}|{timestamp}|{nonce}");
@@ -374,7 +376,7 @@ Both sides cap the preface line at 1024 bytes and stop reading at `\n` or EOF. T
 
 ### Startup
 
-`run_ssh_server()` in `crates/navigator-sandbox/src/ssh.rs`:
+`run_ssh_server()` in `crates/openshell-sandbox/src/ssh.rs`:
 
 1. Generates an ephemeral Ed25519 host key using `OsRng`
 2. Configures `russh::server::Config` with 1-second auth rejection delay
@@ -413,7 +415,7 @@ Authorization is performed by the gateway (token validation + sandbox readiness 
 2. Clones the master fd for reading and writing
 3. Configures the shell command with environment variables:
    - `OPENSHELL_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM=<from pty request>`
-   - Proxy vars: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `grpc_proxy`
+   - Proxy vars: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `grpc_proxy`, `NODE_USE_ENV_PROXY=1` so Node.js `fetch` honors the proxy env
    - TLS trust vars: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`
    - Provider credential env vars (from the provider registry)
 4. Installs a `pre_exec` hook that:
@@ -438,7 +440,7 @@ The reader-done synchronization ensures correct SSH protocol ordering: data -> E
 
 The gateway and the gRPC exec path both resolve the sandbox's network address using the same logic.
 
-**File**: `crates/navigator-server/src/ssh_tunnel.rs` (gateway), `crates/navigator-server/src/grpc.rs` (exec)
+**File**: `crates/openshell-server/src/ssh_tunnel.rs` (gateway), `crates/openshell-server/src/grpc.rs` (exec)
 
 Resolution order:
 1. If the sandbox has a `status.agent_pod` field, resolve the pod IP via the Kubernetes API (`agent_pod_ip()`)
@@ -454,7 +456,7 @@ The `ConnectTarget` enum in `ssh_tunnel.rs` encodes both cases:
 
 ### CreateSshSession
 
-**Proto**: `proto/navigator.proto` -- `CreateSshSessionRequest` / `CreateSshSessionResponse`
+**Proto**: `proto/openshell.proto` -- `CreateSshSessionRequest` / `CreateSshSessionResponse`
 
 Request:
 - `sandbox_id` (string) -- the sandbox to connect to
@@ -478,7 +480,7 @@ Response:
 
 ### SshSession persistence
 
-**Proto**: `proto/navigator.proto` -- `SshSession` message
+**Proto**: `proto/openshell.proto` -- `SshSession` message
 
 Stored in the gateway's persistence layer (SQLite or Postgres) as object type `"ssh_session"`:
 
@@ -493,7 +495,7 @@ Stored in the gateway's persistence layer (SQLite or Postgres) as object type `"
 
 ### ExecSandbox
 
-**Proto**: `proto/navigator.proto` -- `ExecSandboxRequest` / `ExecSandboxEvent`
+**Proto**: `proto/openshell.proto` -- `ExecSandboxRequest` / `ExecSandboxEvent`
 
 Request:
 - `sandbox_id` (string)
@@ -512,13 +514,13 @@ The gateway builds the remote command by shell-escaping arguments, prepending so
 
 ## Gateway Loopback Resolution
 
-**File**: `crates/navigator-core/src/forward.rs` -- `resolve_ssh_gateway()`
+**File**: `crates/openshell-core/src/forward.rs` -- `resolve_ssh_gateway()`
 
 When the gateway returns a loopback address (`127.0.0.1`, `0.0.0.0`, `localhost`, or `::1`), the client overrides it with the host from the cluster endpoint URL. This handles the common case where the gateway defaults to `127.0.0.1` but the cluster is running on a remote machine.
 
 The override only applies if the cluster endpoint itself is not also a loopback address. If both are loopback, the original address is kept.
 
-This function is shared between the CLI and TUI via the `navigator-core::forward` module.
+This function is shared between the CLI and TUI via the `openshell-core::forward` module.
 
 ## Authentication and Security Model
 
@@ -548,7 +550,7 @@ The sandbox generates a fresh Ed25519 host key on every startup. The CLI disable
 
 ### Gateway configuration
 
-**File**: `crates/navigator-core/src/config.rs` -- `Config` struct
+**File**: `crates/openshell-core/src/config.rs` -- `Config` struct
 
 | Field                      | Default          | Description |
 |----------------------------|------------------|-------------|

@@ -3,10 +3,10 @@
 
 syntax = "proto3";
 
-package navigator.inference.v1;
+package openshell.inference.v1;
 
 option java_multiple_files = true;
-option java_package = "com.anthropic.navigator.inference.v1";
+option java_package = "com.anthropic.openshell.inference.v1";
 
 // Inference service provides cluster inference configuration and bundle delivery.
 service Inference {

@@ -23,11 +23,11 @@ graph TB
             LocalPathProv["local-path-provisioner"]
         end
 
-        subgraph NSNamespace["navigator namespace"]
+        subgraph NSNamespace["openshell namespace"]
 
             subgraph GatewayPod["Gateway StatefulSet"]
-                Gateway["navigator-server<br/>:8080<br/>(gRPC + HTTP, mTLS)"]
-                SQLite[("SQLite DB<br/>/var/navigator/<br/>navigator.db")]
+                Gateway["openshell-server<br/>:8080<br/>(gRPC + HTTP, mTLS)"]
+                SQLite[("SQLite DB<br/>/var/openshell/<br/>openshell.db")]
                 SandboxWatcher["Sandbox Watcher"]
                 KubeEventTailer["Kube Event Tailer"]
                 WatchBus["SandboxWatchBus<br/>(in-memory broadcast)"]
@@ -40,7 +40,7 @@ graph TB
                     SSHServer["Embedded SSH<br/>Server (russh)<br/>:2222"]
                     Proxy["HTTP CONNECT<br/>Proxy<br/>10.200.0.1:3128"]
                     OPA["OPA Policy Engine<br/>(regorus, in-process)"]
-                    InferenceRouter["Inference Router<br/>(navigator-router)"]
+                    InferenceRouter["Inference Router<br/>(openshell-router)"]
                     CertCache["TLS MITM<br/>Cert Cache"]
                 end
 
@@ -178,7 +178,7 @@ graph TB
 | Color | Category | Examples |
 |-------|----------|---------|
 | Blue | User-side components | OpenShell CLI, OpenShell TUI, Python SDK |
-| Orange | Gateway / Control plane | navigator-server, watch bus, log bus |
+| Orange | Gateway / Control plane | openshell-server, watch bus, log bus |
 | Green | Sandbox supervisor | SSH server, HTTP CONNECT proxy, OPA engine, inference router |
 | Purple | Agent process & isolation | AI agent, Landlock, Seccomp, network namespace |
 | Indigo | Data stores | SQLite database |
@@ -195,6 +195,6 @@ graph TB
 
 4. **Sandbox to External**: All agent outbound traffic is forced through the HTTP CONNECT proxy (10.200.0.1:3128) via a network namespace veth pair. OPA/Rego policies evaluate every connection. Optional TLS MITM enables L7 inspection.
 
-5. **Inference Routing**: Inference requests are handled inside the sandbox by the navigator-router (not through the gateway). The gateway provides route configuration and credentials via gRPC; the sandbox executes HTTP requests directly to inference backends.
+5. **Inference Routing**: Inference requests are handled inside the sandbox by the openshell-router (not through the gateway). The gateway provides route configuration and credentials via gRPC; the sandbox executes HTTP requests directly to inference backends.
 
 6. **Sandbox to Gateway**: The sandbox supervisor uses gRPC (mTLS) to fetch policies, provider credentials, inference bundles, and to push logs back to the gateway.

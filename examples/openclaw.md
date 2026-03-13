@@ -25,7 +25,7 @@ Note: you will need use the auth token present in the bootstrapping process to c
 ### Create the sandbox
 
 ```sh
-openshell sandbox create --keep --forward 18789
+openshell sandbox create --forward 18789
 ```
 
 Inside the sandbox, run the onboarding wizard and start the gateway:

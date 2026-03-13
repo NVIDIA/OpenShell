@@ -139,7 +139,7 @@ Port forwarding lifecycle:
 - **On delete**: Any active forwards for the sandbox are automatically stopped before deletion.
 - **PID tracking**: Forward PIDs are stored in `~/.config/openshell/forwards/<name>-<port>.pid`, shared with the CLI.
 
-The forwarding implementation lives in `navigator-core::forward`, shared between the CLI and TUI.
+The forwarding implementation lives in `openshell-core::forward`, shared between the CLI and TUI.
 
 ## What is Not Yet Available
 
@@ -152,6 +152,6 @@ The TUI is in its initial phase. The following features are planned but not yet 
 
 ## Crate Structure
 
-The TUI lives in `crates/navigator-tui/`, a separate workspace crate. The CLI crate (`crates/navigator-cli/`) depends on it and launches it via the `Term` command variant in the `Commands` enum. This keeps TUI-specific dependencies (ratatui, crossterm) out of the CLI when not in use.
+The TUI lives in `crates/openshell-tui/`, a separate workspace crate. The CLI crate (`crates/openshell-cli/`) depends on it and launches it via the `Term` command variant in the `Commands` enum. This keeps TUI-specific dependencies (ratatui, crossterm) out of the CLI when not in use.
 
-The `navigator-tui` crate depends on `navigator-core` for protobuf types, the gRPC client, and shared utilities (e.g., `navigator_core::forward` for port forwarding PID management) — it communicates with the gateway over the same gRPC channel the CLI uses.
+The `openshell-tui` crate depends on `openshell-core` for protobuf types, the gRPC client, and shared utilities (e.g., `openshell_core::forward` for port forwarding PID management) — it communicates with the gateway over the same gRPC channel the CLI uses.

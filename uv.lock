@@ -513,6 +513,18 @@ wheels = [
 ]
 
 [[package]]
+name = "nvidia-sphinx-theme"
+version = "0.0.9.post1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "pydata-sphinx-theme" },
+    { name = "sphinx" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/8c/79/017fab2f7167a9a9795665f894d04f77aafceca80821b51589bb4b23ff5c/nvidia_sphinx_theme-0.0.9.post1-py3-none-any.whl", hash = "sha256:21ca60206dff2f380d7783d64bbaf71a5b9cacae53c7d0686f089c16b5a3d45a", size = 143816, upload-time = "2025-11-09T23:16:55.719Z" },
+]
+
+[[package]]
 name = "openshell"
 source = { virtual = "." }
 dependencies = [
@@ -570,18 +582,6 @@ docs = [
     { name = "sphinx-copybutton", specifier = "<=0.6" },
     { name = "sphinx-design" },
     { name = "sphinxcontrib-mermaid" },
-]
-
-[[package]]
-name = "nvidia-sphinx-theme"
-version = "0.0.9.post1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "pydata-sphinx-theme" },
-    { name = "sphinx" },
-]
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/8c/79/017fab2f7167a9a9795665f894d04f77aafceca80821b51589bb4b23ff5c/nvidia_sphinx_theme-0.0.9.post1-py3-none-any.whl", hash = "sha256:21ca60206dff2f380d7783d64bbaf71a5b9cacae53c7d0686f089c16b5a3d45a", size = 143816, upload-time = "2025-11-09T23:16:55.719Z" },
 ]
 
 [[package]]

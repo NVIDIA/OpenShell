@@ -6,7 +6,6 @@
 ["docker:build"]
 description = "Build all Docker images"
 depends = [
-  "docker:build:sandbox",
   "docker:build:gateway",
   "docker:build:cluster",
 ]
@@ -15,17 +14,6 @@ hide = true
 ["docker:build:ci"]
 description = "Build the CI Docker image"
 run = "tasks/scripts/docker-build-component.sh ci"
-hide = true
-
-["docker:build:sandbox"]
-description = "Build the sandbox Docker image (base variant)"
-run = "tasks/scripts/docker-build-component.sh sandbox --build-arg RUST_BUILD_PROFILE=${RUST_BUILD_PROFILE:-debug}"
-hide = true
-
-["docker:build:sandbox:nvidia"]
-description = "Build the NVIDIA GPU sandbox Docker image"
-depends = ["docker:build:sandbox"]
-run = "tasks/scripts/docker-build-component.sh sandbox nvidia --build-arg BASE_IMAGE=openshell/sandbox:${IMAGE_TAG:-dev}"
 hide = true
 
 ["docker:build:gateway"]

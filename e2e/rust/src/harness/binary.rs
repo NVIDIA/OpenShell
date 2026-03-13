@@ -5,7 +5,7 @@
 //!
 //! Resolves the `openshell` binary at `<workspace>/target/debug/openshell`.
 //! The binary must already be built — the `e2e:rust` mise task handles
-//! this by running `cargo build -p navigator-cli` before the tests.
+//! this by running `cargo build -p openshell-cli` before the tests.
 
 use std::path::{Path, PathBuf};
 
@@ -26,13 +26,13 @@ fn workspace_root() -> PathBuf {
 ///
 /// # Panics
 ///
-/// Panics if the binary is not found. Run `cargo build -p navigator-cli`
+/// Panics if the binary is not found. Run `cargo build -p openshell-cli`
 /// (or `mise run e2e:rust`) first.
 pub fn openshell_bin() -> PathBuf {
     let bin = workspace_root().join("target/debug/openshell");
     assert!(
         bin.is_file(),
-        "openshell binary not found at {bin:?} — run `cargo build -p navigator-cli` first"
+        "openshell binary not found at {bin:?} — run `cargo build -p openshell-cli` first"
     );
     bin
 }
@@ -44,6 +44,41 @@ pub fn openshell_bin() -> PathBuf {
 /// are cleaned up when the handle is dropped.
 pub fn openshell_cmd() -> tokio::process::Command {
     let mut cmd = tokio::process::Command::new(openshell_bin());
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+fn shell_escape(arg: &str) -> String {
+    if arg
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:@".contains(c))
+    {
+        return arg.to_string();
+    }
+
+    format!("'{}'", arg.replace('\'', "'\\''"))
+}
+
+/// Create a [`tokio::process::Command`] that runs `openshell` under a PTY.
+pub fn openshell_tty_cmd(args: &[&str]) -> tokio::process::Command {
+    let bin = openshell_bin();
+    let mut cmd = tokio::process::Command::new("script");
+
+    if cfg!(target_os = "macos") {
+        cmd.arg("-q").arg("/dev/null").arg(bin).args(args);
+    } else {
+        let mut shell_command = shell_escape(bin.to_str().expect("openshell path is utf-8"));
+        for arg in args {
+            shell_command.push(' ');
+            shell_command.push_str(&shell_escape(arg));
+        }
+        cmd.arg("-q")
+            .arg("-e")
+            .arg("-c")
+            .arg(shell_command)
+            .arg("/dev/null");
+    }
+
     cmd.kill_on_drop(true);
     cmd
 }

@@ -19,11 +19,6 @@ jobs:
     with:
       component: gateway
 
-  build-sandbox:
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-
   build-cluster:
     uses: ./.github/workflows/docker-build.yml
     with:
@@ -31,7 +26,7 @@ jobs:
 
   tag-ghcr-latest:
     name: Tag GHCR Images as Latest
-    needs: [build-gateway, build-sandbox, build-cluster]
+    needs: [build-gateway, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -42,7 +37,7 @@ jobs:
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
-          for component in gateway sandbox cluster; do
+          for component in gateway cluster; do
             echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as latest..."
             docker buildx imagetools create \
               --prefer-index=false \
@@ -52,7 +47,7 @@ jobs:
 
   build-python-wheels:
     name: Stage Python Wheels
-    needs: [build-gateway, build-sandbox, build-cluster]
+    needs: [build-gateway, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 120
     outputs:
@@ -69,7 +64,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
-      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
+      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts  # TODO: rename bucket to openshell-pypi-artifacts
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
       AWS_DEFAULT_REGION: us-west-2
@@ -123,7 +118,7 @@ jobs:
     timeout-minutes: 10
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts
+      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts  # TODO: rename bucket to openshell-pypi-artifacts
       NAV_PYPI_REPOSITORY_URL: https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local
       NAV_PYPI_USERNAME: ${{ secrets.NAV_PYPI_USERNAME }}
       NAV_PYPI_PASSWORD: ${{ secrets.NAV_PYPI_PASSWORD }}
@@ -137,7 +132,7 @@ jobs:
 
     - uses: actions/setup-python@v5
       with:
-        python-version: "3.12"
+        python-version: "3.13"
 
     - name: Install publish dependencies
       run: |
@@ -255,10 +250,10 @@ jobs:
       - name: Scope workspace to CLI crates
         run: |
           set -euo pipefail
-          # Remove workspace members that are not needed for navigator-cli.
+          # Remove workspace members that are not needed for openshell-cli.
           # This avoids Cargo feature-unification pulling in aws-lc-sys (via
-          # russh in navigator-sandbox / navigator-server).
-          sed -i 's|members = \["crates/\*"\]|members = ["crates/navigator-cli", "crates/navigator-core", "crates/navigator-bootstrap", "crates/navigator-policy", "crates/navigator-providers", "crates/navigator-tui"]|' Cargo.toml
+          # russh in openshell-sandbox / openshell-server).
+          sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
       - name: Patch workspace version
         if: steps.version.outputs.cargo_version != ''
@@ -267,7 +262,7 @@ jobs:
           sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
-        run: mise x -- cargo build --release --target ${{ matrix.target }} -p navigator-cli
+        run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli
 
       - name: sccache stats
         if: always()

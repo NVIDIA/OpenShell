@@ -221,7 +221,7 @@ if ! command -v docker >/dev/null 2>&1; then
 fi
 
 echo "==> Building openshell CLI..."
-mise exec -- cargo build --release -p navigator-cli
+mise exec -- cargo build --release -p openshell-cli
 mkdir -p "$HOME/.local/bin"
 install -m 0755 target/release/openshell "$HOME/.local/bin/openshell"
 
@@ -237,10 +237,9 @@ export OPENSHELL_CARGO_VERSION="${CARGO_VERSION}"
 export IMAGE_TAG
 mise exec -- tasks/scripts/docker-build-cluster.sh
 mise exec -- tasks/scripts/docker-build-component.sh gateway
-mise exec -- tasks/scripts/docker-build-component.sh sandbox
 
 export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"
-export OPENSHELL_PUSH_IMAGES="openshell/gateway:${IMAGE_TAG},openshell/sandbox:${IMAGE_TAG}"
+export OPENSHELL_PUSH_IMAGES="openshell/gateway:${IMAGE_TAG}"
 
 start_args=(
   gateway

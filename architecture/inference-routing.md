@@ -2,7 +2,7 @@
 
 Inference routing gives sandboxed agents access to LLM APIs through a single, explicit endpoint: `inference.local`. There is no implicit catch-all interception for arbitrary hosts. Requests are routed only when the process targets `inference.local` via HTTPS and the request matches a supported inference API pattern.
 
-All inference execution happens locally inside the sandbox via the `navigator-router` crate. The gateway is control-plane only: it stores configuration and delivers resolved route bundles to sandboxes over gRPC.
+All inference execution happens locally inside the sandbox via the `openshell-router` crate. The gateway is control-plane only: it stores configuration and delivers resolved route bundles to sandboxes over gRPC.
 
 ## Architecture Overview
 
@@ -10,7 +10,7 @@ All inference execution happens locally inside the sandbox via the `navigator-ro
 sequenceDiagram
     participant Agent as Agent Process
     participant Proxy as Sandbox Proxy
-    participant Router as navigator-router
+    participant Router as openshell-router
     participant Gateway as Gateway (gRPC)
     participant Backend as Inference Backend
 
@@ -37,7 +37,7 @@ sequenceDiagram
 
 ## Provider Profiles
 
-File: `crates/navigator-core/src/inference.rs`
+File: `crates/openshell-core/src/inference.rs`
 
 `InferenceProviderProfile` is the single source of truth for provider-specific inference knowledge: default endpoint, supported protocols, credential key lookup order, auth header style, and default headers.
 
@@ -55,7 +55,7 @@ Unknown provider types return `None` from `profile_for()` and default to `Bearer
 
 ## Control Plane (Gateway)
 
-File: `crates/navigator-server/src/inference.rs`
+File: `crates/openshell-server/src/inference.rs`
 
 The gateway implements the `Inference` gRPC service defined in `proto/inference.proto`.
 
@@ -100,10 +100,10 @@ Key messages:
 
 Files:
 
-- `crates/navigator-sandbox/src/proxy.rs` -- proxy interception, inference context, request routing
-- `crates/navigator-sandbox/src/l7/inference.rs` -- pattern detection, HTTP parsing, response formatting
-- `crates/navigator-sandbox/src/lib.rs` -- inference context initialization, route refresh
-- `crates/navigator-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
+- `crates/openshell-sandbox/src/proxy.rs` -- proxy interception, inference context, request routing
+- `crates/openshell-sandbox/src/l7/inference.rs` -- pattern detection, HTTP parsing, response formatting
+- `crates/openshell-sandbox/src/lib.rs` -- inference context initialization, route refresh
+- `crates/openshell-sandbox/src/grpc_client.rs` -- `fetch_inference_bundle()`
 
 In cluster mode, the sandbox starts a background refresh loop as soon as the inference context is created. The loop polls the gateway every 5 seconds by default (`OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS` override) and uses the bundle revision hash to skip no-op cache writes.
 
@@ -122,7 +122,7 @@ When a `CONNECT inference.local:443` arrives:
 
 ### Request classification
 
-File: `crates/navigator-sandbox/src/l7/inference.rs` -- `default_patterns()` and `detect_inference_pattern()`
+File: `crates/openshell-sandbox/src/l7/inference.rs` -- `default_patterns()` and `detect_inference_pattern()`
 
 Supported built-in patterns:
 
@@ -148,15 +148,15 @@ If no pattern matches, the proxy returns `403 Forbidden` with `{"error": "connec
 
 ### Bundle-to-route conversion
 
-`bundle_to_resolved_routes()` in `lib.rs` converts proto `ResolvedRoute` messages to router `ResolvedRoute` structs. Auth header style and default headers are derived from `provider_type` using `navigator_core::inference::auth_for_provider_type()`.
+`bundle_to_resolved_routes()` in `lib.rs` converts proto `ResolvedRoute` messages to router `ResolvedRoute` structs. Auth header style and default headers are derived from `provider_type` using `openshell_core::inference::auth_for_provider_type()`.
 
 ## Router Behavior
 
 Files:
 
-- `crates/navigator-router/src/lib.rs` -- `Router`, `proxy_with_candidates()`, `proxy_with_candidates_streaming()`
-- `crates/navigator-router/src/backend.rs` -- `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
-- `crates/navigator-router/src/config.rs` -- `RouteConfig`, `ResolvedRoute`, YAML loading
+- `crates/openshell-router/src/lib.rs` -- `Router`, `proxy_with_candidates()`, `proxy_with_candidates_streaming()`
+- `crates/openshell-router/src/backend.rs` -- `proxy_to_backend()`, `proxy_to_backend_streaming()`, URL construction
+- `crates/openshell-router/src/config.rs` -- `RouteConfig`, `ResolvedRoute`, YAML loading
 
 ### Route selection
 
@@ -204,9 +204,9 @@ This eliminates full-body buffering for streaming responses (SSE). Time-to-first
 
 ### Mock routes
 
-File: `crates/navigator-router/src/mock.rs`
+File: `crates/openshell-router/src/mock.rs`
 
-Routes with `mock://` scheme endpoints return canned responses without making HTTP requests. Mock responses are protocol-aware (OpenAI chat completion, OpenAI completion, Anthropic messages, or generic JSON). Mock routes include an `x-navigator-mock: true` response header.
+Routes with `mock://` scheme endpoints return canned responses without making HTTP requests. Mock responses are protocol-aware (OpenAI chat completion, OpenAI completion, Anthropic messages, or generic JSON). Mock routes include an `x-openshell-mock: true` response header.
 
 ### HTTP client
 
@@ -214,7 +214,7 @@ The router uses a `reqwest::Client` with a 60-second timeout. Timeouts and conne
 
 ## Standalone Route File
 
-File: `crates/navigator-router/src/config.rs`
+File: `crates/openshell-router/src/config.rs`
 
 Standalone sandboxes can load static routes from YAML via `--inference-routes`:
 
@@ -307,14 +307,14 @@ The `--provider` flag references a provider record name (not a provider type). T
 
 Files:
 
-- `crates/navigator-providers/src/lib.rs` -- `ProviderRegistry`, `ProviderPlugin` trait
-- `crates/navigator-providers/src/providers/openai.rs` -- `OpenaiProvider`
-- `crates/navigator-providers/src/providers/anthropic.rs` -- `AnthropicProvider`
-- `crates/navigator-providers/src/providers/nvidia.rs` -- `NvidiaProvider`
+- `crates/openshell-providers/src/lib.rs` -- `ProviderRegistry`, `ProviderPlugin` trait
+- `crates/openshell-providers/src/providers/openai.rs` -- `OpenaiProvider`
+- `crates/openshell-providers/src/providers/anthropic.rs` -- `AnthropicProvider`
+- `crates/openshell-providers/src/providers/nvidia.rs` -- `NvidiaProvider`
 
 Provider discovery and inference routing are separate concerns:
 
-- `ProviderPlugin` (in `navigator-providers`) handles credential *discovery* -- scanning environment variables to find API keys.
-- `InferenceProviderProfile` (in `navigator-core`) handles how to *use* discovered credentials to make inference API calls.
+- `ProviderPlugin` (in `openshell-providers`) handles credential *discovery* -- scanning environment variables to find API keys.
+- `InferenceProviderProfile` (in `openshell-core`) handles how to *use* discovered credentials to make inference API calls.
 
 The `openai`, `anthropic`, and `nvidia` provider plugins each discover credentials from their canonical environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NVIDIA_API_KEY`). These credentials are stored in provider records and looked up by the gateway at bundle resolution time.

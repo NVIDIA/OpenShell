@@ -5,7 +5,7 @@
 # The image exposes port 8080 with a /hello endpoint.  Use port forwarding
 # (--forward 8080 on the CLI) to reach it from your local machine.
 
-FROM python:3.12-slim
+FROM python:3.13-slim
 
 # System tools useful for sandbox networking and debugging.
 RUN apt-get update && apt-get install -y --no-install-recommends \

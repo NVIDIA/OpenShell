@@ -11,7 +11,6 @@ run = "tasks/scripts/cluster.sh"
 description = "Build and deploy local k3s cluster with OpenShell"
 depends = [
   "docker:build:gateway",
-  "docker:build:sandbox",
 ]
 run = "tasks/scripts/cluster-bootstrap.sh build"
 hide = true
@@ -21,9 +20,9 @@ description = "Alias for cluster (incremental deploy)"
 run = "tasks/scripts/cluster.sh"
 hide = true
 
-["cluster:deploy:sandbox"]
-description = "Fast deploy sandbox-only changes"
-run = "tasks/scripts/cluster-deploy-fast.sh sandbox"
+["cluster:deploy:supervisor"]
+description = "Fast deploy supervisor binary changes (docker cp into cluster)"
+run = "tasks/scripts/cluster-deploy-fast.sh supervisor"
 hide = true
 
 ["cluster:deploy:all"]
@@ -34,9 +33,4 @@ hide = true
 ["cluster:push:gateway"]
 description = "Tag and push gateway image to pull registry"
 run = "tasks/scripts/cluster-push-component.sh gateway"
-hide = true
-
-["cluster:push:sandbox"]
-description = "Tag and push sandbox image to pull registry"
-run = "tasks/scripts/cluster-push-component.sh sandbox"
 hide = true

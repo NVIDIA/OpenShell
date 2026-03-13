@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, navigator_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator
@@ -78,7 +78,7 @@ def _upsert_managed_inference(
     for _ in range(5):
         try:
             sandbox_client._stub.UpdateProvider(
-                navigator_pb2.UpdateProviderRequest(provider=provider),
+                openshell_pb2.UpdateProviderRequest(provider=provider),
                 timeout=timeout,
             )
             break
@@ -88,7 +88,7 @@ def _upsert_managed_inference(
 
             try:
                 sandbox_client._stub.CreateProvider(
-                    navigator_pb2.CreateProviderRequest(provider=provider),
+                    openshell_pb2.CreateProviderRequest(provider=provider),
                     timeout=timeout,
                 )
                 break

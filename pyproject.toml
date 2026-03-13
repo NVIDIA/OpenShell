@@ -57,7 +57,7 @@ package = false
 
 [tool.maturin]
 bindings = "bin"
-manifest-path = "crates/navigator-cli/Cargo.toml"
+manifest-path = "crates/openshell-cli/Cargo.toml"
 python-source = "python"
 module-name = "openshell"
 

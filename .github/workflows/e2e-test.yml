@@ -7,6 +7,11 @@ on:
         description: "Image tag to test (typically the commit SHA)"
         required: true
         type: string
+      runner:
+        description: "GitHub Actions runner label"
+        required: false
+        type: string
+        default: "build-amd64"
 
 permissions:
   contents: read
@@ -15,7 +20,7 @@ permissions:
 jobs:
   e2e:
     name: E2E
-    runs-on: build-amd64
+    runs-on: ${{ inputs.runner }}
     timeout-minutes: 30
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -50,6 +55,7 @@ jobs:
           GATEWAY_HOST: host.docker.internal
           GATEWAY_PORT: "8080"
           SKIP_IMAGE_PUSH: "1"
+          SKIP_CLUSTER_IMAGE_BUILD: "1"
           OPENSHELL_CLUSTER_IMAGE: ghcr.io/nvidia/openshell/cluster:${{ inputs.image-tag }}
         run: mise run --no-prepare --skip-deps cluster
 

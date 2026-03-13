@@ -7,6 +7,8 @@ OpenShell is the safe, private runtime for autonomous AI agents. It provides san
 
 ## Quickstart
 
+Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg). Otherwise, follow the steps below to run locally.
+
 ### Prerequisites
 
 - **Docker** — Docker Desktop (or a Docker daemon) must be running.
@@ -40,7 +42,7 @@ The sandbox container includes the following tools by default:
 | Category   | Tools                                                    |
 | ---------- | -------------------------------------------------------- |
 | Agent      | `claude`, `opencode`, `codex`                            |
-| Language   | `python` (3.12), `node` (22)                             |
+| Language   | `python` (3.13), `node` (22)                             |
 | Developer  | `gh`, `git`, `vim`, `nano`                               |
 | Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
 
@@ -164,6 +166,7 @@ See the [community sandboxes](https://github.com/NVIDIA/OpenShell/blob/main/docs
 - [GitHub Sandbox Tutorial](https://github.com/NVIDIA/OpenShell/blob/main/docs/tutorials/github-sandbox.md) — end-to-end scoped GitHub repo access
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Support Matrix](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/support-matrix.md) — platforms, versions, and kernel requirements
+- [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
 
 ## Contributing
 
