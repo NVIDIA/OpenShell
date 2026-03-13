@@ -57,17 +57,29 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         return;
     }
 
+    // Compute visual selection range (if active).
+    let selection_range = app.log_selection_anchor.map(|anchor| {
+        let cursor_abs = app.sandbox_log_scroll + cursor_pos;
+        (anchor.min(cursor_abs), anchor.max(cursor_abs))
+    });
+
     let lines: Vec<Line<'_>> = filtered
         .iter()
         .skip(app.sandbox_log_scroll)
         .take(inner_height)
         .enumerate()
         .map(|(i, log)| {
+            let abs_idx = app.sandbox_log_scroll + i;
+            let in_selection =
+                selection_range.is_some_and(|(start, end)| abs_idx >= start && abs_idx <= end);
             let mut line = render_log_line(log, inner_width.saturating_sub(2), t);
             if i == cursor_pos {
                 // Prepend green cursor marker and apply highlight background.
                 line.spans.insert(0, Span::styled("▌ ", t.accent));
                 line = line.style(t.log_cursor);
+            } else if in_selection {
+                line.spans.insert(0, Span::styled("▌ ", t.accent));
+                line = line.style(t.log_selection);
             } else {
                 line.spans.insert(0, Span::raw("  "));
             }
@@ -84,14 +96,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
         String::new()
     };
 
-    let autoscroll_span = if app.log_autoscroll {
+    let status_span = if let Some((start, end)) = selection_range {
+        let count = end - start + 1;
+        Span::styled(format!(" VISUAL ({count} lines) "), t.status_warn)
+    } else if app.log_autoscroll {
         Span::styled(" ● FOLLOWING ", t.status_ok)
     } else {
         Span::styled(" ○ PAUSED ", t.status_warn)
     };
 
     let block = block.title_bottom(Line::from(vec![
-        autoscroll_span,
+        status_span,
         Span::styled(scroll_info, t.muted),
         Span::styled(format!(" filter: {filter_label} "), t.muted),
     ]));
@@ -333,7 +348,7 @@ const L7_FIELD_ORDER: &[&str] = &[
 ];
 
 /// Return fields in a smart order based on the log message type.
-fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
+pub(crate) fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
     let order: Option<&[&str]> = if log.message.starts_with("CONNECT") {
         Some(CONNECT_FIELD_ORDER)
     } else if log.message.starts_with("L7_REQUEST") {
@@ -388,7 +403,7 @@ fn level_style(level: &str, t: &crate::theme::Theme) -> ratatui::style::Style {
     }
 }
 
-fn format_short_time(epoch_ms: i64) -> String {
+pub(crate) fn format_short_time(epoch_ms: i64) -> String {
     if epoch_ms <= 0 {
         return String::from("--:--:--");
     }
@@ -398,4 +413,134 @@ fn format_short_time(epoch_ms: i64) -> String {
     let minutes = (time_of_day % 3600) / 60;
     let seconds = time_of_day % 60;
     format!("{hours:02}:{minutes:02}:{seconds:02}")
+}
+
+/// Format a log line as plain text for clipboard copy.
+///
+/// Produces the same layout as `render_log_line()` but without styles or
+/// truncation: `HH:MM:SS {source:<7} {level:<5} {message} [key=value ...]`
+pub(crate) fn format_log_line_plain(log: &LogLine) -> String {
+    let ts = format_short_time(log.timestamp_ms);
+    let mut s = format!("{ts} {:<7} {:<5} {}", log.source, log.level, log.message);
+
+    if !log.fields.is_empty() {
+        let ordered = ordered_fields(log);
+        for (k, v) in &ordered {
+            if !v.is_empty() {
+                s.push(' ');
+                s.push_str(k);
+                s.push('=');
+                s.push_str(v);
+            }
+        }
+    }
+
+    s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn make_log(message: &str, fields: Vec<(&str, &str)>) -> LogLine {
+        LogLine {
+            timestamp_ms: 1_700_000_000_000, // 2023-11-14 22:13:20 UTC
+            level: "INFO".to_string(),
+            source: "sandbox".to_string(),
+            target: "test".to_string(),
+            message: message.to_string(),
+            fields: fields
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn plain_format_basic_line() {
+        let log = make_log("hello world", vec![]);
+        let result = format_log_line_plain(&log);
+        assert!(result.starts_with("22:13:20 sandbox INFO  hello world"));
+        assert!(!result.contains('='));
+    }
+
+    #[test]
+    fn plain_format_with_fields() {
+        let log = make_log(
+            "CONNECT",
+            vec![("dst_host", "example.com"), ("dst_port", "443")],
+        );
+        let result = format_log_line_plain(&log);
+        assert!(result.contains("dst_host=example.com"));
+        assert!(result.contains("dst_port=443"));
+    }
+
+    #[test]
+    fn plain_format_skips_empty_fields() {
+        let log = make_log("test", vec![("key1", "val"), ("key2", "")]);
+        let result = format_log_line_plain(&log);
+        assert!(result.contains("key1=val"));
+        assert!(!result.contains("key2="));
+    }
+
+    #[test]
+    fn plain_format_zero_timestamp() {
+        let log = LogLine {
+            timestamp_ms: 0,
+            level: "ERROR".to_string(),
+            source: "gateway".to_string(),
+            target: String::new(),
+            message: "fail".to_string(),
+            fields: HashMap::new(),
+        };
+        let result = format_log_line_plain(&log);
+        assert!(result.starts_with("--:--:-- gateway ERROR fail"));
+    }
+
+    #[test]
+    fn plain_format_connect_field_order() {
+        let log = make_log(
+            "CONNECT",
+            vec![
+                ("binary", "/usr/bin/curl"),
+                ("action", "allow"),
+                ("dst_host", "example.com"),
+            ],
+        );
+        let result = format_log_line_plain(&log);
+        // "action" should appear before "dst_host" which should appear before "binary"
+        let action_pos = result.find("action=").unwrap();
+        let dst_pos = result.find("dst_host=").unwrap();
+        let binary_pos = result.find("binary=").unwrap();
+        assert!(action_pos < dst_pos);
+        assert!(dst_pos < binary_pos);
+    }
+
+    #[test]
+    fn plain_format_l7_field_order() {
+        let log = make_log(
+            "L7_REQUEST",
+            vec![
+                ("policy", "default"),
+                ("l7_action", "allow"),
+                ("l7_target", "/api"),
+            ],
+        );
+        let result = format_log_line_plain(&log);
+        let action_pos = result.find("l7_action=").unwrap();
+        let target_pos = result.find("l7_target=").unwrap();
+        let policy_pos = result.find("policy=").unwrap();
+        assert!(action_pos < target_pos);
+        assert!(target_pos < policy_pos);
+    }
+
+    #[test]
+    fn plain_format_alphabetical_fields_for_unknown_message() {
+        let log = make_log("SOMETHING", vec![("zebra", "z"), ("alpha", "a")]);
+        let result = format_log_line_plain(&log);
+        let alpha_pos = result.find("alpha=").unwrap();
+        let zebra_pos = result.find("zebra=").unwrap();
+        assert!(alpha_pos < zebra_pos);
+    }
 }

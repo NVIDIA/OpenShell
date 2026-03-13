@@ -355,6 +355,9 @@ pub struct App {
     pub log_viewport_height: usize,
     /// When `Some(idx)`, a detail popup is shown for the filtered log line at this index.
     pub log_detail_index: Option<usize>,
+    /// Anchor index (absolute in filtered list) for visual selection mode.
+    /// When `Some`, the user is in visual-select mode (`v`).
+    pub log_selection_anchor: Option<usize>,
     /// Handle for the streaming log task. Dropped to cancel.
     pub log_stream_handle: Option<tokio::task::JoinHandle<()>>,
 
@@ -448,6 +451,7 @@ impl App {
             log_autoscroll: true,
             log_viewport_height: 0,
             log_detail_index: None,
+            log_selection_anchor: None,
             log_stream_handle: None,
             draft_chunks: Vec::new(),
             draft_version: 0,
@@ -900,12 +904,69 @@ impl App {
 
         match key.code {
             KeyCode::Esc => {
-                self.cancel_log_stream();
-                self.focus = Focus::SandboxPolicy;
+                if self.log_selection_anchor.is_some() {
+                    // Cancel visual selection, stay in log viewer.
+                    self.log_selection_anchor = None;
+                } else {
+                    self.cancel_log_stream();
+                    self.log_selection_anchor = None;
+                    self.focus = Focus::SandboxPolicy;
+                }
             }
             KeyCode::Char('q') => self.running = false,
+            KeyCode::Char('y') => {
+                if filtered_len == 0 {
+                    return;
+                }
+                let filtered = self.filtered_log_lines();
+                if let Some(anchor) = self.log_selection_anchor {
+                    // Visual mode: yank selected range.
+                    let cursor_abs = self.sandbox_log_scroll + self.log_cursor;
+                    let start = anchor.min(cursor_abs);
+                    let end = anchor.max(cursor_abs);
+                    let text: String = filtered[start..=end.min(filtered.len() - 1)]
+                        .iter()
+                        .map(|l| crate::ui::sandbox_logs::format_log_line_plain(l))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    crate::clipboard::copy_to_clipboard(&text);
+                    self.log_selection_anchor = None;
+                } else {
+                    // Normal mode: yank current line.
+                    let abs = self.sandbox_log_scroll + self.log_cursor;
+                    if let Some(log) = filtered.get(abs) {
+                        let text = crate::ui::sandbox_logs::format_log_line_plain(log);
+                        crate::clipboard::copy_to_clipboard(&text);
+                    }
+                }
+            }
+            KeyCode::Char('Y') => {
+                // Yank all visible lines in the viewport.
+                if filtered_len == 0 {
+                    return;
+                }
+                let filtered = self.filtered_log_lines();
+                let start = self.sandbox_log_scroll;
+                let end = (start + vh).min(filtered.len());
+                let text: String = filtered[start..end]
+                    .iter()
+                    .map(|l| crate::ui::sandbox_logs::format_log_line_plain(l))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                crate::clipboard::copy_to_clipboard(&text);
+            }
+            KeyCode::Char('v') => {
+                // Toggle visual selection mode.
+                if self.log_selection_anchor.is_some() {
+                    self.log_selection_anchor = None;
+                } else {
+                    let abs = self.sandbox_log_scroll + self.log_cursor;
+                    self.log_selection_anchor = Some(abs);
+                    self.log_autoscroll = false;
+                }
+            }
             KeyCode::Enter => {
-                if filtered_len > 0 {
+                if filtered_len > 0 && self.log_selection_anchor.is_none() {
                     let abs = self.sandbox_log_scroll + self.log_cursor;
                     if abs < filtered_len {
                         self.log_detail_index = Some(abs);
@@ -936,6 +997,7 @@ impl App {
                 self.log_autoscroll = false;
             }
             KeyCode::Char('G' | 'f') => {
+                self.log_selection_anchor = None;
                 self.sandbox_log_scroll = self.log_autoscroll_offset();
                 self.log_autoscroll = true;
                 let visible = filtered_len.saturating_sub(self.sandbox_log_scroll);
@@ -948,13 +1010,16 @@ impl App {
             }
             KeyCode::Char('s') => {
                 self.log_source_filter = self.log_source_filter.next();
+                self.log_selection_anchor = None;
                 self.sandbox_log_scroll = 0;
                 self.log_cursor = 0;
             }
             KeyCode::Char('r') => {
+                self.log_selection_anchor = None;
                 self.focus = Focus::SandboxDraft;
             }
             KeyCode::Char('p') => {
+                self.log_selection_anchor = None;
                 self.focus = Focus::SandboxPolicy;
             }
             _ => {}
@@ -1533,6 +1598,7 @@ impl App {
         self.log_cursor = 0;
         self.log_autoscroll = true;
         self.log_detail_index = None;
+        self.log_selection_anchor = None;
         self.confirm_delete = false;
         self.sandbox_policy = None;
         self.sandbox_providers_list.clear();
