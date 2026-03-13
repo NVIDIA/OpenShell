@@ -2031,19 +2031,17 @@ pub async fn sandbox_create(
                                 .message
                                 .strip_prefix("Pulling image ")
                                 .map_or("", |s| s.trim_matches('"'));
-                            {
-                                if let Some(d) = display.as_mut() {
-                                    d.set_active("Pulling image...");
-                                    if !image_name.is_empty() {
-                                        d.set_active_detail(image_name);
-                                    }
+                            if let Some(d) = display.as_mut() {
+                                d.set_active("Pulling image...");
+                                if !image_name.is_empty() {
+                                    d.set_active_detail(image_name);
+                                }
+                            } else {
+                                let ts = format_timestamp(provision_start.elapsed());
+                                if image_name.is_empty() {
+                                    println!("{} Pulling image...", ts.dimmed());
                                 } else {
-                                    let ts = format_timestamp(provision_start.elapsed());
-                                    if image_name.is_empty() {
-                                        println!("{} Pulling image...", ts.dimmed());
-                                    } else {
-                                        println!("{} Pulling image {image_name}", ts.dimmed());
-                                    }
+                                    println!("{} Pulling image {image_name}", ts.dimmed());
                                 }
                             }
                         }

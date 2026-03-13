@@ -233,7 +233,6 @@ RUN mkdir -p /var/lib/rancher/k3s/server/manifests \
              /opt/openshell/manifests \
              /opt/openshell/charts \
              /opt/openshell/gpu-manifests \
-             /opt/openshell/bin \
              /run/flannel
 
 # Copy entrypoint script that configures DNS for Docker environments

@@ -312,10 +312,6 @@ if [[ "${build_supervisor}" == "1" ]]; then
   # stray newline before erroring), so inspect the container's *image* instead.
   _cluster_image=$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
   CLUSTER_ARCH=$(docker image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
-  case "${CLUSTER_ARCH}" in
-    aarch64|arm64) RUST_TARGET="aarch64-unknown-linux-gnu" ;;
-    *)             RUST_TARGET="x86_64-unknown-linux-gnu" ;;
-  esac
 
   # Build the supervisor binary using docker buildx with a lightweight build.
   # We use the same cross-build.sh helpers as the full cluster image but only

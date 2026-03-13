@@ -613,7 +613,7 @@ fn supervisor_volume() -> serde_json::Value {
         "name": SUPERVISOR_VOLUME_NAME,
         "hostPath": {
             "path": SUPERVISOR_HOST_PATH,
-            "type": "Directory"
+            "type": "DirectoryOrCreate"
         }
     })
 }
@@ -1522,7 +1522,7 @@ mod tests {
         assert_eq!(volumes.len(), 1);
         assert_eq!(volumes[0]["name"], SUPERVISOR_VOLUME_NAME);
         assert_eq!(volumes[0]["hostPath"]["path"], SUPERVISOR_HOST_PATH);
-        assert_eq!(volumes[0]["hostPath"]["type"], "Directory");
+        assert_eq!(volumes[0]["hostPath"]["type"], "DirectoryOrCreate");
 
         // Agent container command should be overridden
         let command = pod_template["spec"]["containers"][0]["command"]
