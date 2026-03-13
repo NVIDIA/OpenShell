@@ -1312,6 +1312,7 @@ pub async fn gateway_admin_deploy(
     ssh_key: Option<&str>,
     port: u16,
     gateway_host: Option<&str>,
+    recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
     registry_token: Option<&str>,
@@ -1319,17 +1320,59 @@ pub async fn gateway_admin_deploy(
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
+    // Build remote options once so we can reuse them for the existence check
+    // and the deploy options.
+    let remote_opts = remote.map(|dest| {
+        let mut opts = RemoteOptions::new(dest);
+        if let Some(key) = ssh_key {
+            opts = opts.with_ssh_key(key);
+        }
+        opts
+    });
+
+    // Check whether a gateway already exists. If so, prompt the user (unless
+    // --recreate was passed or we're in non-interactive mode).
+    let mut should_recreate = recreate;
+    if let Some(existing) =
+        openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
+    {
+        if !should_recreate {
+            let interactive = std::io::stderr().is_terminal();
+            if interactive {
+                let status = if existing.container_running {
+                    "running"
+                } else {
+                    "stopped"
+                };
+                eprintln!(
+                    "{} Gateway '{name}' already exists ({status}).",
+                    "!".yellow().bold()
+                );
+                should_recreate = Confirm::new()
+                    .with_prompt("Destroy and recreate it?")
+                    .default(false)
+                    .interact()
+                    .into_diagnostic()?;
+                if !should_recreate {
+                    eprintln!("Keeping existing gateway.");
+                    return Ok(());
+                }
+            } else {
+                // Non-interactive mode: reuse existing gateway silently.
+                eprintln!("Gateway '{name}' already exists, reusing.");
+                return Ok(());
+            }
+        }
+    }
+
     let mut options = DeployOptions::new(name)
         .with_port(port)
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
-        .with_gpu(gpu);
-    if let Some(dest) = remote {
-        let mut remote_opts = RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            remote_opts = remote_opts.with_ssh_key(key);
-        }
-        options = options.with_remote(remote_opts);
+        .with_gpu(gpu)
+        .with_recreate(should_recreate);
+    if let Some(opts) = remote_opts {
+        options = options.with_remote(opts);
     }
     if let Some(host) = gateway_host {
         options = options.with_gateway_host(host);
@@ -1338,9 +1381,6 @@ pub async fn gateway_admin_deploy(
         options = options.with_registry_token(token);
     }
 
-    // Teardown of any existing resources is handled inside
-    // deploy_gateway_with_logs(), so both `gateway start` and the
-    // auto-bootstrap path in `sandbox create` get the same cleanup.
     let handle = deploy_gateway_with_panel(options, name, location).await?;
 
     print_deploy_summary(name, &handle);

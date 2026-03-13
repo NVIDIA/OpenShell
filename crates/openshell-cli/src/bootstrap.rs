@@ -144,7 +144,9 @@ pub async fn run_bootstrap(
     );
     eprintln!();
 
-    let mut options = openshell_bootstrap::DeployOptions::new(&gateway_name);
+    // Auto-bootstrap always recreates if stale Docker resources are found
+    // (e.g. metadata was deleted but container/volume still exist).
+    let mut options = openshell_bootstrap::DeployOptions::new(&gateway_name).with_recreate(true);
     if let Some(dest) = remote {
         let mut remote_opts = openshell_bootstrap::RemoteOptions::new(dest);
         if let Some(key) = ssh_key {

@@ -740,8 +740,8 @@ enum GatewayCommands {
 
         /// Destroy and recreate the gateway from scratch if one already exists.
         ///
-        /// Without this flag, an interactive prompt asks what to do; in
-        /// non-interactive mode the existing gateway is reused silently.
+        /// Without this flag, an interactive prompt asks whether to recreate;
+        /// in non-interactive mode the existing gateway is reused silently.
         #[arg(long)]
         recreate: bool,
 
@@ -1420,13 +1420,13 @@ async fn main() -> Result<()> {
                 registry_token,
                 gpu,
             } => {
-                let _ = recreate; // teardown is always performed by deploy
                 run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
                     ssh_key.as_deref(),
                     port,
                     gateway_host.as_deref(),
+                    recreate,
                     plaintext,
                     disable_gateway_auth,
                     registry_token.as_deref(),
