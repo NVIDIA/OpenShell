@@ -88,10 +88,7 @@ fn write_tree_node(cmd: &Command, out: &mut String, prefix: &str, is_last: bool)
 
     writeln!(out, "{prefix}{connector}{name}{positionals}").unwrap();
 
-    let children: Vec<_> = cmd
-        .get_subcommands()
-        .filter(|c| !c.is_hide_set())
-        .collect();
+    let children: Vec<_> = cmd.get_subcommands().filter(|c| !c.is_hide_set()).collect();
 
     for (i, child) in children.iter().enumerate() {
         write_tree_node(child, out, &child_prefix, i == children.len() - 1);
@@ -167,11 +164,7 @@ fn write_all_commands(root: &Command, out: &mut String, root_name: &str) {
             .collect();
 
         for child in &children {
-            write_leaf_command(
-                child,
-                out,
-                &format!("{root_name} {}", group.get_name()),
-            );
+            write_leaf_command(child, out, &format!("{root_name} {}", group.get_name()));
         }
     }
 
