@@ -50,6 +50,18 @@ done
 kubectl -n openshell get statefulset/openshell >/dev/null 2>&1 || exit 1
 kubectl -n openshell wait --for=jsonpath='{.status.readyReplicas}'=1 statefulset/openshell --timeout=1s >/dev/null 2>&1 || exit 1
 
+# ---------------------------------------------------------------------------
+# Verify the sandbox supervisor binary exists on the node filesystem.
+# Sandbox pods mount /opt/openshell/bin as a read-only hostPath volume and
+# exec /opt/openshell/bin/openshell-sandbox as their entrypoint. If the binary
+# is missing (e.g. cluster image was built without the supervisor-builder
+# stage), every sandbox pod will crash with "no such file or directory".
+# ---------------------------------------------------------------------------
+if [ ! -x /opt/openshell/bin/openshell-sandbox ]; then
+    echo "HEALTHCHECK_MISSING_SUPERVISOR: /opt/openshell/bin/openshell-sandbox not found" >&2
+    exit 1
+fi
+
 # Verify TLS secrets exist (created by openshell-bootstrap before the StatefulSet starts)
 # Skip when TLS is disabled — secrets are not required.
 if [ "${DISABLE_TLS:-}" != "true" ]; then

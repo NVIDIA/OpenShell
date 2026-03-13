@@ -26,6 +26,7 @@ Use **only** `openshell` CLI commands (`openshell status`, `openshell doctor log
     - k3s API server readiness (`/readyz`)
     - `openshell` statefulset ready in `openshell` namespace
     - TLS secrets `openshell-server-tls` and `openshell-client-tls` exist in `openshell` namespace
+    - Sandbox supervisor binary exists at `/opt/openshell/bin/openshell-sandbox` (emits `HEALTHCHECK_MISSING_SUPERVISOR` marker if absent)
 
 For local deploys, metadata endpoint selection now depends on Docker connectivity:
 
@@ -311,6 +312,8 @@ If DNS is broken, all image pulls from the distribution registry will fail, as w
 | `metrics-server` errors in logs | Normal k3s noise, not the root cause | These errors are benign — look for the actual failing health check component |
 | Stale NotReady nodes from previous deploys | Volume reused across container recreations | The deploy flow now auto-cleans stale nodes; if it still fails, manually delete NotReady nodes (see Step 2) or choose "Recreate" when prompted |
 | gRPC `UNIMPLEMENTED` for newer RPCs in push mode | Helm values still point at older pulled images instead of the pushed refs | Verify rendered `openshell-helmchart.yaml` uses the expected push refs (`server`, `sandbox`, `pki-job`) and not `:latest` |
+| Sandbox pods crash with `/opt/openshell/bin/openshell-sandbox: no such file or directory` | Supervisor binary missing from cluster image | The cluster image was built/published without the `supervisor-builder` stage. Rebuild with `mise run docker:build:cluster` and recreate gateway. Bootstrap auto-detects via `HEALTHCHECK_MISSING_SUPERVISOR` marker |
+| `HEALTHCHECK_MISSING_SUPERVISOR` in health check logs | `/opt/openshell/bin/openshell-sandbox` not found in gateway container | Rebuild cluster image: `mise run docker:build:cluster`, then `openshell gateway destroy <name> && openshell gateway start` |
 
 ## Full Diagnostic Dump
 
@@ -358,6 +361,9 @@ openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-op
 
 echo "=== Registry Configuration ==="
 openshell doctor exec -- cat /etc/rancher/k3s/registries.yaml
+
+echo "=== Supervisor Binary ==="
+openshell doctor exec -- ls -la /opt/openshell/bin/openshell-sandbox
 
 echo "=== DNS Configuration ==="
 openshell doctor exec -- cat /etc/rancher/k3s/resolv.conf
