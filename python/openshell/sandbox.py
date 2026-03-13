@@ -556,7 +556,7 @@ _PYTHON_CLOUDPICKLE_BOOTSTRAP = (
     "print(result) if result is not None else None"
 )
 
-_SANDBOX_PYTHON_BIN = "/app/.venv/bin/python"
+_SANDBOX_PYTHON_BIN = "python"
 
 
 def _serialize_python_callable(

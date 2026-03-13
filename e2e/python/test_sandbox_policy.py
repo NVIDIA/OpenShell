@@ -51,7 +51,7 @@ def _policy_for_python_proxy_tests() -> sandbox_pb2.SandboxPolicy:
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.openai.com", port=443)
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/app/.venv/bin/python")],
+                binaries=[sandbox_pb2.NetworkBinary(path="/usr/bin/python*")],
             )
         },
     )
@@ -373,7 +373,7 @@ def test_l4_binary_restricted_denies_wrong_binary(
     """L4-3: Policy restricted to specific binary denies others.
 
     Policy allows /usr/bin/curl -> api.anthropic.com:443.
-    Python (exec_python uses /app/.venv/bin/python) should be denied.
+    Python (exec_python uses python) should be denied.
     """
     policy = _base_policy(
         network_policies={
@@ -438,7 +438,7 @@ def test_l4_cross_policy_denied(
                 endpoints=[
                     sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
                 ],
-                binaries=[sandbox_pb2.NetworkBinary(path="/app/.venv/bin/python")],
+                binaries=[sandbox_pb2.NetworkBinary(path="/usr/bin/python*")],
             ),
             "other": sandbox_pb2.NetworkPolicyRule(
                 name="other",

@@ -312,9 +312,7 @@ network_policies:
       - { path: /sandbox/.venv/bin/python }
       - { path: /sandbox/.venv/bin/python3 }
       - { path: /sandbox/.venv/bin/pip }
-      - { path: /app/.venv/bin/python }
-      - { path: /app/.venv/bin/python3 }
-      - { path: /app/.venv/bin/pip }
+      - { path: /usr/bin/python* }
       - { path: /usr/local/bin/uv }
       - { path: "/sandbox/.uv/python/**" }
 
