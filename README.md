@@ -5,6 +5,8 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
+> **Want to try OpenShell without local setup?** Deploy on cloud compute with a [Brev launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg).
+
 ## Quickstart
 
 ### Prerequisites
