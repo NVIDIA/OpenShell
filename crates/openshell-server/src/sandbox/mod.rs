@@ -381,7 +381,7 @@ const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 /// How long a sandbox can stay in `Provisioning` in the store without a
 /// corresponding Kubernetes resource before it is considered orphaned and
 /// removed.
-const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(120);
+const ORPHAN_GRACE_PERIOD: Duration = Duration::from_secs(300);
 
 /// Periodically reconcile the store against Kubernetes to clean up orphaned
 /// sandbox records.  A record is orphaned when it exists in the store but

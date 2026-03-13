@@ -248,7 +248,7 @@ class SandboxClient:
         raise SandboxError(f"sandbox {sandbox_name} was not deleted within timeout")
 
     def wait_ready(
-        self, sandbox_name: str, *, timeout_seconds: float = 120.0
+        self, sandbox_name: str, *, timeout_seconds: float = 300.0
     ) -> SandboxRef:
         deadline = time.time() + timeout_seconds
         while time.time() < deadline:
