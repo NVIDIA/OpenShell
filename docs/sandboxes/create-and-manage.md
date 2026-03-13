@@ -37,7 +37,7 @@ the cause. Start Docker and try again.
 
 ## Set Up a Gateway
 
-Every sandbox requires a gateway. For local use, you can skip this step. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps one for you. If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to {doc}`gateways` for deployment options and multi-gateway management.
+Every sandbox requires a gateway. For local use, you can skip this step. If you run `openshell sandbox create` without a gateway, the CLI auto-bootstraps a local gateway for you. If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to {doc}`gateways` for deployment options and multi-gateway management.
 
 ## Create a Sandbox
 
