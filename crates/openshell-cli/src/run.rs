@@ -1346,6 +1346,7 @@ pub async fn gateway_admin_deploy(
                 } else {
                     "volume only"
                 };
+                eprintln!();
                 eprintln!(
                     "{} Gateway '{name}' already exists ({status}).",
                     "!".yellow().bold()
@@ -1353,6 +1354,7 @@ pub async fn gateway_admin_deploy(
                 if let Some(image) = &existing.container_image {
                     eprintln!("  {} {}", "Image:".dimmed(), image);
                 }
+                eprintln!();
                 eprint!("Destroy and recreate? [y/N] ");
                 std::io::stderr().flush().ok();
                 let mut input = String::new();
