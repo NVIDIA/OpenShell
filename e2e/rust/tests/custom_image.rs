@@ -15,7 +15,7 @@ use std::io::Write;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-const DOCKERFILE_CONTENT: &str = r#"FROM python:3.12-slim
+const DOCKERFILE_CONTENT: &str = r#"FROM python:3.13-slim
 
 # iproute2 is required for sandbox network namespace isolation.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \

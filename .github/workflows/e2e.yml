@@ -15,12 +15,6 @@ jobs:
     with:
       component: gateway
 
-  build-sandbox:
-    if: contains(github.event.pull_request.labels.*.name, 'e2e')
-    uses: ./.github/workflows/docker-build.yml
-    with:
-      component: sandbox
-
   build-cluster:
     if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
@@ -28,7 +22,7 @@ jobs:
       component: cluster
 
   e2e:
-    needs: [build-gateway, build-sandbox, build-cluster]
+    needs: [build-gateway, build-cluster]
     uses: ./.github/workflows/e2e-test.yml
     with:
       image-tag: ${{ github.sha }}

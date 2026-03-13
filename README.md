@@ -40,7 +40,7 @@ The sandbox container includes the following tools by default:
 | Category   | Tools                                                    |
 | ---------- | -------------------------------------------------------- |
 | Agent      | `claude`, `opencode`, `codex`                            |
-| Language   | `python` (3.12), `node` (22)                             |
+| Language   | `python` (3.13), `node` (22)                             |
 | Developer  | `gh`, `git`, `vim`, `nano`                               |
 | Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
 

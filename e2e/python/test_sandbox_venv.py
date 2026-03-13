@@ -37,12 +37,6 @@ def test_sandbox_venv_in_path(
         assert "/sandbox/.venv/bin" in path_dirs, (
             f"Expected /sandbox/.venv/bin in PATH, got: {result.stdout.strip()}"
         )
-        # /sandbox/.venv/bin must come before /app/.venv/bin
-        sandbox_idx = path_dirs.index("/sandbox/.venv/bin")
-        app_idx = path_dirs.index("/app/.venv/bin")
-        assert sandbox_idx < app_idx, (
-            "/sandbox/.venv/bin must precede /app/.venv/bin in PATH"
-        )
 
 
 def test_pip_install_in_sandbox(

@@ -12,7 +12,7 @@ redactions = ["*_TOKEN", "*_PASSWORD"]
 experimental = true
 
 [tools]
-python = "3.12.12"
+python = "3.13.12"
 rust = "stable"
 kubectl = "1.35.1"
 uv = "0.10.2"
