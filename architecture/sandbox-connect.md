@@ -415,7 +415,7 @@ Authorization is performed by the gateway (token validation + sandbox readiness 
 2. Clones the master fd for reading and writing
 3. Configures the shell command with environment variables:
    - `OPENSHELL_SANDBOX=1`, `HOME=/sandbox`, `USER=sandbox`, `TERM=<from pty request>`
-   - Proxy vars: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `http_proxy`, `https_proxy`, `grpc_proxy`, `NODE_USE_ENV_PROXY=1` so Node.js `fetch` honors the proxy env
+   - Proxy vars: `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY=127.0.0.1,localhost,::1`, `http_proxy`, `https_proxy`, `grpc_proxy`, `no_proxy=127.0.0.1,localhost,::1`, `NODE_USE_ENV_PROXY=1` so Node.js `fetch` honors the proxy env while localhost stays direct
    - TLS trust vars: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`
    - Provider credential env vars (from the provider registry)
 4. Installs a `pre_exec` hook that:
