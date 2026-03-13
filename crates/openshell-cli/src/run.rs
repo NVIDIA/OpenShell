@@ -63,7 +63,7 @@ fn phase_name(phase: i32) -> &'static str {
 }
 
 fn ready_false_condition_message(
-    status: Option<&navigator_core::proto::SandboxStatus>,
+    status: Option<&openshell_core::proto::SandboxStatus>,
 ) -> Option<String> {
     let condition = status?.conditions.iter().find(|condition| {
         condition.r#type == "Ready" && condition.status.eq_ignore_ascii_case("false")

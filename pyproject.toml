@@ -64,7 +64,7 @@ module-name = "openshell"
 [tool.ruff]
 target-version = "py312"
 line-length = 88
-exclude = ["python/openshell/_proto", "python/navigator/_proto"]
+exclude = ["python/openshell/_proto"]
 
 [tool.ruff.lint]
 select = [
