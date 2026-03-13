@@ -1,6 +1,6 @@
 # Sandbox Custom Containers
 
-Users can run `openshell sandbox create --from <source>` to launch a sandbox with a custom container image while keeping the `navigator-sandbox` process supervisor in control.
+Users can run `openshell sandbox create --from <source>` to launch a sandbox with a custom container image while keeping the `openshell-sandbox` process supervisor in control.
 
 ## The `--from` Flag
 
@@ -34,12 +34,12 @@ When `--from` points to a Dockerfile or directory, the CLI:
 
 ## How It Works
 
-The supervisor binary (`navigator-sandbox`) is **always side-loaded** from the k3s node filesystem via a read-only `hostPath` volume. It is never baked into sandbox images. This applies to all sandbox pods — whether using the default community base image, a custom image, or a user-built Dockerfile.
+The supervisor binary (`openshell-sandbox`) is **always side-loaded** from the k3s node filesystem via a read-only `hostPath` volume. It is never baked into sandbox images. This applies to all sandbox pods — whether using the default community base image, a custom image, or a user-built Dockerfile.
 
 ```mermaid
 flowchart TB
     subgraph node["K3s Node"]
-        bin["/opt/openshell/bin/navigator-sandbox
+        bin["/opt/openshell/bin/openshell-sandbox
         (built into cluster image, updatable via docker cp)"]
     end
 
@@ -48,8 +48,8 @@ flowchart TB
     subgraph pod["Pod"]
         subgraph agent["Agent Container"]
             agent_desc["Image: community base or custom image
-            Command: /opt/navigator/bin/navigator-sandbox
-            Volume: /opt/navigator/bin (ro hostPath)
+            Command: /opt/openshell/bin/openshell-sandbox
+            Volume: /opt/openshell/bin (ro hostPath)
             Env: OPENSHELL_SANDBOX_ID, OPENSHELL_ENDPOINT, ...
             Caps: SYS_ADMIN, NET_ADMIN, SYS_PTRACE"]
         end
@@ -58,9 +58,9 @@ flowchart TB
 
 The server applies these transforms to every sandbox pod template (`sandbox/mod.rs`):
 
-1. Adds a `hostPath` volume named `navigator-supervisor-bin` pointing to `/opt/openshell/bin` on the node.
-2. Mounts it read-only at `/opt/navigator/bin` in the agent container.
-3. Overrides the agent container's `command` to `/opt/navigator/bin/navigator-sandbox`.
+1. Adds a `hostPath` volume named `openshell-supervisor-bin` pointing to `/opt/openshell/bin` on the node.
+2. Mounts it read-only at `/opt/openshell/bin` in the agent container.
+3. Overrides the agent container's `command` to `/opt/openshell/bin/openshell-sandbox`.
 4. Sets `runAsUser: 0` so the supervisor has root privileges for namespace creation, proxy setup, and Landlock/seccomp.
 
 These transforms apply to both generated templates and user-provided `pod_template` overrides.
@@ -90,9 +90,9 @@ openshell sandbox create --from ./my-sandbox/  # directory with Dockerfile
 
 ## Supervisor Behavior in Custom Images
 
-The `navigator-sandbox` supervisor adapts to arbitrary environments:
+The `openshell-sandbox` supervisor adapts to arbitrary environments:
 
-- **Log file fallback**: Attempts to open `/var/log/navigator.log` for append; silently falls back to stdout-only logging if the path is not writable.
+- **Log file fallback**: Attempts to open `/var/log/openshell.log` for append; silently falls back to stdout-only logging if the path is not writable.
 - **Command resolution**: Executes the command from CLI args, then the `OPENSHELL_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
 - **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable.
 
@@ -106,13 +106,13 @@ The `navigator-sandbox` supervisor adapts to arbitrary environments:
 | `OPENSHELL_COMMUNITY_REGISTRY` env var | Allows organizations to host their own community sandbox registry |
 | hostPath side-load | Supervisor binary lives on the node filesystem — no init container, no emptyDir, no extra image pull. Faster pod startup. |
 | Read-only mount in agent | Supervisor binary cannot be tampered with by the workload |
-| Command override | Ensures `navigator-sandbox` is the entrypoint regardless of the image's default CMD |
+| Command override | Ensures `openshell-sandbox` is the entrypoint regardless of the image's default CMD |
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
-| Non-fatal log file init | `/var/log/navigator.log` may be unwritable in arbitrary images; falls back to stdout |
+| Non-fatal log file init | `/var/log/openshell.log` may be unwritable in arbitrary images; falls back to stdout |
 | `docker save` / `ctr import` for push | Avoids requiring a registry for local dev; images land directly in the k3s containerd store |
 
 ## Limitations
 
 - Distroless / `FROM scratch` images are not supported (the supervisor needs glibc and `/proc`)
 - Missing `iproute2` (or required capabilities) blocks startup in proxy mode because namespace isolation is mandatory
-- The supervisor binary must be present on the k3s node at `/opt/openshell/bin/navigator-sandbox` (embedded in the cluster image at build time)
+- The supervisor binary must be present on the k3s node at `/opt/openshell/bin/openshell-sandbox` (embedded in the cluster image at build time)

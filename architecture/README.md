@@ -84,7 +84,7 @@ When the agent (or any tool running inside the sandbox) tries to connect to a re
 3. **Evaluates the request against policy** using the OPA engine. The policy can allow or deny connections based on the destination hostname, port, and the identity of the requesting program.
 4. **Rejects connections to internal IP addresses** as a defense against SSRF (Server-Side Request Forgery). Even if the policy allows a hostname, the proxy resolves DNS before connecting and blocks any result that points to a private network address (e.g., cloud metadata endpoints, localhost, or RFC 1918 ranges). This prevents an attacker from redirecting an allowed hostname to internal infrastructure.
 5. **Performs protocol-aware inspection (L7)** for configured endpoints. The proxy can terminate TLS, inspect the underlying HTTP traffic, and enforce rules on individual API requests -- not just connection-level allow/deny. This operates in either audit mode (log violations but allow traffic) or enforce mode (block violations).
-6. **Intercepts inference API calls** to `inference.local`. When the agent sends an HTTPS CONNECT request to `inference.local`, the proxy bypasses OPA evaluation entirely and handles the connection through a dedicated inference interception path. It TLS-terminates the connection, parses the HTTP request, detects known inference API patterns (OpenAI, Anthropic, model discovery), and routes matching requests locally through the sandbox's embedded inference router (`navigator-router`). Non-inference requests to `inference.local` are denied with 403.
+6. **Intercepts inference API calls** to `inference.local`. When the agent sends an HTTPS CONNECT request to `inference.local`, the proxy bypasses OPA evaluation entirely and handles the connection through a dedicated inference interception path. It TLS-terminates the connection, parses the HTTP request, detects known inference API patterns (OpenAI, Anthropic, model discovery), and routes matching requests locally through the sandbox's embedded inference router (`openshell-router`). Non-inference requests to `inference.local` are denied with 403.
 
 The proxy generates an ephemeral certificate authority at startup and injects it into the sandbox's trust store. This allows it to transparently inspect HTTPS traffic when L7 inspection is configured for an endpoint, and to serve TLS for `inference.local` interception.
 
@@ -166,7 +166,7 @@ For more detail, see [Providers](sandbox-providers.md).
 
 ### Inference Routing
 
-The inference routing system transparently intercepts AI inference API calls from sandboxed agents and routes them to configured backends. Routing happens locally within the sandbox -- the proxy intercepts connections to `inference.local`, and the embedded `navigator-router` forwards requests directly to the backend without traversing the gateway at request time.
+The inference routing system transparently intercepts AI inference API calls from sandboxed agents and routes them to configured backends. Routing happens locally within the sandbox -- the proxy intercepts connections to `inference.local`, and the embedded `openshell-router` forwards requests directly to the backend without traversing the gateway at request time.
 
 **How it works end-to-end:**
 
@@ -174,7 +174,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 2. When a sandbox starts, the supervisor fetches an inference bundle from the gateway via the `GetInferenceBundle` RPC. The gateway resolves the stored provider reference into a complete route: endpoint URL, API key, supported protocols, provider type, and auth metadata. The sandbox refreshes this bundle eagerly in the background every 5 seconds by default (override with `OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS`).
 3. The agent sends requests to `https://inference.local` using standard OpenAI or Anthropic SDK calls.
 4. The sandbox proxy intercepts the HTTPS CONNECT to `inference.local` (bypassing OPA policy evaluation), TLS-terminates the connection using the sandbox's ephemeral CA, and parses the HTTP request.
-5. Known inference API patterns are detected (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic, `GET /v1/models` for model discovery). Matching requests are forwarded to the first compatible route by the `navigator-router`, which rewrites the auth header, injects provider-specific default headers (e.g., `anthropic-version` for Anthropic), and overrides the model field in the request body.
+5. Known inference API patterns are detected (e.g., `POST /v1/chat/completions` for OpenAI, `POST /v1/messages` for Anthropic, `GET /v1/models` for model discovery). Matching requests are forwarded to the first compatible route by the `openshell-router`, which rewrites the auth header, injects provider-specific default headers (e.g., `anthropic-version` for Anthropic), and overrides the model field in the request body.
 6. Non-inference requests to `inference.local` are denied with 403.
 
 **Key design properties:**
@@ -182,7 +182,7 @@ The inference routing system transparently intercepts AI inference API calls fro
 - Agents need zero code changes -- standard OpenAI/Anthropic SDK calls work transparently when pointed at `inference.local`.
 - The sandbox never sees the real API key for the backend -- credential isolation is maintained through the gateway's bundle resolution.
 - Routing is explicit via `inference.local`; OPA network policy is not involved in inference routing.
-- Provider-specific behavior (auth header style, default headers, supported protocols) is centralized in `InferenceProviderProfile` definitions in `navigator-core`. Supported inference provider types are openai, anthropic, and nvidia.
+- Provider-specific behavior (auth header style, default headers, supported protocols) is centralized in `InferenceProviderProfile` definitions in `openshell-core`. Supported inference provider types are openai, anthropic, and nvidia.
 - Cluster inference is managed via CLI (`openshell cluster inference set/get`).
 
 **Inference routes** are stored on the gateway as protobuf objects (`InferenceRoute` in `proto/inference.proto`). Cluster inference uses a managed singleton route entry keyed by `inference.local` and configured from provider + model settings. Endpoint, credentials, and protocols are resolved from the referenced provider record at bundle fetch time, so rotating a provider's API key takes effect on the next bundle refresh without reconfiguring the route.
@@ -191,11 +191,11 @@ The inference routing system transparently intercepts AI inference API calls fro
 
 | Component | Location | Role |
 |---|---|---|
-| Proxy inference interception | `crates/navigator-sandbox/src/proxy.rs` | Intercepts `inference.local` CONNECT requests, TLS-terminates, dispatches to router |
-| Inference pattern detection | `crates/navigator-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
-| Local inference router | `crates/navigator-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
-| Provider profiles | `crates/navigator-core/src/inference.rs` | Centralized auth, headers, protocols, and endpoint defaults per provider type |
-| Gateway inference service | `crates/navigator-server/src/inference.rs` | Stores cluster inference config, resolves bundles with credentials from provider records |
+| Proxy inference interception | `crates/openshell-sandbox/src/proxy.rs` | Intercepts `inference.local` CONNECT requests, TLS-terminates, dispatches to router |
+| Inference pattern detection | `crates/openshell-sandbox/src/l7/inference.rs` | Matches HTTP method + path against known inference API patterns |
+| Local inference router | `crates/openshell-router/src/lib.rs` | Selects a compatible route by protocol and proxies to the backend |
+| Provider profiles | `crates/openshell-core/src/inference.rs` | Centralized auth, headers, protocols, and endpoint defaults per provider type |
+| Gateway inference service | `crates/openshell-server/src/inference.rs` | Stores cluster inference config, resolves bundles with credentials from provider records |
 | Proto definitions | `proto/inference.proto` | `ClusterInferenceConfig`, `ResolvedRoute`, bundle RPCs |
 
 

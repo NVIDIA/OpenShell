@@ -8,7 +8,7 @@ This document describes how the CLI resolves a gateway and communicates with it 
 
 ### Gateway resolution
 
-When any CLI command needs to talk to the gateway, it resolves the target through a priority chain (`crates/navigator-cli/src/main.rs` -- `resolve_gateway()`):
+When any CLI command needs to talk to the gateway, it resolves the target through a priority chain (`crates/openshell-cli/src/main.rs` -- `resolve_gateway()`):
 
 1. `--gateway-endpoint <URL>` flag (direct URL, reusing stored metadata when the gateway is known).
 2. `--cluster <NAME>` / `-g <NAME>` flag.
@@ -45,7 +45,7 @@ graph TD
 
 ### mTLS connection (default)
 
-**File**: `crates/navigator-cli/src/tls.rs` -- `build_channel()`
+**File**: `crates/openshell-cli/src/tls.rs` -- `build_channel()`
 
 The default mode for self-deployed gateways. The CLI loads three PEM files from `~/.config/openshell/clusters/<name>/mtls/`:
 
@@ -67,12 +67,12 @@ sequenceDiagram
     CLI->>GW: TLS handshake (present client cert)
     GW->>GW: Verify client cert against CA
     GW-->>CLI: TLS established (HTTP/2 via ALPN)
-    CLI->>GW: gRPC requests (Navigator / Inference service)
+    CLI->>GW: gRPC requests (OpenShell / Inference service)
 ```
 
 ### Edge-authenticated connection
 
-**Files**: `crates/navigator-cli/src/edge_tunnel.rs`, `crates/navigator-cli/src/auth.rs`
+**Files**: `crates/openshell-cli/src/edge_tunnel.rs`, `crates/openshell-cli/src/auth.rs`
 
 For gateways behind an edge proxy (e.g., Cloudflare Access), the CLI routes traffic through a local WebSocket tunnel proxy:
 
@@ -108,12 +108,12 @@ openshell/
 
 For gateways that are already deployed behind an edge proxy (e.g., Cloudflare Access), deployment is not needed -- only registration.
 
-**File**: `crates/navigator-cli/src/run.rs` -- `gateway_add()`
+**File**: `crates/openshell-cli/src/run.rs` -- `gateway_add()`
 
 ```mermaid
 sequenceDiagram
     participant U as User
-    participant CLI as navigator-cli
+    participant CLI as openshell-cli
     participant Browser as Browser
     participant Edge as Edge Proxy
     participant GW as Gateway

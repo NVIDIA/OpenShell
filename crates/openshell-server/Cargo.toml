@@ -1,0 +1,83 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "openshell-server"
+description = "OpenShell gRPC/HTTP server with protocol multiplexing"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "openshell-server"
+path = "src/main.rs"
+
+[dependencies]
+openshell-core = { path = "../openshell-core" }
+openshell-policy = { path = "../openshell-policy" }
+
+# Async runtime
+tokio = { workspace = true }
+
+# gRPC
+tonic = { workspace = true, features = ["channel", "tls"] }
+prost = { workspace = true }
+prost-types = { workspace = true }
+
+# HTTP server
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true, features = ["client", "http1", "http2"] }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+
+# TLS
+tokio-rustls = { workspace = true }
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+
+# CLI
+clap = { workspace = true }
+
+# Error handling
+miette = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# Utilities
+futures = { workspace = true }
+bytes = { workspace = true }
+pin-project-lite = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio-stream = { workspace = true }
+sqlx = { workspace = true }
+kube = { workspace = true }
+kube-runtime = { workspace = true }
+k8s-openapi = { workspace = true }
+uuid = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+russh = "0.57"
+rand = "0.9"
+petname = "2"
+
+[dev-dependencies]
+hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
+rcgen = { version = "0.13", features = ["crypto", "pem"] }
+tempfile = "3"
+tokio-tungstenite = { workspace = true }
+futures-util = "0.3"
+
+[lints]
+workspace = true

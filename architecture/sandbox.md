@@ -4,7 +4,7 @@ The sandbox binary isolates a user-specified command inside a child process with
 
 ## Source File Index
 
-All paths are relative to `crates/navigator-sandbox/src/`.
+All paths are relative to `crates/openshell-sandbox/src/`.
 
 | File | Purpose |
 |------|---------|
@@ -18,7 +18,7 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 | `ssh.rs` | Embedded SSH server (`russh` crate) with PTY support and handshake verification |
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
-| `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedNavigatorClient`) |
+| `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedOpenShellClient`) |
 | `denial_aggregator.rs` | `DenialAggregator` background task -- receives `DenialEvent`s from the proxy, deduplicates by `(host, port, binary)`, drains on flush interval |
 | `mechanistic_mapper.rs` | Deterministic policy recommendation generator -- converts denial summaries to `PolicyChunk` proposals with confidence scores, rationale, and SSRF/private-IP detection |
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
@@ -35,7 +35,7 @@ All paths are relative to `crates/navigator-sandbox/src/`.
 
 ## Startup and Orchestration
 
-The `run_sandbox()` function in `crates/navigator-sandbox/src/lib.rs` is the main orchestration entry point. It executes the following steps in order.
+The `run_sandbox()` function in `crates/openshell-sandbox/src/lib.rs` is the main orchestration entry point. It executes the following steps in order.
 
 ### Orchestration flow
 
@@ -76,7 +76,7 @@ flowchart TD
 
 1. **Policy loading** (`load_policy()`):
    - Priority 1: `--policy-rules` + `--policy-data` provided -- load OPA engine from local Rego file and YAML data file via `OpaEngine::from_files()`. Query `query_sandbox_config()` for filesystem/landlock/process settings. Network mode forced to `Proxy`.
-   - Priority 2: `--sandbox-id` + `--navigator-endpoint` provided -- fetch typed proto policy via `grpc_client::fetch_policy()`. Create OPA engine via `OpaEngine::from_proto()` using baked-in Rego rules. Convert proto to `SandboxPolicy` via `TryFrom`, which always forces `NetworkMode::Proxy` so that all egress passes through the proxy and the `inference.local` virtual host is always addressable.
+   - Priority 2: `--sandbox-id` + `--openshell-endpoint` provided -- fetch typed proto policy via `grpc_client::fetch_policy()`. Create OPA engine via `OpaEngine::from_proto()` using baked-in Rego rules. Convert proto to `SandboxPolicy` via `TryFrom`, which always forces `NetworkMode::Proxy` so that all egress passes through the proxy and the `inference.local` virtual host is always addressable.
    - Neither present: return fatal error.
    - Output: `(SandboxPolicy, Option<Arc<OpaEngine>>)`
 
@@ -88,7 +88,7 @@ flowchart TD
 
 5. **TLS state for L7 inspection** (proxy mode only):
    - Generate ephemeral CA via `SandboxCa::generate()` using `rcgen`
-   - Write CA cert PEM and combined bundle (system CAs + sandbox CA) to `/etc/navigator-tls/`
+   - Write CA cert PEM and combined bundle (system CAs + sandbox CA) to `/etc/openshell-tls/`
    - Add the TLS directory to `policy.filesystem.read_only` so Landlock allows the child to read it
    - Build upstream `ClientConfig` with Mozilla root CAs via `webpki_roots`
    - Create `Arc<ProxyTlsState>` wrapping a `CertCache` and the upstream config
@@ -113,13 +113,13 @@ flowchart TD
 
 10. **Store entrypoint PID**: `entrypoint_pid.store(pid, Ordering::Release)` so the proxy can resolve TCP peer identity via `/proc`.
 
-11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `navigator_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
+11. **Spawn policy poll task** (gRPC mode only): If `sandbox_id`, `openshell_endpoint`, and an OPA engine are all present, spawn `run_policy_poll_loop()` as a background tokio task. This task polls the gateway for policy updates and hot-reloads the OPA engine when a new version is detected. See [Policy Reload Lifecycle](#policy-reload-lifecycle) for details.
 
 12. **Wait with timeout**: If `--timeout > 0`, wrap `handle.wait()` in `tokio::time::timeout()`. On timeout, kill the process and return exit code 124.
 
 ## Policy Model
 
-Policy data structures live in `crates/navigator-sandbox/src/policy.rs`.
+Policy data structures live in `crates/openshell-sandbox/src/policy.rs`.
 
 ```rust
 pub struct SandboxPolicy {
@@ -188,11 +188,11 @@ flowchart LR
 
 ## OPA Policy Engine
 
-The OPA engine lives in `crates/navigator-sandbox/src/opa.rs` and uses the `regorus` crate -- a pure-Rust Rego evaluator with no external OPA daemon dependency.
+The OPA engine lives in `crates/openshell-sandbox/src/opa.rs` and uses the `regorus` crate -- a pure-Rust Rego evaluator with no external OPA daemon dependency.
 
 ### Baked-in rules
 
-The Rego rules are compiled into the binary via `include_str!("../data/sandbox-policy.rego")`. The package is `navigator.sandbox`. Key rules:
+The Rego rules are compiled into the binary via `include_str!("../data/sandbox-policy.rego")`. The package is `openshell.sandbox`. Key rules:
 
 | Rule | Type | Purpose |
 |------|------|---------|
@@ -247,15 +247,15 @@ Input JSON shape:
 ```
 
 Evaluates three Rego rules:
-1. `data.navigator.sandbox.allow_network` -> bool
-2. `data.navigator.sandbox.deny_reason` -> string
-3. `data.navigator.sandbox.matched_network_policy` -> string (or `Undefined`)
+1. `data.openshell.sandbox.allow_network` -> bool
+2. `data.openshell.sandbox.deny_reason` -> string
+3. `data.openshell.sandbox.matched_network_policy` -> string (or `Undefined`)
 
 Returns `PolicyDecision { allowed, reason, matched_policy }`.
 
 #### `evaluate_network_action(input: &NetworkInput) -> Result<NetworkAction>`
 
-Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.navigator.sandbox.network_action` Rego rule, which returns one of two string values:
+Uses the same input JSON shape as `evaluate_network()`. Evaluates the `data.openshell.sandbox.network_action` Rego rule, which returns one of two string values:
 
 - `"allow"` -- endpoint + binary explicitly matched in a network policy
 - `"deny"` -- network connections not allowed by policy
@@ -277,7 +277,7 @@ The proxy calls `evaluate_network_action()` (not `evaluate_network()`) as its ma
 
 ### L7 endpoint config query
 
-After L4 allows a connection, `query_endpoint_config(input)` evaluates `data.navigator.sandbox.matched_endpoint_config` to get the full endpoint object. If the endpoint has a `protocol` field, `l7::parse_l7_config()` extracts the L7 config for protocol-aware inspection.
+After L4 allows a connection, `query_endpoint_config(input)` evaluates `data.openshell.sandbox.matched_endpoint_config` to get the full endpoint object. If the endpoint has a `protocol` field, `l7::parse_l7_config()` extracts the L7 config for protocol-aware inspection.
 
 ### Engine cloning for L7
 
@@ -294,7 +294,7 @@ Both methods hold the `Mutex` only for the final swap (`*engine = new_engine`), 
 
 ## Policy Reload Lifecycle
 
-**File:** `crates/navigator-sandbox/src/lib.rs` (`run_policy_poll_loop()`)
+**File:** `crates/openshell-sandbox/src/lib.rs` (`run_policy_poll_loop()`)
 
 In gRPC mode, the sandbox can receive policy updates at runtime without restarting. A background task polls the gateway for new policy versions and hot-reloads the OPA engine when changes are detected. Only **dynamic** policy domains (network rules) can change at runtime; **static** domains (filesystem, Landlock, process) are applied once in the pre-exec closure and cannot be modified after the child process spawns.
 
@@ -340,24 +340,24 @@ sequenceDiagram
     end
 ```
 
-The `run_policy_poll_loop()` function in `crates/navigator-sandbox/src/lib.rs` implements this loop:
+The `run_policy_poll_loop()` function in `crates/openshell-sandbox/src/lib.rs` implements this loop:
 
-1. **Connect once**: Create a `CachedNavigatorClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
+1. **Connect once**: Create a `CachedOpenShellClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
 2. **Fetch initial version**: Call `poll_policy(sandbox_id)` to establish the baseline `current_version`. On failure, log a warning and retry on the next interval.
 3. **Poll loop**: Sleep for the configured interval, then call `poll_policy()` again.
 4. **Version comparison**: If `result.version <= current_version`, skip. The version is a monotonically increasing `u32` per sandbox.
 5. **Reload attempt**: Call `opa_engine.reload_from_proto(&result.policy)`. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
 6. **Status reporting**: On success, report `PolicyStatus::Loaded` to the gateway via `ReportPolicyStatus` RPC. On failure, report `PolicyStatus::Failed` with the error message. Status report failures are logged but do not affect the poll loop.
 
-### `CachedNavigatorClient`
+### `CachedOpenShellClient`
 
-**File:** `crates/navigator-sandbox/src/grpc_client.rs`
+**File:** `crates/openshell-sandbox/src/grpc_client.rs`
 
-`CachedNavigatorClient` is a persistent gRPC client for the `Navigator` service. It wraps a `NavigatorClient<Channel>` connected once at construction and reused for all subsequent calls.
+`CachedOpenShellClient` is a persistent gRPC client for the `OpenShell` service. It wraps a `OpenShellClient<Channel>` connected once at construction and reused for all subsequent calls.
 
 ```rust
-pub struct CachedNavigatorClient {
-    client: NavigatorClient<Channel>,
+pub struct CachedOpenShellClient {
+    client: OpenShellClient<Channel>,
 }
 
 pub struct PolicyPollResult {
@@ -371,7 +371,7 @@ Methods:
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
 - **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing the policy, version, and hash.
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
-- **`raw_client()`**: Return a clone of the underlying `NavigatorClient<Channel>` for direct RPC calls (used by the log push task).
+- **`raw_client()`**: Return a clone of the underlying `OpenShellClient<Channel>` for direct RPC calls (used by the log push task).
 
 ### Server-side policy versioning
 
@@ -379,9 +379,9 @@ The gateway assigns a monotonically increasing version number to each policy rev
 
 Proto messages involved:
 - `GetSandboxPolicyResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`
-- `ReportPolicyStatusRequest` (`proto/navigator.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
+- `ReportPolicyStatusRequest` (`proto/openshell.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
 - `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
-- `SandboxPolicyRevision` (`proto/navigator.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`
+- `SandboxPolicyRevision` (`proto/openshell.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`
 
 ### Failure modes
 
@@ -399,7 +399,7 @@ All enforcement code runs in the child process's pre-exec closure -- after `fork
 
 ### Landlock filesystem isolation
 
-**File:** `crates/navigator-sandbox/src/sandbox/linux/landlock.rs`
+**File:** `crates/openshell-sandbox/src/sandbox/linux/landlock.rs`
 
 Landlock restricts the child process's filesystem access to an explicit allowlist.
 
@@ -417,7 +417,7 @@ Error behavior depends on `LandlockCompatibility`:
 
 ### Seccomp syscall filtering
 
-**File:** `crates/navigator-sandbox/src/sandbox/linux/seccomp.rs`
+**File:** `crates/openshell-sandbox/src/sandbox/linux/seccomp.rs`
 
 Seccomp blocks socket creation for specific address families. The filter targets a single syscall (`SYS_socket`) and inspects argument 0 (the domain).
 
@@ -437,7 +437,7 @@ In `Proxy` mode, `AF_INET`/`AF_INET6` are allowed because the sandboxed process 
 
 ### Network namespace isolation
 
-**File:** `crates/navigator-sandbox/src/sandbox/linux/netns.rs`
+**File:** `crates/openshell-sandbox/src/sandbox/linux/netns.rs`
 
 The network namespace creates an isolated network stack where the sandboxed process can only communicate through the proxy.
 
@@ -489,7 +489,7 @@ If namespace creation fails (e.g., missing capabilities), startup fails in `Prox
 
 ## HTTP CONNECT Proxy
 
-**File:** `crates/navigator-sandbox/src/proxy.rs`
+**File:** `crates/openshell-sandbox/src/proxy.rs`
 
 The proxy is an async TCP listener that accepts HTTP CONNECT requests. Each connection spawns a handler task. The proxy evaluates every CONNECT request against OPA policy with full process-identity binding, except for connections to the `inference.local` virtual host which bypass OPA and are handled by the inference interception path.
 
@@ -620,7 +620,7 @@ After OPA allows a connection, the proxy resolves DNS and rejects any host that 
 
 ### Inference interception
 
-When a CONNECT target is `inference.local`, the proxy TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `navigator-router` crate. The function `handle_inference_interception()` implements this path and returns an `InferenceOutcome`:
+When a CONNECT target is `inference.local`, the proxy TLS-terminates the client side and inspects the HTTP traffic to detect inference API calls. Matched requests are executed locally via the `openshell-router` crate. The function `handle_inference_interception()` implements this path and returns an `InferenceOutcome`:
 
 ```rust
 enum InferenceOutcome {
@@ -678,15 +678,15 @@ When `Router::proxy_with_candidates()` returns an error, `router_error_to_http()
 
 ### Inference routing context
 
-**Files:** `crates/navigator-sandbox/src/lib.rs` (`build_inference_context`, `bundle_to_resolved_routes`, `spawn_route_refresh`), `crates/navigator-sandbox/src/proxy.rs` (`InferenceContext`)
+**Files:** `crates/openshell-sandbox/src/lib.rs` (`build_inference_context`, `bundle_to_resolved_routes`, `spawn_route_refresh`), `crates/openshell-sandbox/src/proxy.rs` (`InferenceContext`)
 
-The sandbox executes inference requests locally using the `navigator-router` crate. `InferenceContext` holds the router, API patterns, and a cached set of resolved routes:
+The sandbox executes inference requests locally using the `openshell-router` crate. `InferenceContext` holds the router, API patterns, and a cached set of resolved routes:
 
 ```rust
 pub struct InferenceContext {
     pub patterns: Vec<InferenceApiPattern>,
-    router: navigator_router::Router,
-    routes: Arc<tokio::sync::RwLock<Vec<navigator_router::config::ResolvedRoute>>>,
+    router: openshell_router::Router,
+    routes: Arc<tokio::sync::RwLock<Vec<openshell_router::config::ResolvedRoute>>>,
 }
 ```
 
@@ -700,7 +700,7 @@ The sandbox is designed to operate both as part of a cluster and as a standalone
 
 1. **Route file (standalone mode)**: `--inference-routes` / `OPENSHELL_INFERENCE_ROUTES` points to a YAML file parsed by `RouterConfig::load_from_file()`. Routes are resolved via `config.resolve_routes()`. File loading or parsing errors are fatal (fail-fast), but an empty route list gracefully disables inference routing (returns `None`). The route file always takes precedence -- if both a route file and cluster credentials are present, the route file wins and the cluster bundle is not fetched.
 
-2. **Cluster bundle (cluster mode)**: When `navigator_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `navigator_core::inference::auth_for_provider_type()`.
+2. **Cluster bundle (cluster mode)**: When `openshell_endpoint` is available (and no route file is configured), routes are fetched from the gateway via `grpc_client::fetch_inference_bundle()`, which calls the `GetInferenceBundle` gRPC RPC on the `Inference` service. The RPC takes no arguments (the bundle is cluster-scoped, not per-sandbox). The gateway returns a `GetInferenceBundleResponse` containing resolved `ResolvedRoute` entries for the managed cluster route. These proto messages are converted to router `ResolvedRoute` structs by `bundle_to_resolved_routes()`, which maps provider types to auth headers and default headers via `openshell_core::inference::auth_for_provider_type()`.
 
 3. **No source**: If neither route file nor cluster credentials are configured, `build_inference_context()` returns `None` and inference routing is disabled.
 
@@ -741,7 +741,7 @@ flowchart TD
 
 #### API key security
 
-`ResolvedRoute` has a custom `Debug` implementation in `crates/navigator-router/src/config.rs` that redacts the `api_key` field, printing `[REDACTED]` instead of the actual value. This prevents key leakage in log output and debug traces.
+`ResolvedRoute` has a custom `Debug` implementation in `crates/openshell-router/src/config.rs` that redacts the `api_key` field, printing `[REDACTED]` instead of the actual value. This prevents key leakage in log output and debug traces.
 
 ### Post-decision: L7 dispatch or raw tunnel (`Allow` path)
 
@@ -760,7 +760,7 @@ After a CONNECT is allowed, the SSRF check passes, and the upstream TCP connecti
 
 ## L7 Protocol-Aware Inspection
 
-**Files:** `crates/navigator-sandbox/src/l7/`
+**Files:** `crates/openshell-sandbox/src/l7/`
 
 The L7 subsystem inspects application-layer traffic within CONNECT tunnels. Instead of raw `copy_bidirectional`, each request is parsed, evaluated against OPA rules, and either forwarded or blocked.
 
@@ -820,13 +820,13 @@ Expansion happens in `expand_access_presets()` before the Rego engine loads the 
 
 ### TLS termination
 
-**File:** `crates/navigator-sandbox/src/l7/tls.rs`
+**File:** `crates/openshell-sandbox/src/l7/tls.rs`
 
 TLS termination enables the proxy to inspect HTTPS traffic by performing MITM decryption.
 
 **Ephemeral CA lifecycle:**
-1. At sandbox startup, `SandboxCa::generate()` creates a self-signed CA (CN: "Navigator Sandbox CA") using `rcgen`
-2. The CA cert PEM and a combined bundle (system CAs + sandbox CA) are written to `/etc/navigator-tls/`
+1. At sandbox startup, `SandboxCa::generate()` creates a self-signed CA (CN: "OpenShell Sandbox CA") using `rcgen`
+2. The CA cert PEM and a combined bundle (system CAs + sandbox CA) are written to `/etc/openshell-tls/`
 3. The sandbox CA cert path is set as `NODE_EXTRA_CA_CERTS` (additive for Node.js)
 4. The combined bundle is set as `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (replaces defaults for OpenSSL, Python requests, curl)
 
@@ -845,7 +845,7 @@ System CA bundles are searched at well-known paths: `/etc/ssl/certs/ca-certifica
 
 ### REST protocol provider
 
-**File:** `crates/navigator-sandbox/src/l7/rest.rs`
+**File:** `crates/openshell-sandbox/src/l7/rest.rs`
 
 Implements `L7Provider` for HTTP/1.1:
 
@@ -853,17 +853,17 @@ Implements `L7Provider` for HTTP/1.1:
 
 - **`relay()`**: Forwards request headers and body to upstream (handling Content-Length, chunked, and no-body cases), then reads and relays the full response back to the client.
 
-- **`deny()`**: Sends an HTTP `403 Forbidden` JSON response with `Content-Type: application/json`, including the policy name, matched rule, and deny reason. Sets `Connection: close` and includes an `X-Navigator-Policy` header.
+- **`deny()`**: Sends an HTTP `403 Forbidden` JSON response with `Content-Type: application/json`, including the policy name, matched rule, and deny reason. Sets `Connection: close` and includes an `X-OpenShell-Policy` header.
 
 - **`looks_like_http()`**: Protocol detection via first-byte peek -- checks for standard HTTP method prefixes (GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS, CONNECT, TRACE).
 
 ### Per-request L7 evaluation
 
-`relay_with_inspection()` in `crates/navigator-sandbox/src/l7/relay.rs` is the main relay loop:
+`relay_with_inspection()` in `crates/openshell-sandbox/src/l7/relay.rs` is the main relay loop:
 
 1. Parse one HTTP request from client via the provider
 2. Build L7 input JSON with `request.method`, `request.path`, plus the CONNECT-level context (host, port, binary, ancestors, cmdline)
-3. Evaluate `data.navigator.sandbox.allow_request` and `data.navigator.sandbox.request_deny_reason`
+3. Evaluate `data.openshell.sandbox.allow_request` and `data.openshell.sandbox.request_deny_reason`
 4. Log the L7 decision (tagged `L7_REQUEST`)
 5. If allowed (or audit mode): relay request to upstream and response back to client, then loop
 6. If denied in enforce mode: send 403 and close the connection
@@ -872,7 +872,7 @@ Implements `L7Provider` for HTTP/1.1:
 
 ### SHA256 TOFU (Trust-On-First-Use)
 
-**File:** `crates/navigator-sandbox/src/identity.rs`
+**File:** `crates/openshell-sandbox/src/identity.rs`
 
 `BinaryIdentityCache` wraps a `Mutex<HashMap<PathBuf, CachedBinary>>`, where
 each cached entry stores:
@@ -892,7 +892,7 @@ The TOFU model means:
 
 ### /proc-based identity resolution
 
-**File:** `crates/navigator-sandbox/src/procfs.rs`
+**File:** `crates/openshell-sandbox/src/procfs.rs`
 
 The proxy resolves which binary is making each network request by inspecting `/proc`.
 
@@ -920,7 +920,7 @@ Both IPv4 (`/proc/{pid}/net/tcp`) and IPv6 (`/proc/{pid}/net/tcp6`) tables are c
 
 ## Process Management
 
-**File:** `crates/navigator-sandbox/src/process.rs`
+**File:** `crates/openshell-sandbox/src/process.rs`
 
 ### `ProcessHandle`
 
@@ -962,7 +962,7 @@ Exit code is `code` if the process exited normally, or `128 + signal` if killed 
 
 ## SSH Server
 
-**File:** `crates/navigator-sandbox/src/ssh.rs`
+**File:** `crates/openshell-sandbox/src/ssh.rs`
 
 The embedded SSH server provides remote shell access to the sandbox. It uses the `russh` crate and allocates PTYs for interactive sessions.
 
@@ -1017,11 +1017,11 @@ The `SshHandler` implements `russh::server::Handler`:
 
 ## Zombie Reaping (PID 1 Init Duties)
 
-`navigator-sandbox` runs as PID 1 inside the container. In Linux, when a process exits, its parent must call `waitpid()` to collect the exit status; otherwise the process remains as a zombie. Orphaned processes (whose parent exits first) are reparented to PID 1, which becomes responsible for reaping them.
+`openshell-sandbox` runs as PID 1 inside the container. In Linux, when a process exits, its parent must call `waitpid()` to collect the exit status; otherwise the process remains as a zombie. Orphaned processes (whose parent exits first) are reparented to PID 1, which becomes responsible for reaping them.
 
 Coding agents running inside the sandbox (OpenClaw, Claude, Codex) frequently spawn background daemons and child processes. When these grandchildren are orphaned, they become PID 1's responsibility. Without reaping, they accumulate as zombies for the lifetime of the container.
 
-**File:** `crates/navigator-sandbox/src/lib.rs`
+**File:** `crates/openshell-sandbox/src/lib.rs`
 
 The sandbox supervisor registers a `SIGCHLD` handler at startup and spawns a background reaper task. The reaper also runs on a 5-second interval timer as a fallback in case signals are coalesced or missed. On each wake, it loops calling `waitid(Id::All, WEXITED | WNOHANG | WNOWAIT)` to inspect exited children without consuming their status. For each exited child:
 
@@ -1039,7 +1039,7 @@ This two-phase approach (peek with `WNOWAIT`, then selectively reap) avoids `ECH
 |----------|----------|---------|---------|
 | `OPENSHELL_SANDBOX_COMMAND` | (trailing args) | `/bin/bash` | Command to execute inside sandbox |
 | `OPENSHELL_SANDBOX_ID` | `--sandbox-id` | | Sandbox ID for gRPC policy fetch |
-| `OPENSHELL_ENDPOINT` | `--navigator-endpoint` | | Gateway gRPC endpoint |
+| `OPENSHELL_ENDPOINT` | `--openshell-endpoint` | | Gateway gRPC endpoint |
 | `OPENSHELL_POLICY_RULES` | `--policy-rules` | | Path to Rego policy file |
 | `OPENSHELL_POLICY_DATA` | `--policy-data` | | Path to YAML data file |
 | `OPENSHELL_LOG_LEVEL` | `--log-level` | `warn` | Log level (trace/debug/info/warn/error) |
@@ -1121,7 +1121,7 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 
 Dual-output logging is configured in `main.rs`:
 - **stdout**: Filtered by `--log-level` (default `warn`), uses ANSI colors
-- **`/var/log/navigator.log`**: Fixed at `info` level, no ANSI, non-blocking writer
+- **`/var/log/openshell.log`**: Fixed at `info` level, no ANSI, non-blocking writer
 
 Key structured log events:
 - `CONNECT`: One per proxy CONNECT request (for non-`inference.local` targets) with full identity context. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
@@ -1161,7 +1161,7 @@ Two log sources feed the same `TracingLogBus`:
 
 ### LogPushLayer
 
-**File:** `crates/navigator-sandbox/src/log_push.rs`
+**File:** `crates/openshell-sandbox/src/log_push.rs`
 
 `LogPushLayer` is a `tracing_subscriber::Layer` that intercepts tracing events in the sandbox supervisor and forwards them to the gateway.
 
@@ -1181,9 +1181,9 @@ Key behaviors:
 
 ### Initialization
 
-**File:** `crates/navigator-sandbox/src/main.rs`
+**File:** `crates/openshell-sandbox/src/main.rs`
 
-The log push layer is set up in `main()` before calling `run_sandbox()`, only in gRPC mode (when both `--sandbox-id` and `--navigator-endpoint` are present):
+The log push layer is set up in `main()` before calling `run_sandbox()`, only in gRPC mode (when both `--sandbox-id` and `--openshell-endpoint` are present):
 
 1. `spawn_log_push_task(endpoint, sandbox_id)` creates the mpsc channel and background task, returning the sender half and a `JoinHandle`.
 2. `LogPushLayer::new(sandbox_id, tx)` wraps the sender in a tracing layer.
@@ -1193,12 +1193,12 @@ This means the push layer captures all tracing events the sandbox supervisor gen
 
 ### Background push task
 
-**File:** `crates/navigator-sandbox/src/log_push.rs` (`spawn_log_push_task()`, `run_push_loop()`)
+**File:** `crates/openshell-sandbox/src/log_push.rs` (`spawn_log_push_task()`, `run_push_loop()`)
 
 The background task batches log lines and streams them to the gateway:
 
 1. **Channel setup**: Creates a bounded `mpsc::channel::<SandboxLogLine>(1024)`. The sender goes to the `LogPushLayer`; the receiver feeds the push loop.
-2. **gRPC connection**: Connects a `CachedNavigatorClient` to the gateway. On connection failure, the task prints to stderr (cannot use tracing to avoid recursion) and exits.
+2. **gRPC connection**: Connects a `CachedOpenShellClient` to the gateway. On connection failure, the task prints to stderr (cannot use tracing to avoid recursion) and exits.
 3. **Client-streaming RPC**: Opens a `PushSandboxLogs` client-streaming call via a secondary `mpsc::channel::<PushSandboxLogsRequest>(32)` wrapped in `tokio_stream::wrappers::ReceiverStream`. A separate spawned task drives the gRPC call.
 4. **Batch-and-flush loop**: Accumulates lines in a `Vec` (capacity 50). Flushes when:
    - The batch reaches 50 lines, OR
@@ -1207,7 +1207,7 @@ The background task batches log lines and streams them to the gateway:
 
 ### Server-side ingestion
 
-**File:** `crates/navigator-server/src/grpc.rs` (`push_sandbox_logs`)
+**File:** `crates/openshell-server/src/grpc.rs` (`push_sandbox_logs`)
 
 The `PushSandboxLogs` RPC handler processes each batch:
 1. Validates `sandbox_id` is non-empty (skips empty batches).
@@ -1218,7 +1218,7 @@ The `PushSandboxLogs` RPC handler processes each batch:
 
 ### TracingLogBus integration
 
-**File:** `crates/navigator-server/src/tracing_bus.rs`
+**File:** `crates/openshell-server/src/tracing_bus.rs`
 
 `publish_external()` wraps the `SandboxLogLine` in a `SandboxStreamEvent` and calls the internal `publish()` method, which:
 1. Sends the event to the per-sandbox `broadcast::Sender` (capacity 1024). Subscribers (active `WatchSandbox` streams) receive the event immediately.
@@ -1252,7 +1252,7 @@ Gateway-sourced logs do not currently populate the `fields` map (it remains empt
 
 ### CLI filtering
 
-**File:** `crates/navigator-cli/src/main.rs` (command definition), `crates/navigator-cli/src/run.rs` (`sandbox_logs()`)
+**File:** `crates/openshell-cli/src/main.rs` (command definition), `crates/openshell-cli/src/run.rs` (`sandbox_logs()`)
 
 The `nav logs` command supports filtering by source and level:
 
@@ -1292,7 +1292,7 @@ Filtering is implemented server-side. For `WatchSandbox`, filters apply to both 
 
 ### CLI output format
 
-`print_log_line()` in `crates/navigator-cli/src/run.rs` formats each log line:
+`print_log_line()` in `crates/openshell-cli/src/run.rs` formats each log line:
 
 ```
 [timestamp] [source ] [level] [target] message key=value key=value
@@ -1300,15 +1300,15 @@ Filtering is implemented server-side. For `WatchSandbox`, filters apply to both 
 
 Example output:
 ```
-[1708891234.567] [sandbox] [INFO ] [navigator_sandbox::proxy] CONNECT api.example.com:443 dst_host=api.example.com action=allow
-[1708891234.890] [gateway] [INFO ] [navigator_server::grpc] ReportPolicyStatus: sandbox reported policy load result
+[1708891234.567] [sandbox] [INFO ] [openshell_sandbox::proxy] CONNECT api.example.com:443 dst_host=api.example.com action=allow
+[1708891234.890] [gateway] [INFO ] [openshell_server::grpc] ReportPolicyStatus: sandbox reported policy load result
 ```
 
 When the `fields` map is non-empty, entries are sorted by key and appended as `key=value` pairs.
 
 ### Create-watch filter
 
-**File:** `crates/navigator-cli/src/run.rs`
+**File:** `crates/openshell-cli/src/run.rs`
 
 During `sandbox create`, the CLI opens a `WatchSandbox` stream with `stop_on_terminal: true` to wait until the sandbox reaches `Ready` phase. This stream uses `log_sources: ["gateway"]` to filter out sandbox-pushed logs. Without this filter, continuous sandbox supervisor logs (e.g., proxy CONNECT events) would keep the stream active and prevent `stop_on_terminal` from detecting that provisioning has completed and the stream should close.
 
@@ -1352,7 +1352,7 @@ sequenceDiagram
 
 ## Platform Support
 
-Platform-specific code is abstracted through `crates/navigator-sandbox/src/sandbox/mod.rs`.
+Platform-specific code is abstracted through `crates/openshell-sandbox/src/sandbox/mod.rs`.
 
 | Feature | Linux | Other platforms |
 |---------|-------|-----------------|
@@ -1374,4 +1374,4 @@ On non-Linux platforms, the sandbox can still run commands with proxy-based netw
 - [Sandbox Connect](sandbox-connect.md) -- SSH tunnel from gateway to sandbox
 - [Providers](sandbox-providers.md) -- Provider credential injection
 - [Policy Language](security-policy.md) -- Rego policy syntax and rules
-- [Inference Routing](inference-routing.md) -- Inference interception, route management, and the `navigator-router` crate
+- [Inference Routing](inference-routing.md) -- Inference interception, route management, and the `openshell-router` crate

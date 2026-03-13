@@ -3,12 +3,12 @@
 
 syntax = "proto3";
 
-package navigator.datamodel.v1;
+package openshell.datamodel.v1;
 
 import "google/protobuf/struct.proto";
 import "sandbox.proto";
 
-// Sandbox model stored by Navigator.
+// Sandbox model stored by OpenShell.
 message Sandbox {
   string id = 1;
   string name = 2;
@@ -22,13 +22,13 @@ message Sandbox {
   uint32 current_policy_version = 8;
 }
 
-// Navigator-level sandbox spec.
+// OpenShell-level sandbox spec.
 message SandboxSpec {
   string log_level = 1;
   map<string, string> environment = 5;
   SandboxTemplate template = 6;
   // Required sandbox policy configuration.
-  navigator.sandbox.v1.SandboxPolicy policy = 7;
+  openshell.sandbox.v1.SandboxPolicy policy = 7;
   // Provider names to attach to this sandbox.
   repeated string providers = 8;
 }
@@ -74,7 +74,7 @@ enum SandboxPhase {
   SANDBOX_PHASE_UNKNOWN = 5;
 }
 
-// Provider model stored by Navigator.
+// Provider model stored by OpenShell.
 message Provider {
   string id = 1;
   string name = 2;

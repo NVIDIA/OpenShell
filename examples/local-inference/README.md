@@ -75,7 +75,7 @@ Run the sandbox binary directly with a route file — no OpenShell cluster neede
 # 1. Edit routes.yaml to point at your local LLM (e.g. LM Studio on :1234)
 
 # 2. Run the sandbox with --inference-routes
-navigator-sandbox \
+openshell-sandbox \
   --inference-routes examples/local-inference/routes.yaml \
   --policy-rules <your-policy.rego> \
   --policy-data examples/local-inference/sandbox-policy.yaml \

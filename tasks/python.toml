@@ -243,7 +243,7 @@ uv run python -m grpc_tools.protoc \
   --pyi_out=python/openshell/_proto \
   --grpc_python_out=python/openshell/_proto \
   proto/inference.proto \
-  proto/navigator.proto \
+  proto/openshell.proto \
   proto/datamodel.proto \
   proto/sandbox.proto
 # Fix absolute imports in generated stubs to use package-relative imports
@@ -255,11 +255,11 @@ line_rewrites = {
     "python/openshell/_proto/inference_pb2_grpc.py": [
         (r"^import inference_pb2 as inference__pb2$", "from . import inference_pb2 as inference__pb2"),
     ],
-    "python/openshell/_proto/navigator_pb2_grpc.py": [
-        (r"^import navigator_pb2 as navigator__pb2$", "from . import navigator_pb2 as navigator__pb2"),
+    "python/openshell/_proto/openshell_pb2_grpc.py": [
+        (r"^import openshell_pb2 as openshell__pb2$", "from . import openshell_pb2 as openshell__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],
-    "python/openshell/_proto/navigator_pb2.py": [
+    "python/openshell/_proto/openshell_pb2.py": [
         (r"^import datamodel_pb2 as datamodel__pb2$", "from . import datamodel_pb2 as datamodel__pb2"),
         (r"^import sandbox_pb2 as sandbox__pb2$", "from . import sandbox_pb2 as sandbox__pb2"),
     ],

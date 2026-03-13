@@ -25,7 +25,7 @@ This is your primary fallback. Use it freely -- the CLI's help output is authori
 
 ## Prerequisites
 
-- `openshell` is on the PATH (install via `cargo install --path crates/navigator-cli`)
+- `openshell` is on the PATH (install via `cargo install --path crates/openshell-cli`)
 - Docker is running (required for gateway operations and BYOC)
 - For remote clusters: SSH access to the target host
 
@@ -563,5 +563,5 @@ $ openshell sandbox upload --help
 | Skill | When to use |
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
-| `debug-navigator-cluster` | Diagnosing cluster startup or health failures |
+| `debug-openshell-cluster` | Diagnosing cluster startup or health failures |
 | `tui-development` | Developing features for the OpenShell TUI (`openshell term`) |

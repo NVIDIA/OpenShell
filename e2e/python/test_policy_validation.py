@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING
 import grpc
 import pytest
 
-from openshell._proto import datamodel_pb2, navigator_pb2, sandbox_pb2
+from openshell._proto import datamodel_pb2, openshell_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -68,7 +68,7 @@ def test_create_sandbox_rejects_root_user(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(navigator_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "root" in exc_info.value.details().lower()
@@ -92,7 +92,7 @@ def test_create_sandbox_rejects_path_traversal(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(navigator_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "traversal" in exc_info.value.details().lower()
@@ -116,7 +116,7 @@ def test_create_sandbox_rejects_overly_broad_paths(
 
     stub = sandbox_client._stub
     with pytest.raises(grpc.RpcError) as exc_info:
-        stub.CreateSandbox(navigator_pb2.CreateSandboxRequest(name="", spec=spec))
+        stub.CreateSandbox(openshell_pb2.CreateSandboxRequest(name="", spec=spec))
 
     assert exc_info.value.code() == grpc.StatusCode.INVALID_ARGUMENT
     assert "broad" in exc_info.value.details().lower()
@@ -154,7 +154,7 @@ def test_update_policy_rejects_immutable_fields(
 
         with pytest.raises(grpc.RpcError) as exc_info:
             stub.UpdateSandboxPolicy(
-                navigator_pb2.UpdateSandboxPolicyRequest(
+                openshell_pb2.UpdateSandboxPolicyRequest(
                     name=sandbox_name,
                     policy=unsafe_policy,
                 )
