@@ -1337,22 +1337,33 @@ pub async fn gateway_admin_deploy(
         openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
     {
         if !should_recreate {
-            let interactive = std::io::stderr().is_terminal();
+            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
             if interactive {
                 let status = if existing.container_running {
                     "running"
-                } else {
+                } else if existing.container_exists {
                     "stopped"
+                } else {
+                    "volume only"
                 };
+                eprintln!();
                 eprintln!(
                     "{} Gateway '{name}' already exists ({status}).",
                     "!".yellow().bold()
                 );
-                should_recreate = Confirm::new()
-                    .with_prompt("Destroy and recreate it?")
-                    .default(false)
-                    .interact()
-                    .into_diagnostic()?;
+                if let Some(image) = &existing.container_image {
+                    eprintln!("  {} {}", "Image:".dimmed(), image);
+                }
+                eprintln!();
+                eprint!("Destroy and recreate? [y/N] ");
+                std::io::stderr().flush().ok();
+                let mut input = String::new();
+                std::io::stdin()
+                    .read_line(&mut input)
+                    .into_diagnostic()
+                    .wrap_err("failed to read user input")?;
+                let choice = input.trim().to_lowercase();
+                should_recreate = choice == "y" || choice == "yes";
                 if !should_recreate {
                     eprintln!("Keeping existing gateway.");
                     return Ok(());
