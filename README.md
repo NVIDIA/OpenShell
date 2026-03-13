@@ -5,6 +5,10 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
+OpenShell is built agent-first.  The project ships with agent skills for everything from cluster debugging to policy generation, and we expect contributors to use them.
+
+> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one cluster. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
+
 ## Quickstart
 
 Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg). Otherwise, follow the steps below to run locally.
@@ -58,6 +62,18 @@ The sandbox container includes the following tools by default:
 | Language   | `python` (3.13), `node` (22)                             |
 | Developer  | `gh`, `git`, `vim`, `nano`                               |
 | Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
+
+### Explore with your agent
+
+Clone the repo and point your coding agent at it. The project includes agent skills that can answer questions, walk you through workflows, and diagnose problems — no issue filing required.
+
+```bash
+git clone https://github.com/NVIDIA/OpenShell.git   # or git@github.com:NVIDIA/OpenShell.git
+cd OpenShell
+# Point your agent here — it will discover the skills in .agents/skills/ automatically
+```
+
+Your agent can load skills for CLI usage (`openshell-cli`), cluster troubleshooting (`debug-openshell-cluster`), policy generation (`generate-sandbox-policy`), and more. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full skills table.
 
 ### See network policy in action
 
@@ -172,6 +188,17 @@ openshell sandbox create --from registry.io/img:v1 # container image
 
 See the [community sandboxes](https://github.com/NVIDIA/OpenShell/blob/main/docs/sandboxes/community-sandboxes.md) catalog and the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for details.
 
+## Built With Agents
+
+OpenShell is developed using the same agent-driven workflows it enables. The `.agents/skills/` directory contains workflow automation that powers the project's development cycle:
+
+- **Spike and build:** Investigate a problem with `create-spike`, then implement it with `build-from-issue` once a human approves.
+- **Triage and route:** Community issues are assessed with `triage-issue`, classified, and routed into the spike-build pipeline.
+- **Security review:** `review-security-issue` produces a severity assessment and remediation plan. `fix-security-issue` implements it.
+- **Policy authoring:** `generate-sandbox-policy` creates YAML policies from plain-language requirements or API documentation.
+
+All implementation work is human-gated — agents propose plans, humans approve, agents build. See [AGENTS.md](AGENTS.md) for the full workflow chain documentation.
+
 ## Learn More
 
 - [Full Documentation](https://github.com/NVIDIA/OpenShell/tree/main/docs) — overview, architecture, tutorials, and reference
@@ -180,10 +207,11 @@ See the [community sandboxes](https://github.com/NVIDIA/OpenShell/blob/main/docs
 - [Architecture](https://github.com/NVIDIA/OpenShell/tree/main/architecture) — detailed architecture docs and design decisions
 - [Support Matrix](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/support-matrix.md) — platforms, versions, and kernel requirements
 - [Brev Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg) — try OpenShell on cloud compute without local setup
+- [Agent Instructions](AGENTS.md) — system prompt and workflow documentation for agent contributors
 
 ## Contributing
 
-See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md) for building from source and contributing to OpenShell.
+OpenShell is built agent-first — your agent is your first collaborator. Before opening issues or submitting code, point your agent at the repo and let it use the skills in `.agents/skills/` to investigate, diagnose, and prototype. See [CONTRIBUTING.md](CONTRIBUTING.md) for the full agent skills table, contribution workflow, and development setup.
 
 ## License
 

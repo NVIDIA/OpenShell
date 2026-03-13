@@ -55,7 +55,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 ## Plans
 
-- Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you skip right to GitHub.
+- Store plan documents in `architecture/plans`. This is git ignored so its for easier access for humans. When asked to create Spikes or issues, you can skip to GitHub issues. Only use the plans dir when you aren't writing data somewhere else specific.
 - When asked to write a plan, write it there without asking for the location.
 
 ## Sandbox Infra Changes
