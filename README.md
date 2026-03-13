@@ -18,12 +18,19 @@ Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchabl
 **Binary (recommended — requires [GitHub CLI](https://cli.github.com)):**
 
 ```bash
-gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-aarch64-apple-darwin.tar.gz" -O - \
-  | tar xz \
-  && sudo install -m 755 openshell /usr/local/bin/openshell
+sh -c 'ARCH=$(uname -m); OS=$(uname -s); \
+    case "${OS}-${ARCH}" in \
+      Linux-x86_64)  ASSET="openshell-x86_64-unknown-linux-musl.tar.gz" ;; \
+      Linux-aarch64) ASSET="openshell-aarch64-unknown-linux-musl.tar.gz" ;; \
+      Darwin-arm64)  ASSET="openshell-aarch64-apple-darwin.tar.gz" ;; \
+      *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;; \
+    esac; \
+    gh release download devel --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
+      | tar xz \
+      && sudo install -m 755 openshell /usr/local/bin/openshell'
 ```
 
-Or use the install script which auto-detects your platform (Linux x86_64, Linux aarch64, macOS Apple Silicon):
+Or use the install script from the repo which auto-detects your platform (Linux x86_64, Linux aarch64, macOS Apple Silicon):
 
 ```bash
 ./install.sh
@@ -59,20 +66,20 @@ OpenShell applies defense in depth across four policy domains:
 | Layer      | What it protects                                    | When it applies             |
 | ---------- | --------------------------------------------------- | --------------------------- |
 | Filesystem | Prevents reads/writes outside allowed paths.        | Locked at sandbox creation. |
-| Network    | Blocks unauthorized outbound connections.            | Hot-reloadable at runtime.  |
-| Process    | Blocks privilege escalation and dangerous syscalls.  | Locked at sandbox creation. |
-| Inference  | Reroutes model API calls to controlled backends.     | Hot-reloadable at runtime.  |
+| Network    | Blocks unauthorized outbound connections.           | Hot-reloadable at runtime.  |
+| Process    | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
+| Inference  | Reroutes model API calls to controlled backends.    | Hot-reloadable at runtime.  |
 
 Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
 
 ## Supported Agents
 
-| Agent | Source | Notes |
-|---|---|---|
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Built-in | Works out of the box. Requires `ANTHROPIC_API_KEY`. |
-| [OpenCode](https://opencode.ai/) | Built-in | Works out of the box. Requires `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
-| [Codex](https://developers.openai.com/codex) | Built-in | Works out of the box. Requires `OPENAI_API_KEY`. |
-| [OpenClaw](https://openclaw.ai/) | [Community](https://github.com/NVIDIA/OpenShell-Community) | Launch with `openshell sandbox create --from openclaw`. |
+| Agent                                                         | Source                                                     | Notes                                                                    |
+| ------------------------------------------------------------- | ---------------------------------------------------------- | ------------------------------------------------------------------------ |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | Built-in                                                   | Works out of the box. Requires `ANTHROPIC_API_KEY`.                      |
+| [OpenCode](https://opencode.ai/)                              | Built-in                                                   | Works out of the box. Requires `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
+| [Codex](https://developers.openai.com/codex)                  | Built-in                                                   | Works out of the box. Requires `OPENAI_API_KEY`.                         |
+| [OpenClaw](https://openclaw.ai/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community) | Launch with `openshell sandbox create --from openclaw`.                  |
 
 ## How It Works
 
@@ -84,27 +91,27 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 
 Under the hood, the gateway runs as a [K3s](https://k3s.io/) Kubernetes cluster inside Docker — no separate K8s install required.
 
-| Component | Role |
-|---|---|
-| **Gateway** | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary. |
-| **Sandbox** | Isolated runtime with container supervision and policy-enforced egress routing. |
-| **Policy Engine** | Enforces filesystem, network, and process constraints from application layer down to kernel. |
-| **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute. |
+| Component          | Role                                                                                         |
+| ------------------ | -------------------------------------------------------------------------------------------- |
+| **Gateway**        | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary.          |
+| **Sandbox**        | Isolated runtime with container supervision and policy-enforced egress routing.              |
+| **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
+| **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
 ## Key Commands
 
-| Command | Description |
-|---|---|
-| `openshell sandbox create -- <agent>` | Create a sandbox and launch an agent. |
-| `openshell sandbox connect [name]` | SSH into a running sandbox. |
-| `openshell sandbox list` | List all sandboxes. |
-| `openshell sandbox delete <name>` | Delete a sandbox. |
-| `openshell provider create --type claude --from-existing` | Create a credential provider from env vars. |
-| `openshell policy set <name> --policy file.yaml` | Apply or update a policy on a running sandbox. |
-| `openshell policy get <name>` | Show the active policy. |
-| `openshell inference set --provider <p> --model <m>` | Configure the `inference.local` endpoint. |
-| `openshell logs [name] --tail` | Stream sandbox logs. |
-| `openshell term` | Launch the real-time terminal UI for debugging. |
+| Command                                                   | Description                                     |
+| --------------------------------------------------------- | ----------------------------------------------- |
+| `openshell sandbox create -- <agent>`                     | Create a sandbox and launch an agent.           |
+| `openshell sandbox connect [name]`                        | SSH into a running sandbox.                     |
+| `openshell sandbox list`                                  | List all sandboxes.                             |
+| `openshell sandbox delete <name>`                         | Delete a sandbox.                               |
+| `openshell provider create --type claude --from-existing` | Create a credential provider from env vars.     |
+| `openshell policy set <name> --policy file.yaml`          | Apply or update a policy on a running sandbox.  |
+| `openshell policy get <name>`                             | Show the active policy.                         |
+| `openshell inference set --provider <p> --model <m>`      | Configure the `inference.local` endpoint.       |
+| `openshell logs [name] --tail`                            | Stream sandbox logs.                            |
+| `openshell term`                                          | Launch the real-time terminal UI for debugging. |
 
 See the full [CLI reference](https://github.com/NVIDIA/OpenShell/blob/main/docs/reference/cli.md) for all commands, flags, and environment variables.
 

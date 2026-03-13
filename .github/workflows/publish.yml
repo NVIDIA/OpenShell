@@ -386,12 +386,12 @@ jobs:
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OpenShell Latest Devel
+          name: OpenShell Development Build
           prerelease: true
           tag_name: devel
           target_commitish: ${{ github.sha }}
           body: |
-            This devel build is automatically built on every commit to main that passes CI.
+            This build is automatically built on every commit to main that passes CI.
 
             > **NOTE**: This is a development build, not a tagged release, and may be unstable.
 
@@ -400,15 +400,16 @@ jobs:
             Requires the [GitHub CLI (`gh`)](https://cli.github.com) to be installed and authenticated.
 
             ```bash
-            gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-$(uname -m | sed 's/arm64/aarch64/')-$(uname -s | sed 's/Darwin/apple-darwin/;s/Linux/unknown-linux-musl/').tar.gz" -O - \
-              | tar xz \
-              && sudo install -m 755 openshell /usr/local/bin/openshell
-            ```
-
-            Or use the install script (also requires `gh`):
-
-            ```bash
-            ./install.sh
+            sh -c 'ARCH=$(uname -m); OS=$(uname -s); \
+                case "${OS}-${ARCH}" in \
+                  Linux-x86_64)  ASSET="openshell-x86_64-unknown-linux-musl.tar.gz" ;; \
+                  Linux-aarch64) ASSET="openshell-aarch64-unknown-linux-musl.tar.gz" ;; \
+                  Darwin-arm64)  ASSET="openshell-aarch64-apple-darwin.tar.gz" ;; \
+                  *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;; \
+                esac; \
+                gh release download devel --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
+                  | tar xz \
+                  && sudo install -m 755 openshell /usr/local/bin/openshell'
             ```
 
             ### Assets
