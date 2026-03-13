@@ -810,9 +810,11 @@ network_policies:
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
         assert_eq!(violations.len(), 2);
-        assert!(violations
-            .iter()
-            .all(|v| matches!(v, PolicyViolation::InvalidProcessIdentity { .. })));
+        assert!(
+            violations
+                .iter()
+                .all(|v| matches!(v, PolicyViolation::InvalidProcessIdentity { .. }))
+        );
     }
 
     #[test]
@@ -830,9 +832,11 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, PolicyViolation::PathTraversal { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::PathTraversal { .. }))
+        );
     }
 
     #[test]
@@ -844,9 +848,11 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, PolicyViolation::RelativePath { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::RelativePath { .. }))
+        );
     }
 
     #[test]
@@ -858,9 +864,11 @@ network_policies:
             read_write: vec!["/".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::OverlyBroadPath { .. }))
+        );
     }
 
     #[test]
@@ -902,9 +910,11 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, PolicyViolation::TooManyPaths { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::TooManyPaths { .. }))
+        );
     }
 
     #[test]
@@ -917,9 +927,11 @@ network_policies:
             read_write: vec!["/tmp".into()],
         });
         let violations = validate_sandbox_policy(&policy).unwrap_err();
-        assert!(violations
-            .iter()
-            .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. })));
+        assert!(
+            violations
+                .iter()
+                .any(|v| matches!(v, PolicyViolation::FieldTooLong { .. }))
+        );
     }
 
     #[test]
