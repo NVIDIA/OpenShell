@@ -902,6 +902,13 @@ enum InferenceCommands {
         /// agent harness) and is not accessible to user code.
         #[arg(long)]
         system: bool,
+
+        /// Skip endpoint verification before saving the route.
+        ///
+        /// Accepted now so scripts can opt out explicitly ahead of a future
+        /// default switch to verification.
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Update gateway-level inference configuration (partial update).
@@ -918,6 +925,13 @@ enum InferenceCommands {
         /// Target the system inference route.
         #[arg(long)]
         system: bool,
+
+        /// Skip endpoint verification before saving the route.
+        ///
+        /// Accepted now so scripts can opt out explicitly ahead of a future
+        /// default switch to verification.
+        #[arg(long)]
+        no_verify: bool,
     },
 
     /// Get gateway-level inference provider and model.
@@ -1757,6 +1771,7 @@ async fn main() -> Result<()> {
                     provider,
                     model,
                     system,
+                    no_verify: _,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(endpoint, &provider, &model, route_name, &tls)
@@ -1766,6 +1781,7 @@ async fn main() -> Result<()> {
                     provider,
                     model,
                     system,
+                    no_verify: _,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_update(
@@ -2688,5 +2704,53 @@ mod tests {
             }
             other => panic!("expected SshProxy, got: {other:?}"),
         }
+    }
+
+    #[test]
+    fn inference_set_accepts_no_verify_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "inference",
+            "set",
+            "--provider",
+            "openai-dev",
+            "--model",
+            "gpt-4.1",
+            "--no-verify",
+        ])
+        .expect("inference set should parse --no-verify");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inference {
+                command: Some(InferenceCommands::Set {
+                    no_verify: true,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn inference_update_accepts_no_verify_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "inference",
+            "update",
+            "--provider",
+            "openai-dev",
+            "--no-verify",
+        ])
+        .expect("inference update should parse --no-verify");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inference {
+                command: Some(InferenceCommands::Update {
+                    no_verify: true,
+                    ..
+                })
+            })
+        ));
     }
 }
