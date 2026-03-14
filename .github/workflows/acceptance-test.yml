@@ -3,15 +3,8 @@ name: Acceptance Test
 on:
   workflow_dispatch:
     inputs:
-      release_type:
-        description: "Release type to test against"
-        required: true
-        type: choice
-        options:
-          - dev
-          - tag
-      ref:
-        description: "Tag (e.g. v1.2.3) or commit SHA for the release to test"
+      tag:
+        description: "Release tag to test (e.g. devel, v1.2.3)"
         required: true
         type: string
   workflow_run:
@@ -60,13 +53,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            RELEASE_TYPE="${{ inputs.release_type }}"
-            REF="${{ inputs.ref }}"
-            if [ "$RELEASE_TYPE" = "dev" ]; then
-              echo "tag=devel" >> "$GITHUB_OUTPUT"
-            else
-              echo "tag=${REF}" >> "$GITHUB_OUTPUT"
-            fi
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
           else
             WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
             if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
