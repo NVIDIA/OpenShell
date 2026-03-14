@@ -121,7 +121,7 @@ After inference is configured, code inside any sandbox can call `https://inferen
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="https://inference.local/v1", api_key="dummy")
+client = OpenAI(base_url="https://inference.local/v1", api_key="unused")
 
 response = client.chat.completions.create(
     model="anything",
@@ -129,7 +129,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The client-supplied model is ignored for generation requests. OpenShell rewrites it to the configured model before forwarding upstream.
+The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding.
 
 Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
 
