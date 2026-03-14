@@ -7,6 +7,7 @@
 //! start, stop, list, and track background SSH port forwards.
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -216,6 +217,41 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
 }
 
 // ---------------------------------------------------------------------------
+// Port availability check
+// ---------------------------------------------------------------------------
+
+/// Check whether a local port is available for forwarding.
+///
+/// Attempts to bind `127.0.0.1:<port>`.  If the port is already in use, the
+/// error message includes an actionable hint:
+///
+/// - If an existing openshell forward owns the port, suggest the stop command.
+/// - Otherwise, suggest `lsof` to identify the owning process.
+pub fn check_port_available(port: u16) -> Result<()> {
+    if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+        // Port is free — the listener is dropped immediately, releasing it.
+        return Ok(());
+    }
+
+    // Port is occupied.  Check if it belongs to a tracked openshell forward.
+    if let Ok(forwards) = list_forwards()
+        && let Some(fwd) = forwards.iter().find(|f| f.port == port && f.alive)
+    {
+        return Err(miette::miette!(
+            "Port {port} is already forwarded to sandbox '{}'.\n\
+             Stop it with: openshell forward stop {port} {}",
+            fwd.sandbox,
+            fwd.sandbox,
+        ));
+    }
+
+    Err(miette::miette!(
+        "Port {port} is already in use by another process.\n\
+         Find it with: lsof -i :{port} -sTCP:LISTEN",
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // SSH utility functions (shared between CLI and TUI)
 // ---------------------------------------------------------------------------
 
@@ -422,5 +458,31 @@ mod tests {
             .collect();
         // 0 is valid u16 but we may want to filter it; 99999 overflows u16.
         assert_eq!(ports, vec![8080, 3000, 0]);
+    }
+
+    #[test]
+    fn check_port_available_free_port() {
+        // Bind to port 0 to get an OS-assigned free port, then drop the
+        // listener so the port is released before we test it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert!(check_port_available(port).is_ok());
+    }
+
+    #[test]
+    fn check_port_available_occupied_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Keep the listener alive so the port stays occupied.
+
+        let result = check_port_available(port);
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected 'already in use' in error message, got: {msg}"
+        );
     }
 }

@@ -311,6 +311,8 @@ pub async fn sandbox_forward(
     background: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
+    openshell_core::forward::check_port_available(port)?;
+
     let session = ssh_session_config(server, name, tls).await?;
 
     let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));

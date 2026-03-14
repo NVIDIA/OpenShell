@@ -1360,6 +1360,11 @@ async fn start_port_forwards(
 
     // Start a forward for each port.
     for port in ports {
+        if let Err(e) = openshell_core::forward::check_port_available(*port) {
+            tracing::warn!("skipping forward for port {port}: {e}");
+            continue;
+        }
+
         let mut command = std::process::Command::new("ssh");
         command
             .arg("-o")
