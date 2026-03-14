@@ -1,0 +1,52 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Release Auto-Tag
+
+on:
+  workflow_dispatch: {}
+  # schedule:
+  #   - cron: "0 3 * * *" # 7 PM PT (03:00 UTC during PDT)
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-auto-tag
+  cancel-in-progress: false
+
+jobs:
+  create-tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine next patch version
+        id: version
+        run: |
+          latest=$(git tag -l 'v*.*.*' --sort=-v:refname | head -1)
+          if [ -z "$latest" ]; then
+            echo "::error::No existing v*.*.* tags found"
+            exit 1
+          fi
+          echo "Latest tag: $latest"
+
+          major=$(echo "$latest" | sed 's/^v//' | cut -d. -f1)
+          minor=$(echo "$latest" | sed 's/^v//' | cut -d. -f2)
+          patch=$(echo "$latest" | sed 's/^v//' | cut -d. -f3)
+          next="v${major}.${minor}.$((patch + 1))"
+
+          if git tag -l "$next" | grep -q .; then
+            echo "::error::Tag $next already exists"
+            exit 1
+          fi
+
+          echo "next=$next" >> "$GITHUB_OUTPUT"
+          echo "Next tag: $next"
+
+      - name: Create and push tag
+        run: |
+          git tag ${{ steps.version.outputs.next }}
+          git push origin ${{ steps.version.outputs.next }}
