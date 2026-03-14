@@ -26,7 +26,17 @@ content:
 
 # Gateways
 
-The gateway is the control plane for OpenShell. It coordinates sandbox lifecycle, manages providers, enforces policies, and brokers all requests between the CLI and running sandboxes.
+The gateway is the control plane for OpenShell. All control-plane traffic between the CLI and running sandboxes flows through the gateway.
+
+The gateway is responsible for:
+
+- Provisioning and managing sandboxes, including creation, deletion, and status monitoring.
+- Storing provider credentials (API keys, tokens) and delivering them to sandboxes at startup.
+- Delivering network and filesystem policies to sandboxes. Policy enforcement itself happens inside each sandbox through the proxy, OPA, Landlock, and seccomp.
+- Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.
+- Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.
+
+The gateway runs inside a Docker container and exposes a single port (gRPC and HTTP multiplexed), secured by mTLS by default. No separate Kubernetes installation is required. It can be deployed locally, on a remote host via SSH, or behind a cloud reverse proxy.
 
 OpenShell supports three gateway types:
 

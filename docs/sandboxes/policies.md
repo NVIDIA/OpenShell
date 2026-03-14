@@ -28,7 +28,58 @@ content:
 
 Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the [Policy Schema Reference](../reference/policy-schema.md).
 
-## Quick Start: Apply a Custom Policy
+## Policy Structure
+
+A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and dynamic sections `network_policies` and `inference` that are hot-reloadable on a running sandbox.
+
+```yaml
+version: 1
+
+# Static: locked at sandbox creation. Paths the agent can read vs read/write.
+filesystem_policy:
+  read_only: [/usr, /lib, /etc]
+  read_write: [/sandbox, /tmp]
+
+# Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
+landlock:
+  compatibility: best_effort
+
+# Static: Unprivileged user/group the agent process runs as.
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+# Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
+network_policies:
+  my_api:
+    name: my-api
+    endpoints:
+      - host: api.example.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: full
+    binaries:
+      - path: /usr/bin/curl
+
+# Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).
+inference:
+  allowed_routes: [local]
+```
+
+Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
+Dynamic sections can be updated on a running sandbox with `openshell policy set` and take effect without restarting.
+
+| Section | Type | Description |
+|---|---|---|
+| `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
+| `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (use the highest ABI the host kernel supports) or `hard_requirement` (fail if the required ABI is unavailable). |
+| `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
+| `network_policies` | Dynamic | Controls network access for the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches and inference routes are configured, the request may be rerouted for inference. Otherwise the connection is denied. |
+| `inference` | Dynamic | Controls which inference routing backends the sandbox can use. Set `allowed_routes` to a list of route names (for example, `[local]` or `[local, nvidia]`). When an outbound request does not match any `network_policies` entry, the proxy checks whether the destination matches a configured inference route. If it does and the route is in `allowed_routes`, the request is forwarded to that backend. |
+
+## Apply a Custom Policy
 
 Pass a policy YAML file when creating the sandbox:
 
@@ -190,6 +241,6 @@ Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspect
 
 Explore related topics:
 
-- To learn about policy structure and network access rules, refer to {doc}`index`.
+- To learn about network access rules and sandbox isolation layers, refer to {doc}`index`.
 - To view the full field-by-field YAML definition, refer to the [Policy Schema Reference](../reference/policy-schema.md).
 - To review the default policy breakdown, refer to {doc}`../reference/default-policy`.

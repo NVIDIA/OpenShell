@@ -204,8 +204,8 @@ tutorials/index
 :hidden:
 
 sandboxes/index
-sandboxes/create-and-manage
-sandboxes/gateways
+Create and Manage Sandboxes <sandboxes/create-and-manage>
+Deploy and Manage Gateways <sandboxes/gateways>
 sandboxes/providers
 sandboxes/policies
 sandboxes/community-sandboxes

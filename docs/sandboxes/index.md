@@ -1,12 +1,13 @@
 ---
 title:
-  page: About Sandboxes
-  nav: Sandboxes
-description: Understand sandbox lifecycle, supported agents, built-in default policy, and network access rules in OpenShell.
+  page: About Gateways and Sandboxes
+  nav: Gateways and Sandboxes
+description: Understand gateways, gateway types, sandbox lifecycle, supported agents, built-in default policy, and network access rules in OpenShell.
 topics:
 - Generative AI
 - Cybersecurity
 tags:
+- Gateway
 - Sandboxing
 - AI Agents
 - Security
@@ -25,9 +26,25 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# About Sandboxes
+# About Gateways and Sandboxes
 
-Every OpenShell deployment starts with a **gateway**, the control plane that manages sandboxes, providers, and policies. A **sandbox** is a safe, private execution environment for an AI agent, created using a gateway. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+Every OpenShell deployment starts with a *gateway* and one or more *sandboxes*. The gateway is the control plane that manages sandbox lifecycle, providers, and policies. A sandbox is the data plane, a safe, private execution environment where an AI agent runs. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.
+
+## Gateway Types
+
+A gateway coordinates everything: it provisions sandboxes, brokers CLI requests, enforces policies, and manages provider credentials. OpenShell supports three deployment models so the gateway can run wherever your workload requires.
+
+| Type | Where It Runs | Best For |
+|---|---|---|
+| **Local** | Docker on your workstation | Solo development and quick iteration. The CLI auto-bootstraps a local gateway if none exists. |
+| **Remote** | Docker on a remote host via SSH | Running sandboxes on a more powerful machine (for example, a DGX Spark) while keeping the CLI on your laptop. |
+| **Cloud** | Behind a reverse proxy (for example, Cloudflare Access) | Shared team environments where multiple users connect to the same gateway through browser-based authentication. |
+
+All three types expose the same API surface. Sandboxes, policies, and providers work identically regardless of where the gateway runs. The only difference is how the CLI reaches the gateway — direct Docker socket, SSH tunnel, or HTTPS through a proxy.
+
+:::{tip}
+You do not need to deploy a gateway manually. Running `openshell sandbox create` without a gateway auto-bootstraps a local one for you.
+:::
 
 ## Sandbox Lifecycle
 
@@ -53,7 +70,7 @@ The following table summarizes the agents that run in OpenShell sandboxes. All a
 
 <!-- | [NemoClaw](https://github.com/NVIDIA/OpenShell-Community) | [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/nemoclaw) | Bundled | OpenClaw with NVIDIA DevX UI extension. Launch with `openshell sandbox create --from nemoclaw`. | -->
 
-## Built-in Default Policy
+## Sandbox Policies
 
 OpenShell ships a built-in policy that covers common agent workflows out of the box.
 When you create a sandbox without `--policy`, the default policy is applied. It controls three things:
@@ -66,58 +83,7 @@ When you create a sandbox without `--policy`, the default policy is applied. It 
 
 For the full breakdown of each default policy block and agent compatibility details, refer to {doc}`../reference/default-policy`.
 
-## Policy Structure
-
-A policy has static sections (`filesystem_policy`, `landlock`, `process`) that are locked at sandbox creation, and dynamic sections (`network_policies`, `inference`) that are hot-reloadable on a running sandbox.
-
-```yaml
-version: 1
-
-# Static: locked at sandbox creation. Paths the agent can read vs read/write.
-filesystem_policy:
-  read_only: [/usr, /lib, /etc]
-  read_write: [/sandbox, /tmp]
-
-# Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.
-landlock:
-  compatibility: best_effort
-
-# Static: Unprivileged user/group the agent process runs as.
-process:
-  run_as_user: sandbox
-  run_as_group: sandbox
-
-# Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.
-network_policies:
-  my_api:
-    name: my-api
-    endpoints:
-      - host: api.example.com
-        port: 443
-        protocol: rest
-        tls: terminate
-        enforcement: enforce
-        access: full
-    binaries:
-      - path: /usr/bin/curl
-
-# Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).
-inference:
-  allowed_routes: [local]
-```
-
-For the complete structure and every field, refer to the [Policy Schema Reference](../reference/policy-schema.md).
-
-## Network Access Rules
-
-Network access is controlled by policy blocks under `network_policies`. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries that are allowed to use those endpoints.
-
-Every outbound connection from the sandbox goes through the proxy:
-
-- The proxy queries the {doc}`policy engine <../about/architecture>` with the destination (host and port) and the calling binary. A connection is allowed only when both match an entry in the same policy block.
-- For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is checked against that endpoint's `rules` (method and path).
-- If no endpoint matches and inference routes are configured, the request may be rerouted for inference.
-- Otherwise the connection is denied. Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads.
+For the full policy structure with annotated YAML examples, refer to {doc}`policies`.
 
 ## Next Steps
 
