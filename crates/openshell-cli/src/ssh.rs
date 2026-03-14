@@ -20,9 +20,13 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::process::Command as TokioCommand;
 use tokio_rustls::TlsConnector;
+
+const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -309,9 +313,11 @@ pub async fn sandbox_forward(
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls).await?;
 
-    let mut command = ssh_base_command(&session.proxy_command);
+    let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
     command
         .arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
         .arg("-L")
         .arg(format!("{port}:127.0.0.1:{port}"));
 
@@ -326,10 +332,18 @@ pub async fn sandbox_forward(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
-    let status = tokio::task::spawn_blocking(move || command.status())
-        .await
-        .into_diagnostic()?
-        .into_diagnostic()?;
+    let status = if background {
+        command.status().await.into_diagnostic()?
+    } else {
+        let mut child = command.spawn().into_diagnostic()?;
+        match tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await {
+            Ok(status) => status.into_diagnostic()?,
+            Err(_) => {
+                eprintln!("{}", foreground_forward_started_message(name, port));
+                child.wait().await.into_diagnostic()?
+            }
+        }
+    };
 
     if !status.success() {
         return Err(miette::miette!("ssh exited with status {status}"));
@@ -349,6 +363,14 @@ pub async fn sandbox_forward(
     }
 
     Ok(())
+}
+
+fn foreground_forward_started_message(name: &str, port: u16) -> String {
+    format!(
+        "{} Forwarding port {port} to sandbox {name}\n  Access at: http://127.0.0.1:{port}/\n  Press Ctrl+C to stop\n  {}",
+        "✓".green().bold(),
+        "Hint: pass --background to start forwarding without blocking your terminal".dimmed(),
+    )
 }
 
 async fn sandbox_exec_with_mode(
@@ -1104,5 +1126,17 @@ mod tests {
         .unwrap_err();
         let text = format!("{err}");
         assert!(text.contains("openshell-test-missing-binary is not installed or not on PATH"));
+    }
+
+    #[test]
+    fn foreground_forward_started_message_includes_port_and_stop_hint() {
+        let message = foreground_forward_started_message("demo", 8080);
+        assert!(message.contains("Forwarding port 8080 to sandbox demo"));
+        assert!(message.contains("Access at: http://127.0.0.1:8080/"));
+        assert!(message.contains("sandbox demo"));
+        assert!(message.contains("Press Ctrl+C to stop"));
+        assert!(message.contains(
+            "Hint: pass --background to start forwarding without blocking your terminal"
+        ));
     }
 }
