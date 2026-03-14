@@ -5,66 +5,107 @@ description: Create GitHub issues using the gh CLI. Use when the user wants to c
 
 # Create GitHub Issue
 
-Create issues on GitHub using the `gh` CLI.
+Create issues on GitHub using the `gh` CLI. Issues must conform to the project's issue templates.
 
 ## Prerequisites
 
 The `gh` CLI must be authenticated (`gh auth status`).
 
-## Creating an Issue
+## Issue Templates
 
-Use `gh issue create` with title and body:
-
-```bash
-gh issue create --title "Issue title" --body "Issue description"
-```
-
-### With Labels
-
-```bash
-gh issue create --title "Title" --body "Description" --label "bug" --label "priority:high"
-```
-
-### Assign to Someone
-
-```bash
-gh issue create --title "Title" --body "Description" --assignee "username"
-```
-
-### Assign to Yourself
-
-```bash
-gh issue create --title "Title" --body "Description" --assignee "@me"
-```
-
-## Issue Formatting Guidelines
-
-Format the description based on the issue type:
+This project uses YAML form issue templates. When creating issues, match the template structure so the output aligns with what GitHub renders.
 
 ### Bug Reports
 
-Include:
+Use the `bug` label. The body must include an **Agent Diagnostic** section — this is required by the template and enforced by project convention.
 
-- What happened (actual behavior)
-- What should happen (expected behavior)
-- Steps to reproduce
-- Environment details if relevant
+```bash
+gh issue create \
+  --title "bug: <concise description>" \
+  --label "bug" \
+  --body "$(cat <<'EOF'
+## Agent Diagnostic
+
+<Paste the output from the agent's investigation. What skills were loaded?
+What was found? What was tried?>
+
+## Description
+
+**Actual behavior:** <what happened>
+
+**Expected behavior:** <what should happen>
+
+## Reproduction Steps
+
+1. <step>
+2. <step>
+
+## Environment
+
+- OS: <os>
+- Docker: <version>
+- OpenShell: <version>
+
+## Logs
+
+```
+<relevant output>
+```
+EOF
+)"
+```
 
 ### Feature Requests
 
-Include:
+Use the `feat` label. The body must include a **Proposed Design** — not a "please build this" request.
 
-- Problem or use case being addressed
-- Proposed solution
-- Acceptance criteria (what "done" looks like)
+```bash
+gh issue create \
+  --title "feat: <concise description>" \
+  --label "feat" \
+  --body "$(cat <<'EOF'
+## Problem Statement
+
+<What problem does this solve? Why does it matter?>
+
+## Proposed Design
+
+<How should this work? Describe the system behavior, components involved,
+and user-facing interface.>
+
+## Alternatives Considered
+
+<What other approaches were evaluated? Why is this design better?>
+
+## Agent Investigation
+
+<If the agent explored the codebase to assess feasibility, paste findings here.>
+EOF
+)"
+```
 
 ### Tasks
 
-Include:
+For internal tasks that don't fit bug/feature templates:
 
-- Clear description of the work
-- Any context or dependencies
-- Definition of done
+```bash
+gh issue create \
+  --title "<type>: <description>" \
+  --body "$(cat <<'EOF'
+## Description
+
+<Clear description of the work>
+
+## Context
+
+<Any dependencies, related issues, or background>
+
+## Definition of Done
+
+- [ ] <criterion>
+EOF
+)"
+```
 
 ## Useful Options
 

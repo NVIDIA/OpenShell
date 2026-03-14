@@ -1,0 +1,6 @@
+# Broad ownership — core team reviews everything
+* @NVIDIA/openshell-codeowners
+
+# Agent infrastructure — tighter review
+.agents/ @NVIDIA/openshell-codeowners
+AGENTS.md @NVIDIA/openshell-codeowners

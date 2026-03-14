@@ -1,0 +1,60 @@
+name: Feature Request
+description: Propose a feature with a design. Not a "please build this" request.
+title: "feat: "
+labels: ["feat"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Design-First Feature Proposals
+
+        OpenShell feature requests must include a design proposal — describe the system behavior you want, not just the outcome. If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), include its findings.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem Statement
+      description: What problem does this solve? Why does it matter?
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed Design
+      description: |
+        How should this work? Describe the system behavior, components involved, and user-facing interface. This should be a design, not a wish list.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives Considered
+      description: What other approaches did you evaluate? Why is the proposed design better?
+    validations:
+      required: true
+
+  - type: textarea
+    id: agent-investigation
+    attributes:
+      label: Agent Investigation
+      description: |
+        If your agent explored the codebase to assess feasibility (e.g., using the `create-spike` skill), paste its findings here. This is optional but strengthens the proposal.
+      placeholder: |
+        Example:
+        - Used `create-spike` to investigate existing provider infrastructure
+        - Found that `crates/openshell-providers/` already supports a plugin pattern
+        - Proposed design extends the existing trait rather than adding a new abstraction
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I've reviewed existing issues and the architecture docs
+          required: true
+        - label: This is a design proposal, not a "please build this" request
+          required: true

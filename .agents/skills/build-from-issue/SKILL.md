@@ -93,6 +93,8 @@ gh issue view <id> --json number,title,body,state,labels,author
 
 If the issue is closed, report that and stop.
 
+If the issue has the `needs-agent-triage` label, report that the issue has not been triaged yet. Suggest using the `triage-issue` skill first to assess and classify the issue before planning implementation. Stop.
+
 ## Step 2: Fetch and Classify Comments
 
 Fetch all comments:
@@ -480,30 +482,36 @@ gh pr create \
   --body "$(cat <<'EOF'
 > **🏗️ build-from-issue-agent**
 
-Closes #<issue-id>
-
 ## Summary
 <1-3 sentences describing what was built and the approach taken>
 
-## Changes Made
+## Related Issue
+Closes #<issue-id>
+
+## Changes
 - `<file1>`: <what changed and why>
 - `<file2>`: <what changed and why>
 
-## Deviations from Plan
+### Deviations from Plan
 <any deviations from the approved plan, or "None — implemented as planned">
 
-## Tests Added
+## Testing
+- [x] `mise run pre-commit` passes
+- [x] Unit tests added/updated
+- [x] E2E tests added/updated (if applicable)
+
+**Tests added:**
 - **Unit:** <test file(s) and what they cover>
 - **Integration:** <test file(s) and what they cover, or "N/A">
 - **E2E:** <test file(s) and what they cover, or "N/A">
 
-## Documentation Updated
-- `<architecture/doc.md>`: <what was updated>
+## Checklist
+- [x] Follows Conventional Commits
+- [x] Commits are signed off (DCO)
+- [x] Architecture docs updated (if applicable)
 
-## Verification
-- [x] Pre-commit checks passing (unit tests, lint, format)
-- [x] E2E tests passing (if e2e/ files were modified)
-- [x] Architecture documentation updated
+**Documentation updated:**
+- `<architecture/doc.md>`: <what was updated>
 EOF
 )"
 ```

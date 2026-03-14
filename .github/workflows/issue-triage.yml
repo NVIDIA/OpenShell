@@ -1,0 +1,60 @@
+name: Issue Triage Gate
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  check-agent-diagnostic:
+    runs-on: ubuntu-latest
+    # Only run on bug reports (title starts with "bug:")
+    if: startsWith(github.event.issue.title, 'bug:')
+    steps:
+      - name: Check for agent diagnostic section
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = context.payload.issue.body || '';
+
+            // Check if the Agent Diagnostic section has substantive content.
+            // The template placeholder starts with "Example:" — if that's still
+            // there or the section is empty, the reporter didn't fill it in.
+            const diagnosticMatch = body.match(
+              /## Agent Diagnostic\s*\n([\s\S]*?)(?=\n## |\n$)/
+            );
+
+            const hasSubstantiveDiagnostic = diagnosticMatch
+              && diagnosticMatch[1].trim().length > 0
+              && !diagnosticMatch[1].trim().startsWith('Example:');
+
+            if (hasSubstantiveDiagnostic) {
+              console.log('Agent diagnostic section found with content. Passing.');
+              return;
+            }
+
+            console.log('Agent diagnostic section missing or placeholder. Flagging.');
+
+            // Add needs-agent-triage label
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['needs-agent-triage']
+            });
+
+            // Post redirect comment
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: [
+                'This issue appears to have been opened without an agent investigation.',
+                '',
+                'OpenShell is an agent-first project — please point your coding agent at the repo and have it diagnose this before we triage. Your agent can load skills like `debug-openshell-cluster`, `openshell-cli`, and `generate-sandbox-policy`.',
+                '',
+                'See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#before-you-open-an-issue) for the full workflow.',
+              ].join('\n')
+            });
