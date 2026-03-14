@@ -23,9 +23,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
+use tokio::process::Command as TokioCommand;
 use tokio_rustls::TlsConnector;
 
-const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_millis(200);
+const FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Copy, Debug)]
 pub enum Editor {
@@ -312,7 +313,7 @@ pub async fn sandbox_forward(
 ) -> Result<()> {
     let session = ssh_session_config(server, name, tls).await?;
 
-    let mut command = ssh_base_command(&session.proxy_command);
+    let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
     command
         .arg("-N")
         .arg("-o")
@@ -332,22 +333,14 @@ pub async fn sandbox_forward(
         .stderr(Stdio::inherit());
 
     let status = if background {
-        tokio::task::spawn_blocking(move || command.status())
-            .await
-            .into_diagnostic()?
-            .into_diagnostic()?
+        command.status().await.into_diagnostic()?
     } else {
         let mut child = command.spawn().into_diagnostic()?;
-        tokio::time::sleep(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD).await;
-
-        match child.try_wait().into_diagnostic()? {
-            Some(status) => status,
-            None => {
+        match tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await {
+            Ok(status) => status.into_diagnostic()?,
+            Err(_) => {
                 eprintln!("{}", foreground_forward_started_message(name, port));
-                tokio::task::spawn_blocking(move || child.wait())
-                    .await
-                    .into_diagnostic()?
-                    .into_diagnostic()?
+                child.wait().await.into_diagnostic()?
             }
         }
     };
@@ -374,7 +367,7 @@ pub async fn sandbox_forward(
 
 fn foreground_forward_started_message(name: &str, port: u16) -> String {
     format!(
-        "{} Forwarding 127.0.0.1:{port} to sandbox {name}\n  Press Ctrl+C to stop\n  {}",
+        "{} Forwarding port {port} to sandbox {name}\n  Access at: http://127.0.0.1:{port}/\n  Press Ctrl+C to stop\n  {}",
         "✓".green().bold(),
         "Hint: pass --background to keep this running without blocking your terminal".dimmed(),
     )
@@ -1138,7 +1131,8 @@ mod tests {
     #[test]
     fn foreground_forward_started_message_includes_port_and_stop_hint() {
         let message = foreground_forward_started_message("demo", 8080);
-        assert!(message.contains("127.0.0.1:8080"));
+        assert!(message.contains("Forwarding port 8080 to sandbox demo"));
+        assert!(message.contains("Access at: http://127.0.0.1:8080/"));
         assert!(message.contains("sandbox demo"));
         assert!(message.contains("Press Ctrl+C to stop"));
         assert!(message.contains(
