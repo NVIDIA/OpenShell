@@ -119,6 +119,7 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
         config.ssh_handshake_secret.clone(),
         config.ssh_handshake_skew_secs,
         config.client_tls_secret_name.clone(),
+        config.host_gateway_ip.clone(),
     )
     .await
     .map_err(|e| Error::execution(format!("failed to create kubernetes client: {e}")))?;

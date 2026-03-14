@@ -91,6 +91,12 @@ struct Args {
     #[arg(long, env = "OPENSHELL_CLIENT_TLS_SECRET_NAME")]
     client_tls_secret_name: Option<String>,
 
+    /// Host gateway IP for sandbox pod hostAliases.
+    /// When set, sandbox pods get hostAliases entries mapping
+    /// host.docker.internal and host.openshell.internal to this IP.
+    #[arg(long, env = "OPENSHELL_HOST_GATEWAY_IP")]
+    host_gateway_ip: Option<String>,
+
     /// Disable TLS entirely — listen on plaintext HTTP.
     /// Use this when the gateway sits behind a reverse proxy or tunnel
     /// (e.g. Cloudflare Tunnel) that terminates TLS at the edge.
@@ -176,6 +182,10 @@ async fn main() -> Result<()> {
 
     if let Some(name) = args.client_tls_secret_name {
         config = config.with_client_tls_secret_name(name);
+    }
+
+    if let Some(ip) = args.host_gateway_ip {
+        config = config.with_host_gateway_ip(ip);
     }
 
     if args.disable_tls {
