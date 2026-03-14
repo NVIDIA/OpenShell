@@ -32,9 +32,11 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 
 Before you begin, make sure you have:
 
-- Python 3.12 or later
-- [uv](https://docs.astral.sh/uv/) installed
-- Docker Desktop running on your machine
+- Python 3.12 or later.
+- [uv](https://docs.astral.sh/uv/) installed.
+- Docker Desktop running on your machine.
+
+For a complete list of requirements, refer to {doc}`../reference/support-matrix`.
 
 ## Install the OpenShell CLI
 
@@ -53,8 +55,11 @@ $ uv pip install openshell
 ```
 
 :::{tip}
-OpenShell does not have a separate CLI reference page.
-Run `openshell --help` to see all available commands, and `openshell <command> --help` for detailed usage of any subcommand.
+To find the CLI reference, run:
+- `openshell --help` to see all available commands.
+- `openshell <command> --help` for detailed usage of any subcommand.
+
+For example:
 
 ```console
 $ openshell --help
