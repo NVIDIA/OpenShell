@@ -12,7 +12,7 @@ project = "NVIDIA OpenShell Developer Guide"
 this_year = date.today().year
 copyright = f"2025-{this_year}, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "0.0.3"
+release = "latest"
 
 extensions = [
     "myst_parser",
@@ -89,7 +89,7 @@ mermaid_init_js = (
 
 html_domain_indices = False
 html_use_index = False
-html_extra_path = ["project.json", "versions1.json"]
+html_extra_path = ["project.json"]
 highlight_language = "console"
 
 html_theme_options = {
@@ -107,10 +107,6 @@ html_theme_options = {
             "type": "fontawesome",
         },
     ],
-    "switcher": {
-        "json_url": "../versions1.json",
-        "version_match": release,
-    },
 }
 
 html_baseurl = "https://docs.nvidia.com/openshell/latest/"
