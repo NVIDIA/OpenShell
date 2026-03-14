@@ -123,7 +123,7 @@ flowchart TD
 
 The following steps outline the hot-reload policy update workflow.
 
-1. Create the sandbox with your initial policy by following [Quick Start: Apply a Custom Policy](#quick-start-apply-a-custom-policy) above (or set `OPENSHELL_SANDBOX_POLICY`).
+1. Create the sandbox with your initial policy by following [Apply a Custom Policy](#apply-a-custom-policy) above (or set `OPENSHELL_SANDBOX_POLICY`).
 
 2. Monitor denials. Each log entry shows host, port, binary, and reason. Alternatively, use `openshell term` for a live dashboard.
 

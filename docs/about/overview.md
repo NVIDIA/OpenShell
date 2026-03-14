@@ -55,7 +55,7 @@ OpenShell applies defense in depth across the following policy domains.
 | Process | Blocks privilege escalation and dangerous syscalls. | Locked at sandbox creation. |
 | Inference | Reroutes model API calls to controlled backends. | Hot-reloadable at runtime. |
 
-For details, refer to [Built-in Default Policy](../sandboxes/index.md#built-in-default-policy) and [Customize Sandbox Policies](../sandboxes/policies.md).
+For details, refer to [Sandbox Policies](../sandboxes/index.md#sandbox-policies) and [Customize Sandbox Policies](../sandboxes/policies.md).
 
 ## Common Use Cases
 

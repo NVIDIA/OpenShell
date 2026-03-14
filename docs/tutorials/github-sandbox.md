@@ -342,7 +342,7 @@ The following table summarizes the two GitHub-specific blocks:
 
 The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
 
-For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+For details on policy block structure, refer to [Policies](/sandboxes/policies.md).
 ::::
 
 ## Apply the Policy

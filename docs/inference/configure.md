@@ -26,7 +26,7 @@ content:
 
 # Configure Inference Routing
 
-This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — refer to [Network Access Rules](/sandboxes/index.md#network-access-rules) for details.
+This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — refer to [Policies](/sandboxes/policies.md) for details.
 
 The configuration consists of two values:
 
@@ -158,5 +158,5 @@ A successful response confirms the privacy router can reach the configured backe
 Explore related topics:
 
 - To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
-- To control external endpoints, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- To control external endpoints, refer to [Policies](/sandboxes/policies.md).
 - To manage provider records, refer to {doc}`../sandboxes/providers`.
