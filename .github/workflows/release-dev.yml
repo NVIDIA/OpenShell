@@ -14,15 +14,52 @@ defaults:
     shell: bash
 
 jobs:
+  # ---------------------------------------------------------------------------
+  # Compute all versions once at the start to avoid git-describe race conditions
+  # ---------------------------------------------------------------------------
+  compute-versions:
+    name: Compute Versions
+    runs-on: build-amd64
+    timeout-minutes: 5
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+    outputs:
+      python_version: ${{ steps.v.outputs.python }}
+      cargo_version: ${{ steps.v.outputs.cargo }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Fetch tags
+        run: git fetch --tags --force
+
+      - name: Compute all versions
+        id: v
+        run: |
+          set -euo pipefail
+          echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
+          echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+
   build-gateway:
+    needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   build-cluster:
+    needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster
+      cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
@@ -47,11 +84,11 @@ jobs:
 
   build-python-wheels:
     name: Stage Python Wheels
-    needs: [build-gateway, build-cluster]
+    needs: [compute-versions, build-gateway, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 120
     outputs:
-      wheel_version: ${{ steps.version.outputs.wheel_version }}
+      wheel_version: ${{ needs.compute-versions.outputs.python_version }}
       s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
@@ -83,30 +120,21 @@ jobs:
       - name: Mark workspace safe for git
         run: git config --global --add safe.directory "$GITHUB_WORKSPACE"
 
-      - name: Fetch tags
-        run: git fetch --tags --force
-
-      - name: Compute Python version
-        id: version
-        run: |
-          set -euo pipefail
-          WHEEL_VERSION=$(uv run python tasks/scripts/release.py get-version --python)
-          echo "wheel_version=${WHEEL_VERSION}" >> "$GITHUB_OUTPUT"
+      - name: Sync Python dependencies
+        run: uv sync
 
       - name: Build Python wheels
         run: |
           set -euo pipefail
-          WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
-          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-          OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-          OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:multiarch
+          OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:macos
           ls -la target/wheels/*.whl
 
       - name: Upload wheels to S3
         id: upload
         run: |
           set -euo pipefail
-          WHEEL_VERSION="${{ steps.version.outputs.wheel_version }}"
+          WHEEL_VERSION="${{ needs.compute-versions.outputs.python_version }}"
           S3_PREFIX="openshell/${WHEEL_VERSION}"
           aws s3 cp target/wheels/ "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" --recursive --exclude "*" --include "*.whl"
           aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
@@ -190,6 +218,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-cli-linux:
     name: Build CLI (Linux ${{ matrix.arch }})
+    needs: [compute-versions]
     strategy:
       matrix:
         include:
@@ -232,13 +261,6 @@ jobs:
           cache-directories: .cache/sccache
           cache-targets: "true"
 
-      - name: Compute version
-        id: version
-        run: |
-          set -euo pipefail
-          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
-
       - name: Install musl toolchain
         run: |
           set -euo pipefail
@@ -258,10 +280,10 @@ jobs:
           sed -i 's|members = \["crates/\*"\]|members = ["crates/openshell-cli", "crates/openshell-core", "crates/openshell-bootstrap", "crates/openshell-policy", "crates/openshell-providers", "crates/openshell-tui"]|' Cargo.toml
 
       - name: Patch workspace version
-        if: steps.version.outputs.cargo_version != ''
+        if: needs.compute-versions.outputs.cargo_version != ''
         run: |
           set -euo pipefail
-          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ steps.version.outputs.cargo_version }}"'"/}' Cargo.toml
+          sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${{ needs.compute-versions.outputs.cargo_version }}"'"/}' Cargo.toml
 
       - name: Build ${{ matrix.target }}
         run: mise x -- cargo build --release --target ${{ matrix.target }} -p openshell-cli
@@ -290,6 +312,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-cli-macos:
     name: Build CLI (macOS)
+    needs: [compute-versions]
     runs-on: build-amd64
     timeout-minutes: 60
     container:
@@ -320,19 +343,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: ./.github/actions/setup-buildx
 
-      - name: Compute version
-        id: version
-        run: |
-          set -euo pipefail
-          CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-          echo "cargo_version=${CARGO_VERSION}" >> "$GITHUB_OUTPUT"
-
       - name: Build macOS binary via Docker
         run: |
           set -euo pipefail
           docker buildx build \
             --file deploy/docker/Dockerfile.cli-macos \
-            --build-arg OPENSHELL_CARGO_VERSION="${{ steps.version.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" \
             --build-arg OPENSHELL_IMAGE_TAG=dev \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
             --target binary \

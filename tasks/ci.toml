@@ -13,10 +13,6 @@ description = "Build all Rust crates in release mode"
 run = "cargo build --workspace --release"
 hide = true
 
-["build:dev"]
-description = "Build CLI with dev image tag (for local development)"
-run = "OPENSHELL_IMAGE_TAG=dev cargo build -p openshell-cli"
-
 [check]
 description = "Run fast compile and type checks"
 depends = ["rust:check", "python:typecheck"]
