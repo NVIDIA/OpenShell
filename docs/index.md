@@ -105,7 +105,11 @@ Install the CLI and create your first sandbox in two commands.
 </div>
 ```
 
-Refer to the [Quickstart](get-started/quickstart.md) for more details.
+Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags.
+Run `openshell <command> --help` for detailed usage of any subcommand.
+
+Proceed to the [Quickstart](get-started/quickstart.md) for more details.
+
 
 ---
 
