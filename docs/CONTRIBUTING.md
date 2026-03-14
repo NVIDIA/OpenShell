@@ -2,6 +2,17 @@
 
 This guide covers how to write, edit, and review documentation for NVIDIA OpenShell. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
 
+## Use the Agent Skills
+
+If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo includes skills that automate doc work. Use them before writing from scratch.
+
+| Skill | What it does | When to use |
+|---|---|---|
+| `update-docs-from-commits` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
+| `build-from-issue` | Plans and implements work from a GitHub issue, including doc updates. | When working from an issue that has doc impact. |
+
+The skills live in `.agents/skills/` and follow the style guide below automatically. To use one, ask your agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
+
 ## When to Update Docs
 
 Update documentation when your change:
