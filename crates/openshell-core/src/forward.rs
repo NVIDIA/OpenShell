@@ -217,21 +217,108 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
 }
 
 // ---------------------------------------------------------------------------
+// Forward spec parsing
+// ---------------------------------------------------------------------------
+
+/// A parsed port-forward specification: optional bind address + port.
+///
+/// Supports the same `[bind_address:]port` syntax as SSH `-L`.  When no bind
+/// address is given, defaults to `127.0.0.1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardSpec {
+    pub bind_addr: String,
+    pub port: u16,
+}
+
+impl ForwardSpec {
+    /// Default bind address when none is specified.
+    pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
+
+    /// Create a new `ForwardSpec` with the default bind address.
+    pub fn new(port: u16) -> Self {
+        Self {
+            bind_addr: Self::DEFAULT_BIND_ADDR.to_string(),
+            port,
+        }
+    }
+
+    /// Parse a `[bind_address:]port` string.
+    ///
+    /// Examples:
+    /// - `"8080"` → `ForwardSpec { bind_addr: "127.0.0.1", port: 8080 }`
+    /// - `"0.0.0.0:8080"` → `ForwardSpec { bind_addr: "0.0.0.0", port: 8080 }`
+    /// - `"::1:8080"` → `ForwardSpec { bind_addr: "::1", port: 8080 }`
+    pub fn parse(s: &str) -> Result<Self> {
+        // Split on the last ':' to handle IPv6 addresses like "::1:8080".
+        if let Some(pos) = s.rfind(':') {
+            let addr = &s[..pos];
+            let port_str = &s[pos + 1..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                if port == 0 {
+                    return Err(miette::miette!("port must be between 1 and 65535"));
+                }
+                return Ok(Self {
+                    bind_addr: addr.to_string(),
+                    port,
+                });
+            }
+        }
+
+        // No colon or the part after the last colon isn't a valid port —
+        // treat the entire string as a port number.
+        let port: u16 = s.parse().map_err(|_| {
+            miette::miette!("invalid forward spec '{s}': expected [bind_address:]port")
+        })?;
+        if port == 0 {
+            return Err(miette::miette!("port must be between 1 and 65535"));
+        }
+        Ok(Self::new(port))
+    }
+
+    /// The SSH `-L` local-forward argument: `bind_addr:port:127.0.0.1:port`.
+    pub fn ssh_forward_arg(&self) -> String {
+        format!("{}:{}:127.0.0.1:{}", self.bind_addr, self.port, self.port)
+    }
+
+    /// A human-readable URL for the forwarded port.
+    pub fn access_url(&self) -> String {
+        let host = if self.bind_addr == "0.0.0.0" || self.bind_addr == "::" {
+            "localhost"
+        } else {
+            &self.bind_addr
+        };
+        format!("http://{host}:{}/", self.port)
+    }
+}
+
+impl std::fmt::Display for ForwardSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bind_addr == Self::DEFAULT_BIND_ADDR {
+            write!(f, "{}", self.port)
+        } else {
+            write!(f, "{}:{}", self.bind_addr, self.port)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Port availability check
 // ---------------------------------------------------------------------------
 
 /// Check whether a local port is available for forwarding.
 ///
-/// Attempts to bind `127.0.0.1:<port>`.  If the port is already in use, the
+/// Attempts to bind `<bind_addr>:<port>`.  If the port is already in use, the
 /// error message includes an actionable hint:
 ///
 /// - If an existing openshell forward owns the port, suggest the stop command.
 /// - Otherwise, suggest `lsof` to identify the owning process.
-pub fn check_port_available(port: u16) -> Result<()> {
-    if TcpListener::bind(("127.0.0.1", port)).is_ok() {
+pub fn check_port_available(spec: &ForwardSpec) -> Result<()> {
+    if TcpListener::bind((spec.bind_addr.as_str(), spec.port)).is_ok() {
         // Port is free — the listener is dropped immediately, releasing it.
         return Ok(());
     }
+
+    let port = spec.port;
 
     // Port is occupied.  Check if it belongs to a tracked openshell forward.
     if let Ok(forwards) = list_forwards()
@@ -468,7 +555,7 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         drop(listener);
 
-        assert!(check_port_available(port).is_ok());
+        assert!(check_port_available(&ForwardSpec::new(port)).is_ok());
     }
 
     #[test]
@@ -477,12 +564,79 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         // Keep the listener alive so the port stays occupied.
 
-        let result = check_port_available(port);
+        let result = check_port_available(&ForwardSpec::new(port));
         assert!(result.is_err());
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("already in use"),
             "expected 'already in use' in error message, got: {msg}"
         );
+    }
+
+    #[test]
+    fn forward_spec_parse_port_only() {
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.bind_addr, "127.0.0.1");
+        assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_ipv4_and_port() {
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.bind_addr, "0.0.0.0");
+        assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_ipv6_and_port() {
+        let spec = ForwardSpec::parse("::1:8080").unwrap();
+        assert_eq!(spec.bind_addr, "::1");
+        assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_localhost_and_port() {
+        let spec = ForwardSpec::parse("localhost:3000").unwrap();
+        assert_eq!(spec.bind_addr, "localhost");
+        assert_eq!(spec.port, 3000);
+    }
+
+    #[test]
+    fn forward_spec_parse_rejects_zero_port() {
+        assert!(ForwardSpec::parse("0").is_err());
+        assert!(ForwardSpec::parse("0.0.0.0:0").is_err());
+    }
+
+    #[test]
+    fn forward_spec_parse_rejects_invalid() {
+        assert!(ForwardSpec::parse("abc").is_err());
+        assert!(ForwardSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn forward_spec_ssh_forward_arg() {
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "0.0.0.0:8080:127.0.0.1:8080");
+
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "127.0.0.1:8080:127.0.0.1:8080");
+    }
+
+    #[test]
+    fn forward_spec_access_url() {
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.access_url(), "http://127.0.0.1:8080/");
+
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.access_url(), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn forward_spec_display() {
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.to_string(), "8080");
+
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.to_string(), "0.0.0.0:8080");
     }
 }

@@ -1726,7 +1726,7 @@ pub async fn sandbox_create_with_bootstrap(
     ssh_key: Option<&str>,
     providers: &[String],
     policy: Option<&str>,
-    forward: Option<u16>,
+    forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
     tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
@@ -1767,7 +1767,10 @@ pub async fn sandbox_create_with_bootstrap(
     .await
 }
 
-fn sandbox_should_persist(keep: bool, forward: Option<u16>) -> bool {
+fn sandbox_should_persist(
+    keep: bool,
+    forward: Option<&openshell_core::forward::ForwardSpec>,
+) -> bool {
     keep || forward.is_some()
 }
 
@@ -1808,7 +1811,7 @@ pub async fn sandbox_create(
     ssh_key: Option<&str>,
     providers: &[String],
     policy: Option<&str>,
-    forward: Option<u16>,
+    forward: Option<openshell_core::forward::ForwardSpec>,
     command: &[String],
     tty_override: Option<bool>,
     bootstrap_override: Option<bool>,
@@ -1918,7 +1921,7 @@ pub async fn sandbox_create(
         .ok_or_else(|| miette::miette!("sandbox missing from response"))?;
 
     let interactive = std::io::stdout().is_terminal();
-    let persist = sandbox_should_persist(keep, forward);
+    let persist = sandbox_should_persist(keep, forward.as_ref());
     let sandbox_name = sandbox.name.clone();
 
     // Record this sandbox as the last-used for the active gateway only when it
@@ -2195,21 +2198,25 @@ pub async fn sandbox_create(
             // If --forward was requested, start the background port forward
             // *before* running the command so that long-running processes
             // (e.g. `openclaw gateway`) are reachable immediately.
-            if let Some(port) = forward {
+            if let Some(ref spec) = forward {
                 sandbox_forward(
                     &effective_server,
                     &sandbox_name,
-                    port,
+                    spec,
                     true, // background
                     &effective_tls,
                 )
                 .await?;
                 eprintln!(
-                    "  {} Forwarding port {port} to sandbox {sandbox_name} in the background\n",
+                    "  {} Forwarding port {} to sandbox {sandbox_name} in the background\n",
                     "\u{2713}".green().bold(),
+                    spec.port,
                 );
-                eprintln!("  Access at: http://127.0.0.1:{port}/");
-                eprintln!("  Stop with: openshell forward stop {port} {sandbox_name}",);
+                eprintln!("  Access at: {}", spec.access_url());
+                eprintln!(
+                    "  Stop with: openshell forward stop {} {sandbox_name}",
+                    spec.port,
+                );
             }
 
             if let Some(editor) = editor {
@@ -4420,7 +4427,8 @@ mod tests {
 
     #[test]
     fn sandbox_should_persist_when_forward_is_requested() {
-        assert!(sandbox_should_persist(false, Some(8080)));
+        let spec = openshell_core::forward::ForwardSpec::new(8080);
+        assert!(sandbox_should_persist(false, Some(&spec)));
     }
 
     #[test]

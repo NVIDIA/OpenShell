@@ -1313,7 +1313,7 @@ async fn start_port_forwards(
     gateway_name: &str,
     sandbox_name: &str,
     sandbox_id: &str,
-    ports: &[u16],
+    specs: &[openshell_core::forward::ForwardSpec],
 ) {
     // Create SSH session.
     let session = {
@@ -1358,12 +1358,15 @@ async fn start_port_forwards(
         session.sandbox_id, session.token,
     );
 
-    // Start a forward for each port.
-    for port in ports {
-        if let Err(e) = openshell_core::forward::check_port_available(*port) {
-            tracing::warn!("skipping forward for port {port}: {e}");
+    // Start a forward for each spec.
+    for spec in specs {
+        if let Err(e) = openshell_core::forward::check_port_available(spec) {
+            tracing::warn!("skipping forward for port {}: {e}", spec.port);
             continue;
         }
+
+        let ssh_forward_arg = spec.ssh_forward_arg();
+        let port_val = spec.port;
 
         let mut command = std::process::Command::new("ssh");
         command
@@ -1382,13 +1385,12 @@ async fn start_port_forwards(
             .arg("-N")
             .arg("-f")
             .arg("-L")
-            .arg(format!("{port}:127.0.0.1:{port}"))
+            .arg(&ssh_forward_arg)
             .arg("sandbox")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
-        let port_val = *port;
         let sid = session.sandbox_id.clone();
         let name = sandbox_name.to_string();
 

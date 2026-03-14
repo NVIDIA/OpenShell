@@ -1093,9 +1093,9 @@ enum SandboxCommands {
         policy: Option<String>,
 
         /// Forward a local port to the sandbox before the initial command or shell starts.
-        /// Keeps the sandbox alive.
+        /// Accepts [bind_address:]port (e.g. 8080, 0.0.0.0:8080). Keeps the sandbox alive.
         #[arg(long, conflicts_with = "no_keep")]
-        forward: Option<u16>,
+        forward: Option<String>,
 
         /// Allocate a pseudo-terminal for the remote command.
         /// Defaults to auto-detection (on when stdin and stdout are terminals).
@@ -1359,8 +1359,8 @@ enum ForwardCommands {
     /// Start forwarding a local port to a sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Start {
-        /// Port to forward (used as both local and remote port).
-        port: u16,
+        /// Port to forward: [bind_address:]port (e.g. 8080, 0.0.0.0:8080).
+        port: String,
 
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
@@ -1629,18 +1629,20 @@ async fn main() -> Result<()> {
                 name,
                 background,
             } => {
+                let spec = openshell_core::forward::ForwardSpec::parse(&port)?;
                 let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
                 let mut tls = tls.with_gateway_name(&ctx.name);
                 apply_edge_auth(&mut tls, &ctx.name);
                 let name = resolve_sandbox_name(name, &ctx.name)?;
-                run::sandbox_forward(&ctx.endpoint, &name, port, background, &tls).await?;
+                run::sandbox_forward(&ctx.endpoint, &name, &spec, background, &tls).await?;
                 if background {
                     eprintln!(
-                        "{} Forwarding port {port} to sandbox {name} in the background",
+                        "{} Forwarding port {} to sandbox {name} in the background",
                         "✓".green().bold(),
+                        spec.port,
                     );
-                    eprintln!("  Access at: http://127.0.0.1:{port}/");
-                    eprintln!("  Stop with: openshell forward stop {port} {name}");
+                    eprintln!("  Access at: {}", spec.access_url());
+                    eprintln!("  Stop with: openshell forward stop {} {name}", spec.port);
                 }
             }
         },
@@ -1864,6 +1866,9 @@ async fn main() -> Result<()> {
                     });
 
                     let editor = editor.map(Into::into);
+                    let forward = forward
+                        .map(|s| openshell_core::forward::ForwardSpec::parse(&s))
+                        .transpose()?;
                     let keep = keep || !no_keep || editor.is_some() || forward.is_some();
 
                     // For `sandbox create`, a missing cluster is not fatal — the
