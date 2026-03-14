@@ -1,6 +1,19 @@
 name: Acceptance Test
 
 on:
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: "Release type to test against"
+        required: true
+        type: choice
+        options:
+          - dev
+          - tag
+      ref:
+        description: "Tag (e.g. v1.2.3) or commit SHA for the release to test"
+        required: true
+        type: string
   workflow_run:
     workflows: ["Release Dev", "Release Tag"]
     types: [completed]
@@ -16,7 +29,7 @@ defaults:
 jobs:
   acceptance:
     name: Acceptance (${{ matrix.arch }})
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
@@ -46,20 +59,29 @@ jobs:
         id: release
         run: |
           set -euo pipefail
-          WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
-          if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
-            echo "tag=devel" >> "$GITHUB_OUTPUT"
-          elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
-            # Extract the tag from the head branch (e.g. v1.2.3)
-            TAG="${{ github.event.workflow_run.head_branch }}"
-            if [ -z "$TAG" ]; then
-              echo "::error::Could not determine release tag from workflow_run"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RELEASE_TYPE="${{ inputs.release_type }}"
+            REF="${{ inputs.ref }}"
+            if [ "$RELEASE_TYPE" = "dev" ]; then
+              echo "tag=devel" >> "$GITHUB_OUTPUT"
+            else
+              echo "tag=${REF}" >> "$GITHUB_OUTPUT"
+            fi
+          else
+            WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+            if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
+              echo "tag=devel" >> "$GITHUB_OUTPUT"
+            elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
+              TAG="${{ github.event.workflow_run.head_branch }}"
+              if [ -z "$TAG" ]; then
+                echo "::error::Could not determine release tag from workflow_run"
+                exit 1
+              fi
+              echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Unexpected triggering workflow: ${WORKFLOW_NAME}"
               exit 1
             fi
-            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected triggering workflow: ${WORKFLOW_NAME}"
-            exit 1
           fi
 
       - name: Install CLI from GitHub Release
