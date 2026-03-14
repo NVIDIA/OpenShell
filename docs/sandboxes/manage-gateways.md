@@ -38,14 +38,6 @@ The gateway is responsible for:
 
 The gateway runs inside a Docker container and exposes a single port (gRPC and HTTP multiplexed), secured by mTLS by default. No separate Kubernetes installation is required. It can be deployed locally, on a remote host via SSH, or behind a cloud reverse proxy.
 
-OpenShell supports three gateway types:
-
-| Type | Where it runs | How to create |
-|---|---|---|
-| **Local** | Docker on your workstation | `openshell gateway start` |
-| **Remote** | Docker on a remote host via SSH | `openshell gateway start --remote user@host` |
-| **Cloud** | Behind a reverse proxy. For example, Cloudflare Access. | `openshell gateway add https://gateway.example.com` |
-
 ## Deploy a Local Gateway
 
 Deploy a gateway on your workstation. The only prerequisite is a running Docker daemon.
