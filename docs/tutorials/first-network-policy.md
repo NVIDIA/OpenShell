@@ -64,6 +64,8 @@ With no network policy in place, every outbound connection is blocked. Test this
 $ curl -s https://api.github.com/zen
 ```
 
+`https://api.github.com/zen` is a lightweight, unauthenticated GitHub REST endpoint that returns a random aphorism on each call. It requires no tokens or parameters, which makes it a convenient smoke-test target for verifying outbound HTTPS connectivity.
+
 The request fails. By default, all outbound network traffic is denied. The sandbox proxy intercepted the HTTPS CONNECT request to `api.github.com:443` and rejected it because no network policy authorizes `curl` to reach that host.
 
 ```text
@@ -141,7 +143,7 @@ This tutorial uses `curl` and `read-only` access to keep things simple. When bui
 - To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to {doc}`/sandboxes/policies` for examples.
 :::
 
-## Verify That GET Works
+## Verify If GET Requests Are Allowed
 
 The policy is now active. Reconnect to the sandbox and retry the same request to confirm that read access works.
 
