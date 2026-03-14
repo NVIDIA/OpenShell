@@ -398,9 +398,9 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Gateways and Sandboxes</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="index.html">About Sandboxes</a></li>
-<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage</a></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">Gateways</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html">About Gateways and Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage Sandboxes</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">Deploy and Manage Gateways</a></li>
 <li class="toctree-l1"><a class="reference internal" href="providers.html">Providers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="policies.html">Customize Sandbox Policies</a></li>
 <li class="toctree-l1"><a class="reference internal" href="community-sandboxes.html">Community Sandboxes</a></li>
@@ -477,7 +477,16 @@
 -->
 <section class="tex2jax_ignore mathjax_ignore" id="gateways">
 <h1>Gateways<a class="headerlink" href="#gateways" title="Link to this heading">#</a></h1>
-<p>The gateway is the control plane for OpenShell. It coordinates sandbox lifecycle, manages providers, enforces policies, and brokers all requests between the CLI and running sandboxes.</p>
+<p>The gateway is the control plane for OpenShell. All control-plane traffic between the CLI and running sandboxes flows through the gateway.</p>
+<p>The gateway is responsible for:</p>
+<ul class="simple">
+<li><p>Provisioning and managing sandboxes, including creation, deletion, and status monitoring.</p></li>
+<li><p>Storing provider credentials (API keys, tokens) and delivering them to sandboxes at startup.</p></li>
+<li><p>Delivering network and filesystem policies to sandboxes. Policy enforcement itself happens inside each sandbox through the proxy, OPA, Landlock, and seccomp.</p></li>
+<li><p>Managing inference configuration and serving inference bundles so sandboxes can route requests to the correct backend.</p></li>
+<li><p>Providing the SSH tunnel endpoint so you can connect to sandboxes without exposing them directly.</p></li>
+</ul>
+<p>The gateway runs inside a Docker container and exposes a single port (gRPC and HTTP multiplexed), secured by mTLS by default. No separate Kubernetes installation is required. It can be deployed locally, on a remote host via SSH, or behind a cloud reverse proxy.</p>
 <p>OpenShell supports three gateway types:</p>
 <div class="pst-scrollable-table-container"><table class="table">
 <thead>

@@ -833,9 +833,9 @@ window.addEventListener("load", load);</script>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Gateways and Sandboxes</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="index.html">About Sandboxes</a></li>
-<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="gateways.html">Gateways</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html">About Gateways and Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gateways.html">Deploy and Manage Gateways</a></li>
 <li class="toctree-l1"><a class="reference internal" href="providers.html">Providers</a></li>
 <li class="toctree-l1 current active"><a class="current reference internal" href="#">Customize Sandbox Policies</a></li>
 <li class="toctree-l1"><a class="reference internal" href="community-sandboxes.html">Community Sandboxes</a></li>
@@ -913,8 +913,80 @@ window.addEventListener("load", load);</script>
 <section class="tex2jax_ignore mathjax_ignore" id="customize-sandbox-policies">
 <h1>Customize Sandbox Policies<a class="headerlink" href="#customize-sandbox-policies" title="Link to this heading">#</a></h1>
 <p>Use this page to apply and iterate policy changes on running sandboxes. For a full field-by-field YAML definition, use the <a class="reference internal" href="../reference/policy-schema.html"><span class="std std-doc">Policy Schema Reference</span></a>.</p>
-<section id="quick-start-apply-a-custom-policy">
-<h2>Quick Start: Apply a Custom Policy<a class="headerlink" href="#quick-start-apply-a-custom-policy" title="Link to this heading">#</a></h2>
+<section id="policy-structure">
+<h2>Policy Structure<a class="headerlink" href="#policy-structure" title="Link to this heading">#</a></h2>
+<p>A policy has static sections <code class="docutils literal notranslate"><span class="pre">filesystem_policy</span></code>, <code class="docutils literal notranslate"><span class="pre">landlock</span></code>, and <code class="docutils literal notranslate"><span class="pre">process</span></code> that are locked at sandbox creation, and dynamic sections <code class="docutils literal notranslate"><span class="pre">network_policies</span></code> and <code class="docutils literal notranslate"><span class="pre">inference</span></code> that are hot-reloadable on a running sandbox.</p>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
+
+<span class="c1"># Static: locked at sandbox creation. Paths the agent can read vs read/write.</span>
+<span class="nt">filesystem_policy</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">read_only</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/usr</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/lib</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/etc</span><span class="p p-Indicator">]</span>
+<span class="w">  </span><span class="nt">read_write</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/sandbox</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/tmp</span><span class="p p-Indicator">]</span>
+
+<span class="c1"># Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.</span>
+<span class="nt">landlock</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">best_effort</span>
+
+<span class="c1"># Static: Unprivileged user/group the agent process runs as.</span>
+<span class="nt">process</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">run_as_user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+<span class="w">  </span><span class="nt">run_as_group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
+
+<span class="c1"># Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.</span>
+<span class="nt">network_policies</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">my_api</span><span class="p">:</span>
+<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-api</span>
+<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.example.com</span>
+<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
+<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
+<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
+<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
+<span class="w">        </span><span class="nt">access</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">full</span>
+<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
+<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/usr/bin/curl</span>
+
+<span class="c1"># Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).</span>
+<span class="nt">inference</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">allowed_routes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">local</span><span class="p p-Indicator">]</span>
+</pre></div>
+</div>
+<p>Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
+Dynamic sections can be updated on a running sandbox with <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">policy</span> <span class="pre">set</span></code> and take effect without restarting.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Section</p></th>
+<th class="head"><p>Type</p></th>
+<th class="head"><p>Description</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">filesystem_policy</span></code></p></td>
+<td><p>Static</p></td>
+<td><p>Controls which directories the agent can access on disk. Paths are split into <code class="docutils literal notranslate"><span class="pre">read_only</span></code> and <code class="docutils literal notranslate"><span class="pre">read_write</span></code> lists. Any path not listed in either list is inaccessible. Set <code class="docutils literal notranslate"><span class="pre">include_workdir:</span> <span class="pre">true</span></code> to automatically add the agent’s working directory to <code class="docutils literal notranslate"><span class="pre">read_write</span></code>. <a class="reference external" href="https://docs.kernel.org/security/landlock.html" rel="noreferer noopener" target="_blank">Landlock LSM</a> enforces these restrictions at the kernel level.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">landlock</span></code></p></td>
+<td><p>Static</p></td>
+<td><p>Configures Landlock LSM enforcement behavior. Set <code class="docutils literal notranslate"><span class="pre">compatibility</span></code> to <code class="docutils literal notranslate"><span class="pre">best_effort</span></code> (use the highest ABI the host kernel supports) or <code class="docutils literal notranslate"><span class="pre">hard_requirement</span></code> (fail if the required ABI is unavailable).</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">process</span></code></p></td>
+<td><p>Static</p></td>
+<td><p>Sets the OS-level identity for the agent process. <code class="docutils literal notranslate"><span class="pre">run_as_user</span></code> and <code class="docutils literal notranslate"><span class="pre">run_as_group</span></code> default to <code class="docutils literal notranslate"><span class="pre">sandbox</span></code>. Root (<code class="docutils literal notranslate"><span class="pre">root</span></code> or <code class="docutils literal notranslate"><span class="pre">0</span></code>) is rejected. The agent also runs with seccomp filters that block dangerous system calls.</p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">network_policies</span></code></p></td>
+<td><p>Dynamic</p></td>
+<td><p>Controls network access for the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection goes through the proxy, which queries the <a class="reference internal" href="../about/architecture.html"><span class="doc">policy engine</span></a> with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> and <code class="docutils literal notranslate"><span class="pre">tls:</span> <span class="pre">terminate</span></code>, each HTTP request is also checked against that endpoint’s <code class="docutils literal notranslate"><span class="pre">rules</span></code> (method and path). <br>Endpoints without <code class="docutils literal notranslate"><span class="pre">protocol</span></code> or <code class="docutils literal notranslate"><span class="pre">tls</span></code> allow the TCP stream through without inspecting payloads. <br>If no endpoint matches and inference routes are configured, the request may be rerouted for inference. Otherwise the connection is denied.</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">inference</span></code></p></td>
+<td><p>Dynamic</p></td>
+<td><p>Controls which inference routing backends the sandbox can use. Set <code class="docutils literal notranslate"><span class="pre">allowed_routes</span></code> to a list of route names (for example, <code class="docutils literal notranslate"><span class="pre">[local]</span></code> or <code class="docutils literal notranslate"><span class="pre">[local,</span> <span class="pre">nvidia]</span></code>). When an outbound request does not match any <code class="docutils literal notranslate"><span class="pre">network_policies</span></code> entry, the proxy checks whether the destination matches a configured inference route. If it does and the route is in <code class="docutils literal notranslate"><span class="pre">allowed_routes</span></code>, the request is forwarded to that backend.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+</section>
+<section id="apply-a-custom-policy">
+<h2>Apply a Custom Policy<a class="headerlink" href="#apply-a-custom-policy" title="Link to this heading">#</a></h2>
 <p>Pass a policy YAML file when creating the sandbox:</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>sandbox<span class="w"> </span>create<span class="w"> </span>--policy<span class="w"> </span>./my-policy.yaml<span class="w"> </span>--<span class="w"> </span>claude
 </pre></div>
@@ -949,7 +1021,7 @@ window.addEventListener("load", load);</script>
     linkStyle default stroke:#76b900,stroke-width:2px
     </pre><p>The following steps outline the hot-reload policy update workflow.</p>
 <ol class="arabic">
-<li><p>Create the sandbox with your initial policy by following <a class="reference internal" href="#quick-start-apply-a-custom-policy">Quick Start: Apply a Custom Policy</a> above (or set <code class="docutils literal notranslate"><span class="pre">OPENSHELL_SANDBOX_POLICY</span></code>).</p></li>
+<li><p>Create the sandbox with your initial policy by following <a class="reference internal" href="#apply-a-custom-policy">Apply a Custom Policy</a> above (or set <code class="docutils literal notranslate"><span class="pre">OPENSHELL_SANDBOX_POLICY</span></code>).</p></li>
 <li><p>Monitor denials. Each log entry shows host, port, binary, and reason. Alternatively, use <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">term</span></code> for a live dashboard.</p>
 <div class="highlight-console notranslate"><div class="highlight"><pre><span></span><span class="gp">$ </span>openshell<span class="w"> </span>logs<span class="w"> </span>&lt;name&gt;<span class="w"> </span>--tail<span class="w"> </span>--source<span class="w"> </span>sandbox
 </pre></div>
@@ -1058,7 +1130,7 @@ Granular rules</label><div class="sd-tab-content docutils">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
 <p>Explore related topics:</p>
 <ul class="simple">
-<li><p>To learn about policy structure and network access rules, refer to <a class="reference internal" href="index.html"><span class="doc">About Sandboxes</span></a>.</p></li>
+<li><p>To learn about network access rules and sandbox isolation layers, refer to <a class="reference internal" href="index.html"><span class="doc">About Gateways and Sandboxes</span></a>.</p></li>
 <li><p>To view the full field-by-field YAML definition, refer to the <a class="reference internal" href="../reference/policy-schema.html"><span class="std std-doc">Policy Schema Reference</span></a>.</p></li>
 <li><p>To review the default policy breakdown, refer to <a class="reference internal" href="../reference/default-policy.html"><span class="doc">Default Policy Reference</span></a>.</p></li>
 </ul>
@@ -1114,7 +1186,8 @@ Granular rules</label><div class="sd-tab-content docutils">
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start-apply-a-custom-policy">Quick Start: Apply a Custom Policy</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#policy-structure">Policy Structure</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#apply-a-custom-policy">Apply a Custom Policy</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#iterate-on-a-running-sandbox">Iterate on a Running Sandbox</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#debug-denied-requests">Debug Denied Requests</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a></li>

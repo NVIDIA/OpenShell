@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>About Sandboxes &#8212; NVIDIA OpenShell Developer Guide</title>
+    <title>About Gateways and Sandboxes &#8212; NVIDIA OpenShell Developer Guide</title>
   
   
   
@@ -398,9 +398,9 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Gateways and Sandboxes</span></p>
 <ul class="current nav bd-sidenav">
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">About Sandboxes</a></li>
-<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="gateways.html">Gateways</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">About Gateways and Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="create-and-manage.html">Create and Manage Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="gateways.html">Deploy and Manage Gateways</a></li>
 <li class="toctree-l1"><a class="reference internal" href="providers.html">Providers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="policies.html">Customize Sandbox Policies</a></li>
 <li class="toctree-l1"><a class="reference internal" href="community-sandboxes.html">Community Sandboxes</a></li>
@@ -454,7 +454,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">About Sandboxes</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">About Gateways and Sandboxes</span></li>
   </ul>
 </nav>
 </div>
@@ -475,9 +475,41 @@
   SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
   SPDX-License-Identifier: Apache-2.0
 -->
-<section class="tex2jax_ignore mathjax_ignore" id="about-sandboxes">
-<h1>About Sandboxes<a class="headerlink" href="#about-sandboxes" title="Link to this heading">#</a></h1>
-<p>Every OpenShell deployment starts with a <strong>gateway</strong>, the control plane that manages sandboxes, providers, and policies. A <strong>sandbox</strong> is a safe, private execution environment for an AI agent, created using a gateway. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.</p>
+<section class="tex2jax_ignore mathjax_ignore" id="about-gateways-and-sandboxes">
+<h1>About Gateways and Sandboxes<a class="headerlink" href="#about-gateways-and-sandboxes" title="Link to this heading">#</a></h1>
+<p>Every OpenShell deployment starts with a <em>gateway</em> and one or more <em>sandboxes</em>. The gateway is the control plane that manages sandbox lifecycle, providers, and policies. A sandbox is the data plane, a safe, private execution environment where an AI agent runs. Each sandbox runs with multiple layers of protection that prevent unauthorized data access, credential exposure, and network exfiltration. Protection layers include filesystem restrictions (Landlock), system call filtering (seccomp), network namespace isolation, and a privacy-enforcing HTTP CONNECT proxy.</p>
+<section id="gateway-types">
+<h2>Gateway Types<a class="headerlink" href="#gateway-types" title="Link to this heading">#</a></h2>
+<p>A gateway coordinates everything: it provisions sandboxes, brokers CLI requests, enforces policies, and manages provider credentials. OpenShell supports three deployment models so the gateway can run wherever your workload requires.</p>
+<div class="pst-scrollable-table-container"><table class="table">
+<thead>
+<tr class="row-odd"><th class="head"><p>Type</p></th>
+<th class="head"><p>Where It Runs</p></th>
+<th class="head"><p>Best For</p></th>
+</tr>
+</thead>
+<tbody>
+<tr class="row-even"><td><p><strong>Local</strong></p></td>
+<td><p>Docker on your workstation</p></td>
+<td><p>Solo development and quick iteration. The CLI auto-bootstraps a local gateway if none exists.</p></td>
+</tr>
+<tr class="row-odd"><td><p><strong>Remote</strong></p></td>
+<td><p>Docker on a remote host via SSH</p></td>
+<td><p>Running sandboxes on a more powerful machine (for example, a DGX Spark) while keeping the CLI on your laptop.</p></td>
+</tr>
+<tr class="row-even"><td><p><strong>Cloud</strong></p></td>
+<td><p>Behind a reverse proxy (for example, Cloudflare Access)</p></td>
+<td><p>Shared team environments where multiple users connect to the same gateway through browser-based authentication.</p></td>
+</tr>
+</tbody>
+</table>
+</div>
+<p>All three types expose the same API surface. Sandboxes, policies, and providers work identically regardless of where the gateway runs. The only difference is how the CLI reaches the gateway — direct Docker socket, SSH tunnel, or HTTPS through a proxy.</p>
+<div class="admonition tip">
+<p class="admonition-title">Tip</p>
+<p>You do not need to deploy a gateway manually. Running <code class="docutils literal notranslate"><span class="pre">openshell</span> <span class="pre">sandbox</span> <span class="pre">create</span></code> without a gateway auto-bootstraps a local one for you.</p>
+</div>
+</section>
 <section id="sandbox-lifecycle">
 <h2>Sandbox Lifecycle<a class="headerlink" href="#sandbox-lifecycle" title="Link to this heading">#</a></h2>
 <p>Every sandbox moves through a defined set of phases:</p>
@@ -541,8 +573,8 @@
 </div>
 <!-- | [NemoClaw](https://github.com/NVIDIA/OpenShell-Community) | [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/nemoclaw) | Bundled | OpenClaw with NVIDIA DevX UI extension. Launch with `openshell sandbox create --from nemoclaw`. | -->
 </section>
-<section id="built-in-default-policy">
-<h2>Built-in Default Policy<a class="headerlink" href="#built-in-default-policy" title="Link to this heading">#</a></h2>
+<section id="sandbox-policies">
+<h2>Sandbox Policies<a class="headerlink" href="#sandbox-policies" title="Link to this heading">#</a></h2>
 <p>OpenShell ships a built-in policy that covers common agent workflows out of the box.
 When you create a sandbox without <code class="docutils literal notranslate"><span class="pre">--policy</span></code>, the default policy is applied. It controls three things:</p>
 <div class="pst-scrollable-table-container"><table class="table">
@@ -569,57 +601,7 @@ When you create a sandbox without <code class="docutils literal notranslate"><sp
 </table>
 </div>
 <p>For the full breakdown of each default policy block and agent compatibility details, refer to <a class="reference internal" href="../reference/default-policy.html"><span class="doc">Default Policy Reference</span></a>.</p>
-</section>
-<section id="policy-structure">
-<h2>Policy Structure<a class="headerlink" href="#policy-structure" title="Link to this heading">#</a></h2>
-<p>A policy has static sections (<code class="docutils literal notranslate"><span class="pre">filesystem_policy</span></code>, <code class="docutils literal notranslate"><span class="pre">landlock</span></code>, <code class="docutils literal notranslate"><span class="pre">process</span></code>) that are locked at sandbox creation, and dynamic sections (<code class="docutils literal notranslate"><span class="pre">network_policies</span></code>, <code class="docutils literal notranslate"><span class="pre">inference</span></code>) that are hot-reloadable on a running sandbox.</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">version</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-
-<span class="c1"># Static: locked at sandbox creation. Paths the agent can read vs read/write.</span>
-<span class="nt">filesystem_policy</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">read_only</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/usr</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/lib</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/etc</span><span class="p p-Indicator">]</span>
-<span class="w">  </span><span class="nt">read_write</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">/sandbox</span><span class="p p-Indicator">,</span><span class="w"> </span><span class="nv">/tmp</span><span class="p p-Indicator">]</span>
-
-<span class="c1"># Static: Landlock LSM kernel enforcement. best_effort uses highest ABI the host supports.</span>
-<span class="nt">landlock</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">compatibility</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">best_effort</span>
-
-<span class="c1"># Static: Unprivileged user/group the agent process runs as.</span>
-<span class="nt">process</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">run_as_user</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
-<span class="w">  </span><span class="nt">run_as_group</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">sandbox</span>
-
-<span class="c1"># Dynamic: hot-reloadable. Named blocks of endpoints + binaries allowed to reach them.</span>
-<span class="nt">network_policies</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">my_api</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">name</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">my-api</span>
-<span class="w">    </span><span class="nt">endpoints</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">host</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">api.example.com</span>
-<span class="w">        </span><span class="nt">port</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">443</span>
-<span class="w">        </span><span class="nt">protocol</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">rest</span>
-<span class="w">        </span><span class="nt">tls</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">terminate</span>
-<span class="w">        </span><span class="nt">enforcement</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">enforce</span>
-<span class="w">        </span><span class="nt">access</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">full</span>
-<span class="w">    </span><span class="nt">binaries</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="nt">path</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/usr/bin/curl</span>
-
-<span class="c1"># Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).</span>
-<span class="nt">inference</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">allowed_routes</span><span class="p">:</span><span class="w"> </span><span class="p p-Indicator">[</span><span class="nv">local</span><span class="p p-Indicator">]</span>
-</pre></div>
-</div>
-<p>For the complete structure and every field, refer to the <a class="reference internal" href="../reference/policy-schema.html"><span class="std std-doc">Policy Schema Reference</span></a>.</p>
-</section>
-<section id="network-access-rules">
-<h2>Network Access Rules<a class="headerlink" href="#network-access-rules" title="Link to this heading">#</a></h2>
-<p>Network access is controlled by policy blocks under <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries that are allowed to use those endpoints.</p>
-<p>Every outbound connection from the sandbox goes through the proxy:</p>
-<ul class="simple">
-<li><p>The proxy queries the <a class="reference internal" href="../about/architecture.html"><span class="doc">policy engine</span></a> with the destination (host and port) and the calling binary. A connection is allowed only when both match an entry in the same policy block.</p></li>
-<li><p>For endpoints with <code class="docutils literal notranslate"><span class="pre">protocol:</span> <span class="pre">rest</span></code> and <code class="docutils literal notranslate"><span class="pre">tls:</span> <span class="pre">terminate</span></code>, each HTTP request is checked against that endpoint’s <code class="docutils literal notranslate"><span class="pre">rules</span></code> (method and path).</p></li>
-<li><p>If no endpoint matches and inference routes are configured, the request may be rerouted for inference.</p></li>
-<li><p>Otherwise the connection is denied. Endpoints without <code class="docutils literal notranslate"><span class="pre">protocol</span></code> or <code class="docutils literal notranslate"><span class="pre">tls</span></code> allow the TCP stream through without inspecting payloads.</p></li>
-</ul>
+<p>For the full policy structure with annotated YAML examples, refer to <a class="reference internal" href="policies.html"><span class="doc">Customize Sandbox Policies</span></a>.</p>
 </section>
 <section id="next-steps">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
@@ -682,11 +664,10 @@ When you create a sandbox without <code class="docutils literal notranslate"><sp
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#gateway-types">Gateway Types</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sandbox-lifecycle">Sandbox Lifecycle</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#supported-agents">Supported Agents</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#built-in-default-policy">Built-in Default Policy</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#policy-structure">Policy Structure</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#network-access-rules">Network Access Rules</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#sandbox-policies">Sandbox Policies</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
 </ul>
   </nav></div>

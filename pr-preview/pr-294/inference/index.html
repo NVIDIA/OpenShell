@@ -398,9 +398,9 @@
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Gateways and Sandboxes</span></p>
 <ul class="nav bd-sidenav">
-<li class="toctree-l1"><a class="reference internal" href="../sandboxes/index.html">About Sandboxes</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../sandboxes/create-and-manage.html">Create and Manage</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../sandboxes/gateways.html">Gateways</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/index.html">About Gateways and Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/create-and-manage.html">Create and Manage Sandboxes</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../sandboxes/gateways.html">Deploy and Manage Gateways</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../sandboxes/providers.html">Providers</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../sandboxes/policies.html">Customize Sandbox Policies</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../sandboxes/community-sandboxes.html">Community Sandboxes</a></li>
@@ -487,7 +487,7 @@ The following table summarizes how OpenShell handles inference traffic.</p>
 </thead>
 <tbody>
 <tr class="row-even"><td><p><strong>External endpoints</strong></p></td>
-<td><p>Traffic to hosts like <code class="docutils literal notranslate"><span class="pre">api.openai.com</span></code> or <code class="docutils literal notranslate"><span class="pre">api.anthropic.com</span></code> is treated like any other outbound request — allowed or denied by <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>. Refer to <a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>.</p></td>
+<td><p>Traffic to hosts like <code class="docutils literal notranslate"><span class="pre">api.openai.com</span></code> or <code class="docutils literal notranslate"><span class="pre">api.anthropic.com</span></code> is treated like any other outbound request — allowed or denied by <code class="docutils literal notranslate"><span class="pre">network_policies</span></code>. Refer to <a class="reference internal" href="../sandboxes/policies.html"><span class="std std-doc">Policies</span></a>.</p></td>
 </tr>
 <tr class="row-odd"><td><p><strong><code class="docutils literal notranslate"><span class="pre">inference.local</span></code></strong></p></td>
 <td><p>A special endpoint exposed inside every sandbox for inference that should stay local to the host for privacy and security. The <a class="reference internal" href="../about/architecture.html"><span class="doc">privacy router</span></a> strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint.</p></td>
@@ -588,7 +588,7 @@ Anthropic-compatible</label><div class="sd-tab-content docutils">
 <p>Continue with one of the following:</p>
 <ul class="simple">
 <li><p>To set up the backend behind <code class="docutils literal notranslate"><span class="pre">inference.local</span></code>, refer to <a class="reference internal" href="configure.html"><span class="doc">Configure Inference Routing</span></a>.</p></li>
-<li><p>To control external endpoints, refer to <a class="reference internal" href="../sandboxes/index.html#network-access-rules"><span class="std std-ref">Network Access Rules</span></a>.</p></li>
+<li><p>To control external endpoints, refer to <a class="reference internal" href="../sandboxes/policies.html"><span class="std std-doc">Policies</span></a>.</p></li>
 </ul>
 </section>
 </section>
