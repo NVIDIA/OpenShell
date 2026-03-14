@@ -121,7 +121,7 @@ fn render_connect_page(
         .replace('<', "\\x3c")
         .replace('>', "\\x3e");
 
-    let version = env!("CARGO_PKG_VERSION");
+    let version = openshell_core::VERSION;
 
     format!(
         r#"<!DOCTYPE html>

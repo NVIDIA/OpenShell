@@ -76,6 +76,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 FROM --platform=$BUILDPLATFORM rust:1.88-slim AS supervisor-builder
 ARG TARGETARCH
 ARG BUILDARCH
+ARG OPENSHELL_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 ARG SCCACHE_MEMCACHED_ENDPOINT
 
@@ -135,6 +136,9 @@ RUN --mount=type=cache,id=cargo-registry-supervisor-${TARGETARCH},sharing=locked
     --mount=type=cache,id=cargo-target-supervisor-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-supervisor-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
+    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi && \
     cargo_cross_build --release -p openshell-sandbox && \
     mkdir -p /build/out && \
     cp "$(cross_output_dir release)/openshell-sandbox" /build/out/

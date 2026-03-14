@@ -15,6 +15,7 @@ use openshell_server::{run_server, tracing_bus::TracingLogBus};
 /// `OpenShell` Server - gRPC and HTTP server with protocol multiplexing.
 #[derive(Parser, Debug)]
 #[command(name = "openshell-server")]
+#[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
     /// Port to bind the server to (all interfaces).

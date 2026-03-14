@@ -7,6 +7,7 @@
 //! - Protocol buffer definitions and generated code
 //! - Configuration management
 //! - Common error types
+//! - Build version metadata
 
 pub mod config;
 pub mod error;
@@ -16,3 +17,14 @@ pub mod proto;
 
 pub use config::{Config, TlsConfig};
 pub use error::{Error, Result};
+
+/// Build version string derived from git metadata.
+///
+/// For local builds this is computed by `build.rs` via `git describe` using
+/// the guess-next-dev scheme (e.g. `0.0.4-dev.6+g2bf9969`). In Docker/CI
+/// builds where `.git` is absent, falls back to `CARGO_PKG_VERSION` which
+/// is already set correctly by the build pipeline's sed patch.
+pub const VERSION: &str = match option_env!("OPENSHELL_GIT_VERSION") {
+    Some(v) => v,
+    None => env!("CARGO_PKG_VERSION"),
+};
