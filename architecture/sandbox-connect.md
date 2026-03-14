@@ -163,8 +163,9 @@ on the host are forwarded to `127.0.0.1:<port>` inside the sandbox.
 #### CLI
 
 - Reuses the same `ProxyCommand` path as `sandbox connect`.
-- Invokes OpenSSH with `-N -L <port>:127.0.0.1:<port> sandbox`.
-- By default stays attached in foreground until interrupted (Ctrl+C).
+- Invokes OpenSSH with `-N -o ExitOnForwardFailure=yes -L <port>:127.0.0.1:<port> sandbox`.
+- By default stays attached in foreground until interrupted (Ctrl+C), and prints an early startup
+  confirmation after SSH stays up through its initial forward-setup checks.
 - With `-d`/`--background`, SSH forks after auth and the CLI exits. The PID is
   tracked in `~/.config/openshell/forwards/<name>-<port>.pid` along with sandbox id metadata.
 - `openshell forward stop <port> <name>` validates PID ownership and then kills a background forward.
