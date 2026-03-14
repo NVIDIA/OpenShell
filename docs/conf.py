@@ -12,7 +12,7 @@ project = "NVIDIA OpenShell Developer Guide"
 this_year = date.today().year
 copyright = f"2025-{this_year}, NVIDIA Corporation"
 author = "NVIDIA Corporation"
-release = "0.0.1"
+release = "0.0.3"
 
 extensions = [
     "myst_parser",
