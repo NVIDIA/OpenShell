@@ -45,6 +45,7 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GATEWAY_HOST: host.docker.internal
     steps:
       - uses: actions/checkout@v4
 
@@ -107,6 +108,9 @@ jobs:
 
       - name: Verify CLI installation
         run: openshell --version
+
+      - name: Start gateway
+        run: openshell gateway start --no-tty
 
       - name: Run canary test
         run: |
