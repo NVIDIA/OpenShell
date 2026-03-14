@@ -75,22 +75,51 @@ jobs:
         run: |
           set -euo pipefail
           TAG="${{ steps.release.outputs.tag }}"
-          ASSET="openshell-${{ matrix.target }}.tar.gz"
+          ASSET_NAME="openshell-${{ matrix.target }}.tar.gz"
+          API="https://api.github.com/repos/${{ github.repository }}"
 
-          echo "Downloading ${ASSET} from release ${TAG}..."
-          gh release download "${TAG}" \
-            --repo "${{ github.repository }}" \
-            --pattern "${ASSET}" \
-            --output "/tmp/${ASSET}"
+          echo "Downloading ${ASSET_NAME} from release ${TAG}..."
 
-          tar -xzf "/tmp/${ASSET}" -C /tmp
+          # Look up the asset download URL via the releases API
+          ASSET_URL=$(curl -fsSL \
+            -H "Authorization: token ${GH_TOKEN}" \
+            "${API}/releases/tags/${TAG}" \
+            | jq -r --arg name "${ASSET_NAME}" \
+              '.assets[] | select(.name == $name) | .url')
+
+          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
+            echo "::error::Asset ${ASSET_NAME} not found in release ${TAG}"
+            exit 1
+          fi
+
+          # Download the asset binary
+          curl -fsSL \
+            -H "Authorization: token ${GH_TOKEN}" \
+            -H "Accept: application/octet-stream" \
+            -o "/tmp/${ASSET_NAME}" \
+            "${ASSET_URL}"
+
+          tar -xzf "/tmp/${ASSET_NAME}" -C /tmp
           install -m 755 /tmp/openshell /usr/local/bin/openshell
-          rm -f "/tmp/${ASSET}" /tmp/openshell
+          rm -f "/tmp/${ASSET_NAME}" /tmp/openshell
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Verify CLI installation
         run: openshell --version
+
+      - name: Resolve gateway host
+        run: |
+          # On Linux CI runners host.docker.internal is not set automatically
+          # (it's a Docker Desktop feature). Add it via the Docker bridge IP.
+          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
+            BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+            echo "Adding /etc/hosts entry: ${BRIDGE_IP} host.docker.internal"
+            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
+          fi
+
+      - name: Start gateway
+        run: openshell gateway start --gateway-host host.docker.internal
 
       - name: Run canary test
         run: |
