@@ -1,0 +1,167 @@
+# Contributing to NVIDIA OpenShell Documentation
+
+This guide covers how to write, edit, and review documentation for NVIDIA OpenShell. If you change code that affects user-facing behavior, update the relevant docs in the same PR.
+
+## Use the Agent Skills
+
+If you use an AI coding agent (Cursor, Claude Code, Codex, etc.), the repo includes skills that automate doc work. Use them before writing from scratch.
+
+| Skill | What it does | When to use |
+|---|---|---|
+| `update-docs-from-commits` | Scans recent commits for user-facing changes and drafts doc updates. | After landing features, before a release, or to find doc gaps. |
+| `build-from-issue` | Plans and implements work from a GitHub issue, including doc updates. | When working from an issue that has doc impact. |
+
+The skills live in `.agents/skills/` and follow the style guide below automatically. To use one, ask your agent to run it (e.g., "catch up the docs for everything merged since v0.2.0").
+
+## When to Update Docs
+
+Update documentation when your change:
+
+- Adds, removes, or renames a CLI command or flag.
+- Changes default behavior or configuration.
+- Adds a new feature that users interact with.
+- Fixes a bug that the docs describe incorrectly.
+- Changes an API, protocol, or policy schema.
+
+## Building Docs Locally
+
+Verify the docs are built correctly by building them and checking the output.
+
+To build the docs, run:
+
+```bash
+mise run docs
+```
+
+To serve the docs locally and automatically rebuild on changes, run:
+
+```bash
+mise run docs:serve
+```
+
+## Writing Conventions
+
+### Format
+
+- Docs use [MyST Markdown](https://myst-parser.readthedocs.io/), a Sphinx-compatible superset of CommonMark.
+- Every page starts with YAML frontmatter (title, description, topics, tags, content type).
+- Include the SPDX license header after frontmatter:
+  ```
+  <!--
+    SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+    SPDX-License-Identifier: Apache-2.0
+  -->
+  ```
+
+### Frontmatter Template
+
+```yaml
+---
+title:
+  page: Page Title
+  nav: Short Nav Title
+description: One-sentence summary of the page.
+topics:
+- Generative AI
+- Cybersecurity
+tags:
+- Relevant
+- Tags
+content:
+  type: concept | how_to | get_started | tutorial | reference
+  difficulty: technical_beginner | technical_intermediate | technical_advanced
+  audience:
+  - engineer
+  - data_scientist
+---
+```
+
+### Page Structure
+
+1. H1 heading matching the `title.page` value.
+2. A one- or two-sentence introduction stating what the page covers.
+3. Sections organized by task or concept, using H2 and H3. Start each section with an introductory sentence that orients the reader.
+4. A "Next Steps" section at the bottom linking to related pages.
+
+## Style Guide
+
+Write like you are explaining something to a colleague. Be direct, specific, and concise.
+
+### Voice and Tone
+
+- Use active voice. "The CLI creates a gateway" not "A gateway is created by the CLI."
+- Use second person ("you") when addressing the reader.
+- Use present tense. "The command returns an error" not "The command will return an error."
+- State facts. Do not hedge with "simply," "just," "easily," or "of course."
+
+### Things to Avoid
+
+These patterns are common in LLM-generated text and erode trust with technical readers. Remove them during review.
+
+| Pattern | Problem | Fix |
+|---|---|---|
+| Unnecessary bold | "This is a **critical** step" on routine instructions. | Reserve bold for UI labels, parameter names, and genuine warnings. |
+| Em dashes everywhere | "The gateway — which runs in Docker — creates sandboxes." | Use commas or split into two sentences. Em dashes are fine sparingly but should not appear multiple times per paragraph. |
+| Superlatives | "OpenShell provides a powerful, robust, seamless experience." | Say what it does, not how great it is. |
+| Hedge words | "Simply run the command" or "You can easily configure..." | Drop the adverb. "Run the command." |
+| Emoji in prose | "🚀 Let's get started!" | No emoji in documentation prose. |
+| Rhetorical questions | "Want to secure your agents? Look no further!" | State the purpose directly. |
+
+### Formatting Rules
+
+- End every sentence with a period.
+- One sentence per line in the source file (makes diffs readable).
+- Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
+- Use code blocks with the `console` language for CLI examples. Prefix commands with `$`:
+  ```console
+  $ openshell gateway start
+  ```
+- Use tables for structured comparisons. Keep tables simple (no nested formatting).
+- Use MyST admonitions (`:::{tip}`, `:::{note}`, `:::{warning}`) for callouts, not bold text.
+- Avoid nested admonitions.
+- Do not number section titles. Write "Deploy a Gateway" not "Section 1: Deploy a Gateway" or "Step 3: Verify."
+- Do not use colons in titles. Write "Deploy and Manage Gateways" not "Gateways: Deploy and Manage."
+- Use colons only to introduce a list. Do not use colons as general-purpose punctuation between clauses.
+
+### Word List
+
+Use these consistently:
+
+| Use | Do not use |
+|---|---|
+| gateway | Gateway (unless starting a sentence) |
+| sandbox | Sandbox (unless starting a sentence) |
+| CLI | cli, Cli |
+| API key | api key, API Key |
+| NVIDIA | Nvidia, nvidia |
+| OpenShell | Open Shell, openShell, Openshell, openshell |
+| mTLS | MTLS, mtls |
+| YAML | yaml, Yaml |
+
+## Submitting Doc Changes
+
+1. Create a branch following the project convention: `docs/<issue-id>-<description>/<username>`.
+2. Make your changes.
+3. Build locally with `mise run docs` and verify the output.
+4. Run `mise run pre-commit` to catch formatting issues.
+5. Open a PR with `docs:` as the conventional commit type.
+
+```
+docs: update gateway deployment instructions
+```
+
+If your doc change accompanies a code change, include both in the same PR and use the code change's commit type:
+
+```
+feat(cli): add --gpu flag to gateway start
+```
+
+## Reviewing Doc PRs
+
+When reviewing documentation:
+
+- Check that the style guide rules above are followed.
+- Watch for LLM-generated patterns (excessive bold, em dashes, filler).
+- Verify code examples are accurate and runnable.
+- Confirm cross-references and links are not broken.
+- Build locally to check rendering.
