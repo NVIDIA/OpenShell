@@ -43,6 +43,7 @@ copybutton_exclude = ".linenos, .gp, .go"
 exclude_patterns = [
     "README.md",
     "SETUP.md",
+    "CONTRIBUTING.md",
     "_build/**",
     "_ext/**",
 ]

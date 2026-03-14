@@ -147,7 +147,19 @@ These are the primary `mise` tasks for day-to-day development:
 | `tasks/`        | `mise` task definitions and build scripts     |
 | `deploy/`       | Dockerfiles, Helm chart, Kubernetes manifests |
 | `architecture/` | Architecture docs and plans                   |
+| `docs/`         | User-facing documentation (Sphinx/MyST)       |
 | `.agents/`      | Agent skills and persona definitions          |
+
+## Documentation
+
+If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR.
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the doc structure, style guide, and formatting rules.
+
+Build and preview docs locally:
+
+```bash
+mise run docs
+```
 
 ## Pull Requests
 
