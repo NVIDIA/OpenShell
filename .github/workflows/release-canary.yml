@@ -1,0 +1,114 @@
+name: Release Canary
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to test (e.g. devel, v1.2.3)"
+        required: true
+        type: string
+  workflow_run:
+    workflows: ["Release Dev", "Release Tag"]
+    types: [completed]
+
+permissions:
+  contents: read
+  packages: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  acceptance:
+    name: Canary (${{ matrix.arch }})
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: release
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+            if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
+              echo "tag=devel" >> "$GITHUB_OUTPUT"
+            elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
+              TAG="${{ github.event.workflow_run.head_branch }}"
+              if [ -z "$TAG" ]; then
+                echo "::error::Could not determine release tag from workflow_run"
+                exit 1
+              fi
+              echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Unexpected triggering workflow: ${WORKFLOW_NAME}"
+              exit 1
+            fi
+          fi
+
+      - name: Install CLI from GitHub Release
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.release.outputs.tag }}"
+          ASSET="openshell-${{ matrix.target }}.tar.gz"
+
+          echo "Downloading ${ASSET} from release ${TAG}..."
+          gh release download "${TAG}" \
+            --repo "${{ github.repository }}" \
+            --pattern "${ASSET}" \
+            --output "/tmp/${ASSET}"
+
+          tar -xzf "/tmp/${ASSET}" -C /tmp
+          install -m 755 /tmp/openshell /usr/local/bin/openshell
+          rm -f "/tmp/${ASSET}" /tmp/openshell
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify CLI installation
+        run: openshell --version
+
+      - name: Run canary test
+        run: |
+          set -euo pipefail
+
+          echo "Creating sandbox and running 'echo hello world'..."
+          OUTPUT=$(openshell sandbox create --no-keep --no-tty -- echo "hello world" 2>&1) || {
+            EXIT_CODE=$?
+            echo "::error::openshell sandbox create failed with exit code ${EXIT_CODE}"
+            echo "$OUTPUT"
+            exit $EXIT_CODE
+          }
+
+          echo "$OUTPUT"
+
+          if echo "$OUTPUT" | grep -q "hello world"; then
+            echo "Canary test passed: 'hello world' found in output"
+          else
+            echo "::error::Canary test failed: 'hello world' not found in output"
+            exit 1
+          fi
