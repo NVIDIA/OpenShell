@@ -41,7 +41,7 @@ After completing this tutorial, you understand:
 - Docker Desktop running on your machine.
 
 :::{tip}
-To run every step of this tutorial, you can also use the automated demo script at `examples/sandbox-policy-quickstart/demo.sh`. It runs the full walkthrough in under a minute but without any user interaction.
+To run every step of this tutorial, you can also use the automated demo script at `https://github.com/NVIDIA/OpenShell/blob/main/examples/sandbox-policy-quickstart/demo.sh`. It runs the full walkthrough in under a minute but without any user interaction.
 
 ```console
 $ bash examples/sandbox-policy-quickstart/demo.sh
