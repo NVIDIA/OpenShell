@@ -26,11 +26,12 @@ use miette::{IntoDiagnostic, Result};
 use std::sync::{Arc, Mutex};
 
 use crate::constants::{
-    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME, volume_name,
+    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME, network_name,
+    volume_name,
 };
 use crate::docker::{
     check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_volume, start_container, stop_container,
+    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -309,6 +310,7 @@ where
 
     // All subsequent operations use the target Docker (remote or local)
     log("[status] Initializing environment".to_string());
+    ensure_network(&target_docker, &network_name(&name)).await?;
     ensure_volume(&target_docker, &volume_name(&name)).await?;
 
     // Compute extra TLS SANs for remote deployments so the gateway and k3s
