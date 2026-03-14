@@ -612,7 +612,11 @@ fn default_gateway_image_ref() -> String {
     {
         return image;
     }
-    format!("{}:{}", image::DEFAULT_GATEWAY_IMAGE, image::DEFAULT_IMAGE_TAG)
+    format!(
+        "{}:{}",
+        image::DEFAULT_GATEWAY_IMAGE,
+        image::DEFAULT_IMAGE_TAG
+    )
 }
 
 /// Create the three TLS K8s secrets required by the `OpenShell` server and sandbox pods.
