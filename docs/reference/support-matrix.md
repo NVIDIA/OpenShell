@@ -58,9 +58,8 @@ OpenShell enforces sandbox isolation through two Linux kernel security modules:
 | -------------------------------------------------------------- | ----------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | [Landlock LSM](https://docs.kernel.org/security/landlock.html) | Recommended | Enforces filesystem access restrictions at the kernel level. The `best_effort` compatibility mode uses the highest Landlock ABI the host kernel supports. The `hard_requirement` mode fails sandbox creation if the required ABI is unavailable. |
 | seccomp                                                        | Required    | Filters dangerous system calls. Available on all modern Linux kernels (3.17+).                                                                                                                                                                   |
-
 On macOS, these kernel modules run inside the Docker Desktop Linux VM, not on the host kernel.
 
 ## Agent Compatibility
 
-For the full list of supported agents and their default policy coverage, refer to the [Supported Agents](../sandboxes/index.md#supported-agents) table.
+For the full list of supported agents and their default policy coverage, refer to the {doc}`../about/supported-agents` page.

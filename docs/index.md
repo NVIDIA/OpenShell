@@ -188,6 +188,7 @@ Home <self>
 
 Overview <about/overview>
 How It Works <about/architecture>
+Supported Agents <about/supported-agents>
 Release Notes <about/release-notes>
 ```
 
