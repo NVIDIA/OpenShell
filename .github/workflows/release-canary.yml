@@ -110,7 +110,7 @@ jobs:
         run: openshell --version
 
       - name: Start gateway
-        run: openshell gateway start --no-tty
+        run: openshell gateway start
 
       - name: Run canary test
         run: |
