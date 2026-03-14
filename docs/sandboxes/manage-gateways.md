@@ -1,6 +1,6 @@
 ---
 title:
-  page: Gateways
+  page: Deploy and Manage Gateways
   nav: Gateways
 description: Deploy local and remote gateways, register cloud gateways, and manage multiple gateway environments.
 topics:
@@ -24,7 +24,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Gateways
+# Deploy and Manage Gateways
 
 The gateway is the control plane for OpenShell. All control-plane traffic between the CLI and running sandboxes flows through the gateway.
 
@@ -235,5 +235,5 @@ $ openshell gateway start --recreate
 
 ## Next Steps
 
-- To create a sandbox using the gateway, refer to {doc}`create-and-manage`.
+- To create a sandbox using the gateway, refer to {doc}`manage-sandboxes`.
 - To install the CLI and get started quickly, refer to the {doc}`/get-started/quickstart`.

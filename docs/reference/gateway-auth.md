@@ -26,7 +26,7 @@ content:
 
 # Gateway Authentication
 
-This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to {doc}`/sandboxes/create-and-manage`.
+This page describes how the CLI resolves a gateway, authenticates with it, and where credentials are stored. For how to deploy or register gateways, refer to {doc}`/sandboxes/manage-sandboxes`.
 
 ## Gateway Resolution
 

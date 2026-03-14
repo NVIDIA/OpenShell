@@ -76,7 +76,7 @@ For the full policy structure with annotated YAML examples, refer to {doc}`polic
 
 Continue with one of the following:
 
-- To create your first sandbox, refer to {doc}`create-and-manage`.
-- To supply API keys or tokens, refer to {doc}`providers`.
+- To create your first sandbox, refer to {doc}`manage-sandboxes`.
+- To supply API keys or tokens, refer to {doc}`manage-providers`.
 - To control what the agent can access, refer to {doc}`policies`.
 - To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.

@@ -65,7 +65,7 @@ Depending on whether you start a new sandbox or use an existing sandbox, choose 
 
 In terminal 2, create a new sandbox with Claude Code. The {doc}`default policy </reference/default-policy>` is applied automatically, which allows read-only access to GitHub.
 
-Create a {doc}`credential provider </sandboxes/providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
+Create a {doc}`credential provider </sandboxes/manage-providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
 
 ```console
 $ GITHUB_TOKEN=<your-token>
@@ -379,4 +379,4 @@ The following resources cover related topics in greater depth:
 
 - To add per-repository access levels (read-write vs read-only) or restrict to specific API methods, refer to the [Policy Schema Reference](/reference/policy-schema.md).
 - To learn the full policy iteration workflow (pull, edit, push, verify), refer to {doc}`/sandboxes/policies`.
-- To inject credentials automatically instead of pasting tokens, refer to {doc}`/sandboxes/providers`.
+- To inject credentials automatically instead of pasting tokens, refer to {doc}`/sandboxes/manage-providers`.

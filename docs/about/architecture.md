@@ -69,12 +69,12 @@ OpenShell can run locally, on a remote host, or behind a cloud proxy. The archit
 | **Remote** | The gateway runs on a remote host via SSH. Only Docker is required on the remote machine. | `openshell gateway start --remote user@host` |
 | **Cloud** | A gateway already running behind a reverse proxy (e.g. Cloudflare Access). Register and authenticate via browser. | `openshell gateway add https://gateway.example.com` |
 
-You can register multiple gateways and switch between them with `openshell gateway select`. For the full deployment and management workflow, refer to the [Gateways](../sandboxes/gateways.md) section.
+You can register multiple gateways and switch between them with `openshell gateway select`. For the full deployment and management workflow, refer to the [Gateways](../sandboxes/manage-gateways.md) section.
 
 ## Next Steps
 
 Continue with one of the following:
 
-- To deploy or register a gateway, refer to [Gateways](../sandboxes/gateways.md).
+- To deploy or register a gateway, refer to [Gateways](../sandboxes/manage-gateways.md).
 - To create your first sandbox, refer to the [Quickstart](../get-started/quickstart.md).
 - To learn how OpenShell enforces isolation across all protection layers, refer to [Sandboxes](../sandboxes/index.md).

@@ -1,7 +1,7 @@
 ---
 title:
-  page: Create and Manage
-  nav: Create and Manage
+  page: Manage Sandboxes
+  nav: Sandboxes
 description: Set up gateways, create sandboxes, and manage the full sandbox lifecycle.
 topics:
 - Generative AI
@@ -25,7 +25,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Create and Manage
+# Manage Sandboxes
 
 This page covers creating sandboxes and managing them. For background on what sandboxes are and how isolation works, refer to [About Sandboxes](index.md).
 
@@ -47,7 +47,7 @@ Every sandbox requires a gateway. If you run `openshell sandbox create` without 
 
 ### Remote Gateways
 
-If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to {doc}`gateways` for deployment options and multi-gateway management.
+If you plan to run sandboxes on a remote host or a cloud-hosted gateway, set up the gateway first. Refer to {doc}`manage-gateways` for deployment options and multi-gateway management.
 
 ### GPU Resources
 
@@ -209,6 +209,6 @@ $ openshell sandbox delete --all
 ## Next Steps
 
 - To follow a complete end-to-end example, refer to the {doc}`/tutorials/github-sandbox` tutorial.
-- To supply API keys or tokens, refer to {doc}`providers`.
+- To supply API keys or tokens, refer to {doc}`manage-providers`.
 - To control what the agent can access, refer to {doc}`policies`.
 - To use a pre-built environment, refer to the {doc}`community-sandboxes` catalog.

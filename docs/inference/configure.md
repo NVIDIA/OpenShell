@@ -159,4 +159,4 @@ Explore related topics:
 
 - To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
 - To control external endpoints, refer to [Policies](/sandboxes/policies.md).
-- To manage provider records, refer to {doc}`../sandboxes/providers`.
+- To manage provider records, refer to {doc}`../sandboxes/manage-providers`.

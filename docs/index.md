@@ -145,7 +145,7 @@ Hands-on walkthroughs from first sandbox to custom policies.
 :::
 
 :::{grid-item-card} Gateways and Sandboxes
-:link: sandboxes/gateways
+:link: sandboxes/manage-gateways
 :link-type: doc
 
 Deploy gateways, create sandboxes, configure policies, providers, and community images for your AI agents.
@@ -205,11 +205,11 @@ tutorials/index
 :hidden:
 
 sandboxes/index
-Create and Manage Sandboxes <sandboxes/create-and-manage>
-Deploy and Manage Gateways <sandboxes/gateways>
-sandboxes/providers
-sandboxes/policies
-sandboxes/community-sandboxes
+Sandboxes <sandboxes/manage-sandboxes>
+Gateways <sandboxes/manage-gateways>
+Providers <sandboxes/manage-providers>
+Policies <sandboxes/policies>
+Community Sandboxes <sandboxes/community-sandboxes>
 ```
 
 ```{toctree}
