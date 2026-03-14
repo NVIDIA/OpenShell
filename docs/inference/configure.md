@@ -135,7 +135,9 @@ Use this endpoint when inference should stay local to the host for privacy and s
 
 ### Verify the Endpoint from a Sandbox
 
-`openshell inference get` confirms the configuration was saved, but does not verify the upstream endpoint is reachable. To confirm end-to-end connectivity, connect to a sandbox and run:
+`openshell inference get` confirms the configuration was saved, but does not verify the upstream endpoint is reachable. The CLI also accepts `--no-verify` on `openshell inference set` and `openshell inference update` so automation can opt out explicitly ahead of a future verify-by-default rollout.
+
+To confirm end-to-end connectivity, connect to a sandbox and run:
 
 ```bash
 curl https://inference.local/v1/responses \
