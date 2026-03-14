@@ -436,7 +436,9 @@ pub async fn ensure_container(
         env_vars.push(format!("SSH_GATEWAY_PORT={gateway_port}"));
     }
 
-    // Pass image configuration for local development.
+    // Pass image configuration to the cluster entrypoint.
+    // The effective tag is resolved from the runtime IMAGE_TAG env var (if set)
+    // or the compile-time default (see image::DEFAULT_IMAGE_TAG).
     // When OPENSHELL_PUSH_IMAGES is set the entrypoint overrides the baked-in
     // HelmChart manifest so k3s uses the locally-pushed images with
     // IfNotPresent pull policy instead of pulling from the remote registry.
@@ -444,22 +446,20 @@ pub async fn ensure_container(
         .ok()
         .filter(|v| !v.trim().is_empty())
         .is_some();
+    let effective_tag = std::env::var("IMAGE_TAG")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| image::DEFAULT_IMAGE_TAG.to_string());
     if push_mode {
-        let tag = std::env::var("IMAGE_TAG")
-            .ok()
-            .filter(|v| !v.trim().is_empty())
-            .unwrap_or_else(|| "dev".to_string());
         if let Ok(images) = std::env::var("OPENSHELL_PUSH_IMAGES")
             && !images.trim().is_empty()
         {
             env_vars.push(format!("PUSH_IMAGE_REFS={images}"));
         }
-        env_vars.push(format!("IMAGE_TAG={tag}"));
+        env_vars.push(format!("IMAGE_TAG={effective_tag}"));
         env_vars.push("IMAGE_PULL_POLICY=IfNotPresent".to_string());
-    } else if let Ok(tag) = std::env::var("IMAGE_TAG")
-        && !tag.trim().is_empty()
-    {
-        env_vars.push(format!("IMAGE_TAG={tag}"));
+    } else {
+        env_vars.push(format!("IMAGE_TAG={effective_tag}"));
     }
 
     // Disable TLS: pass through to the entrypoint so the HelmChart manifest

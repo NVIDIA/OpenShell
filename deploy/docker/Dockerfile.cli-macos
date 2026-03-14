@@ -19,6 +19,7 @@ FROM ${OSXCROSS_IMAGE} AS osxcross
 FROM python:3.12-slim AS builder
 
 ARG OPENSHELL_CARGO_VERSION
+ARG OPENSHELL_IMAGE_TAG
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"

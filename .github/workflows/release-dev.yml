@@ -1,4 +1,4 @@
-name: Publish
+name: Release Dev
 
 on:
   push:
@@ -24,8 +24,8 @@ jobs:
     with:
       component: cluster
 
-  tag-ghcr-latest:
-    name: Tag GHCR Images as Latest
+  tag-ghcr-dev:
+    name: Tag GHCR Images as Dev
     needs: [build-gateway, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 10
@@ -33,15 +33,15 @@ jobs:
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Tag images as latest
+      - name: Tag images as dev
         run: |
           set -euo pipefail
           REGISTRY="ghcr.io/nvidia/openshell"
           for component in gateway cluster; do
-            echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as latest..."
+            echo "Tagging ${REGISTRY}/${component}:${{ github.sha }} as dev..."
             docker buildx imagetools create \
               --prefer-index=false \
-              -t "${REGISTRY}/${component}:latest" \
+              -t "${REGISTRY}/${component}:dev" \
               "${REGISTRY}/${component}:${{ github.sha }}"
           done
 
@@ -64,6 +64,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+      OPENSHELL_IMAGE_TAG: dev
       NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts  # TODO: rename bucket to openshell-pypi-artifacts
       AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
       AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
@@ -209,6 +210,7 @@ jobs:
     env:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
+      OPENSHELL_IMAGE_TAG: dev
     steps:
       - uses: actions/checkout@v4
         with:
@@ -331,6 +333,7 @@ jobs:
           docker buildx build \
             --file deploy/docker/Dockerfile.cli-macos \
             --build-arg OPENSHELL_CARGO_VERSION="${{ steps.version.outputs.cargo_version }}" \
+            --build-arg OPENSHELL_IMAGE_TAG=dev \
             --build-arg CARGO_TARGET_CACHE_SCOPE="${{ github.sha }}" \
             --target binary \
             --output type=local,dest=out/ \
