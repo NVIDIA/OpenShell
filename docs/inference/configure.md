@@ -26,7 +26,7 @@ content:
 
 # Configure Inference Routing
 
-This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — refer to [Policies](/sandboxes/policies.md) for details.
+This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies`. Refer to [Policies](/sandboxes/policies.md) for details.
 
 The configuration consists of two values:
 
@@ -148,10 +148,8 @@ curl https://inference.local/v1/responses \
 
 A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
 
-:::{note}
-- **Gateway-scoped**: every sandbox using the active gateway sees the same `inference.local` backend.
-- **HTTPS only** — `inference.local` is intercepted only for HTTPS traffic.
-:::
+- Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
+- HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
 
 ## Next Steps
 
