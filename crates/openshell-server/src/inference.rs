@@ -414,7 +414,7 @@ async fn verify_provider_endpoint(
     let protocol = validated_protocol(route)?;
     let url = validation_url(&route.base_url, probe.path);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| Status::internal(format!("build validation client failed: {err}")))?;
 
