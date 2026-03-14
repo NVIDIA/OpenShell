@@ -241,7 +241,9 @@ fn diagnose_image_pull_auth_failure(_gateway_name: &str) -> GatewayFailureDiagno
     GatewayFailureDiagnosis {
         summary: "Registry authentication failed".to_string(),
         explanation: "Could not authenticate with the container registry. The image may not \
-            exist, or you may not have permission to access it."
+            exist, or you may not have permission to access it. Public GHCR repos \
+            should not require authentication — if you see this error with the default \
+            registry, it may indicate the image does not exist or a network issue."
             .to_string(),
         recovery_steps: vec![
             RecoveryStep::with_command(
@@ -249,7 +251,8 @@ fn diagnose_image_pull_auth_failure(_gateway_name: &str) -> GatewayFailureDiagno
                 "docker pull ghcr.io/nvidia/openshell/cluster:latest",
             ),
             RecoveryStep::new(
-                "If using a private registry, ensure OPENSHELL_REGISTRY_TOKEN is set",
+                "If using a private registry, set OPENSHELL_REGISTRY_USERNAME and OPENSHELL_REGISTRY_TOKEN \
+                 (or use --registry-username and --registry-token)",
             ),
             RecoveryStep::with_command("Check your Docker login", "docker login ghcr.io"),
         ],

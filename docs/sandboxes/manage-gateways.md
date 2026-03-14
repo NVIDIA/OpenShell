@@ -164,6 +164,16 @@ $ openshell gateway info
 $ openshell gateway info --name my-remote-cluster
 ```
 
+## Advanced Start Options
+
+| Flag | Purpose |
+|---|---|
+| `--gpu` | Enable NVIDIA GPU passthrough. Requires NVIDIA drivers and the Container Toolkit on the host. |
+| `--plaintext` | Listen on HTTP instead of mTLS. Use behind a TLS-terminating reverse proxy. |
+| `--disable-gateway-auth` | Skip mTLS client certificate checks. Use when a reverse proxy cannot forward client certs. |
+| `--registry-username` | Username for registry authentication. Defaults to `__token__` when `--registry-token` is set. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_USERNAME`. |
+| `--registry-token` | Authentication token for pulling container images. For GHCR, a GitHub PAT with `read:packages` scope. Only needed for private registries. Also configurable with `OPENSHELL_REGISTRY_TOKEN`. |
+
 ## Stop and Destroy
 
 Stop a gateway while preserving its state for later restart:

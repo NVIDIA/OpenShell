@@ -1317,6 +1317,7 @@ pub async fn gateway_admin_deploy(
     recreate: bool,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: bool,
 ) -> Result<()> {
@@ -1389,6 +1390,9 @@ pub async fn gateway_admin_deploy(
     }
     if let Some(host) = gateway_host {
         options = options.with_gateway_host(host);
+    }
+    if let Some(username) = registry_username {
+        options = options.with_registry_username(username);
     }
     if let Some(token) = registry_token {
         options = options.with_registry_token(token);

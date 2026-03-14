@@ -160,7 +160,7 @@ openshell doctor exec -- kubectl -n kube-system logs -l job-name=helm-install-op
 Common issues:
 
 - **Replicas 0/0**: The StatefulSet has been scaled to zero — no pods are running. This can happen after a failed deploy, manual scale-down, or Helm values misconfiguration. Fix: `openshell doctor exec -- kubectl -n openshell scale statefulset openshell --replicas=1`
-- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 5). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/`. Ensure a valid `--registry-token` (or `OPENSHELL_REGISTRY_TOKEN`) was provided during deploy.
+- **ImagePullBackOff**: The component image failed to pull. In `internal` mode, verify internal registry readiness and pushed image tags (Step 5). In `external` mode, check `/etc/rancher/k3s/registries.yaml` credentials/endpoints and DNS (Step 8). Default external registry is `ghcr.io/nvidia/openshell/` (public, no auth required). If using a private registry, ensure `--registry-username` and `--registry-token` (or `OPENSHELL_REGISTRY_USERNAME`/`OPENSHELL_REGISTRY_TOKEN`) were provided during deploy.
 - **CrashLoopBackOff**: The server is crashing. Check pod logs for the actual error.
 - **Pending**: Insufficient resources or scheduling constraints.
 

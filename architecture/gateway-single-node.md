@@ -264,7 +264,7 @@ Falls back to `8.8.8.8` / `8.8.4.4` if iptables detection fails.
 
 ### Registry configuration
 
-Writes `/etc/rancher/k3s/registries.yaml` from `REGISTRY_HOST`, `REGISTRY_ENDPOINT`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, and `REGISTRY_INSECURE` environment variables so that k3s/containerd can authenticate when pulling component images at runtime.
+Writes `/etc/rancher/k3s/registries.yaml` from `REGISTRY_HOST`, `REGISTRY_ENDPOINT`, `REGISTRY_USERNAME`, `REGISTRY_PASSWORD`, and `REGISTRY_INSECURE` environment variables so that k3s/containerd can authenticate when pulling component images at runtime. When no explicit credentials are provided (the default for public GHCR repos), the auth block is omitted and images are pulled anonymously.
 
 ### Manifest injection
 
@@ -392,8 +392,8 @@ Variables set on the container by `ensure_container()` in `docker.rs`:
 | `REGISTRY_INSECURE` | `"true"` or `"false"` | Always |
 | `IMAGE_REPO_BASE` | `{registry_host}/{namespace}` (or `IMAGE_REPO_BASE`/`OPENSHELL_IMAGE_REPO_BASE` override) | Always |
 | `REGISTRY_ENDPOINT` | Custom endpoint URL | When `OPENSHELL_REGISTRY_ENDPOINT` is set |
-| `REGISTRY_USERNAME` | Registry auth username | When credentials available |
-| `REGISTRY_PASSWORD` | Registry auth password | When credentials available |
+| `REGISTRY_USERNAME` | Registry auth username | When explicit credentials provided via `--registry-username`/`--registry-token` or env vars |
+| `REGISTRY_PASSWORD` | Registry auth password | When explicit credentials provided via `--registry-username`/`--registry-token` or env vars |
 | `EXTRA_SANS` | Comma-separated extra TLS SANs | When extra SANs computed |
 | `SSH_GATEWAY_HOST` | Resolved remote hostname/IP | Remote deploys only |
 | `SSH_GATEWAY_PORT` | Configured host port (default `8080`) | Remote deploys only |

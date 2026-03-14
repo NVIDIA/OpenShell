@@ -154,9 +154,15 @@ pub async fn run_bootstrap(
         }
         options = options.with_remote(remote_opts);
     }
-    // Read registry token from environment for the auto-bootstrap path.
-    // The explicit `--registry-token` flag is only on `gateway start`;
-    // when bootstrapping via `sandbox create`, the env var is the mechanism.
+    // Read registry credentials from environment for the auto-bootstrap path.
+    // The explicit `--registry-username` / `--registry-token` flags are only
+    // on `gateway start`; when bootstrapping via `sandbox create`, the env
+    // vars are the mechanism.
+    if let Ok(username) = std::env::var("OPENSHELL_REGISTRY_USERNAME")
+        && !username.trim().is_empty()
+    {
+        options = options.with_registry_username(username);
+    }
     if let Ok(token) = std::env::var("OPENSHELL_REGISTRY_TOKEN")
         && !token.trim().is_empty()
     {

@@ -3,9 +3,7 @@
 
 use crate::RemoteOptions;
 use crate::constants::{container_name, network_name, volume_name};
-use crate::image::{
-    self, DEFAULT_IMAGE_REPO_BASE, DEFAULT_REGISTRY, DEFAULT_REGISTRY_USERNAME, parse_image_ref,
-};
+use crate::image::{self, DEFAULT_IMAGE_REPO_BASE, DEFAULT_REGISTRY, parse_image_ref};
 use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
@@ -403,6 +401,7 @@ pub async fn ensure_volume(docker: &Docker, name: &str) -> Result<()> {
 pub async fn ensure_image(
     docker: &Docker,
     image_ref: &str,
+    registry_username: Option<&str>,
     registry_token: Option<&str>,
 ) -> Result<()> {
     match docker.inspect_image(image_ref).await {
@@ -423,9 +422,10 @@ pub async fn ensure_image(
 
     let (repo, tag) = parse_image_ref(image_ref);
 
-    // Use GHCR credentials (explicit or built-in default) for ghcr.io images.
+    // Use explicit GHCR credentials when provided for ghcr.io images.
+    // Public repos are pulled without authentication by default.
     let credentials = if repo.starts_with("ghcr.io/") {
-        image::ghcr_credentials(registry_token)
+        image::ghcr_credentials(registry_username, registry_token)
     } else {
         None
     };
@@ -452,6 +452,7 @@ pub async fn ensure_container(
     gateway_port: u16,
     disable_tls: bool,
     disable_gateway_auth: bool,
+    registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: bool,
 ) -> Result<()> {
@@ -586,15 +587,17 @@ pub async fn ensure_container(
 
     // Credential priority:
     // 1. OPENSHELL_REGISTRY_USERNAME/PASSWORD env vars (power-user override)
-    // 2. registry_token from --registry-token / OPENSHELL_REGISTRY_TOKEN
-    // 3. Built-in default XOR-decoded token
-    let registry_username = env_non_empty("OPENSHELL_REGISTRY_USERNAME")
-        .or_else(|| Some(DEFAULT_REGISTRY_USERNAME.to_string()));
-    let registry_password = env_non_empty("OPENSHELL_REGISTRY_PASSWORD").or_else(|| {
+    // 2. registry_username/registry_token from CLI flags / env vars
+    // No built-in default — GHCR repos are public and pull without auth.
+    let effective_username = env_non_empty("OPENSHELL_REGISTRY_USERNAME").or_else(|| {
+        registry_username
+            .filter(|u| !u.is_empty())
+            .map(ToString::to_string)
+    });
+    let effective_password = env_non_empty("OPENSHELL_REGISTRY_PASSWORD").or_else(|| {
         registry_token
             .filter(|t| !t.is_empty())
             .map(ToString::to_string)
-            .or_else(|| Some(image::default_registry_token()))
     });
 
     let mut env_vars: Vec<String> = vec![
@@ -606,26 +609,11 @@ pub async fn ensure_container(
     if let Some(endpoint) = registry_endpoint {
         env_vars.push(format!("REGISTRY_ENDPOINT={endpoint}"));
     }
-    if let (Some(username), Some(password)) = (registry_username, registry_password) {
+    if let Some(password) = effective_password {
+        // Default to __token__ when only a password/token is provided.
+        let username = effective_username.unwrap_or_else(|| "__token__".to_string());
         env_vars.push(format!("REGISTRY_USERNAME={username}"));
         env_vars.push(format!("REGISTRY_PASSWORD={password}"));
-    }
-
-    // When the primary registry is NOT ghcr.io (e.g. a local registry in
-    // push-mode), we still need containerd credentials for the community
-    // registry so that community sandbox images
-    // (ghcr.io/nvidia/openshell-community/sandboxes/*) can be pulled at
-    // runtime.  Pass community registry credentials as a separate set of
-    // env vars so the entrypoint can add a second block to registries.yaml.
-    if registry_host != DEFAULT_REGISTRY {
-        env_vars.push(format!("COMMUNITY_REGISTRY_HOST={DEFAULT_REGISTRY}"));
-        env_vars.push(format!(
-            "COMMUNITY_REGISTRY_USERNAME={DEFAULT_REGISTRY_USERNAME}"
-        ));
-        env_vars.push(format!(
-            "COMMUNITY_REGISTRY_PASSWORD={}",
-            image::default_registry_token()
-        ));
     }
 
     if !extra_sans.is_empty() {

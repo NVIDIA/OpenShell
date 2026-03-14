@@ -102,9 +102,14 @@ pub struct DeployOptions {
     /// Disable gateway authentication (mTLS client certificate requirement).
     /// Ignored when `disable_tls` is true.
     pub disable_gateway_auth: bool,
+    /// Registry authentication username. Defaults to `__token__` when a
+    /// `registry_token` is provided but no username is set. Only needed
+    /// for private registries — public GHCR repos pull without auth.
+    pub registry_username: Option<String>,
     /// Registry authentication token (e.g. a GitHub PAT with `read:packages`
-    /// scope) used to pull images from ghcr.io both during the initial
-    /// bootstrap pull and inside the k3s cluster at runtime.
+    /// scope) used to pull images from the registry both during the initial
+    /// bootstrap pull and inside the k3s cluster at runtime. Only needed
+    /// for private registries.
     pub registry_token: Option<String>,
     /// Enable NVIDIA GPU passthrough. When true, the Docker container is
     /// created with GPU device requests (`--gpus all`) and the NVIDIA
@@ -126,6 +131,7 @@ impl DeployOptions {
             gateway_host: None,
             disable_tls: false,
             disable_gateway_auth: false,
+            registry_username: None,
             registry_token: None,
             gpu: false,
             recreate: false,
@@ -167,7 +173,14 @@ impl DeployOptions {
         self
     }
 
-    /// Set the registry authentication token for pulling images from ghcr.io.
+    /// Set the registry authentication username.
+    #[must_use]
+    pub fn with_registry_username(mut self, username: impl Into<String>) -> Self {
+        self.registry_username = Some(username.into());
+        self
+    }
+
+    /// Set the registry authentication token for pulling images.
     #[must_use]
     pub fn with_registry_token(mut self, token: impl Into<String>) -> Self {
         self.registry_token = Some(token.into());
@@ -247,6 +260,7 @@ where
     let gateway_host = options.gateway_host;
     let disable_tls = options.disable_tls;
     let disable_gateway_auth = options.disable_gateway_auth;
+    let registry_username = options.registry_username;
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
@@ -302,6 +316,7 @@ where
         image::pull_remote_image(
             &target_docker,
             &image_ref,
+            registry_username.as_deref(),
             registry_token.as_deref(),
             progress_cb,
         )
@@ -309,7 +324,13 @@ where
     } else {
         // Local deployment: ensure image exists (pull if needed)
         log("[status] Downloading gateway".to_string());
-        ensure_image(&target_docker, &image_ref, registry_token.as_deref()).await?;
+        ensure_image(
+            &target_docker,
+            &image_ref,
+            registry_username.as_deref(),
+            registry_token.as_deref(),
+        )
+        .await?;
     }
 
     // All subsequent operations use the target Docker (remote or local)
@@ -388,6 +409,7 @@ where
         port,
         disable_tls,
         disable_gateway_auth,
+        registry_username.as_deref(),
         registry_token.as_deref(),
         gpu,
     )
@@ -537,10 +559,14 @@ pub async fn extract_and_store_pki(
     Ok(())
 }
 
-pub async fn ensure_gateway_image(version: &str, registry_token: Option<&str>) -> Result<String> {
+pub async fn ensure_gateway_image(
+    version: &str,
+    registry_username: Option<&str>,
+    registry_token: Option<&str>,
+) -> Result<String> {
     let docker = Docker::connect_with_local_defaults().into_diagnostic()?;
     let image_ref = format!("{}:{version}", image::DEFAULT_GATEWAY_IMAGE);
-    ensure_image(&docker, &image_ref, registry_token).await?;
+    ensure_image(&docker, &image_ref, registry_username, registry_token).await?;
     Ok(image_ref)
 }
 

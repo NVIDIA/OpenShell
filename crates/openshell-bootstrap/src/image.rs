@@ -42,42 +42,7 @@ pub const DEFAULT_GATEWAY_IMAGE: &str = "ghcr.io/nvidia/openshell/cluster";
 ///
 /// GHCR accepts any non-empty username when authenticating with a PAT;
 /// `__token__` is a common convention for token-based OCI registry auth.
-pub const DEFAULT_REGISTRY_USERNAME: &str = "__token__";
-
-// ---------------------------------------------------------------------------
-// XOR-obfuscated default registry token
-// ---------------------------------------------------------------------------
-// A read-only GHCR PAT is XOR-encoded so it doesn't appear as plaintext in
-// the compiled binary. This is a lightweight deterrent against casual
-// inspection — it is NOT a security boundary. The `--registry-token` flag
-// (or `OPENSHELL_REGISTRY_TOKEN` env var) overrides this default.
-
-/// XOR key used to decode the default registry token.
-const XOR_KEY: [u8; 32] = [
-    0x9c, 0x87, 0xc1, 0x0c, 0x00, 0xe2, 0x59, 0x14, 0x98, 0xb8, 0xa5, 0x45, 0x48, 0x40, 0x3e, 0x92,
-    0x62, 0x41, 0xfe, 0x5e, 0xd4, 0x09, 0x23, 0xe6, 0x85, 0xa7, 0x94, 0xab, 0xb8, 0x15, 0xcd, 0x45,
-];
-
-/// XOR-encoded default GHCR registry token.
-const DEFAULT_REGISTRY_TOKEN_ENC: [u8; 40] = [
-    0xfb, 0xef, 0xb1, 0x53, 0x44, 0xb4, 0x6d, 0x71, 0xd0, 0xf0, 0xd1, 0x15, 0x09, 0x39, 0x72, 0xd7,
-    0x29, 0x36, 0xb7, 0x69, 0xe5, 0x64, 0x55, 0xaf, 0xee, 0xd2, 0xc0, 0xd2, 0xd1, 0x5b, 0x81, 0x0e,
-    0xd1, 0xf5, 0xf2, 0x5a, 0x6b, 0xa3, 0x14, 0x46,
-];
-
-/// Decode an XOR-encoded byte slice using [`XOR_KEY`].
-fn xor_decode(encoded: &[u8]) -> String {
-    encoded
-        .iter()
-        .enumerate()
-        .map(|(i, b)| (b ^ XOR_KEY[i % XOR_KEY.len()]) as char)
-        .collect()
-}
-
-/// Default GHCR registry token, decoded at runtime.
-pub(crate) fn default_registry_token() -> String {
-    xor_decode(&DEFAULT_REGISTRY_TOKEN_ENC)
-}
+const DEFAULT_REGISTRY_USERNAME: &str = "__token__";
 
 /// Parse an image reference into (repository, tag).
 ///
@@ -150,18 +115,22 @@ pub async fn pull_image(
     Ok(())
 }
 
-/// Build [`DockerCredentials`] for ghcr.io from a registry token.
+/// Build [`DockerCredentials`] for ghcr.io from explicit credentials.
 ///
-/// When `token` is `None` or empty, falls back to the built-in default
-/// token (XOR-decoded at runtime). Always returns `Some`.
-#[allow(clippy::unnecessary_wraps)]
-pub(crate) fn ghcr_credentials(token: Option<&str>) -> Option<DockerCredentials> {
-    let effective_token = token
-        .filter(|t| !t.is_empty())
-        .map_or_else(default_registry_token, ToString::to_string);
+/// Returns `None` when `token` is `None` or empty — the default GHCR repos
+/// are public and do not require authentication. When a token is provided,
+/// uses the given `username` (falling back to `__token__` if `None`/empty).
+pub(crate) fn ghcr_credentials(
+    username: Option<&str>,
+    token: Option<&str>,
+) -> Option<DockerCredentials> {
+    let token = token.filter(|t| !t.is_empty())?;
+    let username = username
+        .filter(|u| !u.is_empty())
+        .unwrap_or(DEFAULT_REGISTRY_USERNAME);
     Some(DockerCredentials {
-        username: Some(DEFAULT_REGISTRY_USERNAME.to_string()),
-        password: Some(effective_token),
+        username: Some(username.to_string()),
+        password: Some(token.to_string()),
         serveraddress: Some(DEFAULT_REGISTRY.to_string()),
         ..Default::default()
     })
@@ -182,6 +151,7 @@ pub(crate) fn ghcr_credentials(token: Option<&str>) -> Option<DockerCredentials>
 pub async fn pull_remote_image(
     remote: &Docker,
     image_ref: &str,
+    registry_username: Option<&str>,
     registry_token: Option<&str>,
     mut on_progress: impl FnMut(String) + Send + 'static,
 ) -> Result<()> {
@@ -213,7 +183,7 @@ pub async fn pull_remote_image(
     );
     on_progress(format!("[progress] Pulling {platform_str} image"));
 
-    let credentials = ghcr_credentials(registry_token);
+    let credentials = ghcr_credentials(registry_username, registry_token);
 
     let options = CreateImageOptions {
         from_image: Some(registry_image_base),
@@ -351,8 +321,8 @@ mod tests {
     }
 
     #[test]
-    fn ghcr_credentials_with_token() {
-        let creds = ghcr_credentials(Some("ghp_test123"));
+    fn ghcr_credentials_with_token_default_username() {
+        let creds = ghcr_credentials(None, Some("ghp_test123"));
         assert!(creds.is_some());
         let creds = creds.unwrap();
         assert_eq!(creds.username.as_deref(), Some("__token__"));
@@ -361,31 +331,21 @@ mod tests {
     }
 
     #[test]
-    fn ghcr_credentials_without_token_uses_default() {
-        // When no explicit token is provided, the built-in default is used.
-        let creds = ghcr_credentials(None).unwrap();
-        assert_eq!(creds.username.as_deref(), Some("__token__"));
+    fn ghcr_credentials_with_custom_username() {
+        let creds = ghcr_credentials(Some("myuser"), Some("ghp_test123"));
+        assert!(creds.is_some());
+        let creds = creds.unwrap();
+        assert_eq!(creds.username.as_deref(), Some("myuser"));
+        assert_eq!(creds.password.as_deref(), Some("ghp_test123"));
         assert_eq!(creds.serveraddress.as_deref(), Some("ghcr.io"));
-        // The password should be the decoded default token (non-empty).
-        assert!(creds.password.is_some());
-        assert!(!creds.password.as_ref().unwrap().is_empty());
-
-        // Same for empty string.
-        let creds2 = ghcr_credentials(Some("")).unwrap();
-        assert_eq!(creds2.password, creds.password);
     }
 
     #[test]
-    fn xor_decode_default_token() {
-        let token = default_registry_token();
-        assert!(
-            !token.is_empty(),
-            "default token should decode to non-empty"
-        );
-        assert!(
-            token.chars().all(|c| c.is_ascii_graphic()),
-            "default token should be printable ASCII"
-        );
+    fn ghcr_credentials_without_token_returns_none() {
+        // No token means unauthenticated (public repos).
+        assert!(ghcr_credentials(None, None).is_none());
+        assert!(ghcr_credentials(None, Some("")).is_none());
+        assert!(ghcr_credentials(Some("myuser"), None).is_none());
     }
 
     #[test]

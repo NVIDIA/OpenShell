@@ -763,12 +763,21 @@ enum GatewayCommands {
         #[arg(long)]
         disable_gateway_auth: bool,
 
-        /// Authentication token for pulling container images from ghcr.io.
+        /// Username for authenticating with the container image registry.
         ///
-        /// A GitHub personal access token (PAT) with `read:packages` scope.
-        /// Used to pull the cluster bootstrap image and passed into the k3s
-        /// cluster so it can pull server, sandbox, and community images at
-        /// runtime.
+        /// Defaults to `__token__` when `--registry-token` is set (the
+        /// standard convention for GHCR PAT-based auth). Only needed for
+        /// private registries — public GHCR repos pull without auth.
+        #[arg(long, env = "OPENSHELL_REGISTRY_USERNAME")]
+        registry_username: Option<String>,
+
+        /// Authentication token for pulling container images from the registry.
+        ///
+        /// For GHCR, this is a GitHub personal access token (PAT) with
+        /// `read:packages` scope. Only needed for private registries —
+        /// public GHCR repos pull without auth. Used to pull the cluster
+        /// bootstrap image and passed into the k3s cluster so it can pull
+        /// server, sandbox, and community images at runtime.
         #[arg(long, env = "OPENSHELL_REGISTRY_TOKEN")]
         registry_token: Option<String>,
 
@@ -1438,6 +1447,7 @@ async fn main() -> Result<()> {
                 recreate,
                 plaintext,
                 disable_gateway_auth,
+                registry_username,
                 registry_token,
                 gpu,
             } => {
@@ -1450,6 +1460,7 @@ async fn main() -> Result<()> {
                     recreate,
                     plaintext,
                     disable_gateway_auth,
+                    registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
                 )
