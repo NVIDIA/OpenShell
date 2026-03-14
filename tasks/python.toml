@@ -52,6 +52,7 @@ CARGO_TARGET_CACHE_SCOPE=$(printf '%s' "$CACHE_SCOPE_INPUT" | sha256_16_stdin)
 VERSION_ARGS=(
   --build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}"
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
+  ${OPENSHELL_IMAGE_TAG:+--build-arg "OPENSHELL_IMAGE_TAG=${OPENSHELL_IMAGE_TAG}"}
 )
 
 if ! docker buildx inspect multiarch >/dev/null 2>&1; then
@@ -172,6 +173,7 @@ docker build \
   --build-arg "OSXCROSS_IMAGE=${OSXCROSS_IMAGE_REF}" \
   --build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}" \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
+  ${OPENSHELL_IMAGE_TAG:+--build-arg "OPENSHELL_IMAGE_TAG=${OPENSHELL_IMAGE_TAG}"} \
   --output type=local,dest=target/wheels \
   .
 
