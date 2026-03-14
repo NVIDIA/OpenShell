@@ -40,6 +40,15 @@ After completing this tutorial, you understand:
 - A working OpenShell installation. Complete the {doc}`/get-started/quickstart` before proceeding.
 - Docker Desktop running on your machine.
 
+:::{tip}
+To run every step of this tutorial, you can also use the automated demo script at `examples/sandbox-policy-quickstart/demo.sh`. It runs the full walkthrough in under a minute but without any user interaction.
+
+```console
+$ bash examples/sandbox-policy-quickstart/demo.sh
+```
+
+:::
+
 ## Create a Sandbox
 
 Start by creating a sandbox with no network policies. This gives you a clean environment to observe default-deny behavior.
