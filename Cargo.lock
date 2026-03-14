@@ -2983,6 +2983,7 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-policy",
+ "openshell-router",
  "petname",
  "pin-project-lite",
  "prost",

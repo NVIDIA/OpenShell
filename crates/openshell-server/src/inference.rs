@@ -1,13 +1,14 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_core::inference::AuthHeader;
 use openshell_core::proto::{
     ClusterInferenceConfig, GetClusterInferenceRequest, GetClusterInferenceResponse,
     GetInferenceBundleRequest, GetInferenceBundleResponse, InferenceRoute, Provider, ResolvedRoute,
     SetClusterInferenceRequest, SetClusterInferenceResponse, ValidatedEndpoint,
     inference_server::Inference,
 };
+use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
+use openshell_router::{RouterError, verify_backend_endpoint};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Request, Response, Status};
@@ -212,16 +213,7 @@ fn build_cluster_inference_config(provider: &Provider, model_id: &str) -> Cluste
 
 struct ResolvedProviderRoute {
     provider_type: String,
-    base_url: String,
-    protocols: Vec<String>,
-    api_key: String,
-    auth: AuthHeader,
-    default_headers: Vec<(String, String)>,
-}
-
-struct ValidationProbe {
-    path: &'static str,
-    body: serde_json::Value,
+    route: RouterResolvedRoute,
 }
 
 #[derive(Debug)]
@@ -263,134 +255,20 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
 
     Ok(ResolvedProviderRoute {
         provider_type,
-        base_url,
-        protocols: profile.protocols.iter().map(|p| (*p).to_string()).collect(),
-        api_key,
-        auth: profile.auth.clone(),
-        default_headers: profile
-            .default_headers
-            .iter()
-            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
-            .collect(),
+        route: RouterResolvedRoute {
+            name: provider.name.clone(),
+            endpoint: base_url,
+            model: String::new(),
+            api_key,
+            protocols: profile.protocols.iter().map(|p| (*p).to_string()).collect(),
+            auth: profile.auth.clone(),
+            default_headers: profile
+                .default_headers
+                .iter()
+                .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                .collect(),
+        },
     })
-}
-
-fn validation_probe(
-    route: &ResolvedProviderRoute,
-    model_id: &str,
-) -> Result<ValidationProbe, Status> {
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_chat_completions")
-    {
-        return Ok(ValidationProbe {
-            path: "/v1/chat/completions",
-            body: serde_json::json!({
-                "model": model_id,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-            }),
-        });
-    }
-
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "anthropic_messages")
-    {
-        return Ok(ValidationProbe {
-            path: "/v1/messages",
-            body: serde_json::json!({
-                "model": model_id,
-                "messages": [{"role": "user", "content": "ping"}],
-                "max_tokens": 1,
-            }),
-        });
-    }
-
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_responses")
-    {
-        return Ok(ValidationProbe {
-            path: "/v1/responses",
-            body: serde_json::json!({
-                "model": model_id,
-                "input": "ping",
-                "max_output_tokens": 1,
-            }),
-        });
-    }
-
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_completions")
-    {
-        return Ok(ValidationProbe {
-            path: "/v1/completions",
-            body: serde_json::json!({
-                "model": model_id,
-                "prompt": "ping",
-                "max_tokens": 1,
-            }),
-        });
-    }
-
-    Err(Status::failed_precondition(format!(
-        "provider type '{}' does not expose a writable inference protocol for validation",
-        route.provider_type
-    )))
-}
-
-fn validated_protocol(route: &ResolvedProviderRoute) -> Result<String, Status> {
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_chat_completions")
-    {
-        return Ok("openai_chat_completions".to_string());
-    }
-
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "anthropic_messages")
-    {
-        return Ok("anthropic_messages".to_string());
-    }
-
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_responses")
-    {
-        return Ok("openai_responses".to_string());
-    }
-
-    if route
-        .protocols
-        .iter()
-        .any(|protocol| protocol == "openai_completions")
-    {
-        return Ok("openai_completions".to_string());
-    }
-
-    Err(Status::failed_precondition(format!(
-        "provider type '{}' does not expose a writable inference protocol for validation",
-        route.provider_type
-    )))
-}
-
-fn validation_url(base_url: &str, path: &str) -> String {
-    let base = base_url.trim_end_matches('/');
-    if base.ends_with("/v1") && (path == "/v1" || path.starts_with("/v1/")) {
-        return format!("{base}{}", &path[3..]);
-    }
-
-    format!("{base}{path}")
 }
 
 fn validation_failure(
@@ -405,97 +283,55 @@ fn validation_failure(
     ))
 }
 
+fn validation_next_steps(details: &str) -> &'static str {
+    if details.contains("credentials") {
+        return "verify the provider API key and any required auth headers";
+    }
+    if details.contains("rate-limited") {
+        return "retry later or verify quota/limits on the upstream provider";
+    }
+    if details.contains("validation request") || details.contains("unexpected HTTP") {
+        return "confirm the provider type, base URL, and model identifier";
+    }
+    if details.contains("failed to connect") || details.contains("timed out") {
+        return "check that the service is running, confirm the base URL and protocol, and verify credentials";
+    }
+    if details.contains("upstream returned HTTP") {
+        return "check whether the endpoint is healthy and serving requests";
+    }
+    "confirm the endpoint URL, protocol, credentials, and model identifier"
+}
+
 async fn verify_provider_endpoint(
     provider_name: &str,
     model_id: &str,
     route: &ResolvedProviderRoute,
 ) -> Result<ValidatedEndpoint, Status> {
-    let probe = validation_probe(route, model_id)?;
-    let protocol = validated_protocol(route)?;
-    let url = validation_url(&route.base_url, probe.path);
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .map_err(|err| Status::internal(format!("build validation client failed: {err}")))?;
+    let mut route = route.route.clone();
+    route.model = model_id.to_string();
 
-    let mut request = client
-        .post(&url)
-        .header(reqwest::header::CONTENT_TYPE, "application/json");
-    request = match &route.auth {
-        AuthHeader::Bearer => request.bearer_auth(&route.api_key),
-        AuthHeader::Custom(name) => request.header(*name, &route.api_key),
-    };
-
-    for (name, value) in &route.default_headers {
-        request = request.header(name, value);
-    }
-
-    let response = request.json(&probe.body).send().await.map_err(|err| {
-        let details = if err.is_timeout() {
-            format!("request to {url} timed out")
-        } else if err.is_connect() {
-            format!("failed to connect to {url}: {err}")
-        } else {
-            format!("request to {url} failed: {err}")
-        };
-
-        validation_failure(
-            provider_name,
-            model_id,
-            &route.base_url,
-            &details,
-            "check that the service is running, confirm the base URL and protocol, and verify credentials",
-        )
-    })?;
-
-    if response.status().is_success() {
-        return Ok(ValidatedEndpoint { url, protocol });
-    }
-
-    let status = response.status();
-    let body = response.text().await.unwrap_or_default();
-    let body = body.trim();
-    let body_suffix = if body.is_empty() {
-        String::new()
-    } else {
-        format!(
-            " Response body: {}",
-            body.chars().take(200).collect::<String>()
-        )
-    };
-
-    let (details, next_steps) = match status.as_u16() {
-        400 | 404 | 405 | 422 => (
-            format!("upstream rejected the validation request with HTTP {status}.{body_suffix}"),
-            "confirm the provider type, base URL, and model identifier",
-        ),
-        401 | 403 => (
-            format!("upstream rejected credentials with HTTP {status}.{body_suffix}"),
-            "verify the provider API key and any required auth headers",
-        ),
-        429 => (
-            format!(
-                "upstream rate-limited the validation request with HTTP {status}.{body_suffix}"
+    verify_backend_endpoint(&client, &route)
+        .await
+        .map(|validated| ValidatedEndpoint {
+            url: validated.url,
+            protocol: validated.protocol,
+        })
+        .map_err(|err| match err {
+            RouterError::Internal(details)
+            | RouterError::UpstreamUnavailable(details)
+            | RouterError::UpstreamProtocol(details) => validation_failure(
+                provider_name,
+                model_id,
+                &route.endpoint,
+                &details,
+                validation_next_steps(&details),
             ),
-            "retry later or verify quota/limits on the upstream provider",
-        ),
-        500..=599 => (
-            format!("upstream returned HTTP {status}.{body_suffix}"),
-            "check whether the endpoint is healthy and serving requests",
-        ),
-        _ => (
-            format!("upstream returned unexpected HTTP {status}.{body_suffix}"),
-            "confirm the endpoint URL, protocol, credentials, and model identifier",
-        ),
-    };
-
-    Err(validation_failure(
-        provider_name,
-        model_id,
-        &route.base_url,
-        &details,
-        next_steps,
-    ))
+            other => Status::internal(format!("unexpected validation router error: {other}")),
+        })
 }
 
 fn find_provider_api_key(provider: &Provider, preferred_key_names: &[&str]) -> Option<String> {
@@ -612,10 +448,10 @@ async fn resolve_route_by_name(
 
     Ok(Some(ResolvedRoute {
         name: route_name.to_string(),
-        base_url: resolved.base_url,
+        base_url: resolved.route.endpoint,
         model_id: config.model_id.clone(),
-        api_key: resolved.api_key,
-        protocols: resolved.protocols,
+        api_key: resolved.route.api_key,
+        protocols: resolved.route.protocols,
         provider_type: resolved.provider_type,
     }))
 }
@@ -1002,43 +838,6 @@ mod tests {
         assert_eq!(route.name, SANDBOX_SYSTEM_ROUTE_NAME);
         let config = route.config.as_ref().expect("config");
         assert_eq!(config.model_id, "gpt-4o-mini");
-    }
-
-    #[test]
-    fn openai_validation_probe_uses_lightweight_chat_shape() {
-        let route = ResolvedProviderRoute {
-            provider_type: "openai".to_string(),
-            base_url: "https://api.openai.com/v1".to_string(),
-            protocols: vec!["openai_chat_completions".to_string()],
-            api_key: "sk-test".to_string(),
-            auth: AuthHeader::Bearer,
-            default_headers: Vec::new(),
-        };
-
-        let probe = validation_probe(&route, "gpt-4.1").expect("probe should build");
-
-        assert_eq!(probe.path, "/v1/chat/completions");
-        assert_eq!(probe.body["model"], "gpt-4.1");
-        assert_eq!(probe.body["max_tokens"], 1);
-    }
-
-    #[test]
-    fn anthropic_validation_probe_uses_messages_shape() {
-        let route = ResolvedProviderRoute {
-            provider_type: "anthropic".to_string(),
-            base_url: "https://api.anthropic.com/v1".to_string(),
-            protocols: vec!["anthropic_messages".to_string()],
-            api_key: "sk-test".to_string(),
-            auth: AuthHeader::Custom("x-api-key"),
-            default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
-        };
-
-        let probe =
-            validation_probe(&route, "claude-sonnet-4-20250514").expect("probe should build");
-
-        assert_eq!(probe.path, "/v1/messages");
-        assert_eq!(probe.body["model"], "claude-sonnet-4-20250514");
-        assert_eq!(probe.body["max_tokens"], 1);
     }
 
     #[tokio::test]

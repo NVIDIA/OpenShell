@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-router = { path = "../openshell-router" }
 
 # Async runtime
 tokio = { workspace = true }
