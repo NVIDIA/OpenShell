@@ -16,7 +16,7 @@ OpenShell publishes multi-architecture container images for `linux/amd64` and `l
 | Linux (Debian/Ubuntu)            | x86_64 (amd64)        | Supported |
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
-| Windows (WSL 2 + Docker Desktop) | x86_64                | Untested  |
+| Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
 
 ## Software Prerequisites
 
