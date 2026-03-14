@@ -25,9 +25,11 @@ content:
 
 # NVIDIA OpenShell Release Notes
 
-Use the following GitHub resources directly:
+NVIDIA OpenShell follows a frequent release cadence. Use the following GitHub resources directly.
 
-- [Releases](https://github.com/NVIDIA/OpenShell/releases): Check the versioned releases with assets.
-- [Release comparison](https://github.com/NVIDIA/OpenShell/compare): Check the difference between any two tags or branches.
-- [Merged pull requests](https://github.com/NVIDIA/OpenShell/pulls?q=is%3Apr+is%3Amerged): Check the individual changes with discussion and review context.
-- [Commit history](https://github.com/NVIDIA/OpenShell/commits/main): Check the full commit log on `main`.
+| Resource | Description |
+|---|---|
+| [Releases](https://github.com/NVIDIA/OpenShell/releases) | Versioned release notes and downloadable assets. |
+| [Release comparison](https://github.com/NVIDIA/OpenShell/compare) | Diff between any two tags or branches. |
+| [Merged pull requests](https://github.com/NVIDIA/OpenShell/pulls?q=is%3Apr+is%3Amerged) | Individual changes with review discussion. |
+| [Commit history](https://github.com/NVIDIA/OpenShell/commits/main) | Full commit log on `main`. |
