@@ -65,10 +65,22 @@ elif [[ "${DOCKER_PLATFORM:-}" == *","* ]]; then
   OUTPUT_FLAG="--push"
 fi
 
+# Compute cargo version from git tags (same scheme as docker-build-component.sh).
+VERSION_ARGS=()
+if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
+  VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${OPENSHELL_CARGO_VERSION}")
+else
+  CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
+  if [[ -n "${CARGO_VERSION}" ]]; then
+    VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}")
+  fi
+fi
+
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
   ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
+  ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
   -f deploy/docker/Dockerfile.cluster \
   -t ${IMAGE_NAME}:${IMAGE_TAG} \
   ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \

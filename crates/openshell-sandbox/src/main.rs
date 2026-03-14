@@ -14,6 +14,7 @@ use openshell_sandbox::run_sandbox;
 /// OpenShell Sandbox - process isolation and monitoring.
 #[derive(Parser, Debug)]
 #[command(name = "openshell-sandbox")]
+#[command(version = openshell_core::VERSION)]
 #[command(about = "Process sandbox and monitor", long_about = None)]
 struct Args {
     /// Command to execute in the sandbox.

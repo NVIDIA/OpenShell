@@ -298,7 +298,7 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
 /// `OpenShell` CLI - agent execution and management.
 #[derive(Parser, Debug)]
 #[command(name = "openshell")]
-#[command(author, version, about, long_about = None)]
+#[command(author, version = openshell_core::VERSION, about, long_about = None)]
 #[command(propagate_version = true)]
 #[command(help_template = HELP_TEMPLATE)]
 #[command(disable_help_subcommand = true)]

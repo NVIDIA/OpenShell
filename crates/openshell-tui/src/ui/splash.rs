@@ -45,8 +45,8 @@ const ART_WIDTH: u16 = 40;
 /// Total content lines: 6 (OPEN) + 6 (SHELL) + 1 (blank) + 1 (tagline) = 14.
 const CONTENT_LINES: u16 = 14;
 
-// Border (2) + top/bottom inner padding (2) + content + blank before footer (1) + footer (1).
-const MODAL_HEIGHT: u16 = CONTENT_LINES + 6;
+// Border (2) + top/bottom inner padding (2) + content + blank before footer (1) + footer (2).
+const MODAL_HEIGHT: u16 = CONTENT_LINES + 7;
 
 // Art width + left/right padding (3+3) + borders (2).
 const MODAL_WIDTH: u16 = ART_WIDTH + 8;
@@ -73,13 +73,13 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, theme: &crate::theme::Theme) {
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
-    // Split inner area: art content + spacer + footer.
+    // Split inner area: art content + spacer + footer (2 lines).
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(CONTENT_LINES), // OPEN + SHELL + blank + tagline
             Constraint::Min(0),                // spacer
-            Constraint::Length(1),             // footer
+            Constraint::Length(2),             // footer (version + prompt)
         ])
         .split(inner);
 
@@ -102,27 +102,20 @@ pub fn draw(frame: &mut Frame<'_>, area: Rect, theme: &crate::theme::Theme) {
 
     frame.render_widget(Paragraph::new(content_lines), chunks[0]);
 
-    // -- Footer: version + ALPHA badge (left) + prompt (right) --
-    let version = format!("v{}", env!("CARGO_PKG_VERSION"));
-    let spacer = " ";
+    // -- Footer: version + ALPHA badge on line 1, prompt on line 2 --
+    let version = format!("v{}", openshell_core::VERSION);
     let alpha_badge = "ALPHA";
-    let prompt_text = "press any key";
 
-    // Pad between left group and prompt to fill the line.
-    let used = version.len() + spacer.len() + alpha_badge.len() + prompt_text.len() + 2; // +2 for ░ and space
-    let footer_width = chunks[2].width as usize;
-    let gap = footer_width.saturating_sub(used);
-
-    let footer = Line::from(vec![
-        Span::styled(version, t.accent),
-        Span::styled(spacer, t.muted),
-        Span::styled(alpha_badge, t.title_bar),
-        Span::styled(" ".repeat(gap), t.muted),
-        Span::styled(prompt_text, t.muted),
-        Span::styled(" ░", t.muted),
+    let footer = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled(version, t.accent),
+            Span::styled(" ", t.muted),
+            Span::styled(alpha_badge, t.title_bar),
+        ]),
+        Line::from(Span::styled("press any key ░", t.muted)),
     ]);
 
-    frame.render_widget(Paragraph::new(footer), chunks[2]);
+    frame.render_widget(footer, chunks[2]);
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

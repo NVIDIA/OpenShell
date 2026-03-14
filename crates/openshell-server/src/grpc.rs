@@ -134,7 +134,7 @@ impl OpenShell for OpenShellService {
     ) -> Result<Response<HealthResponse>, Status> {
         Ok(Response::new(HealthResponse {
             status: ServiceStatus::Healthy.into(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
+            version: openshell_core::VERSION.to_string(),
         }))
     }
 

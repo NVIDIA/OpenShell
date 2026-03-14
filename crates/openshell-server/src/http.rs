@@ -31,7 +31,7 @@ async fn healthz() -> impl IntoResponse {
 async fn readyz() -> impl IntoResponse {
     let response = HealthResponse {
         status: "healthy",
-        version: env!("CARGO_PKG_VERSION"),
+        version: openshell_core::VERSION,
     };
 
     (StatusCode::OK, Json(response))

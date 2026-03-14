@@ -321,11 +321,23 @@ if [[ "${build_supervisor}" == "1" ]]; then
   SUPERVISOR_BUILD_DIR=$(mktemp -d)
   trap 'rm -rf "${SUPERVISOR_BUILD_DIR}"' EXIT
 
+  # Compute cargo version from git tags for the supervisor binary.
+  SUPERVISOR_VERSION_ARGS=()
+  if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
+    SUPERVISOR_VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${OPENSHELL_CARGO_VERSION}")
+  else
+    _cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
+    if [[ -n "${_cargo_version}" ]]; then
+      SUPERVISOR_VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${_cargo_version}")
+    fi
+  fi
+
   docker buildx build \
     --file deploy/docker/Dockerfile.cluster \
     --target supervisor-builder \
     --build-arg "BUILDARCH=$(docker version --format '{{.Server.Arch}}')" \
     --build-arg "TARGETARCH=${CLUSTER_ARCH}" \
+    ${SUPERVISOR_VERSION_ARGS[@]+"${SUPERVISOR_VERSION_ARGS[@]}"} \
     --output "type=local,dest=${SUPERVISOR_BUILD_DIR}" \
     --platform "linux/${CLUSTER_ARCH}" \
     .
