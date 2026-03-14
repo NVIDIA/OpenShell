@@ -65,6 +65,10 @@ spec:
             - name: OPENSHELL_SSH_GATEWAY_PORT
               value: {{ .Values.server.sshGatewayPort | quote }}
             {{- end }}
+            {{- if .Values.server.hostGatewayIP }}
+            - name: OPENSHELL_HOST_GATEWAY_IP
+              value: {{ .Values.server.hostGatewayIP | quote }}
+            {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
               value: {{ required "server.sshHandshakeSecret is required" .Values.server.sshHandshakeSecret | quote }}
             {{- if .Values.server.disableTls }}

@@ -331,6 +331,27 @@ if [ "${GPU_ENABLED:-}" = "true" ]; then
 fi
 
 # ---------------------------------------------------------------------------
+# Detect host gateway IP for sandbox pod hostAliases
+# ---------------------------------------------------------------------------
+# Sandbox pods need to reach services running on the Docker host (e.g.
+# provider endpoints during local development). On Docker Desktop,
+# host.docker.internal resolves to a special host-reachable IP that is NOT the
+# bridge default gateway, so prefer Docker's own resolution when available.
+# Fall back to the container default gateway on Linux engines where
+# host.docker.internal commonly maps to the bridge gateway anyway.
+HOST_GATEWAY_IP=$(getent ahostsv4 host.docker.internal 2>/dev/null | awk 'NR == 1 { print $1; exit }')
+if [ -n "$HOST_GATEWAY_IP" ]; then
+    echo "Detected host gateway IP from host.docker.internal: $HOST_GATEWAY_IP"
+else
+    HOST_GATEWAY_IP=$(ip -4 route | awk '/default/ { print $3; exit }')
+    if [ -n "$HOST_GATEWAY_IP" ]; then
+        echo "Detected host gateway IP from default route: $HOST_GATEWAY_IP"
+    else
+        echo "Warning: Could not detect host gateway IP from host.docker.internal or default route"
+    fi
+fi
+
+# ---------------------------------------------------------------------------
 # Override image tag and pull policy for local development
 # ---------------------------------------------------------------------------
 # When IMAGE_TAG is set, replace the default ":latest" tag on all component
@@ -426,6 +447,16 @@ if [ -f "$HELMCHART" ]; then
     else
         sed -i "s|__DISABLE_TLS__|false|g" "$HELMCHART"
     fi
+fi
+
+# Inject host gateway IP into the HelmChart manifest so sandbox pods can
+# reach services on the Docker host via host.docker.internal / host.openshell.internal.
+if [ -n "$HOST_GATEWAY_IP" ] && [ -f "$HELMCHART" ]; then
+    echo "Setting host gateway IP: $HOST_GATEWAY_IP"
+    sed -i "s|__HOST_GATEWAY_IP__|${HOST_GATEWAY_IP}|g" "$HELMCHART"
+else
+    # Clear the placeholder so the server gets an empty string (feature disabled)
+    sed -i "s|hostGatewayIP: __HOST_GATEWAY_IP__|hostGatewayIP: \"\"|g" "$HELMCHART"
 fi
 
 # Inject chart checksum into the HelmChart manifest so that a changed chart

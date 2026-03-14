@@ -77,6 +77,13 @@ pub struct Config {
     /// the server over mTLS.
     #[serde(default)]
     pub client_tls_secret_name: String,
+
+    /// Host gateway IP for sandbox pod hostAliases.
+    /// When set, sandbox pods get hostAliases entries mapping
+    /// `host.docker.internal` and `host.openshell.internal` to this IP,
+    /// allowing them to reach services running on the Docker host.
+    #[serde(default)]
+    pub host_gateway_ip: String,
 }
 
 /// TLS configuration.
@@ -125,6 +132,7 @@ impl Config {
             ssh_handshake_skew_secs: default_ssh_handshake_skew_secs(),
             ssh_session_ttl_secs: default_ssh_session_ttl_secs(),
             client_tls_secret_name: String::new(),
+            host_gateway_ip: String::new(),
         }
     }
 
@@ -230,6 +238,13 @@ impl Config {
     #[must_use]
     pub fn with_client_tls_secret_name(mut self, name: impl Into<String>) -> Self {
         self.client_tls_secret_name = name.into();
+        self
+    }
+
+    /// Set the host gateway IP for sandbox pod hostAliases.
+    #[must_use]
+    pub fn with_host_gateway_ip(mut self, ip: impl Into<String>) -> Self {
+        self.host_gateway_ip = ip.into();
         self
     }
 }

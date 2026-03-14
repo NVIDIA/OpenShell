@@ -170,6 +170,7 @@ For the target daemon (local or remote):
    - Volume bind mount: `openshell-cluster-{name}:/var/lib/rancher/k3s`.
     - Network: `openshell-cluster-{name}` (per-gateway bridge network).
    - Extra host: `host.docker.internal:host-gateway`.
+   - The cluster entrypoint prefers the resolved IPv4 for `host.docker.internal` when populating sandbox pod `hostAliases`, then falls back to the container default gateway. This keeps sandbox host aliases working on Docker Desktop, where the host-reachable IP differs from the bridge gateway.
    - Port mappings:
 
       | Container Port | Host Port | Purpose |

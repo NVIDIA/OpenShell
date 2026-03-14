@@ -49,6 +49,9 @@ pub struct SandboxClient {
     ssh_handshake_skew_secs: u64,
     /// When non-empty, sandbox pods get this K8s secret mounted for mTLS to the server.
     client_tls_secret_name: String,
+    /// When non-empty, sandbox pods get `hostAliases` entries mapping
+    /// `host.docker.internal` and `host.openshell.internal` to this IP.
+    host_gateway_ip: String,
 }
 
 impl std::fmt::Debug for SandboxClient {
@@ -71,6 +74,7 @@ impl SandboxClient {
         ssh_handshake_secret: String,
         ssh_handshake_skew_secs: u64,
         client_tls_secret_name: String,
+        host_gateway_ip: String,
     ) -> Result<Self, KubeError> {
         let mut config = match kube::Config::incluster() {
             Ok(c) => c,
@@ -92,6 +96,7 @@ impl SandboxClient {
             ssh_handshake_secret,
             ssh_handshake_skew_secs,
             client_tls_secret_name,
+            host_gateway_ip,
         })
     }
 
@@ -206,6 +211,7 @@ impl SandboxClient {
             self.ssh_handshake_secret(),
             self.ssh_handshake_skew_secs(),
             &self.client_tls_secret_name,
+            &self.host_gateway_ip,
         );
         let api = self.api();
 
@@ -759,6 +765,7 @@ fn sandbox_to_k8s_spec(
     ssh_handshake_secret: &str,
     ssh_handshake_skew_secs: u64,
     client_tls_secret_name: &str,
+    host_gateway_ip: &str,
 ) -> serde_json::Value {
     let mut root = serde_json::Map::new();
     if let Some(spec) = spec {
@@ -787,6 +794,7 @@ fn sandbox_to_k8s_spec(
                     ssh_handshake_skew_secs,
                     &spec.environment,
                     client_tls_secret_name,
+                    host_gateway_ip,
                 ),
             );
             if !template.agent_socket.is_empty() {
@@ -820,6 +828,7 @@ fn sandbox_to_k8s_spec(
                 ssh_handshake_skew_secs,
                 spec_env,
                 client_tls_secret_name,
+                host_gateway_ip,
             ),
         );
     }
@@ -843,6 +852,7 @@ fn sandbox_template_to_k8s(
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
     client_tls_secret_name: &str,
+    host_gateway_ip: &str,
 ) -> serde_json::Value {
     if let Some(pod_template) = struct_to_json(&template.pod_template) {
         return inject_pod_template(
@@ -859,6 +869,7 @@ fn sandbox_template_to_k8s(
             ssh_handshake_skew_secs,
             spec_environment,
             client_tls_secret_name,
+            host_gateway_ip,
         );
     }
 
@@ -968,6 +979,17 @@ fn sandbox_template_to_k8s(
         );
     }
 
+    // Add hostAliases so sandbox pods can reach the Docker host.
+    if !host_gateway_ip.is_empty() {
+        spec.insert(
+            "hostAliases".to_string(),
+            serde_json::json!([{
+                "ip": host_gateway_ip,
+                "hostnames": ["host.docker.internal", "host.openshell.internal"]
+            }]),
+        );
+    }
+
     let mut template_value = serde_json::Map::new();
     if !metadata.is_empty() {
         template_value.insert("metadata".to_string(), serde_json::Value::Object(metadata));
@@ -997,6 +1019,7 @@ fn inject_pod_template(
     ssh_handshake_skew_secs: u64,
     spec_environment: &std::collections::HashMap<String, String>,
     client_tls_secret_name: &str,
+    host_gateway_ip: &str,
 ) -> serde_json::Value {
     let Some(spec) = pod_template
         .get_mut("spec")
@@ -1009,6 +1032,17 @@ fn inject_pod_template(
         spec.insert(
             "runtimeClassName".to_string(),
             serde_json::json!(GPU_RUNTIME_CLASS_NAME),
+        );
+    }
+
+    // Add hostAliases so sandbox pods can reach the Docker host.
+    if !host_gateway_ip.is_empty() {
+        spec.insert(
+            "hostAliases".to_string(),
+            serde_json::json!([{
+                "ip": host_gateway_ip,
+                "hostnames": ["host.docker.internal", "host.openshell.internal"]
+            }]),
         );
     }
 
@@ -1806,6 +1840,7 @@ mod tests {
             300,
             &std::collections::HashMap::new(),
             "",
+            "",
         );
 
         assert_eq!(
@@ -1850,6 +1885,7 @@ mod tests {
             "secret",
             300,
             &std::collections::HashMap::new(),
+            "",
             "",
         );
 
@@ -1910,6 +1946,7 @@ mod tests {
             300,
             &std::collections::HashMap::new(),
             "",
+            "",
         );
 
         assert_eq!(
@@ -1920,5 +1957,117 @@ mod tests {
             pod_template["spec"]["containers"][0]["resources"]["limits"][GPU_RESOURCE_NAME],
             serde_json::json!(GPU_RESOURCE_QUANTITY)
         );
+    }
+
+    #[test]
+    fn host_aliases_injected_when_gateway_ip_set() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "172.17.0.1",
+        );
+
+        let host_aliases = pod_template["spec"]["hostAliases"]
+            .as_array()
+            .expect("hostAliases should exist");
+        assert_eq!(host_aliases.len(), 1);
+        assert_eq!(host_aliases[0]["ip"], "172.17.0.1");
+        let hostnames = host_aliases[0]["hostnames"]
+            .as_array()
+            .expect("hostnames should exist");
+        assert!(hostnames.contains(&serde_json::json!("host.docker.internal")));
+        assert!(hostnames.contains(&serde_json::json!("host.openshell.internal")));
+    }
+
+    #[test]
+    fn host_aliases_not_injected_when_gateway_ip_empty() {
+        let pod_template = sandbox_template_to_k8s(
+            &SandboxTemplate::default(),
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "",
+        );
+
+        assert!(
+            pod_template["spec"]["hostAliases"].is_null(),
+            "hostAliases should not be present when host_gateway_ip is empty"
+        );
+    }
+
+    #[test]
+    fn host_aliases_injected_in_custom_pod_template() {
+        let template = SandboxTemplate {
+            pod_template: Some(Struct {
+                fields: [(
+                    "spec".to_string(),
+                    Value {
+                        kind: Some(Kind::StructValue(Struct {
+                            fields: [(
+                                "containers".to_string(),
+                                Value {
+                                    kind: Some(Kind::ListValue(prost_types::ListValue {
+                                        values: vec![Value {
+                                            kind: Some(Kind::StructValue(Struct {
+                                                fields: [(
+                                                    "name".to_string(),
+                                                    string_value("agent"),
+                                                )]
+                                                .into_iter()
+                                                .collect(),
+                                            })),
+                                        }],
+                                    })),
+                                },
+                            )]
+                            .into_iter()
+                            .collect(),
+                        })),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            }),
+            ..SandboxTemplate::default()
+        };
+
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "",
+            "192.168.65.2",
+        );
+
+        let host_aliases = pod_template["spec"]["hostAliases"]
+            .as_array()
+            .expect("hostAliases should exist in custom pod template");
+        assert_eq!(host_aliases[0]["ip"], "192.168.65.2");
     }
 }
