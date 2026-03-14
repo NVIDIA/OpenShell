@@ -32,7 +32,7 @@ Every OpenShell deployment starts with a *gateway* and one or more *sandboxes*. 
 
 ## Gateway Types
 
-A gateway coordinates everything: it provisions sandboxes, brokers CLI requests, enforces policies, and manages provider credentials. OpenShell supports three deployment models so the gateway can run wherever your workload requires.
+A gateway provisions sandboxes, brokers CLI requests, enforces policies, and manages provider credentials. OpenShell supports three deployment models, so the gateway can run wherever your workload requires.
 
 | Type | Where It Runs | Best For |
 |---|---|---|
@@ -40,7 +40,7 @@ A gateway coordinates everything: it provisions sandboxes, brokers CLI requests,
 | **Remote** | Docker on a remote host via SSH | Running sandboxes on a more powerful machine (for example, a DGX Spark) while keeping the CLI on your laptop. |
 | **Cloud** | Behind a reverse proxy (for example, Cloudflare Access) | Shared team environments where multiple users connect to the same gateway through browser-based authentication. |
 
-All three types expose the same API surface. Sandboxes, policies, and providers work identically regardless of where the gateway runs. The only difference is how the CLI reaches the gateway — direct Docker socket, SSH tunnel, or HTTPS through a proxy.
+All three types expose the same API surface. Sandboxes, policies, and providers work identically regardless of where the gateway runs. The only difference is how the CLI reaches the gateway, whether through a direct Docker socket, SSH tunnel, or HTTPS through a proxy.
 
 :::{tip}
 You do not need to deploy a gateway manually. Running `openshell sandbox create` without a gateway auto-bootstraps a local one for you.
@@ -60,7 +60,7 @@ Every sandbox moves through a defined set of phases:
 ## Sandbox Policies
 
 OpenShell ships a built-in policy that covers common agent workflows out of the box.
-When you create a sandbox without `--policy`, the default policy is applied. It controls three things:
+When you create a sandbox without `--policy`, the default policy is applied. It controls three areas.
 
 | Layer | What It Controls | How It Works |
 |---|---|---|
