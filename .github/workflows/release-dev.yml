@@ -140,6 +140,13 @@ jobs:
           aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
           echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
 
+      - name: Upload wheel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheels
+          path: target/wheels/*.whl
+          retention-days: 5
+
   publish-python:
     name: Publish Python
     needs: [build-python-wheels]
@@ -371,11 +378,11 @@ jobs:
           retention-days: 5
 
   # ---------------------------------------------------------------------------
-  # Create / update the devel GitHub Release with CLI binaries
+  # Create / update the devel GitHub Release with CLI binaries and wheels
   # ---------------------------------------------------------------------------
   release-devel:
     name: Release Devel
-    needs: [build-cli-linux, build-cli-macos]
+    needs: [build-cli-linux, build-cli-macos, build-python-wheels]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -388,11 +395,17 @@ jobs:
           path: release/
           merge-multiple: true
 
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wheels
+          path: release/
+
       - name: Generate checksums
         run: |
           set -euo pipefail
           cd release
-          sha256sum *.tar.gz > openshell-checksums-sha256.txt
+          sha256sum *.tar.gz *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
 
       - name: Move devel tag
@@ -438,9 +451,11 @@ jobs:
             | `openshell-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-x86_64-unknown-linux-musl.tar.gz" -O - \| tar xz && sudo install -m 755 openshell /usr/local/bin/openshell` |
             | `openshell-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-aarch64-unknown-linux-musl.tar.gz" -O - \| tar xz && sudo install -m 755 openshell /usr/local/bin/openshell` |
             | `openshell-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-aarch64-apple-darwin.tar.gz" -O - \| tar xz && sudo install -m 755 openshell /usr/local/bin/openshell` |
+            | `openshell-*.whl` | Python wheels | `gh release download devel --repo NVIDIA/OpenShell --pattern "openshell-*.whl"` |
             | `openshell-checksums-sha256.txt` | — | SHA256 checksums for all archives |
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-apple-darwin.tar.gz
+            release/*.whl
             release/openshell-checksums-sha256.txt
