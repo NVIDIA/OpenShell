@@ -19,3 +19,7 @@ pub fn container_name(name: &str) -> String {
 pub fn volume_name(name: &str) -> String {
     format!("openshell-cluster-{name}")
 }
+
+pub fn network_name(name: &str) -> String {
+    format!("openshell-cluster-{name}")
+}

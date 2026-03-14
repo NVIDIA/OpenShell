@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::RemoteOptions;
-use crate::constants::{container_name, volume_name};
+use crate::constants::{container_name, network_name, volume_name};
 use crate::image::{
     self, DEFAULT_IMAGE_REPO_BASE, DEFAULT_REGISTRY, DEFAULT_REGISTRY_USERNAME, parse_image_ref,
 };
@@ -10,10 +10,11 @@ use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, HostConfig, PortBinding, VolumeCreateRequest,
+    ContainerCreateBody, DeviceRequest, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest,
+    PortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
-    CreateContainerOptions, CreateImageOptions, InspectContainerOptions,
+    CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
     ListContainersOptionsBuilder, RemoveContainerOptions, RemoveImageOptions, RemoveVolumeOptions,
     StartContainerOptions,
 };
@@ -185,6 +186,55 @@ pub async fn find_gateway_container(docker: &Docker, port: Option<u16>) -> Resul
     }
 }
 
+/// Create a fresh Docker bridge network for the gateway.
+///
+/// Always removes and recreates the network to guarantee a clean state.
+/// Stale Docker networks (e.g., from a previous interrupted destroy or
+/// Docker Desktop restart) can leave broken routing that causes the
+/// container to fail with "no default routes found".
+pub async fn ensure_network(docker: &Docker, net_name: &str) -> Result<()> {
+    force_remove_network(docker, net_name).await?;
+
+    // Docker may return a 409 conflict if the previous network teardown has
+    // not fully completed in the daemon. Retry a few times with back-off,
+    // re-attempting the removal before each create.
+    let mut last_err = None;
+    for attempt in 0u64..5 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(500 * attempt)).await;
+            // Re-attempt removal in case the previous teardown has now settled.
+            force_remove_network(docker, net_name).await?;
+        }
+        match docker
+            .create_network(NetworkCreateRequest {
+                name: net_name.to_string(),
+                driver: Some("bridge".to_string()),
+                attachable: Some(true),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(err) if is_conflict(&err) => {
+                tracing::debug!(
+                    "Network create conflict (attempt {}/5), retrying: {}",
+                    attempt + 1,
+                    err,
+                );
+                last_err = Some(err);
+            }
+            Err(err) => {
+                return Err(err)
+                    .into_diagnostic()
+                    .wrap_err("failed to create Docker network");
+            }
+        }
+    }
+    Err(last_err.expect("at least one retry attempt"))
+        .into_diagnostic()
+        .wrap_err("failed to create Docker network after retries (network still in use)")
+}
+
 pub async fn ensure_volume(docker: &Docker, name: &str) -> Result<()> {
     match docker.inspect_volume(name).await {
         Ok(_) => return Ok(()),
@@ -328,6 +378,7 @@ pub async fn ensure_container(
         privileged: Some(true),
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
+        network_mode: Some(network_name(name)),
         // Add host.docker.internal mapping for DNS resolution
         // This allows the entrypoint script to configure CoreDNS to use the host gateway
         extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
@@ -629,6 +680,21 @@ pub async fn destroy_gateway_resources(docker: &Docker, name: &str) -> Result<()
         .ok()
         .and_then(|info| info.image);
 
+    // Explicitly disconnect the container from the per-gateway network before
+    // removing it. This ensures Docker tears down the network endpoint
+    // synchronously so port bindings are released immediately and the
+    // subsequent network cleanup sees zero connected containers.
+    let net_name = network_name(name);
+    let _ = docker
+        .disconnect_network(
+            &net_name,
+            NetworkDisconnectRequest {
+                container: container_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await;
+
     let _ = stop_container(docker, &container_name).await;
 
     let remove_container = docker
@@ -700,7 +766,50 @@ pub async fn destroy_gateway_resources(docker: &Docker, name: &str) -> Result<()
         return Err(err).into_diagnostic();
     }
 
+    // Force-remove the per-gateway network during a full destroy. First
+    // disconnect any stale endpoints that Docker may still report (race
+    // between container removal and network bookkeeping), then remove the
+    // network itself.
+    force_remove_network(docker, &net_name).await?;
+
     Ok(())
+}
+
+/// Forcefully remove a Docker network, disconnecting any remaining
+/// containers first. This ensures that stale Docker network endpoints
+/// cannot prevent port bindings from being released.
+async fn force_remove_network(docker: &Docker, net_name: &str) -> Result<()> {
+    let network = match docker
+        .inspect_network(net_name, None::<InspectNetworkOptions>)
+        .await
+    {
+        Ok(info) => info,
+        Err(err) if is_not_found(&err) => return Ok(()),
+        Err(err) => return Err(err).into_diagnostic(),
+    };
+
+    // Disconnect any containers still attached to the network.
+    if let Some(containers) = network.containers {
+        for (id, _) in containers {
+            let _ = docker
+                .disconnect_network(
+                    net_name,
+                    NetworkDisconnectRequest {
+                        container: id,
+                        force: Some(true),
+                    },
+                )
+                .await;
+        }
+    }
+
+    match docker.remove_network(net_name).await {
+        Ok(()) => Ok(()),
+        Err(err) if is_not_found(&err) => Ok(()),
+        Err(err) => Err(err)
+            .into_diagnostic()
+            .wrap_err("failed to remove Docker network"),
+    }
 }
 
 fn is_not_found(err: &BollardError) -> bool {

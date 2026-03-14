@@ -21,14 +21,14 @@ Out of scope:
 - `crates/openshell-cli/src/run.rs`: CLI command implementations (`gateway_start`, `gateway_stop`, `gateway_destroy`, `gateway_info`, `doctor_logs`).
 - `crates/openshell-cli/src/bootstrap.rs`: Auto-bootstrap helpers for `sandbox create` (offers to deploy a gateway when one is unreachable).
 - `crates/openshell-bootstrap/src/lib.rs`: Gateway lifecycle orchestration (`deploy_gateway`, `deploy_gateway_with_logs`, `gateway_handle`, `check_existing_deployment`).
-- `crates/openshell-bootstrap/src/docker.rs`: Docker API wrappers (network, volume, container, image operations).
+- `crates/openshell-bootstrap/src/docker.rs`: Docker API wrappers (per-gateway network, volume, container, image operations).
 - `crates/openshell-bootstrap/src/image.rs`: Remote image registry pull with XOR-obfuscated distribution credentials.
 - `crates/openshell-bootstrap/src/runtime.rs`: In-container operations via `docker exec` (health polling, stale node cleanup, deployment restart).
 - `crates/openshell-bootstrap/src/metadata.rs`: Gateway metadata creation, storage, and active gateway tracking.
 - `crates/openshell-bootstrap/src/mtls.rs`: Gateway TLS detection and CLI mTLS bundle extraction.
 - `crates/openshell-bootstrap/src/push.rs`: Local development image push into k3s containerd.
 - `crates/openshell-bootstrap/src/paths.rs`: XDG path resolution.
-- `crates/openshell-bootstrap/src/constants.rs`: Shared constants (image name, network name, container/volume naming).
+- `crates/openshell-bootstrap/src/constants.rs`: Shared constants (image name, container/volume/network naming).
 - `deploy/docker/Dockerfile.cluster`: Container image definition (k3s base + Helm charts + manifests + entrypoint).
 - `deploy/docker/cluster-entrypoint.sh`: Container entrypoint (DNS proxy, registry config, manifest injection).
 - `deploy/docker/cluster-healthcheck.sh`: Docker HEALTHCHECK script.
@@ -44,7 +44,7 @@ All gateway lifecycle commands live under `openshell gateway`:
 |---|---|
 | `openshell gateway start [--name NAME] [--remote user@host] [--ssh-key PATH]` | Provision or update a gateway |
 | `openshell gateway stop [--name NAME] [--remote user@host]` | Stop the container (preserves state) |
-| `openshell gateway destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, metadata, and network |
+| `openshell gateway destroy [--name NAME] [--remote user@host]` | Destroy container, attached volumes, per-gateway network, and metadata |
 | `openshell gateway info [--name NAME]` | Show deployment details (endpoint, SSH host) |
 | `openshell status` | Show gateway health via gRPC/HTTP |
 | `openshell doctor logs [--name NAME] [--remote user@host] [--tail N]` | Fetch gateway container logs |
@@ -91,7 +91,7 @@ sequenceDiagram
   Note over B,R: Docker socket APIs only, no extra host dependencies
 
   B->>B: resolve SSH host for extra TLS SANs
-  B->>R: ensure_network (bridge, attachable)
+  B->>R: ensure_network (per-gateway bridge, attachable)
   B->>R: ensure_volume
   B->>R: ensure_container (privileged, k3s server)
   B->>R: start_container
@@ -159,7 +159,7 @@ Image ref resolution in `default_gateway_image_ref()`:
 
 For the target daemon (local or remote):
 
-1. **Ensure bridge network** `openshell-cluster` (attachable, bridge driver) via `ensure_network()`.
+1. **Ensure bridge network** `openshell-cluster-{name}` (attachable, bridge driver) via `ensure_network()`. Each gateway gets its own isolated Docker network.
 2. **Ensure volume** `openshell-cluster-{name}` via `ensure_volume()`.
 3. **Compute extra TLS SANs**:
    - For **local deploys**: Check `DOCKER_HOST` for a non-loopback `tcp://` endpoint (e.g., `tcp://docker:2375` in CI). If found, extract the host as an extra SAN. The function `local_gateway_host_from_docker_host()` skips `localhost`, `127.0.0.1`, and `::1`.
@@ -168,7 +168,7 @@ For the target daemon (local or remote):
    - k3s server command: `server --disable=traefik --tls-san=127.0.0.1 --tls-san=localhost --tls-san=host.docker.internal` plus computed extra SANs.
    - Privileged mode.
    - Volume bind mount: `openshell-cluster-{name}:/var/lib/rancher/k3s`.
-   - Network: `openshell-cluster`.
+    - Network: `openshell-cluster-{name}` (per-gateway bridge network).
    - Extra host: `host.docker.internal:host-gateway`.
    - Port mappings:
 
@@ -349,7 +349,7 @@ flowchart LR
 1. Stop the container.
 2. Remove the container (`force=true`). Tolerates 404.
 3. Remove the volume (`force=true`). Tolerates 404.
-4. Remove the network if no containers remain attached (`cleanup_network_if_unused()`).
+4. Force-remove the per-gateway network via `force_remove_network()`, disconnecting any stale endpoints first.
 
 **CLI layer** (`gateway_destroy()` in `run.rs` additionally):
 
@@ -359,7 +359,7 @@ flowchart LR
 ## Idempotency and Error Behavior
 
 - Re-running deploy is safe:
-  - Existing network/volume are reused (inspect before create).
+  - Network is recreated on each deploy to guarantee a clean state; volume is reused (inspect before create).
   - If a container exists with the same image ID, it is reused; if the image changed, the container is recreated.
   - `start_container` tolerates already-running state (409).
 - In interactive terminals, the CLI prompts the user to optionally destroy and recreate an existing gateway before redeploying.
