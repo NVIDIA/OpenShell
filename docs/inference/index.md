@@ -31,8 +31,8 @@ The following table summarizes how OpenShell handles inference traffic.
 
 | Path | How It Works |
 |---|---|
-| **External endpoints** | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request — allowed or denied by `network_policies`. Refer to [Network Access Rules](/sandboxes/index.md#network-access-rules). |
-| **`inference.local`** | A special endpoint exposed inside every sandbox for inference that should stay local to the host for privacy and security. The {doc}`privacy router </about/architecture>` strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint. |
+| External endpoints | Traffic to hosts like `api.openai.com` or `api.anthropic.com` is treated like any other outbound request, allowed or denied by `network_policies`. Refer to {doc}`../sandboxes/policies`. |
+| `inference.local` | A special endpoint exposed inside every sandbox for routing inference traffic locally, preserving privacy and security. The {doc}`privacy router </about/architecture>` strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint. |
 
 ## How `inference.local` Works
 
@@ -42,10 +42,10 @@ If code calls an external inference host directly, that traffic is evaluated onl
 
 | Property | Detail |
 |---|---|
-| Credentials | No sandbox API keys needed — credentials come from the configured provider record. |
+| Credentials | No sandbox API keys needed. Credentials come from the configured provider record. |
 | Configuration | One provider and one model define sandbox inference. |
 | Provider support | OpenAI, Anthropic, and NVIDIA providers all work through the same endpoint. |
-| Hot-refresh | Provider credential changes and inference updates are picked up without recreating sandboxes. |
+| Hot-refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. |
 
 ## Supported API Patterns
 
@@ -82,4 +82,4 @@ Requests to `inference.local` that do not match the configured provider's suppor
 Continue with one of the following:
 
 - To set up the backend behind `inference.local`, refer to {doc}`configure`.
-- To control external endpoints, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+- To control external endpoints, refer to [Policies](/sandboxes/policies.md).

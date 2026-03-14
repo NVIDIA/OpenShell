@@ -26,7 +26,7 @@ content:
 
 # Configure Inference Routing
 
-This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies` — refer to [Network Access Rules](/sandboxes/index.md#network-access-rules) for details.
+This page covers the managed local inference endpoint (`https://inference.local`). External inference endpoints go through sandbox `network_policies`. Refer to [Policies](/sandboxes/policies.md) for details.
 
 The configuration consists of two values:
 
@@ -121,7 +121,7 @@ After inference is configured, code inside any sandbox can call `https://inferen
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="https://inference.local/v1", api_key="dummy")
+client = OpenAI(base_url="https://inference.local/v1", api_key="unused")
 
 response = client.chat.completions.create(
     model="anything",
@@ -129,7 +129,7 @@ response = client.chat.completions.create(
 )
 ```
 
-The client-supplied model is ignored for generation requests. OpenShell rewrites it to the configured model before forwarding upstream.
+The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding.
 
 Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
 
@@ -148,15 +148,13 @@ curl https://inference.local/v1/responses \
 
 A successful response confirms the privacy router can reach the configured backend and the model is serving requests.
 
-:::{note}
-- **Gateway-scoped** — every sandbox on the active gateway sees the same `inference.local` backend.
-- **HTTPS only** — `inference.local` is intercepted only for HTTPS traffic.
-:::
+- Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
+- HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
 
 ## Next Steps
 
 Explore related topics:
 
 - To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
-- To control external endpoints, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
-- To manage provider records, refer to {doc}`../sandboxes/providers`.
+- To control external endpoints, refer to [Policies](/sandboxes/policies.md).
+- To manage provider records, refer to {doc}`../sandboxes/manage-providers`.

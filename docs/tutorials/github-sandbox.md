@@ -1,7 +1,7 @@
 ---
 title:
-  page: Set Up a Sandbox of Claude Code with a Custom GitHub Policy
-  nav: GitHub Sandbox Tutorial
+  page: Grant GitHub Push Access to a Sandboxed Agent
+  nav: GitHub Push Access
 description: Learn the iterative policy workflow by launching a sandbox, diagnosing a GitHub access denial, and applying a custom policy to fix it.
 topics:
 - Generative AI
@@ -24,7 +24,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Set Up a Sandbox of Claude Code with a Custom GitHub Policy
+# Grant GitHub Push Access to a Sandboxed Agent
 
 This tutorial walks through an iterative sandbox policy workflow. You launch a sandbox, ask Claude Code to push code to GitHub, and observe the default network policy denying the request.
 You then diagnose the denial from your machine and from inside the sandbox, apply a policy update, and verify that the policy update to the sandbox takes effect.
@@ -65,7 +65,7 @@ Depending on whether you start a new sandbox or use an existing sandbox, choose 
 
 In terminal 2, create a new sandbox with Claude Code. The {doc}`default policy </reference/default-policy>` is applied automatically, which allows read-only access to GitHub.
 
-Create a {doc}`credential provider </sandboxes/providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
+Create a {doc}`credential provider </sandboxes/manage-providers>` that injects your GitHub token into the sandbox automatically. The provider reads `GITHUB_TOKEN` from your host environment and sets it as an environment variable inside the sandbox:
 
 ```console
 $ GITHUB_TOKEN=<your-token>
@@ -342,7 +342,7 @@ The following table summarizes the two GitHub-specific blocks:
 
 The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
 
-For details on policy block structure, refer to [Network Access Rules](/sandboxes/index.md#network-access-rules).
+For details on policy block structure, refer to [Policies](/sandboxes/policies.md).
 ::::
 
 ## Apply the Policy
@@ -379,4 +379,4 @@ The following resources cover related topics in greater depth:
 
 - To add per-repository access levels (read-write vs read-only) or restrict to specific API methods, refer to the [Policy Schema Reference](/reference/policy-schema.md).
 - To learn the full policy iteration workflow (pull, edit, push, verify), refer to {doc}`/sandboxes/policies`.
-- To inject credentials automatically instead of pasting tokens, refer to {doc}`/sandboxes/providers`.
+- To inject credentials automatically instead of pasting tokens, refer to {doc}`/sandboxes/manage-providers`.

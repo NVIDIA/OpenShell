@@ -134,21 +134,21 @@ Install the CLI and create your first sandbox in two commands.
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Set Up a Sandbox with GitHub Repo Access
-:link: tutorials/github-sandbox
+:::{grid-item-card} Tutorials
+:link: tutorials/index
 :link-type: doc
 
-End-to-end guides for GitHub repo access, custom policies, and more.
+Hands-on walkthroughs from first sandbox to custom policies.
 
 +++
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Sandboxes
-:link: sandboxes/index
+:::{grid-item-card} Gateways and Sandboxes
+:link: sandboxes/manage-gateways
 :link-type: doc
 
-Create, manage, and customize sandboxes. Configure policies, providers, and community images for your AI agents.
+Deploy gateways, create sandboxes, configure policies, providers, and community images for your AI agents.
 
 +++
 {bdg-secondary}`Concept`
@@ -188,6 +188,7 @@ Home <self>
 
 Overview <about/overview>
 How It Works <about/architecture>
+Supported Agents <about/supported-agents>
 Release Notes <about/release-notes>
 ```
 
@@ -196,18 +197,19 @@ Release Notes <about/release-notes>
 :hidden:
 
 Quickstart <get-started/quickstart>
-GitHub Policy Tutorial <tutorials/github-sandbox>
+tutorials/index
 ```
 
 ```{toctree}
-:caption: Sandboxes
+:caption: Gateways and Sandboxes
 :hidden:
 
 sandboxes/index
-sandboxes/create-and-manage
-sandboxes/providers
-sandboxes/policies
-sandboxes/community-sandboxes
+Sandboxes <sandboxes/manage-sandboxes>
+Gateways <sandboxes/manage-gateways>
+Providers <sandboxes/manage-providers>
+Policies <sandboxes/policies>
+Community Sandboxes <sandboxes/community-sandboxes>
 ```
 
 ```{toctree}
@@ -222,6 +224,7 @@ inference/configure
 :caption: Reference
 :hidden:
 
+reference/gateway-auth
 reference/default-policy
 reference/policy-schema
 reference/support-matrix
@@ -231,5 +234,5 @@ reference/support-matrix
 :caption: Resources
 :hidden:
 
-resources/eula
+resources/license
 ```

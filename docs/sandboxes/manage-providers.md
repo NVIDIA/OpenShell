@@ -25,7 +25,7 @@ content:
   SPDX-License-Identifier: Apache-2.0
 -->
 
-# Providers
+# Manage Providers and Credentials
 
 AI agents typically need credentials to access external services: an API key for the AI model provider, a token for GitHub or GitLab, and so on. OpenShell manages these credentials as first-class entities called *providers*.
 
