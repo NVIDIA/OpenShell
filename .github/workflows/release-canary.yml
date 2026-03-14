@@ -1,4 +1,4 @@
-name: Acceptance Test
+name: Release Canary
 
 on:
   workflow_dispatch:
@@ -21,7 +21,7 @@ defaults:
 
 jobs:
   acceptance:
-    name: Acceptance (${{ matrix.arch }})
+    name: Canary (${{ matrix.arch }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
@@ -92,7 +92,7 @@ jobs:
       - name: Verify CLI installation
         run: openshell --version
 
-      - name: Run acceptance test
+      - name: Run canary test
         run: |
           set -euo pipefail
 
@@ -107,8 +107,8 @@ jobs:
           echo "$OUTPUT"
 
           if echo "$OUTPUT" | grep -q "hello world"; then
-            echo "Acceptance test passed: 'hello world' found in output"
+            echo "Canary test passed: 'hello world' found in output"
           else
-            echo "::error::Acceptance test failed: 'hello world' not found in output"
+            echo "::error::Canary test failed: 'hello world' not found in output"
             exit 1
           fi
