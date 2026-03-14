@@ -27,6 +27,11 @@ on:
         required: false
         type: string
         default: "build-amd64"
+      cargo-version:
+        description: "Pre-computed cargo version (skips internal git-based computation)"
+        required: false
+        type: string
+        default: ""
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -69,7 +74,11 @@ jobs:
         id: version
         run: |
           set -eu
-          echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          if [[ -n "${{ inputs.cargo-version }}" ]]; then
+            echo "cargo_version=${{ inputs.cargo-version }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

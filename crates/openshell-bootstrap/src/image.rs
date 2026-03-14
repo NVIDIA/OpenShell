@@ -17,11 +17,12 @@ const PULL_REGISTRY_DEFAULT_TAG: &str = "latest";
 /// Image tag baked in at compile time.
 ///
 /// Set via `OPENSHELL_IMAGE_TAG` env var during `cargo build`:
-/// - Defaults to `"latest"` when unset (release builds, bare `cargo build`).
-/// - Set to `"dev"` for dev CLI builds targeting locally-built images.
+/// - Defaults to `"dev"` when unset (local builds, `mise run docker:build`).
+/// - CI sets this explicitly: `"dev"` for main-branch builds, the version
+///   string (e.g. `"0.6.0"`) for tagged releases.
 pub const DEFAULT_IMAGE_TAG: &str = match option_env!("OPENSHELL_IMAGE_TAG") {
     Some(tag) => tag,
-    None => "latest",
+    None => "dev",
 };
 
 // ---------------------------------------------------------------------------
