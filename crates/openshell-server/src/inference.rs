@@ -8,7 +8,7 @@ use openshell_core::proto::{
     inference_server::Inference,
 };
 use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
-use openshell_router::{RouterError, verify_backend_endpoint};
+use openshell_router::{ValidationFailureKind, verify_backend_endpoint};
 use std::sync::Arc;
 use std::time::Duration;
 use tonic::{Request, Response, Status};
@@ -283,23 +283,27 @@ fn validation_failure(
     ))
 }
 
-fn validation_next_steps(details: &str) -> &'static str {
-    if details.contains("credentials") {
-        return "verify the provider API key and any required auth headers";
+fn validation_next_steps(kind: ValidationFailureKind) -> &'static str {
+    match kind {
+        ValidationFailureKind::Credentials => {
+            "verify the provider API key and any required auth headers"
+        }
+        ValidationFailureKind::RateLimited => {
+            "retry later or verify quota/limits on the upstream provider"
+        }
+        ValidationFailureKind::RequestShape => {
+            "confirm the provider type, base URL, and model identifier"
+        }
+        ValidationFailureKind::Connectivity => {
+            "check that the service is running, confirm the base URL and protocol, and verify credentials"
+        }
+        ValidationFailureKind::UpstreamHealth => {
+            "check whether the endpoint is healthy and serving requests"
+        }
+        ValidationFailureKind::Unexpected => {
+            "confirm the endpoint URL, protocol, credentials, and model identifier"
+        }
     }
-    if details.contains("rate-limited") {
-        return "retry later or verify quota/limits on the upstream provider";
-    }
-    if details.contains("validation request") || details.contains("unexpected HTTP") {
-        return "confirm the provider type, base URL, and model identifier";
-    }
-    if details.contains("failed to connect") || details.contains("timed out") {
-        return "check that the service is running, confirm the base URL and protocol, and verify credentials";
-    }
-    if details.contains("upstream returned HTTP") {
-        return "check whether the endpoint is healthy and serving requests";
-    }
-    "confirm the endpoint URL, protocol, credentials, and model identifier"
 }
 
 async fn verify_provider_endpoint(
@@ -320,17 +324,14 @@ async fn verify_provider_endpoint(
             url: validated.url,
             protocol: validated.protocol,
         })
-        .map_err(|err| match err {
-            RouterError::Internal(details)
-            | RouterError::UpstreamUnavailable(details)
-            | RouterError::UpstreamProtocol(details) => validation_failure(
+        .map_err(|err| {
+            validation_failure(
                 provider_name,
                 model_id,
                 &route.endpoint,
-                &details,
-                validation_next_steps(&details),
-            ),
-            other => Status::internal(format!("unexpected validation router error: {other}")),
+                &err.details,
+                validation_next_steps(err.kind),
+            )
         })
 }
 

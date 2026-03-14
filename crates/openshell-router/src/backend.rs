@@ -10,6 +10,22 @@ pub struct ValidatedEndpoint {
     pub protocol: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationFailureKind {
+    RequestShape,
+    Credentials,
+    RateLimited,
+    Connectivity,
+    UpstreamHealth,
+    Unexpected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationFailure {
+    pub kind: ValidationFailureKind,
+    pub details: String,
+}
+
 struct ValidationProbe {
     path: &'static str,
     protocol: &'static str,
@@ -140,7 +156,7 @@ async fn send_backend_request(
     })
 }
 
-fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, RouterError> {
+fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, ValidationFailure> {
     if route
         .protocols
         .iter()
@@ -193,19 +209,40 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, RouterErro
         });
     }
 
-    Err(RouterError::Internal(format!(
-        "route '{}' does not expose a writable inference protocol for validation",
-        route.name
-    )))
+    Err(ValidationFailure {
+        kind: ValidationFailureKind::RequestShape,
+        details: format!(
+            "route '{}' does not expose a writable inference protocol for validation",
+            route.name
+        ),
+    })
 }
 
 pub async fn verify_backend_endpoint(
     client: &reqwest::Client,
     route: &ResolvedRoute,
-) -> Result<ValidatedEndpoint, RouterError> {
+) -> Result<ValidatedEndpoint, ValidationFailure> {
     let probe = validation_probe(route)?;
-    let response =
-        send_backend_request(client, route, "POST", probe.path, Vec::new(), probe.body).await?;
+    let response = send_backend_request(client, route, "POST", probe.path, Vec::new(), probe.body)
+        .await
+        .map_err(|err| match err {
+            RouterError::UpstreamUnavailable(details) => ValidationFailure {
+                kind: ValidationFailureKind::Connectivity,
+                details,
+            },
+            RouterError::Internal(details) | RouterError::UpstreamProtocol(details) => {
+                ValidationFailure {
+                    kind: ValidationFailureKind::Unexpected,
+                    details,
+                }
+            }
+            RouterError::RouteNotFound(details)
+            | RouterError::NoCompatibleRoute(details)
+            | RouterError::Unauthorized(details) => ValidationFailure {
+                kind: ValidationFailureKind::Unexpected,
+                details,
+            },
+        })?;
     let url = build_backend_url(&route.endpoint, probe.path);
 
     if response.status().is_success() {
@@ -216,8 +253,9 @@ pub async fn verify_backend_endpoint(
     }
 
     let status = response.status();
-    let body = response.text().await.map_err(|e| {
-        RouterError::UpstreamProtocol(format!("failed to read validation response body: {e}"))
+    let body = response.text().await.map_err(|e| ValidationFailure {
+        kind: ValidationFailureKind::Unexpected,
+        details: format!("failed to read validation response body: {e}"),
     })?;
     let body = body.trim();
     let body_suffix = if body.is_empty() {
@@ -243,7 +281,16 @@ pub async fn verify_backend_endpoint(
         _ => format!("upstream returned unexpected HTTP {status}.{body_suffix}"),
     };
 
-    Err(RouterError::UpstreamProtocol(details))
+    Err(ValidationFailure {
+        kind: match status.as_u16() {
+            400 | 404 | 405 | 422 => ValidationFailureKind::RequestShape,
+            401 | 403 => ValidationFailureKind::Credentials,
+            429 => ValidationFailureKind::RateLimited,
+            500..=599 => ValidationFailureKind::UpstreamHealth,
+            _ => ValidationFailureKind::Unexpected,
+        },
+        details,
+    })
 }
 
 /// Extract status and headers from a [`reqwest::Response`].
