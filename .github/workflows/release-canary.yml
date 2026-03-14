@@ -45,7 +45,6 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      GATEWAY_HOST: host.docker.internal
     steps:
       - uses: actions/checkout@v4
 
@@ -109,8 +108,18 @@ jobs:
       - name: Verify CLI installation
         run: openshell --version
 
+      - name: Resolve gateway host
+        run: |
+          # On Linux CI runners host.docker.internal is not set automatically
+          # (it's a Docker Desktop feature). Add it via the Docker bridge IP.
+          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
+            BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+            echo "Adding /etc/hosts entry: ${BRIDGE_IP} host.docker.internal"
+            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
+          fi
+
       - name: Start gateway
-        run: openshell gateway start
+        run: openshell gateway start --gateway-host host.docker.internal
 
       - name: Run canary test
         run: |
