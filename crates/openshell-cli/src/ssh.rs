@@ -369,7 +369,7 @@ fn foreground_forward_started_message(name: &str, port: u16) -> String {
     format!(
         "{} Forwarding port {port} to sandbox {name}\n  Access at: http://127.0.0.1:{port}/\n  Press Ctrl+C to stop\n  {}",
         "✓".green().bold(),
-        "Hint: pass --background to keep this running without blocking your terminal".dimmed(),
+        "Hint: pass --background to start forwarding without blocking your terminal".dimmed(),
     )
 }
 
@@ -1136,7 +1136,7 @@ mod tests {
         assert!(message.contains("sandbox demo"));
         assert!(message.contains("Press Ctrl+C to stop"));
         assert!(message.contains(
-            "Hint: pass --background to keep this running without blocking your terminal"
+            "Hint: pass --background to start forwarding without blocking your terminal"
         ));
     }
 }
