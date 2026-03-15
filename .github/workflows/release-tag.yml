@@ -55,8 +55,12 @@ jobs:
         id: prev
         run: |
           set -euo pipefail
-          # List tags matching v*.*.* sorted by version descending, skip the current tag
-          PREV=$(git tag --list 'v*.*.*' --sort=-version:refname | grep -v "^${GITHUB_REF_NAME}$" | head -n1 || true)
+          # List tags matching v*.*.* sorted by version descending, keep only
+          # stable releases (no pre-release suffixes like -rc1), skip the current tag
+          PREV=$(git tag --list 'v*.*.*' --sort=-version:refname \
+            | grep -P '^v\d+\.\d+\.\d+$' \
+            | grep -v "^${GITHUB_REF_NAME}$" \
+            | head -n1 || true)
           echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
           echo "Previous release tag: ${PREV:-"(none, first release)"}"
 
