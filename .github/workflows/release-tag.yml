@@ -31,6 +31,7 @@ jobs:
       cargo_version: ${{ steps.v.outputs.cargo }}
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
+      previous_tag: ${{ steps.prev.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -49,6 +50,15 @@ jobs:
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
           echo "semver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Find previous release tag
+        id: prev
+        run: |
+          set -euo pipefail
+          # List tags matching v*.*.* sorted by version descending, skip the current tag
+          PREV=$(git tag --list 'v*.*.*' --sort=-version:refname | grep -v "^${GITHUB_REF_NAME}$" | head -n1 || true)
+          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "Previous release tag: ${PREV:-"(none, first release)"}"
 
   build-gateway:
     needs: [compute-versions]
@@ -412,6 +422,8 @@ jobs:
           generate_release_notes: false
           body: |
             ## OpenShell ${{ github.ref_name }}
+
+            ${{ needs.compute-versions.outputs.previous_tag != '' && format('**Full changelog**: [{0}...{1}](https://github.com/{2}/compare/{0}...{1})', needs.compute-versions.outputs.previous_tag, github.ref_name, github.repository) || '' }}
 
             ### Quick install
 
