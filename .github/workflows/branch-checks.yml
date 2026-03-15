@@ -97,3 +97,28 @@ jobs:
 
       - name: Test
         run: mise run test:python
+
+  internal-wheel-publish-smoke:
+    name: Internal Wheel Publish Smoke
+    if: ${{ github.event.pull_request.head.repo.fork == false }}
+    runs-on: [self-hosted, nv]
+    timeout-minutes: 10
+    steps:
+      - name: Trigger GitLab CI
+        env:
+          GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
+          GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+          WHEEL_FILENAMES: openshell-branch-check-py3-none-any.whl,openshell-branch-check-manylinux_x86_64.whl
+        run: |
+          set -euo pipefail
+          curl -X POST \
+            --fail \
+            -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
+            -F "ref=feat/ci-trigger-pipeline" \
+            -F "variables[PIPELINE_ACTION]=publish_wheels" \
+            -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
+            -F "variables[RELEASE_TAG]=devel" \
+            -F "variables[RELEASE_VERSION]=branch-check-pr-${{ github.event.pull_request.number }}" \
+            -F "variables[RELEASE_KIND]=dev" \
+            -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
+            "${GITLAB_CI_TRIGGER_URL}"
