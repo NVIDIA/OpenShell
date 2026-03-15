@@ -9,6 +9,7 @@
 
 use crate::paths::gateways_dir;
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::paths::{ensure_parent_dir_restricted, set_file_owner_only};
 use std::path::PathBuf;
 
 /// Path to the stored edge auth token for a gateway.
@@ -24,22 +25,12 @@ fn legacy_token_path(gateway_name: &str) -> Result<PathBuf> {
 /// Store an edge authentication token for a gateway.
 pub fn store_edge_token(gateway_name: &str, token: &str) -> Result<()> {
     let path = edge_token_path(gateway_name)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    }
+    ensure_parent_dir_restricted(&path)?;
     std::fs::write(&path, token)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write edge token to {}", path.display()))?;
     // Restrict permissions to owner-only (0600).
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-            .into_diagnostic()
-            .wrap_err("failed to set token file permissions")?;
-    }
+    set_file_owner_only(&path)?;
     Ok(())
 }
 
@@ -47,15 +38,34 @@ pub fn store_edge_token(gateway_name: &str, token: &str) -> Result<()> {
 ///
 /// Returns `None` if no token file exists or the file is empty.
 /// Falls back to the legacy `cf_token` path for backwards compatibility.
+/// When loading from the legacy path, migrates the token to the new path
+/// with proper permissions.
 pub fn load_edge_token(gateway_name: &str) -> Option<String> {
-    // Try the new path first, then fall back to legacy.
-    let path = edge_token_path(gateway_name)
+    // Try the new path first.
+    if let Some(path) = edge_token_path(gateway_name).ok().filter(|p| p.exists()) {
+        let contents = std::fs::read_to_string(&path).ok()?;
+        let token = contents.trim().to_string();
+        if !token.is_empty() {
+            return Some(token);
+        }
+    }
+
+    // Fall back to the legacy cf_token path.
+    let legacy_path = legacy_token_path(gateway_name)
         .ok()
-        .filter(|p| p.exists())
-        .or_else(|| legacy_token_path(gateway_name).ok().filter(|p| p.exists()))?;
-    let contents = std::fs::read_to_string(&path).ok()?;
+        .filter(|p| p.exists())?;
+    let contents = std::fs::read_to_string(&legacy_path).ok()?;
     let token = contents.trim().to_string();
-    if token.is_empty() { None } else { Some(token) }
+    if token.is_empty() {
+        return None;
+    }
+
+    // Migrate: write to new path with proper permissions, then remove legacy.
+    if store_edge_token(gateway_name, &token).is_ok() {
+        let _ = std::fs::remove_file(&legacy_path);
+    }
+
+    Some(token)
 }
 
 /// Remove a stored edge authentication token.

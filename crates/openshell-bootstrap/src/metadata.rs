@@ -4,6 +4,7 @@
 use crate::RemoteOptions;
 use crate::paths::{active_gateway_path, gateways_dir, last_sandbox_path};
 use miette::{IntoDiagnostic, Result, WrapErr};
+use openshell_core::paths::ensure_parent_dir_restricted;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
@@ -205,11 +206,7 @@ pub fn resolve_ssh_hostname(host: &str) -> String {
 
 pub fn store_gateway_metadata(name: &str, metadata: &GatewayMetadata) -> Result<()> {
     let path = stored_metadata_path(name)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    }
+    ensure_parent_dir_restricted(&path)?;
     let contents = serde_json::to_string_pretty(metadata)
         .into_diagnostic()
         .wrap_err("failed to serialize gateway metadata")?;
@@ -237,11 +234,7 @@ pub fn get_gateway_metadata(name: &str) -> Option<GatewayMetadata> {
 /// Save the active gateway name to persistent storage.
 pub fn save_active_gateway(name: &str) -> Result<()> {
     let path = active_gateway_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    }
+    ensure_parent_dir_restricted(&path)?;
     std::fs::write(&path, name)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write active gateway to {}", path.display()))?;
@@ -261,11 +254,7 @@ pub fn load_active_gateway() -> Option<String> {
 /// Save the last-used sandbox name for a gateway to persistent storage.
 pub fn save_last_sandbox(gateway: &str, sandbox: &str) -> Result<()> {
     let path = last_sandbox_path(gateway)?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create {}", parent.display()))?;
-    }
+    ensure_parent_dir_restricted(&path)?;
     std::fs::write(&path, sandbox)
         .into_diagnostic()
         .wrap_err_with(|| format!("failed to write last sandbox to {}", path.display()))?;

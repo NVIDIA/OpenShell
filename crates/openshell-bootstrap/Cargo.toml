@@ -10,6 +10,7 @@ repository.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+openshell-core = { path = "../openshell-core" }
 base64 = "0.22"
 bollard = { version = "0.20", features = ["ssh"] }
 bytes = { workspace = true }

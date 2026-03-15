@@ -6,6 +6,7 @@
 //! Used by both the CLI (`openshell-cli`) and the TUI (`openshell-tui`) to
 //! start, stop, list, and track background SSH port forwards.
 
+use crate::paths::{create_dir_restricted, xdg_config_dir};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -17,15 +18,7 @@ use std::process::Command;
 
 /// Base directory for forward PID files.
 pub fn forward_pid_dir() -> Result<PathBuf> {
-    let base = if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(path)
-    } else {
-        let home = std::env::var("HOME")
-            .into_diagnostic()
-            .wrap_err("HOME is not set")?;
-        PathBuf::from(home).join(".config")
-    };
-    Ok(base.join("openshell").join("forwards"))
+    Ok(xdg_config_dir()?.join("openshell").join("forwards"))
 }
 
 /// PID file path for a specific sandbox + port forward.
@@ -44,9 +37,7 @@ pub fn write_forward_pid(
     bind_addr: &str,
 ) -> Result<()> {
     let dir = forward_pid_dir()?;
-    std::fs::create_dir_all(&dir)
-        .into_diagnostic()
-        .wrap_err("failed to create forwards directory")?;
+    create_dir_restricted(&dir)?;
     let path = forward_pid_path(name, port)?;
     std::fs::write(&path, format!("{pid}\t{sandbox_id}\t{bind_addr}"))
         .into_diagnostic()
