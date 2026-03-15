@@ -331,18 +331,34 @@ impl std::fmt::Display for ForwardSpec {
 
 /// Check whether a local port is available for forwarding.
 ///
-/// Attempts to bind `<bind_addr>:<port>`.  If the port is already in use, the
-/// error message includes an actionable hint:
+/// Uses a two-pronged check:
+/// 1. Attempts to bind `<bind_addr>:<port>` — catches same-family conflicts.
+/// 2. Runs `lsof -i :<port> -sTCP:LISTEN` — catches cross-family conflicts
+///    (e.g. an IPv6 wildcard listener blocking a port the IPv4 bind test
+///    would miss).
+///
+/// If the port is already in use the error message includes an actionable
+/// hint:
 ///
 /// - If an existing openshell forward owns the port, suggest the stop command.
-/// - Otherwise, suggest `lsof` to identify the owning process.
+/// - Otherwise, show the `lsof` output and suggest `kill` to terminate the
+///   owning process.
 pub fn check_port_available(spec: &ForwardSpec) -> Result<()> {
-    if TcpListener::bind((spec.bind_addr.as_str(), spec.port)).is_ok() {
-        // Port is free — the listener is dropped immediately, releasing it.
+    let port = spec.port;
+
+    // Fast path: try binding on the requested address.  If this fails, the
+    // port is definitely taken on this address family.
+    let bind_ok = TcpListener::bind((spec.bind_addr.as_str(), port)).is_ok();
+
+    // Also ask the OS whether *any* process is listening on this port,
+    // regardless of address family.  This catches situations where e.g. a
+    // server binds [::]:8080 but our IPv4 bind test succeeds.
+    let lsof_output = lsof_listeners(port);
+    let lsof_occupied = lsof_output.is_some();
+
+    if bind_ok && !lsof_occupied {
         return Ok(());
     }
-
-    let port = spec.port;
 
     // Port is occupied.  Check if it belongs to a tracked openshell forward.
     if let Ok(forwards) = list_forwards()
@@ -356,10 +372,47 @@ pub fn check_port_available(spec: &ForwardSpec) -> Result<()> {
         ));
     }
 
+    // Build a helpful error with lsof details when available.
+    if let Some(output) = lsof_output {
+        return Err(miette::miette!(
+            "Port {port} is already in use by another process.\n\n\
+             {output}\n\n\
+             To free the port, find the PID above and run:\n  \
+             kill <PID>\n\n\
+             Or find it yourself with:\n  \
+             lsof -i :{port} -sTCP:LISTEN",
+        ));
+    }
+
     Err(miette::miette!(
         "Port {port} is already in use by another process.\n\
-         Find it with: lsof -i :{port} -sTCP:LISTEN",
+         Find it with: lsof -i :{port} -sTCP:LISTEN\n\
+         Then terminate it with: kill <PID>",
     ))
+}
+
+/// Run `lsof` to check for any process listening on `port`.
+///
+/// Returns the trimmed stdout if at least one listener is found, or `None` if
+/// the port is free (or `lsof` is unavailable).
+fn lsof_listeners(port: u16) -> Option<String> {
+    let output = Command::new("lsof")
+        .arg("-i")
+        .arg(format!(":{port}"))
+        .arg("-sTCP:LISTEN")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -590,6 +643,27 @@ mod tests {
 
         let result = check_port_available(&ForwardSpec::new(port));
         assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected 'already in use' in error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_port_available_occupied_ipv6_wildcard() {
+        // Bind on [::]:0 (IPv6 wildcard) — this simulates a server like
+        // `python3 -m http.server` which listens on [::] by default.  The
+        // IPv4-only TcpListener::bind("127.0.0.1", port) might succeed, but
+        // lsof should detect the listener and the check should still fail.
+        let listener = match TcpListener::bind("[::]:0") {
+            Ok(l) => l,
+            Err(_) => return, // IPv6 not available, skip
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        let result = check_port_available(&ForwardSpec::new(port));
+        assert!(result.is_err(), "expected error for IPv6-occupied port {port}");
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("already in use"),
