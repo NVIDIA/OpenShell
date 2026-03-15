@@ -84,7 +84,7 @@ jobs:
           # We use a dedicated socket because the GHA runner injects its own
           # /var/run/docker.sock for container management. DOCKER_HOST is set
           # per-step (not via GITHUB_ENV) to avoid breaking the runner.
-          dockerd --host unix:///var/run/dind.sock &>/var/log/dockerd.log &
+          nohup dockerd --host unix:///var/run/dind.sock &>/var/log/dockerd.log &
           echo "Waiting for Docker daemon..."
           export DOCKER_HOST=unix:///var/run/dind.sock
           timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
