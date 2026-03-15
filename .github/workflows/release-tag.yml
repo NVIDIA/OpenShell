@@ -177,7 +177,7 @@ jobs:
 
   publish-python:
     name: Publish Python
-    needs: [build-python-wheels]
+    needs: [build-python-wheels, e2e]
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     env:

@@ -731,10 +731,11 @@ enum GatewayCommands {
 
         /// Override the gateway host written into cluster metadata.
         ///
-        /// By default, local clusters advertise 127.0.0.1. In environments
-        /// where the test runner cannot reach 127.0.0.1 on the Docker host
-        /// (e.g., CI containers), set this to a reachable hostname such as
-        /// `host.docker.internal`.
+        /// By default, local clusters advertise 127.0.0.1. Set this when
+        /// the client cannot reach the Docker host at 127.0.0.1 — for
+        /// example in CI containers, WSL, or when Docker runs on a
+        /// remote host. Common values: `host.docker.internal`, a LAN IP,
+        /// or a hostname.
         #[arg(long)]
         gateway_host: Option<String>,
 

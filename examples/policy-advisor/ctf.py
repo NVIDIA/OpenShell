@@ -155,9 +155,9 @@ GATES: list[dict] = [
     {
         "num": 7,
         "name": "The Vault",
-        "host": "gitlab-master.nvidia.com",
+        "host": "internal.corp.example.com",
         "port": 443,
-        "url": "https://gitlab-master.nvidia.com/",
+        "url": "https://internal.corp.example.com/",
         "method": "GET",
         "headers": {"User-Agent": "openshell-ctf"},
         "body": None,

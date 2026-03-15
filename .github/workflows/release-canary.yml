@@ -91,6 +91,10 @@ jobs:
           fi
 
       - name: Start gateway
+        env:
+          # Use OPENSHELL_GATEWAY_HOST when supported (CLI >= next release),
+          # fall back to the explicit --gateway-host flag for older CLIs.
+          OPENSHELL_GATEWAY_HOST: host.docker.internal
         run: openshell gateway start --gateway-host host.docker.internal
 
       - name: Run canary test

@@ -47,7 +47,7 @@ the script progresses through each gate.
 | 4 | The Oracle | `api.github.com:443` | Concurrent with 5 and 6 |
 | 5 | The Jester | `icanhazdadjoke.com:443` | Concurrent with 4 and 6 |
 | 6 | The Sphinx | `catfact.ninja:443` | Concurrent with 4 and 5 |
-| 7 | The Vault | `gitlab-master.nvidia.com:443` | Internal IP -- mapper adds `allowed_ips` |
+| 7 | The Vault | `internal.corp.example.com:443` | Internal IP -- mapper adds `allowed_ips` |
 
 Gates 1-3 run sequentially so you can observe the single-approval flow.
 Gate 3 uses `curl` to hit `ifconfig.me:80` -- a different endpoint that only
@@ -123,7 +123,7 @@ Gate 3 uses `curl` to reach `ifconfig.me:80`.  You'll see a new rule for
 When Gates 4-6 start, all three denials arrive together.  Press `A` to approve
 all pending recommendations at once.
 
-Gate 7 requires `allowed_ips` because `gitlab-master.nvidia.com` resolves to a
+Gate 7 requires `allowed_ips` because `internal.corp.example.com` resolves to a
 private IP.  The mapper detects this automatically and includes the resolved IPs
 in the proposed rule.
 
