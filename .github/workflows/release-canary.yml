@@ -81,16 +81,12 @@ jobs:
           # container's daemon, so 127.0.0.1 port bindings are reachable
           # directly — no --gateway-host workaround needed.
           #
-          # We listen on a dedicated socket and set DOCKER_HOST so that the
-          # openshell CLI (and bollard) connects to our DinD daemon rather
-          # than the GitHub Actions runner's injected host socket.
-          export DOCKER_HOST="unix:///var/run/dind.sock"
-          dockerd --host "$DOCKER_HOST" &>/var/log/dockerd.log &
-          echo "Waiting for Docker daemon on ${DOCKER_HOST}..."
-          timeout 30 sh -c 'until docker --host "$DOCKER_HOST" info >/dev/null 2>&1; do sleep 1; done'
+          # We start on the default socket (/var/run/docker.sock). Since we
+          # don't mount the host socket, this path is free inside the container.
+          dockerd &>/var/log/dockerd.log &
+          echo "Waiting for Docker daemon..."
+          timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
           echo "Docker daemon ready"
-          # Persist DOCKER_HOST for subsequent steps
-          echo "DOCKER_HOST=${DOCKER_HOST}" >> "$GITHUB_ENV"
 
       - name: Install CLI from GitHub Release
         run: ./install.sh
