@@ -61,9 +61,16 @@ jobs:
       component: cluster
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
+  e2e:
+    needs: [build-gateway, build-cluster]
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      runner: build-arm64
+
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway, build-cluster]
+    needs: [build-gateway, build-cluster, e2e]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -84,7 +91,7 @@ jobs:
 
   build-python-wheels:
     name: Stage Python Wheels
-    needs: [compute-versions, build-gateway, build-cluster]
+    needs: [compute-versions]
     runs-on: build-amd64
     timeout-minutes: 120
     outputs:

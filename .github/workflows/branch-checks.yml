@@ -1,8 +1,6 @@
-name: Checks
+name: Branch Checks
 
 on:
-  push:
-    branches: [main]
   pull_request:
 
 env:

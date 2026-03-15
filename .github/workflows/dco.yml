@@ -1,4 +1,5 @@
 name: "DCO Assistant"
+
 on:
   issue_comment:
     types: [created]

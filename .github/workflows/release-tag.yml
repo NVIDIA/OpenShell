@@ -42,7 +42,6 @@ jobs:
       cargo_version: ${{ steps.v.outputs.cargo }}
       # Semver without 'v' prefix (e.g. 0.6.0), used for image tags and release body
       semver: ${{ steps.v.outputs.semver }}
-      previous_tag: ${{ steps.prev.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -63,19 +62,6 @@ jobs:
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
           echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Find previous release tag
-        id: prev
-        run: |
-          set -euo pipefail
-          # List tags matching v*.*.* sorted by version descending, keep only
-          # stable releases (no pre-release suffixes like -rc1), skip the current tag
-          PREV=$(git tag --list 'v*.*.*' --sort=-version:refname \
-            | grep -P '^v\d+\.\d+\.\d+$' \
-            | grep -v "^${RELEASE_TAG}$" \
-            | head -n1 || true)
-          echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
-          echo "Previous release tag: ${PREV:-"(none, first release)"}"
-
   build-gateway:
     needs: [compute-versions]
     uses: ./.github/workflows/docker-build.yml
@@ -90,9 +76,16 @@ jobs:
       component: cluster
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
 
+  e2e:
+    needs: [build-gateway, build-cluster]
+    uses: ./.github/workflows/e2e-test.yml
+    with:
+      image-tag: ${{ github.sha }}
+      runner: build-arm64
+
   tag-ghcr-release:
     name: Tag GHCR Images for Release
-    needs: [compute-versions, build-gateway, build-cluster]
+    needs: [compute-versions, build-gateway, build-cluster, e2e]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
@@ -118,7 +111,7 @@ jobs:
 
   build-python-wheels:
     name: Stage Python Wheels
-    needs: [compute-versions, build-gateway, build-cluster]
+    needs: [compute-versions]
     runs-on: build-amd64
     timeout-minutes: 120
     outputs:
@@ -454,11 +447,9 @@ jobs:
           name: OpenShell ${{ env.RELEASE_TAG }}
           prerelease: false
           tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: false
+          generate_release_notes: true
           body: |
             ## OpenShell ${{ env.RELEASE_TAG }}
-
-            ${{ needs.compute-versions.outputs.previous_tag != '' && format('**Full changelog**: [{0}...{1}](https://github.com/{2}/compare/{0}...{1})', needs.compute-versions.outputs.previous_tag, env.RELEASE_TAG, github.repository) || '' }}
 
             ### Quick install
 

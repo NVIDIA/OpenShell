@@ -1,8 +1,6 @@
-name: E2E
+name: Branch E2E Checks
 
 on:
-  push:
-    branches: [main]
   pull_request:
     types: [opened, synchronize, reopened, labeled]
 
@@ -12,7 +10,7 @@ permissions:
 
 jobs:
   build-gateway:
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: gateway
@@ -20,7 +18,7 @@ jobs:
       runner: build-arm64
 
   build-cluster:
-    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'e2e')
+    if: contains(github.event.pull_request.labels.*.name, 'e2e')
     uses: ./.github/workflows/docker-build.yml
     with:
       component: cluster

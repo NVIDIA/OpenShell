@@ -1,4 +1,4 @@
-name: docs-preview-pr
+name: Docs PR Preview
 
 on:
     pull_request:
