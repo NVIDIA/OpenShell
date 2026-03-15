@@ -687,7 +687,10 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
 
         let result = check_port_available(&ForwardSpec::new(port));
-        assert!(result.is_err(), "expected error for IPv6-occupied port {port}");
+        assert!(
+            result.is_err(),
+            "expected error for IPv6-occupied port {port}"
+        );
         let msg = result.unwrap_err().to_string();
         assert!(
             msg.contains("already in use"),

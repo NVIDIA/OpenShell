@@ -1426,7 +1426,9 @@ async fn start_port_forwards(
         match result {
             Ok(Ok(true)) => {
                 if let Some(pid) = openshell_core::forward::find_ssh_forward_pid(&sid, port_val) {
-                    let _ = openshell_core::forward::write_forward_pid(&name, port_val, pid, &sid, &bind_addr);
+                    let _ = openshell_core::forward::write_forward_pid(
+                        &name, port_val, pid, &sid, &bind_addr,
+                    );
                 }
             }
             Ok(Ok(false)) => {

@@ -1583,10 +1583,7 @@ async fn main() -> Result<()> {
                             n
                         }
                         None => {
-                            eprintln!(
-                                "{} No active forward found for port {port}",
-                                "!".yellow(),
-                            );
+                            eprintln!("{} No active forward found for port {port}", "!".yellow(),);
                             return Ok(());
                         }
                     },
