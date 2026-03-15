@@ -92,7 +92,10 @@ jobs:
           # test because background processes don't survive across GHA steps
           # (each step runs via a separate docker-exec invocation).
           export DOCKER_HOST=unix:///var/run/dind.sock
-          dockerd --host "$DOCKER_HOST" &>/var/log/dockerd.log &
+          # Use vfs storage driver to avoid overlay-on-overlay failures
+          # (the GHA container already uses overlayfs, and overlayfs can't
+          # be stacked). VFS is slower but reliable for DinD.
+          dockerd --host "$DOCKER_HOST" --storage-driver=vfs &>/var/log/dockerd.log &
           echo "Waiting for Docker daemon..."
           timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
           echo "Docker daemon ready"
