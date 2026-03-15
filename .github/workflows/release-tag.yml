@@ -4,10 +4,21 @@ on:
   push:
     tags:
       - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to release (e.g. v0.0.4)"
+        required: true
+        type: string
 
 permissions:
   contents: write
   packages: write
+
+# Resolve the tag once: prefer the workflow_dispatch input, fall back to the
+# push-event ref.  Every job references this via env.RELEASE_TAG.
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
 
 defaults:
   run:
@@ -35,6 +46,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git
@@ -49,7 +61,7 @@ jobs:
           set -euo pipefail
           echo "python=$(uv run python tasks/scripts/release.py get-version --python)" >> "$GITHUB_OUTPUT"
           echo "cargo=$(uv run python tasks/scripts/release.py get-version --cargo)" >> "$GITHUB_OUTPUT"
-          echo "semver=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          echo "semver=${RELEASE_TAG#v}" >> "$GITHUB_OUTPUT"
 
       - name: Find previous release tag
         id: prev
@@ -59,7 +71,7 @@ jobs:
           # stable releases (no pre-release suffixes like -rc1), skip the current tag
           PREV=$(git tag --list 'v*.*.*' --sort=-version:refname \
             | grep -P '^v\d+\.\d+\.\d+$' \
-            | grep -v "^${GITHUB_REF_NAME}$" \
+            | grep -v "^${RELEASE_TAG}$" \
             | head -n1 || true)
           echo "tag=${PREV}" >> "$GITHUB_OUTPUT"
           echo "Previous release tag: ${PREV:-"(none, first release)"}"
@@ -131,6 +143,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Log in to GHCR
@@ -186,6 +199,7 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
+        ref: ${{ inputs.tag || github.ref }}
         fetch-depth: 0
 
     - uses: actions/setup-python@v5
@@ -272,6 +286,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git
@@ -358,6 +373,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.tag || github.ref }}
           fetch-depth: 0
 
       - name: Mark workspace safe for git
@@ -409,6 +425,8 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - name: Download all CLI artifacts
         uses: actions/download-artifact@v4
@@ -433,14 +451,14 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          name: OpenShell ${{ github.ref_name }}
+          name: OpenShell ${{ env.RELEASE_TAG }}
           prerelease: false
-          tag_name: ${{ github.ref_name }}
+          tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: false
           body: |
-            ## OpenShell ${{ github.ref_name }}
+            ## OpenShell ${{ env.RELEASE_TAG }}
 
-            ${{ needs.compute-versions.outputs.previous_tag != '' && format('**Full changelog**: [{0}...{1}](https://github.com/{2}/compare/{0}...{1})', needs.compute-versions.outputs.previous_tag, github.ref_name, github.repository) || '' }}
+            ${{ needs.compute-versions.outputs.previous_tag != '' && format('**Full changelog**: [{0}...{1}](https://github.com/{2}/compare/{0}...{1})', needs.compute-versions.outputs.previous_tag, env.RELEASE_TAG, github.repository) || '' }}
 
             ### Quick install
 
@@ -454,7 +472,7 @@ jobs:
                   Darwin-arm64)  ASSET="openshell-aarch64-apple-darwin.tar.gz" ;; \
                   *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;; \
                 esac; \
-                gh release download ${{ github.ref_name }} --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
+                gh release download ${{ env.RELEASE_TAG }} --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
                   | tar xz \
                   && sudo install -m 755 openshell /usr/local/bin/openshell'
             ```
