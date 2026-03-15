@@ -466,3 +466,48 @@ jobs:
             release/openshell-aarch64-apple-darwin.tar.gz
             release/*.whl
             release/openshell-checksums-sha256.txt
+
+  trigger-wheel-publish:
+    name: Trigger Wheel Publish
+    needs: [compute-versions, release-devel]
+    runs-on: [self-hosted, nv]
+    timeout-minutes: 10
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: python-wheels
+          path: release/
+
+      - name: Trigger GitLab CI
+        env:
+          GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
+          GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
+          RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          wheel_files=(release/*.whl)
+          if (( ${#wheel_files[@]} == 0 )); then
+            echo "No wheel artifacts found in release/" >&2
+            exit 1
+          fi
+
+          WHEEL_FILENAMES=$(printf '%s\n' "${wheel_files[@]##*/}" | paste -sd, -)
+          response=$(curl -X POST \
+            --fail \
+            --silent \
+            --show-error \
+            -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
+            -F "ref=main" \
+            -F "variables[PIPELINE_ACTION]=publish_wheels" \
+            -F "variables[GITHUB_REPOSITORY]=${GITHUB_REPOSITORY}" \
+            -F "variables[COMMIT_SHA]=${GITHUB_SHA}" \
+            -F "variables[RELEASE_TAG]=devel" \
+            -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
+            -F "variables[RELEASE_KIND]=dev" \
+            -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
+            "${GITLAB_CI_TRIGGER_URL}")
+          pipeline_id=$(printf '%s' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+          pipeline_status=$(printf '%s' "$response" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+          echo "Triggered GitLab pipeline ${pipeline_id:-unknown} with status=${pipeline_status:-unknown}"
