@@ -77,8 +77,9 @@ RUN curl https://mise.run | sh
 COPY mise.toml /opt/mise/mise.toml
 COPY tasks/ /opt/mise/tasks/
 WORKDIR /opt/mise
-ARG MISE_GITHUB_TOKEN
-RUN mise trust /opt/mise/mise.toml && \
+RUN --mount=type=secret,id=MISE_GITHUB_TOKEN \
+    export MISE_GITHUB_TOKEN="$(cat /run/secrets/MISE_GITHUB_TOKEN 2>/dev/null || true)" && \
+    mise trust /opt/mise/mise.toml && \
     env -u RUSTC_WRAPPER mise install && \
     /root/.cargo/bin/rustup component remove rust-docs || true && \
     rm -rf /root/.rustup/toolchains/*/share/doc /root/.rustup/toolchains/*/share/man

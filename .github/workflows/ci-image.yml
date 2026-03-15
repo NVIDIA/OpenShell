@@ -36,10 +36,12 @@ jobs:
         uses: ./.github/actions/setup-buildx
 
       - name: Build and push CI image
+        env:
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
-            --build-arg MISE_GITHUB_TOKEN=${{ secrets.GITHUB_TOKEN }} \
+            --secret id=MISE_GITHUB_TOKEN,env=MISE_GITHUB_TOKEN \
             --push \
             -t ${{ env.CI_IMAGE }}:${{ github.sha }} \
             -t ${{ env.CI_IMAGE }}:latest \
