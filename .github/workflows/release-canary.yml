@@ -35,16 +35,14 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
-    # Run with Docker-in-Docker: the CI container starts its own dockerd so
-    # the gateway cluster container is a child process. This means 127.0.0.1
-    # port bindings are reachable directly, matching the real user experience
-    # without needing --gateway-host workarounds.
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
     env:
       OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -73,32 +71,43 @@ jobs:
             fi
           fi
 
-      - name: Install CLI from GitHub Release
-        run: ./install.sh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENSHELL_VERSION: ${{ steps.release.outputs.tag }}
+      - name: Install CLI
+        run: |
+          # For workflow_dispatch (manual/branch testing), build from source
+          # so we test the code on this branch. For workflow_run (release
+          # testing), install the published binary.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Building CLI from source..."
+            cargo build --release -p openshell-cli
+            cp target/release/openshell /usr/local/bin/openshell
+          else
+            GH_TOKEN="${{ secrets.GITHUB_TOKEN }}" \
+            OPENSHELL_VERSION="${{ steps.release.outputs.tag }}" \
+              ./install.sh
+          fi
 
       - name: Verify CLI installation
         run: openshell --version
 
+      - name: Resolve gateway host
+        run: |
+          # On Linux CI runners host.docker.internal is not set automatically
+          # (it's a Docker Desktop feature). Add it via the Docker bridge IP.
+          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
+            BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+            echo "Adding /etc/hosts entry: ${BRIDGE_IP} host.docker.internal"
+            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
+          fi
+
       - name: Run canary test
+        env:
+          # The CI container uses Docker-outside-of-Docker (host socket mount),
+          # so the gateway container is a sibling on the host. 127.0.0.1 inside
+          # the CI container doesn't reach it — OPENSHELL_GATEWAY_HOST tells
+          # the auto-bootstrap to advertise host.docker.internal instead.
+          OPENSHELL_GATEWAY_HOST: host.docker.internal
         run: |
           set -euo pipefail
-
-          # Start our own dockerd for Docker-in-Docker. The GHA runner injects
-          # its own /var/run/docker.sock for container management, so we use a
-          # dedicated socket. We start dockerd in the same step as the canary
-          # test because background processes don't survive across GHA steps
-          # (each step runs via a separate docker-exec invocation).
-          export DOCKER_HOST=unix:///var/run/dind.sock
-          # Use vfs storage driver to avoid overlay-on-overlay failures
-          # (the GHA container already uses overlayfs, and overlayfs can't
-          # be stacked). VFS is slower but reliable for DinD.
-          dockerd --host "$DOCKER_HOST" --storage-driver=vfs &>/var/log/dockerd.log &
-          echo "Waiting for Docker daemon..."
-          timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
-          echo "Docker daemon ready"
 
           # Single-command canary: tests the full zero-to-sandbox path.
           # With no gateway configured, `sandbox create` auto-bootstraps a
@@ -110,9 +119,6 @@ jobs:
             EXIT_CODE=$?
             echo "::error::openshell sandbox create failed with exit code ${EXIT_CODE}"
             echo "$OUTPUT"
-            echo ""
-            echo "--- dockerd logs ---"
-            cat /var/log/dockerd.log || true
             exit $EXIT_CODE
           }
 
