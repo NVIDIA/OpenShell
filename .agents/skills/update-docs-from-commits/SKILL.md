@@ -21,7 +21,7 @@ Scan recent git history for commits that affect user-facing behavior and draft d
 
 ## Step 1: Identify Relevant Commits
 
-Determine the commit range. The user may provide one explicitly (e.g., "since v0.2.0" or "last 30 commits"). If not, default to commits since the last release tag or the last 50 commits, whichever is smaller.
+Determine the commit range. The user may provide one explicitly (e.g., "since v0.2.0" or "last 30 commits"). If not, default to commits since the head of the main branch.
 
 ```bash
 # Commits since a tag
@@ -95,7 +95,6 @@ Write the doc update following the rules in `docs/CONTRIBUTING.md`. Key reminder
 - **No em dashes** unless used sparingly. Prefer commas or separate sentences.
 - **Start sections with an introductory sentence** that orients the reader.
 - **No superlatives.** Say what the feature does, not how great it is.
-- **One sentence per line** in the source (for clean diffs).
 - **Code examples use `console` language** with `$` prompt prefix.
 - **Include the SPDX header** if creating a new page.
 - **Match existing frontmatter format** if creating a new page.
