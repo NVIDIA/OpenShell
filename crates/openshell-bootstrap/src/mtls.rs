@@ -1,15 +1,16 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::paths::xdg_config_dir;
 use crate::pki::PkiBundle;
 use miette::{IntoDiagnostic, Result};
+use openshell_core::paths::{create_dir_restricted, set_file_owner_only, xdg_config_dir};
 use std::path::PathBuf;
 
 /// Store the PKI bundle's client materials (ca.crt, tls.crt, tls.key) to the
 /// local filesystem so the CLI can use them for mTLS connections.
 ///
 /// Files are written atomically: temp dir -> validate -> rename over target.
+/// Directories are created with `0o700` and `tls.key` is set to `0o600`.
 pub fn store_pki_bundle(name: &str, bundle: &PkiBundle) -> Result<()> {
     let dir = cli_mtls_dir(name)?;
     let temp_dir = cli_mtls_temp_dir(name)?;
@@ -21,9 +22,9 @@ pub fn store_pki_bundle(name: &str, bundle: &PkiBundle) -> Result<()> {
             .map_err(|e| e.wrap_err(format!("failed to remove {}", temp_dir.display())))?;
     }
 
-    std::fs::create_dir_all(&temp_dir)
-        .into_diagnostic()
-        .map_err(|e| e.wrap_err(format!("failed to create {}", temp_dir.display())))?;
+    // Create the temp dir with restricted permissions so the private key
+    // is never world-readable, even momentarily.
+    create_dir_restricted(&temp_dir)?;
 
     std::fs::write(temp_dir.join("ca.crt"), &bundle.ca_cert_pem)
         .into_diagnostic()
@@ -34,6 +35,9 @@ pub fn store_pki_bundle(name: &str, bundle: &PkiBundle) -> Result<()> {
     std::fs::write(temp_dir.join("tls.key"), &bundle.client_key_pem)
         .into_diagnostic()
         .map_err(|e| e.wrap_err("failed to write tls.key"))?;
+
+    // Restrict the private key to owner-only.
+    set_file_owner_only(&temp_dir.join("tls.key"))?;
 
     validate_cli_mtls_bundle_dir(&temp_dir)?;
 
@@ -60,6 +64,9 @@ pub fn store_pki_bundle(name: &str, bundle: &PkiBundle) -> Result<()> {
         }
         return Err(err);
     }
+
+    // Ensure the final directory also has restricted permissions after rename.
+    create_dir_restricted(&dir)?;
 
     if had_backup {
         std::fs::remove_dir_all(&backup_dir)

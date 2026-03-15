@@ -150,13 +150,7 @@ fn sanitize_name(value: &str) -> String {
 }
 
 fn xdg_config_dir() -> Result<PathBuf> {
-    if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-        return Ok(PathBuf::from(path));
-    }
-    let home = std::env::var("HOME")
-        .into_diagnostic()
-        .wrap_err("HOME is not set")?;
-    Ok(PathBuf::from(home).join(".config"))
+    openshell_core::paths::xdg_config_dir()
 }
 
 pub fn require_tls_materials(server: &str, tls: &TlsOptions) -> Result<TlsMaterials> {

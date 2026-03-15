@@ -773,15 +773,9 @@ fn render_ssh_config(gateway: &str, name: &str) -> String {
 }
 
 fn openshell_ssh_config_path() -> Result<PathBuf> {
-    let base = if let Ok(path) = std::env::var("XDG_CONFIG_HOME") {
-        PathBuf::from(path)
-    } else {
-        let home = std::env::var("HOME")
-            .into_diagnostic()
-            .wrap_err("HOME is not set")?;
-        PathBuf::from(home).join(".config")
-    };
-    Ok(base.join("openshell").join("ssh_config"))
+    Ok(openshell_core::paths::xdg_config_dir()?
+        .join("openshell")
+        .join("ssh_config"))
 }
 
 fn user_ssh_config_path() -> Result<PathBuf> {
@@ -905,9 +899,7 @@ pub fn install_ssh_config(gateway: &str, name: &str) -> Result<PathBuf> {
     ensure_openshell_include(&main_config, &managed_config)?;
 
     if let Some(parent) = managed_config.parent() {
-        fs::create_dir_all(parent)
-            .into_diagnostic()
-            .wrap_err("failed to create OpenShell config directory")?;
+        openshell_core::paths::create_dir_restricted(parent)?;
     }
 
     let alias = host_alias(name);

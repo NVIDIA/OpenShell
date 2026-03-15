@@ -473,10 +473,7 @@ async fn connect_to_gateway(name: &str, endpoint: &str) -> Result<Channel> {
 
 /// Resolve the mTLS cert directory for a gateway.
 fn gateway_mtls_dir(name: &str) -> Option<PathBuf> {
-    let config_dir = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".config")))
-        .ok()?;
+    let config_dir = openshell_core::paths::xdg_config_dir().ok()?;
     Some(
         config_dir
             .join("openshell")
