@@ -10,9 +10,10 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use openshell_e2e::harness::binary::openshell_cmd;
-use openshell_e2e::harness::port::{find_free_port, wait_for_port};
+use openshell_e2e::harness::port::find_free_port;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
+use tokio::time::{interval, timeout};
 
 const INFERENCE_PROVIDER_NAME: &str = "e2e-host-inference";
 const TEST_SERVER_IMAGE: &str = "python:3.13-alpine";
@@ -106,12 +107,43 @@ HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
             ));
         }
 
-        wait_for_port("127.0.0.1", port, Duration::from_secs(30)).await?;
-
-        Ok(Self {
+        let server = Self {
             port,
             container_id: stdout,
+        };
+        server.wait_until_ready().await?;
+        Ok(server)
+    }
+
+    async fn wait_until_ready(&self) -> Result<(), String> {
+        let container_id = self.container_id.clone();
+        timeout(Duration::from_secs(30), async move {
+            let mut tick = interval(Duration::from_millis(500));
+            loop {
+                tick.tick().await;
+                let output = Command::new("docker")
+                    .args([
+                        "exec",
+                        &container_id,
+                        "python3",
+                        "-c",
+                        "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000', timeout=1).read()",
+                    ])
+                    .output();
+
+                match output {
+                    Ok(result) if result.status.success() => return Ok(()),
+                    Ok(_) | Err(_) => continue,
+                }
+            }
         })
+        .await
+        .map_err(|_| {
+            format!(
+                "docker test server {} did not become ready within 30s",
+                self.container_id
+            )
+        })?
     }
 }
 
