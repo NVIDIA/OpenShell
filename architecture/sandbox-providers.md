@@ -274,7 +274,7 @@ for (key, value) in provider_env {
 
 This uses `tokio::process::Command`. The `.env()` call adds each variable to the child's
 inherited environment without clearing it. The spawn path also explicitly removes
-`NEMOCLAW_SSH_HANDSHAKE_SECRET` so the handshake secret does not leak into the agent
+`OPENSHELL_SSH_HANDSHAKE_SECRET` so the handshake secret does not leak into the agent
 entrypoint process.
 
 After provider env vars, proxy env vars (`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`,
@@ -370,7 +370,7 @@ Providers are stored with `object_type = "provider"` in the shared object store.
   provider store and are fetched at runtime by the sandbox supervisor.
 - Child processes never receive the raw provider secret values; they only receive
   placeholders, and the supervisor resolves those placeholders during outbound proxying.
-- `NEMOCLAW_SSH_HANDSHAKE_SECRET` is required by the supervisor/SSH server path but is
+- `OPENSHELL_SSH_HANDSHAKE_SECRET` is required by the supervisor/SSH server path but is
   explicitly kept out of spawned sandbox child-process environments.
 
 ## Test Strategy

@@ -22,7 +22,7 @@ use std::process::Stdio;
 use tokio::process::{Child, Command};
 use tracing::{debug, warn};
 
-const SSH_HANDSHAKE_SECRET_ENV: &str = "NEMOCLAW_SSH_HANDSHAKE_SECRET";
+const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
 
 fn inject_provider_env(cmd: &mut Command, provider_env: &HashMap<String, String>) {
     for (key, value) in provider_env {
