@@ -19,6 +19,9 @@ const SUBNET_PREFIX: &str = "10.200.0";
 const HOST_IP_SUFFIX: u8 = 1;
 const SANDBOX_IP_SUFFIX: u8 = 2;
 
+/// Default proxy port for bypass detection rules.
+const DEFAULT_PROXY_PORT: u16 = 3128;
+
 /// Handle to a network namespace with veth pair.
 ///
 /// The namespace and veth interfaces are automatically cleaned up on drop.
@@ -223,6 +226,219 @@ impl NetworkNamespace {
     pub const fn ns_fd(&self) -> Option<RawFd> {
         self.ns_fd
     }
+
+    /// Install iptables rules for bypass detection inside the namespace.
+    ///
+    /// Sets up OUTPUT chain rules that:
+    /// 1. ACCEPT traffic destined for the proxy (host_ip:proxy_port)
+    /// 2. ACCEPT loopback traffic
+    /// 3. ACCEPT established/related connections (response packets)
+    /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
+    ///
+    /// This provides two benefits:
+    /// - **Fast-fail UX**: applications get immediate ECONNREFUSED instead of
+    ///   a 30-second timeout when they bypass the proxy
+    /// - **Diagnostics**: iptables LOG entries are picked up by the bypass
+    ///   monitor to emit structured tracing events
+    ///
+    /// Degrades gracefully if `iptables` is not available — the namespace
+    /// still provides isolation via routing, just without fast-fail and
+    /// diagnostic logging.
+    pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
+        // Check if iptables is available before attempting to install rules.
+        if !iptables_available() {
+            warn!(
+                namespace = %self.name,
+                "iptables not found; bypass detection rules will not be installed. \
+                 Install the iptables package for proxy bypass diagnostics."
+            );
+            return Ok(());
+        }
+
+        let host_ip_str = self.host_ip.to_string();
+        let proxy_port_str = proxy_port.to_string();
+        let log_prefix = format!("openshell:bypass:{}:", &self.name);
+
+        info!(
+            namespace = %self.name,
+            proxy_addr = %format!("{}:{}", host_ip_str, proxy_port),
+            "Installing bypass detection rules"
+        );
+
+        // Install IPv4 rules (iptables)
+        if let Err(e) =
+            self.install_bypass_rules_for("iptables", &host_ip_str, &proxy_port_str, &log_prefix)
+        {
+            warn!(
+                namespace = %self.name,
+                error = %e,
+                "Failed to install IPv4 bypass detection rules"
+            );
+            return Err(e);
+        }
+
+        // Install IPv6 rules (ip6tables) — best-effort
+        if let Err(e) =
+            self.install_bypass_rules_for("ip6tables", &host_ip_str, &proxy_port_str, &log_prefix)
+        {
+            warn!(
+                namespace = %self.name,
+                error = %e,
+                "Failed to install IPv6 bypass detection rules (non-fatal)"
+            );
+            // IPv6 failure is non-fatal; IPv4 rules are the primary path.
+        }
+
+        info!(
+            namespace = %self.name,
+            "Bypass detection rules installed"
+        );
+
+        Ok(())
+    }
+
+    /// Install bypass detection rules for a specific iptables variant (iptables or ip6tables).
+    fn install_bypass_rules_for(
+        &self,
+        iptables_cmd: &str,
+        host_ip: &str,
+        proxy_port: &str,
+        log_prefix: &str,
+    ) -> Result<()> {
+        // Rule 1: ACCEPT traffic to the proxy
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-d",
+                &format!("{host_ip}/32"),
+                "-p",
+                "tcp",
+                "--dport",
+                proxy_port,
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+
+        // Rule 2: ACCEPT loopback traffic
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+        )?;
+
+        // Rule 3: ACCEPT established/related connections (response packets)
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+
+        // Rule 4: LOG TCP SYN bypass attempts (rate-limited)
+        // LOG rule failure is non-fatal — the REJECT rule still provides fast-fail.
+        if let Err(e) = run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "--syn",
+                "-m",
+                "limit",
+                "--limit",
+                "5/sec",
+                "--limit-burst",
+                "10",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                log_prefix,
+                "--log-uid",
+            ],
+        ) {
+            warn!(
+                error = %e,
+                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
+                 bypass REJECT rules will still be installed"
+            );
+        }
+
+        // Rule 5: REJECT TCP bypass attempts (fast-fail)
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "icmp-port-unreachable",
+            ],
+        )?;
+
+        // Rule 6: LOG UDP bypass attempts (rate-limited, covers DNS bypass)
+        if let Err(e) = run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "-m",
+                "limit",
+                "--limit",
+                "5/sec",
+                "--limit-burst",
+                "10",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                log_prefix,
+                "--log-uid",
+            ],
+        ) {
+            warn!(
+                error = %e,
+                "Failed to install LOG rule for UDP; bypass REJECT rules will still be installed"
+            );
+        }
+
+        // Rule 7: REJECT UDP bypass attempts (covers DNS bypass)
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "icmp-port-unreachable",
+            ],
+        )?;
+
+        Ok(())
+    }
 }
 
 impl Drop for NetworkNamespace {
@@ -297,6 +513,42 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run an iptables command inside a network namespace.
+fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    let mut full_args = vec!["netns", "exec", netns, iptables_cmd];
+    full_args.extend(args);
+
+    debug!(
+        command = %format!("ip {}", full_args.join(" ")),
+        "Running iptables in namespace"
+    );
+
+    let output = Command::new("ip")
+        .args(&full_args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "ip netns exec {} {} failed: {}",
+            netns,
+            iptables_cmd,
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Check if iptables is available on the system.
+fn iptables_available() -> bool {
+    Command::new("which")
+        .arg("iptables")
+        .output()
+        .is_ok_and(|o| o.status.success())
 }
 
 #[cfg(test)]

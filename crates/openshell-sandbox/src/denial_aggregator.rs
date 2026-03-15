@@ -28,7 +28,7 @@ pub struct DenialEvent {
     pub ancestors: Vec<String>,
     /// Reason for denial (e.g. "no matching policy", "internal address").
     pub deny_reason: String,
-    /// Denial stage: "connect", "forward", "ssrf", "l7".
+    /// Denial stage: "connect", "forward", "ssrf", "l7", "bypass".
     pub denial_stage: String,
     /// L7 request details (method, path, decision) if this is an L7 denial.
     pub l7_method: Option<String>,

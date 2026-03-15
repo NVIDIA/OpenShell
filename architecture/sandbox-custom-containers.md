@@ -98,7 +98,7 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 
 - **Log file fallback**: Attempts to open `/var/log/openshell.log` for append; silently falls back to stdout-only logging if the path is not writable.
 - **Command resolution**: Executes the command from CLI args, then the `OPENSHELL_SANDBOX_COMMAND` env var (set to `sleep infinity` by the server), then `/bin/bash` as a last resort.
-- **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable.
+- **Network namespace**: Requires successful namespace creation for proxy isolation; startup fails in proxy mode if required capabilities (`CAP_NET_ADMIN`, `CAP_SYS_ADMIN`) or `iproute2` are unavailable. If the `iptables` package is present, the supervisor installs OUTPUT chain rules (LOG + REJECT) inside the namespace to provide fast-fail behavior (immediate `ECONNREFUSED` instead of a 30-second timeout) and diagnostic logging when processes attempt direct connections that bypass the HTTP CONNECT proxy. If `iptables` is absent, the supervisor logs a warning and continues — core network isolation still works via routing.
 
 ## Design Decisions
 
@@ -114,6 +114,7 @@ The `openshell-sandbox` supervisor adapts to arbitrary environments:
 | Clear `run_as_user/group` for custom images | Prevents startup failure when the image lacks the default `sandbox` user |
 | Non-fatal log file init | `/var/log/openshell.log` may be unwritable in arbitrary images; falls back to stdout |
 | `docker save` / `ctr import` for push | Avoids requiring a registry for local dev; images land directly in the k3s containerd store |
+| Optional `iptables` for bypass detection | Core network isolation works via routing alone (`iproute2`); `iptables` only adds fast-fail (`ECONNREFUSED`) and diagnostic LOG entries. Making it optional avoids hard failures in minimal images that lack `iptables` while giving better UX when it is available. |
 
 ## Limitations
 

@@ -19,13 +19,14 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `identity.rs` | `BinaryIdentityCache` -- SHA256 trust-on-first-use binary integrity |
 | `procfs.rs` | `/proc` filesystem reading for TCP peer identity resolution and ancestor chain walking |
 | `grpc_client.rs` | gRPC client for fetching policy, provider environment, inference route bundles, policy polling/status reporting, proposal submission, and log push (`CachedOpenShellClient`) |
-| `denial_aggregator.rs` | `DenialAggregator` background task -- receives `DenialEvent`s from the proxy, deduplicates by `(host, port, binary)`, drains on flush interval |
+| `denial_aggregator.rs` | `DenialAggregator` background task -- receives `DenialEvent`s from the proxy and bypass monitor, deduplicates by `(host, port, binary)`, drains on flush interval |
 | `mechanistic_mapper.rs` | Deterministic policy recommendation generator -- converts denial summaries to `PolicyChunk` proposals with confidence scores, rationale, and SSRF/private-IP detection |
 | `sandbox/mod.rs` | Platform abstraction -- dispatches to Linux or no-op |
 | `sandbox/linux/mod.rs` | Linux composition: Landlock then seccomp |
 | `sandbox/linux/landlock.rs` | Filesystem isolation via Landlock LSM (ABI V1) |
 | `sandbox/linux/seccomp.rs` | Syscall filtering via BPF on `SYS_socket` |
-| `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, cleanup on drop |
+| `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
+| `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
 | `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion |
 | `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers |
@@ -55,10 +56,12 @@ flowchart TD
     H --> I{Proxy mode?}
     I -- Yes --> J[Generate ephemeral CA + write TLS files]
     J --> K[Create network namespace]
-    K --> K2[Build InferenceContext]
+    K --> K1[Install bypass detection rules]
+    K1 --> K2[Build InferenceContext]
     K2 --> L[Start HTTP CONNECT proxy]
     I -- No --> M[Skip proxy setup]
-    L --> N{SSH enabled?}
+    L --> L2[Spawn bypass monitor]
+    L2 --> N{SSH enabled?}
     M --> N
     N -- Yes --> O[Spawn SSH server task]
     N -- No --> P[Spawn child process]
@@ -96,7 +99,8 @@ flowchart TD
 6. **Network namespace** (Linux, proxy mode only):
    - `NetworkNamespace::create()` builds the veth pair and namespace
    - Opens `/var/run/netns/sandbox-{uuid}` as an FD for later `setns()`
-   - On failure: return a fatal startup error (fail-closed)
+   - `install_bypass_rules(proxy_port)` installs iptables OUTPUT chain rules for bypass detection (fast-fail UX + diagnostic logging). See [Bypass detection](#bypass-detection).
+   - On failure: return a fatal startup error (fail-closed). Bypass rule failure is non-fatal (logged as warning).
 
 7. **Proxy startup** (proxy mode only):
    - Validate that OPA engine and identity cache are present
@@ -475,15 +479,123 @@ Each step has rollback on failure -- if any `ip` command fails, previously creat
 2. Delete the host-side veth (`ip link delete veth-h-{id}`) -- this automatically removes the peer
 3. Delete the namespace (`ip netns delete sandbox-{id}`)
 
+#### Bypass detection
+
+**Files:** `crates/openshell-sandbox/src/sandbox/linux/netns.rs` (`install_bypass_rules()`), `crates/openshell-sandbox/src/bypass_monitor.rs`
+
+The network namespace routes all sandbox traffic through the veth pair, but a misconfigured process that ignores proxy environment variables can still attempt direct connections to the veth gateway IP or other addresses. Bypass detection catches these attempts, providing two benefits: immediate connection failure (fast-fail UX) instead of a 30-second TCP timeout, and structured diagnostic logging that identifies the offending process.
+
+##### iptables rules
+
+`install_bypass_rules()` installs OUTPUT chain rules inside the sandbox network namespace using `iptables` (IPv4) and `ip6tables` (IPv6, best-effort). Rules are installed via `ip netns exec {namespace} iptables ...`. The rules are evaluated in order:
+
+| # | Rule | Target | Purpose |
+|---|------|--------|---------|
+| 1 | `-d {host_ip}/32 -p tcp --dport {proxy_port}` | `ACCEPT` | Allow traffic to the proxy |
+| 2 | `-o lo` | `ACCEPT` | Allow loopback traffic |
+| 3 | `-m conntrack --ctstate ESTABLISHED,RELATED` | `ACCEPT` | Allow response packets for established connections |
+| 4 | `-p tcp --syn -m limit --limit 5/sec --limit-burst 10 --log-prefix "openshell:bypass:{ns}:"` | `LOG` | Log TCP SYN bypass attempts (rate-limited) |
+| 5 | `-p tcp` | `REJECT --reject-with icmp-port-unreachable` | Reject TCP bypass attempts (fast-fail) |
+| 6 | `-p udp -m limit --limit 5/sec --limit-burst 10 --log-prefix "openshell:bypass:{ns}:"` | `LOG` | Log UDP bypass attempts, including DNS (rate-limited) |
+| 7 | `-p udp` | `REJECT --reject-with icmp-port-unreachable` | Reject UDP bypass attempts (fast-fail) |
+
+The LOG rules use the `--log-uid` flag to include the UID of the process that initiated the connection. The log prefix `openshell:bypass:{namespace_name}:` enables the bypass monitor to filter `/dev/kmsg` for events belonging to a specific sandbox.
+
+The proxy port defaults to `3128` unless the policy specifies a different `http_addr`. IPv6 rules mirror the IPv4 rules via `ip6tables`; IPv6 rule installation failure is non-fatal (logged as warning) since IPv4 is the primary path.
+
+**Graceful degradation:** If iptables is not available (checked via `which iptables`), a warning is logged and rule installation is skipped entirely. The network namespace still provides isolation via routing — processes can only reach the proxy's IP, but without bypass rules they get a timeout rather than an immediate rejection. LOG rule failure is also non-fatal — if the `xt_LOG` kernel module is not loaded, the REJECT rules are still installed for fast-fail behavior.
+
+##### /dev/kmsg monitor
+
+`bypass_monitor::spawn()` starts a background tokio task (via `spawn_blocking`) that reads kernel log messages from `/dev/kmsg`. The monitor:
+
+1. Opens `/dev/kmsg` in read mode and seeks to end (skips historical messages)
+2. Reads lines via `BufReader`, filtering for the namespace-specific prefix `openshell:bypass:{namespace_name}:`
+3. Parses iptables LOG format via `parse_kmsg_line()`, extracting `DST`, `DPT`, `SPT`, `PROTO`, and `UID` fields
+4. Resolves process identity for TCP events via `procfs::resolve_tcp_peer_identity()` (best-effort — requires a valid entrypoint PID and non-zero source port)
+5. Emits a structured `tracing::warn!()` event with the tag `BYPASS_DETECT`
+6. Sends a `DenialEvent` to the denial aggregator channel (if available)
+
+The `BypassEvent` struct holds the parsed fields:
+
+```rust
+pub struct BypassEvent {
+    pub dst_addr: String,   // Destination IP address
+    pub dst_port: u16,      // Destination port
+    pub src_port: u16,      // Source port (for process identity resolution)
+    pub proto: String,      // "tcp" or "udp"
+    pub uid: Option<u32>,   // UID from --log-uid (if present)
+}
+```
+
+##### BYPASS_DETECT tracing event
+
+Each detected bypass attempt emits a `warn!()` log line with the following structured fields:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `dst_addr` | string | Destination IP address |
+| `dst_port` | u16 | Destination port |
+| `proto` | string | `"tcp"` or `"udp"` |
+| `binary` | string | Binary path of the offending process (or `"-"` if unresolved) |
+| `binary_pid` | string | PID of the offending process (or `"-"`) |
+| `ancestors` | string | Ancestor chain (e.g., `"/usr/bin/bash -> /usr/bin/node"`) or `"-"` |
+| `action` | string | Always `"reject"` |
+| `reason` | string | `"direct connection bypassed HTTP CONNECT proxy"` |
+| `hint` | string | Context-specific remediation hint (see below) |
+
+The `hint` field provides actionable guidance:
+
+| Condition | Hint |
+|-----------|------|
+| UDP + port 53 | `"DNS queries should route through the sandbox proxy; check resolver configuration"` |
+| UDP (other) | `"UDP traffic must route through the sandbox proxy"` |
+| TCP | `"ensure process honors HTTP_PROXY/HTTPS_PROXY; for Node.js set NODE_USE_ENV_PROXY=1"` |
+
+Process identity resolution is best-effort and TCP-only. For UDP events or when the entrypoint PID is not yet set (PID == 0), the binary, PID, and ancestors fields are reported as `"-"`.
+
+##### DenialEvent integration
+
+Each bypass event sends a `DenialEvent` to the denial aggregator with `denial_stage: "bypass"`. This integrates bypass detections into the same deduplication, aggregation, and policy proposal pipeline as proxy-level denials. The `DenialEvent` fields:
+
+| Field | Value |
+|-------|-------|
+| `host` | Destination IP address |
+| `port` | Destination port |
+| `binary` | Binary path (or `"-"`) |
+| `ancestors` | Ancestor chain parsed from `" -> "` separator |
+| `deny_reason` | `"direct connection bypassed HTTP CONNECT proxy"` |
+| `denial_stage` | `"bypass"` |
+| `l7_method` | `None` |
+| `l7_path` | `None` |
+
+The denial aggregator deduplicates bypass events by the same `(host, port, binary)` key used for proxy denials, and flushes them to the gateway via `SubmitPolicyAnalysis` on the same interval.
+
+##### Lifecycle wiring
+
+The bypass detection subsystem is wired in `crates/openshell-sandbox/src/lib.rs`:
+
+1. After `NetworkNamespace::create()` succeeds, `install_bypass_rules(proxy_port)` is called. Failure is non-fatal (logged as warning).
+2. The proxy's denial channel sender (`denial_tx`) is cloned as `bypass_denial_tx` before being passed to the proxy.
+3. After proxy startup, `bypass_monitor::spawn()` is called with the namespace name, entrypoint PID, and `bypass_denial_tx`. Returns `Option<JoinHandle>` — `None` if `/dev/kmsg` is unavailable.
+
+The monitor runs for the lifetime of the sandbox. It exits when `/dev/kmsg` reaches EOF (process termination) or encounters an unrecoverable read error.
+
+**Graceful degradation:** If `/dev/kmsg` cannot be opened (e.g., restricted container environment without access to the kernel ring buffer), the monitor logs a one-time warning and returns `None`. The iptables REJECT rules still provide fast-fail UX — the monitor only adds diagnostic visibility.
+
+##### Dependencies
+
+Bypass detection requires the `iptables` package for rule installation (in addition to `iproute2` for namespace management). If iptables is not installed, bypass detection degrades to routing-only isolation. The `/dev/kmsg` device is required for the monitor but not for the REJECT rules.
+
 #### Required capabilities
 
 | Capability | Purpose |
 |------------|---------|
 | `CAP_SYS_ADMIN` | Creating network namespaces, `setns()` |
-| `CAP_NET_ADMIN` | Creating veth pairs, assigning IPs, configuring routes |
+| `CAP_NET_ADMIN` | Creating veth pairs, assigning IPs, configuring routes, installing iptables bypass detection rules |
 | `CAP_SYS_PTRACE` | Proxy reading `/proc/<pid>/fd/` and `/proc/<pid>/exe` for processes running as a different user |
 
-The `iproute2` package must be installed (provides the `ip` command).
+The `iproute2` package must be installed (provides the `ip` command). The `iptables` package is required for bypass detection rules; if absent, the namespace still provides routing-based isolation but without fast-fail rejection or diagnostic logging for bypass attempts.
 
 If namespace creation fails (e.g., missing capabilities), startup fails in `Proxy` mode. This preserves fail-closed behavior: either network namespace isolation is active, or the sandbox does not run.
 
@@ -1087,6 +1199,12 @@ The sandbox uses `miette` for error reporting and `thiserror` for typed errors. 
 | Landlock failure + `HardRequirement` | Fatal |
 | Seccomp failure | Fatal |
 | Network namespace creation failure | Fatal in `Proxy` mode (sandbox startup aborts) |
+| Bypass detection: iptables not available | Warn + skip rule installation (routing-only isolation) |
+| Bypass detection: IPv4 rule installation failure | Warn + returned as error (non-fatal at call site) |
+| Bypass detection: IPv6 rule installation failure | Warn + continue (IPv4 rules are the primary path) |
+| Bypass detection: LOG rule installation failure | Warn + continue (REJECT rules still installed for fast-fail) |
+| Bypass detection: `/dev/kmsg` not available | Warn + monitor not started (REJECT rules still provide fast-fail) |
+| Bypass detection: `/dev/kmsg` read error (EPIPE/EIO) | Debug log + continue reading (kernel ring buffer overrun) |
 | Ephemeral CA generation failure | Warn + TLS termination disabled (L7 inspection on TLS endpoints will not work) |
 | CA file write failure | Warn + TLS termination disabled |
 | OPA engine Mutex lock poisoned | Error on the individual evaluation |
@@ -1125,8 +1243,9 @@ Dual-output logging is configured in `main.rs`:
 
 Key structured log events:
 - `CONNECT`: One per proxy CONNECT request (for non-`inference.local` targets) with full identity context. Inference interception failures produce a separate `info!()` log with `action=deny` and the denial reason.
+- `BYPASS_DETECT`: One per detected direct connection attempt that bypassed the HTTP CONNECT proxy. Includes destination, protocol, process identity (best-effort), and remediation hint. Emitted at `warn` level.
 - `L7_REQUEST`: One per L7-inspected request with method, path, and decision
-- Sandbox lifecycle events: process start, exit, namespace creation/cleanup
+- Sandbox lifecycle events: process start, exit, namespace creation/cleanup, bypass rule installation
 - Policy reload events: new version detected, reload success/failure, status report outcomes
 
 ## Log Streaming
@@ -1359,6 +1478,7 @@ Platform-specific code is abstracted through `crates/openshell-sandbox/src/sandb
 | Landlock | Applied via `landlock` crate (ABI V1) | Warning + no-op |
 | Seccomp | Applied via `seccompiler` crate | No-op |
 | Network namespace | Full veth pair isolation | Not available |
+| Bypass detection | iptables rules + `/dev/kmsg` monitor | Not available (no netns) |
 | `/proc` identity binding | Full support | `evaluate_opa_tcp()` always denies |
 | Proxy | Functional (binds to veth IP or loopback) | Functional (loopback only, no identity binding) |
 | SSH server | Full support (with netns for shell processes) | Functional (no netns isolation for shell processes) |
