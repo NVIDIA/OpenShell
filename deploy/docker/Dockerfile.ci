@@ -49,6 +49,16 @@ RUN case "$TARGETARCH" in \
       -o /usr/local/lib/docker/cli-plugins/docker-buildx \
     && chmod +x /usr/local/lib/docker/cli-plugins/docker-buildx
 
+# Install GitHub CLI used by install.sh and CI jobs
+ARG GH_VERSION=2.74.1
+RUN case "$TARGETARCH" in \
+      amd64) gh_arch=amd64 ;; \
+      arm64) gh_arch=arm64 ;; \
+      *) echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
+    esac \
+    && curl -fsSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_${gh_arch}.tar.gz" \
+    | tar xz --strip-components=2 -C /usr/local/bin "gh_${GH_VERSION}_linux_${gh_arch}/bin/gh"
+
 # Install AWS CLI v2 used for ECR publishing
 RUN case "$TARGETARCH" in \
       amd64) aws_arch=x86_64 ;; \

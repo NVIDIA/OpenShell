@@ -72,38 +72,10 @@ jobs:
           fi
 
       - name: Install CLI from GitHub Release
-        run: |
-          set -euo pipefail
-          TAG="${{ steps.release.outputs.tag }}"
-          ASSET_NAME="openshell-${{ matrix.target }}.tar.gz"
-          API="https://api.github.com/repos/${{ github.repository }}"
-
-          echo "Downloading ${ASSET_NAME} from release ${TAG}..."
-
-          # Look up the asset download URL via the releases API
-          ASSET_URL=$(curl -fsSL \
-            -H "Authorization: token ${GH_TOKEN}" \
-            "${API}/releases/tags/${TAG}" \
-            | jq -r --arg name "${ASSET_NAME}" \
-              '.assets[] | select(.name == $name) | .url')
-
-          if [ -z "$ASSET_URL" ] || [ "$ASSET_URL" = "null" ]; then
-            echo "::error::Asset ${ASSET_NAME} not found in release ${TAG}"
-            exit 1
-          fi
-
-          # Download the asset binary
-          curl -fsSL \
-            -H "Authorization: token ${GH_TOKEN}" \
-            -H "Accept: application/octet-stream" \
-            -o "/tmp/${ASSET_NAME}" \
-            "${ASSET_URL}"
-
-          tar -xzf "/tmp/${ASSET_NAME}" -C /tmp
-          install -m 755 /tmp/openshell /usr/local/bin/openshell
-          rm -f "/tmp/${ASSET_NAME}" /tmp/openshell
+        run: ./install.sh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENSHELL_VERSION: ${{ steps.release.outputs.tag }}
 
       - name: Verify CLI installation
         run: openshell --version
