@@ -387,6 +387,65 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
     assert_eq!(response.status, 200);
 }
 
+/// Regression test: when the client sends `anthropic-version`, the header must
+/// reach the upstream. Previously, the header was added to the strip list
+/// (because it appeared in `default_headers`) AND the default injection was
+/// skipped (because `already_sent` checked the *original* input), so neither
+/// the client's value nor the default reached the backend.
+#[tokio::test]
+async fn proxy_forwards_client_anthropic_version_header() {
+    let mock_server = MockServer::start().await;
+
+    // The upstream requires anthropic-version — wiremock will reject if missing.
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("x-api-key", "test-anthropic-key"))
+        .and(header("anthropic-version", "2024-10-22"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&mock_server)
+        .await;
+
+    let router = Router::new().unwrap();
+    let candidates = vec![ResolvedRoute {
+        name: "inference.local".to_string(),
+        endpoint: mock_server.uri(),
+        model: "claude-sonnet-4-20250514".to_string(),
+        api_key: "test-anthropic-key".to_string(),
+        protocols: vec!["anthropic_messages".to_string()],
+        auth: AuthHeader::Custom("x-api-key"),
+        default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+    }];
+
+    let body = serde_json::to_vec(&serde_json::json!({
+        "model": "claude-sonnet-4-20250514",
+        "max_tokens": 1,
+        "messages": [{"role": "user", "content": "hi"}]
+    }))
+    .unwrap();
+
+    // Client explicitly sends anthropic-version: 2024-10-22 — this value should
+    // reach the upstream, NOT be silently dropped.
+    let response = router
+        .proxy_with_candidates(
+            "anthropic_messages",
+            "POST",
+            "/v1/messages",
+            vec![
+                ("content-type".to_string(), "application/json".to_string()),
+                ("anthropic-version".to_string(), "2024-10-22".to_string()),
+            ],
+            bytes::Bytes::from(body),
+            &candidates,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        response.status, 200,
+        "upstream should have received anthropic-version header"
+    );
+}
+
 #[test]
 fn config_resolves_routes_with_protocol() {
     let config = RouterConfig {
