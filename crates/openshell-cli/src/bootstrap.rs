@@ -162,6 +162,16 @@ pub async fn run_bootstrap(
     {
         options = options.with_registry_token(token);
     }
+    // Read gateway host override from environment. In CI containers that use
+    // Docker-outside-of-Docker (socket mount), 127.0.0.1 inside the CI
+    // container doesn't reach the sibling gateway container. Setting
+    // OPENSHELL_GATEWAY_HOST=host.docker.internal (or the bridge IP) fixes
+    // this. The explicit `--gateway-host` flag is only on `gateway start`.
+    if let Ok(host) = std::env::var("OPENSHELL_GATEWAY_HOST")
+        && !host.trim().is_empty()
+    {
+        options = options.with_gateway_host(host);
+    }
     options = options.with_gpu(gpu);
 
     let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
