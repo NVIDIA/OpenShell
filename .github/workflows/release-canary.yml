@@ -75,15 +75,22 @@ jobs:
 
       - name: Start Docker daemon
         run: |
-          # Start dockerd for Docker-in-Docker. The CI container runs
+          # Start our own dockerd for Docker-in-Docker. The CI container runs
           # --privileged so the daemon can create networks and cgroups.
           # Using DinD means the gateway container is a child of this
           # container's daemon, so 127.0.0.1 port bindings are reachable
           # directly — no --gateway-host workaround needed.
-          dockerd &>/var/log/dockerd.log &
-          echo "Waiting for Docker daemon..."
-          timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+          #
+          # We listen on a dedicated socket and set DOCKER_HOST so that the
+          # openshell CLI (and bollard) connects to our DinD daemon rather
+          # than the GitHub Actions runner's injected host socket.
+          export DOCKER_HOST="unix:///var/run/dind.sock"
+          dockerd --host "$DOCKER_HOST" &>/var/log/dockerd.log &
+          echo "Waiting for Docker daemon on ${DOCKER_HOST}..."
+          timeout 30 sh -c 'until docker --host "$DOCKER_HOST" info >/dev/null 2>&1; do sleep 1; done'
           echo "Docker daemon ready"
+          # Persist DOCKER_HOST for subsequent steps
+          echo "DOCKER_HOST=${DOCKER_HOST}" >> "$GITHUB_ENV"
 
       - name: Install CLI from GitHub Release
         run: ./install.sh

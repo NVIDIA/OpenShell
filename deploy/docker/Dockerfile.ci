@@ -51,7 +51,7 @@ RUN case "$TARGETARCH" in \
     && curl -fsSL "https://download.docker.com/linux/static/stable/${docker_arch}/docker-${DOCKER_VERSION}.tgz" \
     | tar xz --strip-components=1 -C /usr/local/bin \
         docker/docker docker/dockerd docker/containerd \
-        docker/containerd-shim-runc-v2 docker/runc \
+        docker/containerd-shim-runc-v2 docker/runc docker/docker-proxy \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
     && curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${buildx_arch}" \
       -o /usr/local/lib/docker/cli-plugins/docker-buildx \
