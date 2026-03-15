@@ -162,11 +162,11 @@ pub async fn run_bootstrap(
     {
         options = options.with_registry_token(token);
     }
-    // Read gateway host override from environment. In CI containers that use
-    // Docker-outside-of-Docker (socket mount), 127.0.0.1 inside the CI
-    // container doesn't reach the sibling gateway container. Setting
-    // OPENSHELL_GATEWAY_HOST=host.docker.internal (or the bridge IP) fixes
-    // this. The explicit `--gateway-host` flag is only on `gateway start`.
+    // Read gateway host override from environment. Needed whenever the
+    // client cannot reach the Docker host at 127.0.0.1 — CI containers,
+    // WSL, remote Docker hosts, etc. The explicit `--gateway-host` flag
+    // is only on `gateway start`; this env var covers the auto-bootstrap
+    // path triggered by `sandbox create`.
     if let Ok(host) = std::env::var("OPENSHELL_GATEWAY_HOST")
         && !host.trim().is_empty()
     {

@@ -92,8 +92,8 @@ pub struct DeployOptions {
     /// Override the gateway host advertised in cluster metadata and passed to
     /// the server. When set, the metadata will use this host instead of
     /// `127.0.0.1` and the container will receive `SSH_GATEWAY_HOST`.
-    /// Useful in CI where `127.0.0.1` is not reachable from the test runner
-    /// (e.g., `host.docker.internal`).
+    /// Needed whenever the client cannot reach the Docker host at 127.0.0.1
+    /// — CI containers, WSL, remote Docker hosts, etc.
     pub gateway_host: Option<String>,
     /// Disable TLS entirely — the server listens on plaintext HTTP.
     pub disable_tls: bool,
