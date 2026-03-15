@@ -70,7 +70,7 @@ jobs:
 
   tag-ghcr-dev:
     name: Tag GHCR Images as Dev
-    needs: [build-gateway, build-cluster, e2e]
+    needs: [build-gateway, build-cluster]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:
