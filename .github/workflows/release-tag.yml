@@ -111,7 +111,7 @@ jobs:
 
   build-python-wheels:
     name: Stage Python Wheels
-    needs: [compute-versions, build-gateway, build-cluster]
+    needs: [compute-versions]
     runs-on: build-amd64
     timeout-minutes: 120
     outputs:
