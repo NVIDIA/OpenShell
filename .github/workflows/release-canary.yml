@@ -20,8 +20,8 @@ defaults:
     shell: bash
 
 jobs:
-  acceptance:
-    name: Canary (${{ matrix.arch }})
+  canary-auto-bootstrap:
+    name: Canary Auto-Bootstrap (${{ matrix.arch }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
@@ -117,5 +117,107 @@ jobs:
             echo "Canary test passed: 'hello world' found in output"
           else
             echo "::error::Canary test failed: 'hello world' not found in output"
+            exit 1
+          fi
+
+  canary-two-step:
+    name: Canary Two-Step (${{ matrix.arch }})
+    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: build-amd64
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: build-arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      OPENSHELL_GATEWAY_HOST: host.docker.internal
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Determine release tag
+        id: release
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.tag }}" >> "$GITHUB_OUTPUT"
+          else
+            WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+            if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
+              echo "tag=devel" >> "$GITHUB_OUTPUT"
+            elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
+              TAG="${{ github.event.workflow_run.head_branch }}"
+              if [ -z "$TAG" ]; then
+                echo "::error::Could not determine release tag from workflow_run"
+                exit 1
+              fi
+              echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            else
+              echo "::error::Unexpected triggering workflow: ${WORKFLOW_NAME}"
+              exit 1
+            fi
+          fi
+
+      - name: Install CLI from GitHub Release
+        run: ./install.sh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENSHELL_VERSION: ${{ steps.release.outputs.tag }}
+
+      - name: Verify CLI installation
+        run: openshell --version
+
+      - name: Resolve gateway host
+        run: |
+          # On Linux CI runners host.docker.internal is not set automatically
+          # (it's a Docker Desktop feature). Add it via the Docker bridge IP.
+          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
+            BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
+            echo "Adding /etc/hosts entry: ${BRIDGE_IP} host.docker.internal"
+            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
+          fi
+
+      - name: Start gateway
+        run: |
+          set -euo pipefail
+
+          # Two-step canary: explicitly start the gateway first, then create
+          # a sandbox against it. This tests the `gateway start` + `sandbox
+          # create` flow separately from the auto-bootstrap path.
+          echo "Starting gateway..."
+          openshell gateway start
+
+      - name: Run canary test
+        run: |
+          set -euo pipefail
+
+          echo "Creating sandbox against running gateway..."
+          OUTPUT=$(openshell sandbox create --no-keep --no-tty -- echo "hello world" 2>&1) || {
+            EXIT_CODE=$?
+            echo "::error::openshell sandbox create failed with exit code ${EXIT_CODE}"
+            echo "$OUTPUT"
+            exit $EXIT_CODE
+          }
+
+          echo "$OUTPUT"
+
+          if echo "$OUTPUT" | grep -q "hello world"; then
+            echo "Two-step canary test passed: 'hello world' found in output"
+          else
+            echo "::error::Two-step canary test failed: 'hello world' not found in output"
             exit 1
           fi
