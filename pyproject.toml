@@ -8,7 +8,7 @@ build-backend = "maturin"
 [project]
 name = "openshell"
 dynamic = ["version"]
-description = "OpenShell is a safe, private runtime for autonomous AI agents"
+description = "OpenShell is the safe, private runtime for autonomous AI agents. "
 license = "Apache-2.0"
 readme = "README.md"
 authors = [{ name = "NVIDIA Inc." }]
