@@ -312,7 +312,7 @@ async fn verify_provider_endpoint(
     route: &ResolvedProviderRoute,
 ) -> Result<ValidatedEndpoint, Status> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(15))
         .build()
         .map_err(|err| Status::internal(format!("build validation client failed: {err}")))?;
     let mut route = route.route.clone();

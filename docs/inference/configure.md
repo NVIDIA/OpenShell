@@ -135,7 +135,7 @@ Use this endpoint when inference should stay local to the host for privacy and s
 
 ### Verify the Endpoint from a Sandbox
 
-`openshell inference set` and `openshell inference update` verify the upstream endpoint by default before saving the configuration. If the endpoint is not live yet, try again with `--no-verify` to persist the route without the probe.
+`openshell inference set` and `openshell inference update` verify the resolved upstream endpoint by default before saving the configuration. If the endpoint is not live yet, retry with `--no-verify` to persist the route without the probe.
 
 `openshell inference get` confirms the current saved configuration. To confirm end-to-end connectivity from a sandbox, run:
 

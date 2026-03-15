@@ -304,6 +304,8 @@ Cluster inference commands:
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
 
+Inference writes verify by default. `--no-verify` is the explicit opt-out for endpoints that are not up yet.
+
 ## Provider Discovery
 
 Files:

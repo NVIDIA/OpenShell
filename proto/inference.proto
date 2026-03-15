@@ -58,6 +58,8 @@ message SetClusterInferenceRequest {
   string route_name = 3;
   // Verify the resolved upstream endpoint synchronously before persistence.
   bool verify = 4;
+  // Skip synchronous endpoint validation before persistence.
+  bool no_verify = 5;
 }
 
 message ValidatedEndpoint {
