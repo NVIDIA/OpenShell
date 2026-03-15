@@ -55,17 +55,7 @@ $ uv pip install openshell
 ```
 
 :::{tip}
-To find the CLI reference, run:
-- `openshell --help` to see all available commands.
-- `openshell <command> --help` for detailed usage of any subcommand.
-
-For example:
-
-```console
-$ openshell --help
-$ openshell gateway --help
-$ openshell sandbox create --help
-```
+Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags. You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
 :::
 
 ## Deploy a Gateway (Optional)
@@ -78,7 +68,7 @@ To start the gateway explicitly or deploy to a remote host, choose the tab that 
 ::::{tab-item} Brev
 
 :::{note}
-Deploy an OpenShell gateway on Brev by clicking **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT).
+Deploy an OpenShell gateway on Brev by clicking **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg).
 :::
 
 After the instance starts running, find the gateway URL in the Brev console under **Using Secure Links**.

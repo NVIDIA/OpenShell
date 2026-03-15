@@ -42,6 +42,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Triage | `triage-issue` | Assess, classify, and route community-filed issues |
 | Platform | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs |
 | Platform | `tui-development` | Development guide for the ratatui-based terminal UI |
+| Documentation | `update-docs-from-commits` | Scan recent commits and draft doc updates for user-facing changes |
 | Maintenance | `sync-agent-infra` | Detect and fix drift across agent-first infrastructure files |
 | Reference | `sbom` | Generate SBOMs and resolve dependency licenses |
 
@@ -153,13 +154,18 @@ These are the primary `mise` tasks for day-to-day development:
 ## Documentation
 
 If your change affects user-facing behavior (new flags, changed defaults, new features, bug fixes that contradict existing docs), update the relevant pages under `docs/` in the same PR.
-See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for the doc structure, style guide, and formatting rules.
 
-Build and preview docs locally:
+To ensure your doc changes follow NVIDIA documentation style, use the `update-docs-from-commits` skill.
+It scans commits, identifies doc pages that need updates, and drafts content that follows the style guide in `docs/CONTRIBUTING.md`.
+
+To build and preview docs locally:
 
 ```bash
-mise run docs
+mise run docs # to build the docs locally
+mise run docs:serve # to serve locally and automatically rebuild on changes
 ```
+
+See [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) for more details.
 
 ## Pull Requests
 

@@ -105,11 +105,9 @@ Install the CLI and create your first sandbox in two commands.
 </div>
 ```
 
-Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags.
-Run `openshell <command> --help` for detailed usage of any subcommand.
+Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags. You can also clone the [OpenShell repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
 
 Proceed to the [Quickstart](get-started/quickstart.md) for more details.
-
 
 ---
 
