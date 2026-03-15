@@ -10,8 +10,8 @@ use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, HostConfig, NetworkCreateRequest, NetworkDisconnectRequest,
-    PortBinding, VolumeCreateRequest,
+    ContainerCreateBody, DeviceRequest, HostConfig, HostConfigCgroupnsModeEnum,
+    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -523,6 +523,11 @@ pub async fn ensure_container(
 
     let mut host_config = HostConfig {
         privileged: Some(true),
+        // Use host cgroup namespace so k3s kubelet can manage cgroup controllers
+        // (cpu, cpuset, memory, pids, etc.) required for pod QoS. With cgroup v2
+        // and a private cgroupns, the controllers are not delegated into the
+        // container's namespace, causing kubelet ContainerManager to fail.
+        cgroupns_mode: Some(HostConfigCgroupnsModeEnum::HOST),
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
         network_mode: Some(network_name(name)),
