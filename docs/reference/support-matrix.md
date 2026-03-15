@@ -15,7 +15,7 @@ OpenShell publishes multi-architecture container images for `linux/amd64` and `l
 | -------------------------------- | --------------------- | --------- |
 | Linux (Debian/Ubuntu)            | x86_64 (amd64)        | Supported |
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
-| macOS (Docker Desktop / OrbStack)| Apple Silicon (arm64) | Supported |
+| macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
 
 ## Software Prerequisites
@@ -24,19 +24,7 @@ The following software must be installed on the host before using the OpenShell 
 
 | Component                       | Minimum Version | Notes                                           |
 | ------------------------------- | --------------- | ----------------------------------------------- |
-| Docker-compatible runtime       | 28.04           | Must be running before any `openshell` command. |
-
-Supported Docker-compatible runtimes:
-
-- [Docker Desktop](https://www.docker.com/products/docker-desktop) (macOS, Windows, Linux)
-- [OrbStack](https://orbstack.dev) (macOS) - lower memory usage alternative to Docker Desktop
-- [Docker Engine](https://docs.docker.com/engine/install/) (Linux)
-
-If your runtime uses a non-default Docker socket path, set the `DOCKER_HOST` environment variable:
-
-```bash
-export DOCKER_HOST=unix:///var/run/docker.sock
-```
+| Docker Desktop or Docker Engine | 28.04           | Must be running before any `openshell` command. |
 
 ## Sandbox Runtime Versions
 

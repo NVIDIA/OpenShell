@@ -32,9 +32,11 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 
 Before you begin, make sure you have:
 
-- Python 3.12 or later
-- [uv](https://docs.astral.sh/uv/) installed
-- A Docker-compatible runtime running on your machine ([Docker Desktop](https://www.docker.com/products/docker-desktop), [OrbStack](https://orbstack.dev), or [Docker Engine](https://docs.docker.com/engine/install/))
+- Python 3.12 or later.
+- [uv](https://docs.astral.sh/uv/) installed.
+- Docker Desktop running on your machine.
+
+For a complete list of requirements, refer to {doc}`../reference/support-matrix`.
 
 ## Install the OpenShell CLI
 
@@ -42,29 +44,45 @@ Install the `openshell` package into a virtual environment.
 
 Activate your virtual environment:
 
-```bash
-uv venv && source .venv/bin/activate
+```console
+$ uv venv && source .venv/bin/activate
 ```
 
 Install the CLI:
 
-```bash
-uv pip install openshell
+```console
+$ uv pip install openshell
 ```
 
-## Connect to a Remote Gateway (Optional)
+:::{tip}
+To find the CLI reference, run:
+- `openshell --help` to see all available commands.
+- `openshell <command> --help` for detailed usage of any subcommand.
 
-If you're running locally, skip this step. The OpenShell CLI creates a gateway automatically when you create your first sandbox.
+For example:
+
+```console
+$ openshell --help
+$ openshell gateway --help
+$ openshell sandbox create --help
+```
+:::
+
+## Deploy a Gateway (Optional)
+
+Running `openshell sandbox create` without a gateway auto-bootstraps a local one.
+To start the gateway explicitly or deploy to a remote host, choose the tab that matches your setup.
 
 :::::{tab-set}
 
 ::::{tab-item} Brev
 
 :::{note}
-Deploy an OpenShell gateway on Brev by hitting **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT).
+Deploy an OpenShell gateway on Brev by clicking **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3AaK9NmCzWp3pVyUDNNFBt805FT).
 :::
 
-After the instance is running, find the gateway URL in the Brev console under **Using Secure Links**. Copy the shareable URL for **port 8080** — this is the gateway endpoint.
+After the instance starts running, find the gateway URL in the Brev console under **Using Secure Links**.
+Copy the shareable URL for **port 8080**, which is the gateway endpoint.
 
 ```console
 $ openshell gateway add https://<your-port-8080-url>.brevlab.com
@@ -94,6 +112,7 @@ After `openshell status` shows the gateway as healthy, all subsequent commands r
 
 ## Create Your First OpenShell Sandbox
 
+Create a sandbox and launch an agent inside it.
 Choose the tab that matches your agent:
 
 ::::{tab-set}
@@ -106,7 +125,10 @@ Run the following command to create a sandbox with Claude Code:
 $ openshell sandbox create -- claude
 ```
 
-The CLI prompts you to create a provider from local credentials — type `yes` to continue. If `ANTHROPIC_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+The CLI prompts you to create a provider from local credentials.
+Type `yes` to continue.
+If `ANTHROPIC_API_KEY` is set in your environment, the CLI picks it up automatically.
+If not, you can configure it from inside the sandbox after it launches.
 :::
 
 :::{tab-item} OpenCode
@@ -117,7 +139,10 @@ Run the following command to create a sandbox with OpenCode:
 $ openshell sandbox create -- opencode
 ```
 
-The CLI prompts you to create a provider from local credentials. Type `yes` to continue. If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+The CLI prompts you to create a provider from local credentials.
+Type `yes` to continue.
+If `OPENAI_API_KEY` or `OPENROUTER_API_KEY` is set in your environment, the CLI picks it up automatically.
+If not, you can configure it from inside the sandbox after it launches.
 :::
 
 :::{tab-item} Codex
@@ -128,7 +153,10 @@ Run the following command to create a sandbox with Codex:
 $ openshell sandbox create -- codex
 ```
 
-The CLI prompts you to create a provider from local credentials. Type `yes` to continue. If `OPENAI_API_KEY` is set in your environment, it is picked up automatically. If not, you can configure it from inside the sandbox after it launches.
+The CLI prompts you to create a provider from local credentials.
+Type `yes` to continue.
+If `OPENAI_API_KEY` is set in your environment, the CLI picks it up automatically.
+If not, you can configure it from inside the sandbox after it launches.
 :::
 
 :::{tab-item} OpenClaw
@@ -139,12 +167,14 @@ Run the following command to create a sandbox with OpenClaw:
 $ openshell sandbox create --from openclaw
 ```
 
-The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog. Each definition bundles a container image, a tailored policy, and optional skills into a single package.
+The `--from` flag pulls a pre-built sandbox definition from the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog.
+Each definition bundles a container image, a tailored policy, and optional skills into a single package.
 :::
 
 :::{tab-item} Community Sandbox
 
-You can use the `--from` flag to pull other OpenShell sandbox images from the [NVIDIA Container Registry](https://registry.nvidia.com/). For example, to pull the `base` image, run the following command:
+Use the `--from` flag to pull other OpenShell sandbox images from the [NVIDIA Container Registry](https://registry.nvidia.com/).
+For example, to pull the `base` image, run the following command:
 
 ```console
 $ openshell sandbox create --from base

@@ -4,19 +4,19 @@ title:
   nav: First Network Policy
 description: See how OpenShell network policies work by creating a sandbox, observing default-deny in action, and applying a fine-grained L7 read-only rule.
 topics:
-- Generative AI
-- Cybersecurity
+  - Generative AI
+  - Cybersecurity
 tags:
-- Tutorial
-- Policy
-- Network Policy
-- Sandbox
-- Security
+  - Tutorial
+  - Policy
+  - Network Policy
+  - Sandbox
+  - Security
 content:
   type: tutorial
   difficulty: technical_beginner
   audience:
-  - engineer
+    - engineer
 ---
 
 <!--
@@ -38,7 +38,6 @@ After completing this tutorial, you understand:
 ## Prerequisites
 
 - A working OpenShell installation. Complete the {doc}`/get-started/quickstart` before proceeding.
-- A Docker-compatible runtime running on your machine (Docker Desktop, OrbStack, or Docker Engine).
 
 :::{tip}
 To run every step of this tutorial, you can also use the automated demo script at the [examples/sandbox-policy-quickstart](https://github.com/NVIDIA/OpenShell/blob/main/examples/sandbox-policy-quickstart) directory in the NVIDIA OpenShell repository. It runs the full walkthrough in under a minute but without any user interaction.
@@ -150,7 +149,7 @@ This tutorial uses `curl` and `read-only` access to keep things simple. When bui
 - To scope the policy to an agent, replace the `binaries` section with your agent's binary, such as `/usr/local/bin/claude`, instead of `curl`.
 - To grant write access, change `access: read-only` to `read-write` or add explicit `rules` for specific paths. Refer to the {doc}`/reference/policy-schema`.
 - To allow additional endpoints, stack multiple policies in the same file for PyPI, npm, or your internal APIs. Refer to {doc}`/sandboxes/policies` for examples.
-:::
+  :::
 
 ## Verify If GET Requests Are Allowed
 
@@ -183,7 +182,11 @@ $ curl -s -X POST https://api.github.com/repos/octocat/hello-world/issues \
 ```
 
 ```json
-{"error":"policy_denied","policy":"github-api-readonly","detail":"POST /repos/octocat/hello-world/issues not permitted by policy"}
+{
+  "error": "policy_denied",
+  "policy": "github-api-readonly",
+  "detail": "POST /repos/octocat/hello-world/issues not permitted by policy"
+}
 ```
 
 The CONNECT request succeeded because `api.github.com` is allowed, but the L7 proxy inspected the HTTP method and returned `403`. `POST` is not in the `read-only` preset. An agent with this policy can read code from GitHub but cannot create issues, push commits, or modify anything.
@@ -226,6 +229,7 @@ To run this entire walkthrough non-interactively, use the automated demo script:
 ```console
 $ bash examples/sandbox-policy-quickstart/demo.sh
 ```
+
 :::
 
 ## Next Steps
