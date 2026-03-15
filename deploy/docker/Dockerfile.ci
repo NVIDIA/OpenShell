@@ -17,9 +17,7 @@ ENV MISE_DATA_DIR=/opt/mise
 ENV MISE_CACHE_DIR=/opt/mise/cache
 ENV PATH="/opt/mise/shims:/root/.cargo/bin:/root/.local/bin:$PATH"
 
-# Install system dependencies.
-# iptables is required for Docker-in-Docker networking (dockerd uses it for
-# container NAT and bridge rules).
+# Install system dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
@@ -36,22 +34,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xz-utils \
     jq \
     rsync \
-    iptables \
     && rm -rf /var/lib/apt/lists/*
 
-# Install Docker CLI, daemon, and buildx plugin.
-# The full daemon (dockerd + containerd + runc) is needed for Docker-in-Docker
-# workflows like the release canary test, where the CI container runs its own
-# Docker daemon instead of mounting the host socket.
+# Install Docker CLI and buildx plugin used by CI jobs
 RUN case "$TARGETARCH" in \
       amd64) docker_arch=x86_64; buildx_arch=amd64 ;; \
       arm64) docker_arch=aarch64; buildx_arch=arm64 ;; \
       *) echo "Unsupported TARGETARCH: $TARGETARCH"; exit 1 ;; \
     esac \
     && curl -fsSL "https://download.docker.com/linux/static/stable/${docker_arch}/docker-${DOCKER_VERSION}.tgz" \
-    | tar xz --strip-components=1 -C /usr/local/bin \
-        docker/docker docker/dockerd docker/containerd \
-        docker/containerd-shim-runc-v2 docker/runc docker/docker-proxy \
+    | tar xz --strip-components=1 -C /usr/local/bin docker/docker \
     && mkdir -p /usr/local/lib/docker/cli-plugins \
     && curl -fsSL "https://github.com/docker/buildx/releases/download/${BUILDX_VERSION}/buildx-${BUILDX_VERSION}.linux-${buildx_arch}" \
       -o /usr/local/lib/docker/cli-plugins/docker-buildx \
