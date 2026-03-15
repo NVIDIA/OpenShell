@@ -79,24 +79,14 @@ async fn send_backend_request(
         }
     }
 
-    // Collect header names we need to strip (auth, host, and any default header
-    // names that will be set from route defaults).
-    let strip_headers: Vec<String> = {
-        let mut s = vec![
-            "authorization".to_string(),
-            "x-api-key".to_string(),
-            "host".to_string(),
-        ];
-        for (name, _) in &route.default_headers {
-            s.push(name.to_ascii_lowercase());
-        }
-        s
-    };
+    // Strip auth and host headers — auth is re-injected above from the route
+    // config, and host must match the upstream.
+    let strip_headers: [&str; 3] = ["authorization", "x-api-key", "host"];
 
-    // Forward non-sensitive headers (skip auth, host, and any we'll override)
+    // Forward non-sensitive headers.
     for (name, value) in &headers {
         let name_lc = name.to_ascii_lowercase();
-        if strip_headers.contains(&name_lc) {
+        if strip_headers.contains(&name_lc.as_str()) {
             continue;
         }
         builder = builder.header(name.as_str(), value.as_str());
