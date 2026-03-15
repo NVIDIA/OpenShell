@@ -48,7 +48,9 @@ pub use crate::ssh::{
     sandbox_connect, sandbox_connect_editor, sandbox_exec, sandbox_forward, sandbox_ssh_proxy,
     sandbox_ssh_proxy_by_name, sandbox_sync_down, sandbox_sync_up, sandbox_sync_up_files,
 };
-pub use openshell_core::forward::{list_forwards, stop_forward, stop_forwards_for_sandbox};
+pub use openshell_core::forward::{
+    find_forward_by_port, list_forwards, stop_forward, stop_forwards_for_sandbox,
+};
 
 /// Convert a sandbox phase integer to a human-readable string.
 fn phase_name(phase: i32) -> &'static str {

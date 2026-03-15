@@ -122,6 +122,30 @@ pub fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> boo
     sandbox_id.is_none_or(|id| cmd.contains(id))
 }
 
+/// Find the sandbox name that owns a forward on the given port.
+///
+/// Scans all PID files in the forwards directory for a file matching
+/// `*-<port>.pid`.  Ports are unique across sandboxes so at most one
+/// match is expected.
+pub fn find_forward_by_port(port: u16) -> Result<Option<String>> {
+    let dir = forward_pid_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    let suffix = format!("-{port}.pid");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if let Some(name) = file_name.strip_suffix(&suffix) {
+            if !name.is_empty() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+    }
+    Ok(None)
+}
+
 /// Stop a background port forward.
 pub fn stop_forward(name: &str, port: u16) -> Result<bool> {
     let pid_path = forward_pid_path(name, port)?;

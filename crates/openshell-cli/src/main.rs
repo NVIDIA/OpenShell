@@ -1377,7 +1377,7 @@ enum ForwardCommands {
         /// Port that was forwarded.
         port: u16,
 
-        /// Sandbox name (defaults to last-used sandbox).
+        /// Sandbox name (auto-detected from active forwards if omitted).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
     },
@@ -1575,8 +1575,22 @@ async fn main() -> Result<()> {
             command: Some(fwd_cmd),
         }) => match fwd_cmd {
             ForwardCommands::Stop { port, name } => {
-                let gateway_name = resolve_gateway_name(&cli.gateway).unwrap_or_default();
-                let name = resolve_sandbox_name(name, &gateway_name)?;
+                let name = match name {
+                    Some(n) => n,
+                    None => match run::find_forward_by_port(port)? {
+                        Some(n) => {
+                            eprintln!("→ Found forward on sandbox '{n}'");
+                            n
+                        }
+                        None => {
+                            eprintln!(
+                                "{} No active forward found for port {port}",
+                                "!".yellow(),
+                            );
+                            return Ok(());
+                        }
+                    },
+                };
                 if run::stop_forward(&name, port)? {
                     eprintln!(
                         "{} Stopped forward of port {port} for sandbox {name}",
