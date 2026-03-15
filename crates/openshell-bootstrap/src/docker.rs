@@ -91,6 +91,153 @@ pub fn normalize_arch(arch: &str) -> String {
     }
 }
 
+/// Result of a successful Docker preflight check.
+///
+/// Contains the validated Docker client and metadata about the daemon so
+/// callers can reuse the connection without re-checking.
+#[derive(Debug)]
+pub struct DockerPreflight {
+    /// A Docker client that has been verified as connected and responsive.
+    pub docker: Docker,
+    /// Docker daemon version string (e.g., "28.1.1").
+    pub version: Option<String>,
+}
+
+/// Well-known Docker socket paths to probe when the default fails.
+///
+/// These cover common container runtimes on macOS and Linux:
+/// - `/var/run/docker.sock` — default for Docker Desktop, `OrbStack`, Colima
+/// - `$HOME/.colima/docker.sock` — Colima (older installs)
+/// - `$HOME/.orbstack/run/docker.sock` — `OrbStack` (if symlink is missing)
+const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
+    "/var/run/docker.sock",
+    // Expanded at runtime via home_dir():
+    // ~/.colima/docker.sock
+    // ~/.orbstack/run/docker.sock
+];
+
+/// Check that a Docker-compatible runtime is installed, running, and reachable.
+///
+/// This is the primary preflight gate. It must be called before any gateway
+/// deploy work begins. On failure it produces a user-friendly error with
+/// actionable recovery steps instead of a raw bollard connection error.
+pub async fn check_docker_available() -> Result<DockerPreflight> {
+    // Step 1: Try to connect using bollard's default resolution
+    // (respects DOCKER_HOST, then falls back to /var/run/docker.sock).
+    let docker = match Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(err) => {
+            return Err(docker_not_reachable_error(
+                &format!("{err}"),
+                "Failed to create Docker client",
+            ));
+        }
+    };
+
+    // Step 2: Ping the daemon to confirm it's responsive.
+    if let Err(err) = docker.ping().await {
+        return Err(docker_not_reachable_error(
+            &format!("{err}"),
+            "Docker socket exists but the daemon is not responding",
+        ));
+    }
+
+    // Step 3: Query version info (best-effort — don't fail on this).
+    let version = match docker.version().await {
+        Ok(v) => v.version,
+        Err(_) => None,
+    };
+
+    Ok(DockerPreflight { docker, version })
+}
+
+/// Build a rich, user-friendly error when Docker is not reachable.
+fn docker_not_reachable_error(raw_err: &str, summary: &str) -> miette::Report {
+    let docker_host = std::env::var("DOCKER_HOST").ok();
+    let socket_exists = std::path::Path::new("/var/run/docker.sock").exists();
+
+    let mut hints: Vec<String> = Vec::new();
+
+    if !socket_exists && docker_host.is_none() {
+        // No socket and no DOCKER_HOST — likely nothing is installed or started
+        hints.push(
+            "No Docker socket found at /var/run/docker.sock and DOCKER_HOST is not set."
+                .to_string(),
+        );
+        hints.push(
+            "Install and start a Docker-compatible runtime. See the support matrix \
+             in the OpenShell docs for tested configurations."
+                .to_string(),
+        );
+
+        // Check for alternative sockets that might exist
+        let alt_sockets = find_alternative_sockets();
+        if !alt_sockets.is_empty() {
+            hints.push(format!(
+                "Found Docker-compatible socket(s) at alternative path(s):\n  {}\n\n  \
+                 Set DOCKER_HOST to use one, e.g.:\n\n    \
+                 export DOCKER_HOST=unix://{}",
+                alt_sockets.join("\n  "),
+                alt_sockets[0],
+            ));
+        }
+    } else if docker_host.is_some() {
+        // DOCKER_HOST is set but daemon didn't respond
+        let host_val = docker_host.unwrap();
+        hints.push(format!(
+            "DOCKER_HOST is set to '{host_val}' but the Docker daemon is not responding."
+        ));
+        hints.push(
+            "Verify your Docker runtime is started and the DOCKER_HOST value is correct."
+                .to_string(),
+        );
+    } else {
+        // Socket exists but daemon isn't responding
+        hints.push(
+            "Docker socket found at /var/run/docker.sock but the daemon is not responding."
+                .to_string(),
+        );
+        hints.push("Start your Docker runtime and try again.".to_string());
+    }
+
+    hints.push("Verify Docker is working with: docker info".to_string());
+
+    let help_text = hints.join("\n\n");
+
+    miette::miette!(help = help_text, "{summary}.\n\n  {raw_err}")
+}
+
+/// Probe for Docker-compatible sockets at non-default locations.
+fn find_alternative_sockets() -> Vec<String> {
+    let mut found = Vec::new();
+
+    // Check well-known static paths
+    for path in WELL_KNOWN_SOCKET_PATHS {
+        if std::path::Path::new(path).exists() {
+            found.push(path.to_string());
+        }
+    }
+
+    // Check home-relative paths
+    if let Some(home) = home_dir() {
+        let home_sockets = [
+            format!("{home}/.colima/docker.sock"),
+            format!("{home}/.orbstack/run/docker.sock"),
+        ];
+        for path in &home_sockets {
+            if std::path::Path::new(path).exists() && !found.contains(path) {
+                found.push(path.clone());
+            }
+        }
+    }
+
+    found
+}
+
+fn home_dir() -> Option<String> {
+    std::env::var("HOME").ok()
+}
+
 /// Create an SSH Docker client from remote options.
 pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> {
     // Ensure destination has ssh:// prefix
@@ -980,5 +1127,75 @@ mod tests {
             os: "linux".to_string(),
         };
         assert_eq!(platform.platform_string(), "linux/arm64");
+    }
+
+    #[test]
+    fn docker_not_reachable_error_no_socket_no_docker_host() {
+        // Simulate: no socket at default path, no DOCKER_HOST set.
+        // We can't guarantee /var/run/docker.sock state in CI, but we can
+        // verify the error message is well-formed and contains guidance.
+        let err =
+            docker_not_reachable_error("connection refused", "Failed to create Docker client");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("Failed to create Docker client"),
+            "should include the summary"
+        );
+        assert!(
+            msg.contains("connection refused"),
+            "should include the raw error"
+        );
+        // The message should always include the verification step
+        assert!(
+            msg.contains("docker info"),
+            "should suggest 'docker info' verification"
+        );
+    }
+
+    #[test]
+    fn docker_not_reachable_error_with_docker_host() {
+        // Simulate: DOCKER_HOST is set but daemon unresponsive.
+        // We set the env var temporarily (this is test-only).
+        let prev_docker_host = std::env::var("DOCKER_HOST").ok();
+        // SAFETY: test-only, single-threaded test runner for this test
+        unsafe {
+            std::env::set_var("DOCKER_HOST", "unix:///tmp/fake-docker.sock");
+        }
+
+        let err = docker_not_reachable_error(
+            "daemon not responding",
+            "Docker socket exists but the daemon is not responding",
+        );
+        let msg = format!("{err:?}");
+
+        // Restore env
+        // SAFETY: test-only, restoring previous state
+        unsafe {
+            match prev_docker_host {
+                Some(val) => std::env::set_var("DOCKER_HOST", val),
+                None => std::env::remove_var("DOCKER_HOST"),
+            }
+        }
+
+        assert!(
+            msg.contains("DOCKER_HOST"),
+            "should mention DOCKER_HOST when it is set"
+        );
+        assert!(
+            msg.contains("unix:///tmp/fake-docker.sock"),
+            "should show the current DOCKER_HOST value"
+        );
+    }
+
+    #[test]
+    fn find_alternative_sockets_returns_vec() {
+        // Verify the function runs without panic and returns a vec.
+        // Exact contents depend on the host system, so we just check the type.
+        let sockets = find_alternative_sockets();
+        // On any system, /var/run/docker.sock may or may not exist
+        assert!(
+            sockets.len() <= 10,
+            "should return a reasonable number of sockets"
+        );
     }
 }

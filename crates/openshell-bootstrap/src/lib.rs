@@ -30,8 +30,9 @@ use crate::constants::{
     volume_name,
 };
 use crate::docker::{
-    check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
+    check_docker_available, check_existing_gateway, check_port_conflicts,
+    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
+    start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -44,7 +45,7 @@ use crate::runtime::{
 };
 
 pub use crate::constants::container_name;
-pub use crate::docker::{ExistingGatewayInfo, create_ssh_docker_client};
+pub use crate::docker::{DockerPreflight, ExistingGatewayInfo, create_ssh_docker_client};
 pub use crate::metadata::{
     GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
     list_gateways, load_active_gateway, load_gateway_metadata, load_last_sandbox,
@@ -222,9 +223,11 @@ pub async fn check_existing_deployment(
     name: &str,
     remote: Option<&RemoteOptions>,
 ) -> Result<Option<ExistingGatewayInfo>> {
-    let docker = match remote {
-        Some(remote_opts) => create_ssh_docker_client(remote_opts).await?,
-        None => Docker::connect_with_local_defaults().into_diagnostic()?,
+    let docker = if let Some(remote_opts) = remote {
+        create_ssh_docker_client(remote_opts).await?
+    } else {
+        let preflight = check_docker_available().await?;
+        preflight.docker
     };
     check_existing_gateway(&docker, name).await
 }
@@ -258,16 +261,16 @@ where
         }
     };
 
-    // Create Docker client based on deployment mode
-    let (target_docker, remote_opts) = match &options.remote {
-        Some(remote_opts) => {
-            let remote = create_ssh_docker_client(remote_opts).await?;
-            (remote, Some(remote_opts.clone()))
-        }
-        None => (
-            Docker::connect_with_local_defaults().into_diagnostic()?,
-            None,
-        ),
+    // Create Docker client based on deployment mode.
+    // For local deploys, run a preflight check to fail fast with actionable
+    // guidance when Docker is not installed, not running, or unreachable.
+    let (target_docker, remote_opts) = if let Some(remote_opts) = &options.remote {
+        let remote = create_ssh_docker_client(remote_opts).await?;
+        (remote, Some(remote_opts.clone()))
+    } else {
+        log("[status] Checking Docker".to_string());
+        let preflight = check_docker_available().await?;
+        (preflight.docker, None)
     };
 
     // If an existing gateway is found, either tear it down (when recreate is

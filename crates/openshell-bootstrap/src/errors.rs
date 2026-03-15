@@ -155,12 +155,16 @@ const FAILURE_PATTERNS: &[FailurePattern] = &[
         match_mode: MatchMode::Any,
         diagnose: diagnose_certificate_issue,
     },
-    // Docker daemon not running
+    // Docker daemon not running or socket not found
     FailurePattern {
         matchers: &[
             "Cannot connect to the Docker daemon",
             "docker daemon is not running",
             "Is the docker daemon running",
+            "Socket not found",
+            "No such file or directory",
+            "Failed to create Docker client",
+            "Docker socket exists but the daemon is not responding",
         ],
         match_mode: MatchMode::Any,
         diagnose: diagnose_docker_not_running,
@@ -203,7 +207,7 @@ fn diagnose_no_default_route(_gateway_name: &str) -> GatewayFailureDiagnosis {
                 "Stop any container holding the gateway port (default 8080), then retry",
             ),
             RecoveryStep::with_command("Prune unused Docker networks", "docker network prune -f"),
-            RecoveryStep::new("Restart Docker Desktop (if on Mac/Windows)"),
+            RecoveryStep::new("Restart your Docker runtime"),
             RecoveryStep::new("Then retry: openshell gateway start"),
         ],
         retryable: true,
@@ -309,10 +313,7 @@ fn diagnose_oom_killed(_gateway_name: &str) -> GatewayFailureDiagnosis {
             The gateway requires at least 4GB of memory."
             .to_string(),
         recovery_steps: vec![
-            RecoveryStep::new(
-                "Increase Docker memory allocation to at least 4GB \
-                (Docker Desktop → Settings → Resources)",
-            ),
+            RecoveryStep::new("Increase Docker memory allocation to at least 4GB"),
             RecoveryStep::new("Close other memory-intensive applications"),
             RecoveryStep::new("Then retry: openshell gateway start"),
         ],
@@ -335,10 +336,7 @@ fn diagnose_node_pressure(gateway_name: &str) -> GatewayFailureDiagnosis {
                 "docker system prune -a --volumes",
             ),
             RecoveryStep::with_command("Check available memory on the host", "free -h"),
-            RecoveryStep::new(
-                "Increase Docker resource allocation \
-                (Docker Desktop → Settings → Resources), or free resources on the host",
-            ),
+            RecoveryStep::new("Increase Docker resource allocation or free resources on the host"),
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway after freeing resources",
                 format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
@@ -392,10 +390,16 @@ fn diagnose_certificate_issue(gateway_name: &str) -> GatewayFailureDiagnosis {
 fn diagnose_docker_not_running(_gateway_name: &str) -> GatewayFailureDiagnosis {
     GatewayFailureDiagnosis {
         summary: "Docker is not running".to_string(),
-        explanation: "The Docker daemon is not running or not accessible.".to_string(),
+        explanation: "The Docker daemon is not running or not accessible. OpenShell requires \
+            a Docker-compatible container runtime to manage gateway clusters."
+            .to_string(),
         recovery_steps: vec![
-            RecoveryStep::new("Start Docker Desktop (Mac/Windows) or the Docker service (Linux)"),
-            RecoveryStep::with_command("Verify Docker is running", "docker info"),
+            RecoveryStep::new("Start your Docker runtime"),
+            RecoveryStep::with_command("Verify Docker is accessible", "docker info"),
+            RecoveryStep::new(
+                "If using a non-default Docker socket, set DOCKER_HOST:\n     \
+                 export DOCKER_HOST=unix:///var/run/docker.sock",
+            ),
             RecoveryStep::new("Then retry: openshell gateway start"),
         ],
         retryable: true,
@@ -555,6 +559,61 @@ mod tests {
             d.summary.contains("pressure"),
             "expected pressure diagnosis, got: {}",
             d.summary
+        );
+    }
+
+    #[test]
+    fn test_diagnose_docker_not_running() {
+        let diagnosis = diagnose_failure("test", "Cannot connect to the Docker daemon", None);
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(d.summary.contains("Docker"));
+        assert!(d.retryable);
+    }
+
+    #[test]
+    fn test_diagnose_docker_socket_not_found() {
+        let diagnosis = diagnose_failure("test", "Socket not found: /var/run/docker.sock", None);
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(d.summary.contains("Docker"));
+        assert!(d.retryable);
+    }
+
+    #[test]
+    fn test_diagnose_docker_no_such_file() {
+        let diagnosis = diagnose_failure("test", "No such file or directory (os error 2)", None);
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(d.summary.contains("Docker"));
+    }
+
+    #[test]
+    fn test_diagnose_docker_preflight_error() {
+        let diagnosis = diagnose_failure(
+            "test",
+            "Failed to create Docker client.\n\n  connection error",
+            None,
+        );
+        assert!(diagnosis.is_some());
+        let d = diagnosis.unwrap();
+        assert!(d.summary.contains("Docker"));
+        assert!(d.retryable);
+    }
+
+    #[test]
+    fn test_diagnose_docker_recovery_mentions_docker_host() {
+        let diagnosis = diagnose_failure("test", "Cannot connect to the Docker daemon", None);
+        let d = diagnosis.unwrap();
+        let steps_text: String = d
+            .recovery_steps
+            .iter()
+            .map(|s| s.description.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            steps_text.contains("DOCKER_HOST"),
+            "recovery steps should mention DOCKER_HOST"
         );
     }
 

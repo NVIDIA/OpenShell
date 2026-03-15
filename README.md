@@ -5,7 +5,7 @@
 
 OpenShell is the safe, private runtime for autonomous AI agents. It provides sandboxed execution environments that protect your data, credentials, and infrastructure — governed by declarative YAML policies that prevent unauthorized file access, data exfiltration, and uncontrolled network activity.
 
-OpenShell is built agent-first.  The project ships with agent skills for everything from cluster debugging to policy generation, and we expect contributors to use them.
+OpenShell is built agent-first. The project ships with agent skills for everything from cluster debugging to policy generation, and we expect contributors to use them.
 
 > **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one cluster. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
 
@@ -15,7 +15,7 @@ Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchabl
 
 ### Prerequisites
 
-- **Docker** — Docker Desktop (or a Docker daemon) must be running.
+- **Docker** — A Docker-compatible runtime must be running. Tested on Docker 28.04.
 
 ### Install
 

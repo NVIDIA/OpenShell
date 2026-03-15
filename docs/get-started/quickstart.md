@@ -34,7 +34,7 @@ Before you begin, make sure you have:
 
 - Python 3.12 or later
 - [uv](https://docs.astral.sh/uv/) installed
-- Docker Desktop running on your machine
+- A Docker-compatible runtime running on your machine ([Docker Desktop](https://www.docker.com/products/docker-desktop), [OrbStack](https://orbstack.dev), or [Docker Engine](https://docs.docker.com/engine/install/))
 
 ## Install the OpenShell CLI
 
