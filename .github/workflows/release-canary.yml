@@ -35,14 +35,16 @@ jobs:
             target: aarch64-unknown-linux-musl
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
+    # Run with Docker-in-Docker: the CI container starts its own dockerd so
+    # the gateway cluster container is a child process. This means 127.0.0.1
+    # port bindings are reachable directly, matching the real user experience
+    # without needing --gateway-host workarounds.
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
         username: ${{ github.actor }}
         password: ${{ secrets.GITHUB_TOKEN }}
       options: --privileged
-      volumes:
-        - /var/run/docker.sock:/var/run/docker.sock
     env:
       OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -71,6 +73,18 @@ jobs:
             fi
           fi
 
+      - name: Start Docker daemon
+        run: |
+          # Start dockerd for Docker-in-Docker. The CI container runs
+          # --privileged so the daemon can create networks and cgroups.
+          # Using DinD means the gateway container is a child of this
+          # container's daemon, so 127.0.0.1 port bindings are reachable
+          # directly — no --gateway-host workaround needed.
+          dockerd &>/var/log/dockerd.log &
+          echo "Waiting for Docker daemon..."
+          timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+          echo "Docker daemon ready"
+
       - name: Install CLI from GitHub Release
         run: ./install.sh
         env:
@@ -80,28 +94,23 @@ jobs:
       - name: Verify CLI installation
         run: openshell --version
 
-      - name: Resolve gateway host
-        run: |
-          # On Linux CI runners host.docker.internal is not set automatically
-          # (it's a Docker Desktop feature). Add it via the Docker bridge IP.
-          if ! getent hosts host.docker.internal >/dev/null 2>&1; then
-            BRIDGE_IP=$(docker network inspect bridge --format '{{(index .IPAM.Config 0).Gateway}}')
-            echo "Adding /etc/hosts entry: ${BRIDGE_IP} host.docker.internal"
-            echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
-          fi
-
-      - name: Start gateway
-        run: openshell gateway start --gateway-host host.docker.internal
-
       - name: Run canary test
         run: |
           set -euo pipefail
 
-          echo "Creating sandbox and running 'echo hello world'..."
+          # Single-command canary: tests the full zero-to-sandbox path.
+          # With no gateway configured, `sandbox create` auto-bootstraps a
+          # gateway (pulls the cluster image from GHCR, starts k3s, deploys
+          # the control plane, generates mTLS PKI), then creates a sandbox
+          # and runs the command inside it.
+          echo "Creating sandbox (with auto-bootstrap) and running 'echo hello world'..."
           OUTPUT=$(openshell sandbox create --no-keep --no-tty -- echo "hello world" 2>&1) || {
             EXIT_CODE=$?
             echo "::error::openshell sandbox create failed with exit code ${EXIT_CODE}"
             echo "$OUTPUT"
+            echo ""
+            echo "--- dockerd logs ---"
+            cat /var/log/dockerd.log || true
             exit $EXIT_CODE
           }
 
