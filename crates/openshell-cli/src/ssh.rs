@@ -307,10 +307,12 @@ pub async fn sandbox_connect_editor(
 pub async fn sandbox_forward(
     server: &str,
     name: &str,
-    port: u16,
+    spec: &openshell_core::forward::ForwardSpec,
     background: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
+    openshell_core::forward::check_port_available(spec)?;
+
     let session = ssh_session_config(server, name, tls).await?;
 
     let mut command = TokioCommand::from(ssh_base_command(&session.proxy_command));
@@ -319,7 +321,7 @@ pub async fn sandbox_forward(
         .arg("-o")
         .arg("ExitOnForwardFailure=yes")
         .arg("-L")
-        .arg(format!("{port}:127.0.0.1:{port}"));
+        .arg(spec.ssh_forward_arg());
 
     if background {
         // SSH -f: fork to background after authentication.
@@ -332,6 +334,8 @@ pub async fn sandbox_forward(
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
 
+    let port = spec.port;
+
     let status = if background {
         command.status().await.into_diagnostic()?
     } else {
@@ -339,7 +343,7 @@ pub async fn sandbox_forward(
         match tokio::time::timeout(FOREGROUND_FORWARD_STARTUP_GRACE_PERIOD, child.wait()).await {
             Ok(status) => status.into_diagnostic()?,
             Err(_) => {
-                eprintln!("{}", foreground_forward_started_message(name, port));
+                eprintln!("{}", foreground_forward_started_message(name, spec));
                 child.wait().await.into_diagnostic()?
             }
         }
@@ -352,7 +356,7 @@ pub async fn sandbox_forward(
     if background {
         // SSH has forked — find its PID and record it.
         if let Some(pid) = find_ssh_forward_pid(&session.sandbox_id, port) {
-            write_forward_pid(name, port, pid, &session.sandbox_id)?;
+            write_forward_pid(name, port, pid, &session.sandbox_id, &spec.bind_addr)?;
         } else {
             eprintln!(
                 "{} Could not discover backgrounded SSH process; \
@@ -365,10 +369,15 @@ pub async fn sandbox_forward(
     Ok(())
 }
 
-fn foreground_forward_started_message(name: &str, port: u16) -> String {
+fn foreground_forward_started_message(
+    name: &str,
+    spec: &openshell_core::forward::ForwardSpec,
+) -> String {
     format!(
-        "{} Forwarding port {port} to sandbox {name}\n  Access at: http://127.0.0.1:{port}/\n  Press Ctrl+C to stop\n  {}",
+        "{} Forwarding port {} to sandbox {name}\n  Access at: {}\n  Press Ctrl+C to stop\n  {}",
         "✓".green().bold(),
+        spec.port,
+        spec.access_url(),
         "Hint: pass --background to start forwarding without blocking your terminal".dimmed(),
     )
 }
@@ -1130,7 +1139,8 @@ mod tests {
 
     #[test]
     fn foreground_forward_started_message_includes_port_and_stop_hint() {
-        let message = foreground_forward_started_message("demo", 8080);
+        let spec = openshell_core::forward::ForwardSpec::new(8080);
+        let message = foreground_forward_started_message("demo", &spec);
         assert!(message.contains("Forwarding port 8080 to sandbox demo"));
         assert!(message.contains("Access at: http://127.0.0.1:8080/"));
         assert!(message.contains("sandbox demo"));
@@ -1138,5 +1148,13 @@ mod tests {
         assert!(message.contains(
             "Hint: pass --background to start forwarding without blocking your terminal"
         ));
+    }
+
+    #[test]
+    fn foreground_forward_started_message_custom_bind_addr() {
+        let spec = openshell_core::forward::ForwardSpec::parse("0.0.0.0:3000").unwrap();
+        let message = foreground_forward_started_message("demo", &spec);
+        assert!(message.contains("Forwarding port 3000 to sandbox demo"));
+        assert!(message.contains("Access at: http://localhost:3000/"));
     }
 }

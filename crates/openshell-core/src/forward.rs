@@ -7,6 +7,7 @@
 //! start, stop, list, and track background SSH port forwards.
 
 use miette::{IntoDiagnostic, Result, WrapErr};
+use std::net::TcpListener;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -33,13 +34,21 @@ pub fn forward_pid_path(name: &str, port: u16) -> Result<PathBuf> {
 }
 
 /// Write a PID file for a background forward.
-pub fn write_forward_pid(name: &str, port: u16, pid: u32, sandbox_id: &str) -> Result<()> {
+///
+/// File format: `<pid>\t<sandbox_id>\t<bind_addr>`
+pub fn write_forward_pid(
+    name: &str,
+    port: u16,
+    pid: u32,
+    sandbox_id: &str,
+    bind_addr: &str,
+) -> Result<()> {
     let dir = forward_pid_dir()?;
     std::fs::create_dir_all(&dir)
         .into_diagnostic()
         .wrap_err("failed to create forwards directory")?;
     let path = forward_pid_path(name, port)?;
-    std::fs::write(&path, format!("{pid}\t{sandbox_id}"))
+    std::fs::write(&path, format!("{pid}\t{sandbox_id}\t{bind_addr}"))
         .into_diagnostic()
         .wrap_err("failed to write forward PID file")?;
     Ok(())
@@ -71,6 +80,8 @@ pub fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
 pub struct ForwardPidRecord {
     pub pid: u32,
     pub sandbox_id: Option<String>,
+    /// Bind address from the PID file, or `None` for old-format files.
+    pub bind_addr: Option<String>,
 }
 
 /// Read the PID from a forward PID file.  Returns `None` if the file does not
@@ -78,10 +89,15 @@ pub struct ForwardPidRecord {
 pub fn read_forward_pid(name: &str, port: u16) -> Option<ForwardPidRecord> {
     let path = forward_pid_path(name, port).ok()?;
     let contents = std::fs::read_to_string(path).ok()?;
-    let mut parts = contents.split_whitespace();
-    let pid = parts.next()?.parse().ok()?;
+    let mut parts = contents.split('\t');
+    let pid = parts.next()?.trim().parse().ok()?;
     let sandbox_id = parts.next().map(str::to_string);
-    Some(ForwardPidRecord { pid, sandbox_id })
+    let bind_addr = parts.next().map(|s| s.trim().to_string());
+    Some(ForwardPidRecord {
+        pid,
+        sandbox_id,
+        bind_addr,
+    })
 }
 
 /// Check whether a process is alive.
@@ -119,6 +135,30 @@ pub fn pid_matches_forward(pid: u32, port: u16, sandbox_id: Option<&str>) -> boo
     }
 
     sandbox_id.is_none_or(|id| cmd.contains(id))
+}
+
+/// Find the sandbox name that owns a forward on the given port.
+///
+/// Scans all PID files in the forwards directory for a file matching
+/// `*-<port>.pid`.  Ports are unique across sandboxes so at most one
+/// match is expected.
+pub fn find_forward_by_port(port: u16) -> Result<Option<String>> {
+    let dir = forward_pid_dir()?;
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(_) => return Ok(None),
+    };
+    let suffix = format!("-{port}.pid");
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let file_name = file_name.to_string_lossy();
+        if let Some(name) = file_name.strip_suffix(&suffix) {
+            if !name.is_empty() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Stop a background port forward.
@@ -180,6 +220,8 @@ pub struct ForwardInfo {
     pub port: u16,
     pub pid: u32,
     pub alive: bool,
+    /// Bind address (defaults to `127.0.0.1` for old PID files).
+    pub bind_addr: String,
 }
 
 /// List all tracked forwards.
@@ -207,12 +249,190 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
                 port,
                 pid: record.pid,
                 alive: pid_is_alive(record.pid),
+                bind_addr: record
+                    .bind_addr
+                    .unwrap_or_else(|| ForwardSpec::DEFAULT_BIND_ADDR.to_string()),
             });
         }
     }
 
     forwards.sort_by(|a, b| a.sandbox.cmp(&b.sandbox).then(a.port.cmp(&b.port)));
     Ok(forwards)
+}
+
+// ---------------------------------------------------------------------------
+// Forward spec parsing
+// ---------------------------------------------------------------------------
+
+/// A parsed port-forward specification: optional bind address + port.
+///
+/// Supports the same `[bind_address:]port` syntax as SSH `-L`.  When no bind
+/// address is given, defaults to `127.0.0.1`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardSpec {
+    pub bind_addr: String,
+    pub port: u16,
+}
+
+impl ForwardSpec {
+    /// Default bind address when none is specified.
+    pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1";
+
+    /// Create a new `ForwardSpec` with the default bind address.
+    pub fn new(port: u16) -> Self {
+        Self {
+            bind_addr: Self::DEFAULT_BIND_ADDR.to_string(),
+            port,
+        }
+    }
+
+    /// Parse a `[bind_address:]port` string.
+    ///
+    /// Examples:
+    /// - `"8080"` → `ForwardSpec { bind_addr: "127.0.0.1", port: 8080 }`
+    /// - `"0.0.0.0:8080"` → `ForwardSpec { bind_addr: "0.0.0.0", port: 8080 }`
+    /// - `"::1:8080"` → `ForwardSpec { bind_addr: "::1", port: 8080 }`
+    pub fn parse(s: &str) -> Result<Self> {
+        // Split on the last ':' to handle IPv6 addresses like "::1:8080".
+        if let Some(pos) = s.rfind(':') {
+            let addr = &s[..pos];
+            let port_str = &s[pos + 1..];
+            if let Ok(port) = port_str.parse::<u16>() {
+                if port == 0 {
+                    return Err(miette::miette!("port must be between 1 and 65535"));
+                }
+                return Ok(Self {
+                    bind_addr: addr.to_string(),
+                    port,
+                });
+            }
+        }
+
+        // No colon or the part after the last colon isn't a valid port —
+        // treat the entire string as a port number.
+        let port: u16 = s.parse().map_err(|_| {
+            miette::miette!("invalid forward spec '{s}': expected [bind_address:]port")
+        })?;
+        if port == 0 {
+            return Err(miette::miette!("port must be between 1 and 65535"));
+        }
+        Ok(Self::new(port))
+    }
+
+    /// The SSH `-L` local-forward argument: `bind_addr:port:127.0.0.1:port`.
+    pub fn ssh_forward_arg(&self) -> String {
+        format!("{}:{}:127.0.0.1:{}", self.bind_addr, self.port, self.port)
+    }
+
+    /// A human-readable URL for the forwarded port.
+    pub fn access_url(&self) -> String {
+        let host = if self.bind_addr == "0.0.0.0" || self.bind_addr == "::" {
+            "localhost"
+        } else {
+            &self.bind_addr
+        };
+        format!("http://{host}:{}/", self.port)
+    }
+}
+
+impl std::fmt::Display for ForwardSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.bind_addr == Self::DEFAULT_BIND_ADDR {
+            write!(f, "{}", self.port)
+        } else {
+            write!(f, "{}:{}", self.bind_addr, self.port)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Port availability check
+// ---------------------------------------------------------------------------
+
+/// Check whether a local port is available for forwarding.
+///
+/// Uses a two-pronged check:
+/// 1. Attempts to bind `<bind_addr>:<port>` — catches same-family conflicts.
+/// 2. Runs `lsof -i :<port> -sTCP:LISTEN` — catches cross-family conflicts
+///    (e.g. an IPv6 wildcard listener blocking a port the IPv4 bind test
+///    would miss).
+///
+/// If the port is already in use the error message includes an actionable
+/// hint:
+///
+/// - If an existing openshell forward owns the port, suggest the stop command.
+/// - Otherwise, show the `lsof` output and suggest `kill` to terminate the
+///   owning process.
+pub fn check_port_available(spec: &ForwardSpec) -> Result<()> {
+    let port = spec.port;
+
+    // Fast path: try binding on the requested address.  If this fails, the
+    // port is definitely taken on this address family.
+    let bind_ok = TcpListener::bind((spec.bind_addr.as_str(), port)).is_ok();
+
+    // Also ask the OS whether *any* process is listening on this port,
+    // regardless of address family.  This catches situations where e.g. a
+    // server binds [::]:8080 but our IPv4 bind test succeeds.
+    let lsof_output = lsof_listeners(port);
+    let lsof_occupied = lsof_output.is_some();
+
+    if bind_ok && !lsof_occupied {
+        return Ok(());
+    }
+
+    // Port is occupied.  Check if it belongs to a tracked openshell forward.
+    if let Ok(forwards) = list_forwards()
+        && let Some(fwd) = forwards.iter().find(|f| f.port == port && f.alive)
+    {
+        return Err(miette::miette!(
+            "Port {port} is already forwarded to sandbox '{}'.\n\
+             Stop it with: openshell forward stop {port} {}",
+            fwd.sandbox,
+            fwd.sandbox,
+        ));
+    }
+
+    // Build a helpful error with lsof details when available.
+    if let Some(output) = lsof_output {
+        return Err(miette::miette!(
+            "Port {port} is already in use by another process.\n\n\
+             {output}\n\n\
+             To free the port, find the PID above and run:\n  \
+             kill <PID>\n\n\
+             Or find it yourself with:\n  \
+             lsof -i :{port} -sTCP:LISTEN",
+        ));
+    }
+
+    Err(miette::miette!(
+        "Port {port} is already in use by another process.\n\
+         Find it with: lsof -i :{port} -sTCP:LISTEN\n\
+         Then terminate it with: kill <PID>",
+    ))
+}
+
+/// Run `lsof` to check for any process listening on `port`.
+///
+/// Returns the trimmed stdout if at least one listener is found, or `None` if
+/// the port is free (or `lsof` is unavailable).
+fn lsof_listeners(port: u16) -> Option<String> {
+    let output = Command::new("lsof")
+        .arg("-i")
+        .arg(format!(":{port}"))
+        .arg("-sTCP:LISTEN")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        None
+    } else {
+        Some(stdout)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -366,18 +586,21 @@ mod tests {
                 port: 8080,
                 pid: 123,
                 alive: true,
+                bind_addr: "127.0.0.1".to_string(),
             },
             ForwardInfo {
                 sandbox: "mybox".to_string(),
                 port: 3000,
                 pid: 456,
                 alive: true,
+                bind_addr: "127.0.0.1".to_string(),
             },
             ForwardInfo {
                 sandbox: "other".to_string(),
                 port: 9090,
                 pid: 789,
                 alive: true,
+                bind_addr: "0.0.0.0".to_string(),
             },
         ];
         assert_eq!(build_sandbox_notes("mybox", &forwards), "fwd:8080,3000");
@@ -392,6 +615,7 @@ mod tests {
             port: 8080,
             pid: 123,
             alive: false,
+            bind_addr: "127.0.0.1".to_string(),
         }];
         assert_eq!(build_sandbox_notes("mybox", &forwards), "");
     }
@@ -422,5 +646,122 @@ mod tests {
             .collect();
         // 0 is valid u16 but we may want to filter it; 99999 overflows u16.
         assert_eq!(ports, vec![8080, 3000, 0]);
+    }
+
+    #[test]
+    fn check_port_available_free_port() {
+        // Bind to port 0 to get an OS-assigned free port, then drop the
+        // listener so the port is released before we test it.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+
+        assert!(check_port_available(&ForwardSpec::new(port)).is_ok());
+    }
+
+    #[test]
+    fn check_port_available_occupied_port() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Keep the listener alive so the port stays occupied.
+
+        let result = check_port_available(&ForwardSpec::new(port));
+        assert!(result.is_err());
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected 'already in use' in error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn check_port_available_occupied_ipv6_wildcard() {
+        // Bind on [::]:0 (IPv6 wildcard) — this simulates a server like
+        // `python3 -m http.server` which listens on [::] by default.  The
+        // IPv4-only TcpListener::bind("127.0.0.1", port) might succeed, but
+        // lsof should detect the listener and the check should still fail.
+        let listener = match TcpListener::bind("[::]:0") {
+            Ok(l) => l,
+            Err(_) => return, // IPv6 not available, skip
+        };
+        let port = listener.local_addr().unwrap().port();
+
+        let result = check_port_available(&ForwardSpec::new(port));
+        assert!(
+            result.is_err(),
+            "expected error for IPv6-occupied port {port}"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("already in use"),
+            "expected 'already in use' in error message, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn forward_spec_parse_port_only() {
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.bind_addr, "127.0.0.1");
+        assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_ipv4_and_port() {
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.bind_addr, "0.0.0.0");
+        assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_ipv6_and_port() {
+        let spec = ForwardSpec::parse("::1:8080").unwrap();
+        assert_eq!(spec.bind_addr, "::1");
+        assert_eq!(spec.port, 8080);
+    }
+
+    #[test]
+    fn forward_spec_parse_localhost_and_port() {
+        let spec = ForwardSpec::parse("localhost:3000").unwrap();
+        assert_eq!(spec.bind_addr, "localhost");
+        assert_eq!(spec.port, 3000);
+    }
+
+    #[test]
+    fn forward_spec_parse_rejects_zero_port() {
+        assert!(ForwardSpec::parse("0").is_err());
+        assert!(ForwardSpec::parse("0.0.0.0:0").is_err());
+    }
+
+    #[test]
+    fn forward_spec_parse_rejects_invalid() {
+        assert!(ForwardSpec::parse("abc").is_err());
+        assert!(ForwardSpec::parse("").is_err());
+    }
+
+    #[test]
+    fn forward_spec_ssh_forward_arg() {
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "0.0.0.0:8080:127.0.0.1:8080");
+
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.ssh_forward_arg(), "127.0.0.1:8080:127.0.0.1:8080");
+    }
+
+    #[test]
+    fn forward_spec_access_url() {
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.access_url(), "http://127.0.0.1:8080/");
+
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.access_url(), "http://localhost:8080/");
+    }
+
+    #[test]
+    fn forward_spec_display() {
+        let spec = ForwardSpec::parse("8080").unwrap();
+        assert_eq!(spec.to_string(), "8080");
+
+        let spec = ForwardSpec::parse("0.0.0.0:8080").unwrap();
+        assert_eq!(spec.to_string(), "0.0.0.0:8080");
     }
 }

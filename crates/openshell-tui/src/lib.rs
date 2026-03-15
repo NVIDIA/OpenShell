@@ -1313,7 +1313,7 @@ async fn start_port_forwards(
     gateway_name: &str,
     sandbox_name: &str,
     sandbox_id: &str,
-    ports: &[u16],
+    specs: &[openshell_core::forward::ForwardSpec],
 ) {
     // Create SSH session.
     let session = {
@@ -1358,8 +1358,12 @@ async fn start_port_forwards(
         session.sandbox_id, session.token,
     );
 
-    // Start a forward for each port.
-    for port in ports {
+    // Start a forward for each spec.
+    for spec in specs {
+        let ssh_forward_arg = spec.ssh_forward_arg();
+        let port_val = spec.port;
+        let bind_addr = spec.bind_addr.clone();
+
         let mut command = std::process::Command::new("ssh");
         command
             .arg("-o")
@@ -1377,13 +1381,12 @@ async fn start_port_forwards(
             .arg("-N")
             .arg("-f")
             .arg("-L")
-            .arg(format!("{port}:127.0.0.1:{port}"))
+            .arg(&ssh_forward_arg)
             .arg("sandbox")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
 
-        let port_val = *port;
         let sid = session.sandbox_id.clone();
         let name = sandbox_name.to_string();
 
@@ -1418,7 +1421,9 @@ async fn start_port_forwards(
         match result {
             Ok(Ok(true)) => {
                 if let Some(pid) = openshell_core::forward::find_ssh_forward_pid(&sid, port_val) {
-                    let _ = openshell_core::forward::write_forward_pid(&name, port_val, pid, &sid);
+                    let _ = openshell_core::forward::write_forward_pid(
+                        &name, port_val, pid, &sid, &bind_addr,
+                    );
                 }
             }
             Ok(Ok(false)) => {

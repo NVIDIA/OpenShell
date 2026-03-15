@@ -99,8 +99,14 @@ pub struct GatewayEntry {
 // ---------------------------------------------------------------------------
 
 /// Data extracted from the create sandbox form:
-/// `(name, image, command, selected_provider_names, forward_ports)`.
-pub type CreateFormData = (String, String, String, Vec<String>, Vec<u16>);
+/// `(name, image, command, selected_provider_names, forward_specs)`.
+pub type CreateFormData = (
+    String,
+    String,
+    String,
+    Vec<String>,
+    Vec<openshell_core::forward::ForwardSpec>,
+);
 
 /// Which field is focused in the create sandbox modal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -336,8 +342,8 @@ pub struct App {
     // Create sandbox modal
     pub create_form: Option<CreateSandboxForm>,
     pub pending_create_sandbox: bool,
-    /// Ports to forward after sandbox creation completes.
-    pub pending_forward_ports: Vec<u16>,
+    /// Forward specs to apply after sandbox creation completes.
+    pub pending_forward_ports: Vec<openshell_core::forward::ForwardSpec>,
     /// Command to exec via SSH after sandbox creation completes.
     pub pending_exec_command: String,
     /// Animation ticker handle — aborted when animation stops.
@@ -1147,11 +1153,16 @@ impl App {
             .filter(|p| p.selected)
             .map(|p| p.name.clone())
             .collect();
-        let ports: Vec<u16> = form
+        let ports: Vec<openshell_core::forward::ForwardSpec> = form
             .ports
             .split(',')
-            .filter_map(|s| s.trim().parse::<u16>().ok())
-            .filter(|&p| p > 0)
+            .filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() {
+                    return None;
+                }
+                openshell_core::forward::ForwardSpec::parse(s).ok()
+            })
             .collect();
         Some((
             form.name.clone(),

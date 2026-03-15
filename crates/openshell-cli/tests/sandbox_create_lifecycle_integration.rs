@@ -704,7 +704,7 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
         None,
         &[],
         None,
-        Some(8080),
+        Some(openshell_core::forward::ForwardSpec::new(8080)),
         &["echo".to_string(), "OK".to_string()],
         Some(false),
         Some(false),
