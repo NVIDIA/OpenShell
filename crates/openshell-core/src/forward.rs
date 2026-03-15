@@ -34,13 +34,21 @@ pub fn forward_pid_path(name: &str, port: u16) -> Result<PathBuf> {
 }
 
 /// Write a PID file for a background forward.
-pub fn write_forward_pid(name: &str, port: u16, pid: u32, sandbox_id: &str) -> Result<()> {
+///
+/// File format: `<pid>\t<sandbox_id>\t<bind_addr>`
+pub fn write_forward_pid(
+    name: &str,
+    port: u16,
+    pid: u32,
+    sandbox_id: &str,
+    bind_addr: &str,
+) -> Result<()> {
     let dir = forward_pid_dir()?;
     std::fs::create_dir_all(&dir)
         .into_diagnostic()
         .wrap_err("failed to create forwards directory")?;
     let path = forward_pid_path(name, port)?;
-    std::fs::write(&path, format!("{pid}\t{sandbox_id}"))
+    std::fs::write(&path, format!("{pid}\t{sandbox_id}\t{bind_addr}"))
         .into_diagnostic()
         .wrap_err("failed to write forward PID file")?;
     Ok(())
@@ -72,6 +80,8 @@ pub fn find_ssh_forward_pid(sandbox_id: &str, port: u16) -> Option<u32> {
 pub struct ForwardPidRecord {
     pub pid: u32,
     pub sandbox_id: Option<String>,
+    /// Bind address from the PID file, or `None` for old-format files.
+    pub bind_addr: Option<String>,
 }
 
 /// Read the PID from a forward PID file.  Returns `None` if the file does not
@@ -79,10 +89,15 @@ pub struct ForwardPidRecord {
 pub fn read_forward_pid(name: &str, port: u16) -> Option<ForwardPidRecord> {
     let path = forward_pid_path(name, port).ok()?;
     let contents = std::fs::read_to_string(path).ok()?;
-    let mut parts = contents.split_whitespace();
-    let pid = parts.next()?.parse().ok()?;
+    let mut parts = contents.split('\t');
+    let pid = parts.next()?.trim().parse().ok()?;
     let sandbox_id = parts.next().map(str::to_string);
-    Some(ForwardPidRecord { pid, sandbox_id })
+    let bind_addr = parts.next().map(|s| s.trim().to_string());
+    Some(ForwardPidRecord {
+        pid,
+        sandbox_id,
+        bind_addr,
+    })
 }
 
 /// Check whether a process is alive.
@@ -205,6 +220,8 @@ pub struct ForwardInfo {
     pub port: u16,
     pub pid: u32,
     pub alive: bool,
+    /// Bind address (defaults to `127.0.0.1` for old PID files).
+    pub bind_addr: String,
 }
 
 /// List all tracked forwards.
@@ -232,6 +249,9 @@ pub fn list_forwards() -> Result<Vec<ForwardInfo>> {
                 port,
                 pid: record.pid,
                 alive: pid_is_alive(record.pid),
+                bind_addr: record
+                    .bind_addr
+                    .unwrap_or_else(|| ForwardSpec::DEFAULT_BIND_ADDR.to_string()),
             });
         }
     }
@@ -566,18 +586,21 @@ mod tests {
                 port: 8080,
                 pid: 123,
                 alive: true,
+                bind_addr: "127.0.0.1".to_string(),
             },
             ForwardInfo {
                 sandbox: "mybox".to_string(),
                 port: 3000,
                 pid: 456,
                 alive: true,
+                bind_addr: "127.0.0.1".to_string(),
             },
             ForwardInfo {
                 sandbox: "other".to_string(),
                 port: 9090,
                 pid: 789,
                 alive: true,
+                bind_addr: "0.0.0.0".to_string(),
             },
         ];
         assert_eq!(build_sandbox_notes("mybox", &forwards), "fwd:8080,3000");
@@ -592,6 +615,7 @@ mod tests {
             port: 8080,
             pid: 123,
             alive: false,
+            bind_addr: "127.0.0.1".to_string(),
         }];
         assert_eq!(build_sandbox_notes("mybox", &forwards), "");
     }

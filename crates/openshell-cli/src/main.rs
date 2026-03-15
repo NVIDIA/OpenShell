@@ -1614,12 +1614,20 @@ async fn main() -> Result<()> {
                         .max()
                         .unwrap_or(7)
                         .max(7);
+                    let bind_width = forwards
+                        .iter()
+                        .map(|f| f.bind_addr.len())
+                        .max()
+                        .unwrap_or(4)
+                        .max(4);
                     println!(
-                        "{:<width$} {:<8} {:<10} STATUS",
+                        "{:<nw$} {:<bw$} {:<8} {:<10} STATUS",
                         "SANDBOX",
+                        "BIND",
                         "PORT",
                         "PID",
-                        width = name_width,
+                        nw = name_width,
+                        bw = bind_width,
                     );
                     for f in &forwards {
                         let status = if f.alive {
@@ -1628,12 +1636,14 @@ async fn main() -> Result<()> {
                             "dead".red().to_string()
                         };
                         println!(
-                            "{:<width$} {:<8} {:<10} {}",
+                            "{:<nw$} {:<bw$} {:<8} {:<10} {}",
                             f.sandbox,
+                            f.bind_addr,
                             f.port,
                             f.pid,
                             status,
-                            width = name_width,
+                            nw = name_width,
+                            bw = bind_width,
                         );
                     }
                 }

@@ -356,7 +356,7 @@ pub async fn sandbox_forward(
     if background {
         // SSH has forked — find its PID and record it.
         if let Some(pid) = find_ssh_forward_pid(&session.sandbox_id, port) {
-            write_forward_pid(name, port, pid, &session.sandbox_id)?;
+            write_forward_pid(name, port, pid, &session.sandbox_id, &spec.bind_addr)?;
         } else {
             eprintln!(
                 "{} Could not discover backgrounded SSH process; \
