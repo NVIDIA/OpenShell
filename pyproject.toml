@@ -29,6 +29,7 @@ classifiers = [
     "Programming Language :: Rust",
     "License :: OSI Approved :: Apache Software License",
     "Topic :: Security",
+    "Topic :: Scientific/Engineering",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
     "Operating System :: POSIX :: Linux",
     "Operating System :: MacOS :: MacOS X",
