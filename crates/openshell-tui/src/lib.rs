@@ -1360,11 +1360,6 @@ async fn start_port_forwards(
 
     // Start a forward for each spec.
     for spec in specs {
-        if let Err(e) = openshell_core::forward::check_port_available(spec) {
-            tracing::warn!("skipping forward for port {}: {e}", spec.port);
-            continue;
-        }
-
         let ssh_forward_arg = spec.ssh_forward_arg();
         let port_val = spec.port;
         let bind_addr = spec.bind_addr.clone();
