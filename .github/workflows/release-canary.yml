@@ -73,27 +73,6 @@ jobs:
             fi
           fi
 
-      - name: Start Docker daemon
-        run: |
-          # Start our own dockerd for Docker-in-Docker. The CI container runs
-          # --privileged so the daemon can create networks and cgroups.
-          # Using DinD means the gateway container is a child of this
-          # container's daemon, so 127.0.0.1 port bindings are reachable
-          # directly — no --gateway-host workaround needed.
-          #
-          # We use a dedicated socket because the GHA runner injects its own
-          # /var/run/docker.sock for container management. DOCKER_HOST is set
-          # per-step (not via GITHUB_ENV) to avoid breaking the runner.
-          # Use setsid to fully detach dockerd from the step's process group
-          # so it survives when the GHA runner's docker-exec shell exits.
-          setsid dockerd --host unix:///var/run/dind.sock </dev/null &>/var/log/dockerd.log &
-          echo "Waiting for Docker daemon..."
-          export DOCKER_HOST=unix:///var/run/dind.sock
-          timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
-          echo "Docker daemon ready"
-          # Verify the socket file exists
-          ls -la /var/run/dind.sock
-
       - name: Install CLI from GitHub Release
         run: ./install.sh
         env:
@@ -104,10 +83,19 @@ jobs:
         run: openshell --version
 
       - name: Run canary test
-        env:
-          DOCKER_HOST: unix:///var/run/dind.sock
         run: |
           set -euo pipefail
+
+          # Start our own dockerd for Docker-in-Docker. The GHA runner injects
+          # its own /var/run/docker.sock for container management, so we use a
+          # dedicated socket. We start dockerd in the same step as the canary
+          # test because background processes don't survive across GHA steps
+          # (each step runs via a separate docker-exec invocation).
+          export DOCKER_HOST=unix:///var/run/dind.sock
+          dockerd --host "$DOCKER_HOST" &>/var/log/dockerd.log &
+          echo "Waiting for Docker daemon..."
+          timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
+          echo "Docker daemon ready"
 
           # Single-command canary: tests the full zero-to-sandbox path.
           # With no gateway configured, `sandbox create` auto-bootstraps a
