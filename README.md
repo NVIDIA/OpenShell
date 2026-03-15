@@ -21,25 +21,10 @@ Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchabl
 
 ### Install
 
-**Binary (recommended — requires [GitHub CLI](https://cli.github.com)):**
+**Binary (recommended):**
 
 ```bash
-sh -c 'ARCH=$(uname -m); OS=$(uname -s); \
-    case "${OS}-${ARCH}" in \
-      Linux-x86_64)  ASSET="openshell-x86_64-unknown-linux-musl.tar.gz" ;; \
-      Linux-aarch64) ASSET="openshell-aarch64-unknown-linux-musl.tar.gz" ;; \
-      Darwin-arm64)  ASSET="openshell-aarch64-apple-darwin.tar.gz" ;; \
-      *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;; \
-    esac; \
-    gh release download devel --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
-      | tar xz \
-      && sudo install -m 755 openshell /usr/local/bin/openshell'
-```
-
-Or use the install script from the repository:
-
-```bash
-./install.sh
+curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
 **From PyPI (requires [uv](https://docs.astral.sh/uv/)):**
