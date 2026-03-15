@@ -20,12 +20,18 @@ defaults:
     shell: bash
 
 jobs:
-  acceptance:
-    name: Canary (${{ matrix.arch }})
+  canary:
+    name: Canary ${{ matrix.mode }} (${{ matrix.arch }})
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     strategy:
       fail-fast: false
       matrix:
+        arch:
+          - amd64
+          - arm64
+        mode:
+          - auto-bootstrap
+          - two-step
         include:
           - arch: amd64
             runner: build-amd64
@@ -45,6 +51,11 @@ jobs:
         - /var/run/docker.sock:/var/run/docker.sock
     env:
       OPENSHELL_REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # The CI container mounts the host Docker socket, so the gateway
+      # container is a sibling — not reachable at 127.0.0.1 from inside
+      # this container. OPENSHELL_GATEWAY_HOST tells the auto-bootstrap
+      # to advertise a reachable address instead.
+      OPENSHELL_GATEWAY_HOST: host.docker.internal
     steps:
       - uses: actions/checkout@v4
 
@@ -90,12 +101,16 @@ jobs:
             echo "${BRIDGE_IP} host.docker.internal" >> /etc/hosts
           fi
 
+      # Two-step mode: explicitly start the gateway before creating a sandbox.
+      # --gateway-host is required because the gateway container is a Docker
+      # sibling (not in the same network namespace). Without it the metadata
+      # stores 127.0.0.1 which is unreachable from this CI container.
       - name: Start gateway
-        env:
-          # Use OPENSHELL_GATEWAY_HOST when supported (CLI >= next release),
-          # fall back to the explicit --gateway-host flag for older CLIs.
-          OPENSHELL_GATEWAY_HOST: host.docker.internal
-        run: openshell gateway start --gateway-host host.docker.internal
+        if: matrix.mode == 'two-step'
+        run: |
+          set -euo pipefail
+          echo "Starting gateway..."
+          openshell gateway start --gateway-host "$OPENSHELL_GATEWAY_HOST"
 
       - name: Run canary test
         run: |
