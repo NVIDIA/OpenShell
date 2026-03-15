@@ -81,10 +81,12 @@ jobs:
           # container's daemon, so 127.0.0.1 port bindings are reachable
           # directly — no --gateway-host workaround needed.
           #
-          # We start on the default socket (/var/run/docker.sock). Since we
-          # don't mount the host socket, this path is free inside the container.
-          dockerd &>/var/log/dockerd.log &
+          # We use a dedicated socket because the GHA runner injects its own
+          # /var/run/docker.sock for container management. DOCKER_HOST is set
+          # per-step (not via GITHUB_ENV) to avoid breaking the runner.
+          dockerd --host unix:///var/run/dind.sock &>/var/log/dockerd.log &
           echo "Waiting for Docker daemon..."
+          export DOCKER_HOST=unix:///var/run/dind.sock
           timeout 30 sh -c 'until docker info >/dev/null 2>&1; do sleep 1; done'
           echo "Docker daemon ready"
 
@@ -98,6 +100,8 @@ jobs:
         run: openshell --version
 
       - name: Run canary test
+        env:
+          DOCKER_HOST: unix:///var/run/dind.sock
         run: |
           set -euo pipefail
 
