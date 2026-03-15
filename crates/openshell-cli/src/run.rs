@@ -1826,6 +1826,12 @@ pub async fn sandbox_create(
         ));
     }
 
+    // Check port availability *before* creating the sandbox so we don't
+    // leave an orphaned sandbox behind when the forward would fail.
+    if let Some(ref spec) = forward {
+        openshell_core::forward::check_port_available(spec)?;
+    }
+
     // Try connecting to the gateway. If the connection fails due to a
     // connectivity error and bootstrap is allowed, start a new gateway.
     //
