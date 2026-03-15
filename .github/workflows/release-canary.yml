@@ -198,8 +198,13 @@ jobs:
           # Two-step canary: explicitly start the gateway first, then create
           # a sandbox against it. This tests the `gateway start` + `sandbox
           # create` flow separately from the auto-bootstrap path.
+          #
+          # --gateway-host is required because the gateway container is a
+          # Docker sibling (not in the same network namespace). Without it
+          # the metadata stores 127.0.0.1 which is unreachable from this
+          # CI container.
           echo "Starting gateway..."
-          openshell gateway start
+          openshell gateway start --gateway-host "$OPENSHELL_GATEWAY_HOST"
 
       - name: Run canary test
         run: |
