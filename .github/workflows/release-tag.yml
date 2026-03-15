@@ -519,8 +519,10 @@ jobs:
           fi
 
           WHEEL_FILENAMES=$(printf '%s\n' "${wheel_files[@]##*/}" | paste -sd, -)
-          curl -X POST \
+          response=$(curl -X POST \
             --fail \
+            --silent \
+            --show-error \
             -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
             -F "ref=main" \
             -F "variables[PIPELINE_ACTION]=publish_wheels" \
@@ -529,4 +531,14 @@ jobs:
             -F "variables[RELEASE_VERSION]=${RELEASE_VERSION}" \
             -F "variables[RELEASE_KIND]=stable" \
             -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
-            "${GITLAB_CI_TRIGGER_URL}"
+            "${GITLAB_CI_TRIGGER_URL}")
+          RESPONSE_JSON="$response" python - <<'PY'
+          import json
+          import os
+
+          response = json.loads(os.environ["RESPONSE_JSON"])
+          print(
+              f"Triggered GitLab pipeline {response['id']} "
+              f"with status={response['status']}"
+          )
+          PY

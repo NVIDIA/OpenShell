@@ -111,8 +111,10 @@ jobs:
           WHEEL_FILENAMES: openshell-branch-check-py3-none-any.whl,openshell-branch-check-manylinux_x86_64.whl
         run: |
           set -euo pipefail
-          curl -X POST \
+          response=$(curl -X POST \
             --fail \
+            --silent \
+            --show-error \
             -F "token=${GITLAB_CI_TRIGGER_TOKEN}" \
             -F "ref=feat/ci-trigger-pipeline" \
             -F "variables[PIPELINE_ACTION]=publish_wheels" \
@@ -121,4 +123,14 @@ jobs:
             -F "variables[RELEASE_VERSION]=branch-check-pr-${{ github.event.pull_request.number }}" \
             -F "variables[RELEASE_KIND]=dev" \
             -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
-            "${GITLAB_CI_TRIGGER_URL}"
+            "${GITLAB_CI_TRIGGER_URL}")
+          RESPONSE_JSON="$response" python - <<'PY'
+          import json
+          import os
+
+          response = json.loads(os.environ["RESPONSE_JSON"])
+          print(
+              f"Triggered GitLab pipeline {response['id']} "
+              f"with status={response['status']}"
+          )
+          PY
