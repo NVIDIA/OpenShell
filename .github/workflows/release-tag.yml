@@ -532,13 +532,6 @@ jobs:
             -F "variables[RELEASE_KIND]=stable" \
             -F "variables[WHEEL_FILENAMES]=${WHEEL_FILENAMES}" \
             "${GITLAB_CI_TRIGGER_URL}")
-          RESPONSE_JSON="$response" python - <<'PY'
-          import json
-          import os
-
-          response = json.loads(os.environ["RESPONSE_JSON"])
-          print(
-              f"Triggered GitLab pipeline {response['id']} "
-              f"with status={response['status']}"
-          )
-          PY
+          pipeline_id=$(printf '%s' "$response" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+          pipeline_status=$(printf '%s' "$response" | sed -n 's/.*"status":"\([^"]*\)".*/\1/p')
+          echo "Triggered GitLab pipeline ${pipeline_id:-unknown} with status=${pipeline_status:-unknown}"
