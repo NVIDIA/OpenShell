@@ -168,3 +168,107 @@ async fn sandbox_create_auto_bootstrap_fails_fast_without_docker() {
         "sandbox create error should mention Docker:\n{clean}"
     );
 }
+
+// -------------------------------------------------------------------
+// doctor check: validates system prerequisites
+// -------------------------------------------------------------------
+
+/// `openshell doctor check` with Docker unavailable should fail fast
+/// and report the Docker check as FAILED.
+#[tokio::test]
+async fn doctor_check_fails_without_docker() {
+    let (output, code, elapsed) = run_without_docker(&["doctor", "check"]).await;
+
+    assert_ne!(
+        code, 0,
+        "doctor check should fail when Docker is unavailable, output:\n{output}"
+    );
+
+    assert!(
+        elapsed.as_secs() < 10,
+        "doctor check should complete quickly (took {}s)",
+        elapsed.as_secs()
+    );
+
+    let clean = strip_ansi(&output);
+    assert!(
+        clean.contains("FAILED"),
+        "doctor check should report Docker as FAILED:\n{clean}"
+    );
+}
+
+/// `openshell doctor check` output should include the check label
+/// so the user knows what was tested.
+#[tokio::test]
+async fn doctor_check_output_shows_docker_label() {
+    let (output, _, _) = run_without_docker(&["doctor", "check"]).await;
+    let clean = strip_ansi(&output);
+
+    assert!(
+        clean.contains("Docker"),
+        "doctor check output should include 'Docker' label:\n{clean}"
+    );
+}
+
+/// `openshell doctor check` with Docker unavailable should include
+/// actionable guidance in the error output.
+#[tokio::test]
+async fn doctor_check_error_includes_guidance() {
+    let (output, code, _) = run_without_docker(&["doctor", "check"]).await;
+
+    assert_ne!(code, 0);
+    let clean = strip_ansi(&output);
+
+    assert!(
+        clean.contains("DOCKER_HOST"),
+        "doctor check error should mention DOCKER_HOST:\n{clean}"
+    );
+    assert!(
+        clean.contains("docker info"),
+        "doctor check error should suggest 'docker info':\n{clean}"
+    );
+}
+
+/// When Docker IS available, `openshell doctor check` should pass and
+/// report the version.
+///
+/// This test only runs when Docker is actually reachable on the host
+/// (i.e., it will pass in CI with Docker but be skipped locally if
+/// Docker is not running). We detect this by checking if the default
+/// socket exists.
+#[tokio::test]
+async fn doctor_check_passes_with_docker() {
+    if !std::path::Path::new("/var/run/docker.sock").exists() {
+        eprintln!("skipping: /var/run/docker.sock not found");
+        return;
+    }
+
+    let tmpdir = tempfile::tempdir().expect("create isolated config dir");
+    let mut cmd = openshell_cmd();
+    cmd.args(["doctor", "check"])
+        .env("XDG_CONFIG_HOME", tmpdir.path())
+        .env("HOME", tmpdir.path())
+        .env_remove("OPENSHELL_GATEWAY")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let output = cmd.output().await.expect("spawn openshell");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let combined = format!("{stdout}{stderr}");
+    let code = output.status.code().unwrap_or(-1);
+    let clean = strip_ansi(&combined);
+
+    assert_eq!(
+        code, 0,
+        "doctor check should pass when Docker is available, output:\n{clean}"
+    );
+    assert!(
+        clean.contains("All checks passed"),
+        "doctor check should report success:\n{clean}"
+    );
+    assert!(
+        clean.contains("ok"),
+        "doctor check should show 'ok' for Docker:\n{clean}"
+    );
+}

@@ -30,9 +30,8 @@ use crate::constants::{
     volume_name,
 };
 use crate::docker::{
-    check_docker_available, check_existing_gateway, check_port_conflicts,
-    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
-    start_container, stop_container,
+    check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
+    ensure_image, ensure_network, ensure_volume, start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -45,7 +44,9 @@ use crate::runtime::{
 };
 
 pub use crate::constants::container_name;
-pub use crate::docker::{DockerPreflight, ExistingGatewayInfo, create_ssh_docker_client};
+pub use crate::docker::{
+    DockerPreflight, ExistingGatewayInfo, check_docker_available, create_ssh_docker_client,
+};
 pub use crate::metadata::{
     GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
     list_gateways, load_active_gateway, load_gateway_metadata, load_last_sandbox,
