@@ -8,9 +8,10 @@ build-backend = "maturin"
 [project]
 name = "openshell"
 dynamic = ["version"]
-description = "OpenShell is the runtime environment for autonomous agents"
+description = "OpenShell is a safe, private runtime for autonomous AI agents"
 license = "Apache-2.0"
 readme = "README.md"
+authors = [{ name = "NVIDIA Inc." }]
 requires-python = ">=3.12"
 dependencies = [
     "cloudpickle>=3.0",
@@ -20,11 +21,23 @@ dependencies = [
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Information Technology",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Rust",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: Security",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS :: MacOS X",
 ]
+keywords = ["agent", "sandbox", "nvidia"]
+
+[project.urls]
+source = "https://github.com/NVIDIA/OpenShell"
+documentation = "https://docs.nvidia.com/openshell/latest/"
 
 [dependency-groups]
 dev = [
