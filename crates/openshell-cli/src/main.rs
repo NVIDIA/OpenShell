@@ -281,6 +281,7 @@ const DOCTOR_HELP: &str = "\x1b[1mALIAS\x1b[0m
   dr
 
 \x1b[1mEXAMPLES\x1b[0m
+  $ openshell doctor check
   $ openshell doctor logs --lines 100
   $ openshell doctor exec -- kubectl get pods -A
   $ openshell doctor llm.txt
@@ -1015,6 +1016,17 @@ enum DoctorCommands {
     ///   openshell doctor llm.txt | pbcopy
     #[command(name = "llm.txt", help_template = LEAF_HELP_TEMPLATE)]
     LlmTxt,
+
+    /// Validate system prerequisites for running a gateway.
+    ///
+    /// Checks that a Docker-compatible runtime is installed, running, and
+    /// reachable. Reports version info and socket path. Use this to verify
+    /// your environment before running `openshell gateway start`.
+    ///
+    /// Examples:
+    ///   openshell doctor check
+    #[command(help_template = LEAF_HELP_TEMPLATE)]
+    Check,
 }
 
 #[derive(Subcommand, Debug)]
@@ -1539,6 +1551,9 @@ async fn main() -> Result<()> {
             }
             DoctorCommands::LlmTxt => {
                 run::doctor_llm()?;
+            }
+            DoctorCommands::Check => {
+                run::doctor_check().await?;
             }
         },
         Some(Commands::Doctor { command: None }) => {
