@@ -208,6 +208,113 @@ Check instead:
 
 Use the `generate-sandbox-policy` skill when the user needs help authoring policy YAML.
 
+## Fix: Local Host Inference Timeouts (Firewall)
+
+Use this fix when a sandbox can reach `https://inference.local`, but OpenShell reports an upstream timeout against a host-local backend such as Ollama.
+
+Example symptom:
+
+```json
+{"error":"request to http://host.docker.internal:11434/v1/models timed out"}
+```
+
+### When This Happens
+
+This failure commonly appears on Linux hosts that:
+
+- Run the OpenShell gateway in Docker
+- Route `inference.local` to a host-local OpenAI-compatible endpoint such as Ollama
+- Use UFW or another host firewall with default incoming or routed traffic denied
+
+In this case, OpenShell routing is usually working correctly. The failing hop is container-to-host traffic on the backend port.
+
+### Why CoreDNS Is Not the Cause
+
+This is not the same issue as the Colima CoreDNS fix.
+
+OpenShell injects `host.docker.internal` and `host.openshell.internal` into sandbox pods with `hostAliases`. That path bypasses cluster DNS lookup. If the request still times out, the usual cause is host firewall policy, not CoreDNS.
+
+### Verify the Problem
+
+1. Confirm the model server works on the host:
+
+   ```bash
+   curl -sS http://127.0.0.1:11434/v1/models
+   ```
+
+2. Confirm the host gateway address also works on the host:
+
+   ```bash
+   curl -sS http://172.17.0.1:11434/v1/models
+   ```
+
+3. Test the same endpoint from the OpenShell cluster container:
+
+   ```bash
+   docker exec openshell-cluster-<gateway> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
+   ```
+
+If steps 1 and 2 succeed but step 3 times out, host firewall policy is blocking the container-to-host path.
+
+### Fix
+
+Allow the OpenShell cluster bridge network to reach the host-local inference port.
+
+Example narrow UFW rule:
+
+```bash
+sudo ufw allow proto tcp \
+  from 172.18.0.0/16 \
+  to 172.17.0.1 \
+  port 11434 \
+  comment 'OpenShell local inference'
+```
+
+This example matches a common local layout:
+
+- `172.18.0.0/16`: the Docker bridge subnet used by the OpenShell cluster container
+- `172.17.0.1`: the host gateway IP injected into sandbox pods for `host.docker.internal`
+- `11434/tcp`: the default Ollama port
+
+Adjust the source subnet, destination IP, or port if your local Docker network differs.
+
+### Verify the Fix
+
+1. Re-run the cluster container check:
+
+   ```bash
+   docker exec openshell-cluster-<gateway> wget -qO- -T 5 http://host.docker.internal:11434/v1/models
+   ```
+
+2. Re-test from a sandbox:
+
+   ```bash
+   curl -sS https://inference.local/v1/models
+   ```
+
+Both commands should return the upstream model list.
+
+### Check the Active Firewall Rule
+
+```bash
+sudo ufw status numbered
+```
+
+You should see a rule similar to:
+
+```
+172.17.0.1 11434/tcp  ALLOW IN  172.18.0.0/16
+```
+
+### If It Still Fails
+
+- Confirm the backend listens on a host-reachable address: `ss -ltnp | rg ':11434\b'`
+- Confirm the provider points at the host alias path you expect: `openshell provider get <provider-name>`
+- Confirm the active inference route: `openshell inference get`
+- Inspect sandbox logs for upstream timeout details: `openshell logs <sandbox-name> --since 10m`
+
+If the host uses a firewall other than UFW, apply the equivalent allow rule for traffic from the Docker bridge network to the host-local inference port.
+
 ## Common Failure Patterns
 
 | Symptom | Likely cause | Fix |
@@ -220,6 +327,7 @@ Use the `generate-sandbox-policy` skill when the user needs help authoring polic
 | `no compatible route` | Provider type does not match request shape | Switch provider type or change the client API |
 | Direct call to external host is denied | Missing policy or provider attachment | Update `network_policies` and launch sandbox with the right provider |
 | SDK fails on empty auth token | Client requires a non-empty API key even though OpenShell injects the real one | Use any placeholder token such as `test` |
+| Upstream timeout from container to host-local backend | Host firewall (UFW or similar) blocks container-to-host traffic | Allow the Docker bridge subnet to reach the inference port on the host gateway IP (see firewall fix section above) |
 
 ## Full Diagnostic Dump
 
