@@ -59,12 +59,10 @@ openshell sandbox create \
 On first use, create the Hindsight CLI config:
 
 ```bash
-mkdir -p ~/.hindsight
-cat > ~/.hindsight/config << 'EOF'
-api_url = "${HINDSIGHT_API_URL}"
-api_key = "${HINDSIGHT_API_KEY}"
-EOF
-chmod 600 ~/.hindsight/config
+# The CLI reads HINDSIGHT_API_URL and HINDSIGHT_API_KEY env vars directly,
+# so no config file is needed when the provider injects them.
+# To persist config explicitly:
+hindsight configure --api-url "$HINDSIGHT_API_URL" --api-key "$HINDSIGHT_API_KEY"
 ```
 
 If the `hindsight` CLI is not available in the base image, install it:
@@ -124,32 +122,32 @@ hindsight memory recall <bank-id> "query" -o json
 hindsight memory retain <bank-id> "Project uses 2-space indentation with Prettier"
 
 # Store a learning with context
-hindsight memory retain <bank-id> "Build failed when using Node 18, works with Node 20" --context learnings
+hindsight memory retain <bank-id> "Build failed when using Node 18, works with Node 20" --context "learnings from CI pipeline"
 
 # Store a procedure
-hindsight memory retain <bank-id> "Running integration tests requires Docker and POSTGRES_URL set" --context procedures
+hindsight memory retain <bank-id> "Running integration tests requires Docker and POSTGRES_URL set" --context "setup procedures"
 
 # Store a debugging outcome
-hindsight memory retain <bank-id> "The auth timeout was caused by missing CONNECTION_POOL_SIZE env var, default of 5 was too low" --context debugging
+hindsight memory retain <bank-id> "The auth timeout was caused by missing CONNECTION_POOL_SIZE env var, default of 5 was too low" --context "debugging auth timeout"
 ```
 
 ### What to Store
 
-| Category | Examples | Context Tag |
-|----------|----------|-------------|
-| Project conventions | Coding standards, branch naming, PR conventions | `conventions` |
-| Procedures | Steps that completed a task, required env vars | `procedures` |
-| Learnings | Bugs and solutions, what worked and what didn't | `learnings` |
-| Architecture | Design decisions, component relationships | `architecture` |
-| Team knowledge | Onboarding info, domain knowledge, pitfalls | `team` |
-| Individual preferences | "Alice prefers explicit type annotations" | `preferences` |
+| Category | Examples | Context |
+|----------|----------|---------|
+| Project conventions | Coding standards, branch naming, PR conventions | `"project conventions"` |
+| Procedures | Steps that completed a task, required env vars | `"setup procedures"` |
+| Learnings | Bugs and solutions, what worked and what didn't | `"learnings from debugging"` |
+| Architecture | Design decisions, component relationships | `"architecture decisions"` |
+| Team knowledge | Onboarding info, domain knowledge, pitfalls | `"team knowledge"` |
+| Individual preferences | "Alice prefers explicit type annotations" | `"Alice preferences"` |
 
 ### Retain Best Practices
 
 1. **Store immediately** — do not batch. The sandbox could be destroyed.
 2. **Be specific** — store "npm test requires --experimental-vm-modules flag" not "tests need a flag".
 3. **Include outcomes** — store what worked AND what did not work.
-4. **Use context tags** — they help with filtering during recall.
+4. **Use `--context`** — provide descriptive context to help Hindsight understand the memory's purpose.
 5. **Attribute preferences** — store "Alice prefers X" not "user prefers X".
 
 ## Workflow 3: Reflect for Synthesized Answers
@@ -193,10 +191,10 @@ This is the core value of Hindsight in OpenShell. When a sandbox is destroyed an
 
 ```bash
 # Agent discovers something during work
-hindsight memory retain my-project "The retry logic in api/client.rs has no backoff jitter, causing thundering herd under load" --context learnings
+hindsight memory retain my-project "The retry logic in api/client.rs has no backoff jitter, causing thundering herd under load" --context "learnings from load testing"
 
 # Agent completes a partial fix
-hindsight memory retain my-project "Fixed retry backoff in api/client.rs by adding exponential jitter. Still need to add circuit breaker logic." --context progress
+hindsight memory retain my-project "Fixed retry backoff in api/client.rs by adding exponential jitter. Still need to add circuit breaker logic." --context "progress on retry backoff fix"
 ```
 
 **New sandbox session:**
@@ -213,8 +211,8 @@ hindsight memory recall my-project "retry logic and backoff changes"
 Adopt this pattern for every sandbox session:
 
 1. **Session start**: `hindsight memory recall <bank-id> "<topic of current task>"`
-2. **During work**: `hindsight memory retain <bank-id> "<learning>" --context learnings` (as discoveries happen)
-3. **Session end**: `hindsight memory retain <bank-id> "<summary of progress and next steps>" --context progress`
+2. **During work**: `hindsight memory retain <bank-id> "<learning>" --context "learnings"` (as discoveries happen)
+3. **Session end**: `hindsight memory retain <bank-id> "<summary of progress and next steps>" --context "session progress and next steps"`
 
 ## Network Policy
 
@@ -284,7 +282,7 @@ hindsight bank disposition <bank-id>
 | Command | Description |
 |---------|-------------|
 | `hindsight memory retain <bank> "text"` | Store a memory |
-| `hindsight memory retain <bank> "text" --context <tag>` | Store with context tag |
+| `hindsight memory retain <bank> "text" --context "desc"` | Store with context |
 | `hindsight memory retain-files <bank> <path>` | Retain from files |
 | `hindsight memory recall <bank> "query"` | Search memories |
 | `hindsight memory recall <bank> "query" --budget high` | Thorough search |

@@ -28,26 +28,26 @@ Config file location: `~/.hindsight/config`
 
 ```bash
 hindsight memory retain <bank_id> "<text>"
-hindsight memory retain <bank_id> "<text>" --context <tag>
+hindsight memory retain <bank_id> "<text>" --context "<description>"
 hindsight memory retain <bank_id> "<text>" --async
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--context <tag>` | Context tag for categorization (e.g., learnings, procedures, conventions) |
+| `--context <text>` | Freeform context describing the memory (e.g., "learnings from debugging auth") |
 | `--async` | Queue for background processing instead of waiting |
 
 ### retain-files — Bulk Import from Files
 
 ```bash
 hindsight memory retain-files <bank_id> <file_or_directory>
-hindsight memory retain-files <bank_id> <path> --context <tag>
+hindsight memory retain-files <bank_id> <path> --context "<description>"
 hindsight memory retain-files <bank_id> <path> --async
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--context <tag>` | Context tag applied to all retained content |
+| `--context <text>` | Freeform context applied to all retained content |
 | `--async` | Queue for background processing |
 
 Directories are processed recursively by default.
@@ -64,23 +64,27 @@ hindsight memory recall <bank_id> "<query>" --trace
 
 | Flag | Description |
 |------|-------------|
-| `--budget <level>` | Search thoroughness: low, medium, high (default: medium) |
-| `--max-tokens <n>` | Maximum tokens in response |
-| `--fact-type <types>` | Comma-separated: world, experience, observation |
+| `--budget <level>` | Search thoroughness: low, mid, high (default: mid) |
+| `--max-tokens <n>` | Maximum tokens in response (default: 4096) |
+| `--fact-type <types>` | Comma-separated: world, experience, opinion (default: all three) |
 | `--trace` | Show trace information for debugging |
+| `--include-chunks` | Include source chunks in results |
+| `--chunk-max-tokens <n>` | Maximum tokens for chunks (default: 8192, requires --include-chunks) |
 
 ### reflect — Synthesized Response
 
 ```bash
 hindsight memory reflect <bank_id> "<question>"
-hindsight memory reflect <bank_id> "<question>" --context <tag>
+hindsight memory reflect <bank_id> "<question>" --context "<additional context>"
 hindsight memory reflect <bank_id> "<question>" --budget high
 ```
 
 | Flag | Description |
 |------|-------------|
-| `--context <tag>` | Additional context for the reflection |
-| `--budget <level>` | Search thoroughness: low, medium, high |
+| `--context <text>` | Additional context for the reflection |
+| `--budget <level>` | Search thoroughness: low, mid, high (default: mid) |
+| `--max-tokens <n>` | Maximum tokens for the response |
+| `--schema <path>` | Path to JSON schema file for structured output |
 
 ## Bank Management
 
@@ -89,7 +93,7 @@ hindsight bank list                           # List all banks
 hindsight bank stats <bank_id>                # View bank statistics
 hindsight bank disposition <bank_id>          # View personality traits
 hindsight bank name <bank_id> "<name>"        # Set bank display name
-hindsight bank background <bank_id> "<text>"  # Set bank background context
+hindsight bank mission <bank_id> "<text>"     # Set bank mission statement
 ```
 
 ## Document Management
@@ -131,6 +135,7 @@ The Hindsight API exposes these endpoints (relevant for network policy authoring
 
 | Method | Path | Operation |
 |--------|------|-----------|
+| POST | `/v1/default/banks/{bank_id}/memories` | Retain memories |
 | POST | `/v1/default/banks/{bank_id}/files/retain` | Retain files |
 | POST | `/v1/default/banks/{bank_id}/memories/recall` | Recall memories |
 | POST | `/v1/default/banks/{bank_id}/reflect` | Reflect on memories |
@@ -138,4 +143,4 @@ The Hindsight API exposes these endpoints (relevant for network policy authoring
 | GET | `/v1/default/banks/{bank_id}/stats` | Bank statistics |
 | GET | `/v1/default/banks/{bank_id}/entities` | List entities |
 | GET | `/v1/default/banks/{bank_id}/memories/list` | List memories |
-| POST | `/v1/default/banks/{bank_id}/documents` | Upload documents |
+| GET | `/v1/default/banks/{bank_id}/documents` | List documents |
