@@ -9,7 +9,7 @@ OpenShell is the safe, private runtime for autonomous AI agents. It provides san
 
 OpenShell is built agent-first. The project ships with agent skills for everything from cluster debugging to policy generation, and we expect contributors to use them.
 
-> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one cluster. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
+> **Alpha software — single-player mode.** OpenShell is proof-of-life: one developer, one environment, one gateway. We are building toward multi-tenant enterprise deployments, but the starting point is getting your own environment up and running. Expect rough edges. Bring your agent.
 
 ## Quickstart
 
@@ -54,7 +54,7 @@ uv tool install -U openshell
 openshell sandbox create -- claude  # or opencode, codex
 ```
 
-A gateway cluster is created automatically on first use. To deploy on a remote host instead, pass `--remote user@host`.
+A gateway is created automatically on first use. To deploy on a remote host instead, pass `--remote user@host` to the create command.
 
 The sandbox container includes the following tools by default:
 
@@ -64,6 +64,8 @@ The sandbox container includes the following tools by default:
 | Language   | `python` (3.13), `node` (22)                             |
 | Developer  | `gh`, `git`, `vim`, `nano`                               |
 | Networking | `ping`, `dig`, `nslookup`, `nc`, `traceroute`, `netstat` |
+
+For more details see https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base.
 
 ### See network policy in action
 
@@ -138,7 +140,7 @@ OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or
 openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
 ```
 
-The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also inferred automatically for community images with `gpu` in the name (e.g., `--from nvidia-gpu`).
+The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also inferred automatically for community images with `gpu` in the name.
 
 **Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
