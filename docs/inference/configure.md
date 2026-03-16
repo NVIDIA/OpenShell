@@ -58,10 +58,10 @@ $ openshell provider create \
     --name my-local-model \
     --type openai \
     --credential OPENAI_API_KEY=empty-if-not-required \
-    --config OPENAI_BASE_URL=http://192.168.10.15/v1
+    --config OPENAI_BASE_URL=http://host.openshell.internal:11434/v1
 ```
 
-Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running on your network. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
+Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running where the gateway runs. For host-backed local inference, use `host.openshell.internal` or the host's LAN IP. Avoid `127.0.0.1` and `localhost`. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
 
 ::::
 
@@ -131,7 +131,13 @@ response = client.chat.completions.create(
 
 The client-supplied `model` and `api_key` values are not sent upstream. The privacy router injects the real credentials from the configured provider and rewrites the model before forwarding.
 
+Some SDKs require a non-empty API key even though `inference.local` does not use the sandbox-provided value. In those cases, pass any placeholder such as `test` or `unused`.
+
 Use this endpoint when inference should stay local to the host for privacy and security reasons. External providers that should be reached directly belong in `network_policies` instead.
+
+When the upstream runs on the same machine as the gateway, bind it to `0.0.0.0` and point the provider at `host.openshell.internal` or the host's LAN IP. `127.0.0.1` and `localhost` usually fail because the request originates from the gateway or sandbox runtime, not from your shell.
+
+If the gateway runs on a remote host or behind a cloud deployment, `host.openshell.internal` points to that remote machine, not to your laptop. A laptop-local Ollama or vLLM process is not reachable from a remote gateway unless you add your own tunnel or shared network path.
 
 ### Verify the Endpoint from a Sandbox
 
@@ -152,11 +158,13 @@ A successful response confirms the privacy router can reach the configured backe
 
 - Gateway-scoped: Every sandbox using the active gateway sees the same `inference.local` backend.
 - HTTPS only: `inference.local` is intercepted only for HTTPS traffic.
+- Hot reload: Provider and inference changes are picked up within about 5 seconds by default.
 
 ## Next Steps
 
 Explore related topics:
 
 - To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
+- To follow a complete Ollama-based local setup, refer to {doc}`/tutorials/local-inference-ollama`.
 - To control external endpoints, refer to [Policies](/sandboxes/policies.md).
 - To manage provider records, refer to {doc}`../sandboxes/manage-providers`.

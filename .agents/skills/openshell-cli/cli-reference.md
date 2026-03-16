@@ -270,7 +270,7 @@ View sandbox logs. Supports one-shot and streaming.
 
 ### `openshell policy set <name> --policy <PATH>`
 
-Update the policy on a live sandbox. Only dynamic fields (`network_policies`, `inference`) can be changed at runtime.
+Update the policy on a live sandbox. Only the dynamic `network_policies` field can be changed at runtime.
 
 | Flag | Default | Description |
 |------|---------|-------------|

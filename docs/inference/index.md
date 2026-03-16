@@ -43,9 +43,9 @@ If code calls an external inference host directly, that traffic is evaluated onl
 | Property | Detail |
 |---|---|
 | Credentials | No sandbox API keys needed. Credentials come from the configured provider record. |
-| Configuration | One provider and one model define sandbox inference. |
+| Configuration | One provider and one model define sandbox inference for the active gateway. Every sandbox on that gateway sees the same `inference.local` backend. |
 | Provider support | OpenAI, Anthropic, and NVIDIA providers all work through the same endpoint. |
-| Hot-refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. |
+| Hot-refresh | OpenShell picks up provider credential changes and inference updates without recreating sandboxes. Changes propagate within about 5 seconds by default. |
 
 ## Supported API Patterns
 

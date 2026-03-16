@@ -84,7 +84,7 @@ Policy fields fall into two categories based on when they are enforced:
 | Category | Fields | Enforcement Point | Updatable? |
 |----------|--------|-------------------|------------|
 | **Static** | `filesystem_policy`, `landlock`, `process` | Applied once in the child process `pre_exec` (after `fork()`, before `exec()`). Kernel-level Landlock rulesets and UID/GID changes cannot be reversed. | No -- immutable after sandbox creation |
-| **Dynamic** | `network_policies`, `inference` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `openshell policy set` |
+| **Dynamic** | `network_policies` | Evaluated at runtime by the OPA engine on every proxy CONNECT request and L7 rule check. The OPA engine can be atomically replaced. | Yes -- via `openshell policy set` |
 
 Attempting to change a static field in an update request returns an `INVALID_ARGUMENT` error with a message indicating which field cannot be modified. See `crates/openshell-server/src/grpc.rs` -- `validate_static_fields_unchanged()`.
 
@@ -1092,9 +1092,6 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/python3.13 }
 
-inference:
-  allowed_routes:
-    - local
 ```
 
 ---

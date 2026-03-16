@@ -7,7 +7,7 @@ OpenShell is built agent-first. We design systems and use agents to implement th
 This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:
 
 1. Clone the repo and point your coding agent at it.
-2. Load the relevant skill — `debug-openshell-cluster` for cluster problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
+2. Load the relevant skill - `debug-openshell-cluster` for cluster problems, `debug-inference` for inference setup problems, `openshell-cli` for usage questions, `generate-sandbox-policy` for policy help.
 3. Have your agent investigate. Let it run diagnostics, read the architecture docs, and attempt a fix.
 4. If the agent cannot resolve it, open an issue **with the agent's diagnostic output attached**. The issue template requires this.
 
@@ -16,12 +16,13 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 - A real bug that your agent confirmed and could not fix.
 - A feature proposal with a design — not a "please build this" request.
 - An infrastructure problem that the `debug-openshell-cluster` skill could not resolve.
+- An inference setup problem that the `debug-inference` skill could not resolve.
 - Security vulnerabilities must follow [SECURITY.md](SECURITY.md) — **not** GitHub issues.
 
 ### When NOT to Open an Issue
 
 - Questions about how things work — your agent can answer these from the codebase and architecture docs.
-- Configuration problems — your agent can diagnose these with `openshell-cli` and `debug-openshell-cluster`.
+- Configuration problems - your agent can diagnose these with `openshell-cli`, `debug-openshell-cluster`, and `debug-inference`.
 - "How do I..." requests — the skills cover CLI usage, policy generation, TUI development, and more.
 
 ## Agent Skills for Contributors
@@ -32,6 +33,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 |----------|-------|---------|
 | Getting Started | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, BYOC workflows |
 | Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues |
+| Getting Started | `debug-inference` | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
 | Contributing | `create-spike` | Investigate a problem, produce a structured GitHub issue |
 | Contributing | `build-from-issue` | Plan and implement work from a GitHub issue (maintainer workflow) |
 | Contributing | `create-github-issue` | Create well-structured GitHub issues |

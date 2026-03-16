@@ -208,7 +208,7 @@ openshell sandbox delete sandbox-1 sandbox-2 sandbox-3   # Multiple at once
 
 This is the most important multi-step workflow. It enables a tight feedback cycle where sandbox policy is refined based on observed activity.
 
-**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and dynamic fields (hot-reloadable on a running sandbox: `network_policies`, `inference`). Only dynamic fields can be updated without recreating the sandbox.
+**Key concept**: Policies have static fields (immutable after creation: `filesystem_policy`, `landlock`, `process`) and one dynamic field (`network_policies`). Only `network_policies` can be updated without recreating the sandbox.
 
 ```
 Create sandbox with initial policy
@@ -272,7 +272,7 @@ Edit `current-policy.yaml` to allow the blocked actions. **For policy content au
 - Enforcement modes (`audit` vs `enforce`)
 - Binary matching patterns
 
-Only `network_policies` and `inference` sections can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated.
+Only `network_policies` can be modified at runtime. If `filesystem_policy`, `landlock`, or `process` need changes, the sandbox must be recreated.
 
 ### Step 5: Push the updated policy
 
@@ -564,4 +564,5 @@ $ openshell sandbox upload --help
 |-------|------------|
 | `generate-sandbox-policy` | Creating or modifying policy YAML content (network rules, L7 inspection, access presets, endpoint configuration) |
 | `debug-openshell-cluster` | Diagnosing cluster startup or health failures |
+| `debug-inference` | Diagnosing `inference.local`, host-backed local inference, and provider base URL issues |
 | `tui-development` | Developing features for the OpenShell TUI (`openshell term`) |

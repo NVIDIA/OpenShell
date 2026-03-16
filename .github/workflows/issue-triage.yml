@@ -53,7 +53,7 @@ jobs:
               body: [
                 'This issue appears to have been opened without an agent investigation.',
                 '',
-                'OpenShell is an agent-first project — please point your coding agent at the repo and have it diagnose this before we triage. Your agent can load skills like `debug-openshell-cluster`, `openshell-cli`, and `generate-sandbox-policy`.',
+                'OpenShell is an agent-first project - please point your coding agent at the repo and have it diagnose this before we triage. Your agent can load skills like `debug-openshell-cluster`, `debug-inference`, `openshell-cli`, and `generate-sandbox-policy`.',
                 '',
                 'See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#before-you-open-an-issue) for the full workflow.',
               ].join('\n')

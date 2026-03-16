@@ -30,7 +30,7 @@ Use this page to apply and iterate policy changes on running sandboxes. For a fu
 
 ## Policy Structure
 
-A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and dynamic sections `network_policies` and `inference` that are hot-reloadable on a running sandbox.
+A policy has static sections `filesystem_policy`, `landlock`, and `process` that are locked at sandbox creation, and a dynamic section `network_policies` that is hot-reloadable on a running sandbox.
 
 ```yaml
 version: 1
@@ -63,9 +63,6 @@ network_policies:
     binaries:
       - path: /usr/bin/curl
 
-# Dynamic: hot-reloadable. Routing hints this sandbox can use for inference (e.g. local, nvidia).
-inference:
-  allowed_routes: [local]
 ```
 
 Static sections are locked at sandbox creation. Changing them requires destroying and recreating the sandbox.
@@ -76,8 +73,7 @@ Dynamic sections can be updated on a running sandbox with `openshell policy set`
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (use the highest ABI the host kernel supports) or `hard_requirement` (fail if the required ABI is unavailable). |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches and inference routes are configured, the request may be rerouted for inference. Otherwise the connection is denied. |
-| `inference` | Dynamic | Controls which inference routing backends the sandbox can use. Set `allowed_routes` to a list of route names (for example, `[local]` or `[local, nvidia]`). When an outbound request does not match any `network_policies` entry, the proxy checks whether the destination matches a configured inference route. If it does and the route is in `allowed_routes`, the request is forwarded to that backend. |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
 
 ## Apply a Custom Policy
 
@@ -137,7 +133,7 @@ The following steps outline the hot-reload policy update workflow.
    $ openshell policy get <name> --full > current-policy.yaml
    ```
 
-4. Edit the YAML: add or adjust `network_policies` entries, binaries, `access` or `rules`, or `inference.allowed_routes`.
+4. Edit the YAML: add or adjust `network_policies` entries, binaries, `access`, or `rules`.
 
 5. Push the updated policy. Exit codes: 0 = loaded, 1 = validation failed, 124 = timeout.
 

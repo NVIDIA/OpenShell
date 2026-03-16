@@ -51,11 +51,11 @@ Every outbound connection from agent code passes through the same decision path:
 
 1. The agent process opens an outbound connection (API call, package install, git clone, and so on).
 2. The proxy inside the sandbox intercepts the connection and identifies which binary opened it.
-3. The proxy queries the policy engine with the destination, port, and calling binary.
-4. The policy engine returns one of three decisions:
-   - **Allow** — the destination and binary match a policy block. Traffic flows directly to the external service.
-   - **Route for inference** — no policy block matched, but inference routing is configured. The privacy router intercepts the request, strips the original credentials, injects the configured backend credentials, and forwards to the managed model endpoint.
-   - **Deny** — no match and no inference route. The connection is blocked and logged.
+3. If the target is `https://inference.local`, the proxy handles it as managed inference before policy evaluation. OpenShell strips sandbox-supplied credentials, injects the configured backend credentials, and forwards the request to the managed model endpoint.
+4. For every other destination, the proxy queries the policy engine with the destination, port, and calling binary.
+5. The policy engine returns one of two decisions:
+   - **Allow** - the destination and binary match a policy block. Traffic flows directly to the external service.
+   - **Deny** - no policy block matched. The connection is blocked and logged.
 
 For REST endpoints with TLS termination enabled, the proxy also decrypts TLS and checks each HTTP request against per-method, per-path rules before allowing it through.
 

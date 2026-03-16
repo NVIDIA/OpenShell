@@ -121,7 +121,7 @@ OpenShell Terminal combines sandbox status and live logs in a single real-time d
 $ openshell term
 ```
 
-Use the terminal to spot blocked connections marked `action=deny` and inference interceptions marked `action=inspect_for_inference`. If a connection is blocked unexpectedly, add the host to your network policy. Refer to {doc}`policies` for the workflow.
+Use the terminal to spot blocked connections marked `action=deny` and inference-related proxy activity. If a connection is blocked unexpectedly, add the host to your network policy. Refer to {doc}`policies` for the workflow.
 
 ## Port Forwarding
 

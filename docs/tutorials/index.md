@@ -43,6 +43,15 @@ Launch Claude Code in a sandbox, diagnose a policy denial, and iterate on a cust
 +++
 {bdg-secondary}`Tutorial`
 :::
+
+:::{grid-item-card} Local Inference with Ollama
+:link: local-inference-ollama
+:link-type: doc
+
+Route inference to a local Ollama server, verify it from a sandbox, and reuse the same pattern for other OpenAI-compatible engines.
++++
+{bdg-secondary}`Tutorial`
+:::
 ::::
 
 ```{toctree}
@@ -50,4 +59,5 @@ Launch Claude Code in a sandbox, diagnose a policy denial, and iterate on a cust
 
 First Network Policy <first-network-policy>
 GitHub Push Access <github-sandbox>
+Local Inference with Ollama <local-inference-ollama>
 ```
