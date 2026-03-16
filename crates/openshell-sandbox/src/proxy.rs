@@ -1647,6 +1647,43 @@ async fn handle_forward_proxy(
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
+    // Forward proxy requests are parsed and rewritten before relay, so they
+    // cannot safely enter the CONNECT-style per-request L7 inspection loop.
+    // Deny here when endpoint-level L7 rules are configured to avoid bypassing
+    // method/path policy enforcement.
+    if query_l7_config(&opa_engine, &decision, &host_lc, port).is_some() {
+        let reason = "forward proxy is not allowed for endpoints with L7 policy; use CONNECT";
+        info!(
+            src_addr = %peer_addr.ip(),
+            src_port = peer_addr.port(),
+            proxy_addr = %local_addr,
+            dst_host = %host_lc,
+            dst_port = port,
+            method = %method,
+            path = %path,
+            binary = %binary_str,
+            binary_pid = %pid_str,
+            ancestors = %ancestors_str,
+            cmdline = %cmdline_str,
+            action = "deny",
+            engine = "opa",
+            policy = %policy_str,
+            reason = %reason,
+            "FORWARD",
+        );
+        emit_denial_simple(
+            denial_tx,
+            &host_lc,
+            port,
+            &binary_str,
+            &decision,
+            reason,
+            "forward_l7",
+        );
+        respond(client, b"HTTP/1.1 403 Forbidden\r\n\r\n").await?;
+        return Ok(());
+    }
+
     // 5. DNS resolution + SSRF defence (mirrors the CONNECT path logic).
     //    - If allowed_ips is set: validate resolved IPs against the allowlist
     //      (this is the SSRF override for private IP destinations).
