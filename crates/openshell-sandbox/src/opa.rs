@@ -862,10 +862,12 @@ mod tests {
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(config
-            .filesystem
-            .read_write
-            .contains(&PathBuf::from("/tmp")));
+        assert!(
+            config
+                .filesystem
+                .read_write
+                .contains(&PathBuf::from("/tmp"))
+        );
     }
 
     #[test]
@@ -1224,10 +1226,12 @@ network_policies:
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(config
-            .filesystem
-            .read_write
-            .contains(&PathBuf::from("/tmp")));
+        assert!(
+            config
+                .filesystem
+                .read_write
+                .contains(&PathBuf::from("/tmp"))
+        );
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
     }
