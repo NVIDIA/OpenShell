@@ -18,8 +18,7 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
         return Ok(());
     }
 
-    let allow_inet = matches!(policy.network.mode, NetworkMode::Proxy);
-    let filter = build_filter(allow_inet)?;
+    let filter = build_filter()?;
 
     // Required before applying seccomp filters.
     let rc = unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) };
@@ -34,15 +33,17 @@ pub fn apply(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
-fn build_filter(allow_inet: bool) -> Result<seccompiler::BpfProgram> {
+fn build_filter() -> Result<seccompiler::BpfProgram> {
     let mut rules: BTreeMap<i64, Vec<SeccompRule>> = BTreeMap::new();
 
-    let mut blocked_domains = vec![libc::AF_PACKET, libc::AF_BLUETOOTH, libc::AF_VSOCK];
-    if !allow_inet {
-        blocked_domains.push(libc::AF_INET);
-        blocked_domains.push(libc::AF_INET6);
-        blocked_domains.push(libc::AF_NETLINK);
-    }
+    let blocked_domains = vec![
+        libc::AF_PACKET,
+        libc::AF_BLUETOOTH,
+        libc::AF_VSOCK,
+        libc::AF_INET,
+        libc::AF_INET6,
+        libc::AF_NETLINK,
+    ];
 
     for domain in blocked_domains {
         debug!(domain, "Blocking socket domain via seccomp");
