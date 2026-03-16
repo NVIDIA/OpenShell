@@ -328,29 +328,51 @@ jobs:
           cat openshell-checksums-sha256.txt
 
       - name: Prune stale wheel assets from devel release
+        uses: actions/github-script@v7
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           WHEEL_VERSION: ${{ needs.build-python-wheels.outputs.wheel_version }}
-        run: |
-          set -euo pipefail
-          CURRENT_PREFIX="openshell-${WHEEL_VERSION}-"
+        with:
+          script: |
+            const wheelVersion = process.env.WHEEL_VERSION;
+            const currentPrefix = `openshell-${wheelVersion}-`;
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
 
-          if ! gh release view devel --repo "${GITHUB_REPOSITORY}" --json assets > /dev/null 2>&1; then
-            echo "No existing devel release found; skipping wheel pruning."
-            exit 0
-          fi
+            core.info(`=== Wheel pruning diagnostics ===`);
+            core.info(`WHEEL_VERSION: ${wheelVersion}`);
+            core.info(`CURRENT_PREFIX: ${currentPrefix}`);
 
-          gh release view devel --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' \
-            | while read -r asset; do
-                case "$asset" in
-                  *.whl)
-                    if [[ "$asset" != "${CURRENT_PREFIX}"* ]]; then
-                      echo "Deleting stale wheel asset: $asset"
-                      gh release delete-asset devel "$asset" --repo "${GITHUB_REPOSITORY}" --yes
-                    fi
-                    ;;
-                esac
-              done
+            // Fetch the devel release
+            let release;
+            try {
+              release = await github.rest.repos.getReleaseByTag({ owner, repo, tag: 'devel' });
+            } catch (err) {
+              if (err.status === 404) {
+                core.info('No existing devel release found; skipping wheel pruning.');
+                return;
+              }
+              throw err;
+            }
+
+            const assets = release.data.assets;
+            core.info(`=== Current devel release assets (${assets.length} total) ===`);
+            for (const a of assets) {
+              core.info(`  ${String(a.id).padStart(12)}  ${a.name}`);
+            }
+
+            // Delete stale wheels
+            let kept = 0, deleted = 0;
+            for (const asset of assets) {
+              if (!asset.name.endsWith('.whl')) continue;
+              if (asset.name.startsWith(currentPrefix)) {
+                core.info(`Keeping current wheel: ${asset.name}`);
+                kept++;
+              } else {
+                core.info(`Deleting stale wheel: ${asset.name} (id=${asset.id})`);
+                await github.rest.repos.deleteReleaseAsset({ owner, repo, asset_id: asset.id });
+                deleted++;
+              }
+            }
+            core.info(`Summary: kept=${kept}, deleted=${deleted}`);
 
       - name: Move devel tag
         run: |
