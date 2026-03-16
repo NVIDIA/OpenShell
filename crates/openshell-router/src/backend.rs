@@ -3,6 +3,7 @@
 
 use crate::RouterError;
 use crate::config::{AuthHeader, ResolvedRoute};
+use crate::mock;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedEndpoint {
@@ -223,6 +224,14 @@ pub async fn verify_backend_endpoint(
     route: &ResolvedRoute,
 ) -> Result<ValidatedEndpoint, ValidationFailure> {
     let probe = validation_probe(route)?;
+
+    if mock::is_mock_route(route) {
+        return Ok(ValidatedEndpoint {
+            url: build_backend_url(&route.endpoint, probe.path),
+            protocol: probe.protocol.to_string(),
+        });
+    }
+
     let response = send_backend_request(client, route, "POST", probe.path, Vec::new(), probe.body)
         .await
         .map_err(|err| match err {
@@ -436,5 +445,20 @@ mod tests {
 
         assert_eq!(validated.protocol, "anthropic_messages");
         assert_eq!(validated.url, format!("{}/v1/messages", mock_server.uri()));
+    }
+
+    #[tokio::test]
+    async fn verify_backend_endpoint_accepts_mock_routes() {
+        let route = test_route(
+            "mock://test-backend",
+            &["openai_chat_completions"],
+            AuthHeader::Bearer,
+        );
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let validated = verify_backend_endpoint(&client, &route).await.unwrap();
+
+        assert_eq!(validated.protocol, "openai_chat_completions");
+        assert_eq!(validated.url, "mock://test-backend/v1/chat/completions");
     }
 }
