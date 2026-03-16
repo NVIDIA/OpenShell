@@ -280,8 +280,8 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        assert p.credentials["KEY_A"] == "rotated-a"
-        assert p.credentials["KEY_B"] == "val-b", "KEY_B should be preserved"
+        # Credentials are redacted in gRPC responses (security hardening).
+        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
         assert p.config["BASE_URL"] == "https://example.com", (
             "config should be preserved"
         )
@@ -320,7 +320,8 @@ def test_update_provider_empty_maps_preserves_all(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        assert p.credentials["TOKEN"] == "secret"
+        # Credentials are redacted in gRPC responses (security hardening).
+        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
         assert p.config["URL"] == "https://api.example.com"
     finally:
         _delete_provider(stub, name)
@@ -358,9 +359,8 @@ def test_update_provider_merges_config_preserves_credentials(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        assert p.credentials["API_KEY"] == "original-key", (
-            "credentials should be untouched"
-        )
+        # Credentials are redacted in gRPC responses (security hardening).
+        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
         assert p.config["ENDPOINT"] == "https://new.example.com"
     finally:
         _delete_provider(stub, name)
