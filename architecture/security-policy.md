@@ -387,6 +387,7 @@ network_policies:
     name: claude_code # <-- human-readable name (used in audit logs)
     endpoints: # <-- allowed host:port pairs
       - { host: api.anthropic.com, port: 443 }
+      - { host: "*.anthropic.com", ports: [443, 8443] } # glob host + multi-port
     binaries: # <-- allowed binary identities
       - { path: /usr/local/bin/claude }
 ```
@@ -403,10 +404,11 @@ network_policies:
 
 Each endpoint defines a network destination and, optionally, L7 inspection behavior.
 
-| Field         | Type       | Default         | Description                                                                                                         |
-| ------------- | ---------- | --------------- | ------------------------------------------------------------------------------------------------------------------- |
-| `host`         | `string`   | _(required)_    | Hostname to match (case-insensitive). Optional when `allowed_ips` is set (see [Hostless Endpoints](#hostless-endpoints-allowed_ips-without-host)). |
-| `port`         | `integer`  | _(required)_    | TCP port to match                                                                                                   |
+| Field         | Type        | Default         | Description                                                                                                         |
+| ------------- | ----------- | --------------- | ------------------------------------------------------------------------------------------------------------------- |
+| `host`         | `string`   | _(required)_    | Hostname or glob pattern to match (case-insensitive). Supports wildcards (`*.example.com`). Optional when `allowed_ips` is set (see [Hostless Endpoints](#hostless-endpoints-allowed_ips-without-host)). See [Host Wildcards](#host-wildcards). |
+| `port`         | `integer`  | _(required)_    | TCP port to match. Mutually exclusive with `ports` — if both are set, `ports` takes precedence. See [Multi-Port Endpoints](#multi-port-endpoints). |
+| `ports`        | `integer[]`| `[]`            | Multiple TCP ports to match. When non-empty, the endpoint covers all listed ports. Backwards compatible with `port`. See [Multi-Port Endpoints](#multi-port-endpoints). |
 | `protocol`     | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
 | `tls`          | `string`   | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination).                  |
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
@@ -462,6 +464,135 @@ The `access` field provides shorthand for common rule sets. During preprocessing
 | `full`       | `*/**`                                                             | All methods, all paths                   |
 
 See `crates/openshell-sandbox/src/l7/mod.rs` -- `expand_access_presets()`.
+
+#### Host Wildcards
+
+The `host` field supports glob patterns for matching multiple subdomains under a common domain. Wildcards use OPA's `glob.match` function with `.` as the delimiter, consistent with TLS certificate wildcard semantics.
+
+| Pattern | Matches | Does Not Match |
+|---------|---------|----------------|
+| `*.example.com` | `api.example.com`, `cdn.example.com` | `example.com`, `deep.sub.example.com` |
+| `**.example.com` | `api.example.com`, `deep.sub.example.com` | `example.com` |
+| `*.EXAMPLE.COM` | `api.example.com` (case-insensitive) | |
+
+**Wildcard semantics**:
+
+- `*` matches exactly one DNS label (does not cross `.` boundaries). `*.example.com` matches `api.example.com` but not `deep.sub.example.com`.
+- `**` matches across label boundaries. `**.example.com` matches both `api.example.com` and `deep.sub.example.com`.
+- Matching is case-insensitive — both the pattern and the incoming hostname are lowercased before comparison.
+- The bare domain is never matched. `*.example.com` does not match `example.com` (there must be at least one label before the domain).
+
+**Validation rules**:
+
+- **Error**: Bare `*` or `**` (matches all hosts) is rejected. Use a specific pattern like `*.example.com`.
+- **Error**: Patterns must start with `*.` or `**.` prefix. Malformed patterns like `*com` are rejected.
+- **Warning**: Broad patterns like `*.com` (only two labels) trigger a warning about covering all subdomains of a TLD.
+
+See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()` for validation, `sandbox-policy.rego` -- `endpoint_allowed` for the Rego glob matching rule.
+
+**Rego implementation**: The Rego rules detect host wildcards via `contains(endpoint.host, "*")` and dispatch to `glob.match(lower(endpoint.host), ["."], lower(network.host))`. Exact-match hosts use a separate, faster `lower(endpoint.host) == lower(network.host)` rule. See `crates/openshell-sandbox/data/sandbox-policy.rego`.
+
+**Example**: Allow any subdomain of `example.com` on port 443:
+
+```yaml
+network_policies:
+  example_wildcard:
+    name: example_wildcard
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+Host wildcards compose with all other endpoint features — L7 inspection, TLS termination, multi-port, and `allowed_ips`:
+
+```yaml
+network_policies:
+  wildcard_l7:
+    name: wildcard_l7
+    endpoints:
+      - host: "*.example.com"
+        port: 8080
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+#### Multi-Port Endpoints
+
+The `ports` field allows a single endpoint entry to cover multiple TCP ports. This avoids duplicating endpoint definitions that differ only in port number.
+
+**Normalization**: Both YAML loading paths (file mode and gRPC mode) normalize `port` and `ports` before the data reaches the OPA engine:
+
+- If `ports` is non-empty, it takes precedence. `port` is ignored.
+- If `ports` is empty and `port` is set, the scalar is promoted to `ports: [port]`.
+- The scalar `port` field is removed from the JSON fed to OPA. Rego rules always reference `endpoint.ports[_]`.
+
+This normalization happens in `crates/openshell-sandbox/src/opa.rs` -- `normalize_endpoint_ports()` (YAML path) and `proto_to_opa_data_json()` (proto path).
+
+**Backwards compatibility**: Existing policies using `port: 443` continue to work without changes. The scalar is silently promoted to `ports: [443]` at load time.
+
+**YAML serialization**: When serializing policy back to YAML (e.g., `nav policy get --full`), a single-element `ports` array is emitted as the compact `port: N` scalar form. Multi-element arrays are emitted as `ports: [N, M]`. See `crates/openshell-policy/src/lib.rs` -- `from_proto()`.
+
+**Example**: Allow both standard HTTPS and a custom TLS port:
+
+```yaml
+network_policies:
+  multi_port:
+    name: multi_port
+    endpoints:
+      - host: api.example.com
+        ports:
+          - 443
+          - 8443
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+This is equivalent to two separate endpoint entries:
+
+```yaml
+    endpoints:
+      - { host: api.example.com, port: 443 }
+      - { host: api.example.com, port: 8443 }
+```
+
+Multi-port endpoints compose with host wildcards, L7 rules, and all other endpoint fields:
+
+```yaml
+network_policies:
+  wildcard_multi_port:
+    name: wildcard_multi_port
+    endpoints:
+      - host: "*.example.com"
+        ports: [443, 8443]
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
+```
+
+Hostless endpoints also support multi-port:
+
+```yaml
+network_policies:
+  private_multi:
+    name: private_multi
+    endpoints:
+      - ports: [80, 443]
+        allowed_ips: ["10.0.0.0/8"]
+    binaries:
+      - { path: /usr/bin/curl }
+```
 
 ---
 
@@ -793,6 +924,8 @@ The following validation rules are enforced during policy loading (both file mod
 | `tls: terminate` without `protocol`            | `TLS termination requires a protocol for L7 inspection`                                    |
 | `protocol: sql` with `enforcement: enforce`    | `SQL enforcement requires full SQL parsing (not available in v1). Use enforcement: audit.` |
 | `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
+| Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
+| Host wildcard does not start with `*.` or `**.`| `host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'`        |
 | Invalid HTTP method in REST rules              | _(warning, not error)_                                                                     |
 
 ### Errors (Live Update Rejection)
@@ -812,6 +945,7 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | Condition                                                                    | Warning Message                                                                                   |
 | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
 | `protocol: rest` on port 443 without `tls: terminate`                        | `L7 rules won't be evaluated on encrypted traffic without tls: terminate`                         |
+| Host wildcard with ≤2 labels (e.g., `*.com`)                                | `host wildcard '*.com' is very broad (covers all subdomains of a TLD)`                            |
 | Unknown HTTP method in rules (not GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/\*) | `Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS.` |
 
 See `crates/openshell-sandbox/src/l7/mod.rs` -- `validate_l7_policies()`.
@@ -1078,6 +1212,30 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 
+  # Host wildcard: allow any subdomain of example.com on dual ports
+  example_apis:
+    name: example_apis
+    endpoints:
+      - host: "*.example.com"
+        ports:
+          - 443
+          - 8443
+    binaries:
+      - { path: /usr/bin/curl }
+
+  # Multi-port with L7: same L7 rules applied across two ports
+  multi_port_l7:
+    name: multi_port_l7
+    endpoints:
+      - host: api.internal.svc
+        ports: [8080, 9090]
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-only
+    binaries:
+      - { path: /usr/bin/curl }
+
   # Forward proxy + CONNECT: private service accessible via plain HTTP or tunnel
   # With allowed_ips set and the destination being a private IP, both
   # `http://10.86.8.223:8000/path` (forward proxy) and
@@ -1115,7 +1273,7 @@ When the gateway delivers policy via gRPC, the protobuf `SandboxPolicy` message 
 | `NetworkPolicyRule` | `name`                                                              | `network_policies.<key>.name`               |
 | `NetworkPolicyRule` | `endpoints`                                                         | `network_policies.<key>.endpoints`          |
 | `NetworkPolicyRule` | `binaries`                                                          | `network_policies.<key>.binaries`           |
-| `NetworkEndpoint`   | `host`, `port`, `protocol`, `tls`, `enforcement`, `access`, `rules`, `allowed_ips` | Same field names                            |
+| `NetworkEndpoint`   | `host`, `port`, `ports`, `protocol`, `tls`, `enforcement`, `access`, `rules`, `allowed_ips` | Same field names. `port`/`ports` normalized during loading (see [Multi-Port Endpoints](#multi-port-endpoints)). |
 | `L7Rule`            | `allow`                                                             | `rules[].allow`                             |
 | `L7Allow`           | `method`, `path`, `command`                                         | `rules[].allow.method`, `.path`, `.command` |
 

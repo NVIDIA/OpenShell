@@ -274,18 +274,15 @@ impl OpaEngine {
     /// Reload policy and data from strings (data is YAML).
     ///
     /// Designed for future gRPC hot-reload from the openshell gateway.
-    /// Replaces the entire engine atomically.
+    /// Replaces the entire engine atomically. Routes through the full
+    /// preprocessing pipeline (port normalization, L7 validation, preset
+    /// expansion) to maintain consistency with `from_strings()`.
     pub fn reload(&self, policy: &str, data_yaml: &str) -> Result<()> {
-        let mut new_engine = regorus::Engine::new();
-        new_engine
-            .add_policy("policy.rego".into(), policy.into())
-            .map_err(|e| miette::miette!("{e}"))?;
-        let data_value =
-            regorus::Value::from_yaml_str(data_yaml).map_err(|e| miette::miette!("{e}"))?;
-        new_engine
-            .add_data(data_value)
-            .map_err(|e| miette::miette!("{e}"))?;
-
+        let new = Self::from_strings(policy, data_yaml)?;
+        let new_engine = new
+            .engine
+            .into_inner()
+            .map_err(|_| miette::miette!("lock poisoned on new engine"))?;
         let mut engine = self
             .engine
             .lock()
@@ -512,10 +509,13 @@ fn parse_process_policy(val: &regorus::Value) -> ProcessPolicy {
     }
 }
 
-/// Preprocess YAML policy data: parse, validate, expand access presets, return JSON.
+/// Preprocess YAML policy data: parse, normalize, validate, expand access presets, return JSON.
 fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     let mut data: serde_json::Value = serde_yaml::from_str(yaml_str)
         .map_err(|e| miette::miette!("failed to parse YAML data: {e}"))?;
+
+    // Normalize port → ports for all endpoints so Rego always sees "ports" array.
+    normalize_endpoint_ports(&mut data);
 
     // Validate BEFORE expanding presets (catches user errors like rules+access)
     let (errors, warnings) = crate::l7::validate_l7_policies(&data);
@@ -533,6 +533,56 @@ fn preprocess_yaml_data(yaml_str: &str) -> Result<String> {
     crate::l7::expand_access_presets(&mut data);
 
     serde_json::to_string(&data).map_err(|e| miette::miette!("failed to serialize data: {e}"))
+}
+
+/// Normalize endpoint port/ports in JSON data.
+///
+/// YAML policies may use `port: N` (single) or `ports: [N, M]` (multi).
+/// This normalizes all endpoints to have a `ports` array so Rego rules
+/// only need to reference `endpoint.ports[_]`.
+fn normalize_endpoint_ports(data: &mut serde_json::Value) {
+    let Some(policies) = data
+        .get_mut("network_policies")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return;
+    };
+
+    for (_name, policy) in policies.iter_mut() {
+        let Some(endpoints) = policy.get_mut("endpoints").and_then(|v| v.as_array_mut()) else {
+            continue;
+        };
+
+        for ep in endpoints.iter_mut() {
+            let ep_obj = match ep.as_object_mut() {
+                Some(obj) => obj,
+                None => continue,
+            };
+
+            // If "ports" already exists and is non-empty, keep it.
+            let has_ports = ep_obj
+                .get("ports")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
+
+            if !has_ports {
+                // Promote scalar "port" to "ports" array.
+                let port = ep_obj
+                    .get("port")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                if port > 0 {
+                    ep_obj.insert(
+                        "ports".to_string(),
+                        serde_json::Value::Array(vec![serde_json::json!(port)]),
+                    );
+                }
+            }
+
+            // Remove scalar "port" — Rego only uses "ports".
+            ep_obj.remove("port");
+        }
+    }
 }
 
 /// Convert typed proto policy fields to JSON suitable for `engine.add_data_json()`.
@@ -589,7 +639,16 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                 .endpoints
                 .iter()
                 .map(|e| {
-                    let mut ep = serde_json::json!({"host": e.host, "port": e.port});
+                    // Normalize port/ports: ports takes precedence, then
+                    // single port promoted to array. Rego always sees "ports".
+                    let ports: Vec<u32> = if !e.ports.is_empty() {
+                        e.ports.clone()
+                    } else if e.port > 0 {
+                        vec![e.port]
+                    } else {
+                        vec![]
+                    };
+                    let mut ep = serde_json::json!({"host": e.host, "ports": ports});
                     if !e.protocol.is_empty() {
                         ep["protocol"] = e.protocol.clone().into();
                     }
@@ -1934,5 +1993,556 @@ process:
         };
         let ips = engine.query_allowed_ips(&input).unwrap();
         assert_eq!(ips, vec!["10.0.5.0/24", "10.0.6.0/24"]);
+    }
+
+    // ========================================================================
+    // Multi-port endpoint tests
+    // ========================================================================
+
+    #[test]
+    fn multi_port_endpoint_matches_first_port() {
+        let data = r#"
+network_policies:
+  multi:
+    name: multi
+    endpoints:
+      - { host: api.example.com, ports: [443, 8443] }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "First port in multi-port should match: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn multi_port_endpoint_matches_second_port() {
+        let data = r#"
+network_policies:
+  multi:
+    name: multi
+    endpoints:
+      - { host: api.example.com, ports: [443, 8443] }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Second port in multi-port should match: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn multi_port_endpoint_rejects_unlisted_port() {
+        let data = r#"
+network_policies:
+  multi:
+    name: multi
+    endpoints:
+      - { host: api.example.com, ports: [443, 8443] }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 80,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed, "Unlisted port should be denied");
+    }
+
+    #[test]
+    fn single_port_backwards_compat() {
+        // Old-style YAML with just `port: 443` should still work
+        let data = r#"
+network_policies:
+  compat:
+    name: compat
+    endpoints:
+      - { host: api.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Single port backwards compat: {}",
+            decision.reason
+        );
+
+        // Wrong port should still deny
+        let input_bad = NetworkInput {
+            host: "api.example.com".into(),
+            port: 80,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input_bad).unwrap();
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn hostless_endpoint_multi_port() {
+        let data = r#"
+network_policies:
+  private:
+    name: private
+    endpoints:
+      - ports: [80, 443]
+        allowed_ips: ["10.0.0.0/8"]
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        // Port 80
+        let input80 = NetworkInput {
+            host: "anything.internal".into(),
+            port: 80,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input80).unwrap();
+        assert!(
+            decision.allowed,
+            "Hostless multi-port should match port 80: {}",
+            decision.reason
+        );
+        // Port 443
+        let input443 = NetworkInput {
+            host: "anything.internal".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input443).unwrap();
+        assert!(
+            decision.allowed,
+            "Hostless multi-port should match port 443: {}",
+            decision.reason
+        );
+        // Port 8080 should deny
+        let input_bad = NetworkInput {
+            host: "anything.internal".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input_bad).unwrap();
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn from_proto_multi_port_allows_matching() {
+        let mut network_policies = std::collections::HashMap::new();
+        network_policies.insert(
+            "multi".to_string(),
+            NetworkPolicyRule {
+                name: "multi".to_string(),
+                endpoints: vec![NetworkEndpoint {
+                    host: "api.example.com".to_string(),
+                    port: 443,
+                    ports: vec![443, 8443],
+                    ..Default::default()
+                }],
+                binaries: vec![NetworkBinary {
+                    path: "/usr/bin/curl".to_string(),
+                    ..Default::default()
+                }],
+            },
+        );
+        let proto = ProtoSandboxPolicy {
+            version: 1,
+            filesystem: Some(ProtoFs {
+                include_workdir: true,
+                read_only: vec![],
+                read_write: vec![],
+            }),
+            landlock: Some(openshell_core::proto::LandlockPolicy {
+                compatibility: "best_effort".to_string(),
+            }),
+            process: Some(ProtoProc {
+                run_as_user: "sandbox".to_string(),
+                run_as_group: "sandbox".to_string(),
+            }),
+            network_policies,
+        };
+        let engine = OpaEngine::from_proto(&proto).unwrap();
+        // Port 443
+        let input443 = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&input443).unwrap().allowed);
+        // Port 8443
+        let input8443 = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(engine.evaluate_network(&input8443).unwrap().allowed);
+        // Port 80 denied
+        let input80 = NetworkInput {
+            host: "api.example.com".into(),
+            port: 80,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        assert!(!engine.evaluate_network(&input80).unwrap().allowed);
+    }
+
+    // ========================================================================
+    // Host wildcard tests
+    // ========================================================================
+
+    #[test]
+    fn wildcard_host_matches_subdomain() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "*.example.com should match api.example.com: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_rejects_deep_subdomain() {
+        // * should match single DNS label only (does not cross .)
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "deep.sub.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*.example.com should NOT match deep.sub.example.com"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_rejects_exact_domain() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            !decision.allowed,
+            "*.example.com should NOT match example.com (requires at least one label)"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_case_insensitive() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.EXAMPLE.COM", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Host wildcards should be case-insensitive: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_plus_port() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        // Right host, wrong port
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 80,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(!decision.allowed, "Wildcard host on wrong port should deny");
+    }
+
+    #[test]
+    fn wildcard_host_multi_port() {
+        let data = r#"
+network_policies:
+  wildcard:
+    name: wildcard
+    endpoints:
+      - { host: "*.example.com", ports: [443, 8443] }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8443,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let decision = engine.evaluate_network(&input).unwrap();
+        assert!(
+            decision.allowed,
+            "Wildcard host + multi-port should match: {}",
+            decision.reason
+        );
+    }
+
+    #[test]
+    fn wildcard_host_l7_rules_apply() {
+        let data = r#"
+network_policies:
+  wildcard_l7:
+    name: wildcard_l7
+    endpoints:
+      - host: "*.example.com"
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow:
+              method: GET
+              path: "/api/**"
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        // L7 GET to /api/foo — should be allowed
+        let input = l7_input("api.example.com", 8080, "GET", "/api/foo");
+        assert!(
+            eval_l7(&engine, &input),
+            "L7 rule should apply to wildcard-matched host"
+        );
+        // L7 DELETE to /api/foo — should be denied by L7 rule
+        let input_bad = l7_input("api.example.com", 8080, "DELETE", "/api/foo");
+        assert!(
+            !eval_l7(&engine, &input_bad),
+            "L7 DELETE should be denied even on wildcard host"
+        );
+    }
+
+    #[test]
+    fn wildcard_host_l7_endpoint_config_returned() {
+        let data = r#"
+network_policies:
+  wildcard_l7:
+    name: wildcard_l7
+    endpoints:
+      - host: "*.example.com"
+        port: 8080
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow:
+              method: GET
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        let input = NetworkInput {
+            host: "api.example.com".into(),
+            port: 8080,
+            binary_path: PathBuf::from("/usr/bin/curl"),
+            binary_sha256: "unused".into(),
+            ancestors: vec![],
+            cmdline_paths: vec![],
+        };
+        let config = engine.query_endpoint_config(&input).unwrap();
+        assert!(
+            config.is_some(),
+            "Should return endpoint config for wildcard-matched host"
+        );
+        let config = config.unwrap();
+        let l7 = crate::l7::parse_l7_config(&config).unwrap();
+        assert_eq!(l7.protocol, crate::l7::L7Protocol::Rest);
+        assert_eq!(l7.enforcement, crate::l7::EnforcementMode::Enforce);
+    }
+
+    #[test]
+    fn l7_multi_port_request_evaluation() {
+        let data = r#"
+network_policies:
+  multi_l7:
+    name: multi_l7
+    endpoints:
+      - host: api.example.com
+        ports: [8080, 9090]
+        protocol: rest
+        enforcement: enforce
+        tls: terminate
+        rules:
+          - allow:
+              method: GET
+              path: "**"
+    binaries:
+      - { path: /usr/bin/curl }
+filesystem_policy:
+  include_workdir: true
+  read_only: []
+  read_write: []
+landlock:
+  compatibility: best_effort
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+"#;
+        let engine = OpaEngine::from_strings(TEST_POLICY, data).unwrap();
+        // GET on port 8080 — allowed
+        let input1 = l7_input("api.example.com", 8080, "GET", "/anything");
+        assert!(
+            eval_l7(&engine, &input1),
+            "L7 on first port of multi-port should work"
+        );
+        // GET on port 9090 — allowed
+        let input2 = l7_input("api.example.com", 9090, "GET", "/anything");
+        assert!(
+            eval_l7(&engine, &input2),
+            "L7 on second port of multi-port should work"
+        );
     }
 }

@@ -81,7 +81,12 @@ struct NetworkPolicyRuleDef {
 struct NetworkEndpointDef {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     host: String,
+    /// Single port (backwards compat). Mutually exclusive with `ports`.
+    #[serde(default, skip_serializing_if = "is_zero")]
     port: u32,
+    /// Multiple ports. When non-empty, this endpoint covers all listed ports.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ports: Vec<u32>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     protocol: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -94,6 +99,10 @@ struct NetworkEndpointDef {
     rules: Vec<L7RuleDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_ips: Vec<String>,
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -141,25 +150,37 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                 endpoints: rule
                     .endpoints
                     .into_iter()
-                    .map(|e| NetworkEndpoint {
-                        host: e.host,
-                        port: e.port,
-                        protocol: e.protocol,
-                        tls: e.tls,
-                        enforcement: e.enforcement,
-                        access: e.access,
-                        rules: e
-                            .rules
-                            .into_iter()
-                            .map(|r| L7Rule {
-                                allow: Some(L7Allow {
-                                    method: r.allow.method,
-                                    path: r.allow.path,
-                                    command: r.allow.command,
-                                }),
-                            })
-                            .collect(),
-                        allowed_ips: e.allowed_ips,
+                    .map(|e| {
+                        // Normalize port/ports: ports takes precedence, else
+                        // single port is promoted to ports array.
+                        let normalized_ports = if !e.ports.is_empty() {
+                            e.ports
+                        } else if e.port > 0 {
+                            vec![e.port]
+                        } else {
+                            vec![]
+                        };
+                        NetworkEndpoint {
+                            host: e.host,
+                            port: normalized_ports.first().copied().unwrap_or(0),
+                            ports: normalized_ports,
+                            protocol: e.protocol,
+                            tls: e.tls,
+                            enforcement: e.enforcement,
+                            access: e.access,
+                            rules: e
+                                .rules
+                                .into_iter()
+                                .map(|r| L7Rule {
+                                    allow: Some(L7Allow {
+                                        method: r.allow.method,
+                                        path: r.allow.path,
+                                        command: r.allow.command,
+                                    }),
+                                })
+                                .collect(),
+                            allowed_ips: e.allowed_ips,
+                        }
                     })
                     .collect(),
                 binaries: rule
@@ -228,28 +249,38 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                 endpoints: rule
                     .endpoints
                     .iter()
-                    .map(|e| NetworkEndpointDef {
-                        host: e.host.clone(),
-                        port: e.port,
-                        protocol: e.protocol.clone(),
-                        tls: e.tls.clone(),
-                        enforcement: e.enforcement.clone(),
-                        access: e.access.clone(),
-                        rules: e
-                            .rules
-                            .iter()
-                            .map(|r| {
-                                let a = r.allow.clone().unwrap_or_default();
-                                L7RuleDef {
-                                    allow: L7AllowDef {
-                                        method: a.method,
-                                        path: a.path,
-                                        command: a.command,
-                                    },
-                                }
-                            })
-                            .collect(),
-                        allowed_ips: e.allowed_ips.clone(),
+                    .map(|e| {
+                        // Use compact form: if ports has exactly 1 element,
+                        // emit port (scalar). If >1, emit ports (array).
+                        let (port, ports) = if e.ports.len() > 1 {
+                            (0, e.ports.clone())
+                        } else {
+                            (e.ports.first().copied().unwrap_or(e.port), vec![])
+                        };
+                        NetworkEndpointDef {
+                            host: e.host.clone(),
+                            port,
+                            ports,
+                            protocol: e.protocol.clone(),
+                            tls: e.tls.clone(),
+                            enforcement: e.enforcement.clone(),
+                            access: e.access.clone(),
+                            rules: e
+                                .rules
+                                .iter()
+                                .map(|r| {
+                                    let a = r.allow.clone().unwrap_or_default();
+                                    L7RuleDef {
+                                        allow: L7AllowDef {
+                                            method: a.method,
+                                            path: a.path,
+                                            command: a.command,
+                                        },
+                                    }
+                                })
+                                .collect(),
+                            allowed_ips: e.allowed_ips.clone(),
+                        }
                     })
                     .collect(),
                 binaries: rule
@@ -957,5 +988,133 @@ network_policies:
         assert!(s.contains("root"));
         assert!(s.contains("run_as_user"));
         assert!(s.contains("sandbox"));
+    }
+
+    // ---- Multi-port and host wildcard tests ----
+
+    #[test]
+    fn parse_ports_array() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - { host: api.example.com, ports: [80, 443] }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        let ep = &policy.network_policies["test"].endpoints[0];
+        assert_eq!(ep.ports, vec![80, 443]);
+        // port should be set to first element for backwards compat
+        assert_eq!(ep.port, 80);
+    }
+
+    #[test]
+    fn parse_single_port_normalized_to_ports() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - { host: api.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        let ep = &policy.network_policies["test"].endpoints[0];
+        assert_eq!(ep.ports, vec![443]);
+        assert_eq!(ep.port, 443);
+    }
+
+    #[test]
+    fn round_trip_preserves_multi_port() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: api.example.com
+        ports:
+          - 80
+          - 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+
+        let ep1 = &proto1.network_policies["test"].endpoints[0];
+        let ep2 = &proto2.network_policies["test"].endpoints[0];
+        assert_eq!(ep1.ports, ep2.ports);
+        assert_eq!(ep1.ports, vec![80, 443]);
+    }
+
+    #[test]
+    fn serialize_single_port_uses_compact_form() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - { host: api.example.com, port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto).expect("serialize failed");
+        // Should use compact `port: 443` form, not `ports: [443]`
+        assert!(
+            yaml_out.contains("port: 443"),
+            "Single port should serialize as compact form, got:\n{yaml_out}"
+        );
+        assert!(
+            !yaml_out.contains("ports:"),
+            "Single port should not produce ports array, got:\n{yaml_out}"
+        );
+    }
+
+    #[test]
+    fn parse_wildcard_host() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - { host: "*.example.com", port: 443 }
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        let ep = &policy.network_policies["test"].endpoints[0];
+        assert_eq!(ep.host, "*.example.com");
+    }
+
+    #[test]
+    fn round_trip_preserves_wildcard_host() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: "*.example.com"
+        port: 443
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let proto1 = parse_sandbox_policy(yaml).expect("parse failed");
+        let yaml_out = serialize_sandbox_policy(&proto1).expect("serialize failed");
+        let proto2 = parse_sandbox_policy(&yaml_out).expect("re-parse failed");
+        assert_eq!(
+            proto1.network_policies["test"].endpoints[0].host,
+            proto2.network_policies["test"].endpoints[0].host
+        );
     }
 }
