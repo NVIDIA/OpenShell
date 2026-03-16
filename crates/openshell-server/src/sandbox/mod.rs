@@ -936,14 +936,15 @@ fn sandbox_template_to_k8s(
 
     // The sandbox process needs SYS_ADMIN (for seccomp filter installation and
     // network namespace creation), NET_ADMIN (for network namespace veth setup),
-    // and SYS_PTRACE (for the CONNECT proxy to read /proc/<pid>/fd/ of sandbox-user
-    // processes to resolve binary identity for network policy enforcement).
+    // SYS_PTRACE (for the CONNECT proxy to read /proc/<pid>/fd/ of sandbox-user
+    // processes to resolve binary identity for network policy enforcement),
+    // and SYSLOG (for reading /dev/kmsg to surface bypass detection diagnostics).
     // This mirrors the capabilities used by `mise run sandbox`.
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
             "capabilities": {
-                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
             }
         }),
     );
@@ -1684,7 +1685,7 @@ mod tests {
                     "image": "custom-image:latest",
                     "securityContext": {
                         "capabilities": {
-                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
                         }
                     }
                 }]

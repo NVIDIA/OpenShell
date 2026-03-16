@@ -405,6 +405,15 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     | cut -d'\"' -f4") || true
   SSH_HANDSHAKE_SECRET="${EXISTING_SECRET:-$(openssl rand -hex 32)}"
 
+  # Retrieve the host gateway IP from the entrypoint-rendered HelmChart CR so
+  # that hostAliases for host.openshell.internal are preserved across fast deploys.
+  HOST_GATEWAY_IP=$(cluster_exec "kubectl -n kube-system get helmchart openshell -o jsonpath='{.spec.valuesContent}' 2>/dev/null \
+    | grep hostGatewayIP | awk '{print \$2}'" 2>/dev/null) || true
+  HOST_GATEWAY_ARGS=""
+  if [[ -n "${HOST_GATEWAY_IP}" ]]; then
+    HOST_GATEWAY_ARGS="--set server.hostGatewayIP=${HOST_GATEWAY_IP}"
+  fi
+
   cluster_exec "helm upgrade openshell ${CONTAINER_CHART_DIR} \
     --namespace openshell \
     --set image.repository=${IMAGE_REPO_BASE}/gateway \
@@ -415,6 +424,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
     --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
+    ${HOST_GATEWAY_ARGS} \
     ${helm_wait_args}"
   helm_end=$(date +%s)
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"

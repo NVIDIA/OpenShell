@@ -223,6 +223,339 @@ impl NetworkNamespace {
     pub const fn ns_fd(&self) -> Option<RawFd> {
         self.ns_fd
     }
+
+    /// Install iptables rules for bypass detection inside the namespace.
+    ///
+    /// Sets up OUTPUT chain rules that:
+    /// 1. ACCEPT traffic destined for the proxy (host_ip:proxy_port)
+    /// 2. ACCEPT loopback traffic
+    /// 3. ACCEPT established/related connections (response packets)
+    /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
+    ///
+    /// This provides two benefits:
+    /// - **Fast-fail UX**: applications get immediate ECONNREFUSED instead of
+    ///   a 30-second timeout when they bypass the proxy
+    /// - **Diagnostics**: iptables LOG entries are picked up by the bypass
+    ///   monitor to emit structured tracing events
+    ///
+    /// Degrades gracefully if `iptables` is not available — the namespace
+    /// still provides isolation via routing, just without fast-fail and
+    /// diagnostic logging.
+    pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
+        // Check if iptables is available before attempting to install rules.
+        let iptables_path = match find_iptables() {
+            Some(path) => path,
+            None => {
+                warn!(
+                    namespace = %self.name,
+                    search_paths = ?IPTABLES_SEARCH_PATHS,
+                    "iptables not found; bypass detection rules will not be installed. \
+                     Install the iptables package for proxy bypass diagnostics."
+                );
+                return Ok(());
+            }
+        };
+
+        let host_ip_str = self.host_ip.to_string();
+        let proxy_port_str = proxy_port.to_string();
+        let log_prefix = format!("openshell:bypass:{}:", &self.name);
+
+        info!(
+            namespace = %self.name,
+            iptables = iptables_path,
+            proxy_addr = %format!("{}:{}", host_ip_str, proxy_port),
+            "Installing bypass detection rules"
+        );
+
+        // Install IPv4 rules
+        if let Err(e) =
+            self.install_bypass_rules_for(iptables_path, &host_ip_str, &proxy_port_str, &log_prefix)
+        {
+            warn!(
+                namespace = %self.name,
+                error = %e,
+                "Failed to install IPv4 bypass detection rules"
+            );
+            return Err(e);
+        }
+
+        // Install IPv6 rules — best-effort.
+        // Skip the proxy ACCEPT rule for IPv6 since the proxy address is IPv4.
+        if let Some(ip6_path) = find_ip6tables(iptables_path) {
+            if let Err(e) = self.install_bypass_rules_for_v6(&ip6_path, &log_prefix) {
+                warn!(
+                    namespace = %self.name,
+                    error = %e,
+                    "Failed to install IPv6 bypass detection rules (non-fatal)"
+                );
+            }
+        }
+
+        info!(
+            namespace = %self.name,
+            "Bypass detection rules installed"
+        );
+
+        Ok(())
+    }
+
+    /// Install bypass detection rules for a specific iptables variant (iptables or ip6tables).
+    fn install_bypass_rules_for(
+        &self,
+        iptables_cmd: &str,
+        host_ip: &str,
+        proxy_port: &str,
+        log_prefix: &str,
+    ) -> Result<()> {
+        // Rule 1: ACCEPT traffic to the proxy
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-d",
+                &format!("{host_ip}/32"),
+                "-p",
+                "tcp",
+                "--dport",
+                proxy_port,
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+
+        // Rule 2: ACCEPT loopback traffic
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+        )?;
+
+        // Rule 3: ACCEPT established/related connections (response packets)
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+
+        // Rule 4: LOG TCP SYN bypass attempts (rate-limited)
+        // LOG rule failure is non-fatal — the REJECT rule still provides fast-fail.
+        if let Err(e) = run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "--syn",
+                "-m",
+                "limit",
+                "--limit",
+                "5/sec",
+                "--limit-burst",
+                "10",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                log_prefix,
+                "--log-uid",
+            ],
+        ) {
+            warn!(
+                error = %e,
+                "Failed to install LOG rule for TCP (xt_LOG module may not be loaded); \
+                 bypass REJECT rules will still be installed"
+            );
+        }
+
+        // Rule 5: REJECT TCP bypass attempts (fast-fail)
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "icmp-port-unreachable",
+            ],
+        )?;
+
+        // Rule 6: LOG UDP bypass attempts (rate-limited, covers DNS bypass)
+        if let Err(e) = run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "-m",
+                "limit",
+                "--limit",
+                "5/sec",
+                "--limit-burst",
+                "10",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                log_prefix,
+                "--log-uid",
+            ],
+        ) {
+            warn!(
+                error = %e,
+                "Failed to install LOG rule for UDP; bypass REJECT rules will still be installed"
+            );
+        }
+
+        // Rule 7: REJECT UDP bypass attempts (covers DNS bypass)
+        run_iptables_netns(
+            &self.name,
+            iptables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "icmp-port-unreachable",
+            ],
+        )?;
+
+        Ok(())
+    }
+
+    /// Install IPv6 bypass detection rules.
+    ///
+    /// Similar to `install_bypass_rules_for` but omits the proxy ACCEPT rule
+    /// (the proxy listens on an IPv4 address) and uses IPv6-appropriate
+    /// REJECT types.
+    fn install_bypass_rules_for_v6(&self, ip6tables_cmd: &str, log_prefix: &str) -> Result<()> {
+        // ACCEPT loopback traffic
+        run_iptables_netns(
+            &self.name,
+            ip6tables_cmd,
+            &["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"],
+        )?;
+
+        // ACCEPT established/related connections
+        run_iptables_netns(
+            &self.name,
+            ip6tables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-m",
+                "conntrack",
+                "--ctstate",
+                "ESTABLISHED,RELATED",
+                "-j",
+                "ACCEPT",
+            ],
+        )?;
+
+        // LOG TCP SYN bypass attempts (rate-limited)
+        if let Err(e) = run_iptables_netns(
+            &self.name,
+            ip6tables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "--syn",
+                "-m",
+                "limit",
+                "--limit",
+                "5/sec",
+                "--limit-burst",
+                "10",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                log_prefix,
+                "--log-uid",
+            ],
+        ) {
+            warn!(error = %e, "Failed to install IPv6 LOG rule for TCP");
+        }
+
+        // REJECT TCP bypass attempts
+        run_iptables_netns(
+            &self.name,
+            ip6tables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "tcp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "icmp6-port-unreachable",
+            ],
+        )?;
+
+        // LOG UDP bypass attempts (rate-limited)
+        if let Err(e) = run_iptables_netns(
+            &self.name,
+            ip6tables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "-m",
+                "limit",
+                "--limit",
+                "5/sec",
+                "--limit-burst",
+                "10",
+                "-j",
+                "LOG",
+                "--log-prefix",
+                log_prefix,
+                "--log-uid",
+            ],
+        ) {
+            warn!(error = %e, "Failed to install IPv6 LOG rule for UDP");
+        }
+
+        // REJECT UDP bypass attempts
+        run_iptables_netns(
+            &self.name,
+            ip6tables_cmd,
+            &[
+                "-A",
+                "OUTPUT",
+                "-p",
+                "udp",
+                "-j",
+                "REJECT",
+                "--reject-with",
+                "icmp6-port-unreachable",
+            ],
+        )?;
+
+        Ok(())
+    }
 }
 
 impl Drop for NetworkNamespace {
@@ -256,7 +589,7 @@ impl Drop for NetworkNamespace {
     }
 }
 
-/// Run an `ip` command.
+/// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
     debug!(command = %format!("ip {}", args.join(" ")), "Running ip command");
 
@@ -297,6 +630,58 @@ fn run_ip_netns(netns: &str, args: &[&str]) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Run an iptables command inside a network namespace.
+fn run_iptables_netns(netns: &str, iptables_cmd: &str, args: &[&str]) -> Result<()> {
+    let mut full_args = vec!["netns", "exec", netns, iptables_cmd];
+    full_args.extend(args);
+
+    debug!(
+        command = %format!("ip {}", full_args.join(" ")),
+        "Running iptables in namespace"
+    );
+
+    let output = Command::new("ip")
+        .args(&full_args)
+        .output()
+        .into_diagnostic()?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(miette::miette!(
+            "ip netns exec {} {} failed: {}",
+            netns,
+            iptables_cmd,
+            stderr.trim()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Well-known paths where iptables may be installed.
+/// The sandbox container PATH often excludes `/usr/sbin`, so we probe
+/// explicit paths rather than relying on `which`.
+const IPTABLES_SEARCH_PATHS: &[&str] =
+    &["/usr/sbin/iptables", "/sbin/iptables", "/usr/bin/iptables"];
+
+/// Find the iptables binary path, checking well-known locations.
+fn find_iptables() -> Option<&'static str> {
+    IPTABLES_SEARCH_PATHS
+        .iter()
+        .find(|path| std::path::Path::new(path).exists())
+        .copied()
+}
+
+/// Find the ip6tables binary path, deriving it from the iptables location.
+fn find_ip6tables(iptables_path: &str) -> Option<String> {
+    let ip6_path = iptables_path.replace("iptables", "ip6tables");
+    if std::path::Path::new(&ip6_path).exists() {
+        Some(ip6_path)
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

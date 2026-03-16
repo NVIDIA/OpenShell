@@ -56,7 +56,7 @@ python/*.data
 venv/
 ENV/
 env/
-.python-version
+# .python-version is tracked — pins uv to match the sandbox base image Python
 
 # Installer logs
 pip-log.txt

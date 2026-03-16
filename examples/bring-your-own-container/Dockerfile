@@ -8,8 +8,10 @@
 FROM python:3.13-slim
 
 # System tools useful for sandbox networking and debugging.
+# iproute2: required for network namespace management (ip netns, veth pairs)
+# iptables: optional, enables bypass detection (LOG + REJECT for direct connections)
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        curl iproute2 \
+        curl iproute2 iptables \
     && rm -rf /var/lib/apt/lists/*
 
 # Create the sandbox user (uid/gid 1000) for non-root execution.
