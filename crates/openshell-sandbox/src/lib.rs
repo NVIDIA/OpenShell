@@ -1199,9 +1199,30 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
         None
     };
 
-    // Create and chown each read_write path
+    // Create and chown each read_write path.
+    //
+    // SECURITY: use symlink_metadata (lstat) to inspect each path *before*
+    // calling chown.  chown follows symlinks, so a malicious container image
+    // could place a symlink (e.g. /sandbox -> /etc/shadow) to trick the
+    // root supervisor into transferring ownership of arbitrary files.
+    // The TOCTOU window between lstat and chown is not exploitable because
+    // no untrusted process is running yet (the child has not been forked).
     for path in &policy.filesystem.read_write {
-        if !path.exists() {
+        // Check for symlinks or non-directory files before touching the path.
+        if let Ok(meta) = std::fs::symlink_metadata(path) {
+            if meta.file_type().is_symlink() {
+                return Err(miette::miette!(
+                    "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
+                    path.display()
+                ));
+            }
+            if !meta.file_type().is_dir() {
+                return Err(miette::miette!(
+                    "read_write path '{}' exists but is not a directory — refusing to chown",
+                    path.display()
+                ));
+            }
+        } else {
             debug!(path = %path.display(), "Creating read_write directory");
             std::fs::create_dir_all(path).into_diagnostic()?;
         }
