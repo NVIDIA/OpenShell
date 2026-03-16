@@ -482,10 +482,25 @@ fi
 # Pre-creating the directory eliminates this failure mode.
 mkdir -p /run/flannel
 
+# ---------------------------------------------------------------------------
+# Detect cgroup version and set kubelet compatibility flags
+# ---------------------------------------------------------------------------
+# Kubernetes 1.35+ (k3s v1.35.x) rejects cgroup v1 by default. Hosts running
+# older distros (e.g. Rocky Linux 8, CentOS 7/8, Ubuntu 18.04) still use
+# cgroup v1. When we detect cgroup v1, pass --kubelet-arg=fail-cgroupv1=false
+# so kubelet warns instead of refusing to start. This flag can be removed once
+# cgroup v1 support is no longer needed.
+EXTRA_KUBELET_ARGS=""
+if [ ! -f /sys/fs/cgroup/cgroup.controllers ]; then
+    echo "Detected cgroup v1 — adding kubelet compatibility flag (fail-cgroupv1=false)"
+    EXTRA_KUBELET_ARGS="--kubelet-arg=fail-cgroupv1=false"
+fi
+
 # Docker Desktop can briefly start the container before its bridge default route
 # is fully installed. k3s exits immediately in that state, so wait briefly for
 # routing to settle first.
 wait_for_default_route
 
 # Execute k3s with explicit resolv-conf.
-exec /bin/k3s "$@" --resolv-conf="$RESOLV_CONF"
+# shellcheck disable=SC2086
+exec /bin/k3s "$@" --resolv-conf="$RESOLV_CONF" $EXTRA_KUBELET_ARGS
