@@ -1208,17 +1208,12 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     // The TOCTOU window between lstat and chown is not exploitable because
     // no untrusted process is running yet (the child has not been forked).
     for path in &policy.filesystem.read_write {
-        // Check for symlinks or non-directory files before touching the path.
+        // Check for symlinks before touching the path.  Character/block devices
+        // (e.g. /dev/null) are legitimate read_write entries and must be allowed.
         if let Ok(meta) = std::fs::symlink_metadata(path) {
             if meta.file_type().is_symlink() {
                 return Err(miette::miette!(
                     "read_write path '{}' is a symlink — refusing to chown (potential privilege escalation)",
-                    path.display()
-                ));
-            }
-            if !meta.file_type().is_dir() {
-                return Err(miette::miette!(
-                    "read_write path '{}' exists but is not a directory — refusing to chown",
                     path.display()
                 ));
             }
