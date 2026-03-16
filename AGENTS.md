@@ -49,7 +49,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 
 - First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
 - Org members and collaborators bypass the vouch gate automatically.
-- Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED`.
+- Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED.td`.
 - Skills that create PRs (`create-github-pr`, `build-from-issue`) should note this requirement when operating on behalf of external contributors.
 
 ## Issue and PR Conventions

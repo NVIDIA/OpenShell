@@ -6,4 +6,4 @@
 AGENTS.md @NVIDIA/openshell-codeowners
 
 # Vouch list — maintainers only (bot commits bypass, but manual edits need review)
-.github/VOUCHED @NVIDIA/openshell-codeowners
+.github/VOUCHED.td @NVIDIA/openshell-codeowners
