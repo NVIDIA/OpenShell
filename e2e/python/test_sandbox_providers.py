@@ -194,7 +194,7 @@ def test_ssh_handshake_secret_not_visible_in_exec_environment(
     def read_handshake_secret() -> str:
         import os
 
-        return os.environ.get("NEMOCLAW_SSH_HANDSHAKE_SECRET", "NOT_SET")
+        return os.environ.get("OPENSHELL_SSH_HANDSHAKE_SECRET", "NOT_SET")
 
     with sandbox(delete_on_exit=True) as sb:
         result = sb.exec_python(read_handshake_secret)

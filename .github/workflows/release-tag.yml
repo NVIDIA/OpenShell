@@ -116,7 +116,6 @@ jobs:
     timeout-minutes: 120
     outputs:
       wheel_version: ${{ needs.compute-versions.outputs.python_version }}
-      s3_prefix: ${{ steps.upload.outputs.s3_prefix }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -129,10 +128,6 @@ jobs:
       MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
       OPENSHELL_IMAGE_TAG: ${{ needs.compute-versions.outputs.semver }}
-      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts  # TODO: rename bucket to openshell-pypi-artifacts
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-west-2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -158,96 +153,12 @@ jobs:
           OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:macos
           ls -la target/wheels/*.whl
 
-      - name: Upload wheels to S3
-        id: upload
-        run: |
-          set -euo pipefail
-          WHEEL_VERSION="${{ needs.compute-versions.outputs.python_version }}"
-          S3_PREFIX="openshell/${WHEEL_VERSION}"
-          aws s3 cp target/wheels/ "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" --recursive --exclude "*" --include "*.whl"
-          aws s3 ls "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/"
-          echo "s3_prefix=${S3_PREFIX}" >> "$GITHUB_OUTPUT"
-
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
         with:
           name: python-wheels
           path: target/wheels/*.whl
           retention-days: 5
-
-  publish-python:
-    name: Publish Python
-    needs: [build-python-wheels, e2e]
-    runs-on: [self-hosted, nv]
-    timeout-minutes: 10
-    env:
-      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-      NAV_PYPI_S3_BUCKET: navigator-pypi-artifacts  # TODO: rename bucket to openshell-pypi-artifacts
-      NAV_PYPI_REPOSITORY_URL: https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local
-      NAV_PYPI_USERNAME: ${{ secrets.NAV_PYPI_USERNAME }}
-      NAV_PYPI_PASSWORD: ${{ secrets.NAV_PYPI_PASSWORD }}
-      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-      AWS_DEFAULT_REGION: us-west-2
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        ref: ${{ inputs.tag || github.ref }}
-        fetch-depth: 0
-
-    - uses: actions/setup-python@v5
-      with:
-        python-version: "3.13"
-
-    - name: Install publish dependencies
-      run: |
-        set -euo pipefail
-        python -m pip install --upgrade pip uv
-
-        if ! command -v aws >/dev/null 2>&1; then
-          ARCH="$(uname -m)"
-          case "$ARCH" in
-            x86_64|amd64) AWSCLI_ARCH="x86_64" ;;
-            aarch64|arm64) AWSCLI_ARCH="aarch64" ;;
-            *)
-              echo "Unsupported architecture for AWS CLI installer: $ARCH" >&2
-              exit 1
-              ;;
-          esac
-
-          rm -rf aws awscliv2.zip
-          curl --fail --silent --show-error --location \
-            "https://awscli.amazonaws.com/awscli-exe-linux-${AWSCLI_ARCH}.zip" \
-            --output awscliv2.zip
-          unzip -q awscliv2.zip
-          ./aws/install --install-dir "$HOME/.local/aws-cli" --bin-dir "$HOME/.local/bin" --update
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-        fi
-
-        aws --version
-        uv --version
-
-    - name: List and download versioned wheels from S3
-      run: |
-        set -euo pipefail
-        WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
-        S3_PREFIX="${{ needs.build-python-wheels.outputs.s3_prefix }}"
-        OBJECT_COUNT=$(aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "length(Contents)" --output text)
-        if [ "$OBJECT_COUNT" = "None" ] || [ "$OBJECT_COUNT" = "0" ]; then
-          echo "No wheel artifacts found for ${WHEEL_VERSION} at s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" >&2
-          exit 1
-        fi
-        aws s3api list-objects-v2 --bucket "$NAV_PYPI_S3_BUCKET" --prefix "${S3_PREFIX}/" --query "Contents[].Key" --output text
-        mkdir -p target/wheels
-        aws s3 cp "s3://${NAV_PYPI_S3_BUCKET}/${S3_PREFIX}/" target/wheels/ --recursive --exclude "*" --include "*.whl"
-        ls -la target/wheels/*.whl
-
-    - name: Publish wheels to Artifactory
-      run: |
-        set -euo pipefail
-        WHEEL_VERSION="${{ needs.build-python-wheels.outputs.wheel_version }}"
-        uv run python tasks/scripts/release.py python-publish --version "$WHEEL_VERSION"
 
   # ---------------------------------------------------------------------------
   # Build CLI binaries (Linux musl — static, native on each arch)
@@ -413,7 +324,7 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Release
-    needs: [compute-versions, build-cli-linux, build-cli-macos, build-python-wheels, publish-python, tag-ghcr-release]
+    needs: [compute-versions, build-cli-linux, build-cli-macos, build-python-wheels, tag-ghcr-release]
     runs-on: build-amd64
     timeout-minutes: 10
     steps:

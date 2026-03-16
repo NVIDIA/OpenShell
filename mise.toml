@@ -36,9 +36,6 @@ UV_CACHE_DIR = "{{config_root}}/.cache/uv"
 RUSTC_WRAPPER = "sccache"
 SCCACHE_DIR = "{{config_root}}/.cache/sccache"
 
-# Artifact registries
-NAV_PYPI_REPOSITORY_URL = "https://urm.nvidia.com/artifactory/api/pypi/nv-shared-pypi-local"
-
 # Shared build constants (overridable via environment)
 DOCKER_BUILDKIT = "1"
 

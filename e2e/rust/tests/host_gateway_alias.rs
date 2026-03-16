@@ -16,6 +16,7 @@ use tempfile::NamedTempFile;
 use tokio::time::{interval, timeout};
 
 const INFERENCE_PROVIDER_NAME: &str = "e2e-host-inference";
+const INFERENCE_PROVIDER_UNREACHABLE_NAME: &str = "e2e-host-inference-unreachable";
 const TEST_SERVER_IMAGE: &str = "python:3.13-alpine";
 static INFERENCE_ROUTE_LOCK: Mutex<()> = Mutex::new(());
 
@@ -177,6 +178,22 @@ async fn delete_provider(name: &str) {
     let _ = cmd.status().await;
 }
 
+async fn create_openai_provider(name: &str, base_url: &str) -> Result<String, String> {
+    run_cli(&[
+        "provider",
+        "create",
+        "--name",
+        name,
+        "--type",
+        "openai",
+        "--credential",
+        "OPENAI_API_KEY=dummy",
+        "--config",
+        &format!("OPENAI_BASE_URL={base_url}"),
+    ])
+    .await
+}
+
 fn write_policy(port: u16) -> Result<NamedTempFile, String> {
     let mut file = NamedTempFile::new().map_err(|e| format!("create temp policy file: {e}"))?;
     let policy = format!(
@@ -282,35 +299,32 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         delete_provider(INFERENCE_PROVIDER_NAME).await;
     }
 
-    run_cli(&[
-        "provider",
-        "create",
-        "--name",
+    let create_output = create_openai_provider(
         INFERENCE_PROVIDER_NAME,
-        "--type",
-        "openai",
-        "--credential",
-        "OPENAI_API_KEY=dummy",
-        "--config",
-        &format!(
-            "OPENAI_BASE_URL=http://host.openshell.internal:{}/v1",
-            server.port
-        ),
-    ])
+        &format!("http://host.openshell.internal:{}/v1", server.port),
+    )
     .await
     .expect("create host-backed OpenAI provider");
 
-    run_cli(&[
+    let inference_output = run_cli(&[
         "inference",
         "set",
         "--provider",
         INFERENCE_PROVIDER_NAME,
         "--model",
         "host-echo-model",
-        "--no-verify",
     ])
     .await
     .expect("point inference.local at host-backed provider");
+
+    assert!(
+        inference_output.contains("Validated Endpoints:"),
+        "expected verification details in output:\n{inference_output}"
+    );
+    assert!(
+        inference_output.contains("/v1/chat/completions (openai_chat_completions)"),
+        "expected validated endpoint in output:\n{inference_output}"
+    );
 
     let guard = SandboxGuard::create(&[
         "--",
@@ -337,5 +351,70 @@ async fn sandbox_inference_local_routes_to_host_openshell_internal() {
         guard.create_output.contains("hello-from-host"),
         "expected sandbox to receive echoed inference content:\n{}",
         guard.create_output
+    );
+
+    let _ = create_output;
+}
+
+#[tokio::test]
+async fn inference_set_supports_no_verify_for_unreachable_endpoint() {
+    let _inference_lock = INFERENCE_ROUTE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+    let current_inference = run_cli(&["inference", "get"])
+        .await
+        .expect("read current inference config");
+    if !current_inference.contains("Not configured") {
+        eprintln!("Skipping test: existing inference config would make shared state unsafe");
+        return;
+    }
+
+    if provider_exists(INFERENCE_PROVIDER_UNREACHABLE_NAME).await {
+        delete_provider(INFERENCE_PROVIDER_UNREACHABLE_NAME).await;
+    }
+
+    create_openai_provider(
+        INFERENCE_PROVIDER_UNREACHABLE_NAME,
+        "http://host.openshell.internal:9/v1",
+    )
+    .await
+    .expect("create unreachable OpenAI provider");
+
+    let verify_err = run_cli(&[
+        "inference",
+        "set",
+        "--provider",
+        INFERENCE_PROVIDER_UNREACHABLE_NAME,
+        "--model",
+        "host-echo-model",
+    ])
+    .await
+    .expect_err("default verification should fail for unreachable endpoint");
+
+    assert!(
+        verify_err.contains("failed to verify inference endpoint"),
+        "expected verification failure output:\n{verify_err}"
+    );
+    assert!(
+        verify_err.contains("--no-verify"),
+        "expected retry hint in failure output:\n{verify_err}"
+    );
+
+    let no_verify_output = run_cli(&[
+        "inference",
+        "set",
+        "--provider",
+        INFERENCE_PROVIDER_UNREACHABLE_NAME,
+        "--model",
+        "host-echo-model",
+        "--no-verify",
+    ])
+    .await
+    .expect("no-verify should bypass validation");
+
+    assert!(
+        !no_verify_output.contains("Validated Endpoints:"),
+        "did not expect validation output when bypassing verification:\n{no_verify_output}"
     );
 }

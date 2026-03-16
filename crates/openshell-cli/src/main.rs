@@ -906,9 +906,6 @@ enum InferenceCommands {
         system: bool,
 
         /// Skip endpoint verification before saving the route.
-        ///
-        /// Accepted now so scripts can opt out explicitly ahead of a future
-        /// default switch to verification.
         #[arg(long)]
         no_verify: bool,
     },
@@ -929,9 +926,6 @@ enum InferenceCommands {
         system: bool,
 
         /// Skip endpoint verification before saving the route.
-        ///
-        /// Accepted now so scripts can opt out explicitly ahead of a future
-        /// default switch to verification.
         #[arg(long)]
         no_verify: bool,
     },
@@ -1810,17 +1804,19 @@ async fn main() -> Result<()> {
                     provider,
                     model,
                     system,
-                    no_verify: _,
+                    no_verify,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
-                    run::gateway_inference_set(endpoint, &provider, &model, route_name, &tls)
-                        .await?;
+                    run::gateway_inference_set(
+                        endpoint, &provider, &model, route_name, no_verify, &tls,
+                    )
+                    .await?;
                 }
                 InferenceCommands::Update {
                     provider,
                     model,
                     system,
-                    no_verify: _,
+                    no_verify,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_update(
@@ -1828,6 +1824,7 @@ async fn main() -> Result<()> {
                         provider.as_deref(),
                         model.as_deref(),
                         route_name,
+                        no_verify,
                         &tls,
                     )
                     .await?;
@@ -2560,6 +2557,54 @@ mod tests {
     }
 
     #[test]
+    fn inference_set_accepts_no_verify_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "inference",
+            "set",
+            "--provider",
+            "openai-dev",
+            "--model",
+            "gpt-4.1",
+            "--no-verify",
+        ])
+        .expect("inference set should parse --no-verify");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inference {
+                command: Some(InferenceCommands::Set {
+                    no_verify: true,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn inference_update_accepts_no_verify_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "inference",
+            "update",
+            "--provider",
+            "openai-dev",
+            "--no-verify",
+        ])
+        .expect("inference update should parse --no-verify");
+
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Inference {
+                command: Some(InferenceCommands::Update {
+                    no_verify: true,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
     fn completion_script_uses_openshell_command_name() {
         let script = normalize_completion_script(
             b"/tmp/custom/openshell -- \"${words[@]}\"\n#compdef openshell\n".to_vec(),
@@ -2746,53 +2791,5 @@ mod tests {
             }
             other => panic!("expected SshProxy, got: {other:?}"),
         }
-    }
-
-    #[test]
-    fn inference_set_accepts_no_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "set",
-            "--provider",
-            "openai-dev",
-            "--model",
-            "gpt-4.1",
-            "--no-verify",
-        ])
-        .expect("inference set should parse --no-verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Set {
-                    no_verify: true,
-                    ..
-                })
-            })
-        ));
-    }
-
-    #[test]
-    fn inference_update_accepts_no_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "update",
-            "--provider",
-            "openai-dev",
-            "--no-verify",
-        ])
-        .expect("inference update should parse --no-verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Update {
-                    no_verify: true,
-                    ..
-                })
-            })
-        ));
     }
 }

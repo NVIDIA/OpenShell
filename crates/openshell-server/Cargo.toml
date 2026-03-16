@@ -17,6 +17,7 @@ path = "src/main.rs"
 [dependencies]
 openshell-core = { path = "../openshell-core" }
 openshell-policy = { path = "../openshell-policy" }
+openshell-router = { path = "../openshell-router" }
 
 # Async runtime
 tokio = { workspace = true }
@@ -61,6 +62,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tokio-stream = { workspace = true }
 sqlx = { workspace = true }
+reqwest = { workspace = true }
 kube = { workspace = true }
 kube-runtime = { workspace = true }
 k8s-openapi = { workspace = true }
@@ -78,6 +80,7 @@ rcgen = { version = "0.13", features = ["crypto", "pem"] }
 tempfile = "3"
 tokio-tungstenite = { workspace = true }
 futures-util = "0.3"
+wiremock = "0.6"
 
 [lints]
 workspace = true

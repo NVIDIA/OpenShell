@@ -3,6 +3,35 @@
 
 use crate::RouterError;
 use crate::config::{AuthHeader, ResolvedRoute};
+use crate::mock;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedEndpoint {
+    pub url: String,
+    pub protocol: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationFailureKind {
+    RequestShape,
+    Credentials,
+    RateLimited,
+    Connectivity,
+    UpstreamHealth,
+    Unexpected,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidationFailure {
+    pub kind: ValidationFailureKind,
+    pub details: String,
+}
+
+struct ValidationProbe {
+    path: &'static str,
+    protocol: &'static str,
+    body: bytes::Bytes,
+}
 
 /// Response from a proxied HTTP request to a backend (fully buffered).
 #[derive(Debug)]
@@ -128,6 +157,151 @@ async fn send_backend_request(
     })
 }
 
+fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, ValidationFailure> {
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_chat_completions")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/chat/completions",
+            protocol: "openai_chat_completions",
+            body: bytes::Bytes::from_static(
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":1}"#,
+            ),
+        });
+    }
+
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "anthropic_messages")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/messages",
+            protocol: "anthropic_messages",
+            body: bytes::Bytes::from_static(
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":1}"#,
+            ),
+        });
+    }
+
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_responses")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/responses",
+            protocol: "openai_responses",
+            body: bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":1}"#),
+        });
+    }
+
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "openai_completions")
+    {
+        return Ok(ValidationProbe {
+            path: "/v1/completions",
+            protocol: "openai_completions",
+            body: bytes::Bytes::from_static(br#"{"prompt":"ping","max_tokens":1}"#),
+        });
+    }
+
+    Err(ValidationFailure {
+        kind: ValidationFailureKind::RequestShape,
+        details: format!(
+            "route '{}' does not expose a writable inference protocol for validation",
+            route.name
+        ),
+    })
+}
+
+pub async fn verify_backend_endpoint(
+    client: &reqwest::Client,
+    route: &ResolvedRoute,
+) -> Result<ValidatedEndpoint, ValidationFailure> {
+    let probe = validation_probe(route)?;
+
+    if mock::is_mock_route(route) {
+        return Ok(ValidatedEndpoint {
+            url: build_backend_url(&route.endpoint, probe.path),
+            protocol: probe.protocol.to_string(),
+        });
+    }
+
+    let response = send_backend_request(client, route, "POST", probe.path, Vec::new(), probe.body)
+        .await
+        .map_err(|err| match err {
+            RouterError::UpstreamUnavailable(details) => ValidationFailure {
+                kind: ValidationFailureKind::Connectivity,
+                details,
+            },
+            RouterError::Internal(details) | RouterError::UpstreamProtocol(details) => {
+                ValidationFailure {
+                    kind: ValidationFailureKind::Unexpected,
+                    details,
+                }
+            }
+            RouterError::RouteNotFound(details)
+            | RouterError::NoCompatibleRoute(details)
+            | RouterError::Unauthorized(details) => ValidationFailure {
+                kind: ValidationFailureKind::Unexpected,
+                details,
+            },
+        })?;
+    let url = build_backend_url(&route.endpoint, probe.path);
+
+    if response.status().is_success() {
+        return Ok(ValidatedEndpoint {
+            url,
+            protocol: probe.protocol.to_string(),
+        });
+    }
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| ValidationFailure {
+        kind: ValidationFailureKind::Unexpected,
+        details: format!("failed to read validation response body: {e}"),
+    })?;
+    let body = body.trim();
+    let body_suffix = if body.is_empty() {
+        String::new()
+    } else {
+        format!(
+            " Response body: {}",
+            body.chars().take(200).collect::<String>()
+        )
+    };
+
+    let details = match status.as_u16() {
+        400 | 404 | 405 | 422 => {
+            format!("upstream rejected the validation request with HTTP {status}.{body_suffix}")
+        }
+        401 | 403 => {
+            format!("upstream rejected credentials with HTTP {status}.{body_suffix}")
+        }
+        429 => {
+            format!("upstream rate-limited the validation request with HTTP {status}.{body_suffix}")
+        }
+        500..=599 => format!("upstream returned HTTP {status}.{body_suffix}"),
+        _ => format!("upstream returned unexpected HTTP {status}.{body_suffix}"),
+    };
+
+    Err(ValidationFailure {
+        kind: match status.as_u16() {
+            400 | 404 | 405 | 422 => ValidationFailureKind::RequestShape,
+            401 | 403 => ValidationFailureKind::Credentials,
+            429 => ValidationFailureKind::RateLimited,
+            500..=599 => ValidationFailureKind::UpstreamHealth,
+            _ => ValidationFailureKind::Unexpected,
+        },
+        details,
+    })
+}
+
 /// Extract status and headers from a [`reqwest::Response`].
 fn extract_response_metadata(response: &reqwest::Response) -> (u16, Vec<(String, String)>) {
     let status = response.status().as_u16();
@@ -201,7 +375,11 @@ fn build_backend_url(endpoint: &str, path: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::build_backend_url;
+    use super::{build_backend_url, verify_backend_endpoint};
+    use crate::config::ResolvedRoute;
+    use openshell_core::inference::AuthHeader;
+    use wiremock::matchers::{body_partial_json, header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn build_backend_url_dedupes_v1_prefix() {
@@ -225,5 +403,62 @@ mod tests {
             build_backend_url("https://api.openai.com/v1", "/v1"),
             "https://api.openai.com/v1"
         );
+    }
+
+    fn test_route(endpoint: &str, protocols: &[&str], auth: AuthHeader) -> ResolvedRoute {
+        ResolvedRoute {
+            name: "inference.local".to_string(),
+            endpoint: endpoint.to_string(),
+            model: "test-model".to_string(),
+            api_key: "sk-test".to_string(),
+            protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
+            auth,
+            default_headers: vec![("anthropic-version".to_string(), "2023-06-01".to_string())],
+        }
+    }
+
+    #[tokio::test]
+    async fn verify_backend_endpoint_uses_route_auth_and_shape() {
+        let mock_server = MockServer::start().await;
+        let route = test_route(
+            &mock_server.uri(),
+            &["anthropic_messages"],
+            AuthHeader::Custom("x-api-key"),
+        );
+
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(header("x-api-key", "sk-test"))
+            .and(header("anthropic-version", "2023-06-01"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "test-model",
+                "max_tokens": 1,
+            })))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),
+            )
+            .mount(&mock_server)
+            .await;
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let validated = verify_backend_endpoint(&client, &route).await.unwrap();
+
+        assert_eq!(validated.protocol, "anthropic_messages");
+        assert_eq!(validated.url, format!("{}/v1/messages", mock_server.uri()));
+    }
+
+    #[tokio::test]
+    async fn verify_backend_endpoint_accepts_mock_routes() {
+        let route = test_route(
+            "mock://test-backend",
+            &["openai_chat_completions"],
+            AuthHeader::Bearer,
+        );
+
+        let client = reqwest::Client::builder().build().unwrap();
+        let validated = verify_backend_endpoint(&client, &route).await.unwrap();
+
+        assert_eq!(validated.protocol, "openai_chat_completions");
+        assert_eq!(validated.url, "mock://test-backend/v1/chat/completions");
     }
 }

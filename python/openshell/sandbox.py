@@ -398,11 +398,13 @@ class InferenceRouteClient:
         *,
         provider_name: str,
         model_id: str,
+        no_verify: bool = False,
     ) -> ClusterInferenceConfig:
         response = self._stub.SetClusterInference(
             inference_pb2.SetClusterInferenceRequest(
                 provider_name=provider_name,
                 model_id=model_id,
+                no_verify=no_verify,
             ),
             timeout=self._timeout,
         )

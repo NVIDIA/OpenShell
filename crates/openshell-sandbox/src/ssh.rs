@@ -30,7 +30,7 @@ use tracing::{info, warn};
 
 const PREFACE_MAGIC: &str = "NSSH1";
 #[cfg(test)]
-const SSH_HANDSHAKE_SECRET_ENV: &str = "NEMOCLAW_SSH_HANDSHAKE_SECRET";
+const SSH_HANDSHAKE_SECRET_ENV: &str = "OPENSHELL_SSH_HANDSHAKE_SECRET";
 
 /// A time-bounded set of nonces used to detect replayed NSSH1 handshakes.
 /// Each entry records the `Instant` it was inserted; a background reaper task
