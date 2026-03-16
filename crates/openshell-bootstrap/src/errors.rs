@@ -180,7 +180,9 @@ fn diagnose_corrupted_state(gateway_name: &str) -> GatewayFailureDiagnosis {
         recovery_steps: vec![
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway",
-                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+                format!(
+                    "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                ),
             ),
             RecoveryStep::with_command(
                 "If that fails, remove the volume for a clean slate",
@@ -230,7 +232,7 @@ fn diagnose_port_conflict(_gateway_name: &str) -> GatewayFailureDiagnosis {
             ),
             RecoveryStep::with_command(
                 "Or stop other openshell gateways",
-                "openshell gateway list && openshell gateway destroy <name>",
+                "openshell gateway list && openshell gateway destroy --name <name>",
             ),
         ],
         retryable: false,
@@ -283,7 +285,9 @@ fn diagnose_k3s_dns_proxy_failure(gateway_name: &str) -> GatewayFailureDiagnosis
             RecoveryStep::with_command("Prune Docker networks", "docker network prune -f"),
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway",
-                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+                format!(
+                    "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                ),
             ),
         ],
         retryable: true,
@@ -342,7 +346,9 @@ fn diagnose_node_pressure(gateway_name: &str) -> GatewayFailureDiagnosis {
             RecoveryStep::new("Increase Docker resource allocation or free resources on the host"),
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway after freeing resources",
-                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+                format!(
+                    "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                ),
             ),
         ],
         retryable: false,
@@ -365,7 +371,9 @@ fn diagnose_missing_supervisor(gateway_name: &str) -> GatewayFailureDiagnosis {
             ),
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway with the updated image",
-                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+                format!(
+                    "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                ),
             ),
             RecoveryStep::new(
                 "Or set OPENSHELL_CLUSTER_IMAGE to a cluster image version that includes \
@@ -384,7 +392,7 @@ fn diagnose_certificate_issue(gateway_name: &str) -> GatewayFailureDiagnosis {
             .to_string(),
         recovery_steps: vec![RecoveryStep::with_command(
             "Destroy and recreate the gateway to regenerate certificates",
-            format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+            format!("openshell gateway destroy --name {gateway_name} && openshell gateway start"),
         )],
         retryable: false,
     }
@@ -443,7 +451,9 @@ pub fn generic_failure_diagnosis(gateway_name: &str) -> GatewayFailureDiagnosis 
         recovery_steps: vec![
             RecoveryStep::with_command(
                 "Try destroying and recreating the gateway",
-                format!("openshell gateway destroy {gateway_name} && openshell gateway start"),
+                format!(
+                    "openshell gateway destroy --name {gateway_name} && openshell gateway start"
+                ),
             ),
             RecoveryStep::with_command(
                 "Check container logs for details",

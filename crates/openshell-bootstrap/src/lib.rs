@@ -298,7 +298,7 @@ where
             return Err(miette::miette!(
                 "Gateway '{name}' already exists (container_running={}).\n\
                  Use --recreate to destroy and redeploy, or destroy it first with:\n\n    \
-                 openshell gateway destroy {name}",
+                 openshell gateway destroy --name {name}",
                 existing.container_running,
             ));
         }

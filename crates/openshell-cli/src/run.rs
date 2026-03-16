@@ -1900,7 +1900,7 @@ pub async fn sandbox_create(
                 eprintln!();
                 eprintln!(
                     "    {} && {}",
-                    format!("openshell gateway destroy {gateway_name}").cyan(),
+                    format!("openshell gateway destroy --name {gateway_name}").cyan(),
                     "openshell gateway start".cyan(),
                 );
                 eprintln!();
