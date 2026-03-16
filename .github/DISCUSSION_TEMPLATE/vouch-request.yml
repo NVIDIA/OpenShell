@@ -1,0 +1,58 @@
+title: "Vouch request: [your GitHub username]"
+labels: []
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ## Vouch Request
+
+        OpenShell uses a vouch system for first-time contributors. Fill out this
+        form to request approval. A maintainer will review and comment `/vouch`
+        if approved.
+
+        **Write in your own words.** Do not have an AI generate this request.
+        Requests that read like LLM output will be denied.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What do you want to work on?
+      description: >
+        Describe the change you want to make. Link to an existing issue if
+        there is one.
+      placeholder: "I want to fix #123 which causes sandbox timeouts when..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this change?
+      description: >
+        Explain your motivation and why this matters. Keep it concise.
+      placeholder: "This bug affects anyone running sandboxes on ARM64 because..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: approach
+    attributes:
+      label: How do you plan to implement it?
+      description: >
+        Brief description of your approach. You don't need a full design doc,
+        but show that you understand the relevant code.
+      placeholder: "The timeout is set in crates/openshell-sandbox/src/runtime.rs. I'd change..."
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Checklist
+      options:
+        - label: I wrote this request myself (not AI-generated)
+          required: true
+        - label: I have read [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md)
+          required: true
+        - label: I understand that OpenShell is agent-first — I will use agents as tools but I own and understand my code
+          required: true

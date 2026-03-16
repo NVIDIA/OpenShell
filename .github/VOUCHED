@@ -1,0 +1,11 @@
+# Vouched Contributors
+#
+# Users listed here have been approved to submit pull requests.
+# Org members and collaborators with push access bypass this check automatically.
+#
+# To vouch a new contributor, a maintainer comments "/vouch" on their
+# Vouch Request discussion. The vouch-command workflow appends their
+# username here and confirms approval.
+#
+# Format: one GitHub username per line, no @ prefix.
+# Lines starting with # are comments.

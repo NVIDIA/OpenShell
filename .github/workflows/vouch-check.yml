@@ -1,0 +1,119 @@
+name: Vouch Check
+
+on:
+  pull_request_target:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  vouch-gate:
+    if: github.repository_owner == 'NVIDIA'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check if contributor is vouched
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const author = context.payload.pull_request.user.login;
+            const authorType = context.payload.pull_request.user.type;
+
+            // 0. Skip bots (dependabot, renovate, github-actions, etc.).
+            if (authorType === 'Bot') {
+              console.log(`${author} is a bot (type: ${authorType}). Skipping vouch check.`);
+              return;
+            }
+
+            // 1. Check org membership — members bypass the vouch gate.
+            try {
+              const { status } = await github.rest.orgs.checkMembershipForUser({
+                org: context.repo.owner,
+                username: author,
+              });
+              if (status === 204 || status === 302) {
+                console.log(`${author} is an org member. Skipping vouch check.`);
+                return;
+              }
+            } catch (e) {
+              // 404 = not a member, continue to next check.
+              if (e.status !== 404) {
+                console.log(`Org membership check error: ${e.message}`);
+              }
+            }
+
+            // 2. Check collaborator status — direct collaborators bypass.
+            try {
+              const { status } = await github.rest.repos.checkCollaborator({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: author,
+              });
+              if (status === 204) {
+                console.log(`${author} is a collaborator. Skipping vouch check.`);
+                return;
+              }
+            } catch (e) {
+              if (e.status !== 404) {
+                console.log(`Collaborator check error: ${e.message}`);
+              }
+            }
+
+            // 3. Check the VOUCHED file. Read from the default branch, NOT the
+            //    PR branch — the PR author could add themselves to VOUCHED in
+            //    their fork.
+            let vouched = false;
+            try {
+              const { data } = await github.rest.repos.getContent({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                path: '.github/VOUCHED',
+                ref: context.payload.repository.default_branch,
+              });
+              const content = Buffer.from(data.content, 'base64').toString('utf-8');
+              const usernames = content
+                .split('\n')
+                .map(line => line.trim())
+                .filter(line => line && !line.startsWith('#'));
+              vouched = usernames.some(
+                name => name.toLowerCase() === author.toLowerCase()
+              );
+            } catch (e) {
+              console.log(`Could not read VOUCHED file: ${e.message}`);
+            }
+
+            if (vouched) {
+              console.log(`${author} is in the VOUCHED file. Approved.`);
+              return;
+            }
+
+            // Not vouched — close the PR with an explanation.
+            console.log(`${author} is not vouched. Closing PR.`);
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: [
+                `Thank you for your interest in contributing to OpenShell, @${author}.`,
+                '',
+                'This project uses a **vouch system** for first-time contributors. Before submitting a pull request, you need to be vouched by a maintainer.',
+                '',
+                '**To get vouched:**',
+                '1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.',
+                '2. Describe what you want to change and why.',
+                '3. Write in your own words — do not have an AI generate the request.',
+                '4. A maintainer will comment `/vouch` if approved.',
+                '5. Once vouched, open a new PR (preferred) or reopen this one after a few minutes.',
+                '',
+                'See [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#first-time-contributors) for details.',
+              ].join('\n'),
+            });
+
+            await github.rest.pulls.update({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: context.payload.pull_request.number,
+              state: 'closed',
+            });
