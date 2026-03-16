@@ -13,7 +13,6 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 ## Quickstart
 
-Want to run on cloud compute? [Launch on Brev](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Azt0aYgVNFEuz7opyx3gscmowS). Otherwise, follow the steps below to run locally.
 
 ### Prerequisites
 
