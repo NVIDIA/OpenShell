@@ -182,6 +182,21 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 }
             }
 
+            // port + ports mutual exclusion
+            let has_scalar_port = ep
+                .get("port")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|p| p > 0);
+            let has_ports_array = ep
+                .get("ports")
+                .and_then(|v| v.as_array())
+                .is_some_and(|a| !a.is_empty());
+            if has_scalar_port && has_ports_array {
+                errors.push(format!(
+                    "{loc}: port and ports are mutually exclusive; use ports for multiple ports"
+                ));
+            }
+
             // rules + access mutual exclusion
             if has_rules && !access.is_empty() {
                 errors.push(format!("{loc}: rules and access are mutually exclusive"));
@@ -639,6 +654,29 @@ mod tests {
         assert!(
             warnings.is_empty(),
             "*.example.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_port_and_ports_mutually_exclusive() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "port": 443,
+                        "ports": [443, 8443]
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("port and ports are mutually exclusive")),
+            "Should reject both port and ports, got errors: {errors:?}"
         );
     }
 
