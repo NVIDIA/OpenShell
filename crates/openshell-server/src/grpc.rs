@@ -1023,10 +1023,16 @@ impl OpenShell for OpenShellService {
             // Validate policy safety (no root, no path traversal, etc.).
             validate_policy_safety(&new_policy)?;
         } else {
-            // No baseline policy exists (sandbox created without one). The
-            // sandbox is syncing a locally-discovered or restrictive-default
-            // policy. Backfill spec.policy so future updates can validate
-            // against it.
+            // No baseline policy exists (sandbox created without one).
+            // Validate against the restrictive default before backfilling so
+            // untrusted sandbox images cannot inject a more permissive policy.
+            let restrictive_baseline = openshell_policy::restrictive_default_policy();
+            validate_static_fields_unchanged(&restrictive_baseline, &new_policy)?;
+            validate_network_mode_unchanged(&restrictive_baseline, &new_policy)?;
+            validate_policy_safety(&new_policy)?;
+
+            // Backfill spec.policy so future updates can validate against the
+            // same baseline that was accepted here.
             let mut sandbox = sandbox;
             if let Some(ref mut spec) = sandbox.spec {
                 spec.policy = Some(new_policy.clone());
