@@ -1,0 +1,49 @@
+# Example sandbox policy with Hindsight memory access.
+#
+# This policy grants the sandbox agent access to the Hindsight Cloud API
+# for memory recall and retain operations. It uses read-write access,
+# which allows GET (recall) and POST (retain) but not DELETE.
+#
+# Usage:
+#   openshell sandbox create --policy example-policy.yaml --provider hindsight -- claude
+#
+# For self-hosted Hindsight instances, change the host and add allowed_ips
+# for private IP ranges. See SKILL.md for examples.
+
+version: 1
+
+filesystem_policy:
+  include_workdir: true
+  read_only:
+    - /usr
+    - /lib
+    - /proc
+    - /dev/urandom
+    - /app
+    - /etc
+    - /var/log
+  read_write:
+    - /sandbox
+    - /tmp
+    - /dev/null
+
+landlock:
+  compatibility: best_effort
+
+process:
+  run_as_user: sandbox
+  run_as_group: sandbox
+
+network_policies:
+  hindsight_memory:
+    name: hindsight_memory
+    endpoints:
+      - host: api.hindsight.vectorize.io
+        port: 443
+        protocol: rest
+        tls: terminate
+        enforcement: enforce
+        access: read-write
+    binaries:
+      - { path: /usr/local/bin/hindsight }
+      - { path: /usr/bin/curl }

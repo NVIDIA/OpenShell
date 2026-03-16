@@ -43,6 +43,7 @@ Skills live in `.agents/skills/`. Your agent's harness can discover and load the
 | Reviewing | `watch-github-actions` | Monitor CI pipeline status and logs |
 | Triage | `triage-issue` | Assess, classify, and route community-filed issues |
 | Platform | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs |
+| Platform | `hindsight-memory` | Persistent agent memory across sandbox sessions using Hindsight |
 | Platform | `tui-development` | Development guide for the ratatui-based terminal UI |
 | Documentation | `update-docs` | Scan recent commits and draft doc updates for user-facing changes |
 | Maintenance | `sync-agent-infra` | Detect and fix drift across agent-first infrastructure files |
