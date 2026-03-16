@@ -32,73 +32,27 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 
 Before you begin, make sure you have:
 
-- Python 3.12 or later.
-- [uv](https://docs.astral.sh/uv/) installed.
 - Docker Desktop running on your machine.
 
 For a complete list of requirements, refer to {doc}`../reference/support-matrix`.
 
 ## Install the OpenShell CLI
 
-Install the `openshell` package into a virtual environment.
-
-Activate your virtual environment:
+Run the install script:
 
 ```console
-$ uv venv && source .venv/bin/activate
+$ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 ```
 
-Install the CLI:
+If you prefer [uv](https://docs.astral.sh/uv/):
 
 ```console
-$ uv pip install openshell
+$ uv tool install -U openshell
 ```
 
 :::{tip}
 Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags. You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
 :::
-
-## Deploy a Gateway (Optional)
-
-Running `openshell sandbox create` without a gateway auto-bootstraps a local one.
-To start the gateway explicitly or deploy to a remote host, choose the tab that matches your setup.
-
-:::::{tab-set}
-
-::::{tab-item} Brev
-
-:::{note}
-Deploy an OpenShell gateway on Brev by clicking **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg).
-:::
-
-After the instance starts running, find the gateway URL in the Brev console under **Using Secure Links**.
-Copy the shareable URL for **port 8080**, which is the gateway endpoint.
-
-```console
-$ openshell gateway add https://<your-port-8080-url>.brevlab.com
-$ openshell status
-```
-
-::::
-
-::::{tab-item} DGX Spark
-
-:::{note}
-Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured (such as SSH keys added to the host).
-:::
-
-Deploy to a DGX Spark machine over SSH:
-
-```console
-$ openshell gateway start --remote <username>@<spark-ssid>.local
-$ openshell status
-```
-
-After `openshell status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
-
-::::
-
-:::::
 
 ## Create Your First OpenShell Sandbox
 
@@ -171,3 +125,47 @@ $ openshell sandbox create --from base
 ```
 
 :::
+
+::::
+
+## Deploy a Gateway (Optional)
+
+Running `openshell sandbox create` without a gateway auto-bootstraps a local one.
+To start the gateway explicitly or deploy to a remote host, choose the tab that matches your setup.
+
+:::::{tab-set}
+
+::::{tab-item} Brev
+
+:::{note}
+Deploy an OpenShell gateway on Brev by clicking **Deploy** on the [OpenShell Launchable](https://brev.nvidia.com/launchable/deploy/now?launchableID=env-3Ap3tL55zq4a8kew1AuW0FpSLsg).
+:::
+
+After the instance starts running, find the gateway URL in the Brev console under **Using Secure Links**.
+Copy the shareable URL for **port 8080**, which is the gateway endpoint.
+
+```console
+$ openshell gateway add https://<your-port-8080-url>.brevlab.com
+$ openshell status
+```
+
+::::
+
+::::{tab-item} DGX Spark
+
+:::{note}
+Set up your Spark with NVIDIA Sync first, or make sure SSH access is configured (such as SSH keys added to the host).
+:::
+
+Deploy to a DGX Spark machine over SSH:
+
+```console
+$ openshell gateway start --remote <username>@<spark-ssid>.local
+$ openshell status
+```
+
+After `openshell status` shows the gateway as healthy, all subsequent commands route through the SSH tunnel.
+
+::::
+
+:::::

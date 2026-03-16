@@ -69,27 +69,6 @@ $ openshell sandbox create --from my-registry.example.com/my-image:latest
 
 The CLI resolves community names against the [OpenShell Community](https://github.com/NVIDIA/OpenShell-Community) catalog, pulls the bundled Dockerfile and policy, builds the image locally, and creates the sandbox. For the full catalog and how to contribute your own, refer to {doc}`community-sandboxes`.
 
-The following is an example of a fully specified creation command:
-
-```console
-$ openshell sandbox create \
-    --name dev \
-    --provider my-claude \
-    --policy policy.yaml \
-    --upload \
-    -- claude
-```
-
-Additional `sandbox create` flags:
-
-| Flag | Purpose |
-|---|---|
-| `--no-keep` | Delete the sandbox automatically after the initial command exits |
-| `--forward <port>` | Forward a local port to the sandbox before running |
-| `--tty` / `--no-tty` | Force or disable pseudo-terminal allocation |
-| `--no-bootstrap` | Error if no gateway is available instead of auto-bootstrapping |
-| `--no-auto-providers` | Error if required providers are missing instead of prompting |
-
 ## Connect to a Sandbox
 
 Open an SSH session into a running sandbox:
@@ -203,7 +182,6 @@ Deleting a sandbox stops all processes, releases resources, and purges injected 
 
 ```console
 $ openshell sandbox delete my-sandbox
-$ openshell sandbox delete --all
 ```
 
 ## Next Steps

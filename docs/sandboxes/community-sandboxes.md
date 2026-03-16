@@ -45,7 +45,6 @@ The following community sandboxes are available in the catalog.
 | `base` | Foundational image with system tools and dev environment |
 | `openclaw` | Open agent manipulation and control |
 | `sdg` | Synthetic data generation workflows |
-| `simulation` | General-purpose simulation sandboxes |
 
 ## Use a Community Sandbox
 
