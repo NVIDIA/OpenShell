@@ -137,7 +137,6 @@ The following provider types are supported.
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
 | `generic` | User-defined | Any service with custom credentials |
-| `outlook` | *(none: no auto-discovery)* | Microsoft Outlook integration |
 
 :::{tip}
 Use the `generic` type for any service not listed above. You define the
