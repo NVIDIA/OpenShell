@@ -15,7 +15,15 @@ use std::io::Write;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-const DOCKERFILE_CONTENT: &str = r#"FROM ghcr.io/nvidia/openshell-community/sandboxes/base:latest
+const DOCKERFILE_CONTENT: &str = r#"FROM public.ecr.aws/docker/library/python:3.13-slim
+
+# iproute2 is required for sandbox network namespace isolation.
+RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create the sandbox user/group so the supervisor can switch to it.
+RUN groupadd -g 1000 sandbox && \
+    useradd -m -u 1000 -g sandbox sandbox
 
 # Write a marker file so we can verify this is our custom image.
 RUN echo "custom-image-e2e-marker" > /opt/marker.txt
