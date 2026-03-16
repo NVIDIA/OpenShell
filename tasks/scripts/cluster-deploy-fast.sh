@@ -26,6 +26,10 @@ fi
 DEPLOY_FAST_MODE=${DEPLOY_FAST_MODE:-auto}
 FORCE_HELM_UPGRADE=${FORCE_HELM_UPGRADE:-0}
 DEPLOY_FAST_HELM_WAIT=${DEPLOY_FAST_HELM_WAIT:-0}
+DEPLOY_FAST_READINESS_TIMEOUT_SECONDS=${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS:-90}
+DEPLOY_FAST_READINESS_POLL_SECONDS=${DEPLOY_FAST_READINESS_POLL_SECONDS:-2}
+DEPLOY_FAST_SUPERVISOR_RECONCILE=${DEPLOY_FAST_SUPERVISOR_RECONCILE:-rolling-delete}
+DEPLOY_FAST_SUPERVISOR_RECONCILE_TIMEOUT_SECONDS=${DEPLOY_FAST_SUPERVISOR_RECONCILE_TIMEOUT_SECONDS:-90}
 DEPLOY_FAST_STATE_FILE=${DEPLOY_FAST_STATE_FILE:-.cache/cluster-deploy-fast.state}
 DEPLOY_TX_ID=${DEPLOY_TX_ID:-"tx-$(date +%Y%m%d-%H%M%S)-$RANDOM"}
 DEPLOY_REPORT_DIR=${DEPLOY_REPORT_DIR:-.cache/deploy-reports}
@@ -79,17 +83,35 @@ supervisor_duration=0
 image_push_duration=0
 helm_upgrade_duration=0
 gateway_rollout_duration=0
+supervisor_reconcile_duration=0
+readiness_duration=0
 total_duration=0
 gateway_deployed_digest=""
 gateway_target_digest=""
 skip_gateway_reconcile=0
 skip_gateway_reconcile_reason=""
+readiness_gate_status="pending"
+readiness_failure_reason=""
+supervisor_reconcile_performed=0
+supervisor_reconcile_restarted_pods=0
+supervisor_reconcile_waits=0
+supervisor_reconcile_expected_running=0
+supervisor_reconcile_failure_reason=""
 
 state_gateway_fingerprint=""
 state_supervisor_fingerprint=""
 state_helm_fingerprint=""
 
 mkdir -p "${DEPLOY_REPORT_DIR}"
+
+case "${DEPLOY_FAST_SUPERVISOR_RECONCILE}" in
+  rolling-delete|none)
+    ;;
+  *)
+    echo "Error: DEPLOY_FAST_SUPERVISOR_RECONCILE must be 'rolling-delete' or 'none' (got '${DEPLOY_FAST_SUPERVISOR_RECONCILE}')."
+    exit 1
+    ;;
+esac
 
 if ! docker ps -q --filter "name=^${CONTAINER_NAME}$" --filter "health=healthy" | grep -q .; then
   echo "Error: Cluster container '${CONTAINER_NAME}' is not running or not healthy."
@@ -100,6 +122,186 @@ fi
 # Run a command inside the cluster container with KUBECONFIG pre-configured.
 cluster_exec() {
   docker exec "${CONTAINER_NAME}" sh -c "KUBECONFIG=/etc/rancher/k3s/k3s.yaml $*"
+}
+
+gateway_workload_kind() {
+  if cluster_exec "kubectl get statefulset/openshell -n openshell" >/dev/null 2>&1; then
+    echo "statefulset"
+    return
+  fi
+  if cluster_exec "kubectl get deployment/openshell -n openshell" >/dev/null 2>&1; then
+    echo "deployment"
+    return
+  fi
+  echo ""
+}
+
+wait_for_gateway_ready() {
+  local timeout_s=${1:-90}
+  local poll_s=${2:-2}
+  local deadline
+  local workload_kind
+  local desired_replicas
+  local ready_replicas
+  local reason="unknown"
+
+  deadline=$(( $(date +%s) + timeout_s ))
+
+  while true; do
+    if ! cluster_exec "kubectl get --raw='/readyz'" >/dev/null 2>&1; then
+      reason="apiserver_not_ready"
+    elif ! docker exec "${CONTAINER_NAME}" test -x /opt/openshell/bin/openshell-sandbox >/dev/null 2>&1; then
+      reason="supervisor_binary_missing"
+    else
+      workload_kind=$(gateway_workload_kind)
+      if [[ -z "${workload_kind}" ]]; then
+        reason="gateway_workload_missing"
+      else
+        desired_replicas=$(cluster_exec "kubectl get ${workload_kind}/openshell -n openshell -o jsonpath='{.spec.replicas}'" 2>/dev/null || true)
+        ready_replicas=$(cluster_exec "kubectl get ${workload_kind}/openshell -n openshell -o jsonpath='{.status.readyReplicas}'" 2>/dev/null || true)
+        if [[ -z "${desired_replicas}" ]]; then
+          desired_replicas=1
+        fi
+        if [[ -z "${ready_replicas}" ]]; then
+          ready_replicas=0
+        fi
+        if [[ "${ready_replicas}" -ge "${desired_replicas}" ]]; then
+          return 0
+        fi
+        reason="gateway_not_ready:${ready_replicas}/${desired_replicas}"
+      fi
+    fi
+
+    if [[ $(date +%s) -ge "${deadline}" ]]; then
+      readiness_failure_reason="${reason}"
+      return 1
+    fi
+
+    sleep "${poll_s}"
+  done
+}
+
+list_running_sandbox_pods() {
+  cluster_exec "kubectl get pods -n openshell -l 'openshell.ai/managed-by=openshell,openshell.ai/sandbox-id' --field-selector=status.phase=Running -o jsonpath='{range .items[*]}{.metadata.name}{\"\\n\"}{end}'" 2>/dev/null || true
+}
+
+count_running_sandbox_pods() {
+  local markers
+  markers=$(cluster_exec "kubectl get pods -n openshell -l 'openshell.ai/managed-by=openshell,openshell.ai/sandbox-id' --field-selector=status.phase=Running -o jsonpath='{range .items[*]}x{end}'" 2>/dev/null || true)
+  if [[ -z "${markers}" ]]; then
+    echo "0"
+    return
+  fi
+  echo "${#markers}"
+}
+
+wait_for_running_sandboxes_ready() {
+  local expected_count=$1
+  local timeout_s=${2:-90}
+  local poll_s=${3:-2}
+  local deadline
+  local running_count
+
+  if [[ "${expected_count}" -le 0 ]]; then
+    return 0
+  fi
+
+  deadline=$(( $(date +%s) + timeout_s ))
+
+  while true; do
+    running_count=$(count_running_sandbox_pods)
+    if [[ "${running_count}" -ge "${expected_count}" ]]; then
+      if cluster_exec "kubectl wait --for=condition=Ready pod -n openshell -l 'openshell.ai/managed-by=openshell,openshell.ai/sandbox-id' --field-selector=status.phase=Running --timeout=1s" >/dev/null 2>&1; then
+        return 0
+      fi
+      supervisor_reconcile_failure_reason="sandbox_pods_not_ready"
+    else
+      supervisor_reconcile_failure_reason="sandbox_pod_count:${running_count}/${expected_count}"
+    fi
+
+    if [[ $(date +%s) -ge "${deadline}" ]]; then
+      if [[ -z "${supervisor_reconcile_failure_reason}" ]]; then
+        supervisor_reconcile_failure_reason="sandbox_reconcile_timeout"
+      fi
+      return 1
+    fi
+
+    sleep "${poll_s}"
+  done
+}
+
+reconcile_supervisor_pods() {
+  local mode=$1
+  local timeout_s=$2
+  local poll_s=$3
+  local reconcile_start
+  local reconcile_end
+  local pod_name
+  local -a sandbox_pods=()
+
+  if [[ "${mode}" == "none" ]]; then
+    echo "Supervisor reconcile mode is 'none'; skipping running sandbox pod restart."
+    return 0
+  fi
+
+  while IFS= read -r pod_name; do
+    if [[ -n "${pod_name}" ]]; then
+      sandbox_pods+=("${pod_name}")
+    fi
+  done < <(list_running_sandbox_pods)
+
+  supervisor_reconcile_expected_running=${#sandbox_pods[@]}
+  if [[ "${supervisor_reconcile_expected_running}" -eq 0 ]]; then
+    echo "No running sandbox pods found for supervisor reconcile."
+    return 0
+  fi
+
+  supervisor_reconcile_performed=1
+  reconcile_start=$(date +%s)
+  echo "Reconciling ${supervisor_reconcile_expected_running} running sandbox pod(s) after supervisor update..."
+
+  for pod_name in "${sandbox_pods[@]}"; do
+    echo "Restarting sandbox pod ${pod_name}..."
+    cluster_exec "kubectl delete pod ${pod_name} -n openshell --wait=true --timeout=${timeout_s}s" >/dev/null
+    supervisor_reconcile_restarted_pods=$((supervisor_reconcile_restarted_pods + 1))
+
+    if ! wait_for_running_sandboxes_ready "${supervisor_reconcile_expected_running}" "${timeout_s}" "${poll_s}"; then
+      echo "Error: sandbox pod readiness did not recover after restarting ${pod_name} (${supervisor_reconcile_failure_reason})."
+      return 1
+    fi
+    supervisor_reconcile_waits=$((supervisor_reconcile_waits + 1))
+  done
+
+  reconcile_end=$(date +%s)
+  log_duration "Supervisor pod reconcile" "${reconcile_start}" "${reconcile_end}"
+  supervisor_reconcile_duration=$((reconcile_end - reconcile_start))
+  return 0
+}
+
+run_readiness_gate() {
+  local gate_start
+  local gate_end
+
+  gate_start=$(date +%s)
+  echo "Running readiness gate..."
+
+  if ! wait_for_gateway_ready "${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS}" "${DEPLOY_FAST_READINESS_POLL_SECONDS}"; then
+    gate_end=$(date +%s)
+    readiness_duration=$((gate_end - gate_start))
+    readiness_gate_status="failed"
+    if [[ -z "${readiness_failure_reason}" ]]; then
+      readiness_failure_reason="unknown"
+    fi
+    echo "Error: readiness gate failed (${readiness_failure_reason})."
+    cluster_exec "kubectl get pods -n openshell -o wide" || true
+    return 1
+  fi
+
+  gate_end=$(date +%s)
+  readiness_duration=$((gate_end - gate_start))
+  readiness_gate_status="passed"
+  echo "Readiness gate passed."
+  return 0
 }
 
 # Best-effort: find the currently running gateway image digest from pod status.
@@ -393,6 +595,8 @@ echo "  build gateway:    ${build_gateway}"
 echo "  build supervisor: ${build_supervisor}"
 echo "  helm upgrade:     ${needs_helm_upgrade}"
 echo "  cargo profile:    ${CARGO_BUILD_PROFILE}"
+echo "  readiness timeout:${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS}s"
+echo "  supervisor reconcile: ${DEPLOY_FAST_SUPERVISOR_RECONCILE}"
 
 if [[ "${explicit_target}" == "0" && "${build_gateway}" == "0" && "${build_supervisor}" == "0" && "${needs_helm_upgrade}" == "0" && "${DEPLOY_FAST_MODE}" != "full" ]]; then
   echo "No new local changes since last deploy."
@@ -461,6 +665,11 @@ if [[ "${build_supervisor}" == "1" ]]; then
     "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
   docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 
+  reconcile_supervisor_pods \
+    "${DEPLOY_FAST_SUPERVISOR_RECONCILE}" \
+    "${DEPLOY_FAST_SUPERVISOR_RECONCILE_TIMEOUT_SECONDS}" \
+    "${DEPLOY_FAST_READINESS_POLL_SECONDS}"
+
   built_components+=("supervisor")
   supervisor_end=$(date +%s)
   log_duration "Supervisor build + deploy" "${supervisor_start}" "${supervisor_end}"
@@ -521,6 +730,7 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   helm_start=$(date +%s)
   echo "Upgrading helm release..."
   helm_wait_args=""
+  helm_timeout_args="--timeout ${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS}s"
   if [[ "${DEPLOY_FAST_HELM_WAIT}" == "1" ]]; then
     helm_wait_args="--wait"
   fi
@@ -560,7 +770,8 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.clientTlsSecretName=openshell-client-tls \
     --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
     ${HOST_GATEWAY_ARGS} \
-    ${helm_wait_args}"
+    ${helm_wait_args} \
+    ${helm_timeout_args}"
   helm_end=$(date +%s)
   log_duration "Helm upgrade" "${helm_start}" "${helm_end}"
   helm_upgrade_duration=$((helm_end - helm_start))
@@ -571,10 +782,10 @@ if [[ "${build_gateway}" == "1" && "${skip_gateway_reconcile}" == "0" ]]; then
   echo "Restarting gateway to pick up updated image..."
   if cluster_exec "kubectl get statefulset/openshell -n openshell" >/dev/null 2>&1; then
     cluster_exec "kubectl rollout restart statefulset/openshell -n openshell"
-    cluster_exec "kubectl rollout status statefulset/openshell -n openshell"
+    cluster_exec "kubectl rollout status statefulset/openshell -n openshell --timeout=${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS}s"
   elif cluster_exec "kubectl get deployment/openshell -n openshell" >/dev/null 2>&1; then
     cluster_exec "kubectl rollout restart deployment/openshell -n openshell"
-    cluster_exec "kubectl rollout status deployment/openshell -n openshell"
+    cluster_exec "kubectl rollout status deployment/openshell -n openshell --timeout=${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS}s"
   else
     echo "Warning: no openshell workload found to roll out in namespace 'openshell'."
   fi
@@ -587,9 +798,17 @@ fi
 
 if [[ "${build_supervisor}" == "1" ]]; then
   echo "Supervisor binary updated on cluster node."
-  echo "Existing sandbox pods will use the new binary on next restart."
-  echo "New sandbox pods will use the updated binary immediately (hostPath mount)."
+  if [[ "${DEPLOY_FAST_SUPERVISOR_RECONCILE}" == "none" ]]; then
+    echo "Running sandbox pods keep their current supervisor until they restart."
+  elif [[ "${supervisor_reconcile_performed}" == "1" ]]; then
+    echo "Reconciled ${supervisor_reconcile_restarted_pods} running sandbox pod(s) to pick up the new supervisor."
+  else
+    echo "No running sandbox pods required reconcile."
+  fi
+  echo "New sandbox pods use the updated binary immediately (hostPath mount)."
 fi
+
+run_readiness_gate
 
 # Keep deploy state aligned even when explicit targets are used.
 # For explicit runs, update only the components we actually reconciled so auto
@@ -649,6 +868,15 @@ cat > "${DEPLOY_REPORT_FILE}" <<EOF
 - helm_requested_by_gateway_build: \`${helm_requested_by_gateway_build}\`
 - gateway_reconcile_skipped: \`${skip_gateway_reconcile}\`
 - gateway_reconcile_skip_reason: \`${skip_gateway_reconcile_reason}\`
+- readiness_timeout_seconds: \`${DEPLOY_FAST_READINESS_TIMEOUT_SECONDS}\`
+- readiness_poll_seconds: \`${DEPLOY_FAST_READINESS_POLL_SECONDS}\`
+- supervisor_reconcile_mode: \`${DEPLOY_FAST_SUPERVISOR_RECONCILE}\`
+- supervisor_reconcile_timeout_seconds: \`${DEPLOY_FAST_SUPERVISOR_RECONCILE_TIMEOUT_SECONDS}\`
+- supervisor_reconcile_performed: \`${supervisor_reconcile_performed}\`
+- supervisor_reconcile_restarted_pods: \`${supervisor_reconcile_restarted_pods}\`
+- supervisor_reconcile_waits: \`${supervisor_reconcile_waits}\`
+- supervisor_reconcile_expected_running: \`${supervisor_reconcile_expected_running}\`
+- supervisor_reconcile_failure_reason: \`${supervisor_reconcile_failure_reason}\`
 
 ## Fingerprints
 
@@ -667,14 +895,21 @@ cat > "${DEPLOY_REPORT_FILE}" <<EOF
 - deployed_before: \`${gateway_deployed_digest}\`
 - target_after_push: \`${gateway_target_digest}\`
 
+## Readiness
+
+- readiness_gate_status: \`${readiness_gate_status}\`
+- readiness_failure_reason: \`${readiness_failure_reason}\`
+
 ## Durations Seconds
 
 - change_detection: \`${change_detection_duration}\`
 - builds_total: \`${builds_duration}\`
 - supervisor_build_deploy: \`${supervisor_duration}\`
+- supervisor_reconcile: \`${supervisor_reconcile_duration}\`
 - image_push: \`${image_push_duration}\`
 - helm_upgrade: \`${helm_upgrade_duration}\`
 - gateway_rollout: \`${gateway_rollout_duration}\`
+- readiness_gate: \`${readiness_duration}\`
 - total: \`${total_duration}\`
 EOF
 
