@@ -8,6 +8,7 @@ The following table summarizes the agents that run in OpenShell sandboxes. All a
 | [OpenCode](https://opencode.ai/) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Partial coverage | Pre-installed. Add `opencode.ai` endpoint and OpenCode binary paths to the policy for full functionality. |
 | [Codex](https://developers.openai.com/codex) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | No coverage | Pre-installed. Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires `OPENAI_API_KEY`. |
 | [OpenClaw](https://openclaw.ai/) | [`openclaw`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/openclaw) | Bundled | Agent orchestration layer. Launch with `openshell sandbox create --from openclaw`. |
+| [Ollama](https://ollama.com/) | [`ollama`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/ollama) | Bundled | Run cloud and local models. Includes Claude Code, Codex, and OpenClaw. Launch with `openshell sandbox create --from ollama`. |
 
 More community agent sandboxes are available in the {doc}`../sandboxes/community-sandboxes` catalog.
 

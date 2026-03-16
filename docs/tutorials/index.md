@@ -44,11 +44,11 @@ Launch Claude Code in a sandbox, diagnose a policy denial, and iterate on a cust
 {bdg-secondary}`Tutorial`
 :::
 
-:::{grid-item-card} Local Inference with Ollama
+:::{grid-item-card} Inference with Ollama
 :link: local-inference-ollama
 :link-type: doc
 
-Route inference to a local Ollama server, verify it from a sandbox, and reuse the same pattern for other OpenAI-compatible engines.
+Route inference through Ollama using cloud-hosted or local models, and verify it from a sandbox.
 +++
 {bdg-secondary}`Tutorial`
 :::
@@ -59,5 +59,5 @@ Route inference to a local Ollama server, verify it from a sandbox, and reuse th
 
 First Network Policy <first-network-policy>
 GitHub Push Access <github-sandbox>
-Local Inference with Ollama <local-inference-ollama>
+Inference with Ollama <local-inference-ollama>
 ```
