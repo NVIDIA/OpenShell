@@ -17,7 +17,7 @@ use openshell_e2e::harness::sandbox::SandboxGuard;
 use tempfile::NamedTempFile;
 use tokio::time::{interval, timeout};
 
-const TEST_SERVER_IMAGE: &str = "python:3.13-alpine";
+const TEST_SERVER_IMAGE: &str = "ghcr.io/nvidia/openshell/ci:latest";
 
 struct DockerServer {
     port: u16,

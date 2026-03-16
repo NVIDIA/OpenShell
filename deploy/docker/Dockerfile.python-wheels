@@ -4,22 +4,10 @@
 # SPDX-License-Identifier: Apache-2.0
 
 
-ARG PYTHON_VERSION=3.12
+ARG CI_IMAGE=ghcr.io/nvidia/openshell/ci:latest
 
-FROM --platform=$BUILDPLATFORM python:${PYTHON_VERSION}-slim AS base
+FROM --platform=$BUILDPLATFORM ${CI_IMAGE} AS base
 
-ENV PATH="/root/.cargo/bin:${PATH}"
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    curl \
-    gcc \
-    libc6-dev \
-    pkg-config \
-    libssl-dev \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 RUN pip install --no-cache-dir maturin
 
 COPY deploy/docker/cross-build.sh /usr/local/bin/
