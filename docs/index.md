@@ -99,7 +99,7 @@ Install the CLI and create your first sandbox in two commands.
     <span class="nc-term-dot nc-term-dot-g"></span>
   </div>
   <div class="nc-term-body">
-    <div><span class="nc-ps">$ </span>uv pip install openshell</div>
+    <div><span class="nc-ps">$ </span>uv tool install -U openshell</div>
     <div><span class="nc-ps">$ </span>openshell sandbox create <span class="nc-swap"><span>-- <span class="nc-hl">claude</span></span><span>--from <span class="nc-hl">openclaw</span></span><span>-- <span class="nc-hl">opencode</span></span><span>-- <span class="nc-hl">codex</span></span></span><span class="nc-cursor"></span></div>
   </div>
 </div>
