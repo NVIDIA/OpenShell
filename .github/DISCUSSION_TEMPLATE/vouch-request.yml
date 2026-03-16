@@ -34,17 +34,6 @@ body:
     validations:
       required: true
 
-  - type: textarea
-    id: approach
-    attributes:
-      label: How do you plan to implement it?
-      description: >
-        Brief description of your approach. You don't need a full design doc,
-        but show that you understand the relevant code.
-      placeholder: "The timeout is set in crates/openshell-sandbox/src/runtime.rs. I'd change..."
-    validations:
-      required: true
-
   - type: checkboxes
     id: checklist
     attributes:
@@ -53,6 +42,4 @@ body:
         - label: I wrote this request myself (not AI-generated)
           required: true
         - label: I have read [CONTRIBUTING.md](https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md)
-          required: true
-        - label: I understand that OpenShell is agent-first — I will use agents as tools but I own and understand my code
           required: true
