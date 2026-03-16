@@ -104,8 +104,6 @@ OpenShell isolates each sandbox in its own container with policy-enforced egress
 - **Routes for inference** — strips caller credentials, injects backend credentials, and forwards to the managed model.
 - **Denies** — blocks the request and logs it.
 
-Under the hood, the gateway runs as a [K3s](https://k3s.io/) Kubernetes cluster inside Docker — no separate K8s install required.
-
 | Component          | Role                                                                                         |
 | ------------------ | -------------------------------------------------------------------------------------------- |
 | **Gateway**        | Control-plane API that coordinates sandbox lifecycle and acts as the auth boundary.          |
@@ -113,7 +111,7 @@ Under the hood, the gateway runs as a [K3s](https://k3s.io/) Kubernetes cluster 
 | **Policy Engine**  | Enforces filesystem, network, and process constraints from application layer down to kernel. |
 | **Privacy Router** | Privacy-aware LLM routing that keeps sensitive context on sandbox compute.                   |
 
-Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+Under the hood, all these components run as a [K3s](https://k3s.io/) Kubernetes cluster inside a single Docker container — no separate K8s install required. The `openshell gateway` commands take care of provisioning the container and cluster.
 
 ## Protection Layers
 
@@ -127,6 +125,22 @@ OpenShell applies defense in depth across four policy domains:
 | Inference  | Reroutes model API calls to controlled backends.    | Hot-reloadable at runtime.  |
 
 Policies are declarative YAML files. Static sections (filesystem, process) are locked at creation; dynamic sections (network, inference) can be hot-reloaded on a running sandbox with `openshell policy set`.
+
+## Providers
+
+Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
+
+## GPU Support
+
+OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or any GPU workload. Add `--gpu` when creating a sandbox:
+
+```bash
+openshell sandbox create --gpu --from [gpu-enabled-sandbox] -- claude
+```
+
+The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also inferred automatically for community images with `gpu` in the name (e.g., `--from nvidia-gpu`).
+
+**Requirements:** NVIDIA drivers and the [NVIDIA Container Toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) must be installed on the host. The sandbox image itself must include the appropriate GPU drivers and libraries for your workload — the default `base` image does not. See the [BYOC example](https://github.com/NVIDIA/OpenShell/tree/main/examples/bring-your-own-container) for building a custom sandbox image with GPU support.
 
 ## Supported Agents
 
