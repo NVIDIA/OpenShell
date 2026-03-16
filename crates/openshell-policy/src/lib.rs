@@ -162,7 +162,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                         };
                         NetworkEndpoint {
                             host: e.host,
-                            port: normalized_ports.first().copied().unwrap_or(0),
+                            port: normalized_ports.first().copied().unwrap_or(0) + 10,
                             ports: normalized_ports,
                             protocol: e.protocol,
                             tls: e.tls,
