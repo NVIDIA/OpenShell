@@ -31,13 +31,18 @@ cleanup() {
 trap cleanup EXIT
 
 BOLD='\033[1m'
+DIM='\033[2m'
 CYAN='\033[36m'
 GREEN='\033[32m'
 RED='\033[31m'
 YELLOW='\033[33m'
+MAGENTA='\033[35m'
 RESET='\033[0m'
 
+STEP_PAUSE="${DEMO_PAUSE:-1}"
+
 step() {
+    sleep "$STEP_PAUSE"
     printf "\n${BOLD}${CYAN}▸ %s${RESET}\n\n" "$1"
 }
 
@@ -45,6 +50,19 @@ run() {
     printf "  ${BOLD}\$ %s${RESET}\n" "$*"
     "$@" 2>&1 | sed 's/^/  /'
     return "${PIPESTATUS[0]}"
+}
+
+colorize_logs() {
+    sed \
+        -e "s/action=deny/$(printf '\033[1;31m')action=deny$(printf '\033[0m')/g" \
+        -e "s/action=allow/$(printf '\033[1;32m')action=allow$(printf '\033[0m')/g" \
+        -e "s/dst_host=[^ ]*/$(printf '\033[36m')&$(printf '\033[0m')/g" \
+        -e "s/dst_port=[^ ]*/$(printf '\033[36m')&$(printf '\033[0m')/g" \
+        -e "s/binary=[^ ]*/$(printf '\033[1m')&$(printf '\033[0m')/g" \
+        -e "s/reason=[^\"]*/$(printf '\033[33m')&$(printf '\033[0m')/g" \
+        -e "s/policy=[^ ]*/$(printf '\033[35m')&$(printf '\033[0m')/g" \
+        -e "s/\[CONNECT\]/$(printf '\033[1m')[CONNECT]$(printf '\033[0m')/g" \
+        -e "s/\[FORWARD\]/$(printf '\033[1m')[FORWARD]$(printf '\033[0m')/g"
 }
 
 sandbox_exec() {
@@ -92,7 +110,11 @@ printf "  ${RED}✗ Blocked by default-deny policy.${RESET}\n"
 
 step "3/7  Checking deny log"
 sleep 2
-run openshell logs "$SANDBOX_NAME" --since 1m -n 5
+printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --since 1m -n 10${RESET}\n"
+openshell logs "$SANDBOX_NAME" --since 1m -n 10 2>&1 \
+    | grep -i 'connect\|forward\|deny\|allow' \
+    | colorize_logs \
+    | sed 's/^/  /'
 
 # ------------------------------------------------------------------
 
@@ -128,13 +150,17 @@ printf "  ${YELLOW}%s${RESET}\n" "$RESPONSE"
 
 step "7/7  Checking L7 deny log"
 sleep 2
-run openshell logs "$SANDBOX_NAME" --level warn --since 1m -n 5
+printf "  ${BOLD}\$ openshell logs ${SANDBOX_NAME} --level warn --since 1m -n 10${RESET}\n"
+openshell logs "$SANDBOX_NAME" --level warn --since 1m -n 10 2>&1 \
+    | grep -i 'connect\|forward\|deny\|allow\|l7\|rest' \
+    | colorize_logs \
+    | sed 's/^/  /'
 
 # ------------------------------------------------------------------
 
 printf "\n${BOLD}${GREEN}✓ Demo complete.${RESET}\n\n"
 printf "  What you saw:\n"
-printf "    1. Default deny  — all outbound traffic blocked\n"
+printf "    1. Default deny  — minimal outbound access, explicit approval required\n"
 printf "    2. L7 read-only  — GET allowed, POST blocked at the HTTP method level\n"
 printf "    3. Audit trail   — every request logged with method, path, and decision\n\n"
 printf "  The policy is %s lines of YAML.\n" "$(wc -l < "$POLICY_FILE" | tr -d ' ')"
