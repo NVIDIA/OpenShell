@@ -137,7 +137,7 @@ Use this endpoint when inference should stay local to the host for privacy and s
 
 When the upstream runs on the same machine as the gateway, bind it to `0.0.0.0` and point the provider at `host.openshell.internal` or the host's LAN IP. `127.0.0.1` and `localhost` usually fail because the request originates from the gateway or sandbox runtime, not from your shell.
 
-If the gateway runs on a remote host or behind a cloud deployment, `host.openshell.internal` points to that remote machine, not to your laptop. A laptop-local Ollama or vLLM process is not reachable from a remote gateway unless you add your own tunnel or shared network path.
+If the gateway runs on a remote host or behind a cloud deployment, `host.openshell.internal` points to that remote machine, not to your laptop. A locally running Ollama or vLLM process is not reachable from a remote gateway unless you add your own tunnel or shared network path. Ollama also supports cloud-hosted models that do not require local hardware.
 
 ### Verify the Endpoint from a Sandbox
 
