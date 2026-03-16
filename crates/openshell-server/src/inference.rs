@@ -80,7 +80,7 @@ impl Inference for InferenceService {
     ) -> Result<Response<SetClusterInferenceResponse>, Status> {
         let req = request.into_inner();
         let route_name = effective_route_name(&req.route_name)?;
-        let verify = req.verify || !req.no_verify;
+        let verify = !req.no_verify;
         let route = upsert_cluster_inference_route(
             self.state.store.as_ref(),
             route_name,

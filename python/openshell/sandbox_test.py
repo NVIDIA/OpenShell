@@ -6,8 +6,6 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING, Any, cast
 
-import pytest
-
 from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
@@ -141,23 +139,6 @@ def test_from_active_cluster_prefers_openshell_gateway_env(
         client.close()
 
 
-def test_inference_set_cluster_forwards_verify_flag() -> None:
-    stub = _FakeInferenceStub()
-    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
-    client._timeout = 30.0
-    client._stub = cast("Any", stub)
-
-    result = client.set_cluster(
-        provider_name="openai-dev",
-        model_id="gpt-4.1",
-        verify=True,
-    )
-
-    assert result.provider_name == "openai-dev"
-    assert stub.request is not None
-    assert stub.request.verify is True
-
-
 def test_inference_set_cluster_forwards_no_verify_flag() -> None:
     stub = _FakeInferenceStub()
     client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
@@ -172,18 +153,3 @@ def test_inference_set_cluster_forwards_no_verify_flag() -> None:
 
     assert stub.request is not None
     assert stub.request.no_verify is True
-
-
-def test_inference_set_cluster_rejects_conflicting_flags() -> None:
-    stub = _FakeInferenceStub()
-    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
-    client._timeout = 30.0
-    client._stub = cast("Any", stub)
-
-    with pytest.raises(ValueError, match="mutually exclusive"):
-        client.set_cluster(
-            provider_name="openai-dev",
-            model_id="gpt-4.1",
-            verify=True,
-            no_verify=True,
-        )

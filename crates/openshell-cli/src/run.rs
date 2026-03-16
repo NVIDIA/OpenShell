@@ -3390,7 +3390,6 @@ pub async fn gateway_inference_set(
     provider_name: &str,
     model_id: &str,
     route_name: &str,
-    verify: bool,
     no_verify: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -3413,7 +3412,7 @@ pub async fn gateway_inference_set(
             provider_name: provider_name.to_string(),
             model_id: model_id.to_string(),
             route_name: route_name.to_string(),
-            verify,
+            verify: false,
             no_verify,
         })
         .await;
@@ -3450,7 +3449,6 @@ pub async fn gateway_inference_update(
     provider_name: Option<&str>,
     model_id: Option<&str>,
     route_name: &str,
-    verify: bool,
     no_verify: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
@@ -3492,7 +3490,7 @@ pub async fn gateway_inference_update(
             provider_name: provider.to_string(),
             model_id: model.to_string(),
             route_name: route_name.to_string(),
-            verify,
+            verify: false,
             no_verify,
         })
         .await;
