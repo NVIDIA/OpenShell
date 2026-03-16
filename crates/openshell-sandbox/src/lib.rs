@@ -1122,6 +1122,7 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
 #[cfg(unix)]
 fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     use nix::unistd::{Group, User, chown};
+    use std::fs;
 
     let user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
@@ -1164,7 +1165,21 @@ fn prepare_filesystem(policy: &SandboxPolicy) -> Result<()> {
     for path in &policy.filesystem.read_write {
         if !path.exists() {
             debug!(path = %path.display(), "Creating read_write directory");
-            std::fs::create_dir_all(path).into_diagnostic()?;
+            fs::create_dir_all(path).into_diagnostic()?;
+        }
+
+        let metadata = fs::symlink_metadata(path).into_diagnostic()?;
+        if metadata.file_type().is_symlink() {
+            return Err(miette::miette!(
+                "Refusing to set ownership on symlinked read_write path: {}",
+                path.display()
+            ));
+        }
+        if !metadata.is_dir() {
+            return Err(miette::miette!(
+                "read_write path is not a directory: {}",
+                path.display()
+            ));
         }
 
         debug!(path = %path.display(), ?uid, ?gid, "Setting ownership on read_write directory");
@@ -1659,6 +1674,62 @@ filesystem_policy:
         let proto = openshell_policy::restrictive_default_policy();
         let local_policy = SandboxPolicy::try_from(proto).expect("conversion should succeed");
         assert!(matches!(local_policy.network.mode, NetworkMode::Proxy));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_filesystem_rejects_symlink_read_write_path() {
+        use std::os::unix::fs as unix_fs;
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target");
+        std::fs::create_dir_all(&target).unwrap();
+        let symlink = dir.path().join("rw-link");
+        unix_fs::symlink(&target, &symlink).unwrap();
+
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: policy::FilesystemPolicy {
+                read_only: Vec::new(),
+                read_write: vec![symlink],
+                include_workdir: true,
+            },
+            network: policy::NetworkPolicy::default(),
+            landlock: policy::LandlockPolicy::default(),
+            process: policy::ProcessPolicy {
+                run_as_user: Some("root".to_string()),
+                run_as_group: Some("root".to_string()),
+            },
+        };
+
+        let err = prepare_filesystem(&policy).unwrap_err().to_string();
+        assert!(err.contains("symlinked read_write path"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prepare_filesystem_rejects_non_directory_read_write_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("rw-file");
+        std::fs::write(&file_path, "not a directory").unwrap();
+
+        let policy = SandboxPolicy {
+            version: 1,
+            filesystem: policy::FilesystemPolicy {
+                read_only: Vec::new(),
+                read_write: vec![file_path],
+                include_workdir: true,
+            },
+            network: policy::NetworkPolicy::default(),
+            landlock: policy::LandlockPolicy::default(),
+            process: policy::ProcessPolicy {
+                run_as_user: Some("root".to_string()),
+                run_as_group: Some("root".to_string()),
+            },
+        };
+
+        let err = prepare_filesystem(&policy).unwrap_err().to_string();
+        assert!(err.contains("not a directory"));
     }
 
     // ---- Route refresh interval + revision tests ----
