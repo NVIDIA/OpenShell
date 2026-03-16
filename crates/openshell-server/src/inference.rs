@@ -851,6 +851,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("authorization", "Bearer sk-test"))
+            .and(header("content-type", "application/json"))
             .and(body_partial_json(serde_json::json!({
                 "model": "gpt-4o-mini",
                 "max_tokens": 1,

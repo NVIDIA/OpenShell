@@ -224,6 +224,7 @@ pub async fn verify_backend_endpoint(
     route: &ResolvedRoute,
 ) -> Result<ValidatedEndpoint, ValidationFailure> {
     let probe = validation_probe(route)?;
+    let headers = vec![("content-type".to_string(), "application/json".to_string())];
 
     if mock::is_mock_route(route) {
         return Ok(ValidatedEndpoint {
@@ -232,7 +233,7 @@ pub async fn verify_backend_endpoint(
         });
     }
 
-    let response = send_backend_request(client, route, "POST", probe.path, Vec::new(), probe.body)
+    let response = send_backend_request(client, route, "POST", probe.path, headers, probe.body)
         .await
         .map_err(|err| match err {
             RouterError::UpstreamUnavailable(details) => ValidationFailure {
@@ -429,6 +430,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
             .and(header("x-api-key", "sk-test"))
+            .and(header("content-type", "application/json"))
             .and(header("anthropic-version", "2023-06-01"))
             .and(body_partial_json(serde_json::json!({
                 "model": "test-model",
