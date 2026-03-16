@@ -3134,6 +3134,14 @@ fn hmac_sha256(key: &[u8], data: &[u8]) -> String {
 // Provider CRUD
 // ---------------------------------------------------------------------------
 
+/// Strip credential values from a provider before returning it in a gRPC
+/// response.  Internal server paths (inference routing, sandbox env injection)
+/// read credentials from the store directly and are unaffected.
+fn redact_provider_credentials(mut provider: Provider) -> Provider {
+    provider.credentials.clear();
+    provider
+}
+
 async fn create_provider_record(
     store: &crate::persistence::Store,
     mut provider: Provider,
@@ -3169,7 +3177,7 @@ async fn create_provider_record(
         .await
         .map_err(|e| Status::internal(format!("persist provider failed: {e}")))?;
 
-    Ok(provider)
+    Ok(redact_provider_credentials(provider))
 }
 
 async fn get_provider_record(
@@ -3185,6 +3193,7 @@ async fn get_provider_record(
         .await
         .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
         .ok_or_else(|| Status::not_found("provider not found"))
+        .map(redact_provider_credentials)
 }
 
 async fn list_provider_records(
@@ -3201,7 +3210,7 @@ async fn list_provider_records(
     for record in records {
         let provider = Provider::decode(record.payload.as_slice())
             .map_err(|e| Status::internal(format!("decode provider failed: {e}")))?;
-        providers.push(provider);
+        providers.push(redact_provider_credentials(provider));
     }
 
     Ok(providers)
@@ -3270,7 +3279,7 @@ async fn update_provider_record(
         .await
         .map_err(|e| Status::internal(format!("persist provider failed: {e}")))?;
 
-    Ok(updated)
+    Ok(redact_provider_credentials(updated))
 }
 
 async fn delete_provider_record(
@@ -3428,14 +3437,23 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(updated.id, provider_id);
-        // Updated credential has new value.
+        // Credentials are redacted in responses.
+        assert!(
+            updated.credentials.is_empty(),
+            "credentials must be redacted in gRPC responses"
+        );
+        // Verify the store still has full credentials.
+        let stored: Provider = store
+            .get_message_by_name("gitlab-local")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
-            updated.credentials.get("API_TOKEN"),
+            stored.credentials.get("API_TOKEN"),
             Some(&"rotated-token".to_string())
         );
-        // Non-updated credential is preserved (not clobbered).
         assert_eq!(
-            updated.credentials.get("SECONDARY"),
+            stored.credentials.get("SECONDARY"),
             Some(&"secondary-token".to_string())
         );
         // Updated config has new value.
@@ -3528,21 +3546,21 @@ mod tests {
 
         assert_eq!(updated.id, persisted.id);
         assert_eq!(updated.r#type, "nvidia");
-        assert_eq!(updated.credentials.len(), 2);
-        assert_eq!(
-            updated.credentials.get("API_TOKEN"),
-            Some(&"token-123".to_string())
-        );
-        assert_eq!(
-            updated.credentials.get("SECONDARY"),
-            Some(&"secondary-token".to_string())
-        );
+        // Credentials are redacted in responses.
+        assert!(updated.credentials.is_empty());
         assert_eq!(updated.config.len(), 2);
         assert_eq!(
             updated.config.get("endpoint"),
             Some(&"https://example.com".to_string())
         );
         assert_eq!(updated.config.get("region"), Some(&"us-west".to_string()));
+        // Verify the store still has full credentials.
+        let stored: Provider = store
+            .get_message_by_name("noop-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credentials.len(), 2);
     }
 
     #[tokio::test]
@@ -3568,18 +3586,26 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(updated.credentials.len(), 1);
-        assert_eq!(
-            updated.credentials.get("API_TOKEN"),
-            Some(&"token-123".to_string())
-        );
-        assert!(updated.credentials.get("SECONDARY").is_none());
+        // Credentials are redacted in responses.
+        assert!(updated.credentials.is_empty());
         assert_eq!(updated.config.len(), 1);
         assert_eq!(
             updated.config.get("endpoint"),
             Some(&"https://example.com".to_string())
         );
         assert!(updated.config.get("region").is_none());
+        // Verify the store has the correct credential state (SECONDARY deleted).
+        let stored: Provider = store
+            .get_message_by_name("delete-key-test")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.credentials.len(), 1);
+        assert_eq!(
+            stored.credentials.get("API_TOKEN"),
+            Some(&"token-123".to_string())
+        );
+        assert!(stored.credentials.get("SECONDARY").is_none());
     }
 
     #[tokio::test]
