@@ -17,7 +17,7 @@ use tokio::time::{interval, timeout};
 
 const INFERENCE_PROVIDER_NAME: &str = "e2e-host-inference";
 const INFERENCE_PROVIDER_UNREACHABLE_NAME: &str = "e2e-host-inference-unreachable";
-const TEST_SERVER_IMAGE: &str = "ghcr.io/nvidia/openshell/ci:latest";
+const TEST_SERVER_IMAGE: &str = "ghcr.io/nvidia/openshell-community/sandboxes/base:latest";
 static INFERENCE_ROUTE_LOCK: Mutex<()> = Mutex::new(());
 
 async fn run_cli(args: &[&str]) -> Result<String, String> {

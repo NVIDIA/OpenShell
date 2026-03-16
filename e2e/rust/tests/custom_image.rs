@@ -15,7 +15,7 @@ use std::io::Write;
 use openshell_e2e::harness::output::strip_ansi;
 use openshell_e2e::harness::sandbox::SandboxGuard;
 
-const DOCKERFILE_CONTENT: &str = r#"FROM ghcr.io/nvidia/openshell/ci:latest
+const DOCKERFILE_CONTENT: &str = r#"FROM ghcr.io/nvidia/openshell-community/sandboxes/base:latest
 
 # iproute2 is required for sandbox network namespace isolation.
 RUN apt-get update && apt-get install -y --no-install-recommends iproute2 \
