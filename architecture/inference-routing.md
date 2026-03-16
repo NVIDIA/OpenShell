@@ -92,7 +92,7 @@ File: `proto/inference.proto`
 
 Key messages:
 
-- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `verify` / `no_verify` overrides, with verification enabled by default
+- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `no_verify` override, with verification enabled by default
 - `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `version`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
 - `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`
