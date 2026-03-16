@@ -558,6 +558,37 @@ impl NetworkNamespace {
     }
 }
 
+impl Drop for NetworkNamespace {
+    fn drop(&mut self) {
+        debug!(namespace = %self.name, "Cleaning up network namespace");
+
+        // Close the fd if we have one
+        if let Some(fd) = self.ns_fd.take() {
+            let _ = nix::unistd::close(fd);
+        }
+
+        // Delete the host-side veth (this also removes the peer)
+        if let Err(e) = run_ip(&["link", "delete", &self.veth_host]) {
+            warn!(
+                error = %e,
+                veth = %self.veth_host,
+                "Failed to delete veth interface"
+            );
+        }
+
+        // Delete the namespace
+        if let Err(e) = run_ip(&["netns", "delete", &self.name]) {
+            warn!(
+                error = %e,
+                namespace = %self.name,
+                "Failed to delete network namespace"
+            );
+        }
+
+        info!(namespace = %self.name, "Network namespace cleaned up");
+    }
+}
+
 /// Run an `ip` command on the host.
 fn run_ip(args: &[&str]) -> Result<()> {
     debug!(command = %format!("ip {}", args.join(" ")), "Running ip command");

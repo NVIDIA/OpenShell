@@ -660,9 +660,6 @@ const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
 /// via `docker cp` during local development.
 const SUPERVISOR_HOST_PATH: &str = "/opt/openshell/bin";
 
-/// Name of the volume used to expose `/dev/kmsg` for bypass detection logging.
-const KMSG_VOLUME_NAME: &str = "kmsg";
-
 /// Build the hostPath volume definition that exposes the supervisor binary
 /// from the k3s node filesystem.
 fn supervisor_volume() -> serde_json::Value {
@@ -680,28 +677,6 @@ fn supervisor_volume_mount() -> serde_json::Value {
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
         "mountPath": SUPERVISOR_MOUNT_PATH,
-        "readOnly": true
-    })
-}
-
-/// Build the hostPath volume definition that exposes `/dev/kmsg` from the
-/// k3s node. The bypass detection monitor reads kernel log messages to
-/// surface structured diagnostics for direct connection attempts.
-fn kmsg_volume() -> serde_json::Value {
-    serde_json::json!({
-        "name": KMSG_VOLUME_NAME,
-        "hostPath": {
-            "path": "/dev/kmsg",
-            "type": "CharDevice"
-        }
-    })
-}
-
-/// Build the read-only volume mount for `/dev/kmsg` in the agent container.
-fn kmsg_volume_mount() -> serde_json::Value {
-    serde_json::json!({
-        "name": KMSG_VOLUME_NAME,
-        "mountPath": "/dev/kmsg",
         "readOnly": true
     })
 }

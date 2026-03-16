@@ -17,8 +17,8 @@
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
 use crate::denial_aggregator::DenialEvent;
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
