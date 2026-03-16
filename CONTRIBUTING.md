@@ -16,7 +16,6 @@ OpenShell is agent-first, not agent-only. The distinction matters:
 - **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
 - **Do** interrogate your agent until you understand every edge case and interaction in your changes.
 - **Don't** submit code you can't explain without your agent open.
-- **Don't** have an AI write your issue reports, vouch requests, or PR descriptions. We can tell.
 - **Don't** use agents as a substitute for understanding the system. Read the architecture docs.
 
 ## First-Time Contributors
