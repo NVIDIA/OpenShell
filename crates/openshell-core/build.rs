@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::env;
+use std::path::Path;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Git-derived version ---
@@ -9,8 +10,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // builds where .git is absent, this silently does nothing and the binary
     // falls back to CARGO_PKG_VERSION (which is already sed-patched by the
     // build pipeline).
-    println!("cargo:rerun-if-changed=../../.git/HEAD");
-    println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    // In Docker builds we do not copy .git into the context, so registering
+    // missing rerun paths can force unnecessary build script churn.
+    if Path::new("../../.git/HEAD").exists() {
+        println!("cargo:rerun-if-changed=../../.git/HEAD");
+    }
+    if Path::new("../../.git/refs/tags").exists() {
+        println!("cargo:rerun-if-changed=../../.git/refs/tags");
+    }
+    if Path::new("../../.git/packed-refs").exists() {
+        println!("cargo:rerun-if-changed=../../.git/packed-refs");
+    }
 
     if let Some(version) = git_version() {
         println!("cargo:rustc-env=OPENSHELL_GIT_VERSION={version}");

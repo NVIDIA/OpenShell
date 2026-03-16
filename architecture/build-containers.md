@@ -41,6 +41,11 @@ For local (non-CI) Docker builds, OpenShell defaults to the Cargo profile
 `local-fast` to reduce rebuild latency. CI keeps `release` builds by default.
 Set `OPENSHELL_CARGO_PROFILE=release` locally when you need release-equivalent binaries.
 
+The Dockerfiles keep the proto/build-script invalidation touch, but they no
+longer touch gateway/supervisor main sources. That preserves incremental reuse
+for unrelated rebuilds while still forcing protobuf regeneration safety when
+needed.
+
 The incremental deploy (`cluster-deploy-fast.sh`) fingerprints local Git changes and only rebuilds components whose files have changed:
 
 | Changed files | Rebuild triggered |
