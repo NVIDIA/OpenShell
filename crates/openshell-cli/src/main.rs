@@ -905,12 +905,8 @@ enum InferenceCommands {
         #[arg(long)]
         system: bool,
 
-        /// Verify the resolved upstream endpoint before saving the route.
-        #[arg(long, conflicts_with = "no_verify")]
-        verify: bool,
-
         /// Skip endpoint verification before saving the route.
-        #[arg(long, conflicts_with = "verify")]
+        #[arg(long)]
         no_verify: bool,
     },
 
@@ -929,12 +925,8 @@ enum InferenceCommands {
         #[arg(long)]
         system: bool,
 
-        /// Verify the resolved upstream endpoint before saving the route.
-        #[arg(long, conflicts_with = "no_verify")]
-        verify: bool,
-
         /// Skip endpoint verification before saving the route.
-        #[arg(long, conflicts_with = "verify")]
+        #[arg(long)]
         no_verify: bool,
     },
 
@@ -1812,12 +1804,11 @@ async fn main() -> Result<()> {
                     provider,
                     model,
                     system,
-                    verify,
                     no_verify,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
                     run::gateway_inference_set(
-                        endpoint, &provider, &model, route_name, verify, no_verify, &tls,
+                        endpoint, &provider, &model, route_name, no_verify, &tls,
                     )
                     .await?;
                 }
@@ -1825,7 +1816,6 @@ async fn main() -> Result<()> {
                     provider,
                     model,
                     system,
-                    verify,
                     no_verify,
                 } => {
                     let route_name = if system { "sandbox-system" } else { "" };
@@ -1834,7 +1824,6 @@ async fn main() -> Result<()> {
                         provider.as_deref(),
                         model.as_deref(),
                         route_name,
-                        verify,
                         no_verify,
                         &tls,
                     )
@@ -2568,48 +2557,6 @@ mod tests {
     }
 
     #[test]
-    fn inference_set_accepts_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "set",
-            "--provider",
-            "openai-dev",
-            "--model",
-            "gpt-4.1",
-            "--verify",
-        ])
-        .expect("inference set should parse --verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Set { verify: true, .. })
-            })
-        ));
-    }
-
-    #[test]
-    fn inference_update_accepts_verify_flag() {
-        let cli = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "update",
-            "--provider",
-            "openai-dev",
-            "--verify",
-        ])
-        .expect("inference update should parse --verify");
-
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Inference {
-                command: Some(InferenceCommands::Update { verify: true, .. })
-            })
-        ));
-    }
-
-    #[test]
     fn inference_set_accepts_no_verify_flag() {
         let cli = Cli::try_parse_from([
             "openshell",
@@ -2628,7 +2575,6 @@ mod tests {
             Some(Commands::Inference {
                 command: Some(InferenceCommands::Set {
                     no_verify: true,
-                    verify: false,
                     ..
                 })
             })
@@ -2652,30 +2598,10 @@ mod tests {
             Some(Commands::Inference {
                 command: Some(InferenceCommands::Update {
                     no_verify: true,
-                    verify: false,
                     ..
                 })
             })
         ));
-    }
-
-    #[test]
-    fn inference_set_rejects_verify_and_no_verify_together() {
-        let err = Cli::try_parse_from([
-            "openshell",
-            "inference",
-            "set",
-            "--provider",
-            "openai-dev",
-            "--model",
-            "gpt-4.1",
-            "--verify",
-            "--no-verify",
-        ])
-        .expect_err("verify and no-verify should conflict");
-
-        assert!(err.to_string().contains("--verify"));
-        assert!(err.to_string().contains("--no-verify"));
     }
 
     #[test]
