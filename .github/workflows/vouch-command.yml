@@ -19,7 +19,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: mitchellh/vouch/action/manage-by-discussion@v1
+      - uses: mitchellh/vouch/action/manage-by-discussion@f44860978966ace98fb11aaaa20f2b27d7543e13 # v1
         with:
           discussion-number: ${{ github.event.discussion.number }}
           comment-node-id: ${{ github.event.comment.node_id }}

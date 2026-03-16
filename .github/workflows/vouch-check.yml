@@ -13,7 +13,7 @@ jobs:
     if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
     steps:
-      - uses: mitchellh/vouch/action/check-pr@v1
+      - uses: mitchellh/vouch/action/check-pr@f44860978966ace98fb11aaaa20f2b27d7543e13 # v1
         with:
           pr-number: ${{ github.event.pull_request.number }}
           auto-close: true
