@@ -969,13 +969,14 @@ fn sandbox_template_to_k8s(
         serde_json::Value::Array(vec![serde_json::Value::Object(container)]),
     );
 
-    // Add TLS secret volume.
+    // Add TLS secret volume.  Mode 0400 (owner-read) prevents the
+    // unprivileged sandbox user from reading the mTLS private key.
     if !client_tls_secret_name.is_empty() {
         spec.insert(
             "volumes".to_string(),
             serde_json::json!([{
                 "name": "openshell-client-tls",
-                "secret": { "secretName": client_tls_secret_name }
+                "secret": { "secretName": client_tls_secret_name, "defaultMode": 256 }
             }]),
         );
     }
@@ -1047,7 +1048,8 @@ fn inject_pod_template(
         );
     }
 
-    // Inject TLS volume at the pod spec level.
+    // Inject TLS volume at the pod spec level.  Mode 0400 (owner-read)
+    // prevents the unprivileged sandbox user from reading the mTLS private key.
     if !client_tls_secret_name.is_empty() {
         let volumes = spec
             .entry("volumes")
@@ -1055,7 +1057,7 @@ fn inject_pod_template(
         if let Some(volumes_arr) = volumes.as_array_mut() {
             volumes_arr.push(serde_json::json!({
                 "name": "openshell-client-tls",
-                "secret": { "secretName": client_tls_secret_name }
+                "secret": { "secretName": client_tls_secret_name, "defaultMode": 256 }
             }));
         }
     }
@@ -2070,5 +2072,37 @@ mod tests {
             .as_array()
             .expect("hostAliases should exist in custom pod template");
         assert_eq!(host_aliases[0]["ip"], "192.168.65.2");
+    }
+
+    #[test]
+    fn tls_secret_volume_uses_restrictive_default_mode() {
+        let template = SandboxTemplate::default();
+        let pod_template = sandbox_template_to_k8s(
+            &template,
+            false,
+            "openshell/sandbox:latest",
+            "",
+            "sandbox-id",
+            "sandbox-name",
+            "https://gateway.example.com",
+            "0.0.0.0:2222",
+            "secret",
+            300,
+            &std::collections::HashMap::new(),
+            "my-tls-secret",
+            "",
+        );
+
+        let volumes = pod_template["spec"]["volumes"]
+            .as_array()
+            .expect("volumes should exist");
+        let tls_vol = volumes
+            .iter()
+            .find(|v| v["name"] == "openshell-client-tls")
+            .expect("TLS volume should exist");
+        assert_eq!(
+            tls_vol["secret"]["defaultMode"], 256, // 0o400
+            "TLS secret volume must use mode 0400 to prevent sandbox user from reading the private key"
+        );
     }
 }
