@@ -327,13 +327,6 @@ jobs:
           sha256sum *.tar.gz *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
 
-      - name: Move devel tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git tag -fa devel -m "Latest Devel" "${GITHUB_SHA}"
-          git push --force origin devel
-
       - name: Prune stale wheel assets from devel release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -358,6 +351,13 @@ jobs:
                     ;;
                 esac
               done
+
+      - name: Move devel tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -fa devel -m "Latest Devel" "${GITHUB_SHA}"
+          git push --force origin devel
 
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
