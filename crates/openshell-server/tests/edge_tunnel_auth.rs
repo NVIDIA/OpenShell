@@ -18,12 +18,11 @@
 //! | false                 | none        | —                  | rejected |
 //! | true                  | valid       | —                  | OK       |
 //! | true                  | none        | present            | OK (*)   |
-//! | true                  | none        | absent             | OK (**)  |
+//! | true                  | none        | absent             | rejected |
 //!
 //! (*) Simulates the edge tunnel path: no client cert but a JWT header.
-//! (**) TLS handshake succeeds, but in production the auth middleware (not yet
-//!      implemented) would reject.  This test proves the TLS layer alone does
-//!      not block unauthenticated connections when the flag is set.
+//! (**) TLS handshake may succeed, but request auth is rejected without
+//!      a valid edge token in application-layer metadata.
 
 use bytes::Bytes;
 use http_body_util::Empty;
@@ -667,14 +666,10 @@ async fn dual_auth_mtls_still_accepted() {
     server.abort();
 }
 
-/// With allow_unauthenticated=true, no-client-cert connections pass the TLS
-/// handshake. This simulates Cloudflare Tunnel re-originating a connection.
-///
-/// The gRPC health check succeeds because there is no auth middleware yet —
-/// this proves the TLS layer is no longer the gate.  When auth middleware is
-/// added, the test should be updated to expect 401 without a valid JWT.
+/// With allow_unauthenticated=true, no-client-cert connections can pass the TLS
+/// handshake, but are rejected at the application layer without edge auth.
 #[tokio::test]
-async fn tunnel_mode_no_cert_passes_tls_handshake() {
+async fn tunnel_mode_no_cert_rejected_without_edge_token() {
     install_rustls_provider();
     let (temp, pki) = generate_pki();
 
@@ -688,16 +683,15 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
 
     let (addr, server) = start_test_server(tls_acceptor).await;
 
-    // gRPC without client cert — should pass TLS handshake
+    // gRPC without client cert and without edge token — rejected
     let mut grpc = grpc_client_no_cert(addr, pki.ca_cert_pem.clone()).await;
-    let resp = grpc.health(HealthRequest {}).await.unwrap();
-    assert_eq!(
-        resp.get_ref().status,
-        ServiceStatus::Healthy as i32,
-        "gRPC health check should succeed without client cert in tunnel mode"
+    let result = grpc.health(HealthRequest {}).await;
+    assert!(
+        result.is_err(),
+        "gRPC call should fail without edge auth token"
     );
 
-    // HTTP without client cert
+    // HTTP health remains available without edge token
     let client = https_client_no_cert(&pki.ca_cert_pem);
     let req = Request::builder()
         .method("GET")
@@ -705,11 +699,7 @@ async fn tunnel_mode_no_cert_passes_tls_handshake() {
         .body(Empty::<Bytes>::new())
         .unwrap();
     let resp = client.request(req).await.unwrap();
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "HTTP health check should succeed without client cert in tunnel mode"
-    );
+    assert_eq!(resp.status(), StatusCode::OK);
 
     server.abort();
 }

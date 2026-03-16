@@ -21,6 +21,7 @@
 use axum::{
     Router,
     extract::{State, WebSocketUpgrade, ws::Message},
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
     routing::get,
 };
@@ -41,15 +42,28 @@ pub fn router(state: Arc<ServerState>) -> Router {
 /// Handle the WebSocket upgrade request.
 async fn ws_tunnel_handler(
     State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
     ws: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    if requires_edge_auth(&state) && !crate::edge_auth::has_edge_auth_http(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+
     ws.on_upgrade(move |socket| async move {
         if let Err(e) = handle_ws_tunnel(socket, state).await {
             warn!(error = %e, "WebSocket tunnel connection failed");
         }
     })
+    .into_response()
 }
 
+fn requires_edge_auth(state: &ServerState) -> bool {
+    state
+        .config
+        .tls
+        .as_ref()
+        .is_some_and(|tls| tls.allow_unauthenticated)
+}
 /// Pipe bytes between the WebSocket and an in-memory `MultiplexService` stream.
 async fn handle_ws_tunnel(
     ws: axum::extract::ws::WebSocket,

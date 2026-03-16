@@ -10,6 +10,7 @@
 //! - mTLS support
 
 mod auth;
+mod edge_auth;
 mod grpc;
 mod http;
 mod inference;

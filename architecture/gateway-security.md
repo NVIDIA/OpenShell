@@ -170,7 +170,7 @@ sequenceDiagram
 The gateway supports three transport modes:
 
 1. **mTLS (default)** -- TLS is enabled and client certificates are required.
-2. **Dual-auth TLS** -- TLS is enabled, but the handshake also accepts clients without certificates (`allow_unauthenticated=true`). This is used for Cloudflare Tunnel deployments where the edge authenticates the user and forwards a Cloudflare JWT to the gateway.
+2. **Dual-auth TLS** -- TLS is enabled, but the handshake also accepts clients without certificates (`allow_unauthenticated=true`). This is used for Cloudflare Tunnel deployments where the edge authenticates the user and forwards a Cloudflare token to the gateway. In this mode, the gateway enforces application-layer auth by requiring `cf-authorization` or `authorization: Bearer ...` on gRPC and tunnel endpoints.
 3. **Plaintext behind edge** -- TLS is disabled at the gateway and the service listens on HTTP behind a trusted reverse proxy or tunnel.
 
 ### Server Configuration
@@ -178,7 +178,7 @@ The gateway supports three transport modes:
 `TlsAcceptor::from_files()` (`crates/openshell-server/src/tls.rs:27`) constructs the `rustls::ServerConfig`:
 
 1. **Server identity**: loads the server certificate and private key from PEM files (supports PKCS#1, PKCS#8, and SEC1 key formats).
-2. **Client verification**: builds a `WebPkiClientVerifier` from the CA certificate. In the default mode it requires a valid client certificate; in dual-auth mode it also accepts no-certificate clients and defers authentication to the HTTP/gRPC layer.
+2. **Client verification**: builds a `WebPkiClientVerifier` from the CA certificate. In the default mode it requires a valid client certificate; in dual-auth mode it also accepts no-certificate clients and shifts identity checks to HTTP/gRPC token validation.
 3. **ALPN**: advertises `h2` and `http/1.1` for protocol negotiation.
 
 ### Connection Flow
@@ -194,6 +194,15 @@ TCP accept
 
 All traffic shares a single port. When TLS is enabled, the TLS handshake occurs before any HTTP parsing. In plaintext mode, the gateway expects an upstream reverse proxy or tunnel to be the outer security boundary.
 
+### Application-Layer Auth Guard in Dual-Auth Mode
+
+When `allow_unauthenticated=true`, transport security no longer guarantees caller identity. The server applies explicit token checks:
+
+- gRPC requests are intercepted and rejected with `UNAUTHENTICATED` unless metadata contains `cf-authorization` or bearer `authorization`.
+- `/_ws_tunnel` upgrades are rejected with HTTP `401` unless an edge token is present in headers or `CF_Authorization` cookie.
+
+Health endpoints remain unauthenticated for probes.
+
 ### Cloudflare-Specific HTTP Endpoints
 
 Cloudflare-fronted gateways add two HTTP endpoints on the same multiplexed port:
@@ -201,7 +210,7 @@ Cloudflare-fronted gateways add two HTTP endpoints on the same multiplexed port:
 - `/auth/connect` -- browser login relay that reads the `CF_Authorization` cookie server-side and POSTs the token back to the CLI's localhost callback server.
 - `/_ws_tunnel` -- WebSocket upgrade endpoint used to carry gRPC and SSH bytes through Cloudflare Access.
 
-The WebSocket tunnel bridges directly into the gateway's `MultiplexedService` over an in-memory duplex stream. It does not re-enter the public listener, so it behaves the same whether the public listener is plaintext or TLS-backed.
+The WebSocket tunnel bridges directly into the gateway's `MultiplexedService` over an in-memory duplex stream. It does not re-enter the public listener, so it behaves the same whether the public listener is plaintext or TLS-backed. In dual-auth mode, the upgrade request is rejected with `401` unless it includes an edge token (`cf-authorization`, bearer `authorization`, or `CF_Authorization` cookie).
 
 ### What Gets Rejected
 

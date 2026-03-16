@@ -23,9 +23,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, AsyncWrite};
+use tonic::{Request as TonicRequest, Status};
 use tower::ServiceExt;
 
-use crate::{OpenShellService, ServerState, http_router, inference::InferenceService};
+use crate::{OpenShellService, ServerState, edge_auth, http_router, inference::InferenceService};
 
 /// Maximum inbound gRPC message size (1 MB).
 ///
@@ -53,10 +54,25 @@ impl MultiplexService {
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
-        let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
-        let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
-            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let enforce_edge_auth = self
+            .state
+            .config
+            .tls
+            .as_ref()
+            .is_some_and(|tls| tls.allow_unauthenticated);
+        let openshell_state = self.state.clone();
+        let openshell = OpenShellServer::with_interceptor(
+            OpenShellService::new(openshell_state),
+            move |request: TonicRequest<()>| grpc_edge_auth_interceptor(request, enforce_edge_auth),
+        )
+        .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+
+        let inference_state = self.state.clone();
+        let inference = InferenceServer::with_interceptor(
+            InferenceService::new(inference_state),
+            move |request: TonicRequest<()>| grpc_edge_auth_interceptor(request, enforce_edge_auth),
+        )
+        .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
         let grpc_service = GrpcRouter::new(openshell, inference);
         let http_service = http_router(self.state.clone());
 
@@ -68,6 +84,19 @@ impl MultiplexService {
 
         Ok(())
     }
+}
+
+fn grpc_edge_auth_interceptor(
+    request: TonicRequest<()>,
+    enforce_edge_auth: bool,
+) -> std::result::Result<TonicRequest<()>, Status> {
+    if !enforce_edge_auth || edge_auth::has_edge_auth_grpc(request.metadata()) {
+        return Ok(request);
+    }
+
+    Err(Status::unauthenticated(
+        "missing edge auth token: provide cf-authorization or authorization bearer token",
+    ))
 }
 
 /// Combined gRPC service that routes between `OpenShell` and Inference services
