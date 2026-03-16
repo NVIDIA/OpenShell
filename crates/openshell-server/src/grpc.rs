@@ -111,6 +111,11 @@ pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
 }
 
+fn redact_provider_credentials(mut provider: Provider) -> Provider {
+    provider.credentials.clear();
+    provider
+}
+
 /// OpenShell gRPC service implementation.
 #[derive(Debug, Clone)]
 pub struct OpenShellService {
@@ -647,7 +652,7 @@ impl OpenShell for OpenShellService {
         let provider = create_provider_record(self.state.store.as_ref(), provider).await?;
 
         Ok(Response::new(ProviderResponse {
-            provider: Some(provider),
+            provider: Some(redact_provider_credentials(provider)),
         }))
     }
 
@@ -659,7 +664,7 @@ impl OpenShell for OpenShellService {
         let provider = get_provider_record(self.state.store.as_ref(), &name).await?;
 
         Ok(Response::new(ProviderResponse {
-            provider: Some(provider),
+            provider: Some(redact_provider_credentials(provider)),
         }))
     }
 
@@ -672,7 +677,12 @@ impl OpenShell for OpenShellService {
         let providers =
             list_provider_records(self.state.store.as_ref(), limit, request.offset).await?;
 
-        Ok(Response::new(ListProvidersResponse { providers }))
+        Ok(Response::new(ListProvidersResponse {
+            providers: providers
+                .into_iter()
+                .map(redact_provider_credentials)
+                .collect(),
+        }))
     }
 
     async fn update_provider(
@@ -686,7 +696,7 @@ impl OpenShell for OpenShellService {
         let provider = update_provider_record(self.state.store.as_ref(), provider).await?;
 
         Ok(Response::new(ProviderResponse {
-            provider: Some(provider),
+            provider: Some(redact_provider_credentials(provider)),
         }))
     }
 
@@ -3363,6 +3373,18 @@ mod tests {
             MAX_PAGE_SIZE
         );
         assert_eq!(clamp_limit(u32::MAX, 100, MAX_PAGE_SIZE), MAX_PAGE_SIZE);
+    }
+
+    #[test]
+    fn redact_provider_credentials_clears_only_credentials() {
+        let provider = provider_with_values("gitlab-local", "gitlab");
+        let redacted = redact_provider_credentials(provider.clone());
+
+        assert!(redacted.credentials.is_empty());
+        assert_eq!(redacted.id, provider.id);
+        assert_eq!(redacted.name, provider.name);
+        assert_eq!(redacted.r#type, provider.r#type);
+        assert_eq!(redacted.config, provider.config);
     }
 
     fn provider_with_values(name: &str, provider_type: &str) -> Provider {
