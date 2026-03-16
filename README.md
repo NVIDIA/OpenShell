@@ -36,7 +36,7 @@ uv tool install -U openshell
 ### Create a sandbox
 
 ```bash
-openshell sandbox create -- claude  # or opencode, codex
+openshell sandbox create -- claude  # or opencode, codex, ollama
 ```
 
 A gateway is created automatically on first use. To deploy on a remote host instead, pass `--remote user@host` to the create command.
@@ -137,6 +137,7 @@ The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also i
 | [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
 | [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
 | [OpenClaw](https://openclaw.ai/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from openclaw`.                       |
+| [Ollama](https://ollama.com/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                       |
 
 ## Key Commands
 
