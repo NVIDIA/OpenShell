@@ -112,6 +112,7 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             NetworkEndpoint {
                 host: host.clone(),
                 port: *port,
+                ports: vec![*port],
                 protocol: "rest".to_string(),
                 tls: "terminate".to_string(),
                 enforcement: "enforce".to_string(),
@@ -123,6 +124,7 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
             NetworkEndpoint {
                 host: host.clone(),
                 port: *port,
+                ports: vec![*port],
                 allowed_ips: allowed_ips.clone(),
                 ..Default::default()
             }

@@ -1631,3 +1631,200 @@ def test_baseline_enrichment_incomplete_filesystem_policy(
             f"/sandbox not writable: {checks['sandbox_write']}"
         )
         assert checks["var_log"] is True, "OpenShell log not accessible"
+
+
+# =============================================================================
+# Multi-port endpoint tests
+# =============================================================================
+#
+# MP-1: Multi-port endpoint allows connections on any listed port
+# MP-2: Multi-port endpoint denies connections on unlisted ports
+# MP-3: Single port (backwards compat) still works via ports normalization
+# =============================================================================
+
+
+def test_multi_port_allows_all_listed_ports(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """MP-1: Multi-port endpoint allows connections on any listed port.
+
+    Policy allows python -> api.anthropic.com on ports 443 AND 80.
+    Both should be allowed; port 8080 should be denied.
+    """
+    policy = _base_policy(
+        network_policies={
+            "multi": sandbox_pb2.NetworkPolicyRule(
+                name="multi",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com", ports=[443, 80]
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # Port 443 -> allowed
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, f"Port 443 should be allowed: {result.stdout}"
+
+        # Port 80 -> allowed
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 80))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, f"Port 80 should be allowed: {result.stdout}"
+
+
+def test_multi_port_denies_unlisted_port(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """MP-2: Multi-port endpoint denies connections on ports not in the list."""
+    policy = _base_policy(
+        network_policies={
+            "multi": sandbox_pb2.NetworkPolicyRule(
+                name="multi",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com", ports=[443, 80]
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # Port 8080 -> denied (not in [443, 80])
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 8080))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, f"Port 8080 should be denied: {result.stdout}"
+
+
+def test_single_port_backwards_compat(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """MP-3: Old-style single port field still works."""
+    policy = _base_policy(
+        network_policies={
+            "compat": sandbox_pb2.NetworkPolicyRule(
+                name="compat",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="api.anthropic.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # Port 443 -> allowed
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, f"Single port should still work: {result.stdout}"
+
+        # Port 80 -> denied
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 80))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout
+
+
+# =============================================================================
+# Host wildcard tests
+# =============================================================================
+#
+# HW-1: Wildcard *.anthropic.com matches subdomains
+# HW-2: Wildcard *.anthropic.com does NOT match anthropic.com (bare domain)
+# HW-3: Wildcard *.anthropic.com does NOT match deep.sub.anthropic.com
+# =============================================================================
+
+
+def test_host_wildcard_matches_subdomain(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """HW-1: *.anthropic.com matches api.anthropic.com."""
+    policy = _base_policy(
+        network_policies={
+            "wildcard": sandbox_pb2.NetworkPolicyRule(
+                name="wildcard",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # api.anthropic.com -> matches *.anthropic.com
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"*.anthropic.com should match api.anthropic.com: {result.stdout}"
+        )
+
+        # statsig.anthropic.com -> also matches *.anthropic.com
+        result = sb.exec_python(_proxy_connect(), args=("statsig.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"*.anthropic.com should match statsig.anthropic.com: {result.stdout}"
+        )
+
+        # example.com -> does NOT match *.anthropic.com
+        result = sb.exec_python(_proxy_connect(), args=("example.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"*.anthropic.com should NOT match example.com: {result.stdout}"
+        )
+
+
+def test_host_wildcard_rejects_bare_domain(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """HW-2: *.anthropic.com does NOT match anthropic.com (requires a subdomain)."""
+    policy = _base_policy(
+        network_policies={
+            "wildcard": sandbox_pb2.NetworkPolicyRule(
+                name="wildcard",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"*.anthropic.com should NOT match bare anthropic.com: {result.stdout}"
+        )
+
+
+def test_host_wildcard_rejects_deep_subdomain(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """HW-3: *.anthropic.com does NOT match deep.sub.anthropic.com.
+
+    Single * matches one DNS label only (does not cross . boundaries).
+    """
+    policy = _base_policy(
+        network_policies={
+            "wildcard": sandbox_pb2.NetworkPolicyRule(
+                name="wildcard",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="*.anthropic.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(_proxy_connect(), args=("deep.sub.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "403" in result.stdout, (
+            f"*.anthropic.com should NOT match deep.sub.anthropic.com: {result.stdout}"
+        )

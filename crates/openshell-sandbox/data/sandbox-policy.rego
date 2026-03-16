@@ -91,12 +91,24 @@ network_policy_for_request if {
 	binary_allowed(data.network_policies[name], input.exec)
 }
 
-# Endpoint matching: host (case-insensitive) + port.
+# Endpoint matching: exact host (case-insensitive) + port in ports list.
 endpoint_allowed(policy, network) if {
 	some endpoint
 	endpoint := policy.endpoints[_]
+	not contains(endpoint.host, "*")
 	lower(endpoint.host) == lower(network.host)
-	endpoint.port == network.port
+	endpoint.ports[_] == network.port
+}
+
+# Endpoint matching: glob host pattern + port in ports list.
+# Uses "." as delimiter so "*" matches a single DNS label and "**" matches
+# across label boundaries — consistent with TLS certificate wildcard semantics.
+endpoint_allowed(policy, network) if {
+	some endpoint
+	endpoint := policy.endpoints[_]
+	contains(endpoint.host, "*")
+	glob.match(lower(endpoint.host), ["."], lower(network.host))
+	endpoint.ports[_] == network.port
 }
 
 # Endpoint matching: hostless with allowed_ips — match any host on port.
@@ -107,7 +119,7 @@ endpoint_allowed(policy, network) if {
 	endpoint := policy.endpoints[_]
 	object.get(endpoint, "host", "") == ""
 	count(object.get(endpoint, "allowed_ips", [])) > 0
-	endpoint.port == network.port
+	endpoint.ports[_] == network.port
 }
 
 # Binary matching: exact path.
@@ -167,8 +179,7 @@ allow_request if {
 	binary_allowed(policy, input.exec)
 	some ep
 	ep := policy.endpoints[_]
-	lower(ep.host) == lower(input.network.host)
-	ep.port == input.network.port
+	endpoint_matches_request(ep, input.network)
 	request_allowed_for_endpoint(input.request, ep)
 }
 
@@ -245,17 +256,25 @@ matched_endpoint_config := _matching_endpoint_configs[0] if {
 	count(_matching_endpoint_configs) > 0
 }
 
-# Hosted endpoint: match on host (case-insensitive) + port.
+# Hosted endpoint: exact host match + port in ports list.
 endpoint_matches_request(ep, network) if {
+	not contains(ep.host, "*")
 	lower(ep.host) == lower(network.host)
-	ep.port == network.port
+	ep.ports[_] == network.port
+}
+
+# Hosted endpoint: glob host match + port in ports list.
+endpoint_matches_request(ep, network) if {
+	contains(ep.host, "*")
+	glob.match(lower(ep.host), ["."], lower(network.host))
+	ep.ports[_] == network.port
 }
 
 # Hostless endpoint with allowed_ips: match on port only.
 endpoint_matches_request(ep, network) if {
 	object.get(ep, "host", "") == ""
 	count(object.get(ep, "allowed_ips", [])) > 0
-	ep.port == network.port
+	ep.ports[_] == network.port
 }
 
 # An endpoint has extended config if it specifies L7 protocol or allowed_ips.

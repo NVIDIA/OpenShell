@@ -145,11 +145,42 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
                 .get("rules")
                 .and_then(|v| v.as_array())
                 .is_some_and(|a| !a.is_empty());
-            let port = ep
-                .get("port")
-                .and_then(serde_json::Value::as_u64)
-                .unwrap_or(0);
+            let host = ep.get("host").and_then(|v| v.as_str()).unwrap_or("");
+
+            // Read ports from either "ports" array or scalar "port".
+            let ports: Vec<u64> = ep
+                .get("ports")
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.iter().filter_map(|v| v.as_u64()).collect())
+                .unwrap_or_else(|| {
+                    ep.get("port")
+                        .and_then(serde_json::Value::as_u64)
+                        .filter(|p| *p > 0)
+                        .into_iter()
+                        .collect()
+                });
             let loc = format!("{name}.endpoints[{i}]");
+
+            // Validate host wildcard patterns.
+            if host.contains('*') {
+                if host == "*" || host == "**" {
+                    errors.push(format!(
+                        "{loc}: host wildcard '{host}' matches all hosts; use specific patterns like '*.example.com'"
+                    ));
+                } else if !host.starts_with("*.") && !host.starts_with("**.") {
+                    errors.push(format!(
+                        "{loc}: host wildcard must start with '*.' or '**.' (e.g., '*.example.com'), got '{host}'"
+                    ));
+                } else {
+                    // Warn on very broad wildcards like *.com (2 labels)
+                    let label_count = host.split('.').count();
+                    if label_count <= 2 {
+                        warnings.push(format!(
+                            "{loc}: host wildcard '{host}' is very broad (covers all subdomains of a TLD)"
+                        ));
+                    }
+                }
+            }
 
             // rules + access mutual exclusion
             if has_rules && !access.is_empty() {
@@ -189,7 +220,7 @@ pub fn validate_l7_policies(data_json: &serde_json::Value) -> (Vec<String>, Vec<
             }
 
             // port 443 + rest + no tls: terminate
-            if protocol == "rest" && port == 443 && tls != "terminate" {
+            if protocol == "rest" && ports.contains(&443) && tls != "terminate" {
                 warnings.push(format!(
                     "{loc}: L7 rules won't be evaluated on encrypted traffic without `tls: terminate`"
                 ));
@@ -501,6 +532,135 @@ mod tests {
             data["network_policies"]["test"]["endpoints"][0]
                 .get("rules")
                 .is_none()
+        );
+    }
+
+    // ---- Host wildcard validation tests ----
+
+    #[test]
+    fn validate_wildcard_host_star_only_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("matches all hosts")),
+            "Bare * host should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_double_star_only_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "**",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("matches all hosts")),
+            "Bare ** host should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_no_star_dot_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, _warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.iter().any(|e| e.contains("must start with")),
+            "Malformed wildcard should be rejected, got errors: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_broad_warning() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(errors.is_empty(), "*.com should not error: {errors:?}");
+        assert!(
+            warnings.iter().any(|w| w.contains("very broad")),
+            "*.com should warn about breadth, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_wildcard_host_valid_no_error() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "*.example.com",
+                        "port": 443
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            errors.is_empty(),
+            "*.example.com should be valid, got errors: {errors:?}"
+        );
+        assert!(
+            warnings.is_empty(),
+            "*.example.com should not warn, got warnings: {warnings:?}"
+        );
+    }
+
+    #[test]
+    fn validate_ports_array_rest_443_warns() {
+        let data = serde_json::json!({
+            "network_policies": {
+                "test": {
+                    "endpoints": [{
+                        "host": "api.example.com",
+                        "ports": [443, 8080],
+                        "protocol": "rest",
+                        "access": "read-only"
+                    }],
+                    "binaries": []
+                }
+            }
+        });
+        let (_errors, warnings) = validate_l7_policies(&data);
+        assert!(
+            warnings.iter().any(|w| w.contains("tls: terminate")),
+            "REST on port 443 without tls:terminate should warn, got warnings: {warnings:?}"
         );
     }
 }

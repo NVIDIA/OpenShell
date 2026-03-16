@@ -55,7 +55,12 @@ message NetworkPolicyRule {
 
 // A network endpoint (host + port) with optional L7 inspection config.
 message NetworkEndpoint {
+  // Hostname or host glob pattern. Exact match is case-insensitive.
+  // Glob patterns use "." as delimiter: "*.example.com" matches a single
+  // subdomain label, "**.example.com" matches across labels.
   string host = 1;
+  // Single port (backwards compat). Use `ports` for multiple ports.
+  // Mutually exclusive with `ports` — if both are set, `ports` takes precedence.
   uint32 port = 2;
   // Application protocol for L7 inspection: "rest", "sql", or "" (L4-only).
   string protocol = 3;
@@ -76,6 +81,10 @@ message NetworkEndpoint {
   // Loopback (127.0.0.0/8) and link-local (169.254.0.0/16) are always blocked
   // regardless of this field.
   repeated string allowed_ips = 8;
+  // Multiple ports. When non-empty, this endpoint covers all listed ports.
+  // If `port` is set and `ports` is empty, `port` is normalized to `ports: [port]`.
+  // If both are set, `ports` takes precedence.
+  repeated uint32 ports = 9;
 }
 
 // An L7 policy rule (allow-only).
