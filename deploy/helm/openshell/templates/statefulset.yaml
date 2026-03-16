@@ -31,6 +31,13 @@ spec:
         {{- toYaml . | nindent 8 }}
       {{- end }}
       serviceAccountName: {{ include "openshell.serviceAccountName" . }}
+      {{- if .Values.server.hostGatewayIP }}
+      hostAliases:
+        - ip: {{ .Values.server.hostGatewayIP | quote }}
+          hostnames:
+            - host.docker.internal
+            - host.openshell.internal
+      {{- end }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
