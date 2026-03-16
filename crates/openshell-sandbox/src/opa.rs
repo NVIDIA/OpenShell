@@ -730,10 +730,10 @@ mod tests {
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
@@ -828,10 +828,10 @@ mod tests {
         let input = NetworkInput {
             host: "API.ANTHROPIC.COM".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
@@ -885,10 +885,10 @@ mod tests {
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(decision.allowed);
@@ -902,10 +902,10 @@ mod tests {
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(decision.allowed);
@@ -1098,9 +1098,8 @@ network_policies:
     }
 
     #[test]
-    fn cmdline_path_matches_script_binary() {
-        // Simulates: node runs /usr/local/bin/my-tool (a script with shebang)
-        // exe = /usr/bin/node, cmdline contains /usr/local/bin/my-tool
+    fn cmdline_path_does_not_grant_identity() {
+        // cmdline is attacker-controlled and must not grant binary identity.
         let cmdline_data = r"
 network_policies:
   script_test:
@@ -1120,12 +1119,7 @@ network_policies:
             cmdline_paths: vec![PathBuf::from("/usr/local/bin/my-tool")],
         };
         let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected allow via cmdline path match, got deny: {}",
-            decision.reason
-        );
-        assert_eq!(decision.matched_policy.as_deref(), Some("script_test"));
+        assert!(!decision.allowed);
     }
 
     #[test]
@@ -1156,7 +1150,7 @@ network_policies:
     }
 
     #[test]
-    fn cmdline_glob_pattern_matches() {
+    fn cmdline_glob_pattern_does_not_match() {
         let glob_data = r#"
 network_policies:
   glob_test:
@@ -1170,17 +1164,13 @@ network_policies:
         let input = NetworkInput {
             host: "example.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
-        assert!(
-            decision.allowed,
-            "Expected glob to match cmdline path, got deny: {}",
-            decision.reason
-        );
+        assert!(decision.allowed, "Expected glob to match executable path");
     }
 
     #[test]
@@ -1190,10 +1180,10 @@ network_policies:
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
