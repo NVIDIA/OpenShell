@@ -51,9 +51,15 @@ impl L7Provider for RestProvider {
 }
 
 /// Parse one HTTP/1.1 request from the stream.
+///
+/// Reads one byte at a time to stop exactly at the `\r\n\r\n` header
+/// terminator.  A multi-byte read could consume bytes belonging to a
+/// subsequent pipelined request, and those overflow bytes would be
+/// forwarded upstream without L7 policy evaluation -- a request
+/// smuggling vulnerability.  Byte-at-a-time overhead is negligible for
+/// the typical 200-800 byte headers on L7-inspected REST endpoints.
 async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Option<L7Request>> {
     let mut buf = Vec::with_capacity(4096);
-    let mut tmp = [0u8; 1024];
 
     loop {
         if buf.len() > MAX_HEADER_BYTES {
@@ -62,24 +68,19 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
             ));
         }
 
-        let n = match client.read(&mut tmp).await {
-            Ok(n) => n,
+        let byte = match client.read_u8().await {
+            Ok(b) => b,
             Err(e) if buf.is_empty() && is_benign_close(&e) => return Ok(None),
+            Err(e) if buf.is_empty() && e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Ok(None); // Clean close before any data
+            }
             Err(e) => return Err(miette::miette!("{e}")),
         };
-        if n == 0 {
-            if buf.is_empty() {
-                return Ok(None); // Clean connection close
-            }
-            return Err(miette!(
-                "Client disconnected mid-request after {} bytes",
-                buf.len()
-            ));
-        }
-        buf.extend_from_slice(&tmp[..n]);
+        buf.push(byte);
 
-        // Check for end of headers
-        if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+        // Check for end of headers -- `ends_with` is sufficient because
+        // we append exactly one byte per iteration.
+        if buf.ends_with(b"\r\n\r\n") {
             break;
         }
     }
@@ -109,7 +110,7 @@ async fn parse_http_request<C: AsyncRead + Unpin>(client: &mut C) -> Result<Opti
     Ok(Some(L7Request {
         action: method,
         target: path,
-        raw_header: buf, // includes header bytes + any overflow body bytes
+        raw_header: buf, // exact header bytes up to and including \r\n\r\n
         body_length,
     }))
 }
@@ -618,6 +619,43 @@ mod tests {
             BodyLength::None => {}
             other => panic!("Expected None, got {other:?}"),
         }
+    }
+
+    /// Regression test: two pipelined requests in a single write must be
+    /// parsed independently.  Before the fix, the 1024-byte `read()` buffer
+    /// could capture bytes from the second request, which were forwarded
+    /// upstream as body overflow of the first -- bypassing L7 policy checks.
+    #[tokio::test]
+    async fn parse_http_request_does_not_overread_next_request() {
+        let (mut client, mut writer) = tokio::io::duplex(4096);
+
+        tokio::spawn(async move {
+            writer
+                .write_all(
+                    b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n\
+                      POST /blocked HTTP/1.1\r\nHost: example.com\r\nContent-Length: 0\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+
+        let first = parse_http_request(&mut client)
+            .await
+            .expect("first request should parse")
+            .expect("expected first request");
+        assert_eq!(first.action, "GET");
+        assert_eq!(first.target, "/allowed");
+        assert_eq!(
+            first.raw_header, b"GET /allowed HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            "raw_header must contain only the first request's headers"
+        );
+
+        let second = parse_http_request(&mut client)
+            .await
+            .expect("second request should parse")
+            .expect("expected second request");
+        assert_eq!(second.action, "POST");
+        assert_eq!(second.target, "/blocked");
     }
 
     #[test]
