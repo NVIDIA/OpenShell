@@ -5,6 +5,7 @@
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
+pub mod bypass_monitor;
 mod child_env;
 pub mod denial_aggregator;
 mod grpc_client;
@@ -257,7 +258,24 @@ pub async fn run_sandbox(
     #[cfg(target_os = "linux")]
     let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
         match NetworkNamespace::create() {
-            Ok(ns) => Some(ns),
+            Ok(ns) => {
+                // Install bypass detection rules (iptables LOG + REJECT).
+                // This provides fast-fail UX and diagnostic logging for direct
+                // connection attempts that bypass the HTTP CONNECT proxy.
+                let proxy_port = policy
+                    .network
+                    .proxy
+                    .as_ref()
+                    .and_then(|p| p.http_addr)
+                    .map_or(3128, |addr| addr.port());
+                if let Err(e) = ns.install_bypass_rules(proxy_port) {
+                    warn!(
+                        error = %e,
+                        "Failed to install bypass detection rules (non-fatal)"
+                    );
+                }
+                Some(ns)
+            }
             Err(e) => {
                 return Err(miette::miette!(
                     "Network namespace creation failed and proxy mode requires isolation. \
@@ -279,7 +297,8 @@ pub async fn run_sandbox(
     // the entrypoint process's /proc/net/tcp for identity binding.
     let entrypoint_pid = Arc::new(AtomicU32::new(0));
 
-    let (_proxy, denial_rx) = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let (_proxy, denial_rx, bypass_denial_tx) = if matches!(policy.network.mode, NetworkMode::Proxy)
+    {
         let proxy_policy = policy.network.proxy.as_ref().ok_or_else(|| {
             miette::miette!("Network mode is set to proxy but no proxy configuration was provided")
         })?;
@@ -312,11 +331,13 @@ pub async fn run_sandbox(
         .await?;
 
         // Create denial aggregator channel if in gRPC mode (sandbox_id present).
-        let (denial_tx, denial_rx) = if sandbox_id.is_some() {
+        // Clone the sender for the bypass monitor before passing to the proxy.
+        let (denial_tx, denial_rx, bypass_denial_tx) = if sandbox_id.is_some() {
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
-            (Some(tx), Some(rx))
+            let bypass_tx = tx.clone();
+            (Some(tx), Some(rx), Some(bypass_tx))
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let proxy_handle = ProxyHandle::start_with_bind_addr(
@@ -331,10 +352,28 @@ pub async fn run_sandbox(
             denial_tx,
         )
         .await?;
-        (Some(proxy_handle), denial_rx)
+        (Some(proxy_handle), denial_rx, bypass_denial_tx)
     } else {
-        (None, None)
+        (None, None, None)
     };
+
+    // Spawn bypass detection monitor (Linux only, proxy mode only).
+    // Reads /dev/kmsg for iptables LOG entries and emits structured
+    // tracing events for direct connection attempts that bypass the proxy.
+    #[cfg(target_os = "linux")]
+    let _bypass_monitor = if netns.is_some() {
+        bypass_monitor::spawn(
+            netns.as_ref().expect("netns is Some").name().to_string(),
+            entrypoint_pid.clone(),
+            bypass_denial_tx,
+        )
+    } else {
+        None
+    };
+
+    // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
+    #[cfg(not(target_os = "linux"))]
+    drop(bypass_denial_tx);
 
     // Compute the proxy URL and netns fd for SSH sessions.
     // SSH shell processes need both to enforce network policy:
