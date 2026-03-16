@@ -56,6 +56,9 @@ use crate::ServerState;
 /// unbounded memory allocation from an excessively large page request.
 pub const MAX_PAGE_SIZE: u32 = 1000;
 
+/// Metadata key used to bind internal requests to a specific sandbox identity.
+const HEADER_SANDBOX_ID: &str = "x-sandbox-id";
+
 // ---------------------------------------------------------------------------
 // Field-level size limits
 //
@@ -109,6 +112,22 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 /// otherwise returns the smaller of `raw` and `max`.
 pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
+}
+
+fn authorize_sandbox_request<T>(request: &Request<T>, sandbox_id: &str) -> Result<(), Status> {
+    let caller_sandbox_id = request
+        .metadata()
+        .get(HEADER_SANDBOX_ID)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| Status::unauthenticated("missing required x-sandbox-id metadata"))?;
+
+    if caller_sandbox_id != sandbox_id {
+        return Err(Status::permission_denied(
+            "sandbox identity does not match requested sandbox_id",
+        ));
+    }
+
+    Ok(())
 }
 
 /// OpenShell gRPC service implementation.
@@ -796,7 +815,8 @@ impl OpenShell for OpenShellService {
         &self,
         request: Request<GetSandboxProviderEnvironmentRequest>,
     ) -> Result<Response<GetSandboxProviderEnvironmentResponse>, Status> {
-        let sandbox_id = request.into_inner().sandbox_id;
+        let sandbox_id = request.get_ref().sandbox_id.clone();
+        authorize_sandbox_request(&request, &sandbox_id)?;
 
         let sandbox = self
             .state
@@ -3311,15 +3331,15 @@ mod tests {
         MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
         MAX_NAME_LEN, MAX_PAGE_SIZE, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
-        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE, clamp_limit,
-        create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, resolve_provider_environment, update_provider_record,
-        validate_provider_fields, validate_sandbox_spec,
+        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+        authorize_sandbox_request, clamp_limit, create_provider_record, delete_provider_record,
+        get_provider_record, is_valid_env_key, list_provider_records, resolve_provider_environment,
+        update_provider_record, validate_provider_fields, validate_sandbox_spec,
     };
     use crate::persistence::Store;
     use openshell_core::proto::{Provider, SandboxSpec, SandboxTemplate};
     use std::collections::HashMap;
-    use tonic::Code;
+    use tonic::{Code, Request};
 
     #[test]
     fn env_key_validation_accepts_valid_keys() {
@@ -3336,6 +3356,38 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    #[test]
+    fn authorize_sandbox_request_accepts_matching_metadata() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-sandbox-id", "sandbox-123".parse().unwrap());
+
+        assert!(authorize_sandbox_request(&request, "sandbox-123").is_ok());
+    }
+
+    #[test]
+    fn authorize_sandbox_request_rejects_missing_metadata() {
+        let request = Request::new(());
+        let err = authorize_sandbox_request(&request, "sandbox-123").unwrap_err();
+
+        assert_eq!(err.code(), Code::Unauthenticated);
+        assert!(err.message().contains("x-sandbox-id"));
+    }
+
+    #[test]
+    fn authorize_sandbox_request_rejects_mismatched_sandbox_id() {
+        let mut request = Request::new(());
+        request
+            .metadata_mut()
+            .insert("x-sandbox-id", "sandbox-aaa".parse().unwrap());
+
+        let err = authorize_sandbox_request(&request, "sandbox-bbb").unwrap_err();
+
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert!(err.message().contains("does not match"));
     }
 
     // ---- clamp_limit tests ----
