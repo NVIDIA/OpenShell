@@ -129,22 +129,13 @@ binary_allowed(policy, exec) if {
 	b.path == ancestor
 }
 
-# Binary matching: cmdline exact path (script interpreters — e.g. node runs claude script).
-# When /usr/local/bin/claude has shebang #!/usr/bin/env node, the exe is /usr/bin/node
-# but cmdline contains /usr/local/bin/claude as an argv entry.
-binary_allowed(policy, exec) if {
-	some b
-	b := policy.binaries[_]
-	not contains(b.path, "*")
-	cp := exec.cmdline_paths[_]
-	b.path == cp
-}
-
-# Binary matching: glob pattern against path, any ancestor, or any cmdline path.
+# Binary matching: glob pattern against exe path or any ancestor.
+# NOTE: cmdline_paths are intentionally excluded — argv[0] is trivially
+# spoofable via execve and must not be used as a grant-access signal.
 binary_allowed(policy, exec) if {
 	some b in policy.binaries
 	contains(b.path, "*")
-	all_paths := array.concat(array.concat([exec.path], exec.ancestors), exec.cmdline_paths)
+	all_paths := array.concat([exec.path], exec.ancestors)
 	some p in all_paths
 	glob.match(b.path, ["/"], p)
 }
