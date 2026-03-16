@@ -98,7 +98,7 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - When making changes, update the relevant documentation in the `architecture/` directory.
 - When changes affect user-facing behavior, also update the relevant pages under `docs/`.
 - Follow the style guide in [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md): active voice, no unnecessary bold, no em dash overuse, no filler introductions.
-- Use the `update-docs-from-commits` skill to scan recent commits and draft doc updates.
+- Use the `update-docs` skill to scan recent commits and draft doc updates.
 
 ## Security
 
