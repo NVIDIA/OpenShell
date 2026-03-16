@@ -533,7 +533,15 @@ mod tests {
             run_as_user: None,
             run_as_group: None,
         });
-        assert!(drop_privileges(&policy).is_ok());
+        if nix::unistd::geteuid().is_root() {
+            // As root, drop_privileges falls back to "sandbox:sandbox".
+            // If that user exists, it succeeds; if not (e.g. CI), it
+            // must error rather than silently keep root.
+            let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
+            assert_eq!(drop_privileges(&policy).is_ok(), has_sandbox);
+        } else {
+            assert!(drop_privileges(&policy).is_ok());
+        }
     }
 
     #[test]
@@ -542,7 +550,12 @@ mod tests {
             run_as_user: Some(String::new()),
             run_as_group: Some(String::new()),
         });
-        assert!(drop_privileges(&policy).is_ok());
+        if nix::unistd::geteuid().is_root() {
+            let has_sandbox = User::from_name("sandbox").ok().flatten().is_some();
+            assert_eq!(drop_privileges(&policy).is_ok(), has_sandbox);
+        } else {
+            assert!(drop_privileges(&policy).is_ok());
+        }
     }
 
     #[test]
