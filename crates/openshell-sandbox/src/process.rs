@@ -360,7 +360,18 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         _ => None,
     };
 
+    // If no user/group is configured and we are running as root, fall back to
+    // "sandbox:sandbox" instead of silently keeping root.  This covers the
+    // local/dev-mode path where policies are loaded from disk and never pass
+    // through the server-side `ensure_sandbox_process_identity` normalization.
+    // For non-root runtimes, the no-op is safe -- we are already unprivileged.
     if user_name.is_none() && group_name.is_none() {
+        if nix::unistd::geteuid().is_root() {
+            let mut fallback = policy.clone();
+            fallback.process.run_as_user = Some("sandbox".into());
+            fallback.process.run_as_group = Some("sandbox".into());
+            return drop_privileges(&fallback);
+        }
         return Ok(());
     }
 
