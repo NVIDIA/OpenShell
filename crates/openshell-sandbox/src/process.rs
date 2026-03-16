@@ -351,17 +351,25 @@ impl Drop for ProcessHandle {
 
 #[cfg(unix)]
 pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
-    let user_name = match policy.process.run_as_user.as_deref() {
+    let mut user_name = match policy.process.run_as_user.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
     };
-    let group_name = match policy.process.run_as_group.as_deref() {
+    let mut group_name = match policy.process.run_as_group.as_deref() {
         Some(name) if !name.is_empty() => Some(name),
         _ => None,
     };
 
     if user_name.is_none() && group_name.is_none() {
-        return Ok(());
+        // The supervisor process requires elevated capabilities to configure
+        // sandbox isolation, but child workloads must never retain those
+        // capabilities by running as root.
+        if nix::unistd::geteuid().is_root() {
+            user_name = Some("sandbox");
+            group_name = Some("sandbox");
+        } else {
+            return Ok(());
+        }
     }
 
     let user = if let Some(name) = user_name {
@@ -522,7 +530,17 @@ mod tests {
             run_as_user: None,
             run_as_group: None,
         });
-        assert!(drop_privileges(&policy).is_ok());
+
+        let result = drop_privileges(&policy);
+        if nix::unistd::geteuid().is_root() {
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("Sandbox user not found: sandbox"),
+                "expected sandbox fallback resolution failure when running as root: {msg}"
+            );
+        } else {
+            assert!(result.is_ok());
+        }
     }
 
     #[test]
@@ -531,7 +549,17 @@ mod tests {
             run_as_user: Some(String::new()),
             run_as_group: Some(String::new()),
         });
-        assert!(drop_privileges(&policy).is_ok());
+
+        let result = drop_privileges(&policy);
+        if nix::unistd::geteuid().is_root() {
+            let msg = format!("{}", result.unwrap_err());
+            assert!(
+                msg.contains("Sandbox user not found: sandbox"),
+                "expected sandbox fallback resolution failure when running as root: {msg}"
+            );
+        } else {
+            assert!(result.is_ok());
+        }
     }
 
     #[test]
