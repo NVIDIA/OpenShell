@@ -17,8 +17,8 @@
 //! still provide fast-fail UX — the monitor only adds diagnostic visibility.
 
 use crate::denial_aggregator::DenialEvent;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -99,54 +99,75 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
 
 /// Spawn the bypass monitor as a background tokio task.
 ///
-/// Reads `/dev/kmsg` for iptables LOG entries matching the given namespace,
-/// parses them, resolves process identity when possible, and emits structured
-/// tracing events.
+/// Uses `dmesg --follow` to tail the kernel ring buffer for iptables LOG
+/// entries matching the given namespace. Falls back gracefully if `dmesg`
+/// is not available.
 ///
-/// Returns a `JoinHandle` if the monitor was started, or `None` if `/dev/kmsg`
+/// We use `dmesg` rather than reading `/dev/kmsg` directly because the
+/// container runtime's device cgroup policy blocks direct `/dev/kmsg` access
+/// even with `CAP_SYSLOG`. The `dmesg` command reads via the `syslog(2)`
+/// syscall which is permitted with `CAP_SYSLOG`.
+///
+/// Returns a `JoinHandle` if the monitor was started, or `None` if `dmesg`
 /// is not available.
 pub fn spawn(
     namespace_name: String,
     entrypoint_pid: Arc<AtomicU32>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    use std::fs::OpenOptions;
-    use std::io::{BufRead, BufReader, Seek, SeekFrom};
+    use std::io::BufRead;
+    use std::process::{Command, Stdio};
 
-    // Try to open /dev/kmsg — if it fails, degrade gracefully.
-    let file = match OpenOptions::new().read(true).open("/dev/kmsg") {
-        Ok(f) => f,
-        Err(e) => {
-            warn!(
-                error = %e,
-                "Cannot open /dev/kmsg; bypass detection monitor will not run. \
-                 Bypass REJECT rules still provide fast-fail behavior."
-            );
-            return None;
-        }
-    };
+    // Verify dmesg is available before spawning the monitor.
+    let dmesg_check = Command::new("dmesg")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+
+    if !dmesg_check.is_ok_and(|s| s.success()) {
+        warn!(
+            "dmesg not available; bypass detection monitor will not run. \
+             Bypass REJECT rules still provide fast-fail behavior."
+        );
+        return None;
+    }
 
     let namespace_prefix = format!("openshell:bypass:{namespace_name}:");
     debug!(
         namespace = %namespace_name,
-        "Starting bypass detection monitor"
+        "Starting bypass detection monitor via dmesg --follow"
     );
 
     let handle = tokio::task::spawn_blocking(move || {
-        // Seek to end to skip historical messages.
-        let mut file = file;
-        if let Err(e) = file.seek(SeekFrom::End(0)) {
-            warn!(error = %e, "Failed to seek /dev/kmsg to end; may see stale events");
-        }
+        // Start dmesg in follow mode to tail new kernel messages.
+        let mut child = match Command::new("dmesg")
+            .args(["--follow", "--notime"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                warn!(error = %e, "Failed to start dmesg --follow; bypass monitor will not run");
+                return;
+            }
+        };
 
-        let reader = BufReader::new(file);
+        let stdout = match child.stdout.take() {
+            Some(s) => s,
+            None => {
+                warn!("dmesg --follow produced no stdout; bypass monitor will not run");
+                return;
+            }
+        };
+
+        let reader = std::io::BufReader::new(stdout);
         for line in reader.lines() {
             let line = match line {
                 Ok(l) => l,
                 Err(e) => {
-                    // EPIPE or EIO on /dev/kmsg means the kernel ring buffer
-                    // was overrun — we missed some messages. Continue reading.
-                    debug!(error = %e, "Error reading /dev/kmsg line, continuing");
+                    debug!(error = %e, "Error reading dmesg line, continuing");
                     continue;
                 }
             };
@@ -200,7 +221,10 @@ pub fn spawn(
             }
         }
 
-        debug!("Bypass monitor: /dev/kmsg reader exited");
+        // Clean up the dmesg child process.
+        let _ = child.kill();
+        let _ = child.wait();
+        debug!("Bypass monitor: dmesg reader exited");
     });
 
     Some(handle)

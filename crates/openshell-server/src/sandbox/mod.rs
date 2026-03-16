@@ -660,6 +660,9 @@ const SUPERVISOR_VOLUME_NAME: &str = "openshell-supervisor-bin";
 /// via `docker cp` during local development.
 const SUPERVISOR_HOST_PATH: &str = "/opt/openshell/bin";
 
+/// Name of the volume used to expose `/dev/kmsg` for bypass detection logging.
+const KMSG_VOLUME_NAME: &str = "kmsg";
+
 /// Build the hostPath volume definition that exposes the supervisor binary
 /// from the k3s node filesystem.
 fn supervisor_volume() -> serde_json::Value {
@@ -677,6 +680,28 @@ fn supervisor_volume_mount() -> serde_json::Value {
     serde_json::json!({
         "name": SUPERVISOR_VOLUME_NAME,
         "mountPath": SUPERVISOR_MOUNT_PATH,
+        "readOnly": true
+    })
+}
+
+/// Build the hostPath volume definition that exposes `/dev/kmsg` from the
+/// k3s node. The bypass detection monitor reads kernel log messages to
+/// surface structured diagnostics for direct connection attempts.
+fn kmsg_volume() -> serde_json::Value {
+    serde_json::json!({
+        "name": KMSG_VOLUME_NAME,
+        "hostPath": {
+            "path": "/dev/kmsg",
+            "type": "CharDevice"
+        }
+    })
+}
+
+/// Build the read-only volume mount for `/dev/kmsg` in the agent container.
+fn kmsg_volume_mount() -> serde_json::Value {
+    serde_json::json!({
+        "name": KMSG_VOLUME_NAME,
+        "mountPath": "/dev/kmsg",
         "readOnly": true
     })
 }
@@ -936,14 +961,15 @@ fn sandbox_template_to_k8s(
 
     // The sandbox process needs SYS_ADMIN (for seccomp filter installation and
     // network namespace creation), NET_ADMIN (for network namespace veth setup),
-    // and SYS_PTRACE (for the CONNECT proxy to read /proc/<pid>/fd/ of sandbox-user
-    // processes to resolve binary identity for network policy enforcement).
+    // SYS_PTRACE (for the CONNECT proxy to read /proc/<pid>/fd/ of sandbox-user
+    // processes to resolve binary identity for network policy enforcement),
+    // and SYSLOG (for reading /dev/kmsg to surface bypass detection diagnostics).
     // This mirrors the capabilities used by `mise run sandbox`.
     container.insert(
         "securityContext".to_string(),
         serde_json::json!({
             "capabilities": {
-                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+                "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
             }
         }),
     );
@@ -1684,7 +1710,7 @@ mod tests {
                     "image": "custom-image:latest",
                     "securityContext": {
                         "capabilities": {
-                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE"]
+                            "add": ["SYS_ADMIN", "NET_ADMIN", "SYS_PTRACE", "SYSLOG"]
                         }
                     }
                 }]
