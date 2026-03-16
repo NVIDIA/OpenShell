@@ -40,7 +40,7 @@ use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
-use tonic::Code;
+use tonic::{Code, Status};
 
 // Re-export SSH functions for backward compatibility
 pub use crate::ssh::{Editor, print_ssh_config};
@@ -3421,7 +3421,7 @@ pub async fn gateway_inference_set(
         progress.finish_and_clear();
     }
 
-    let response = response.into_diagnostic()?;
+    let response = response.map_err(format_inference_status)?;
 
     let configured = response.into_inner();
     let label = if configured.route_name == "sandbox-system" {
@@ -3499,7 +3499,7 @@ pub async fn gateway_inference_update(
         progress.finish_and_clear();
     }
 
-    let response = response.into_diagnostic()?;
+    let response = response.map_err(format_inference_status)?;
 
     let configured = response.into_inner();
     let label = if configured.route_name == "sandbox-system" {
@@ -3588,6 +3588,16 @@ async fn print_inference_route(
             println!("  {} {}", "Error:".red(), e.message());
         }
     }
+}
+
+fn format_inference_status(status: Status) -> miette::Report {
+    let message = status.message().trim();
+
+    if message.is_empty() {
+        return miette::miette!("inference configuration failed ({})", status.code());
+    }
+
+    miette::miette!("{message}")
 }
 
 pub fn git_repo_root(local_path: &Path) -> Result<PathBuf> {

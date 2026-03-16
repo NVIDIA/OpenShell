@@ -279,7 +279,7 @@ fn validation_failure(
     next_steps: &str,
 ) -> Status {
     Status::failed_precondition(format!(
-        "failed to verify inference endpoint for provider '{provider_name}' and model '{model_id}' at '{base_url}': {details}. Next steps: {next_steps}, or retry with '--no-verify' if the endpoint is not up yet"
+        "failed to verify inference endpoint for provider '{provider_name}' and model '{model_id}' at '{base_url}': {details}. Next steps: {next_steps}, or retry with '--no-verify' if you want to skip verification"
     ))
 }
 
@@ -312,7 +312,7 @@ async fn verify_provider_endpoint(
     route: &ResolvedProviderRoute,
 ) -> Result<ValidatedEndpoint, Status> {
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(30))
         .build()
         .map_err(|err| Status::internal(format!("build validation client failed: {err}")))?;
     let mut route = route.route.clone();
