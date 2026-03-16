@@ -66,8 +66,9 @@ The gateway implements the `Inference` gRPC service defined in `proto/inference.
 1. Validates that both fields are non-empty.
 2. Fetches the named provider record from the store.
 3. Validates the provider by resolving its route (checking that the provider type is supported and has a usable API key).
-4. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
-5. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
+4. By default, performs a lightweight provider-shaped probe against the resolved upstream endpoint (for example, a tiny chat/messages request with `max_tokens: 1`) to confirm the endpoint is reachable and accepts the expected auth/request shape. `--no-verify` disables this probe when the endpoint is not up yet.
+5. Builds a managed route spec that stores only `provider_name` and `model_id`. The spec intentionally leaves `base_url`, `api_key`, and `protocols` empty -- these are resolved dynamically at bundle time from the provider record.
+6. Upserts the route with name `inference.local`. Version starts at 1 and increments monotonically on each update.
 
 `GetClusterInference` returns `provider_name`, `model_id`, and `version` for the managed route. Returns `NOT_FOUND` if cluster inference is not configured.
 
@@ -91,7 +92,7 @@ File: `proto/inference.proto`
 
 Key messages:
 
-- `SetClusterInferenceRequest` -- `provider_name` + `model_id`
+- `SetClusterInferenceRequest` -- `provider_name` + `model_id` + optional `no_verify` override, with verification enabled by default
 - `SetClusterInferenceResponse` -- `provider_name` + `model_id` + `version`
 - `GetInferenceBundleResponse` -- `repeated ResolvedRoute routes` + `revision` + `generated_at_ms`
 - `ResolvedRoute` -- `name`, `base_url`, `protocols`, `api_key`, `model_id`, `provider_type`
@@ -296,12 +297,14 @@ The system route is stored as a separate `InferenceRoute` record in the gateway 
 
 Cluster inference commands:
 
-- `openshell cluster inference set --provider <name> --model <id>` -- configures user-facing cluster inference
-- `openshell cluster inference set --system --provider <name> --model <id>` -- configures system inference
-- `openshell cluster inference get` -- displays both user and system inference configuration
-- `openshell cluster inference get --system` -- displays only the system inference configuration
+- `openshell inference set --provider <name> --model <id>` -- configures user-facing cluster inference
+- `openshell inference set --system --provider <name> --model <id>` -- configures system inference
+- `openshell inference get` -- displays both user and system inference configuration
+- `openshell inference get --system` -- displays only the system inference configuration
 
 The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+
+Inference writes verify by default. `--no-verify` is the explicit opt-out for endpoints that are not up yet.
 
 ## Provider Discovery
 

@@ -2983,12 +2983,14 @@ dependencies = [
  "miette",
  "openshell-core",
  "openshell-policy",
+ "openshell-router",
  "petname",
  "pin-project-lite",
  "prost",
  "prost-types",
  "rand 0.9.2",
  "rcgen",
+ "reqwest",
  "russh",
  "rustls",
  "rustls-pemfile",
@@ -3008,6 +3010,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "wiremock",
 ]
 
 [[package]]

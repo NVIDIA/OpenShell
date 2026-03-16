@@ -7,7 +7,10 @@ mod mock;
 
 use std::time::Duration;
 
-pub use backend::{ProxyResponse, StreamingProxyResponse};
+pub use backend::{
+    ProxyResponse, StreamingProxyResponse, ValidatedEndpoint, ValidationFailure,
+    ValidationFailureKind, verify_backend_endpoint,
+};
 use config::{ResolvedRoute, RouterConfig};
 use tracing::info;
 

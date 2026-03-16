@@ -10,6 +10,7 @@ from openshell._proto import openshell_pb2
 from openshell.sandbox import (
     _PYTHON_CLOUDPICKLE_BOOTSTRAP,
     _SANDBOX_PYTHON_BIN,
+    InferenceRouteClient,
     SandboxClient,
 )
 
@@ -31,6 +32,22 @@ class _FakeStub:
         yield openshell_pb2.ExecSandboxEvent(
             exit=openshell_pb2.ExecSandboxExit(exit_code=0)
         )
+
+
+class _FakeInferenceStub:
+    def __init__(self) -> None:
+        self.request = None
+
+    def SetClusterInference(self, request: Any, timeout: float | None = None) -> Any:
+        self.request = request
+        _ = timeout
+
+        class _Response:
+            provider_name = request.provider_name
+            model_id = request.model_id
+            version = 1
+
+        return _Response()
 
 
 def _client_with_fake_stub(stub: _FakeStub) -> SandboxClient:
@@ -120,3 +137,19 @@ def test_from_active_cluster_prefers_openshell_gateway_env(
         assert client._cluster_name == gateway_name
     finally:
         client.close()
+
+
+def test_inference_set_cluster_forwards_no_verify_flag() -> None:
+    stub = _FakeInferenceStub()
+    client = cast("InferenceRouteClient", object.__new__(InferenceRouteClient))
+    client._timeout = 30.0
+    client._stub = cast("Any", stub)
+
+    client.set_cluster(
+        provider_name="openai-dev",
+        model_id="gpt-4.1",
+        no_verify=True,
+    )
+
+    assert stub.request is not None
+    assert stub.request.no_verify is True

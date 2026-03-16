@@ -526,9 +526,13 @@ pub async fn ensure_container(
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
         network_mode: Some(network_name(name)),
-        // Add host.docker.internal mapping for DNS resolution
-        // This allows the entrypoint script to configure CoreDNS to use the host gateway
-        extra_hosts: Some(vec!["host.docker.internal:host-gateway".to_string()]),
+        // Add host gateway aliases for DNS resolution.
+        // This allows both the entrypoint script and the running gateway
+        // process to reach services on the Docker host.
+        extra_hosts: Some(vec![
+            "host.docker.internal:host-gateway".to_string(),
+            "host.openshell.internal:host-gateway".to_string(),
+        ]),
         ..Default::default()
     };
 

@@ -56,6 +56,15 @@ message SetClusterInferenceRequest {
   // Route name to target. Empty string defaults to "inference.local" (user-facing).
   // Use "sandbox-system" for the sandbox system-level inference route.
   string route_name = 3;
+  // Verify the resolved upstream endpoint synchronously before persistence.
+  bool verify = 4;
+  // Skip synchronous endpoint validation before persistence.
+  bool no_verify = 5;
+}
+
+message ValidatedEndpoint {
+  string url = 1;
+  string protocol = 2;
 }
 
 message SetClusterInferenceResponse {
@@ -64,6 +73,10 @@ message SetClusterInferenceResponse {
   uint64 version = 3;
   // Route name that was configured.
   string route_name = 4;
+  // Whether endpoint verification ran as part of this request.
+  bool validation_performed = 5;
+  // The concrete endpoints that were probed during validation, when available.
+  repeated ValidatedEndpoint validated_endpoints = 6;
 }
 
 message GetClusterInferenceRequest {
