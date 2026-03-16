@@ -169,7 +169,7 @@ pub async fn run_sandbox(
     // Load policy and initialize OPA engine
     let openshell_endpoint_for_proxy = openshell_endpoint.clone();
     let sandbox_name_for_agg = sandbox.clone();
-    let (policy, opa_engine) = load_policy(
+    let (mut policy, opa_engine) = load_policy(
         sandbox_id.clone(),
         sandbox,
         openshell_endpoint.clone(),
@@ -181,7 +181,7 @@ pub async fn run_sandbox(
     // Validate that the required "sandbox" user exists in this image.
     // All sandbox images must include this user for privilege dropping.
     #[cfg(unix)]
-    validate_sandbox_user(&policy)?;
+    validate_sandbox_user(&mut policy)?;
 
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
@@ -1089,8 +1089,28 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
 /// inspect `/etc/passwd`. If the user is missing, the sandbox fails fast
 /// with a clear error instead of silently running child processes as root.
 #[cfg(unix)]
-fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
+fn validate_sandbox_user(policy: &mut SandboxPolicy) -> Result<()> {
     use nix::unistd::User;
+
+    // Default missing/empty process identity to `sandbox` so privilege
+    // dropping cannot be skipped.
+    if policy
+        .process
+        .run_as_user
+        .as_deref()
+        .map_or(true, str::is_empty)
+    {
+        policy.process.run_as_user = Some("sandbox".to_string());
+    }
+
+    if policy
+        .process
+        .run_as_group
+        .as_deref()
+        .map_or(true, str::is_empty)
+    {
+        policy.process.run_as_group = Some("sandbox".to_string());
+    }
 
     let user_name = policy.process.run_as_user.as_deref().unwrap_or("sandbox");
 
@@ -1327,6 +1347,7 @@ async fn run_policy_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, ProcessPolicy};
     use temp_env::with_vars;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -1650,6 +1671,44 @@ filesystem_policy:
         let proc = policy.process.unwrap();
         assert_eq!(proc.run_as_user, "sandbox");
         assert_eq!(proc.run_as_group, "sandbox");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sandbox_user_fills_missing_process_identity() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: None,
+                run_as_group: None,
+            },
+        };
+
+        let _ = validate_sandbox_user(&mut policy);
+        assert_eq!(policy.process.run_as_user.as_deref(), Some("sandbox"));
+        assert_eq!(policy.process.run_as_group.as_deref(), Some("sandbox"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_sandbox_user_fills_empty_process_identity() {
+        let mut policy = SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process: ProcessPolicy {
+                run_as_user: Some(String::new()),
+                run_as_group: Some(String::new()),
+            },
+        };
+
+        let _ = validate_sandbox_user(&mut policy);
+        assert_eq!(policy.process.run_as_user.as_deref(), Some("sandbox"));
+        assert_eq!(policy.process.run_as_group.as_deref(), Some("sandbox"));
     }
 
     #[test]
