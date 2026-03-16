@@ -5,7 +5,6 @@
 
 use clap::Parser;
 use miette::{IntoDiagnostic, Result};
-use std::net::SocketAddr;
 use std::path::PathBuf;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -18,9 +17,9 @@ use openshell_server::{run_server, tracing_bus::TracingLogBus};
 #[command(version = openshell_core::VERSION)]
 #[command(about = "OpenShell gRPC/HTTP server", long_about = None)]
 struct Args {
-    /// Port to bind the server to (all interfaces).
-    #[arg(long, default_value_t = 8080, env = "OPENSHELL_SERVER_PORT")]
-    port: u16,
+    /// Address to bind the server to. Defaults to loopback for safety.
+    #[arg(long, env = "OPENSHELL_SERVER_BIND", default_value = "127.0.0.1:8080")]
+    bind: std::net::SocketAddr,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info", env = "OPENSHELL_LOG_LEVEL")]
@@ -125,7 +124,6 @@ async fn main() -> Result<()> {
     );
 
     // Build configuration
-    let bind = SocketAddr::from(([0, 0, 0, 0], args.port));
 
     let tls = if args.disable_tls {
         None
@@ -152,7 +150,7 @@ async fn main() -> Result<()> {
     };
 
     let mut config = openshell_core::Config::new(tls)
-        .with_bind_address(bind)
+        .with_bind_address(args.bind)
         .with_log_level(&args.log_level);
 
     config = config
