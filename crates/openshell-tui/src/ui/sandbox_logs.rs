@@ -349,6 +349,7 @@ const L7_FIELD_ORDER: &[&str] = &[
 
 /// Return fields in a smart order based on the log message type.
 pub(crate) fn ordered_fields<'a>(log: &'a LogLine) -> Vec<(&'a str, &'a str)> {
+    // Matches both "CONNECT" (L4-only decision) and "CONNECT_L7" (tunnel lifecycle for L7 endpoints)
     let order: Option<&[&str]> = if log.message.starts_with("CONNECT") {
         Some(CONNECT_FIELD_ORDER)
     } else if log.message.starts_with("L7_REQUEST") {
@@ -510,6 +511,25 @@ mod tests {
         );
         let result = format_log_line_plain(&log);
         // "action" should appear before "dst_host" which should appear before "binary"
+        let action_pos = result.find("action=").unwrap();
+        let dst_pos = result.find("dst_host=").unwrap();
+        let binary_pos = result.find("binary=").unwrap();
+        assert!(action_pos < dst_pos);
+        assert!(dst_pos < binary_pos);
+    }
+
+    #[test]
+    fn plain_format_connect_l7_field_order() {
+        let log = make_log(
+            "CONNECT_L7",
+            vec![
+                ("binary", "/usr/bin/curl"),
+                ("action", "allow"),
+                ("dst_host", "api.example.com"),
+            ],
+        );
+        let result = format_log_line_plain(&log);
+        // CONNECT_L7 should use the same field ordering as CONNECT
         let action_pos = result.find("action=").unwrap();
         let dst_pos = result.find("dst_host=").unwrap();
         let binary_pos = result.find("binary=").unwrap();

@@ -347,12 +347,12 @@ async fn handle_tcp_connection(
     );
 
     // Extract action string and matched policy for logging
-    let (action_str, matched_policy, deny_reason) = match &decision.action {
-        NetworkAction::Allow { matched_policy } => ("allow", matched_policy.clone(), String::new()),
-        NetworkAction::Deny { reason } => ("deny", None, reason.clone()),
+    let (matched_policy, deny_reason) = match &decision.action {
+        NetworkAction::Allow { matched_policy } => (matched_policy.clone(), String::new()),
+        NetworkAction::Deny { reason } => (None, reason.clone()),
     };
 
-    // Unified log line: one info! per CONNECT with full context
+    // Build log context fields (shared by deny log below and deferred allow log after L7 check)
     let binary_str = decision
         .binary
         .as_ref()
@@ -382,24 +382,26 @@ async fn handle_tcp_connection(
     };
     let policy_str = matched_policy.as_deref().unwrap_or("-");
 
-    info!(
-        src_addr = %peer_addr.ip(),
-        src_port = peer_addr.port(),
-        proxy_addr = %local_addr,
-        dst_host = %host_lc,
-        dst_port = port,
-        binary = %binary_str,
-        binary_pid = %pid_str,
-        ancestors = %ancestors_str,
-        cmdline = %cmdline_str,
-        action = %action_str,
-        engine = "opa",
-        policy = %policy_str,
-        reason = %deny_reason,
-        "CONNECT",
-    );
-
+    // Log denied connections immediately — they never reach L7.
+    // Allowed connections are logged after the L7 config check (below)
+    // so we can distinguish CONNECT (L4-only) from CONNECT_L7 (L7 follows).
     if matches!(decision.action, NetworkAction::Deny { .. }) {
+        info!(
+            src_addr = %peer_addr.ip(),
+            src_port = peer_addr.port(),
+            proxy_addr = %local_addr,
+            dst_host = %host_lc,
+            dst_port = port,
+            binary = %binary_str,
+            binary_pid = %pid_str,
+            ancestors = %ancestors_str,
+            cmdline = %cmdline_str,
+            action = "deny",
+            engine = "opa",
+            policy = "-",
+            reason = %deny_reason,
+            "CONNECT",
+        );
         emit_denial(
             &denial_tx,
             &host_lc,
@@ -498,7 +500,33 @@ async fn handle_tcp_connection(
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
     // Check if endpoint has L7 config for protocol-aware inspection
-    if let Some(l7_config) = query_l7_config(&opa_engine, &decision, &host_lc, port) {
+    let l7_config = query_l7_config(&opa_engine, &decision, &host_lc, port);
+
+    // Log the allowed CONNECT — use CONNECT_L7 when L7 inspection follows,
+    // so log consumers can distinguish L4-only decisions from tunnel lifecycle events.
+    let connect_msg = if l7_config.is_some() {
+        "CONNECT_L7"
+    } else {
+        "CONNECT"
+    };
+    info!(
+        src_addr = %peer_addr.ip(),
+        src_port = peer_addr.port(),
+        proxy_addr = %local_addr,
+        dst_host = %host_lc,
+        dst_port = port,
+        binary = %binary_str,
+        binary_pid = %pid_str,
+        ancestors = %ancestors_str,
+        cmdline = %cmdline_str,
+        action = "allow",
+        engine = "opa",
+        policy = %policy_str,
+        reason = "",
+        connect_msg,
+    );
+
+    if let Some(l7_config) = l7_config {
         // Clone engine for per-tunnel L7 evaluation (cheap: shares compiled policy via Arc)
         let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
             warn!(error = %e, "Failed to clone OPA engine for L7, falling back to L4-only");
