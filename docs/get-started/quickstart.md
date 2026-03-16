@@ -50,9 +50,7 @@ If you prefer [uv](https://docs.astral.sh/uv/):
 $ uv tool install -U openshell
 ```
 
-:::{tip}
-Run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags. You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
-:::
+After installing the CLI, run `openshell --help` in your terminal to see the full CLI reference, including all commands and flags. You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
 
 ## Create Your First OpenShell Sandbox
 
