@@ -334,6 +334,31 @@ jobs:
           git tag -fa devel -m "Latest Devel" "${GITHUB_SHA}"
           git push --force origin devel
 
+      - name: Prune stale wheel assets from devel release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          WHEEL_VERSION: ${{ needs.build-python-wheels.outputs.wheel_version }}
+        run: |
+          set -euo pipefail
+          CURRENT_PREFIX="openshell-${WHEEL_VERSION}-"
+
+          if ! gh release view devel --repo "${GITHUB_REPOSITORY}" --json assets > /dev/null 2>&1; then
+            echo "No existing devel release found; skipping wheel pruning."
+            exit 0
+          fi
+
+          gh release view devel --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets[].name' \
+            | while read -r asset; do
+                case "$asset" in
+                  *.whl)
+                    if [[ "$asset" != "${CURRENT_PREFIX}"* ]]; then
+                      echo "Deleting stale wheel asset: $asset"
+                      gh release delete-asset devel "$asset" --repo "${GITHUB_REPOSITORY}" --yes
+                    fi
+                    ;;
+                esac
+              done
+
       - name: Create / update GitHub Release
         uses: softprops/action-gh-release@v2
         with:
