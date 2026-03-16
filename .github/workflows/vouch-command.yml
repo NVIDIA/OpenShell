@@ -75,7 +75,33 @@ jobs:
             // --- Read VOUCHED.td ---
 
             const filePath = '.github/VOUCHED.td';
-            const branch = context.payload.repository.default_branch;
+            const branch = 'vouched';
+
+            // Ensure the "vouched" branch exists. If not, create it from main.
+            try {
+              await github.rest.repos.getBranch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                branch,
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                console.log('Creating "vouched" branch from main.');
+                const { data: mainRef } = await github.rest.git.getRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: `heads/${context.payload.repository.default_branch}`,
+                });
+                await github.rest.git.createRef({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  ref: 'refs/heads/vouched',
+                  sha: mainRef.object.sha,
+                });
+              } else {
+                throw e;
+              }
+            }
 
             let currentContent = '';
             let sha = '';
@@ -89,7 +115,7 @@ jobs:
               currentContent = Buffer.from(data.content, 'base64').toString('utf-8');
               sha = data.sha;
             } catch (e) {
-              console.log(`Could not read VOUCHED.td: ${e.message}`);
+              console.log(`Could not read VOUCHED.td on "${branch}" branch: ${e.message}`);
               return;
             }
 

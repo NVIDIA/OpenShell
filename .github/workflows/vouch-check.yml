@@ -59,15 +59,15 @@ jobs:
               }
             }
 
-            // Check the VOUCHED.td file. Read from the default branch, NOT the
-            // PR branch — the PR author could add themselves in their fork.
+            // Check the VOUCHED.td file on the dedicated "vouched" branch.
+            // NOT the PR branch — the PR author could add themselves in their fork.
             let vouched = false;
             try {
               const { data } = await github.rest.repos.getContent({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 path: '.github/VOUCHED.td',
-                ref: context.payload.repository.default_branch,
+                ref: 'vouched',
               });
               const content = Buffer.from(data.content, 'base64').toString('utf-8');
               const usernames = content
