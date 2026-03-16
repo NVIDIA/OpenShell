@@ -110,7 +110,6 @@ These patterns are common in LLM-generated text and erode trust with technical r
 ### Formatting Rules
 
 - End every sentence with a period.
-- One sentence per line in the source file (makes diffs readable).
 - Use `code` formatting for CLI commands, file paths, flags, parameter names, and values.
 - Use code blocks with the `console` language for CLI examples. Prefix commands with `$`:
   ```console
