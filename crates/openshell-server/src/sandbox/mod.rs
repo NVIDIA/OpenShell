@@ -2101,7 +2101,8 @@ mod tests {
             .find(|v| v["name"] == "openshell-client-tls")
             .expect("TLS volume should exist");
         assert_eq!(
-            tls_vol["secret"]["defaultMode"], 256, // 0o400
+            tls_vol["secret"]["defaultMode"],
+            256, // 0o400
             "TLS secret volume must use mode 0400 to prevent sandbox user from reading the private key"
         );
     }

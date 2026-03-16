@@ -862,12 +862,10 @@ mod tests {
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(
-            config
-                .filesystem
-                .read_write
-                .contains(&PathBuf::from("/tmp"))
-        );
+        assert!(config
+            .filesystem
+            .read_write
+            .contains(&PathBuf::from("/tmp")));
     }
 
     #[test]
@@ -1098,9 +1096,11 @@ network_policies:
     }
 
     #[test]
-    fn cmdline_path_matches_script_binary() {
-        // Simulates: node runs /usr/local/bin/my-tool (a script with shebang)
-        // exe = /usr/bin/node, cmdline contains /usr/local/bin/my-tool
+    fn cmdline_path_does_not_grant_access() {
+        // Simulates: node runs /usr/local/bin/my-tool (a script with shebang).
+        // exe = /usr/bin/node, cmdline contains /usr/local/bin/my-tool.
+        // cmdline_paths are attacker-controlled (argv[0] spoofing) and must
+        // NOT be used as a grant-access signal.
         let cmdline_data = r"
 network_policies:
   script_test:
@@ -1121,11 +1121,9 @@ network_policies:
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
-            decision.allowed,
-            "Expected allow via cmdline path match, got deny: {}",
-            decision.reason
+            !decision.allowed,
+            "cmdline_paths must not grant network access (argv[0] is spoofable)"
         );
-        assert_eq!(decision.matched_policy.as_deref(), Some("script_test"));
     }
 
     #[test]
@@ -1156,7 +1154,7 @@ network_policies:
     }
 
     #[test]
-    fn cmdline_glob_pattern_matches() {
+    fn cmdline_glob_pattern_does_not_grant_access() {
         let glob_data = r#"
 network_policies:
   glob_test:
@@ -1177,9 +1175,8 @@ network_policies:
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
-            decision.allowed,
-            "Expected glob to match cmdline path, got deny: {}",
-            decision.reason
+            !decision.allowed,
+            "cmdline_paths must not match globs for granting access (argv[0] is spoofable)"
         );
     }
 
@@ -1190,10 +1187,10 @@ network_policies:
         let input = NetworkInput {
             host: "api.anthropic.com".into(),
             port: 443,
-            binary_path: PathBuf::from("/usr/bin/node"),
+            binary_path: PathBuf::from("/usr/local/bin/claude"),
             binary_sha256: "unused".into(),
             ancestors: vec![],
-            cmdline_paths: vec![PathBuf::from("/usr/local/bin/claude")],
+            cmdline_paths: vec![],
         };
         let decision = engine.evaluate_network(&input).unwrap();
         assert!(
@@ -1227,12 +1224,10 @@ network_policies:
         let config = engine.query_sandbox_config().unwrap();
         assert!(config.filesystem.include_workdir);
         assert!(config.filesystem.read_only.contains(&PathBuf::from("/usr")));
-        assert!(
-            config
-                .filesystem
-                .read_write
-                .contains(&PathBuf::from("/tmp"))
-        );
+        assert!(config
+            .filesystem
+            .read_write
+            .contains(&PathBuf::from("/tmp")));
         assert_eq!(config.process.run_as_user.as_deref(), Some("sandbox"));
         assert_eq!(config.process.run_as_group.as_deref(), Some("sandbox"));
     }
