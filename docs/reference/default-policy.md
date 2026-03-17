@@ -23,6 +23,7 @@ The following table shows the coverage of the default policy for common agents.
 | Agent | Coverage | Action Required |
 |---|---|---|
 | Claude Code | Full | None. Works out of the box. |
+| Kode | Full | None. Works out of the box. |
 | OpenCode | Partial | Add `opencode.ai` endpoint and OpenCode binary paths. |
 | Codex | None | Provide a complete custom policy with OpenAI endpoints and Codex binary paths. |
 

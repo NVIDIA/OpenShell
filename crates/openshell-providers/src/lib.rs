@@ -136,7 +136,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
-        "kode" | "kwa" | "kd" => Some("kode"),
+        "kode" => Some("kode"),
         "outlook" => Some("outlook"),
         _ => None,
     }
@@ -167,8 +167,6 @@ mod tests {
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
         assert_eq!(normalize_provider_type("kode"), Some("kode"));
-        assert_eq!(normalize_provider_type("kwa"), Some("kode"));
-        assert_eq!(normalize_provider_type("kd"), Some("kode"));
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 
