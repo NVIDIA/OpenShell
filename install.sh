@@ -111,8 +111,8 @@ resolve_redirect() {
   if has_cmd curl; then
     curl -fLsS -o /dev/null -w '%{url_effective}' "$_url"
   elif has_cmd wget; then
-    # wget --spider follows redirects and prints the final URL
-    wget --spider -q --max-redirect=10 "$_url" 2>&1 | grep -oP 'Location: \K\S+' | tail -1
+    # wget --spider follows redirects; capture the final Location from stderr
+    wget --spider --max-redirect=10 "$_url" 2>&1 | sed -n 's/^.*Location: \([^ ]*\).*/\1/p' | tail -1
   fi
 }
 
@@ -351,13 +351,20 @@ setup_path() {
   fi
 
   if [ "$_needs_source" = "1" ] || ! is_on_path "$_install_dir"; then
+    # Detect the user's current shell to show the right source command
+    _current_shell="$(basename "${SHELL:-sh}" 2>/dev/null || echo "sh")"
+
     echo ""
     info "to add ${APP_NAME} to your PATH, restart your shell or run:"
     info ""
-    info "    source \"${_env_script}\"    (sh, bash, zsh)"
-    if [ -d "${_home}/.config/fish" ]; then
-      info "    source \"${_fish_env_script}\"    (fish)"
-    fi
+    case "$_current_shell" in
+      fish)
+        info "    source \"${_fish_env_script}\""
+        ;;
+      *)
+        info "    . \"${_env_script}\""
+        ;;
+    esac
   fi
 }
 
