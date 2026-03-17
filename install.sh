@@ -280,7 +280,7 @@ main() {
   fi
 
   _installed_version="$("${_install_dir}/${APP_NAME}" --version 2>/dev/null || echo "${_version}")"
-  info "installed ${APP_NAME} ${_installed_version} to ${_install_dir}/${APP_NAME}"
+  info "installed ${_installed_version} to ${_install_dir}/${APP_NAME}"
 
   # If the install directory isn't on PATH, print instructions
   if ! is_on_path "$_install_dir"; then
