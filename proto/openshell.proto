@@ -52,9 +52,9 @@ service OpenShell {
   // Delete a provider by name.
   rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
 
-  // Get sandbox policy by id (called by sandbox entrypoint and poll loop).
-  rpc GetSandboxPolicy(openshell.sandbox.v1.GetSandboxPolicyRequest)
-      returns (openshell.sandbox.v1.GetSandboxPolicyResponse);
+  // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
+  rpc GetSandboxSettings(openshell.sandbox.v1.GetSandboxSettingsRequest)
+      returns (openshell.sandbox.v1.GetSandboxSettingsResponse);
 
   // Update sandbox policy on a live sandbox.
   rpc UpdateSandboxPolicy(UpdateSandboxPolicyRequest)

@@ -8,13 +8,13 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse,
-    PlatformEvent, ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox,
-    SandboxPhase, SandboxResponse, SandboxStreamEvent, ServiceStatus, UpdateProviderRequest,
-    WatchSandboxRequest, sandbox_stream_event,
+    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxSettingsRequest,
+    GetSandboxSettingsResponse, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
+    ProviderResponse, RevokeSshSessionRequest, RevokeSshSessionResponse, Sandbox, SandboxPhase,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
+    sandbox_stream_event,
 };
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, ExtendedKeyUsagePurpose, IsCa, KeyPair,
@@ -156,11 +156,11 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_settings(
         &self,
-        _request: tonic::Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
-        Ok(Response::new(GetSandboxPolicyResponse::default()))
+        _request: tonic::Request<GetSandboxSettingsRequest>,
+    ) -> Result<Response<GetSandboxSettingsResponse>, Status> {
+        Ok(Response::new(GetSandboxSettingsResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(

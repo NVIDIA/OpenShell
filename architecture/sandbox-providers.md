@@ -241,7 +241,7 @@ variables (injected into the pod spec by the gateway's Kubernetes sandbox creati
 
 In `run_sandbox()` (`crates/openshell-sandbox/src/lib.rs`):
 
-1. loads the sandbox policy via gRPC (`GetSandboxPolicy`),
+1. loads the sandbox policy via gRPC (`GetSandboxSettings`),
 2. fetches provider credentials via gRPC (`GetSandboxProviderEnvironment`),
 3. if the fetch fails, continues with an empty map (graceful degradation with a warning).
 

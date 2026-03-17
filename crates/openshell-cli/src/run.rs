@@ -25,13 +25,14 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyRequest, GetSandboxPolicyStatusRequest,
-    GetSandboxRequest, HealthRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
+    GetSandboxSettingsRequest, HealthRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
     ListSandboxesRequest, PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase,
     SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope,
     SettingValue, UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
     setting_value,
 };
+use openshell_core::settings::{self, SettingValueKind};
 use openshell_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
 };
@@ -3810,6 +3811,68 @@ fn confirm_global_setting_takeover(key: &str, yes: bool) -> Result<()> {
     Ok(())
 }
 
+fn confirm_global_setting_delete(key: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(miette::miette!(
+            "global setting deletes require confirmation; pass --yes in non-interactive mode"
+        ));
+    }
+
+    let proceed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Deleting global setting '{key}' re-enables sandbox-level management for this key. Continue?"
+        ))
+        .default(false)
+        .interact()
+        .into_diagnostic()?;
+
+    if !proceed {
+        return Err(miette::miette!("aborted by user"));
+    }
+
+    Ok(())
+}
+
+fn parse_cli_setting_value(key: &str, raw_value: &str) -> Result<SettingValue> {
+    let setting = settings::setting_for_key(key).ok_or_else(|| {
+        miette::miette!(
+            "unknown setting key '{}'. Allowed keys: {}",
+            key,
+            settings::registered_keys_csv()
+        )
+    })?;
+
+    let value = match setting.kind {
+        SettingValueKind::String => setting_value::Value::StringValue(raw_value.to_string()),
+        SettingValueKind::Int => {
+            let parsed = raw_value.trim().parse::<i64>().map_err(|_| {
+                miette::miette!(
+                    "invalid int value '{}' for key '{}'; expected base-10 integer",
+                    raw_value,
+                    key
+                )
+            })?;
+            setting_value::Value::IntValue(parsed)
+        }
+        SettingValueKind::Bool => {
+            let parsed = settings::parse_bool_like(raw_value).ok_or_else(|| {
+                miette::miette!(
+                    "invalid bool value '{}' for key '{}'; expected one of: true,false,yes,no,1,0",
+                    raw_value,
+                    key
+                )
+            })?;
+            setting_value::Value::BoolValue(parsed)
+        }
+    };
+
+    Ok(SettingValue { value: Some(value) })
+}
+
 fn format_setting_value(value: Option<&SettingValue>) -> String {
     let Some(value) = value.and_then(|v| v.value.as_ref()) else {
         return "<unset>".to_string();
@@ -3881,7 +3944,7 @@ pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) ->
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
     let response = client
-        .get_sandbox_policy(GetSandboxPolicyRequest {
+        .get_sandbox_settings(GetSandboxSettingsRequest {
             sandbox_id: sandbox.id.clone(),
         })
         .await
@@ -3934,6 +3997,7 @@ pub async fn gateway_setting_set(
     yes: bool,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let setting_value = parse_cli_setting_value(key, value)?;
     confirm_global_setting_takeover(key, yes)?;
 
     let mut client = grpc_client(server, tls).await?;
@@ -3942,9 +4006,7 @@ pub async fn gateway_setting_set(
             name: String::new(),
             policy: None,
             setting_key: key.to_string(),
-            setting_value: Some(SettingValue {
-                value: Some(setting_value::Value::StringValue(value.to_string())),
-            }),
+            setting_value: Some(setting_value),
             delete_setting: false,
             global: true,
         })
@@ -3969,15 +4031,15 @@ pub async fn sandbox_setting_set(
     value: &str,
     tls: &TlsOptions,
 ) -> Result<()> {
+    let setting_value = parse_cli_setting_value(key, value)?;
+
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_sandbox_policy(UpdateSandboxPolicyRequest {
             name: name.to_string(),
             policy: None,
             setting_key: key.to_string(),
-            setting_value: Some(SettingValue {
-                value: Some(setting_value::Value::StringValue(value.to_string())),
-            }),
+            setting_value: Some(setting_value),
             delete_setting: false,
             global: false,
         })
@@ -3996,7 +4058,14 @@ pub async fn sandbox_setting_set(
     Ok(())
 }
 
-pub async fn gateway_setting_delete(server: &str, key: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_setting_delete(
+    server: &str,
+    key: &str,
+    yes: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    confirm_global_setting_delete(key, yes)?;
+
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .update_sandbox_policy(UpdateSandboxPolicyRequest {
@@ -4651,8 +4720,9 @@ mod tests {
         GatewayControlTarget, TlsOptions, format_gateway_select_header,
         format_gateway_select_items, gateway_auth_label, gateway_select_with, gateway_type_label,
         git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
-        parse_credential_pairs, provisioning_timeout_message, ready_false_condition_message,
-        resolve_gateway_control_target_from, sandbox_should_persist, source_requests_gpu,
+        parse_cli_setting_value, parse_credential_pairs, provisioning_timeout_message,
+        ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
+        source_requests_gpu,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -4770,6 +4840,46 @@ mod tests {
         assert!(err.to_string().contains(
             "requires local env var 'NAV_PARSE_CREDENTIAL_EMPTY' to be set to a non-empty value"
         ));
+    }
+
+    #[test]
+    fn parse_cli_setting_value_parses_bool_aliases() {
+        let yes_value = parse_cli_setting_value("dummy_bool", "yes").expect("parse yes");
+        assert_eq!(
+            yes_value.value,
+            Some(openshell_core::proto::setting_value::Value::BoolValue(true))
+        );
+
+        let zero_value = parse_cli_setting_value("dummy_bool", "0").expect("parse 0");
+        assert_eq!(
+            zero_value.value,
+            Some(openshell_core::proto::setting_value::Value::BoolValue(
+                false
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_cli_setting_value_parses_int_key() {
+        let int_value = parse_cli_setting_value("dummy_int", "42").expect("parse int");
+        assert_eq!(
+            int_value.value,
+            Some(openshell_core::proto::setting_value::Value::IntValue(42))
+        );
+    }
+
+    #[test]
+    fn parse_cli_setting_value_rejects_invalid_bool() {
+        let err =
+            parse_cli_setting_value("dummy_bool", "maybe").expect_err("invalid bool should fail");
+        assert!(err.to_string().contains("invalid bool value"));
+    }
+
+    #[test]
+    fn parse_cli_setting_value_rejects_unknown_key() {
+        let err =
+            parse_cli_setting_value("unknown_key", "value").expect_err("unknown key should fail");
+        assert!(err.to_string().contains("unknown setting key"));
     }
 
     #[test]

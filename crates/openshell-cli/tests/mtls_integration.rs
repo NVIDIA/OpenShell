@@ -108,12 +108,12 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_settings(
         &self,
-        _request: tonic::Request<openshell_core::proto::GetSandboxPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::GetSandboxPolicyResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::GetSandboxSettingsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetSandboxSettingsResponse>, Status> {
         Ok(Response::new(
-            openshell_core::proto::GetSandboxPolicyResponse::default(),
+            openshell_core::proto::GetSandboxSettingsResponse::default(),
         ))
     }
 

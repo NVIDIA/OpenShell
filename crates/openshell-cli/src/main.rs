@@ -259,6 +259,8 @@ const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
   $ openshell settings set my-sandbox --key log_level --value debug
   $ openshell settings set --global --key log_level --value warn
+  $ openshell settings set --global --key dummy_bool --value yes
+  $ openshell settings set --global --key dummy_int --value 42
   $ openshell settings delete --global --key log_level
 ";
 
@@ -1400,6 +1402,10 @@ enum PolicyCommands {
         /// Delete the global policy setting.
         #[arg(long)]
         global: bool,
+
+        /// Skip the confirmation prompt for global policy delete.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1424,7 +1430,7 @@ enum SettingsCommands {
         #[arg(long)]
         key: String,
 
-        /// Setting value (stored as string).
+        /// Setting value (string input; bool keys accept true/false/yes/no/1/0).
         #[arg(long)]
         value: String,
 
@@ -1447,6 +1453,10 @@ enum SettingsCommands {
         /// Delete at gateway-global scope.
         #[arg(long)]
         global: bool,
+
+        /// Skip the confirmation prompt for global setting delete.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1839,13 +1849,13 @@ async fn main() -> Result<()> {
                     let name = resolve_sandbox_name(name, &ctx.name)?;
                     run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
                 }
-                PolicyCommands::Delete { global } => {
+                PolicyCommands::Delete { global, yes } => {
                     if !global {
                         return Err(miette::miette!(
                             "sandbox policy delete is not supported; use --global to remove global policy lock"
                         ));
                     }
-                    run::gateway_setting_delete(&ctx.endpoint, "policy", &tls).await?;
+                    run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
                 }
             }
         }
@@ -1879,13 +1889,13 @@ async fn main() -> Result<()> {
                         run::sandbox_setting_set(&ctx.endpoint, &name, &key, &value, &tls).await?;
                     }
                 }
-                SettingsCommands::Delete { key, global } => {
+                SettingsCommands::Delete { key, global, yes } => {
                     if !global {
                         return Err(miette::miette!(
                             "sandbox settings cannot be deleted; use --global"
                         ));
                     }
-                    run::gateway_setting_delete(&ctx.endpoint, &key, &tls).await?;
+                    run::gateway_setting_delete(&ctx.endpoint, &key, yes, &tls).await?;
                 }
             }
         }
@@ -2990,14 +3000,42 @@ mod tests {
 
     #[test]
     fn policy_delete_global_parses() {
-        let cli = Cli::try_parse_from(["openshell", "policy", "delete", "--global"])
+        let cli = Cli::try_parse_from(["openshell", "policy", "delete", "--global", "--yes"])
             .expect("policy delete --global should parse");
 
         match cli.command {
             Some(Commands::Policy {
-                command: Some(PolicyCommands::Delete { global }),
-            }) => assert!(global),
+                command: Some(PolicyCommands::Delete { global, yes }),
+            }) => {
+                assert!(global);
+                assert!(yes);
+            }
             other => panic!("expected policy delete command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_delete_global_parses_yes_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "settings",
+            "delete",
+            "--global",
+            "--key",
+            "log_level",
+            "--yes",
+        ])
+        .expect("settings delete --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command: Some(SettingsCommands::Delete { key, global, yes }),
+            }) => {
+                assert_eq!(key, "log_level");
+                assert!(global);
+                assert!(yes);
+            }
+            other => panic!("expected settings delete command, got: {other:?}"),
         }
     }
 }

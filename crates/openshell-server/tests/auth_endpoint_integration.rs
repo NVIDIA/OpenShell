@@ -435,13 +435,13 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_settings(
         &self,
-        _: tonic::Request<openshell_core::proto::GetSandboxPolicyRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxPolicyResponse>, tonic::Status>
+        _: tonic::Request<openshell_core::proto::GetSandboxSettingsRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxSettingsResponse>, tonic::Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::GetSandboxPolicyResponse::default(),
+            openshell_core::proto::GetSandboxSettingsResponse::default(),
         ))
     }
 

@@ -321,12 +321,12 @@ sequenceDiagram
     participant GW as Gateway (gRPC)
     participant OPA as OPA Engine (Arc)
 
-    PL->>GW: GetSandboxPolicy(sandbox_id)
+    PL->>GW: GetSandboxSettings(sandbox_id)
     GW-->>PL: policy + version + hash
     PL->>PL: Store initial version
 
     loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 10)
-        PL->>GW: GetSandboxPolicy(sandbox_id)
+        PL->>GW: GetSandboxSettings(sandbox_id)
         GW-->>PL: policy + version + hash
         alt version > current_version
             PL->>OPA: reload_from_proto(policy)
@@ -347,8 +347,8 @@ sequenceDiagram
 The `run_policy_poll_loop()` function in `crates/openshell-sandbox/src/lib.rs` implements this loop:
 
 1. **Connect once**: Create a `CachedOpenShellClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
-2. **Fetch initial config revision**: Call `poll_policy(sandbox_id)` to establish baseline `current_config_revision`. On failure, log a warning and retry on the next interval.
-3. **Poll loop**: Sleep for the configured interval, then call `poll_policy()` again.
+2. **Fetch initial config revision**: Call `poll_settings(sandbox_id)` to establish baseline `current_config_revision`. On failure, log a warning and retry on the next interval.
+3. **Poll loop**: Sleep for the configured interval, then call `poll_settings()` again.
 4. **Config comparison**: If `result.config_revision == current_config_revision`, skip.
 5. **Reload attempt**: Call `opa_engine.reload_from_proto(policy)` when a policy payload is present. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
 6. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still reload, but they do not write per-sandbox policy status history.
@@ -364,7 +364,7 @@ pub struct CachedOpenShellClient {
     client: OpenShellClient<Channel>,
 }
 
-pub struct PolicyPollResult {
+pub struct SettingsPollResult {
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
@@ -375,16 +375,16 @@ pub struct PolicyPollResult {
 
 Methods:
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
-- **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing policy payload (optional), policy metadata, effective config revision, and policy source.
+- **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, and policy source.
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
 - **`raw_client()`**: Return a clone of the underlying `OpenShellClient<Channel>` for direct RPC calls (used by the log push task).
 
 ### Server-side policy versioning
 
-The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxPolicyResponse` now also carries effective settings and a `config_revision` fingerprint that changes when effective policy/settings change (including global overrides).
+The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxSettingsResponse` now also carries effective settings and a `config_revision` fingerprint that changes when effective policy/settings change (including global overrides).
 
 Proto messages involved:
-- `GetSandboxPolicyResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings`, `config_revision`, `policy_source`
+- `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings`, `config_revision`, `policy_source`
 - `ReportPolicyStatusRequest` (`proto/openshell.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
 - `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
 - `SandboxPolicyRevision` (`proto/openshell.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`

@@ -18,16 +18,17 @@ use openshell_core::proto::{
     DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
-    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider, ProviderResponse,
-    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
-    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
+    GetSandboxSettingsRequest, GetSandboxSettingsResponse, HealthRequest, HealthResponse,
+    ListProvidersRequest, ListProvidersResponse, ListSandboxPoliciesRequest,
+    ListSandboxPoliciesResponse, ListSandboxesRequest, ListSandboxesResponse, PolicyChunk,
+    PolicySource, PolicyStatus, Provider, ProviderResponse, PushSandboxLogsRequest,
+    PushSandboxLogsResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
+    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision, SandboxResponse,
+    SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateProviderRequest, UpdateSandboxPolicyRequest,
     UpdateSandboxPolicyResponse, WatchSandboxRequest, open_shell_server::OpenShell,
@@ -35,6 +36,7 @@ use openshell_core::proto::{
 use openshell_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
 };
+use openshell_core::settings::{self, SettingValueKind};
 use prost::Message;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -729,10 +731,10 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(DeleteProviderResponse { deleted }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_settings(
         &self,
-        request: Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
+        request: Request<GetSandboxSettingsRequest>,
+    ) -> Result<Response<GetSandboxSettingsResponse>, Status> {
         let sandbox_id = request.into_inner().sandbox_id;
 
         let sandbox = self
@@ -758,7 +760,7 @@ impl OpenShell for OpenShellService {
             debug!(
                 sandbox_id = %sandbox_id,
                 version = record.version,
-                "GetSandboxPolicy served from policy history"
+                "GetSandboxSettings served from policy history"
             );
             (
                 Some(decoded),
@@ -778,7 +780,7 @@ impl OpenShell for OpenShellService {
                 None => {
                     debug!(
                         sandbox_id = %sandbox_id,
-                        "GetSandboxPolicy: no policy configured, returning empty response"
+                        "GetSandboxSettings: no policy configured, returning empty response"
                     );
                     (None, 0, String::new())
                 }
@@ -815,7 +817,7 @@ impl OpenShell for OpenShellService {
 
                     info!(
                         sandbox_id = %sandbox_id,
-                        "GetSandboxPolicy served from spec (backfilled version 1)"
+                        "GetSandboxSettings served from spec (backfilled version 1)"
                     );
 
                     (Some(spec_policy), 1, hash)
@@ -841,7 +843,7 @@ impl OpenShell for OpenShellService {
         let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
         let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
 
-        Ok(Response::new(GetSandboxPolicyResponse {
+        Ok(Response::new(GetSandboxSettingsResponse {
             policy,
             version,
             policy_hash,
@@ -1100,6 +1102,9 @@ impl OpenShell for OpenShellService {
                     "reserved key 'policy' must be set via the policy field",
                 ));
             }
+            if key != POLICY_SETTING_KEY {
+                validate_registered_setting_key(key)?;
+            }
 
             let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
             let deleted = if req.delete_setting {
@@ -1109,7 +1114,7 @@ impl OpenShell for OpenShellService {
                     .setting_value
                     .as_ref()
                     .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
-                let stored = proto_setting_to_stored(setting)?;
+                let stored = proto_setting_to_stored(key, setting)?;
                 upsert_setting_value(&mut global_settings.settings, key, stored)
             };
 
@@ -1165,7 +1170,7 @@ impl OpenShell for OpenShellService {
                 .setting_value
                 .as_ref()
                 .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
-            let stored = proto_setting_to_stored(setting)?;
+            let stored = proto_setting_to_stored(key, setting)?;
 
             let mut sandbox_settings =
                 load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
@@ -2541,16 +2546,43 @@ fn compute_config_revision(
     u64::from_le_bytes(bytes)
 }
 
-fn proto_setting_to_stored(value: &SettingValue) -> Result<StoredSettingValue, Status> {
+fn validate_registered_setting_key(key: &str) -> Result<SettingValueKind, Status> {
+    settings::setting_for_key(key)
+        .map(|entry| entry.kind)
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "unknown setting key '{key}'. Allowed keys: {}",
+                settings::registered_keys_csv()
+            ))
+        })
+}
+
+fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSettingValue, Status> {
+    let expected = validate_registered_setting_key(key)?;
     let inner = value
         .value
         .as_ref()
         .ok_or_else(|| Status::invalid_argument("setting_value.value is required"))?;
-    let stored = match inner {
-        setting_value::Value::StringValue(v) => StoredSettingValue::String(v.clone()),
-        setting_value::Value::BoolValue(v) => StoredSettingValue::Bool(*v),
-        setting_value::Value::IntValue(v) => StoredSettingValue::Int(*v),
-        setting_value::Value::BytesValue(v) => StoredSettingValue::Bytes(hex::encode(v)),
+    let stored = match (expected, inner) {
+        (SettingValueKind::String, setting_value::Value::StringValue(v)) => {
+            StoredSettingValue::String(v.clone())
+        }
+        (SettingValueKind::Bool, setting_value::Value::BoolValue(v)) => {
+            StoredSettingValue::Bool(*v)
+        }
+        (SettingValueKind::Int, setting_value::Value::IntValue(v)) => StoredSettingValue::Int(*v),
+        (_, setting_value::Value::BytesValue(_)) => {
+            return Err(Status::invalid_argument(format!(
+                "setting '{key}' expects {} value; bytes are not supported for this key",
+                expected.as_str()
+            )));
+        }
+        (expected_kind, _) => {
+            return Err(Status::invalid_argument(format!(
+                "setting '{key}' expects {} value",
+                expected_kind.as_str()
+            )));
+        }
     };
     Ok(stored)
 }
@@ -5181,5 +5213,41 @@ mod tests {
         );
 
         assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_unknown_key() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                "hello".to_string(),
+            )),
+        };
+
+        let err = super::proto_setting_to_stored("unknown_key", &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_type_mismatch() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                "true".to_string(),
+            )),
+        };
+
+        let err = super::proto_setting_to_stored("dummy_bool", &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("expects bool value"));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_accepts_bool_for_registered_bool_key() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::BoolValue(true)),
+        };
+
+        let stored = super::proto_setting_to_stored("dummy_bool", &value).unwrap();
+        assert_eq!(stored, super::StoredSettingValue::Bool(true));
     }
 }

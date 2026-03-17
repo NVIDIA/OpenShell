@@ -9,10 +9,11 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxPolicyRequest,
-    GetSandboxProviderEnvironmentRequest, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateSandboxPolicyRequest,
-    inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxSettingsRequest, PolicySource, PolicyStatus,
+    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
+    UpdateSandboxPolicyRequest, inference_client::InferenceClient,
+    open_shell_client::OpenShellClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -101,7 +102,7 @@ async fn fetch_policy_with_client(
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
-        .get_sandbox_policy(GetSandboxPolicyRequest {
+        .get_sandbox_settings(GetSandboxSettingsRequest {
             sandbox_id: sandbox_id.to_string(),
         })
         .await
@@ -213,8 +214,8 @@ pub struct CachedOpenShellClient {
     client: OpenShellClient<Channel>,
 }
 
-/// Policy poll result returned by [`CachedOpenShellClient::poll_policy`].
-pub struct PolicyPollResult {
+/// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
+pub struct SettingsPollResult {
     pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
@@ -235,12 +236,12 @@ impl CachedOpenShellClient {
         self.client.clone()
     }
 
-    /// Poll for the current sandbox policy version.
-    pub async fn poll_policy(&self, sandbox_id: &str) -> Result<PolicyPollResult> {
+    /// Poll for current effective sandbox settings and policy metadata.
+    pub async fn poll_settings(&self, sandbox_id: &str) -> Result<SettingsPollResult> {
         let response = self
             .client
             .clone()
-            .get_sandbox_policy(GetSandboxPolicyRequest {
+            .get_sandbox_settings(GetSandboxSettingsRequest {
                 sandbox_id: sandbox_id.to_string(),
             })
             .await
@@ -248,7 +249,7 @@ impl CachedOpenShellClient {
 
         let inner = response.into_inner();
 
-        Ok(PolicyPollResult {
+        Ok(SettingsPollResult {
             policy: inner.policy,
             version: inner.version,
             policy_hash: inner.policy_hash,

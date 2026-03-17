@@ -112,9 +112,9 @@ sequenceDiagram
     GW-->>CLI: UpdateSandboxPolicyResponse(version=N, hash)
 
     loop Every 30s (configurable)
-        SB->>GW: GetSandboxPolicy(sandbox_id)
+        SB->>GW: GetSandboxSettings(sandbox_id)
         GW->>DB: get_latest_policy(sandbox_id)
-        GW-->>SB: GetSandboxPolicyResponse(policy, version=N, hash)
+        GW-->>SB: GetSandboxSettingsResponse(policy, version=N, hash)
     end
 
     Note over SB: Detects version > current_version
@@ -140,7 +140,7 @@ sequenceDiagram
 
 Each sandbox maintains an independent, monotonically increasing version counter for its policy revisions:
 
-- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxPolicy` call if no explicit revision exists in the policy history table. See `crates/openshell-server/src/grpc.rs` -- `get_sandbox_policy()`.
+- **Version 1** is the policy from the sandbox's `spec.policy` at creation time. It is backfilled lazily on the first `GetSandboxSettings` call if no explicit revision exists in the policy history table. See `crates/openshell-server/src/grpc.rs` -- `get_sandbox_settings()`.
 - Each `UpdateSandboxPolicy` call computes the next version as `latest_version + 1` and persists a new `PolicyRecord` with status `"pending"`.
 - When a new version is persisted, all older revisions still in `"pending"` status are marked `"superseded"` via `supersede_pending_policies()`. This handles rapid successive updates where the sandbox has not yet picked up an intermediate version.
 - The `Sandbox` protobuf object carries a `current_policy_version` field (see `proto/datamodel.proto`) that is updated when the sandbox reports a successful load.
@@ -182,7 +182,7 @@ In gRPC mode, the sandbox spawns a background task that periodically polls the g
 The poll loop:
 
 1. Connects a reusable gRPC client (`CachedOpenShellClient`) to avoid per-poll TLS handshake overhead.
-2. Fetches the current policy via `GetSandboxPolicy`, which returns the latest version, its policy payload, and a SHA-256 hash.
+2. Fetches the current policy via `GetSandboxSettings`, which returns the latest version, its policy payload, and a SHA-256 hash.
 3. Compares the returned version against the locally tracked `current_version`. If the server version is not greater, the loop sleeps and retries.
 4. On a new version, calls `OpaEngine::reload_from_proto()` which builds a complete new `regorus::Engine` through the same validated pipeline as the initial load (proto-to-JSON conversion, L7 validation, access preset expansion).
 5. If the new engine builds successfully, it atomically replaces the inner `Mutex<regorus::Engine>`. If it fails, the previous engine is untouched.

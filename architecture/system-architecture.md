@@ -123,7 +123,7 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: Sandbox --> Gateway (control plane)
     %% ============================================================
-    Supervisor -- "gRPC (mTLS):<br/>GetSandboxPolicy,<br/>GetProviderEnvironment,<br/>GetInferenceBundle,<br/>PushSandboxLogs" --> Gateway
+    Supervisor -- "gRPC (mTLS):<br/>GetSandboxSettings,<br/>GetProviderEnvironment,<br/>GetInferenceBundle,<br/>PushSandboxLogs" --> Gateway
 
     %% ============================================================
     %% CONNECTIONS: Sandbox --> External (via proxy)

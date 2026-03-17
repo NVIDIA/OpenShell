@@ -1315,7 +1315,7 @@ async fn run_policy_poll_loop(
     let mut current_config_revision: u64 = 0;
 
     // Initialize revision from the first poll.
-    match client.poll_policy(sandbox_id).await {
+    match client.poll_settings(sandbox_id).await {
         Ok(result) => {
             current_config_revision = result.config_revision;
             debug!(
@@ -1332,7 +1332,7 @@ async fn run_policy_poll_loop(
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = match client.poll_policy(sandbox_id).await {
+        let result = match client.poll_settings(sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
                 debug!(error = %e, "Policy poll: server unreachable, will retry");
