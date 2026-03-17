@@ -39,6 +39,17 @@ network_policies:
       - { path: /usr/local/bin/claude }
       - { path: /usr/bin/node }
 
+  kode_agent:
+    name: kode_agent
+    endpoints:
+      - { host: api.anthropic.com, port: 443 }
+      - { host: api.openai.com, port: 443 }
+    binaries:
+      - { path: /usr/local/bin/kode }
+      - { path: /usr/local/bin/kwa }
+      - { path: /usr/local/bin/kd }
+      - { path: /usr/bin/node }
+
   github_ssh_over_https:
     name: github-ssh-over-https
     endpoints:

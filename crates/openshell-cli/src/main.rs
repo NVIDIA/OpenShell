@@ -583,6 +583,7 @@ enum CliProviderType {
     Nvidia,
     Gitlab,
     Github,
+    Kode,
     Outlook,
 }
 
@@ -613,6 +614,7 @@ impl CliProviderType {
             Self::Nvidia => "nvidia",
             Self::Gitlab => "gitlab",
             Self::Github => "github",
+            Self::Kode => "kode",
             Self::Outlook => "outlook",
         }
     }

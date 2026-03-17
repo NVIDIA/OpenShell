@@ -6,6 +6,7 @@ pub mod claude;
 pub mod codex;
 pub mod generic;
 pub mod github;
+pub mod kode;
 pub mod gitlab;
 pub mod nvidia;
 pub mod openai;
