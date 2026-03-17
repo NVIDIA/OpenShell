@@ -61,7 +61,7 @@ EXAMPLES:
     curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 
     # Install a specific version
-    OPENSHELL_VERSION=v0.0.4 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+    OPENSHELL_VERSION=v0.0.9 curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
 
     # Install to /usr/local/bin
     OPENSHELL_INSTALL_DIR=/usr/local/bin curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
