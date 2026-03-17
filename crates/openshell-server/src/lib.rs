@@ -25,9 +25,10 @@ mod ws_tunnel;
 
 use openshell_core::{Config, Error, Result};
 use std::collections::HashMap;
+use std::io::ErrorKind;
 use std::sync::{Arc, Mutex};
 use tokio::net::TcpListener;
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
@@ -65,6 +66,13 @@ pub struct ServerState {
 
     /// Active SSH tunnel connection counts per sandbox id.
     pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+}
+
+fn is_benign_tls_handshake_failure(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::UnexpectedEof | ErrorKind::ConnectionReset
+    )
 }
 
 impl ServerState {
@@ -198,7 +206,11 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
                         }
                     }
                     Err(e) => {
-                        error!(error = %e, client = %addr, "TLS handshake failed");
+                        if is_benign_tls_handshake_failure(&e) {
+                            debug!(error = %e, client = %addr, "TLS handshake closed early");
+                        } else {
+                            error!(error = %e, client = %addr, "TLS handshake failed");
+                        }
                     }
                 }
             });
@@ -208,6 +220,32 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
                     error!(error = %e, client = %addr, "Connection error");
                 }
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_benign_tls_handshake_failure;
+    use std::io::{Error, ErrorKind};
+
+    #[test]
+    fn classifies_probe_style_tls_disconnects_as_benign() {
+        for kind in [ErrorKind::UnexpectedEof, ErrorKind::ConnectionReset] {
+            let error = Error::new(kind, "probe disconnected");
+            assert!(is_benign_tls_handshake_failure(&error));
+        }
+    }
+
+    #[test]
+    fn preserves_real_tls_failures_as_errors() {
+        for kind in [
+            ErrorKind::InvalidData,
+            ErrorKind::PermissionDenied,
+            ErrorKind::Other,
+        ] {
+            let error = Error::new(kind, "real tls failure");
+            assert!(!is_benign_tls_handshake_failure(&error));
         }
     }
 }

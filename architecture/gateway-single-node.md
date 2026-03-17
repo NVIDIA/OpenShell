@@ -188,9 +188,11 @@ After the container starts:
 1. **Clean stale nodes**: `clean_stale_nodes()` finds `NotReady` nodes via `kubectl get nodes` and deletes them. This is needed when a container is recreated but reuses the persistent volume -- k3s registers a new node (using the container ID as hostname) while old node entries persist in etcd. Non-fatal on error; returns the count of removed nodes.
 2. **Push local images** (optional, local deploy only): If `OPENSHELL_PUSH_IMAGES` is set, the comma-separated image refs are exported from the local Docker daemon as a single tar, uploaded into the container via `docker put_archive`, and imported into containerd via `ctr images import` in the `k8s.io` namespace. After import, `kubectl rollout restart deployment/openshell openshell` is run, followed by `kubectl rollout status --timeout=180s` to wait for completion. See `crates/openshell-bootstrap/src/push.rs`.
 3. **Wait for gateway health**: `wait_for_gateway_ready()` polls the Docker HEALTHCHECK status up to 180 times, 2 seconds apart (6 min total). A background task streams container logs during this wait. Failure modes:
-   - Container exits during polling: error includes recent log lines.
-   - Container has no HEALTHCHECK instruction: fails immediately.
-   - HEALTHCHECK reports unhealthy on final attempt: error includes recent logs.
+    - Container exits during polling: error includes recent log lines.
+    - Container has no HEALTHCHECK instruction: fails immediately.
+    - HEALTHCHECK reports unhealthy on final attempt: error includes recent logs.
+
+The gateway StatefulSet also uses a Kubernetes `startupProbe` on the gRPC port before steady-state liveness and readiness checks begin. This gives single-node k3s boots extra time to absorb early networking and flannel initialization delay without restarting the gateway pod too aggressively.
 
 ### 5) mTLS bundle capture
 

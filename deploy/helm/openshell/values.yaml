@@ -43,6 +43,10 @@ podLifecycle:
   terminationGracePeriodSeconds: 5
 
 probes:
+  startup:
+    periodSeconds: 2
+    timeoutSeconds: 1
+    failureThreshold: 30
   liveness:
     initialDelaySeconds: 2
     periodSeconds: 5
