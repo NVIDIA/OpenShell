@@ -34,6 +34,15 @@ jobs:
           fi
           echo "Latest tag: $latest"
 
+          # Skip if no new commits since the latest tag
+          commit_count=$(git rev-list "${latest}..HEAD" --count)
+          echo "Commits since $latest: $commit_count"
+          if [ "$commit_count" -eq 0 ]; then
+            echo "No new commits since $latest — skipping tag creation"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           major=$(echo "$latest" | sed 's/^v//' | cut -d. -f1)
           minor=$(echo "$latest" | sed 's/^v//' | cut -d. -f2)
           patch=$(echo "$latest" | sed 's/^v//' | cut -d. -f3)
@@ -48,11 +57,13 @@ jobs:
           echo "Next tag: $next"
 
       - name: Create and push tag
+        if: steps.version.outputs.skip != 'true'
         run: |
           git tag ${{ steps.version.outputs.next }}
           git push origin ${{ steps.version.outputs.next }}
 
       - name: Trigger Release Tag workflow
+        if: steps.version.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
