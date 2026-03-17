@@ -14,16 +14,11 @@
 #   OPENSHELL_VERSION     - Release tag to install (default: latest tagged release)
 #   OPENSHELL_INSTALL_DIR - Directory to install into (default: ~/.local/bin)
 #
-# CLI flags:
-#   --help            - Print usage information
-#   --no-modify-path  - Skip PATH modification in shell profiles
-#
 set -eu
 
 APP_NAME="openshell"
 REPO="NVIDIA/OpenShell"
 GITHUB_URL="https://github.com/${REPO}"
-NO_MODIFY_PATH=0
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -55,8 +50,7 @@ USAGE:
     ./install.sh [OPTIONS]
 
 OPTIONS:
-    --no-modify-path    Don't add the install directory to PATH
-    --help              Print this help message
+    --help    Print this help message
 
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION       Release tag to install (default: latest tagged release)
@@ -204,25 +198,14 @@ verify_checksum() {
 }
 
 # ---------------------------------------------------------------------------
-# Install location and PATH management
+# Install location
 # ---------------------------------------------------------------------------
 
-get_home() {
-  if [ -n "${HOME:-}" ]; then
-    echo "$HOME"
-  elif [ -n "${USER:-}" ]; then
-    getent passwd "$USER" | cut -d: -f6
+get_install_dir() {
+  if [ -n "${OPENSHELL_INSTALL_DIR:-}" ]; then
+    echo "$OPENSHELL_INSTALL_DIR"
   else
-    getent passwd "$(id -un)" | cut -d: -f6
-  fi
-}
-
-get_default_install_dir() {
-  if [ -n "${XDG_BIN_HOME:-}" ]; then
-    echo "$XDG_BIN_HOME"
-  else
-    _home="$(get_home)"
-    echo "${_home}/.local/bin"
+    echo "${HOME}/.local/bin"
   fi
 }
 
@@ -233,139 +216,6 @@ is_on_path() {
     *":${_dir}:"*) return 0 ;;
     *)             return 1 ;;
   esac
-}
-
-# Write a small env script that conditionally prepends the install dir to PATH.
-write_env_script_sh() {
-  _wes_dir_expr="$1"
-  _wes_out="$2"
-
-  cat <<ENVEOF > "$_wes_out"
-#!/bin/sh
-# Add OpenShell to PATH if not already present
-case ":\${PATH}:" in
-  *:"${_wes_dir_expr}":*)
-    ;;
-  *)
-    export PATH="${_wes_dir_expr}:\$PATH"
-    ;;
-esac
-ENVEOF
-}
-
-write_env_script_fish() {
-  _wef_dir_expr="$1"
-  _wef_out="$2"
-
-  cat <<ENVEOF > "$_wef_out"
-# Add OpenShell to PATH if not already present
-if not contains "${_wef_dir_expr}" \$PATH
-    set -gx PATH "${_wef_dir_expr}" \$PATH
-end
-ENVEOF
-}
-
-# Add a `. /path/to/env` line to a shell rc file if not already present.
-add_source_line() {
-  _asl_script="$1"
-  _asl_rcfile="$2"
-  _asl_shell="$3"
-
-  if [ "$_asl_shell" = "fish" ]; then
-    _asl_line="source \"${_asl_script}\""
-  else
-    _asl_line=". \"${_asl_script}\""
-  fi
-
-  # Check if line already exists
-  if [ -f "$_asl_rcfile" ] && grep -qF "$_asl_line" "$_asl_rcfile" 2>/dev/null; then
-    return 0
-  fi
-
-  # Append with a leading newline in case the file doesn't end with one
-  printf '\n%s\n' "$_asl_line" >> "$_asl_rcfile"
-  return 1
-}
-
-# Set up PATH modification in common shell rc files.
-setup_path() {
-  _install_dir="$1"
-  _home="$(get_home)"
-  _env_script="${_install_dir}/env"
-  _fish_env_script="${_install_dir}/env.fish"
-  _needs_source=0
-
-  # Replace $HOME in the expression for late-bound references in rc files
-  if [ -n "${HOME:-}" ]; then
-    # shellcheck disable=SC2016
-    _install_dir_expr='$HOME'"${_install_dir#"$_home"}"
-  else
-    _install_dir_expr="$_install_dir"
-  fi
-
-  # Write the env scripts
-  write_env_script_sh "$_install_dir_expr" "$_env_script"
-  write_env_script_fish "$_install_dir_expr" "$_fish_env_script"
-
-  # POSIX shells: .profile, .bashrc, .bash_profile, .zshrc, .zshenv
-  for _rcfile_rel in .profile .bashrc .bash_profile .zshrc .zshenv; do
-    _rcdir="$_home"
-    # zsh respects ZDOTDIR
-    case "$_rcfile_rel" in
-      .zsh*) _rcdir="${ZDOTDIR:-$_home}" ;;
-    esac
-    _rcfile="${_rcdir}/${_rcfile_rel}"
-    if [ -f "$_rcfile" ]; then
-      if ! add_source_line "$_env_script" "$_rcfile" "sh"; then
-        _needs_source=1
-      fi
-    fi
-  done
-
-  # If none of the above existed, create .profile
-  if [ "$_needs_source" = "0" ]; then
-    _found_any=0
-    for _rcfile_rel in .profile .bashrc .bash_profile .zshrc .zshenv; do
-      if [ -f "${_home}/${_rcfile_rel}" ]; then
-        _found_any=1
-        break
-      fi
-    done
-    if [ "$_found_any" = "0" ]; then
-      if ! add_source_line "$_env_script" "${_home}/.profile" "sh"; then
-        _needs_source=1
-      fi
-    fi
-  fi
-
-  # Fish shell
-  _fish_conf_dir="${_home}/.config/fish/conf.d"
-  if [ -d "${_home}/.config/fish" ]; then
-    mkdir -p "$_fish_conf_dir"
-    add_source_line "$_fish_env_script" "${_fish_conf_dir}/${APP_NAME}.env.fish" "fish" || true
-  fi
-
-  # GitHub Actions: write to GITHUB_PATH for CI environments
-  if [ -n "${GITHUB_PATH:-}" ]; then
-    echo "$_install_dir" >> "$GITHUB_PATH"
-  fi
-
-  if [ "$_needs_source" = "1" ] || ! is_on_path "$_install_dir"; then
-    # Detect the user's current shell to show the right source command
-    _current_shell="$(basename "${SHELL:-sh}" 2>/dev/null || echo "sh")"
-
-    echo ""
-    info "to add ${APP_NAME} to your PATH, restart your shell or run:"
-    info ""
-    case "$_current_shell" in
-      fish)
-        info "    source \"${_fish_env_script}\""
-        ;;
-      *)
-        info "    . \"${_env_script}\""
-        ;;
-    esac
-  fi
 }
 
 # ---------------------------------------------------------------------------
@@ -380,9 +230,6 @@ main() {
         usage
         exit 0
         ;;
-      --no-modify-path)
-        NO_MODIFY_PATH=1
-        ;;
       *)
         error "unknown option: $arg"
         ;;
@@ -396,15 +243,7 @@ main() {
   _filename="${APP_NAME}-${_target}.tar.gz"
   _download_url="${GITHUB_URL}/releases/download/${_version}/${_filename}"
   _checksums_url="${GITHUB_URL}/releases/download/${_version}/${APP_NAME}-checksums-sha256.txt"
-
-  # Determine install directory
-  _using_default_dir=0
-  if [ -n "${OPENSHELL_INSTALL_DIR:-}" ]; then
-    _install_dir="$OPENSHELL_INSTALL_DIR"
-  else
-    _install_dir="$(get_default_install_dir)"
-    _using_default_dir=1
-  fi
+  _install_dir="$(get_install_dir)"
 
   info "downloading ${APP_NAME} ${_version} (${_target})..."
 
@@ -443,11 +282,27 @@ main() {
   _installed_version="$("${_install_dir}/${APP_NAME}" --version 2>/dev/null || echo "${_version}")"
   info "installed ${APP_NAME} ${_installed_version} to ${_install_dir}/${APP_NAME}"
 
-  # Set up PATH for default install location
-  if [ "$_using_default_dir" = "1" ] && [ "$NO_MODIFY_PATH" = "0" ]; then
-    if ! is_on_path "$_install_dir"; then
-      setup_path "$_install_dir"
-    fi
+  # If the install directory isn't on PATH, print instructions
+  if ! is_on_path "$_install_dir"; then
+    echo ""
+    info "${_install_dir} is not on your PATH."
+    info ""
+    info "Add it by appending the following to your shell configuration file"
+    info "(e.g. ~/.bashrc, ~/.zshrc, or ~/.config/fish/config.fish):"
+    info ""
+
+    _current_shell="$(basename "${SHELL:-sh}" 2>/dev/null || echo "sh")"
+    case "$_current_shell" in
+      fish)
+        info "    fish_add_path ${_install_dir}"
+        ;;
+      *)
+        info "    export PATH=\"${_install_dir}:\$PATH\""
+        ;;
+    esac
+
+    info ""
+    info "Then restart your shell or run the command above in your current session."
   fi
 }
 
