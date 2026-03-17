@@ -25,7 +25,9 @@ jobs:
   # ---------------------------------------------------------------------------
   install-default:
     name: Install default (${{ matrix.arch }})
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
+    if: >-
+      github.event.workflow_run.conclusion == 'success'
+      && github.event.workflow_run.name == 'Release Tag'
     strategy:
       fail-fast: false
       matrix:
