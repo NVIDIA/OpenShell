@@ -46,18 +46,18 @@ First, complete OpenShell installation and follow the {doc}`/get-started/quickst
 If you prefer to work without having to keep the LM Studio app open, download llmster (headless LM Studio) with the following command:
 
 ### Linux/Mac
-```bash
-curl -fsSL https://lmstudio.ai/install.sh | bash
+```console
+$ curl -fsSL https://lmstudio.ai/install.sh | bash
 ```
 
 ### Windows
-```bash
-irm https://lmstudio.ai/install.ps1 | iex
+```console
+$ irm https://lmstudio.ai/install.ps1 | iex
 ```
 
 And start llmster:
-```bash
-lms daemon up
+```console
+$ lms daemon up
 ```
 
 ## Step 1: Start LM Studio Local Server
@@ -75,9 +75,9 @@ If you're using llmster in headless mode, run `lms server start --bind 0.0.0.0`.
 In the LM Studio app, head to the Model Search tab to download a small model like Qwen3.5 2B.
 
 In the terminal, use the following command to download and load the model:
-```bash
-lms get qwen/qwen3.5-2b
-lms load qwen/qwen3.5-2b
+```console
+$ lms get qwen/qwen3.5-2b
+$ lms load qwen/qwen3.5-2b
 ```
 
 
@@ -168,30 +168,28 @@ Run a simple request through `https://inference.local`:
 
 ::::{tab-item} OpenAI-compatible
 
-```console
-$ openshell sandbox create -- \
+```bash
+openshell sandbox create -- \
     curl https://inference.local/v1/chat/completions \
     --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
 
-$ openshell sandbox create -- \
+openshell sandbox create -- \
     curl https://inference.local/v1/responses \
-    -H "Content-Type: application/json" \
-    -d '{
+    --json '{
       "instructions": "You are a helpful assistant.",
       "input": "hello",
       "max_output_tokens": 10
-    }'    
+    }'
 ```
 
 ::::
 
 ::::{tab-item} Anthropic-compatible
 
-```console
-$ openshell sandbox create -- \
+```bash
+openshell sandbox create -- \
     curl https://inference.local/v1/messages \
-    -H "Content-Type: application/json" \
-    -d '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
+    --json '{"messages":[{"role":"user","content":"hello"}],"max_tokens":10}'
 ```
 
 ::::
