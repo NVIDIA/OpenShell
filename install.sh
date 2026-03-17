@@ -182,21 +182,21 @@ resolve_version() {
 # ---------------------------------------------------------------------------
 
 verify_checksum() {
-  _archive="$1"
-  _checksums="$2"
-  _filename="$3"
+  _vc_archive="$1"
+  _vc_checksums="$2"
+  _vc_filename="$3"
 
-  _expected="$(grep "$_filename" "$_checksums" | awk '{print $1}')"
+  _vc_expected="$(grep "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
 
-  if [ -z "$_expected" ]; then
-    warn "no checksum found for $_filename, skipping verification"
+  if [ -z "$_vc_expected" ]; then
+    warn "no checksum found for $_vc_filename, skipping verification"
     return 0
   fi
 
   if has_cmd shasum; then
-    echo "$_expected  $_archive" | shasum -a 256 -c --quiet 2>/dev/null
+    echo "$_vc_expected  $_vc_archive" | shasum -a 256 -c --quiet 2>/dev/null
   elif has_cmd sha256sum; then
-    echo "$_expected  $_archive" | sha256sum -c --quiet 2>/dev/null
+    echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
   else
     warn "sha256sum/shasum not found, skipping checksum verification"
     return 0
@@ -237,53 +237,53 @@ is_on_path() {
 
 # Write a small env script that conditionally prepends the install dir to PATH.
 write_env_script_sh() {
-  _install_dir_expr="$1"
-  _env_script="$2"
+  _wes_dir_expr="$1"
+  _wes_out="$2"
 
-  cat <<ENVEOF > "$_env_script"
+  cat <<ENVEOF > "$_wes_out"
 #!/bin/sh
 # Add OpenShell to PATH if not already present
 case ":\${PATH}:" in
-  *:"${_install_dir_expr}":*)
+  *:"${_wes_dir_expr}":*)
     ;;
   *)
-    export PATH="${_install_dir_expr}:\$PATH"
+    export PATH="${_wes_dir_expr}:\$PATH"
     ;;
 esac
 ENVEOF
 }
 
 write_env_script_fish() {
-  _install_dir_expr="$1"
-  _env_script="$2"
+  _wef_dir_expr="$1"
+  _wef_out="$2"
 
-  cat <<ENVEOF > "$_env_script"
+  cat <<ENVEOF > "$_wef_out"
 # Add OpenShell to PATH if not already present
-if not contains "${_install_dir_expr}" \$PATH
-    set -gx PATH "${_install_dir_expr}" \$PATH
+if not contains "${_wef_dir_expr}" \$PATH
+    set -gx PATH "${_wef_dir_expr}" \$PATH
 end
 ENVEOF
 }
 
 # Add a `. /path/to/env` line to a shell rc file if not already present.
 add_source_line() {
-  _env_script_path="$1"
-  _rcfile="$2"
-  _shell_type="$3"
+  _asl_script="$1"
+  _asl_rcfile="$2"
+  _asl_shell="$3"
 
-  if [ "$_shell_type" = "fish" ]; then
-    _line="source \"${_env_script_path}\""
+  if [ "$_asl_shell" = "fish" ]; then
+    _asl_line="source \"${_asl_script}\""
   else
-    _line=". \"${_env_script_path}\""
+    _asl_line=". \"${_asl_script}\""
   fi
 
   # Check if line already exists
-  if [ -f "$_rcfile" ] && grep -qF "$_line" "$_rcfile" 2>/dev/null; then
+  if [ -f "$_asl_rcfile" ] && grep -qF "$_asl_line" "$_asl_rcfile" 2>/dev/null; then
     return 0
   fi
 
   # Append with a leading newline in case the file doesn't end with one
-  printf '\n%s\n' "$_line" >> "$_rcfile"
+  printf '\n%s\n' "$_asl_line" >> "$_asl_rcfile"
   return 1
 }
 
