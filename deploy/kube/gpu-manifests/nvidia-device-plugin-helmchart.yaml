@@ -19,9 +19,7 @@ metadata:
   name: nvidia-device-plugin
   namespace: kube-system
 spec:
-  repo: https://nvidia.github.io/k8s-device-plugin
-  chart: nvidia-device-plugin
-  version: "0.18.2"
+  chart: https://%{KUBERNETES_API}%/static/charts/nvidia-device-plugin-0.18.2.tgz
   targetNamespace: nvidia-device-plugin
   createNamespace: true
   valuesContent: |-

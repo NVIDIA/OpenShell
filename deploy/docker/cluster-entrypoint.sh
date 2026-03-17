@@ -328,6 +328,102 @@ if [ "${GPU_ENABLED:-}" = "true" ]; then
             cp "$manifest" "$K3S_MANIFESTS/"
         done
     fi
+
+    # -------------------------------------------------------------------
+    # WSL2 GPU support: CDI mode + libdxcore.so injection + node labeling
+    # -------------------------------------------------------------------
+    # WSL2 virtualises GPU access through /dev/dxg instead of native
+    # /dev/nvidia* device nodes. The legacy nvidia-container-runtime
+    # injection path fails because:
+    #   1. NVML can't initialise without libdxcore.so (the bridge between
+    #      Linux NVML and the Windows DirectX GPU Kernel via /dev/dxg)
+    #   2. NFD can't detect NVIDIA PCI vendor (WSL2 hides PCI topology)
+    #
+    # Fix: switch to CDI mode, patch the CDI spec with libdxcore.so, and
+    # add a k3s manifest that labels the node for the device plugin
+    # DaemonSet affinity.
+    if [ -c /dev/dxg ]; then
+        echo "WSL2 detected (/dev/dxg present) — configuring CDI mode for GPU"
+
+        # 1. Generate CDI spec (nvidia-ctk auto-detects WSL mode)
+        if command -v nvidia-ctk >/dev/null 2>&1; then
+            mkdir -p /var/run/cdi
+            nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml 2>&1 || true
+
+            # 2. Patch CDI spec: add libdxcore.so mount (nvidia-ctk misses it)
+            DXCORE_PATH=$(find /usr/lib -name "libdxcore.so" 2>/dev/null | head -1)
+            if [ -n "$DXCORE_PATH" ] && [ -f /var/run/cdi/nvidia.yaml ]; then
+                DXCORE_DIR=$(dirname "$DXCORE_PATH")
+                # Insert libdxcore mount after the mounts: key
+                sed -i "/^    mounts:/a\\
+        - hostPath: $DXCORE_PATH\\
+          containerPath: $DXCORE_PATH\\
+          options:\\
+            - ro\\
+            - nosuid\\
+            - nodev\\
+            - rbind\\
+            - rprivate" /var/run/cdi/nvidia.yaml
+                # Add ldcache folder for libdxcore directory
+                sed -i "s|update-ldcache|update-ldcache\n            - --folder\n            - $DXCORE_DIR|" /var/run/cdi/nvidia.yaml
+                echo "CDI spec patched with libdxcore.so from $DXCORE_PATH"
+            else
+                echo "Warning: libdxcore.so not found — NVML may fail inside pods"
+            fi
+        fi
+
+        # 3. Switch nvidia container runtime to CDI mode
+        NVIDIA_RUNTIME_CONFIG="/etc/nvidia-container-runtime/config.toml"
+        if [ -f "$NVIDIA_RUNTIME_CONFIG" ]; then
+            sed -i 's/mode = "auto"/mode = "cdi"/' "$NVIDIA_RUNTIME_CONFIG"
+            echo "nvidia-container-runtime switched to CDI mode"
+        fi
+
+        # 4. Create a k3s manifest to label the node with NVIDIA PCI vendor
+        #    (NFD can't detect it on WSL2 since PCI topology is virtualised)
+        cat > "$K3S_MANIFESTS/wsl2-gpu-node-label.yaml" <<'WSLEOF'
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: wsl2-gpu-node-label
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      serviceAccountName: default
+      hostNetwork: true
+      tolerations:
+        - operator: Exists
+      containers:
+        - name: label
+          image: rancher/mirrored-library-busybox:1.37.0
+          command:
+            - /bin/sh
+            - -c
+            - |
+              # Wait for the API server, then label the node
+              until wget -qO- --no-check-certificate https://kubernetes.default.svc/api/v1/nodes 2>/dev/null | grep -q '"items"'; do
+                sleep 2
+              done
+              NODE=$(wget -qO- --no-check-certificate \
+                -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+                https://kubernetes.default.svc/api/v1/nodes 2>/dev/null \
+                | sed -n 's/.*"name":"\([^"]*\)".*/\1/p' | head -1)
+              if [ -n "$NODE" ]; then
+                wget -qO- --no-check-certificate \
+                  -H "Authorization: Bearer $(cat /var/run/secrets/kubernetes.io/serviceaccount/token)" \
+                  -H "Content-Type: application/strategic-merge-patch+json" \
+                  --method=PATCH \
+                  --body-data='{"metadata":{"labels":{"feature.node.kubernetes.io/pci-10de.present":"true"}}}' \
+                  "https://kubernetes.default.svc/api/v1/nodes/$NODE" >/dev/null 2>&1 \
+                  && echo "Labeled node $NODE with pci-10de.present=true" \
+                  || echo "Warning: failed to label node $NODE"
+              fi
+      restartPolicy: OnFailure
+  backoffLimit: 10
+WSLEOF
+        echo "WSL2 GPU node-label job manifest installed"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

@@ -176,6 +176,18 @@ mkdir -p deploy/docker/.build/charts
 echo "Packaging helm chart..."
 helm package deploy/helm/openshell -d deploy/docker/.build/charts/
 
+# Download nvidia-device-plugin chart for GPU support (bundled to avoid
+# dependency on the upstream GitHub Pages Helm repo at cluster start time)
+NVIDIA_DP_VERSION="0.18.2"
+NVIDIA_DP_CHART="deploy/docker/.build/charts/nvidia-device-plugin-${NVIDIA_DP_VERSION}.tgz"
+if [ ! -f "$NVIDIA_DP_CHART" ]; then
+    echo "Downloading nvidia-device-plugin chart v${NVIDIA_DP_VERSION}..."
+    curl -fsSL "https://raw.githubusercontent.com/NVIDIA/k8s-device-plugin/gh-pages/stable/nvidia-device-plugin-${NVIDIA_DP_VERSION}.tgz" \
+        -o "$NVIDIA_DP_CHART" || {
+        echo "Warning: failed to download nvidia-device-plugin chart; GPU support may not work"
+    }
+fi
+
 # ---------------------------------------------------------------------------
 # Step 3: Build and push multi-arch cluster image.
 # The cluster image includes the supervisor binary (built from Rust source)
