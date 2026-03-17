@@ -6,7 +6,7 @@ name: Release Auto-Tag
 on:
   workflow_dispatch: {}
   schedule:
-    - cron: "0 3 * * *" # 7 PM PT (03:00 UTC during PDT)
+    - cron: "0 2 * * *" # 7 PM PDT
 
 permissions:
   contents: write
