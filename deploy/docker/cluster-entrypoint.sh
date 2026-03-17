@@ -345,55 +345,93 @@ if [ "${GPU_ENABLED:-}" = "true" ]; then
     if [ -c /dev/dxg ]; then
         echo "WSL2 detected (/dev/dxg present) — configuring CDI mode for GPU"
 
-        # 1. Generate CDI spec (nvidia-ctk auto-detects WSL mode)
-        if command -v nvidia-ctk >/dev/null 2>&1; then
+        # 1. Build a complete CDI spec from scratch.
+        #    nvidia-ctk cdi generate has two WSL2 bugs:
+        #      a) only creates name=all but the device plugin assigns by UUID
+        #      b) misses libdxcore.so (the NVML-to-DXG bridge library)
+        #    Writing the spec directly avoids fragile sed patching of YAML.
+        if command -v nvidia-ctk >/dev/null 2>&1 && command -v nvidia-smi >/dev/null 2>&1; then
             mkdir -p /var/run/cdi
-            nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml 2>&1 || true
 
-            # 2. Add per-GPU device entries (UUID and index) to CDI spec.
-            #    nvidia-ctk only generates name=all, but the device plugin
-            #    assigns GPUs by UUID which must resolve as a CDI device.
-            if [ -f /var/run/cdi/nvidia.yaml ] && command -v nvidia-smi >/dev/null 2>&1; then
-                idx=0
-                nvidia-smi --query-gpu=gpu_uuid --format=csv,noheader 2>/dev/null | while read -r uuid; do
-                    uuid=$(echo "$uuid" | tr -d ' ')
-                    [ -z "$uuid" ] && continue
-                    sed -i "/- name: all/a\\
-    - name: $uuid\\
-      containerEdits:\\
-        deviceNodes:\\
-            - path: /dev/dxg\\
-    - name: \"$idx\"\\
-      containerEdits:\\
-        deviceNodes:\\
-            - path: /dev/dxg" /var/run/cdi/nvidia.yaml
-                    idx=$((idx + 1))
-                done
-                # nvidia-ctk cdi generate uses cdiVersion 0.3.0 but the
-                # installed CDI library requires >= 0.5.0
-                sed -i 's/cdiVersion: 0\.3\.0/cdiVersion: 0.5.0/' /var/run/cdi/nvidia.yaml
-                echo "CDI spec: added per-GPU UUID and index device entries"
-            fi
-
-            # 4. Patch CDI spec: add libdxcore.so mount (nvidia-ctk misses it)
+            GPU_UUID=$(nvidia-smi --query-gpu=gpu_uuid --format=csv,noheader 2>/dev/null | tr -d ' ' | head -1)
             DXCORE_PATH=$(find /usr/lib -name "libdxcore.so" 2>/dev/null | head -1)
-            if [ -n "$DXCORE_PATH" ] && [ -f /var/run/cdi/nvidia.yaml ]; then
-                DXCORE_DIR=$(dirname "$DXCORE_PATH")
-                # Insert libdxcore mount after the mounts: key
-                sed -i "/^    mounts:/a\\
-        - hostPath: $DXCORE_PATH\\
-          containerPath: $DXCORE_PATH\\
-          options:\\
-            - ro\\
-            - nosuid\\
-            - nodev\\
-            - rbind\\
-            - rprivate" /var/run/cdi/nvidia.yaml
-                # Add ldcache folder for libdxcore directory
-                sed -i "s|update-ldcache|update-ldcache\n            - --folder\n            - $DXCORE_DIR|" /var/run/cdi/nvidia.yaml
-                echo "CDI spec patched with libdxcore.so from $DXCORE_PATH"
+            DXCORE_DIR=$(dirname "$DXCORE_PATH" 2>/dev/null || echo "/usr/lib/x86_64-linux-gnu")
+            DRIVER_DIR=$(ls -d /usr/lib/wsl/drivers/nv*.inf_amd64_* 2>/dev/null | head -1)
+
+            if [ -n "$DRIVER_DIR" ] && [ -n "$GPU_UUID" ]; then
+                cat > /var/run/cdi/nvidia.yaml <<CDIEOF
+---
+cdiVersion: "0.5.0"
+kind: nvidia.com/gpu
+devices:
+    - name: all
+      containerEdits:
+        deviceNodes:
+            - path: /dev/dxg
+    - name: "${GPU_UUID}"
+      containerEdits:
+        deviceNodes:
+            - path: /dev/dxg
+    - name: "0"
+      containerEdits:
+        deviceNodes:
+            - path: /dev/dxg
+containerEdits:
+    env:
+        - NVIDIA_VISIBLE_DEVICES=void
+    hooks:
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - create-symlinks
+            - --link
+            - ${DRIVER_DIR}/nvidia-smi::/usr/bin/nvidia-smi
+          env:
+            - NVIDIA_CTK_DEBUG=false
+        - hookName: createContainer
+          path: /usr/bin/nvidia-cdi-hook
+          args:
+            - nvidia-cdi-hook
+            - update-ldcache
+            - --folder
+            - ${DRIVER_DIR}
+            - --folder
+            - ${DXCORE_DIR}
+          env:
+            - NVIDIA_CTK_DEBUG=false
+    mounts:
+        - hostPath: ${DXCORE_PATH}
+          containerPath: ${DXCORE_PATH}
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/libcuda.so.1.1
+          containerPath: ${DRIVER_DIR}/libcuda.so.1.1
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/libcuda_loader.so
+          containerPath: ${DRIVER_DIR}/libcuda_loader.so
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/libnvdxgdmal.so.1
+          containerPath: ${DRIVER_DIR}/libnvdxgdmal.so.1
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/libnvidia-ml.so.1
+          containerPath: ${DRIVER_DIR}/libnvidia-ml.so.1
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/libnvidia-ml_loader.so
+          containerPath: ${DRIVER_DIR}/libnvidia-ml_loader.so
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/libnvidia-ptxjitcompiler.so.1
+          containerPath: ${DRIVER_DIR}/libnvidia-ptxjitcompiler.so.1
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/nvcubins.bin
+          containerPath: ${DRIVER_DIR}/nvcubins.bin
+          options: [ro, nosuid, nodev, rbind, rprivate]
+        - hostPath: ${DRIVER_DIR}/nvidia-smi
+          containerPath: ${DRIVER_DIR}/nvidia-smi
+          options: [ro, nosuid, nodev, rbind, rprivate]
+CDIEOF
+                echo "CDI spec written (GPU: $GPU_UUID, driver: $DRIVER_DIR, dxcore: $DXCORE_PATH)"
             else
-                echo "Warning: libdxcore.so not found — NVML may fail inside pods"
+                echo "Warning: could not detect GPU UUID or WSL driver store — CDI spec not written"
             fi
         fi
 
