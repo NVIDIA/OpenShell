@@ -4,3 +4,6 @@
 # Agent infrastructure — tighter review
 .agents/ @NVIDIA/openshell-codeowners
 AGENTS.md @NVIDIA/openshell-codeowners
+
+# Vouch list — maintainers only (bot commits bypass, but manual edits need review)
+.github/VOUCHED.td @NVIDIA/openshell-codeowners

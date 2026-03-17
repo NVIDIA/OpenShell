@@ -45,11 +45,19 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 | `.agents/agents/` | Agent personas | Sub-agent definitions (e.g., reviewer, doc writer) |
 | `architecture/` | Architecture docs | Design decisions and component documentation |
 
+## Vouch System
+
+- First-time external contributors must be vouched before their PRs are accepted. The `vouch-check` workflow auto-closes PRs from unvouched users.
+- Org members and collaborators bypass the vouch gate automatically.
+- Maintainers vouch users by commenting `/vouch` on a Vouch Request discussion. The `vouch-command` workflow appends the username to `.github/VOUCHED.td`.
+- Skills that create PRs (`create-github-pr`, `build-from-issue`) should note this requirement when operating on behalf of external contributors.
+
 ## Issue and PR Conventions
 
 - **Bug reports** must include an agent diagnostic section — proof that the reporter's agent investigated the issue before filing. See the issue template.
 - **Feature requests** must include a design proposal, not just a "please build this" request. See the issue template.
 - **PRs** must follow the PR template structure: Summary, Related Issue, Changes, Testing, Checklist.
+- **PRs from unvouched external contributors** are automatically closed. See the Vouch System section above.
 - **Security vulnerabilities** must NOT be filed as GitHub issues. Follow [SECURITY.md](SECURITY.md).
 - Skills that create issues or PRs (`create-github-issue`, `create-github-pr`, `build-from-issue`) should produce output conforming to these templates.
 

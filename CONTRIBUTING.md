@@ -2,6 +2,40 @@
 
 OpenShell is built agent-first. We design systems and use agents to implement them. Your agent is your first collaborator — point it at this repo before opening issues, asking questions, or submitting code.
 
+## The Critical Rule
+
+**You must understand your code.** Using AI agents to write code is not just acceptable, it's how this project works. But you must be able to explain what your changes do and how they interact with the rest of the system. If you can't, don't submit it.
+
+Submitting agent-generated code without understanding it — regardless of how clean it looks — wastes maintainer time and will result in your PR being closed. Repeat offenders will be blocked from the project.
+
+## AI Usage
+
+OpenShell is agent-first, not agent-only. The distinction matters:
+
+- **Do** use agents to explore the codebase, run diagnostics, generate code, and iterate on implementations.
+- **Do** use the skills in `.agents/skills/` — they exist to make your agent effective.
+- **Do** interrogate your agent until you understand every edge case and interaction in your changes.
+- **Don't** submit code you can't explain without your agent open.
+- **Don't** use agents as a substitute for understanding the system. Read the architecture docs.
+
+## First-Time Contributors
+
+We use a vouch system. This exists because AI makes it trivial to generate plausible-looking but low-quality contributions, and we can no longer trust by default.
+
+1. Open a [Vouch Request](https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request) discussion.
+2. Describe what you want to change and why.
+3. Write in your own words. AI-generated vouch requests will be denied.
+4. A maintainer will comment `/vouch` if approved.
+5. Once vouched, you can submit pull requests.
+
+**If you are not vouched, any pull request you open will be automatically closed.** Org members and collaborators with push access bypass this check.
+
+### Finding Work
+
+Issues labeled [`good-first-issue`](https://github.com/NVIDIA/OpenShell/issues?q=is%3Aissue+is%3Aopen+label%3Agood-first-issue) are scoped, well-documented, and friendly to new contributors. Start there. If you need guidance, comment on the issue.
+
+All open issues are actionable — if it's in the issue tracker, it's ready to be worked on.
+
 ## Before You Open an Issue
 
 This project ships with [agent skills](#agent-skills-for-contributors) that can diagnose problems, explore the codebase, generate policies, and walk you through common workflows. Before filing an issue:

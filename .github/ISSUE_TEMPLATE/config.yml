@@ -1,5 +1,11 @@
 blank_issues_enabled: false
 contact_links:
+  - name: First-time contributor? Get vouched first
+    url: https://github.com/NVIDIA/OpenShell/discussions/new?category=vouch-request
+    about: >
+      First-time contributors must be vouched before submitting PRs. Open a
+      Vouch Request discussion describing what you want to work on. A
+      maintainer will approve you with /vouch.
   - name: Have a question?
     url: https://github.com/NVIDIA/OpenShell/blob/main/CONTRIBUTING.md#agent-skills-for-contributors
     about: >
