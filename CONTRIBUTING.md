@@ -168,6 +168,9 @@ These are the primary `mise` tasks for day-to-day development:
 
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
+| `mise run build`   | Build the whole project (Rust crates, Docker images, Python wheel) |
+| `mise run build:docker:gateway` | Build one Docker image using the `build:[tool]:[component]` layout |
+| `mise run build:python:wheel` | Build one Python wheel using the `build:[tool]:[component]` layout |
 | `mise run cluster` | Bootstrap or incremental deploy                         |
 | `mise run sandbox` | Create a sandbox on the running cluster                 |
 | `mise run test`    | Default test suite                                      |

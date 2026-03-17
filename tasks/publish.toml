@@ -12,8 +12,8 @@ VERSION_DOCKER=$(uv run python tasks/scripts/release.py get-version --docker)
 VERSION_PYTHON=$(uv run python tasks/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 IMAGE_TAG=dev TAG_LATEST=true EXTRA_DOCKER_TAGS="$VERSION_DOCKER" mise run docker:publish:cluster:multiarch
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:multiarch
+OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:macos
 uv run python tasks/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """
 hide = true
@@ -27,8 +27,8 @@ VERSION_DOCKER=$(uv run python tasks/scripts/release.py get-version --docker)
 VERSION_PYTHON=$(uv run python tasks/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
 IMAGE_TAG="$VERSION_DOCKER" TAG_LATEST=false mise run docker:publish:cluster:multiarch
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:multiarch
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:macos
+OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:multiarch
+OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:macos
 uv run python tasks/scripts/release.py python-publish --version "$VERSION_PYTHON"
 """
 hide = true

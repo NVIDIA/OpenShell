@@ -3,32 +3,57 @@
 
 # Docker image build tasks
 
-["docker:build"]
+["build:docker"]
 description = "Build all Docker images"
 depends = [
-  "docker:build:gateway",
-  "docker:build:cluster",
+  "build:docker:gateway",
+  "build:docker:cluster",
 ]
 hide = true
 
-["docker:build:ci"]
+["docker:build"]
+description = "Alias for build:docker"
+depends = ["build:docker"]
+hide = true
+
+["build:docker:ci"]
 description = "Build the CI Docker image"
 run = "tasks/scripts/docker-build-component.sh ci"
 hide = true
 
-["docker:build:gateway"]
+["docker:build:ci"]
+description = "Alias for build:docker:ci"
+depends = ["build:docker:ci"]
+hide = true
+
+["build:docker:gateway"]
 description = "Build the gateway Docker image"
 run = "tasks/scripts/docker-build-component.sh gateway"
 hide = true
 
-["docker:build:cluster"]
+["docker:build:gateway"]
+description = "Alias for build:docker:gateway"
+depends = ["build:docker:gateway"]
+hide = true
+
+["build:docker:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
 run = "tasks/scripts/docker-build-cluster.sh"
 hide = true
 
-["docker:build:cluster:multiarch"]
+["docker:build:cluster"]
+description = "Alias for build:docker:cluster"
+depends = ["build:docker:cluster"]
+hide = true
+
+["build:docker:cluster:multiarch"]
 description = "Build multi-arch cluster image and push to a registry"
 run = "tasks/scripts/docker-publish-multiarch.sh --mode registry"
+hide = true
+
+["docker:build:cluster:multiarch"]
+description = "Alias for build:docker:cluster:multiarch"
+depends = ["build:docker:cluster:multiarch"]
 hide = true
 
 ["docker:publish:cluster:multiarch"]

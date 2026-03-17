@@ -10,7 +10,7 @@ run = "tasks/scripts/cluster.sh"
 ["cluster:build:full"]
 description = "Build and deploy local k3s cluster with OpenShell"
 depends = [
-  "docker:build:gateway",
+  "build:docker:gateway",
 ]
 run = "tasks/scripts/cluster-bootstrap.sh build"
 hide = true

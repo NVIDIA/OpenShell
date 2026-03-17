@@ -9,13 +9,18 @@ depends = ["python:proto"]
 run = "uv sync --group dev && uv pip install ."
 hide = true
 
-["python:build"]
+["build:python:wheel"]
 description = "Build Python wheel with CLI binary (native)"
 depends = ["python:proto"]
 run = "uv run maturin build --release"
 hide = true
 
-["python:build:multiarch"]
+["python:build"]
+description = "Alias for build:python:wheel"
+depends = ["build:python:wheel"]
+hide = true
+
+["build:python:wheel:multiarch"]
 description = "Build Python wheels for Linux amd64/arm64 with buildx"
 depends = ["python:proto"]
 run = """
@@ -102,7 +107,12 @@ ls -la target/wheels/*.whl
 """
 hide = true
 
-["python:build:macos"]
+["python:build:multiarch"]
+description = "Alias for build:python:wheel:multiarch"
+depends = ["build:python:wheel:multiarch"]
+hide = true
+
+["build:python:wheel:macos"]
 description = "Build Python wheel for macOS arm64"
 depends = ["python:proto"]
 run = """
@@ -124,14 +134,19 @@ if [ "$(uname -s)" = "Darwin" ] && [ -z "${OPENSHELL_CARGO_VERSION:-}" ]; then
   uv run maturin build --release --target aarch64-apple-darwin --out target/wheels
 else
   echo "Building macOS wheel via Docker cross-toolchain"
-  mise run python:build:macos:docker
+  mise run build:python:wheel:macos:docker
 fi
 
 ls -la target/wheels/*.whl
 """
 hide = true
 
-["python:build:macos:docker"]
+["python:build:macos"]
+description = "Alias for build:python:wheel:macos"
+depends = ["build:python:wheel:macos"]
+hide = true
+
+["build:python:wheel:macos:docker"]
 description = "Build Python wheel for macOS arm64 from Docker"
 depends = ["python:proto"]
 run = """
@@ -181,9 +196,19 @@ ls -la target/wheels/*macosx*arm64.whl
 """
 hide = true
 
-["python:build:all"]
+["python:build:macos:docker"]
+description = "Alias for build:python:wheel:macos:docker"
+depends = ["build:python:wheel:macos:docker"]
+hide = true
+
+["build:python:wheel:all"]
 description = "Build Python wheels for Linux and macOS"
-depends = ["python:build", "python:build:multiarch", "python:build:macos"]
+depends = ["build:python:wheel", "build:python:wheel:multiarch", "build:python:wheel:macos"]
+hide = true
+
+["python:build:all"]
+description = "Alias for build:python:wheel:all"
+depends = ["build:python:wheel:all"]
 hide = true
 
 ["python:lint"]
@@ -216,7 +241,7 @@ run = """
 set -euo pipefail
 VERSION=$(uv run python tasks/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run python:build:all
+OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:all
 uv run python tasks/scripts/release.py python-publish --version "$VERSION"
 """
 hide = true

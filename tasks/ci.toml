@@ -4,11 +4,25 @@
 # CI, build, and quality tasks
 
 [build]
+description = "Build the whole project"
+depends = ["build:rust:workspace", "build:docker", "build:python:wheel"]
+
+["build:rust"]
+description = "Alias for build:rust:workspace"
+depends = ["build:rust:workspace"]
+hide = true
+
+["build:rust:workspace"]
 description = "Build all Rust crates"
 run = "cargo build --workspace"
 hide = true
 
 ["build:release"]
+description = "Alias for build:rust:workspace:release"
+depends = ["build:rust:workspace:release"]
+hide = true
+
+["build:rust:workspace:release"]
 description = "Build all Rust crates in release mode"
 run = "cargo build --workspace --release"
 hide = true
