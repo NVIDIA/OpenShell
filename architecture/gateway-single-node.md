@@ -29,7 +29,7 @@ Out of scope:
 - `crates/openshell-bootstrap/src/push.rs`: Local development image push into k3s containerd.
 - `crates/openshell-bootstrap/src/paths.rs`: XDG path resolution.
 - `crates/openshell-bootstrap/src/constants.rs`: Shared constants (image name, container/volume/network naming).
-- `deploy/docker/Dockerfile.cluster`: Container image definition (k3s base + Helm charts + manifests + entrypoint).
+- `deploy/docker/Dockerfile.images` (target `cluster`): Container image definition (k3s base + Helm charts + manifests + entrypoint).
 - `deploy/docker/cluster-entrypoint.sh`: Container entrypoint (DNS proxy, registry config, manifest injection).
 - `deploy/docker/cluster-healthcheck.sh`: Docker HEALTHCHECK script.
 - Docker daemon(s):
@@ -228,7 +228,7 @@ After deploy, the CLI calls `save_active_gateway(name)`, writing the gateway nam
 
 ## Container Image
 
-The gateway image is defined in `deploy/docker/Dockerfile.cluster`:
+The cluster image is defined by target `cluster` in `deploy/docker/Dockerfile.images`:
 
 ```
 Base:  rancher/k3s:v1.35.2-k3s1
@@ -298,7 +298,7 @@ GPU support is part of the single-node gateway bootstrap path rather than a sepa
 
 - `openshell gateway start --gpu` threads a boolean deploy option through `crates/openshell-cli`, `crates/openshell-bootstrap`, and `crates/openshell-bootstrap/src/docker.rs`.
 - When enabled, the cluster container is created with Docker `DeviceRequests`, which is the API equivalent of `docker run --gpus all`.
-- `deploy/docker/Dockerfile.cluster` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
+- `deploy/docker/Dockerfile.images` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
 - `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
 - `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`, along with GPU Feature Discovery and Node Feature Discovery.
 - k3s auto-detects `nvidia-container-runtime` on `PATH`, registers the `nvidia` containerd runtime, and creates the `nvidia` `RuntimeClass` automatically.
@@ -454,7 +454,7 @@ openshell/
 - `crates/openshell-cli/src/main.rs` -- CLI command definitions
 - `crates/openshell-cli/src/run.rs` -- CLI command implementations
 - `crates/openshell-cli/src/bootstrap.rs` -- auto-bootstrap from sandbox create
-- `deploy/docker/Dockerfile.cluster` -- container image definition
+- `deploy/docker/Dockerfile.images` -- shared image build definition (cluster target)
 - `deploy/docker/cluster-entrypoint.sh` -- container entrypoint script
 - `deploy/docker/cluster-healthcheck.sh` -- Docker HEALTHCHECK script
 - `deploy/kube/manifests/openshell-helmchart.yaml` -- OpenShell Helm chart manifest
