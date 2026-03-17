@@ -82,15 +82,13 @@ jobs:
             fi
           fi
 
-      - name: Install CLI from GitHub Release
+      - name: Install CLI from published install script
         run: |
           set -euo pipefail
-          ./install.sh
+          export OPENSHELL_VERSION="${{ steps.release.outputs.tag }}"
+          export OPENSHELL_INSTALL_DIR="${{ runner.temp }}/openshell-bin"
+          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
           echo "$OPENSHELL_INSTALL_DIR" >> "$GITHUB_PATH"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          OPENSHELL_VERSION: ${{ steps.release.outputs.tag }}
-          OPENSHELL_INSTALL_DIR: ${{ runner.temp }}/openshell-bin
 
       - name: Verify CLI installation
         run: |

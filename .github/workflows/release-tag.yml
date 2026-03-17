@@ -364,37 +364,10 @@ jobs:
 
             ### Quick install
 
-            Requires the [GitHub CLI (`gh`)](https://cli.github.com) to be installed and authenticated.
-
             ```bash
-            sh -c 'ARCH=$(uname -m); OS=$(uname -s); \
-                case "${OS}-${ARCH}" in \
-                  Linux-x86_64)  ASSET="openshell-x86_64-unknown-linux-musl.tar.gz" ;; \
-                  Linux-aarch64) ASSET="openshell-aarch64-unknown-linux-musl.tar.gz" ;; \
-                  Darwin-arm64)  ASSET="openshell-aarch64-apple-darwin.tar.gz" ;; \
-                  *) echo "Unsupported platform: ${OS}-${ARCH}" >&2; exit 1 ;; \
-                esac; \
-                gh release download ${{ env.RELEASE_TAG }} --repo NVIDIA/OpenShell --pattern "${ASSET}" -O - \
-                  | tar xz \
-                  && sudo install -m 755 openshell /usr/local/bin/openshell'
+            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
             ```
 
-            ### Docker images
-
-            ```bash
-            docker pull ghcr.io/nvidia/openshell/gateway:${{ needs.compute-versions.outputs.semver }}
-            docker pull ghcr.io/nvidia/openshell/cluster:${{ needs.compute-versions.outputs.semver }}
-            ```
-
-            ### Assets
-
-            | File | Platform |
-            |------|----------|
-            | `openshell-x86_64-unknown-linux-musl.tar.gz` | Linux x86_64 |
-            | `openshell-aarch64-unknown-linux-musl.tar.gz` | Linux aarch64 / ARM64 |
-            | `openshell-aarch64-apple-darwin.tar.gz` | macOS Apple Silicon |
-            | `openshell-*.whl` | Python wheels |
-            | `openshell-checksums-sha256.txt` | SHA256 checksums for all archives |
           files: |
             release/openshell-x86_64-unknown-linux-musl.tar.gz
             release/openshell-aarch64-unknown-linux-musl.tar.gz
