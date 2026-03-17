@@ -437,12 +437,27 @@ message GetSandboxProviderEnvironmentResponse {
 
 // Update sandbox policy request.
 message UpdateSandboxPolicyRequest {
-  // Sandbox name (canonical lookup key).
+  // Sandbox name (canonical lookup key). Required for sandbox-scoped updates.
+  // Not required when `global=true`.
   string name = 1;
-  // The new policy to apply. Only network_policies and inference fields may
-  // differ from the create-time policy; static fields (filesystem, landlock,
-  // process) must match version 1 or the request is rejected.
+  // The new policy to apply.
+  //
+  // Sandbox scope (`global=false`):
+  // - only network_policies and inference fields may differ from create-time
+  //   policy; static fields must match version 1.
+  //
+  // Global scope (`global=true`):
+  // - applies to all sandboxes in full (no merge).
   openshell.sandbox.v1.SandboxPolicy policy = 2;
+  // Optional single setting key to mutate.
+  string setting_key = 3;
+  // Setting value for upsert operations.
+  openshell.sandbox.v1.SettingValue setting_value = 4;
+  // Delete the setting key from scope.
+  // Sandbox-scoped deletes are rejected; only global delete is supported.
+  bool delete_setting = 5;
+  // Apply mutation at gateway-global scope.
+  bool global = 6;
 }
 
 // Update sandbox policy response.
@@ -451,6 +466,10 @@ message UpdateSandboxPolicyResponse {
   uint32 version = 1;
   // SHA-256 hash of the serialized policy payload.
   string policy_hash = 2;
+  // Settings revision for the scope that was modified.
+  uint64 settings_revision = 3;
+  // True when a setting delete operation removed an existing key.
+  bool deleted = 4;
 }
 
 // Get sandbox policy status request.

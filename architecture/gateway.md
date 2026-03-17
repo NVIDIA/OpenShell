@@ -231,7 +231,7 @@ These RPCs are called by sandbox pods at startup to bootstrap themselves.
 
 | RPC | Description |
 |-----|-------------|
-| `GetSandboxPolicy` | Returns the `SandboxPolicy` from a sandbox's spec, looked up by sandbox ID. |
+| `GetSandboxPolicy` | Returns effective sandbox config looked up by sandbox ID: policy payload, policy metadata, and effective settings. Global settings override sandbox-level values per key. |
 | `GetSandboxProviderEnvironment` | Resolves provider credentials into environment variables for a sandbox. Iterates the sandbox's `spec.providers` list, fetches each `Provider`, and collects credential key-value pairs. First provider wins on duplicate keys. Skips credential keys that do not match `^[A-Za-z_][A-Za-z0-9_]*$`. |
 
 #### Policy Recommendation (Network Rules)

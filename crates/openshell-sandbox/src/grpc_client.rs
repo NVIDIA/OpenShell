@@ -10,7 +10,7 @@ use std::time::Duration;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
     DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxPolicyRequest,
-    GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
+    GetSandboxProviderEnvironmentRequest, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
     SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateSandboxPolicyRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
@@ -129,6 +129,10 @@ async fn sync_policy_with_client(
         .update_sandbox_policy(UpdateSandboxPolicyRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
+            setting_key: String::new(),
+            setting_value: None,
+            delete_setting: false,
+            global: false,
         })
         .await
         .into_diagnostic()
@@ -211,9 +215,11 @@ pub struct CachedOpenShellClient {
 
 /// Policy poll result returned by [`CachedOpenShellClient::poll_policy`].
 pub struct PolicyPollResult {
-    pub policy: ProtoSandboxPolicy,
+    pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
+    pub config_revision: u64,
+    pub policy_source: PolicySource,
 }
 
 impl CachedOpenShellClient {
@@ -241,14 +247,14 @@ impl CachedOpenShellClient {
             .into_diagnostic()?;
 
         let inner = response.into_inner();
-        let policy = inner
-            .policy
-            .ok_or_else(|| miette::miette!("Server returned empty policy"))?;
 
         Ok(PolicyPollResult {
-            policy,
+            policy: inner.policy,
             version: inner.version,
             policy_hash: inner.policy_hash,
+            config_revision: inner.config_revision,
+            policy_source: PolicySource::try_from(inner.policy_source)
+                .unwrap_or(PolicySource::Unspecified),
         })
     }
 

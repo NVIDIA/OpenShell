@@ -147,6 +147,31 @@ The following steps outline the hot-reload policy update workflow.
    $ openshell policy list <name>
    ```
 
+## Global Policy Override
+
+Use a global policy when you want one policy payload to apply to every sandbox.
+
+```console
+$ openshell policy set --global --policy ./global-policy.yaml
+```
+
+When a global policy is configured:
+
+- The global payload is applied in full for all sandboxes.
+- Sandbox-level policy updates are rejected until the global policy is removed.
+
+To restore sandbox-level policy control, delete the global policy setting:
+
+```console
+$ openshell policy delete --global
+```
+
+You can inspect a sandbox's effective settings and policy source with:
+
+```console
+$ openshell settings get <name>
+```
+
 ## Debug Denied Requests
 
 Check `openshell logs <name> --tail --source sandbox` for the denied host, path, and binary.

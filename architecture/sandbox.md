@@ -347,11 +347,11 @@ sequenceDiagram
 The `run_policy_poll_loop()` function in `crates/openshell-sandbox/src/lib.rs` implements this loop:
 
 1. **Connect once**: Create a `CachedOpenShellClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
-2. **Fetch initial version**: Call `poll_policy(sandbox_id)` to establish the baseline `current_version`. On failure, log a warning and retry on the next interval.
+2. **Fetch initial config revision**: Call `poll_policy(sandbox_id)` to establish baseline `current_config_revision`. On failure, log a warning and retry on the next interval.
 3. **Poll loop**: Sleep for the configured interval, then call `poll_policy()` again.
-4. **Version comparison**: If `result.version <= current_version`, skip. The version is a monotonically increasing `u32` per sandbox.
-5. **Reload attempt**: Call `opa_engine.reload_from_proto(&result.policy)`. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
-6. **Status reporting**: On success, report `PolicyStatus::Loaded` to the gateway via `ReportPolicyStatus` RPC. On failure, report `PolicyStatus::Failed` with the error message. Status report failures are logged but do not affect the poll loop.
+4. **Config comparison**: If `result.config_revision == current_config_revision`, skip.
+5. **Reload attempt**: Call `opa_engine.reload_from_proto(policy)` when a policy payload is present. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
+6. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still reload, but they do not write per-sandbox policy status history.
 
 ### `CachedOpenShellClient`
 
@@ -365,24 +365,26 @@ pub struct CachedOpenShellClient {
 }
 
 pub struct PolicyPollResult {
-    pub policy: ProtoSandboxPolicy,
+    pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
+    pub config_revision: u64,
+    pub policy_source: PolicySource,
 }
 ```
 
 Methods:
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
-- **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing the policy, version, and hash.
+- **`poll_policy(sandbox_id)`**: Call `GetSandboxPolicy` RPC and return a `PolicyPollResult` containing policy payload (optional), policy metadata, effective config revision, and policy source.
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
 - **`raw_client()`**: Return a clone of the underlying `OpenShellClient<Channel>` for direct RPC calls (used by the log push task).
 
 ### Server-side policy versioning
 
-The gateway assigns a monotonically increasing version number to each policy revision per sandbox. The `GetSandboxPolicyResponse` includes `version` and `policy_hash` fields. The `ReportPolicyStatus` RPC records which version the sandbox successfully loaded (or failed to load), enabling operators to query `GetSandboxPolicyStatus` for the current active version and load history.
+The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxPolicyResponse` now also carries effective settings and a `config_revision` fingerprint that changes when effective policy/settings change (including global overrides).
 
 Proto messages involved:
-- `GetSandboxPolicyResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`
+- `GetSandboxPolicyResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings`, `config_revision`, `policy_source`
 - `ReportPolicyStatusRequest` (`proto/openshell.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
 - `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
 - `SandboxPolicyRevision` (`proto/openshell.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`

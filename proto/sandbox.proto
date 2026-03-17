@@ -115,6 +115,36 @@ message GetSandboxPolicyRequest {
   string sandbox_id = 1;
 }
 
+// Scope that currently controls a setting.
+enum SettingScope {
+  SETTING_SCOPE_UNSPECIFIED = 0;
+  SETTING_SCOPE_SANDBOX = 1;
+  SETTING_SCOPE_GLOBAL = 2;
+}
+
+// Type-aware setting value for sandbox/gateway settings.
+message SettingValue {
+  oneof value {
+    string string_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    bytes bytes_value = 4;
+  }
+}
+
+// Effective setting value and the scope it was resolved from.
+message EffectiveSetting {
+  SettingValue value = 1;
+  SettingScope scope = 2;
+}
+
+// Source used for the policy payload in GetSandboxPolicyResponse.
+enum PolicySource {
+  POLICY_SOURCE_UNSPECIFIED = 0;
+  POLICY_SOURCE_SANDBOX = 1;
+  POLICY_SOURCE_GLOBAL = 2;
+}
+
 // Response containing sandbox policy.
 message GetSandboxPolicyResponse {
   // The sandbox policy configuration.
@@ -123,4 +153,10 @@ message GetSandboxPolicyResponse {
   uint32 version = 2;
   // SHA-256 hash of the serialized policy payload.
   string policy_hash = 3;
+  // Effective settings resolved for this sandbox, excluding the reserved policy key.
+  map<string, EffectiveSetting> settings = 4;
+  // Fingerprint for effective config (policy + settings). Changes when any effective input changes.
+  uint64 config_revision = 5;
+  // Source of the policy payload for this response.
+  PolicySource policy_source = 6;
 }

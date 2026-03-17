@@ -234,7 +234,7 @@ The CLI is the primary way users interact with the platform. It provides command
 
 - **Gateway management** (`openshell gateway`): Deploy, stop, destroy, and inspect clusters. Supports both local and remote (SSH) targets.
 - **Sandbox management** (`openshell sandbox`): Create sandboxes (with optional file upload and provider auto-discovery), connect to sandboxes via SSH, and delete sandboxes.
-- **Top-level commands**: `openshell status` (cluster health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management).
+- **Top-level commands**: `openshell status` (cluster health), `openshell logs` (sandbox logs), `openshell forward` (port forwarding), `openshell policy` (sandbox policy management), `openshell settings` (effective sandbox settings and global/sandbox key updates).
 - **Provider management** (`openshell provider`): Create, update, list, and delete external service credentials.
 - **Inference management** (`openshell cluster inference`): Configure cluster-level inference by specifying a provider and model. The gateway resolves endpoint and credential details from the named provider record.
 

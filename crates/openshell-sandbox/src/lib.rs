@@ -1309,15 +1309,19 @@ async fn run_policy_poll_loop(
     interval_secs: u64,
 ) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::proto::PolicySource;
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
-    let mut current_version: u32 = 0;
+    let mut current_config_revision: u64 = 0;
 
-    // Initialize current_version from the first poll.
+    // Initialize revision from the first poll.
     match client.poll_policy(sandbox_id).await {
         Ok(result) => {
-            current_version = result.version;
-            debug!(version = current_version, "Policy poll: initial version");
+            current_config_revision = result.config_revision;
+            debug!(
+                config_revision = current_config_revision,
+                "Policy poll: initial config revision"
+            );
         }
         Err(e) => {
             warn!(error = %e, "Policy poll: failed to fetch initial version, will retry");
@@ -1336,30 +1340,38 @@ async fn run_policy_poll_loop(
             }
         };
 
-        if result.version <= current_version {
+        if result.config_revision == current_config_revision {
             continue;
         }
 
         info!(
-            old_version = current_version,
-            new_version = result.version,
+            old_config_revision = current_config_revision,
+            new_config_revision = result.config_revision,
             policy_hash = %result.policy_hash,
-            "Policy poll: new version detected, reloading"
+            "Policy poll: config change detected, reloading"
         );
 
-        match opa_engine.reload_from_proto(&result.policy) {
+        let Some(policy) = result.policy.as_ref() else {
+            warn!("Policy poll: config changed but no policy payload present; skipping reload");
+            current_config_revision = result.config_revision;
+            continue;
+        };
+
+        match opa_engine.reload_from_proto(policy) {
             Ok(()) => {
-                current_version = result.version;
+                current_config_revision = result.config_revision;
                 info!(
-                    version = current_version,
+                    config_revision = current_config_revision,
                     policy_hash = %result.policy_hash,
                     "Policy reloaded successfully"
                 );
-                if let Err(e) = client
-                    .report_policy_status(sandbox_id, result.version, true, "")
-                    .await
-                {
-                    warn!(error = %e, "Failed to report policy load success");
+                if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                    if let Err(e) = client
+                        .report_policy_status(sandbox_id, result.version, true, "")
+                        .await
+                    {
+                        warn!(error = %e, "Failed to report policy load success");
+                    }
                 }
             }
             Err(e) => {
@@ -1368,11 +1380,13 @@ async fn run_policy_poll_loop(
                     error = %e,
                     "Policy reload failed, keeping last-known-good policy"
                 );
-                if let Err(report_err) = client
-                    .report_policy_status(sandbox_id, result.version, false, &e.to_string())
-                    .await
-                {
-                    warn!(error = %report_err, "Failed to report policy load failure");
+                if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                    if let Err(report_err) = client
+                        .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                        .await
+                    {
+                        warn!(error = %report_err, "Failed to report policy load failure");
+                    }
                 }
             }
         }

@@ -25,11 +25,12 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
-    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
-    SetClusterInferenceRequest, UpdateProviderRequest, UpdateSandboxPolicyRequest,
-    WatchSandboxRequest,
+    GetSandboxLogsRequest, GetSandboxPolicyRequest, GetSandboxPolicyStatusRequest,
+    GetSandboxRequest, HealthRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
+    ListSandboxesRequest, PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase,
+    SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope,
+    SettingValue, UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
+    setting_value,
 };
 use openshell_providers::{
     ProviderRegistry, detect_provider_from_command, normalize_provider_type,
@@ -3783,6 +3784,246 @@ fn parse_duration_to_ms(s: &str) -> Result<i64> {
     Ok(num * multiplier)
 }
 
+fn confirm_global_setting_takeover(key: &str, yes: bool) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Err(miette::miette!(
+            "global setting updates require confirmation; pass --yes in non-interactive mode"
+        ));
+    }
+
+    let proceed = Confirm::with_theme(&ColorfulTheme::default())
+        .with_prompt(format!(
+            "Setting '{key}' globally will disable sandbox-level management for this key. Continue?"
+        ))
+        .default(false)
+        .interact()
+        .into_diagnostic()?;
+
+    if !proceed {
+        return Err(miette::miette!("aborted by user"));
+    }
+
+    Ok(())
+}
+
+fn format_setting_value(value: Option<&SettingValue>) -> String {
+    let Some(value) = value.and_then(|v| v.value.as_ref()) else {
+        return "<unset>".to_string();
+    };
+    match value {
+        setting_value::Value::StringValue(v) => v.clone(),
+        setting_value::Value::BoolValue(v) => v.to_string(),
+        setting_value::Value::IntValue(v) => v.to_string(),
+        setting_value::Value::BytesValue(v) => format!("<bytes:{}>", v.len()),
+    }
+}
+
+pub async fn sandbox_policy_set_global(
+    server: &str,
+    policy_path: &str,
+    yes: bool,
+    wait: bool,
+    _timeout_secs: u64,
+    tls: &TlsOptions,
+) -> Result<()> {
+    if wait {
+        return Err(miette::miette!(
+            "--wait is only supported for sandbox-scoped policy updates"
+        ));
+    }
+
+    confirm_global_setting_takeover("policy", yes)?;
+
+    let policy = load_sandbox_policy(Some(policy_path))?
+        .ok_or_else(|| miette::miette!("No policy loaded from {policy_path}"))?;
+
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: String::new(),
+            policy: Some(policy),
+            setting_key: String::new(),
+            setting_value: None,
+            delete_setting: false,
+            global: true,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    eprintln!(
+        "{} Global policy configured (hash: {}, settings revision: {})",
+        "✓".green().bold(),
+        if response.policy_hash.len() >= 12 {
+            &response.policy_hash[..12]
+        } else {
+            &response.policy_hash
+        },
+        response.settings_revision,
+    );
+    Ok(())
+}
+
+pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let sandbox = client
+        .get_sandbox(GetSandboxRequest {
+            name: name.to_string(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner()
+        .sandbox
+        .ok_or_else(|| miette::miette!("sandbox not found"))?;
+
+    let response = client
+        .get_sandbox_policy(GetSandboxPolicyRequest {
+            sandbox_id: sandbox.id.clone(),
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    let policy_source =
+        if response.policy_source == openshell_core::proto::PolicySource::Global as i32 {
+            "global"
+        } else {
+            "sandbox"
+        };
+
+    println!("Sandbox:       {}", name);
+    println!("Config Rev:    {}", response.config_revision);
+    println!("Policy Source: {}", policy_source);
+    println!("Policy Hash:   {}", response.policy_hash);
+
+    if response.settings.is_empty() {
+        println!("Settings:      (none)");
+        return Ok(());
+    }
+
+    println!("Settings:");
+    let mut keys: Vec<_> = response.settings.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(setting) = response.settings.get(&key) {
+            let scope = match SettingScope::try_from(setting.scope) {
+                Ok(SettingScope::Global) => "global",
+                Ok(SettingScope::Sandbox) => "sandbox",
+                _ => "unknown",
+            };
+            println!(
+                "  {} = {} ({})",
+                key,
+                format_setting_value(setting.value.as_ref()),
+                scope
+            );
+        }
+    }
+
+    Ok(())
+}
+
+pub async fn gateway_setting_set(
+    server: &str,
+    key: &str,
+    value: &str,
+    yes: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    confirm_global_setting_takeover(key, yes)?;
+
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: String::new(),
+            policy: None,
+            setting_key: key.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::StringValue(value.to_string())),
+            }),
+            delete_setting: false,
+            global: true,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    println!(
+        "{} Set global setting {}={} (revision {})",
+        "✓".green().bold(),
+        key,
+        value,
+        response.settings_revision
+    );
+    Ok(())
+}
+
+pub async fn sandbox_setting_set(
+    server: &str,
+    name: &str,
+    key: &str,
+    value: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: name.to_string(),
+            policy: None,
+            setting_key: key.to_string(),
+            setting_value: Some(SettingValue {
+                value: Some(setting_value::Value::StringValue(value.to_string())),
+            }),
+            delete_setting: false,
+            global: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    println!(
+        "{} Set sandbox setting {}={} for {} (revision {})",
+        "✓".green().bold(),
+        key,
+        value,
+        name,
+        response.settings_revision
+    );
+    Ok(())
+}
+
+pub async fn gateway_setting_delete(server: &str, key: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: String::new(),
+            policy: None,
+            setting_key: key.to_string(),
+            setting_value: None,
+            delete_setting: true,
+            global: true,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.deleted {
+        println!(
+            "{} Deleted global setting {} (revision {})",
+            "✓".green().bold(),
+            key,
+            response.settings_revision
+        );
+    } else {
+        println!("{} Global setting {} not found", "!".yellow(), key,);
+    }
+    Ok(())
+}
+
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,
@@ -3811,6 +4052,10 @@ pub async fn sandbox_policy_set(
         .update_sandbox_policy(UpdateSandboxPolicyRequest {
             name: name.to_string(),
             policy: Some(policy),
+            setting_key: String::new(),
+            setting_value: None,
+            delete_setting: false,
+            global: false,
         })
         .await
         .into_diagnostic()?;

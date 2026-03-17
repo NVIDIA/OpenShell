@@ -6,36 +6,39 @@
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, generate_name,
+    DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store, generate_name,
 };
 use futures::future;
+use openshell_core::proto::setting_value;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
-    ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
+    ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
     GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyRequest,
     GetSandboxPolicyResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PolicyChunk, PolicyStatus, Provider, ProviderResponse,
+    ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider, ProviderResponse,
     PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SshSession, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateProviderRequest, UpdateSandboxPolicyRequest, UpdateSandboxPolicyResponse,
-    WatchSandboxRequest, open_shell_server::OpenShell,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateProviderRequest, UpdateSandboxPolicyRequest,
+    UpdateSandboxPolicyResponse, WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use openshell_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
 };
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -102,6 +105,32 @@ const MAX_PROVIDER_CREDENTIALS_ENTRIES: usize = 32;
 
 /// Maximum number of entries in the provider `config` map.
 const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
+
+/// Internal object type for durable gateway-global settings.
+const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
+/// Internal object id/name for the singleton global settings record.
+const GLOBAL_SETTINGS_ID: &str = "global";
+const GLOBAL_SETTINGS_NAME: &str = "global";
+/// Internal object type for durable sandbox-scoped settings.
+const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
+/// Reserved settings key used to store global policy payload.
+const POLICY_SETTING_KEY: &str = "policy";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoredSettings {
+    revision: u64,
+    settings: BTreeMap<String, StoredSettingValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value")]
+enum StoredSettingValue {
+    String(String),
+    Bool(bool),
+    Int(i64),
+    /// Hex-encoded binary payload.
+    Bytes(String),
+}
 
 /// Clamp a client-provided page `limit`.
 ///
@@ -722,73 +751,103 @@ impl OpenShell for OpenShellService {
             .await
             .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-        if let Some(record) = latest {
-            let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+        let mut policy_source = PolicySource::Sandbox;
+        let (mut policy, mut version, mut policy_hash) = if let Some(record) = latest {
+            let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
             debug!(
                 sandbox_id = %sandbox_id,
                 version = record.version,
                 "GetSandboxPolicy served from policy history"
             );
-            return Ok(Response::new(GetSandboxPolicyResponse {
-                policy: Some(policy),
-                version: u32::try_from(record.version).unwrap_or(0),
-                policy_hash: record.policy_hash,
-            }));
-        }
+            (
+                Some(decoded),
+                u32::try_from(record.version).unwrap_or(0),
+                record.policy_hash,
+            )
+        } else {
+            // Lazy backfill: no policy history exists yet.
+            let spec = sandbox
+                .spec
+                .ok_or_else(|| Status::internal("sandbox has no spec"))?;
 
-        // Lazy backfill: no policy history exists yet.
-        let spec = sandbox
-            .spec
-            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+            match spec.policy {
+                // If spec.policy is None, the sandbox was created without a policy.
+                // Return an empty policy payload so the sandbox can discover policy
+                // from disk or fall back to its restrictive default.
+                None => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        "GetSandboxPolicy: no policy configured, returning empty response"
+                    );
+                    (None, 0, String::new())
+                }
+                Some(spec_policy) => {
+                    let hash = deterministic_policy_hash(&spec_policy);
+                    let payload = spec_policy.encode_to_vec();
+                    let policy_id = uuid::Uuid::new_v4().to_string();
 
-        // If spec.policy is None, the sandbox was created without a policy.
-        // Return an empty response so the sandbox can discover policy from disk
-        // or fall back to its restrictive default.
-        let Some(policy) = spec.policy else {
-            debug!(
-                sandbox_id = %sandbox_id,
-                "GetSandboxPolicy: no policy configured, returning empty response"
-            );
-            return Ok(Response::new(GetSandboxPolicyResponse {
-                policy: None,
-                version: 0,
-                policy_hash: String::new(),
-            }));
+                    // Best-effort backfill: if it fails (e.g., concurrent backfill race), we still
+                    // return the policy from spec.
+                    if let Err(e) = self
+                        .state
+                        .store
+                        .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
+                        .await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %e,
+                            "Failed to backfill policy version 1"
+                        );
+                    } else if let Err(e) = self
+                        .state
+                        .store
+                        .update_policy_status(&sandbox_id, 1, "loaded", None, None)
+                        .await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %e,
+                            "Failed to mark backfilled policy as loaded"
+                        );
+                    }
+
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        "GetSandboxPolicy served from spec (backfilled version 1)"
+                    );
+
+                    (Some(spec_policy), 1, hash)
+                }
+            }
         };
 
-        // Create version 1 from spec.policy.
-        let payload = policy.encode_to_vec();
-        let hash = deterministic_policy_hash(&policy);
-        let policy_id = uuid::Uuid::new_v4().to_string();
+        let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+        let sandbox_settings =
+            load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
 
-        // Best-effort backfill: if it fails (e.g., concurrent backfill race), we still
-        // return the policy from spec.
-        if let Err(e) = self
-            .state
-            .store
-            .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
-            .await
-        {
-            warn!(sandbox_id = %sandbox_id, error = %e, "Failed to backfill policy version 1");
-        } else if let Err(e) = self
-            .state
-            .store
-            .update_policy_status(&sandbox_id, 1, "loaded", None, None)
-            .await
-        {
-            warn!(sandbox_id = %sandbox_id, error = %e, "Failed to mark backfilled policy as loaded");
+        if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
+            policy = Some(global_policy.clone());
+            policy_hash = deterministic_policy_hash(&global_policy);
+            policy_source = PolicySource::Global;
+            // Keep sandbox policy version for status APIs, but global policy
+            // updates are tracked via config_revision.
+            if version == 0 {
+                version = 1;
+            }
         }
 
-        info!(
-            sandbox_id = %sandbox_id,
-            "GetSandboxPolicy served from spec (backfilled version 1)"
-        );
+        let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
+        let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
 
         Ok(Response::new(GetSandboxPolicyResponse {
-            policy: Some(policy),
-            version: 1,
-            policy_hash: hash,
+            policy,
+            version,
+            policy_hash,
+            settings,
+            config_revision,
+            policy_source: policy_source.into(),
         }))
     }
 
@@ -986,12 +1045,92 @@ impl OpenShell for OpenShellService {
         request: Request<UpdateSandboxPolicyRequest>,
     ) -> Result<Response<UpdateSandboxPolicyResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+        let key = req.setting_key.trim();
+        let has_policy = req.policy.is_some();
+        let has_setting = !key.is_empty();
+
+        if has_policy && has_setting {
+            return Err(Status::invalid_argument(
+                "policy and setting_key cannot be set in the same request",
+            ));
         }
-        let mut new_policy = req
-            .policy
-            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+        if !has_policy && !has_setting {
+            return Err(Status::invalid_argument(
+                "either policy or setting_key must be provided",
+            ));
+        }
+
+        if req.global {
+            if has_policy {
+                if req.delete_setting {
+                    return Err(Status::invalid_argument(
+                        "delete_setting cannot be combined with policy payload",
+                    ));
+                }
+                let mut new_policy = req.policy.ok_or_else(|| {
+                    Status::invalid_argument("policy is required for global policy update")
+                })?;
+                openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
+                validate_policy_safety(&new_policy)?;
+
+                let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
+                let stored_value =
+                    StoredSettingValue::Bytes(hex::encode(new_policy.encode_to_vec()));
+                let changed = upsert_setting_value(
+                    &mut global_settings.settings,
+                    POLICY_SETTING_KEY,
+                    stored_value,
+                );
+                if changed {
+                    global_settings.revision = global_settings.revision.saturating_add(1);
+                    save_global_settings(self.state.store.as_ref(), &global_settings).await?;
+                }
+
+                return Ok(Response::new(UpdateSandboxPolicyResponse {
+                    version: 0,
+                    policy_hash: deterministic_policy_hash(&new_policy),
+                    settings_revision: global_settings.revision,
+                    deleted: false,
+                }));
+            }
+
+            // Global setting mutation.
+            if key == POLICY_SETTING_KEY && !req.delete_setting {
+                return Err(Status::invalid_argument(
+                    "reserved key 'policy' must be set via the policy field",
+                ));
+            }
+
+            let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
+            let deleted = if req.delete_setting {
+                global_settings.settings.remove(key).is_some()
+            } else {
+                let setting = req
+                    .setting_value
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
+                let stored = proto_setting_to_stored(setting)?;
+                upsert_setting_value(&mut global_settings.settings, key, stored)
+            };
+
+            if deleted {
+                global_settings.revision = global_settings.revision.saturating_add(1);
+                save_global_settings(self.state.store.as_ref(), &global_settings).await?;
+            }
+
+            return Ok(Response::new(UpdateSandboxPolicyResponse {
+                version: 0,
+                policy_hash: String::new(),
+                settings_revision: global_settings.revision,
+                deleted: req.delete_setting && deleted,
+            }));
+        }
+
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "name is required for sandbox-scoped updates",
+            ));
+        }
 
         // Resolve sandbox by name.
         let sandbox = self
@@ -1001,8 +1140,66 @@ impl OpenShell for OpenShellService {
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
         let sandbox_id = sandbox.id.clone();
+
+        if has_setting {
+            if req.delete_setting {
+                return Err(Status::invalid_argument(
+                    "sandbox-scoped setting delete is not supported; use global delete",
+                ));
+            }
+            if key == POLICY_SETTING_KEY {
+                return Err(Status::invalid_argument(
+                    "reserved key 'policy' must be set via policy commands",
+                ));
+            }
+
+            let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+            if global_settings.settings.contains_key(key) {
+                return Err(Status::failed_precondition(format!(
+                    "setting '{key}' is managed globally; delete the global setting before sandbox update"
+                )));
+            }
+
+            let setting = req
+                .setting_value
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
+            let stored = proto_setting_to_stored(setting)?;
+
+            let mut sandbox_settings =
+                load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
+            let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
+            if changed {
+                sandbox_settings.revision = sandbox_settings.revision.saturating_add(1);
+                save_sandbox_settings(
+                    self.state.store.as_ref(),
+                    &sandbox_id,
+                    &sandbox.name,
+                    &sandbox_settings,
+                )
+                .await?;
+            }
+
+            return Ok(Response::new(UpdateSandboxPolicyResponse {
+                version: 0,
+                policy_hash: String::new(),
+                settings_revision: sandbox_settings.revision,
+                deleted: false,
+            }));
+        }
+
+        // Sandbox-scoped policy update.
+        let mut new_policy = req
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+
+        let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+        if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
+            return Err(Status::failed_precondition(
+                "policy is managed globally; delete global policy before sandbox policy update",
+            ));
+        }
 
         // Get the baseline (version 1) policy for static field validation.
         let spec = sandbox
@@ -1062,6 +1259,8 @@ impl OpenShell for OpenShellService {
             return Ok(Response::new(UpdateSandboxPolicyResponse {
                 version: u32::try_from(current.version).unwrap_or(0),
                 policy_hash: hash,
+                settings_revision: 0,
+                deleted: false,
             }));
         }
 
@@ -1094,6 +1293,8 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(UpdateSandboxPolicyResponse {
             version: u32::try_from(next_version).unwrap_or(0),
             policy_hash: hash,
+            settings_revision: 0,
+            deleted: false,
         }))
     }
 
@@ -2295,6 +2496,222 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
         hasher.update(value.encode_to_vec());
     }
     hex::encode(hasher.finalize())
+}
+
+fn compute_config_revision(
+    policy: Option<&ProtoSandboxPolicy>,
+    settings: &HashMap<String, EffectiveSetting>,
+    policy_source: PolicySource,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update((policy_source as i32).to_le_bytes());
+    if let Some(policy) = policy {
+        hasher.update(deterministic_policy_hash(policy).as_bytes());
+    }
+    let mut entries: Vec<_> = settings.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+    for (key, setting) in entries {
+        hasher.update(key.as_bytes());
+        hasher.update(setting.scope.to_le_bytes());
+        if let Some(value) = setting.value.as_ref().and_then(|v| v.value.as_ref()) {
+            match value {
+                setting_value::Value::StringValue(v) => {
+                    hasher.update([0]);
+                    hasher.update(v.as_bytes());
+                }
+                setting_value::Value::BoolValue(v) => {
+                    hasher.update([1]);
+                    hasher.update([u8::from(*v)]);
+                }
+                setting_value::Value::IntValue(v) => {
+                    hasher.update([2]);
+                    hasher.update(v.to_le_bytes());
+                }
+                setting_value::Value::BytesValue(v) => {
+                    hasher.update([3]);
+                    hasher.update(v);
+                }
+            }
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn proto_setting_to_stored(value: &SettingValue) -> Result<StoredSettingValue, Status> {
+    let inner = value
+        .value
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("setting_value.value is required"))?;
+    let stored = match inner {
+        setting_value::Value::StringValue(v) => StoredSettingValue::String(v.clone()),
+        setting_value::Value::BoolValue(v) => StoredSettingValue::Bool(*v),
+        setting_value::Value::IntValue(v) => StoredSettingValue::Int(*v),
+        setting_value::Value::BytesValue(v) => StoredSettingValue::Bytes(hex::encode(v)),
+    };
+    Ok(stored)
+}
+
+fn stored_setting_to_proto(value: &StoredSettingValue) -> Result<SettingValue, Status> {
+    let proto = match value {
+        StoredSettingValue::String(v) => SettingValue {
+            value: Some(setting_value::Value::StringValue(v.clone())),
+        },
+        StoredSettingValue::Bool(v) => SettingValue {
+            value: Some(setting_value::Value::BoolValue(*v)),
+        },
+        StoredSettingValue::Int(v) => SettingValue {
+            value: Some(setting_value::Value::IntValue(*v)),
+        },
+        StoredSettingValue::Bytes(v) => {
+            let decoded = hex::decode(v)
+                .map_err(|e| Status::internal(format!("stored bytes decode failed: {e}")))?;
+            SettingValue {
+                value: Some(setting_value::Value::BytesValue(decoded)),
+            }
+        }
+    };
+    Ok(proto)
+}
+
+fn upsert_setting_value(
+    map: &mut BTreeMap<String, StoredSettingValue>,
+    key: &str,
+    value: StoredSettingValue,
+) -> bool {
+    match map.get(key) {
+        Some(existing) if existing == &value => false,
+        _ => {
+            map.insert(key.to_string(), value);
+            true
+        }
+    }
+}
+
+async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
+    load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_ID).await
+}
+
+async fn save_global_settings(store: &Store, settings: &StoredSettings) -> Result<(), Status> {
+    save_settings_record(
+        store,
+        GLOBAL_SETTINGS_OBJECT_TYPE,
+        GLOBAL_SETTINGS_ID,
+        GLOBAL_SETTINGS_NAME,
+        settings,
+    )
+    .await
+}
+
+async fn load_sandbox_settings(store: &Store, sandbox_id: &str) -> Result<StoredSettings, Status> {
+    load_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_id).await
+}
+
+async fn save_sandbox_settings(
+    store: &Store,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    settings: &StoredSettings,
+) -> Result<(), Status> {
+    save_settings_record(
+        store,
+        SANDBOX_SETTINGS_OBJECT_TYPE,
+        sandbox_id,
+        sandbox_name,
+        settings,
+    )
+    .await
+}
+
+async fn load_settings_record(
+    store: &Store,
+    object_type: &str,
+    id: &str,
+) -> Result<StoredSettings, Status> {
+    let record = store
+        .get(object_type, id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch settings failed: {e}")))?;
+    if let Some(record) = record {
+        serde_json::from_slice::<StoredSettings>(&record.payload)
+            .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))
+    } else {
+        Ok(StoredSettings::default())
+    }
+}
+
+async fn save_settings_record(
+    store: &Store,
+    object_type: &str,
+    id: &str,
+    name: &str,
+    settings: &StoredSettings,
+) -> Result<(), Status> {
+    let payload = serde_json::to_vec(settings)
+        .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
+    store
+        .put(object_type, id, name, &payload)
+        .await
+        .map_err(|e| Status::internal(format!("persist settings failed: {e}")))?;
+    Ok(())
+}
+
+fn decode_policy_from_global_settings(
+    global: &StoredSettings,
+) -> Result<Option<ProtoSandboxPolicy>, Status> {
+    let Some(value) = global.settings.get(POLICY_SETTING_KEY) else {
+        return Ok(None);
+    };
+
+    let StoredSettingValue::Bytes(encoded) = value else {
+        return Err(Status::internal(
+            "global policy setting has invalid value type; expected bytes",
+        ));
+    };
+
+    let raw = hex::decode(encoded)
+        .map_err(|e| Status::internal(format!("global policy decode failed: {e}")))?;
+    let policy = ProtoSandboxPolicy::decode(raw.as_slice())
+        .map_err(|e| Status::internal(format!("global policy protobuf decode failed: {e}")))?;
+    Ok(Some(policy))
+}
+
+fn merge_effective_settings(
+    global: &StoredSettings,
+    sandbox: &StoredSettings,
+) -> Result<HashMap<String, EffectiveSetting>, Status> {
+    let mut merged = HashMap::new();
+
+    for (key, value) in &sandbox.settings {
+        if key == POLICY_SETTING_KEY {
+            continue;
+        }
+        merged.insert(
+            key.clone(),
+            EffectiveSetting {
+                value: Some(stored_setting_to_proto(value)?),
+                scope: SettingScope::Sandbox.into(),
+            },
+        );
+    }
+
+    for (key, value) in &global.settings {
+        if key == POLICY_SETTING_KEY {
+            continue;
+        }
+        merged.insert(
+            key.clone(),
+            EffectiveSetting {
+                value: Some(stored_setting_to_proto(value)?),
+                scope: SettingScope::Global.into(),
+            },
+        );
+    }
+
+    Ok(merged)
 }
 
 /// Check if a log line's source matches the filter list.
@@ -4647,5 +5064,122 @@ mod tests {
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("value"));
+    }
+
+    #[test]
+    fn merge_effective_settings_global_overrides_sandbox_key() {
+        let global = super::StoredSettings {
+            revision: 2,
+            settings: [
+                (
+                    "log_level".to_string(),
+                    super::StoredSettingValue::String("warn".to_string()),
+                ),
+                (
+                    "region".to_string(),
+                    super::StoredSettingValue::String("us-west".to_string()),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let sandbox = super::StoredSettings {
+            revision: 1,
+            settings: [
+                (
+                    "log_level".to_string(),
+                    super::StoredSettingValue::String("debug".to_string()),
+                ),
+                (
+                    "feature_x".to_string(),
+                    super::StoredSettingValue::Bool(true),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        let log_level = merged.get("log_level").expect("log_level present");
+        assert_eq!(
+            log_level.scope,
+            openshell_core::proto::SettingScope::Global as i32
+        );
+        assert_eq!(
+            log_level.value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(&openshell_core::proto::setting_value::Value::StringValue(
+                "warn".to_string(),
+            ))
+        );
+
+        let feature_x = merged.get("feature_x").expect("feature_x present");
+        assert_eq!(
+            feature_x.scope,
+            openshell_core::proto::SettingScope::Sandbox as i32
+        );
+    }
+
+    #[test]
+    fn decode_policy_from_global_settings_round_trip() {
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 7,
+            ..Default::default()
+        };
+        let encoded = hex::encode(policy.encode_to_vec());
+        let global = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "policy".to_string(),
+                super::StoredSettingValue::Bytes(encoded),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let decoded = super::decode_policy_from_global_settings(&global)
+            .unwrap()
+            .expect("policy present");
+        assert_eq!(decoded.version, 7);
+    }
+
+    #[test]
+    fn config_revision_changes_when_effective_setting_changes() {
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        let mut settings = HashMap::new();
+        settings.insert(
+            "mode".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "strict".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        settings.insert(
+            "mode".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "relaxed".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        assert_ne!(rev_a, rev_b);
     }
 }
