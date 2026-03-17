@@ -350,7 +350,32 @@ if [ "${GPU_ENABLED:-}" = "true" ]; then
             mkdir -p /var/run/cdi
             nvidia-ctk cdi generate --output=/var/run/cdi/nvidia.yaml 2>&1 || true
 
-            # 2. Patch CDI spec: add libdxcore.so mount (nvidia-ctk misses it)
+            # 2. Add per-GPU device entries (UUID and index) to CDI spec.
+            #    nvidia-ctk only generates name=all, but the device plugin
+            #    assigns GPUs by UUID which must resolve as a CDI device.
+            if [ -f /var/run/cdi/nvidia.yaml ] && command -v nvidia-smi >/dev/null 2>&1; then
+                idx=0
+                nvidia-smi --query-gpu=gpu_uuid --format=csv,noheader 2>/dev/null | while read -r uuid; do
+                    uuid=$(echo "$uuid" | tr -d ' ')
+                    [ -z "$uuid" ] && continue
+                    sed -i "/- name: all/a\\
+    - name: $uuid\\
+      containerEdits:\\
+        deviceNodes:\\
+            - path: /dev/dxg\\
+    - name: \"$idx\"\\
+      containerEdits:\\
+        deviceNodes:\\
+            - path: /dev/dxg" /var/run/cdi/nvidia.yaml
+                    idx=$((idx + 1))
+                done
+                # nvidia-ctk cdi generate uses cdiVersion 0.3.0 but the
+                # installed CDI library requires >= 0.5.0
+                sed -i 's/cdiVersion: 0\.3\.0/cdiVersion: 0.5.0/' /var/run/cdi/nvidia.yaml
+                echo "CDI spec: added per-GPU UUID and index device entries"
+            fi
+
+            # 4. Patch CDI spec: add libdxcore.so mount (nvidia-ctk misses it)
             DXCORE_PATH=$(find /usr/lib -name "libdxcore.so" 2>/dev/null | head -1)
             if [ -n "$DXCORE_PATH" ] && [ -f /var/run/cdi/nvidia.yaml ]; then
                 DXCORE_DIR=$(dirname "$DXCORE_PATH")
@@ -372,14 +397,14 @@ if [ "${GPU_ENABLED:-}" = "true" ]; then
             fi
         fi
 
-        # 3. Switch nvidia container runtime to CDI mode
+        # 5. Switch nvidia container runtime to CDI mode
         NVIDIA_RUNTIME_CONFIG="/etc/nvidia-container-runtime/config.toml"
         if [ -f "$NVIDIA_RUNTIME_CONFIG" ]; then
             sed -i 's/mode = "auto"/mode = "cdi"/' "$NVIDIA_RUNTIME_CONFIG"
             echo "nvidia-container-runtime switched to CDI mode"
         fi
 
-        # 4. Create a k3s manifest to label the node with NVIDIA PCI vendor
+        # 6. Create a k3s manifest to label the node with NVIDIA PCI vendor
         #    (NFD can't detect it on WSL2 since PCI topology is virtualised)
         cat > "$K3S_MANIFESTS/wsl2-gpu-node-label.yaml" <<'WSLEOF'
 apiVersion: batch/v1
