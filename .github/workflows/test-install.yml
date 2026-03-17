@@ -1,0 +1,28 @@
+name: Test Install Script
+
+on:
+  pull_request:
+    paths:
+      - 'install.sh'
+      - 'e2e/test-install.sh'
+      - '.github/workflows/test-install.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'install.sh'
+      - 'e2e/test-install.sh'
+      - '.github/workflows/test-install.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-install:
+    name: Install script tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run install.sh tests
+        run: sh e2e/test-install.sh
