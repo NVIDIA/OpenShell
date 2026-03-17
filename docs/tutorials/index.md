@@ -52,6 +52,15 @@ Route inference to a local Ollama server, verify it from a sandbox, and reuse th
 +++
 {bdg-secondary}`Tutorial`
 :::
+
+:::{grid-item-card} Local Inference with LM Studio
+:link: local-inference-lmstudio
+:link-type: doc
+
+Route inference to a local LM Studio server via the OpenAI or Anthropic compatible APIs.
++++
+{bdg-secondary}`Tutorial`
+:::
 ::::
 
 ```{toctree}
@@ -60,4 +69,5 @@ Route inference to a local Ollama server, verify it from a sandbox, and reuse th
 First Network Policy <first-network-policy>
 GitHub Push Access <github-sandbox>
 Local Inference with Ollama <local-inference-ollama>
+Local Inference with LM Studio <local-inference-lmstudio>
 ```

@@ -7,7 +7,6 @@ env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-  SCCACHE_MEMCACHED_ENDPOINT: ${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}
 
 permissions:
   contents: read
@@ -48,6 +47,10 @@ jobs:
 
       - name: Install tools
         run: mise install
+
+      - name: Configure sccache remote cache
+        if: vars.SCCACHE_MEMCACHED_ENDPOINT != ''
+        run: echo "SCCACHE_MEMCACHED_ENDPOINT=${{ vars.SCCACHE_MEMCACHED_ENDPOINT }}" >> "$GITHUB_ENV"
 
       - name: Cache Rust target and registry
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2

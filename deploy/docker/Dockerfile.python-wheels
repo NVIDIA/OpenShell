@@ -28,8 +28,6 @@ FROM base AS builder
 
 ARG TARGETARCH
 ARG BUILDARCH
-ARG OPENSHELL_CARGO_VERSION
-ARG OPENSHELL_IMAGE_TAG
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ARG SCCACHE_MEMCACHED_ENDPOINT
@@ -86,6 +84,9 @@ RUN touch crates/openshell-cli/src/main.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 
+# Declare version ARG here (not earlier) so the git-hash-bearing value does not
+# invalidate the expensive dependency-build layers above on every commit.
+ARG OPENSHELL_CARGO_VERSION
 RUN --mount=type=cache,id=cargo-registry-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-python-wheels-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \

@@ -76,7 +76,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certifi
 FROM --platform=$BUILDPLATFORM rust:1.88-slim AS supervisor-builder
 ARG TARGETARCH
 ARG BUILDARCH
-ARG OPENSHELL_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 ARG SCCACHE_MEMCACHED_ENDPOINT
 
@@ -132,6 +131,9 @@ RUN touch crates/openshell-sandbox/src/main.rs \
     proto/*.proto
 
 # Build the supervisor binary
+# Declare version ARG here (not earlier) so the git-hash-bearing value does not
+# invalidate the expensive dependency-build layers above on every commit.
+ARG OPENSHELL_CARGO_VERSION
 RUN --mount=type=cache,id=cargo-registry-supervisor-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-target-supervisor-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-supervisor-${TARGETARCH},sharing=locked,target=/tmp/sccache \

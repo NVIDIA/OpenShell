@@ -166,5 +166,6 @@ Explore related topics:
 
 - To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
 - To follow a complete Ollama-based local setup, refer to {doc}`/tutorials/local-inference-ollama`.
+- To follow a complete LM Studio-based local setup, refer to {doc}`/tutorials/local-inference-lmstudio`.
 - To control external endpoints, refer to [Policies](/sandboxes/policies.md).
 - To manage provider records, refer to {doc}`../sandboxes/manage-providers`.
