@@ -1422,6 +1422,10 @@ enum SettingsCommands {
         /// Show gateway-global settings.
         #[arg(long)]
         global: bool,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Set a single setting key.
@@ -1880,17 +1884,17 @@ async fn main() -> Result<()> {
             apply_edge_auth(&mut tls, &ctx.name);
 
             match settings_cmd {
-                SettingsCommands::Get { name, global } => {
+                SettingsCommands::Get { name, global, json } => {
                     if global {
                         if name.is_some() {
                             return Err(miette::miette!(
                                 "settings get --global does not accept a sandbox name"
                             ));
                         }
-                        run::gateway_settings_get(&ctx.endpoint, &tls).await?;
+                        run::gateway_settings_get(&ctx.endpoint, json, &tls).await?;
                     } else {
                         let name = resolve_sandbox_name(name, &ctx.name)?;
-                        run::sandbox_settings_get(&ctx.endpoint, &name, &tls).await?;
+                        run::sandbox_settings_get(&ctx.endpoint, &name, json, &tls).await?;
                     }
                 }
                 SettingsCommands::Set {

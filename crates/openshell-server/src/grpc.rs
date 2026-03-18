@@ -110,8 +110,11 @@ const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
 
 /// Internal object type for durable gateway-global settings.
 const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
-/// Internal object id/name for the singleton global settings record.
-const GLOBAL_SETTINGS_ID: &str = "global";
+/// Internal object id for the singleton global settings record.
+///
+/// Prefixed to avoid collision with other object types in the shared
+/// `objects` table (PRIMARY KEY is on `id` alone, not `(object_type, id)`).
+const GLOBAL_SETTINGS_ID: &str = "gateway_settings:global";
 const GLOBAL_SETTINGS_NAME: &str = "global";
 /// Internal object type for durable sandbox-scoped settings.
 const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
@@ -1100,7 +1103,7 @@ impl OpenShell for OpenShellService {
                     stored_value,
                 );
                 if changed {
-                    global_settings.revision = global_settings.revision.saturating_add(1);
+                    global_settings.revision = global_settings.revision.wrapping_add(1);
                     save_global_settings(self.state.store.as_ref(), &global_settings).await?;
                 }
 
@@ -1135,7 +1138,7 @@ impl OpenShell for OpenShellService {
             };
 
             if deleted {
-                global_settings.revision = global_settings.revision.saturating_add(1);
+                global_settings.revision = global_settings.revision.wrapping_add(1);
                 save_global_settings(self.state.store.as_ref(), &global_settings).await?;
             }
 
@@ -1190,7 +1193,7 @@ impl OpenShell for OpenShellService {
                     load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
                 let removed = sandbox_settings.settings.remove(key).is_some();
                 if removed {
-                    sandbox_settings.revision = sandbox_settings.revision.saturating_add(1);
+                    sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
                     save_sandbox_settings(
                         self.state.store.as_ref(),
                         &sandbox_id,
@@ -1224,7 +1227,7 @@ impl OpenShell for OpenShellService {
                 load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
             let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
             if changed {
-                sandbox_settings.revision = sandbox_settings.revision.saturating_add(1);
+                sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
                 save_sandbox_settings(
                     self.state.store.as_ref(),
                     &sandbox_id,
@@ -5709,7 +5712,7 @@ mod tests {
             super::StoredSettingValue::String("debug".to_string()),
         );
         assert!(changed, "sandbox upsert should report a change");
-        sandbox_settings.revision = sandbox_settings.revision.saturating_add(1);
+        sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
         super::save_sandbox_settings(&store, sandbox_id, "test-sandbox", &sandbox_settings)
             .await
             .unwrap();

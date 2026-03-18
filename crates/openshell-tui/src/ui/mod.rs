@@ -453,3 +453,24 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let bar = Paragraph::new(line).block(Block::default().borders(Borders::NONE));
     frame.render_widget(bar, area);
 }
+
+/// Center a popup rectangle within `area` using percentage-based width and
+/// an absolute height (in rows).
+pub(crate) fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height.min(100)) / 2),
+            Constraint::Length(height),
+            Constraint::Percentage((100 - height.min(100)) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vert[1])[1]
+}

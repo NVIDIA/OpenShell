@@ -3931,7 +3931,12 @@ pub async fn sandbox_policy_set_global(
     Ok(())
 }
 
-pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn sandbox_settings_get(
+    server: &str,
+    name: &str,
+    json: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let sandbox = client
         .get_sandbox(GetSandboxRequest {
@@ -3950,6 +3955,15 @@ pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) ->
         .await
         .into_diagnostic()?
         .into_inner();
+
+    if json {
+        let obj = settings_to_json_sandbox(name, &response);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&obj).into_diagnostic()?
+        );
+        return Ok(());
+    }
 
     let policy_source =
         if response.policy_source == openshell_core::proto::PolicySource::Global as i32 {
@@ -3990,13 +4004,22 @@ pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) ->
     Ok(())
 }
 
-pub async fn gateway_settings_get(server: &str, tls: &TlsOptions) -> Result<()> {
+pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
         .get_gateway_settings(GetGatewaySettingsRequest {})
         .await
         .into_diagnostic()?
         .into_inner();
+
+    if json {
+        let obj = settings_to_json_global(&response);
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&obj).into_diagnostic()?
+        );
+        return Ok(());
+    }
 
     println!("Scope:         global");
     println!("Settings Rev:  {}", response.settings_revision);
@@ -4015,6 +4038,65 @@ pub async fn gateway_settings_get(server: &str, tls: &TlsOptions) -> Result<()> 
         }
     }
     Ok(())
+}
+
+fn settings_to_json_sandbox(
+    name: &str,
+    response: &openshell_core::proto::GetSandboxSettingsResponse,
+) -> serde_json::Value {
+    let policy_source =
+        if response.policy_source == openshell_core::proto::PolicySource::Global as i32 {
+            "global"
+        } else {
+            "sandbox"
+        };
+
+    let mut settings = serde_json::Map::new();
+    let mut keys: Vec<_> = response.settings.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(setting) = response.settings.get(&key) {
+            let scope = match SettingScope::try_from(setting.scope) {
+                Ok(SettingScope::Global) => "global",
+                Ok(SettingScope::Sandbox) => "sandbox",
+                _ => "unset",
+            };
+            settings.insert(
+                key,
+                serde_json::json!({
+                    "value": format_setting_value(setting.value.as_ref()),
+                    "scope": scope,
+                }),
+            );
+        }
+    }
+
+    serde_json::json!({
+        "sandbox": name,
+        "config_revision": response.config_revision,
+        "policy_source": policy_source,
+        "policy_hash": response.policy_hash,
+        "settings": settings,
+    })
+}
+
+fn settings_to_json_global(
+    response: &openshell_core::proto::GetGatewaySettingsResponse,
+) -> serde_json::Value {
+    let mut settings = serde_json::Map::new();
+    let mut keys: Vec<_> = response.settings.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(setting) = response.settings.get(&key) {
+            settings.insert(key, serde_json::json!(format_setting_value(Some(setting))));
+        }
+    }
+
+    serde_json::json!({
+        "scope": "global",
+        "settings_revision": response.settings_revision,
+        "settings": settings,
+    })
 }
 
 pub async fn gateway_setting_set(

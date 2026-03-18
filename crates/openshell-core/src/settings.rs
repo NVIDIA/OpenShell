@@ -34,6 +34,20 @@ pub struct RegisteredSetting {
 ///
 /// `policy` is intentionally excluded because it is a reserved key handled by
 /// dedicated policy commands and payloads.
+///
+/// # Adding a new setting
+///
+/// 1. Add a [`RegisteredSetting`] entry to this array with the key name and
+///    [`SettingValueKind`].
+/// 2. Recompile `openshell-server` (gateway) and `openshell-sandbox`
+///    (supervisor). No database migration is needed -- new keys are stored in
+///    the existing settings JSON blob.
+/// 3. Add sandbox-side consumption in `openshell-sandbox` to read and act on
+///    the new key from the poll loop's `SettingsPollResult::settings` map.
+/// 4. The key will automatically appear in `settings get` (CLI/TUI) and be
+///    settable via `settings set`. The server validates that only registered
+///    keys are accepted.
+/// 5. Add a unit test in this module's `tests` section to cover the new key.
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
     RegisteredSetting {
         key: "log_level",
@@ -77,13 +91,29 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SettingValueKind, parse_bool_like, setting_for_key};
+    use super::{
+        parse_bool_like, registered_keys_csv, setting_for_key, RegisteredSetting, SettingValueKind,
+        REGISTERED_SETTINGS,
+    };
 
     #[test]
     fn setting_for_key_returns_registered_entry() {
         let setting = setting_for_key("dummy_bool").expect("dummy_bool should be registered");
         assert_eq!(setting.kind, SettingValueKind::Bool);
     }
+
+    #[test]
+    fn setting_for_key_returns_none_for_unknown() {
+        assert!(setting_for_key("nonexistent_key").is_none());
+    }
+
+    #[test]
+    fn setting_for_key_returns_none_for_reserved_policy() {
+        // "policy" is intentionally excluded from the registry.
+        assert!(setting_for_key("policy").is_none());
+    }
+
+    // ---- parse_bool_like ----
 
     #[test]
     fn parse_bool_like_accepts_expected_spellings() {
@@ -100,7 +130,111 @@ mod tests {
     }
 
     #[test]
+    fn parse_bool_like_case_insensitive() {
+        assert_eq!(parse_bool_like("TRUE"), Some(true));
+        assert_eq!(parse_bool_like("True"), Some(true));
+        assert_eq!(parse_bool_like("FALSE"), Some(false));
+        assert_eq!(parse_bool_like("False"), Some(false));
+        assert_eq!(parse_bool_like("YES"), Some(true));
+        assert_eq!(parse_bool_like("NO"), Some(false));
+        assert_eq!(parse_bool_like("On"), Some(true));
+        assert_eq!(parse_bool_like("Off"), Some(false));
+    }
+
+    #[test]
+    fn parse_bool_like_trims_whitespace() {
+        assert_eq!(parse_bool_like("  true  "), Some(true));
+        assert_eq!(parse_bool_like("\tfalse\t"), Some(false));
+        assert_eq!(parse_bool_like(" 1 "), Some(true));
+        assert_eq!(parse_bool_like(" 0 "), Some(false));
+    }
+
+    #[test]
     fn parse_bool_like_rejects_unrecognized_values() {
         assert_eq!(parse_bool_like("maybe"), None);
+        assert_eq!(parse_bool_like(""), None);
+        assert_eq!(parse_bool_like("2"), None);
+        assert_eq!(parse_bool_like("nope"), None);
+        assert_eq!(parse_bool_like("yep"), None);
+        assert_eq!(parse_bool_like("enabled"), None);
+        assert_eq!(parse_bool_like("disabled"), None);
+    }
+
+    // ---- REGISTERED_SETTINGS entries ----
+
+    #[test]
+    fn registered_settings_have_valid_kinds() {
+        let valid_kinds = [
+            SettingValueKind::String,
+            SettingValueKind::Int,
+            SettingValueKind::Bool,
+        ];
+        for entry in REGISTERED_SETTINGS {
+            assert!(
+                valid_kinds.contains(&entry.kind),
+                "registered setting '{}' has unexpected kind {:?}",
+                entry.key,
+                entry.kind,
+            );
+        }
+    }
+
+    #[test]
+    fn registered_settings_keys_are_nonempty_and_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for entry in REGISTERED_SETTINGS {
+            assert!(
+                !entry.key.is_empty(),
+                "registered setting key must not be empty"
+            );
+            assert!(
+                seen.insert(entry.key),
+                "duplicate registered setting key '{}'",
+                entry.key,
+            );
+        }
+    }
+
+    #[test]
+    fn registered_settings_excludes_policy() {
+        assert!(
+            !REGISTERED_SETTINGS.iter().any(|e| e.key == "policy"),
+            "policy must not appear in REGISTERED_SETTINGS"
+        );
+    }
+
+    #[test]
+    fn registered_keys_csv_contains_all_keys() {
+        let csv = registered_keys_csv();
+        for entry in REGISTERED_SETTINGS {
+            assert!(
+                csv.contains(entry.key),
+                "registered_keys_csv() missing '{}'",
+                entry.key,
+            );
+        }
+    }
+
+    // ---- SettingValueKind::as_str ----
+
+    #[test]
+    fn setting_value_kind_as_str_returns_expected_labels() {
+        assert_eq!(SettingValueKind::String.as_str(), "string");
+        assert_eq!(SettingValueKind::Int.as_str(), "int");
+        assert_eq!(SettingValueKind::Bool.as_str(), "bool");
+    }
+
+    // ---- RegisteredSetting structural ----
+
+    #[test]
+    fn registered_setting_derives_debug_clone_eq() {
+        let a = RegisteredSetting {
+            key: "test",
+            kind: SettingValueKind::Bool,
+        };
+        let b = a;
+        assert_eq!(a, b);
+        // Debug is exercised implicitly by format!
+        let _ = format!("{a:?}");
     }
 }

@@ -257,22 +257,4 @@ fn draw_confirm_delete(frame: &mut Frame<'_>, app: &App, idx: usize, area: Rect)
     frame.render_widget(Paragraph::new(lines).block(block), popup);
 }
 
-fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
-    use ratatui::layout::{Direction, Layout};
-    let vert = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage((100 - height.min(100)) / 2),
-            Constraint::Length(height),
-            Constraint::Percentage((100 - height.min(100)) / 2),
-        ])
-        .split(area);
-    Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage((100 - percent_x) / 2),
-            Constraint::Percentage(percent_x),
-            Constraint::Percentage((100 - percent_x) / 2),
-        ])
-        .split(vert[1])[1]
-}
+use super::centered_popup as centered_rect;

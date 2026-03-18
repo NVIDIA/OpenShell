@@ -120,13 +120,7 @@ pub struct GlobalSettingEntry {
 
 impl GlobalSettingEntry {
     pub fn display_value(&self) -> String {
-        match &self.value {
-            None => "<unset>".to_string(),
-            Some(setting_value::Value::StringValue(v)) => v.clone(),
-            Some(setting_value::Value::BoolValue(v)) => v.to_string(),
-            Some(setting_value::Value::IntValue(v)) => v.to_string(),
-            Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
-        }
+        display_setting_value(&self.value)
     }
 }
 
@@ -195,17 +189,22 @@ impl SettingScope {
 
 impl SandboxSettingEntry {
     pub fn display_value(&self) -> String {
-        match &self.value {
-            None => "<unset>".to_string(),
-            Some(setting_value::Value::StringValue(v)) => v.clone(),
-            Some(setting_value::Value::BoolValue(v)) => v.to_string(),
-            Some(setting_value::Value::IntValue(v)) => v.to_string(),
-            Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
-        }
+        display_setting_value(&self.value)
     }
 
     pub fn is_globally_managed(&self) -> bool {
         self.scope == SettingScope::Global
+    }
+}
+
+/// Format a proto `SettingValue` for display.
+pub fn display_setting_value(value: &Option<setting_value::Value>) -> String {
+    match value {
+        None => "<unset>".to_string(),
+        Some(setting_value::Value::StringValue(v)) => v.clone(),
+        Some(setting_value::Value::BoolValue(v)) => v.to_string(),
+        Some(setting_value::Value::IntValue(v)) => v.to_string(),
+        Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
     }
 }
 
