@@ -12,10 +12,12 @@ jobs:
   vouch-gate:
     if: github.repository_owner == 'NVIDIA'
     runs-on: ubuntu-latest
+    env:
+      ORG_READ_TOKEN: ${{ secrets.ORG_READ_TOKEN }}
     steps:
       - name: Check org membership
         id: org-check
-        if: ${{ secrets.ORG_READ_TOKEN != '' }}
+        if: env.ORG_READ_TOKEN != ''
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.ORG_READ_TOKEN }}
