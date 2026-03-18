@@ -472,6 +472,8 @@ pub struct App {
 
     // Sandbox policy pane tab + sandbox settings
     pub sandbox_policy_tab: SandboxPolicyTab,
+    pub sandbox_policy_is_global: bool,
+    pub sandbox_global_policy_version: u32,
     pub sandbox_settings: Vec<SandboxSettingEntry>,
     pub sandbox_settings_selected: usize,
     pub sandbox_setting_edit: Option<SettingEditState>,
@@ -598,6 +600,8 @@ impl App {
             pending_sandbox_detail: false,
             pending_shell_connect: false,
             sandbox_policy_tab: SandboxPolicyTab::Policy,
+            sandbox_policy_is_global: false,
+            sandbox_global_policy_version: 0,
             sandbox_settings: Vec::new(),
             sandbox_settings_selected: 0,
             sandbox_setting_edit: None,
@@ -1203,8 +1207,7 @@ impl App {
                             entry.key
                         );
                     } else if entry.value.is_some() {
-                        self.sandbox_confirm_setting_delete =
-                            Some(self.sandbox_settings_selected);
+                        self.sandbox_confirm_setting_delete = Some(self.sandbox_settings_selected);
                     }
                 }
             }

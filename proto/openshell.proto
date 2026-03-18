@@ -478,10 +478,12 @@ message UpdateSettingsResponse {
 
 // Get sandbox policy status request.
 message GetSandboxPolicyStatusRequest {
-  // Sandbox name (canonical lookup key).
+  // Sandbox name (canonical lookup key). Ignored when global is true.
   string name = 1;
   // The specific policy version to query. 0 means latest.
   uint32 version = 2;
+  // Query global policy revisions instead of a sandbox-scoped one.
+  bool global = 3;
 }
 
 // Get sandbox policy status response.
@@ -494,10 +496,12 @@ message GetSandboxPolicyStatusResponse {
 
 // List sandbox policies request.
 message ListSandboxPoliciesRequest {
-  // Sandbox name (canonical lookup key).
+  // Sandbox name (canonical lookup key). Ignored when global is true.
   string name = 1;
   uint32 limit = 2;
   uint32 offset = 3;
+  // List global policy revisions instead of sandbox-scoped ones.
+  bool global = 4;
 }
 
 // List sandbox policies response.

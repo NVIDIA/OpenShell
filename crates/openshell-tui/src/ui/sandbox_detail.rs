@@ -97,6 +97,20 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let mut lines = vec![Line::from(""), row1, row2, row3, row4];
 
+    // Show global policy indicator when the sandbox's policy is managed at
+    // gateway scope.
+    if app.sandbox_policy_is_global {
+        let version_label = if app.sandbox_global_policy_version > 0 {
+            format!("managed globally (v{})", app.sandbox_global_policy_version)
+        } else {
+            "managed globally".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::styled("  Policy: ", t.muted),
+            Span::styled(version_label, t.status_warn),
+        ]));
+    }
+
     // Show pending network rules prompt — but not when delete confirmation is
     // active, since it would push the confirmation off the bottom of the pane.
     if pending_count > 0 && !app.confirm_delete {

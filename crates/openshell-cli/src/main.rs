@@ -1369,10 +1369,10 @@ enum PolicyCommands {
         timeout: u64,
     },
 
-    /// Show current active policy for a sandbox.
+    /// Show current active policy for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
-        /// Sandbox name (defaults to last-used sandbox).
+        /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
@@ -1383,18 +1383,26 @@ enum PolicyCommands {
         /// Print the full policy as YAML.
         #[arg(long)]
         full: bool,
+
+        /// Show the global policy revision.
+        #[arg(long)]
+        global: bool,
     },
 
-    /// List policy history for a sandbox.
+    /// List policy history for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
-        /// Sandbox name (defaults to last-used sandbox).
+        /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Maximum number of revisions to return.
         #[arg(long, default_value_t = 20)]
         limit: u32,
+
+        /// List global policy revisions.
+        #[arg(long)]
+        global: bool,
     },
 
     /// Delete the gateway-global policy lock, restoring sandbox-level policy control.
@@ -1839,6 +1847,12 @@ async fn main() -> Result<()> {
                     timeout,
                 } => {
                     if global {
+                        if wait {
+                            return Err(miette::miette!(
+                                "--wait is not supported for global policies; \
+                                 global policies are effective immediately"
+                            ));
+                        }
                         run::sandbox_policy_set_global(
                             &ctx.endpoint,
                             &policy,
@@ -1854,13 +1868,30 @@ async fn main() -> Result<()> {
                             .await?;
                     }
                 }
-                PolicyCommands::Get { name, rev, full } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                PolicyCommands::Get {
+                    name,
+                    rev,
+                    full,
+                    global,
+                } => {
+                    if global {
+                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                    }
                 }
-                PolicyCommands::List { name, limit } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                PolicyCommands::List {
+                    name,
+                    limit,
+                    global,
+                } => {
+                    if global {
+                        run::sandbox_policy_list_global(&ctx.endpoint, limit, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                    }
                 }
                 PolicyCommands::Delete { global, yes } => {
                     if !global {
@@ -3072,7 +3103,10 @@ mod tests {
 
         match cli.command {
             Some(Commands::Settings {
-                command: Some(SettingsCommands::Delete { key, global, yes, .. }),
+                command:
+                    Some(SettingsCommands::Delete {
+                        key, global, yes, ..
+                    }),
             }) => {
                 assert_eq!(key, "log_level");
                 assert!(global);

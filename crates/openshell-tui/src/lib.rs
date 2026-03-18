@@ -326,19 +326,12 @@ pub async fn run(
                 // Refresh per-sandbox draft counts for badges (dashboard + detail).
                 refresh_sandbox_draft_counts(&mut app).await;
 
-                // Auto-refresh the policy view when a new version is detected.
+                // Auto-refresh sandbox detail (policy, settings, drafts) on
+                // every tick when viewing a sandbox.  The gRPC call is
+                // lightweight and ensures settings changes, global policy
+                // changes, and policy version bumps are reflected live.
                 if app.screen == Screen::Sandbox {
-                    let displayed = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
-                    let listed = app
-                        .sandbox_policy_versions
-                        .get(app.sandbox_selected)
-                        .copied()
-                        .unwrap_or(0);
-                    if listed > 0 && listed != displayed {
-                        refresh_sandbox_policy(&mut app).await;
-                    }
-
-                    // Refresh draft chunks when on sandbox screen.
+                    refresh_sandbox_policy(&mut app).await;
                     refresh_draft_chunks(&mut app).await;
                 }
             }
@@ -763,12 +756,14 @@ async fn fetch_sandbox_detail(app: &mut App) {
                     app.policy_lines = render_policy_lines(&policy, &app.theme);
                     app.sandbox_policy = Some(policy);
                 }
-                // Populate sandbox settings from the same response.
+                // Populate sandbox settings and policy source from the same response.
+                app.sandbox_policy_is_global =
+                    inner.policy_source == openshell_core::proto::PolicySource::Global as i32;
+                app.sandbox_global_policy_version = inner.global_policy_version;
                 app.apply_sandbox_settings(inner.settings);
             }
             Ok(Err(e)) => {
-                let msg = e.message().to_string();
-                tracing::warn!("failed to fetch sandbox policy: {msg}");
+                tracing::warn!("failed to fetch sandbox policy: {}", e.message());
             }
             Err(_) => {
                 tracing::warn!("sandbox policy request timed out");
@@ -2203,6 +2198,10 @@ async fn refresh_sandbox_policy(app: &mut App) {
                 app.policy_lines = render_policy_lines(&policy, &app.theme);
                 app.sandbox_policy = Some(policy);
             }
+            // Refresh settings and policy source alongside the policy.
+            app.sandbox_policy_is_global =
+                inner.policy_source == openshell_core::proto::PolicySource::Global as i32;
+            app.apply_sandbox_settings(inner.settings);
         }
         Ok(Err(e)) => {
             tracing::warn!("failed to refresh sandbox policy: {}", e.message());

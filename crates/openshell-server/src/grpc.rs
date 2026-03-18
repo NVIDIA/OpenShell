@@ -30,8 +30,8 @@ use openshell_core::proto::{
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
     SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateProviderRequest, UpdateSettingsRequest,
-    UpdateSettingsResponse, WatchSandboxRequest, open_shell_server::OpenShell,
+    UndoDraftChunkResponse, UpdateProviderRequest, UpdateSettingsRequest, UpdateSettingsResponse,
+    WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use openshell_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
@@ -120,6 +120,9 @@ const GLOBAL_SETTINGS_NAME: &str = "global";
 const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
 /// Reserved settings key used to store global policy payload.
 const POLICY_SETTING_KEY: &str = "policy";
+/// Sentinel `sandbox_id` used to store global policy revisions in the
+/// `sandbox_policies` table alongside sandbox-scoped revisions.
+const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct StoredSettings {
@@ -846,6 +849,8 @@ impl OpenShell for OpenShellService {
         let sandbox_settings =
             load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
 
+        let mut global_policy_version: u32 = 0;
+
         if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
             policy = Some(global_policy.clone());
             policy_hash = deterministic_policy_hash(&global_policy);
@@ -854,6 +859,15 @@ impl OpenShell for OpenShellService {
             // updates are tracked via config_revision.
             if version == 0 {
                 version = 1;
+            }
+            // Look up the global policy revision version number.
+            if let Ok(Some(global_rev)) = self
+                .state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+            {
+                global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
             }
         }
 
@@ -867,6 +881,7 @@ impl OpenShell for OpenShellService {
             settings,
             config_revision,
             policy_source: policy_source.into(),
+            global_policy_version,
         }))
     }
 
@@ -1108,9 +1123,74 @@ impl OpenShell for OpenShellService {
                 openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
                 validate_policy_safety(&new_policy)?;
 
+                // Compute hash and check for no-op (same policy as latest).
+                let payload = new_policy.encode_to_vec();
+                let hash = deterministic_policy_hash(&new_policy);
+
+                let latest = self
+                    .state
+                    .store
+                    .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("fetch latest global policy failed: {e}"))
+                    })?;
+
+                if let Some(ref current) = latest {
+                    if current.policy_hash == hash {
+                        return Ok(Response::new(UpdateSettingsResponse {
+                            version: u32::try_from(current.version).unwrap_or(0),
+                            policy_hash: hash,
+                            settings_revision: 0,
+                            deleted: false,
+                        }));
+                    }
+                }
+
+                let next_version = latest.map_or(1, |r| r.version + 1);
+                let policy_id = uuid::Uuid::new_v4().to_string();
+
+                // Persist the global policy revision.
+                self.state
+                    .store
+                    .put_policy_revision(
+                        &policy_id,
+                        GLOBAL_POLICY_SANDBOX_ID,
+                        next_version,
+                        &payload,
+                        &hash,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("persist global policy revision failed: {e}"))
+                    })?;
+
+                // Mark it as loaded immediately (no sandbox confirmation for
+                // global policies) and supersede older revisions.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let _ = self
+                    .state
+                    .store
+                    .update_policy_status(
+                        GLOBAL_POLICY_SANDBOX_ID,
+                        next_version,
+                        "loaded",
+                        None,
+                        Some(now_ms),
+                    )
+                    .await;
+                let _ = self
+                    .state
+                    .store
+                    .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, next_version)
+                    .await;
+
+                // Also store in the settings blob (delivery mechanism for
+                // GetSandboxSettings).
                 let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
-                let stored_value =
-                    StoredSettingValue::Bytes(hex::encode(new_policy.encode_to_vec()));
+                let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
                 let changed = upsert_setting_value(
                     &mut global_settings.settings,
                     POLICY_SETTING_KEY,
@@ -1122,8 +1202,8 @@ impl OpenShell for OpenShellService {
                 }
 
                 return Ok(Response::new(UpdateSettingsResponse {
-                    version: 0,
-                    policy_hash: deterministic_policy_hash(&new_policy),
+                    version: u32::try_from(next_version).unwrap_or(0),
+                    policy_hash: hash,
                     settings_revision: global_settings.revision,
                     deleted: false,
                 }));
@@ -1373,38 +1453,43 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxPolicyStatusRequest>,
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
 
-        let sandbox = self
-            .state
-            .store
-            .get_message_by_name::<Sandbox>(&req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        let sandbox_id = sandbox.id;
+        let (policy_id, active_version) = if req.global {
+            (GLOBAL_POLICY_SANDBOX_ID.to_string(), 0_u32)
+        } else {
+            if req.name.is_empty() {
+                return Err(Status::invalid_argument("name is required"));
+            }
+            let sandbox = self
+                .state
+                .store
+                .get_message_by_name::<Sandbox>(&req.name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (sandbox.id, sandbox.current_policy_version)
+        };
 
         let record = if req.version == 0 {
             self.state
                 .store
-                .get_latest_policy(&sandbox_id)
+                .get_latest_policy(&policy_id)
                 .await
                 .map_err(|e| Status::internal(format!("fetch policy failed: {e}")))?
         } else {
             self.state
                 .store
-                .get_policy_by_version(&sandbox_id, i64::from(req.version))
+                .get_policy_by_version(&policy_id, i64::from(req.version))
                 .await
                 .map_err(|e| Status::internal(format!("fetch policy failed: {e}")))?
         };
 
-        let record =
-            record.ok_or_else(|| Status::not_found("no policy revision found for this sandbox"))?;
-
-        let active_version = sandbox.current_policy_version;
+        let not_found_msg = if req.global {
+            "no global policy revision found"
+        } else {
+            "no policy revision found for this sandbox"
+        };
+        let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
 
         Ok(Response::new(GetSandboxPolicyStatusResponse {
             revision: Some(policy_record_to_revision(&record, true)),
@@ -1417,23 +1502,28 @@ impl OpenShell for OpenShellService {
         request: Request<ListSandboxPoliciesRequest>,
     ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
 
-        let sandbox = self
-            .state
-            .store
-            .get_message_by_name::<Sandbox>(&req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let policy_id = if req.global {
+            GLOBAL_POLICY_SANDBOX_ID.to_string()
+        } else {
+            if req.name.is_empty() {
+                return Err(Status::invalid_argument("name is required"));
+            }
+            let sandbox = self
+                .state
+                .store
+                .get_message_by_name::<Sandbox>(&req.name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            sandbox.id
+        };
 
         let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
         let records = self
             .state
             .store
-            .list_policies(&sandbox.id, limit, req.offset)
+            .list_policies(&policy_id, limit, req.offset)
             .await
             .map_err(|e| Status::internal(format!("list policies failed: {e}")))?;
 
@@ -5972,12 +6062,13 @@ mod tests {
                 let _guard = mutex.lock().await;
                 let mut settings = super::load_global_settings(&store).await.unwrap();
                 // Simulate per-key mutation: each task sets a unique key.
-                settings.settings.insert(
-                    format!("key_{i}"),
-                    super::StoredSettingValue::Int(i as i64),
-                );
+                settings
+                    .settings
+                    .insert(format!("key_{i}"), super::StoredSettingValue::Int(i as i64));
                 settings.revision = settings.revision.wrapping_add(1);
-                super::save_global_settings(&store, &settings).await.unwrap();
+                super::save_global_settings(&store, &settings)
+                    .await
+                    .unwrap();
             }));
         }
 
@@ -6018,12 +6109,13 @@ mod tests {
                 let mut settings = super::load_global_settings(&store).await.unwrap();
                 // Yield to encourage interleaving between load and save.
                 tokio::task::yield_now().await;
-                settings.settings.insert(
-                    format!("key_{i}"),
-                    super::StoredSettingValue::Int(i as i64),
-                );
+                settings
+                    .settings
+                    .insert(format!("key_{i}"), super::StoredSettingValue::Int(i as i64));
                 settings.revision = settings.revision.wrapping_add(1);
-                super::save_global_settings(&store, &settings).await.unwrap();
+                super::save_global_settings(&store, &settings)
+                    .await
+                    .unwrap();
             }));
         }
 
@@ -6046,9 +6138,7 @@ mod tests {
                  the locked test is the authoritative correctness check"
             );
         } else {
-            eprintln!(
-                "unlocked test: {lost} lost writes out of {n} (expected behavior)"
-            );
+            eprintln!("unlocked test: {lost} lost writes out of {n} (expected behavior)");
         }
         // Either way, the WITH-lock test above asserts correctness.
     }

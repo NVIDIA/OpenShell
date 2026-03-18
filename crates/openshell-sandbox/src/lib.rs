@@ -1366,7 +1366,9 @@ async fn run_policy_poll_loop(
         // Only reload OPA when the policy payload actually changed.
         if policy_changed {
             let Some(policy) = result.policy.as_ref() else {
-                warn!("Settings poll: policy hash changed but no policy payload present; skipping reload");
+                warn!(
+                    "Settings poll: policy hash changed but no policy payload present; skipping reload"
+                );
                 current_config_revision = result.config_revision;
                 current_policy_hash = result.policy_hash;
                 current_settings = result.settings;
@@ -1375,10 +1377,18 @@ async fn run_policy_poll_loop(
 
             match opa_engine.reload_from_proto(policy) {
                 Ok(()) => {
-                    info!(
-                        policy_hash = %result.policy_hash,
-                        "Policy reloaded successfully"
-                    );
+                    if result.global_policy_version > 0 {
+                        info!(
+                            policy_hash = %result.policy_hash,
+                            global_version = result.global_policy_version,
+                            "Policy reloaded successfully (global)"
+                        );
+                    } else {
+                        info!(
+                            policy_hash = %result.policy_hash,
+                            "Policy reloaded successfully"
+                        );
+                    }
                     if result.version > 0 && result.policy_source == PolicySource::Sandbox {
                         if let Err(e) = client
                             .report_policy_status(sandbox_id, result.version, true, "")
@@ -1390,19 +1400,19 @@ async fn run_policy_poll_loop(
                 }
                 Err(e) => {
                     warn!(
-                        version = result.version,
-                    error = %e,
-                    "Policy reload failed, keeping last-known-good policy"
-                );
-                if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                    if let Err(report_err) = client
-                        .report_policy_status(sandbox_id, result.version, false, &e.to_string())
-                        .await
-                    {
-                        warn!(error = %report_err, "Failed to report policy load failure");
+                            version = result.version,
+                        error = %e,
+                        "Policy reload failed, keeping last-known-good policy"
+                    );
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        if let Err(report_err) = client
+                            .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                            .await
+                        {
+                            warn!(error = %report_err, "Failed to report policy load failure");
+                        }
                     }
                 }
-            }
             }
         }
 

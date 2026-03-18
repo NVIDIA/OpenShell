@@ -3958,10 +3958,7 @@ pub async fn sandbox_settings_get(
 
     if json {
         let obj = settings_to_json_sandbox(name, &response);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&obj).into_diagnostic()?
-        );
+        println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
         return Ok(());
     }
 
@@ -4014,10 +4011,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
 
     if json {
         let obj = settings_to_json_global(&response);
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&obj).into_diagnostic()?
-        );
+        println!("{}", serde_json::to_string_pretty(&obj).into_diagnostic()?);
         return Ok(());
     }
 
@@ -4259,6 +4253,7 @@ pub async fn sandbox_policy_set(
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
             name: name.to_string(),
             version: 0,
+            global: false,
         })
         .await
         .ok()
@@ -4318,6 +4313,7 @@ pub async fn sandbox_policy_set(
             .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
                 name: name.to_string(),
                 version: resp.version,
+                global: false,
             })
             .await
             .into_diagnostic()?;
@@ -4372,6 +4368,7 @@ pub async fn sandbox_policy_get(
         .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
             name: name.to_string(),
             version,
+            global: false,
         })
         .await
         .into_diagnostic()?;
@@ -4410,6 +4407,54 @@ pub async fn sandbox_policy_get(
     Ok(())
 }
 
+pub async fn sandbox_policy_get_global(
+    server: &str,
+    version: u32,
+    full: bool,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let status_resp = client
+        .get_sandbox_policy_status(GetSandboxPolicyStatusRequest {
+            name: String::new(),
+            version,
+            global: true,
+        })
+        .await
+        .into_diagnostic()?;
+
+    let inner = status_resp.into_inner();
+    if let Some(rev) = inner.revision {
+        let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
+        println!("Scope:        global");
+        println!("Version:      {}", rev.version);
+        println!("Hash:         {}", rev.policy_hash);
+        println!("Status:       {status:?}");
+        if rev.created_at_ms > 0 {
+            println!("Created:      {} ms", rev.created_at_ms);
+        }
+        if rev.loaded_at_ms > 0 {
+            println!("Loaded:       {} ms", rev.loaded_at_ms);
+        }
+
+        if full {
+            if let Some(ref policy) = rev.policy {
+                println!("---");
+                let yaml_str = openshell_policy::serialize_sandbox_policy(policy)
+                    .wrap_err("failed to serialize policy to YAML")?;
+                print!("{yaml_str}");
+            } else {
+                eprintln!("Policy payload not available for this version");
+            }
+        }
+    } else {
+        eprintln!("No global policy history found");
+    }
+
+    Ok(())
+}
+
 pub async fn sandbox_policy_list(
     server: &str,
     name: &str,
@@ -4423,6 +4468,7 @@ pub async fn sandbox_policy_list(
             name: name.to_string(),
             limit,
             offset: 0,
+            global: false,
         })
         .await
         .into_diagnostic()?;
@@ -4433,11 +4479,39 @@ pub async fn sandbox_policy_list(
         return Ok(());
     }
 
+    print_policy_revision_table(&revisions);
+    Ok(())
+}
+
+pub async fn sandbox_policy_list_global(server: &str, limit: u32, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+
+    let resp = client
+        .list_sandbox_policies(ListSandboxPoliciesRequest {
+            name: String::new(),
+            limit,
+            offset: 0,
+            global: true,
+        })
+        .await
+        .into_diagnostic()?;
+
+    let revisions = resp.into_inner().revisions;
+    if revisions.is_empty() {
+        eprintln!("No global policy history found");
+        return Ok(());
+    }
+
+    print_policy_revision_table(&revisions);
+    Ok(())
+}
+
+fn print_policy_revision_table(revisions: &[openshell_core::proto::SandboxPolicyRevision]) {
     println!(
         "{:<8} {:<14} {:<12} {:<24} ERROR",
         "VERSION", "HASH", "STATUS", "CREATED"
     );
-    for rev in &revisions {
+    for rev in revisions {
         let status = PolicyStatus::try_from(rev.status).unwrap_or(PolicyStatus::Unspecified);
         let hash_short = if rev.policy_hash.len() >= 12 {
             &rev.policy_hash[..12]
@@ -4458,8 +4532,6 @@ pub async fn sandbox_policy_list(
             error_short,
         );
     }
-
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------

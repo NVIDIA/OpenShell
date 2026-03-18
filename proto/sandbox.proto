@@ -172,4 +172,7 @@ message GetSandboxSettingsResponse {
   uint64 config_revision = 5;
   // Source of the policy payload for this response.
   PolicySource policy_source = 6;
+  // When policy_source is GLOBAL, the version of the global policy revision.
+  // Zero when no global policy is active or when policy_source is SANDBOX.
+  uint32 global_policy_version = 7;
 }

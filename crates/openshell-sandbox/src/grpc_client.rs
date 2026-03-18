@@ -12,8 +12,7 @@ use openshell_core::proto::{
     DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxSettingsRequest, PolicySource, PolicyStatus,
     ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    UpdateSettingsRequest, inference_client::InferenceClient,
-    open_shell_client::OpenShellClient,
+    UpdateSettingsRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -223,6 +222,8 @@ pub struct SettingsPollResult {
     pub policy_source: PolicySource,
     /// Effective settings keyed by name.
     pub settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    /// When `policy_source` is `Global`, the version of the global policy revision.
+    pub global_policy_version: u32,
 }
 
 impl CachedOpenShellClient {
@@ -259,6 +260,7 @@ impl CachedOpenShellClient {
             policy_source: PolicySource::try_from(inner.policy_source)
                 .unwrap_or(PolicySource::Unspecified),
             settings: inner.settings,
+            global_policy_version: inner.global_policy_version,
         })
     }
 
