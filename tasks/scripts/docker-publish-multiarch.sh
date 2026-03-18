@@ -26,6 +26,32 @@
 #   AWS_REGION               - AWS region (default: us-west-2)
 set -euo pipefail
 
+runtime_bundle_var_name() {
+  local arch="$1"
+  local upper_arch
+  upper_arch=$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')
+  printf 'OPENSHELL_RUNTIME_BUNDLE_TARBALL_%s\n' "$upper_arch"
+}
+
+require_runtime_bundle_tarball_for_arch() {
+  local arch="$1"
+  local var_name value
+  var_name="$(runtime_bundle_var_name "$arch")"
+  value="${!var_name:-}"
+
+  if [[ -z "$value" ]]; then
+    echo "missing required variable: ${var_name}" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$value" ]]; then
+    echo "runtime bundle validation failed: tarball not found: ${value}" >&2
+    exit 1
+  fi
+
+  printf '%s\n' "$value"
+}
+
 sha256_16() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print substr($1, 1, 16)}'
@@ -193,16 +219,40 @@ if [ -n "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
   CLUSTER_BUILD_ARGS="--build-arg SCCACHE_MEMCACHED_ENDPOINT=${SCCACHE_MEMCACHED_ENDPOINT}"
 fi
 CLUSTER_IMAGE="${REGISTRY}/${IMAGE_PREFIX:+${IMAGE_PREFIX}}cluster"
-docker buildx build \
-  --platform "${PLATFORMS}" \
-  -f "${CLUSTER_DOCKERFILE}" \
+IFS=',' read -r -a PLATFORM_LIST <<< "${PLATFORMS}"
+CLUSTER_PLATFORM_TAGS=()
+
+for platform in "${PLATFORM_LIST[@]}"; do
+  case "$platform" in
+    linux/amd64)
+      arch="amd64"
+      ;;
+    linux/arm64)
+      arch="arm64"
+      ;;
+    *)
+      echo "Unsupported cluster platform for runtime bundle publishing: ${platform}" >&2
+      exit 1
+      ;;
+  esac
+
+  runtime_bundle_tarball="$(require_runtime_bundle_tarball_for_arch "$arch")"
+  arch_tag="${IMAGE_TAG}-${arch}"
+  CLUSTER_PLATFORM_TAGS+=("${CLUSTER_IMAGE}:${arch_tag}")
+
+  IMAGE_TAG="${arch_tag}" \
+  DOCKER_PLATFORM="$platform" \
+  DOCKER_PUSH=1 \
+  OPENSHELL_RUNTIME_BUNDLE_TARBALL="$runtime_bundle_tarball" \
+  OPENSHELL_CARGO_VERSION="$CARGO_VERSION" \
+  K3S_VERSION="${K3S_VERSION:-}" \
+  tasks/scripts/docker-build-cluster.sh
+done
+
+docker buildx imagetools create \
+  --prefer-index=false \
   -t "${CLUSTER_IMAGE}:${IMAGE_TAG}" \
-  ${K3S_VERSION:+--build-arg K3S_VERSION=${K3S_VERSION}} \
-  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CLUSTER_CARGO_SCOPE}" \
-  ${CLUSTER_BUILD_ARGS} \
-  ${EXTRA_BUILD_FLAGS} \
-  --push \
-  .
+  "${CLUSTER_PLATFORM_TAGS[@]}"
 
 # ---------------------------------------------------------------------------
 # Step 4: Apply additional tags by copying manifests.

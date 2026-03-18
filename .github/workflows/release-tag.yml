@@ -75,6 +75,8 @@ jobs:
     with:
       component: cluster
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
+      runtime-bundle-url-amd64: ${{ vars.OPENSHELL_RUNTIME_BUNDLE_URL_AMD64 }}
+      runtime-bundle-url-arm64: ${{ vars.OPENSHELL_RUNTIME_BUNDLE_URL_ARM64 }}
 
   e2e:
     needs: [build-gateway, build-cluster]

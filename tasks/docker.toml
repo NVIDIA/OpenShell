@@ -22,17 +22,17 @@ run = "tasks/scripts/docker-build-component.sh gateway"
 hide = true
 
 ["docker:build:cluster"]
-description = "Build the k3s cluster image (component images pulled at runtime from registry)"
+description = "Build the k3s cluster image (requires OPENSHELL_RUNTIME_BUNDLE_TARBALL)"
 run = "tasks/scripts/docker-build-cluster.sh"
 hide = true
 
 ["docker:build:cluster:multiarch"]
-description = "Build multi-arch cluster image and push to a registry"
+description = "Build multi-arch cluster image and push to a registry (requires per-arch runtime bundle tarballs)"
 run = "tasks/scripts/docker-publish-multiarch.sh --mode registry"
 hide = true
 
 ["docker:publish:cluster:multiarch"]
-description = "Build and publish multi-arch cluster image to ECR"
+description = "Build and publish multi-arch cluster image to ECR (requires per-arch runtime bundle tarballs)"
 run = "tasks/scripts/docker-publish-multiarch.sh --mode ecr"
 hide = true
 

@@ -32,6 +32,21 @@ on:
         required: false
         type: string
         default: ""
+      runtime-bundle-url:
+        description: "Per-arch runtime bundle tarball URL for single-arch cluster builds"
+        required: false
+        type: string
+        default: ""
+      runtime-bundle-url-amd64:
+        description: "amd64 runtime bundle tarball URL for multi-arch cluster builds"
+        required: false
+        type: string
+        default: ""
+      runtime-bundle-url-arm64:
+        description: "arm64 runtime bundle tarball URL for multi-arch cluster builds"
+        required: false
+        type: string
+        default: ""
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -87,7 +102,30 @@ jobs:
         uses: ./.github/actions/setup-buildx
 
       - name: Build ${{ inputs.component }} image
+        if: inputs.component != 'cluster'
         env:
           DOCKER_BUILDER: openshell
           OPENSHELL_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
         run: mise run --no-prepare docker:build:${{ inputs.component }}
+
+      - name: Build cluster image
+        if: inputs.component == 'cluster'
+        env:
+          DOCKER_BUILDER: openshell
+          OPENSHELL_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
+          OPENSHELL_RUNTIME_BUNDLE_URL: ${{ inputs.runtime-bundle-url }}
+          OPENSHELL_RUNTIME_BUNDLE_URL_AMD64: ${{ inputs.runtime-bundle-url-amd64 }}
+          OPENSHELL_RUNTIME_BUNDLE_URL_ARM64: ${{ inputs.runtime-bundle-url-arm64 }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${DOCKER_PLATFORM}" == *","* ]]; then
+            bash tasks/scripts/ci-build-cluster-image.sh \
+              --platform "${DOCKER_PLATFORM}" \
+              --runtime-bundle-url-amd64 "${OPENSHELL_RUNTIME_BUNDLE_URL_AMD64}" \
+              --runtime-bundle-url-arm64 "${OPENSHELL_RUNTIME_BUNDLE_URL_ARM64}"
+          else
+            bash tasks/scripts/ci-build-cluster-image.sh \
+              --platform "${DOCKER_PLATFORM}" \
+              --runtime-bundle-url "${OPENSHELL_RUNTIME_BUNDLE_URL}"
+          fi

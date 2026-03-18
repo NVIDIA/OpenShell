@@ -58,7 +58,11 @@ For remote dev/test deploys from a local checkout, `scripts/remote-deploy.sh`
 wraps a different workflow: it rsyncs the repository to a remote host, builds
 the release CLI plus cluster/server/sandbox images on that machine, and then
 invokes `openshell gateway start` with explicit flags such as `--recreate`,
-`--plaintext`, or `--disable-gateway-auth` only when requested.
+`--plaintext`, or `--disable-gateway-auth` only when requested. The remote
+cluster-image build now also requires a runtime-bundle tarball: provide
+`--runtime-bundle-tarball <local-path>` for normal sync-and-build deploys, or
+`--remote-runtime-bundle-tarball <remote-path> --skip-sync` when the tarball is
+already present on the remote host.
 
 ## Local Task Flows (`mise`)
 
@@ -70,6 +74,7 @@ Development task entrypoints split bootstrap behavior:
 
 For `mise run cluster`, `.env` acts as local source-of-truth for `GATEWAY_NAME`, `GATEWAY_PORT`, and `OPENSHELL_GATEWAY`. Missing keys are appended; existing values are preserved. If `GATEWAY_PORT` is missing, the task selects a free local port and persists it.
 Fast mode ensures a local registry (`127.0.0.1:5000`) is running and configures k3s to mirror pulls via `host.docker.internal:5000`, so the cluster task can push/pull local component images consistently.
+When that flow needs to rebuild the cluster image, it also requires `OPENSHELL_RUNTIME_BUNDLE_TARBALL`; prebuilt-image paths can still skip the local cluster-image build with `SKIP_CLUSTER_IMAGE_BUILD=1`.
 
 ## Bootstrap Sequence Diagram
 
@@ -298,7 +303,8 @@ GPU support is part of the single-node gateway bootstrap path rather than a sepa
 
 - `openshell gateway start --gpu` threads a boolean deploy option through `crates/openshell-cli`, `crates/openshell-bootstrap`, and `crates/openshell-bootstrap/src/docker.rs`.
 - When enabled, the cluster container is created with Docker `DeviceRequests`, which is the API equivalent of `docker run --gpus all`.
-- `deploy/docker/Dockerfile.cluster` installs NVIDIA Container Toolkit packages in a dedicated Ubuntu stage and copies the runtime binaries, config, and `libnvidia-container` shared libraries into the final Ubuntu-based cluster image.
+- `tasks/scripts/docker-build-cluster.sh` now validates a staged local runtime-bundle tarball and places the verified payload under `deploy/docker/.build/runtime-bundle/<arch>/` before Docker runs.
+- `deploy/docker/Dockerfile.cluster` copies the runtime binaries, config, and `libnvidia-container` shared libraries from that staged local bundle into the final Ubuntu-based cluster image instead of installing toolkit packages from an apt repository during the build.
 - `deploy/docker/cluster-entrypoint.sh` checks `GPU_ENABLED=true` and copies GPU-only manifests from `/opt/openshell/gpu-manifests/` into k3s's manifests directory.
 - `deploy/kube/gpu-manifests/nvidia-device-plugin-helmchart.yaml` installs the NVIDIA device plugin chart, currently pinned to `0.18.2`, along with GPU Feature Discovery and Node Feature Discovery.
 - k3s auto-detects `nvidia-container-runtime` on `PATH`, registers the `nvidia` containerd runtime, and creates the `nvidia` `RuntimeClass` automatically.

@@ -269,7 +269,11 @@ This performs the same bootstrap flow on the remote host via SSH.
 For development and testing against the current checkout, use
 `scripts/remote-deploy.sh` instead. That helper syncs the local repository to
 an SSH-reachable machine, builds the CLI and Docker images on the remote host,
-and then runs `openshell gateway start` there. It defaults to secure gateway
+and then runs `openshell gateway start` there. Cluster-image builds in that
+flow now also require a runtime-bundle tarball: provide
+`--runtime-bundle-tarball <local-path>` for normal sync-and-build deploys, or
+`--remote-runtime-bundle-tarball <remote-path> --skip-sync` if the bundle is
+already staged on the remote host. The helper defaults to secure gateway
 startup and only enables `--plaintext`, `--disable-gateway-auth`, or
 `--recreate` when explicitly requested.
 

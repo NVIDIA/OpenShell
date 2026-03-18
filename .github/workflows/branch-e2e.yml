@@ -24,6 +24,7 @@ jobs:
       component: cluster
       platform: linux/arm64
       runner: build-arm64
+      runtime-bundle-url: ${{ vars.OPENSHELL_RUNTIME_BUNDLE_URL_ARM64 }}
 
   e2e:
     needs: [build-gateway, build-cluster]

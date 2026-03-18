@@ -10,6 +10,18 @@ normalize_name() {
   echo "$1" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//;s/-$//'
 }
 
+require_runtime_bundle_tarball() {
+  if [ -z "${OPENSHELL_RUNTIME_BUNDLE_TARBALL:-}" ]; then
+    echo "missing required variable: OPENSHELL_RUNTIME_BUNDLE_TARBALL" >&2
+    exit 1
+  fi
+
+  if [ ! -f "${OPENSHELL_RUNTIME_BUNDLE_TARBALL}" ]; then
+    echo "runtime bundle validation failed: tarball not found: ${OPENSHELL_RUNTIME_BUNDLE_TARBALL}" >&2
+    exit 1
+  fi
+}
+
 MODE=${1:-build}
 if [ "${MODE}" != "build" ] && [ "${MODE}" != "fast" ]; then
   echo "usage: $0 [build|fast]" >&2
@@ -208,6 +220,10 @@ fi
 
 if is_local_registry_host; then
   ensure_local_registry
+fi
+
+if [ "${SKIP_CLUSTER_IMAGE_BUILD:-}" != "1" ]; then
+  require_runtime_bundle_tarball
 fi
 
 CONTAINER_NAME="openshell-cluster-${CLUSTER_NAME}"

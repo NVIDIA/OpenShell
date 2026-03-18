@@ -27,6 +27,10 @@ Options:
   --disable-gateway-auth      Keep TLS but disable client certificate enforcement
   --image-tag TAG             Docker image tag to build/deploy (default: dev)
   --cargo-version VERSION     Override OPENSHELL_CARGO_VERSION for remote Docker builds
+  --runtime-bundle-tarball PATH
+                              Local runtime bundle tarball to sync and use for remote cluster builds
+  --remote-runtime-bundle-tarball PATH
+                              Remote runtime bundle tarball path to use with --skip-sync
   --help                      Show this help
 
 Examples:
@@ -56,6 +60,8 @@ GATEWAY_PORT=${GATEWAY_PORT:-8080}
 SSH_KEY="${SSH_KEY:-}"
 IMAGE_TAG=${IMAGE_TAG:-dev}
 CARGO_VERSION=${OPENSHELL_CARGO_VERSION:-0.0.0-dev}
+RUNTIME_BUNDLE_TARBALL="${OPENSHELL_RUNTIME_BUNDLE_TARBALL:-}"
+REMOTE_RUNTIME_BUNDLE_TARBALL="${OPENSHELL_REMOTE_RUNTIME_BUNDLE_TARBALL:-}"
 SKIP_SYNC=false
 RECREATE=false
 PLAINTEXT=false
@@ -109,6 +115,16 @@ while [[ $# -gt 0 ]]; do
       CARGO_VERSION="$2"
       shift 2
       ;;
+    --runtime-bundle-tarball)
+      require_value "$1" "${2-}"
+      RUNTIME_BUNDLE_TARBALL="$2"
+      shift 2
+      ;;
+    --remote-runtime-bundle-tarball)
+      require_value "$1" "${2-}"
+      REMOTE_RUNTIME_BUNDLE_TARBALL="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -144,6 +160,27 @@ fi
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+if [[ "${SKIP_SYNC}" == "true" ]]; then
+  if [[ -z "${REMOTE_RUNTIME_BUNDLE_TARBALL}" ]]; then
+    err "--skip-sync requires --remote-runtime-bundle-tarball (or OPENSHELL_REMOTE_RUNTIME_BUNDLE_TARBALL)"
+    exit 1
+  fi
+  REMOTE_RUNTIME_BUNDLE_PATH="${REMOTE_RUNTIME_BUNDLE_TARBALL}"
+else
+  if [[ -z "${RUNTIME_BUNDLE_TARBALL}" ]]; then
+    err "Runtime bundle tarball is required (--runtime-bundle-tarball or OPENSHELL_RUNTIME_BUNDLE_TARBALL)"
+    exit 1
+  fi
+
+  if [[ ! -f "${RUNTIME_BUNDLE_TARBALL}" ]]; then
+    err "Runtime bundle tarball not found: ${RUNTIME_BUNDLE_TARBALL}"
+    exit 1
+  fi
+
+  REMOTE_RUNTIME_BUNDLE_DIR="${REMOTE_DIR}/.cache/runtime-bundles"
+  REMOTE_RUNTIME_BUNDLE_PATH="${REMOTE_RUNTIME_BUNDLE_DIR}/$(basename "${RUNTIME_BUNDLE_TARBALL}")"
+fi
+
 SSH_ARGS=()
 if [[ -n "${SSH_KEY}" ]]; then
   SSH_ARGS=(-i "${SSH_KEY}")
@@ -171,6 +208,12 @@ if [[ "${SKIP_SYNC}" != "true" ]]; then
     --exclude 'e2e/' \
     --exclude 'deploy/docker/.build/' \
     "${REPO_ROOT}/" "${REMOTE_HOST}:${REMOTE_DIR}/"
+
+  info "Syncing runtime bundle to ${REMOTE_HOST}:${REMOTE_RUNTIME_BUNDLE_PATH}"
+  ssh "${SSH_ARGS[@]}" "${REMOTE_HOST}" "mkdir -p '${REMOTE_RUNTIME_BUNDLE_DIR}'"
+  rsync -az \
+    -e "${RSYNC_SSH[*]}" \
+    "${RUNTIME_BUNDLE_TARBALL}" "${REMOTE_HOST}:${REMOTE_RUNTIME_BUNDLE_PATH}"
   info "Sync complete"
 fi
 
@@ -191,7 +234,8 @@ ssh -t "${SSH_ARGS[@]}" "${REMOTE_HOST}" \
   "${CARGO_VERSION}" \
   "${RECREATE}" \
   "${PLAINTEXT}" \
-  "${DISABLE_GATEWAY_AUTH}" <<'REMOTE_EOF'
+  "${DISABLE_GATEWAY_AUTH}" \
+  "${REMOTE_RUNTIME_BUNDLE_PATH}" <<'REMOTE_EOF'
 set -euo pipefail
 
 REMOTE_DIR="$1"
@@ -202,6 +246,7 @@ CARGO_VERSION="$5"
 RECREATE="$6"
 PLAINTEXT="$7"
 DISABLE_GATEWAY_AUTH="$8"
+REMOTE_RUNTIME_BUNDLE_PATH="$9"
 
 cd "${REMOTE_DIR}"
 
@@ -235,6 +280,7 @@ rm -f .env
 echo "==> Building Docker images (tag=${IMAGE_TAG})..."
 export OPENSHELL_CARGO_VERSION="${CARGO_VERSION}"
 export IMAGE_TAG
+export OPENSHELL_RUNTIME_BUNDLE_TARBALL="${REMOTE_RUNTIME_BUNDLE_PATH}"
 mise exec -- tasks/scripts/docker-build-cluster.sh
 mise exec -- tasks/scripts/docker-build-component.sh gateway
 
