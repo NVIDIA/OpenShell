@@ -47,6 +47,10 @@ pub enum Event {
     GlobalSettingSetResult(Result<u64, String>),
     /// Global setting delete result: `Ok(revision)` or `Err(message)`.
     GlobalSettingDeleteResult(Result<u64, String>),
+    /// Sandbox setting set result: `Ok(revision)` or `Err(message)`.
+    SandboxSettingSetResult(Result<u64, String>),
+    /// Sandbox setting delete result: `Ok(revision)` or `Err(message)`.
+    SandboxSettingDeleteResult(Result<u64, String>),
 }
 
 pub struct EventHandler {

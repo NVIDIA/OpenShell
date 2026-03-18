@@ -121,6 +121,15 @@ pub async fn run(
                     app.pending_setting_delete = false;
                     spawn_delete_global_setting(&app, events.sender());
                 }
+                // --- Sandbox settings CRUD ---
+                if app.pending_sandbox_setting_set {
+                    app.pending_sandbox_setting_set = false;
+                    spawn_set_sandbox_setting(&app, events.sender());
+                }
+                if app.pending_sandbox_setting_delete {
+                    app.pending_sandbox_setting_delete = false;
+                    spawn_delete_sandbox_setting(&app, events.sender());
+                }
                 if app.pending_sandbox_detail {
                     app.pending_sandbox_detail = false;
                     fetch_sandbox_detail(&mut app).await;
@@ -262,6 +271,30 @@ pub async fn run(
                     app.status_text = format!("delete setting failed: {msg}");
                 }
             },
+            Some(Event::SandboxSettingSetResult(result)) => {
+                app.sandbox_setting_edit = None;
+                match result {
+                    Ok(_rev) => {
+                        app.status_text = "Sandbox setting updated.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("set sandbox setting failed: {msg}");
+                    }
+                }
+                // Re-fetch sandbox settings to reflect the change.
+                fetch_sandbox_detail(&mut app).await;
+            }
+            Some(Event::SandboxSettingDeleteResult(result)) => {
+                match result {
+                    Ok(_rev) => {
+                        app.status_text = "Sandbox setting deleted.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("delete sandbox setting failed: {msg}");
+                    }
+                }
+                fetch_sandbox_detail(&mut app).await;
+            }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
                     app.scroll_logs(-3);
@@ -730,6 +763,8 @@ async fn fetch_sandbox_detail(app: &mut App) {
                     app.policy_lines = render_policy_lines(&policy, &app.theme);
                     app.sandbox_policy = Some(policy);
                 }
+                // Populate sandbox settings from the same response.
+                app.apply_sandbox_settings(inner.settings);
             }
             Ok(Err(e)) => {
                 let msg = e.message().to_string();
@@ -1937,6 +1972,102 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
             Ok(Err(e)) => Event::GlobalSettingDeleteResult(Err(e.message().to_string())),
             Err(_) => Event::GlobalSettingDeleteResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(ref edit) = app.sandbox_setting_edit else {
+        return;
+    };
+    let Some(entry) = app.sandbox_settings.get(edit.index) else {
+        return;
+    };
+    let Some(sandbox_name) = app.selected_sandbox_name() else {
+        return;
+    };
+
+    let name = sandbox_name.to_string();
+    let key = entry.key.clone();
+    let raw = edit.input.trim().to_string();
+    let kind = entry.kind;
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        use openshell_core::proto::{SettingValue, UpdateSandboxPolicyRequest, setting_value};
+
+        let value = match kind {
+            openshell_core::settings::SettingValueKind::Bool => {
+                let parsed = openshell_core::settings::parse_bool_like(&raw).unwrap_or(false);
+                setting_value::Value::BoolValue(parsed)
+            }
+            openshell_core::settings::SettingValueKind::Int => {
+                let parsed = raw.parse::<i64>().unwrap_or(0);
+                setting_value::Value::IntValue(parsed)
+            }
+            openshell_core::settings::SettingValueKind::String => {
+                setting_value::Value::StringValue(raw)
+            }
+        };
+
+        let req = UpdateSandboxPolicyRequest {
+            name,
+            policy: None,
+            setting_key: key,
+            setting_value: Some(SettingValue { value: Some(value) }),
+            delete_setting: false,
+            global: false,
+        };
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), client.update_sandbox_policy(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => Event::SandboxSettingSetResult(Ok(resp.into_inner().settings_revision)),
+            Ok(Err(e)) => Event::SandboxSettingSetResult(Err(e.message().to_string())),
+            Err(_) => Event::SandboxSettingSetResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let idx = app
+        .sandbox_confirm_setting_delete
+        .unwrap_or(app.sandbox_settings_selected);
+    let Some(entry) = app.sandbox_settings.get(idx) else {
+        return;
+    };
+    let Some(sandbox_name) = app.selected_sandbox_name() else {
+        return;
+    };
+
+    let name = sandbox_name.to_string();
+    let key = entry.key.clone();
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        use openshell_core::proto::UpdateSandboxPolicyRequest;
+
+        let req = UpdateSandboxPolicyRequest {
+            name,
+            policy: None,
+            setting_key: key,
+            setting_value: None,
+            delete_setting: true,
+            global: false,
+        };
+
+        let result =
+            tokio::time::timeout(Duration::from_secs(5), client.update_sandbox_policy(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => {
+                Event::SandboxSettingDeleteResult(Ok(resp.into_inner().settings_revision))
+            }
+            Ok(Err(e)) => Event::SandboxSettingDeleteResult(Err(e.message().to_string())),
+            Err(_) => Event::SandboxSettingDeleteResult(Err("timeout".to_string())),
         };
         let _ = tx.send(event);
     });

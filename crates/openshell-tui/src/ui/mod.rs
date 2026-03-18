@@ -10,6 +10,7 @@ pub(crate) mod sandbox_detail;
 mod sandbox_draft;
 pub(crate) mod sandbox_logs;
 mod sandbox_policy;
+pub(crate) mod sandbox_settings;
 pub(crate) mod sandboxes;
 mod splash;
 
@@ -81,7 +82,10 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     match app.focus {
         Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
         Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
-        _ => sandbox_policy::draw(frame, app, chunks[1]),
+        _ => match app.sandbox_policy_tab {
+            app::SandboxPolicyTab::Settings => sandbox_settings::draw(frame, app, chunks[1]),
+            app::SandboxPolicyTab::Policy => sandbox_policy::draw(frame, app, chunks[1]),
+        },
     }
 
     // Log detail popup renders over the full frame (not constrained to pane).
@@ -380,8 +384,31 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ]);
                 spans
             }
+            _ if app.sandbox_policy_tab == app::SandboxPolicyTab::Settings => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Edit", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[Esc]", t.muted),
+                Span::styled(" Back", t.muted),
+                Span::styled("  ", t.text),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
             _ => vec![
                 Span::styled(" ", t.text),
+                Span::styled("[h]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
                 Span::styled("[j/k]", t.key_hint),
                 Span::styled(" Scroll", t.text),
                 Span::styled("  ", t.text),

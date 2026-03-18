@@ -130,15 +130,83 @@ impl GlobalSettingEntry {
     }
 }
 
-/// Editing state for a global setting.
+/// Editing state for a global or sandbox setting.
 #[derive(Debug, Clone)]
 pub struct SettingEditState {
-    /// Index into `global_settings` being edited.
+    /// Index into the settings list being edited.
     pub index: usize,
     /// Text buffer for string/int types.
     pub input: String,
     /// Validation error to display.
     pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox policy pane tab (Policy vs Settings)
+// ---------------------------------------------------------------------------
+
+/// Which tab is active in the bottom pane of the sandbox screen (when
+/// `Focus::SandboxPolicy`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SandboxPolicyTab {
+    Policy,
+    Settings,
+}
+
+impl SandboxPolicyTab {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Policy => Self::Settings,
+            Self::Settings => Self::Policy,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Sandbox setting entry (effective, with scope)
+// ---------------------------------------------------------------------------
+
+/// A single effective setting for a sandbox, with scope indicator.
+#[derive(Debug, Clone)]
+pub struct SandboxSettingEntry {
+    pub key: String,
+    pub kind: SettingValueKind,
+    pub value: Option<setting_value::Value>,
+    pub scope: SettingScope,
+}
+
+/// The scope a sandbox setting was resolved from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingScope {
+    Unset,
+    Sandbox,
+    Global,
+}
+
+impl SettingScope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unset => "unset",
+            Self::Sandbox => "sandbox",
+            Self::Global => "global",
+        }
+    }
+}
+
+impl SandboxSettingEntry {
+    pub fn display_value(&self) -> String {
+        match &self.value {
+            None => "<unset>".to_string(),
+            Some(setting_value::Value::StringValue(v)) => v.clone(),
+            Some(setting_value::Value::BoolValue(v)) => v.to_string(),
+            Some(setting_value::Value::IntValue(v)) => v.to_string(),
+            Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
+        }
+    }
+
+    pub fn is_globally_managed(&self) -> bool {
+        self.scope == SettingScope::Global
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -403,6 +471,16 @@ pub struct App {
     pub pending_sandbox_detail: bool,
     pub pending_shell_connect: bool,
 
+    // Sandbox policy pane tab + sandbox settings
+    pub sandbox_policy_tab: SandboxPolicyTab,
+    pub sandbox_settings: Vec<SandboxSettingEntry>,
+    pub sandbox_settings_selected: usize,
+    pub sandbox_setting_edit: Option<SettingEditState>,
+    pub sandbox_confirm_setting_set: Option<usize>,
+    pub sandbox_confirm_setting_delete: Option<usize>,
+    pub pending_sandbox_setting_set: bool,
+    pub pending_sandbox_setting_delete: bool,
+
     // Sandbox policy viewer
     pub sandbox_policy: Option<openshell_core::proto::SandboxPolicy>,
     pub sandbox_providers_list: Vec<String>,
@@ -520,6 +598,14 @@ impl App {
             pending_sandbox_delete: false,
             pending_sandbox_detail: false,
             pending_shell_connect: false,
+            sandbox_policy_tab: SandboxPolicyTab::Policy,
+            sandbox_settings: Vec::new(),
+            sandbox_settings_selected: 0,
+            sandbox_setting_edit: None,
+            sandbox_confirm_setting_set: None,
+            sandbox_confirm_setting_delete: None,
+            pending_sandbox_setting_set: false,
+            pending_sandbox_setting_delete: false,
             sandbox_policy: None,
             sandbox_providers_list: Vec::new(),
             policy_lines: Vec::new(),
@@ -582,6 +668,41 @@ impl App {
         }
     }
 
+    /// Apply fetched sandbox settings from the `GetSandboxSettings` response.
+    pub fn apply_sandbox_settings(
+        &mut self,
+        settings: HashMap<String, openshell_core::proto::EffectiveSetting>,
+    ) {
+        self.sandbox_settings = settings::REGISTERED_SETTINGS
+            .iter()
+            .map(|reg| {
+                let (value, scope) = settings
+                    .get(reg.key)
+                    .map(|es| {
+                        let v = es.value.as_ref().and_then(|sv| sv.value.clone());
+                        let s = match es.scope {
+                            1 => SettingScope::Sandbox,
+                            2 => SettingScope::Global,
+                            _ => SettingScope::Unset,
+                        };
+                        (v, s)
+                    })
+                    .unwrap_or((None, SettingScope::Unset));
+                SandboxSettingEntry {
+                    key: reg.key.to_string(),
+                    kind: reg.kind,
+                    value,
+                    scope,
+                }
+            })
+            .collect();
+        if self.sandbox_settings_selected >= self.sandbox_settings.len()
+            && !self.sandbox_settings.is_empty()
+        {
+            self.sandbox_settings_selected = self.sandbox_settings.len() - 1;
+        }
+    }
+
     /// Return log lines matching the current source filter.
     pub fn filtered_log_lines(&self) -> Vec<&LogLine> {
         self.sandbox_log_lines
@@ -627,6 +748,18 @@ impl App {
         }
         if self.confirm_setting_delete.is_some() {
             self.handle_setting_confirm_delete_key(key);
+            return;
+        }
+        if self.sandbox_confirm_setting_set.is_some() {
+            self.handle_sandbox_setting_confirm_set_key(key);
+            return;
+        }
+        if self.sandbox_confirm_setting_delete.is_some() {
+            self.handle_sandbox_setting_confirm_delete_key(key);
+            return;
+        }
+        if self.sandbox_setting_edit.is_some() {
+            self.handle_sandbox_setting_edit_key(key);
             return;
         }
         if self.setting_edit.is_some() {
@@ -947,10 +1080,17 @@ impl App {
             return;
         }
 
+        // Dispatch to sandbox settings handler when on the Settings tab.
+        if self.sandbox_policy_tab == SandboxPolicyTab::Settings {
+            self.handle_sandbox_settings_key(key);
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.cancel_log_stream();
                 self.draft_detail_open = false;
+                self.sandbox_policy_tab = SandboxPolicyTab::Policy;
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
             }
@@ -989,6 +1129,156 @@ impl App {
                 self.policy_scroll = 0;
             }
             KeyCode::Char('q') => self.running = false,
+            KeyCode::Char('h') | KeyCode::Right => {
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_settings_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') => self.running = false,
+            KeyCode::Esc => {
+                self.cancel_log_stream();
+                self.sandbox_policy_tab = SandboxPolicyTab::Policy;
+                self.screen = Screen::Dashboard;
+                self.focus = Focus::Sandboxes;
+            }
+            KeyCode::Char('h') | KeyCode::Right => {
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            KeyCode::Char('l') => {
+                // In policy tab, 'l' opens logs. In settings tab, switch tab.
+                self.sandbox_policy_tab = self.sandbox_policy_tab.next();
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.sandbox_settings.is_empty() {
+                    self.sandbox_settings_selected =
+                        (self.sandbox_settings_selected + 1).min(self.sandbox_settings.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.sandbox_settings_selected = self.sandbox_settings_selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(entry) = self.sandbox_settings.get(self.sandbox_settings_selected) {
+                    if entry.is_globally_managed() {
+                        self.status_text = format!(
+                            "'{}' is managed globally -- delete the global setting first",
+                            entry.key
+                        );
+                        return;
+                    }
+                    if entry.kind == SettingValueKind::Bool {
+                        let new_val = match &entry.value {
+                            Some(setting_value::Value::BoolValue(v)) => !v,
+                            _ => true,
+                        };
+                        self.sandbox_setting_edit = Some(SettingEditState {
+                            index: self.sandbox_settings_selected,
+                            input: new_val.to_string(),
+                            error: None,
+                        });
+                        self.sandbox_confirm_setting_set = Some(self.sandbox_settings_selected);
+                    } else {
+                        let current = entry.display_value();
+                        let input = if current == "<unset>" {
+                            String::new()
+                        } else {
+                            current
+                        };
+                        self.sandbox_setting_edit = Some(SettingEditState {
+                            index: self.sandbox_settings_selected,
+                            input,
+                            error: None,
+                        });
+                    }
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(entry) = self.sandbox_settings.get(self.sandbox_settings_selected) {
+                    if entry.is_globally_managed() {
+                        self.status_text = format!(
+                            "'{}' is managed globally -- delete the global setting first",
+                            entry.key
+                        );
+                    } else if entry.value.is_some() {
+                        self.sandbox_confirm_setting_delete =
+                            Some(self.sandbox_settings_selected);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_setting_edit_key(&mut self, key: KeyEvent) {
+        let Some(ref mut edit) = self.sandbox_setting_edit else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.sandbox_setting_edit = None;
+            }
+            KeyCode::Enter => {
+                let idx = edit.index;
+                if let Some(entry) = self.sandbox_settings.get(idx) {
+                    let raw = edit.input.trim();
+                    match entry.kind {
+                        SettingValueKind::Int => {
+                            if raw.parse::<i64>().is_err() {
+                                edit.error = Some("expected integer".to_string());
+                                return;
+                            }
+                        }
+                        SettingValueKind::Bool => {
+                            if settings::parse_bool_like(raw).is_none() {
+                                edit.error = Some("expected true/false/yes/no/1/0".to_string());
+                                return;
+                            }
+                        }
+                        SettingValueKind::String => {}
+                    }
+                }
+                edit.error = None;
+                self.sandbox_confirm_setting_set = Some(edit.index);
+            }
+            KeyCode::Backspace => {
+                edit.input.pop();
+                edit.error = None;
+            }
+            KeyCode::Char(c) => {
+                edit.input.push(c);
+                edit.error = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_setting_confirm_set_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_sandbox_setting_set = true;
+                self.sandbox_confirm_setting_set = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.sandbox_confirm_setting_set = None;
+                self.sandbox_setting_edit = None;
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_sandbox_setting_confirm_delete_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('y') | KeyCode::Enter => {
+                self.pending_sandbox_setting_delete = true;
+                self.sandbox_confirm_setting_delete = None;
+            }
+            KeyCode::Esc | KeyCode::Char('n') => {
+                self.sandbox_confirm_setting_delete = None;
+            }
             _ => {}
         }
     }
