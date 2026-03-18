@@ -3,29 +3,12 @@
 # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# Build multi-arch gateway + cluster images and push to a container registry.
+# Requires DOCKER_REGISTRY to be set (e.g. ghcr.io/myorg).
+
 set -euo pipefail
 
-usage() {
-  echo "Usage: docker-publish-multiarch.sh --mode registry" >&2
-  exit 1
-}
-
-MODE=""
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --mode)
-      MODE="$2"
-      shift 2
-      ;;
-    *)
-      echo "Unknown argument: $1" >&2
-      usage
-      ;;
-  esac
-done
-
-[[ -n "${MODE}" ]] || usage
-
+REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
 IMAGE_TAG=${IMAGE_TAG:-dev}
 PLATFORMS=${DOCKER_PLATFORMS:-linux/amd64,linux/arm64}
 TAG_LATEST=${TAG_LATEST:-false}
@@ -38,16 +21,6 @@ if [[ -n "${EXTRA_DOCKER_TAGS_RAW}" ]]; then
     [[ -n "${tag}" ]] && EXTRA_TAGS+=("${tag}")
   done
 fi
-
-case "${MODE}" in
-  registry)
-    REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
-    ;;
-  *)
-    echo "Unknown mode: ${MODE}" >&2
-    usage
-    ;;
-esac
 
 BUILDER_NAME=${DOCKER_BUILDER:-multiarch}
 if docker buildx inspect "${BUILDER_NAME}" >/dev/null 2>&1; then
@@ -65,10 +38,6 @@ export IMAGE_REGISTRY="${REGISTRY}"
 
 echo "Building multi-arch gateway image..."
 tasks/scripts/docker-build-image.sh gateway
-
-mkdir -p deploy/docker/.build/charts
-echo "Packaging helm chart..."
-helm package deploy/helm/openshell -d deploy/docker/.build/charts/
 
 echo
 echo "Building multi-arch cluster image..."

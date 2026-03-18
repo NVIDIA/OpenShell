@@ -230,12 +230,12 @@ fi
 # and entrypoint from the working tree.  This ensures the k3s container
 # always starts with the correct chart version.
 if [ "${SKIP_CLUSTER_IMAGE_BUILD:-}" != "1" ]; then
-  tasks/scripts/docker-build-cluster.sh
+  tasks/scripts/docker-build-image.sh cluster
 fi
 
 # In fast/build modes, use the locally-built cluster image rather than the
 # remote distribution registry image.  The local image is built by
-# `docker-build-cluster.sh` and contains the bundled Helm chart and
+# `docker-build-image.sh cluster` and contains the bundled Helm chart and
 # manifests from the current working tree.
 if [ -z "${OPENSHELL_CLUSTER_IMAGE:-}" ]; then
   export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"

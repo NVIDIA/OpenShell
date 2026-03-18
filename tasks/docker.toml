@@ -18,7 +18,7 @@ hide = true
 
 ["build:docker:ci"]
 description = "Build the CI Docker image"
-run = "tasks/scripts/docker-build-component.sh ci"
+run = "tasks/scripts/docker-build-ci.sh"
 hide = true
 
 ["docker:build:ci"]
@@ -28,7 +28,7 @@ hide = true
 
 ["build:docker:gateway"]
 description = "Build the gateway Docker image"
-run = "tasks/scripts/docker-build-component.sh gateway"
+run = "tasks/scripts/docker-build-image.sh gateway"
 hide = true
 
 ["docker:build:gateway"]
@@ -38,7 +38,7 @@ hide = true
 
 ["build:docker:cluster"]
 description = "Build the k3s cluster image (component images pulled at runtime from registry)"
-run = "tasks/scripts/docker-build-cluster.sh"
+run = "tasks/scripts/docker-build-image.sh cluster"
 hide = true
 
 ["docker:build:cluster"]
@@ -48,17 +48,12 @@ hide = true
 
 ["build:docker:cluster:multiarch"]
 description = "Build multi-arch cluster image and push to a registry"
-run = "tasks/scripts/docker-publish-multiarch.sh --mode registry"
+run = "tasks/scripts/docker-publish-multiarch.sh"
 hide = true
 
 ["docker:build:cluster:multiarch"]
 description = "Alias for build:docker:cluster:multiarch"
 depends = ["build:docker:cluster:multiarch"]
-hide = true
-
-["docker:publish:cluster:multiarch"]
-description = "Build and publish multi-arch cluster image to ECR"
-run = "tasks/scripts/docker-publish-multiarch.sh --mode ecr"
 hide = true
 
 ["docker:cleanup"]

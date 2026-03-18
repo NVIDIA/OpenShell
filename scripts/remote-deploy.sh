@@ -235,8 +235,8 @@ rm -f .env
 echo "==> Building Docker images (tag=${IMAGE_TAG})..."
 export OPENSHELL_CARGO_VERSION="${CARGO_VERSION}"
 export IMAGE_TAG
-mise exec -- tasks/scripts/docker-build-cluster.sh
-mise exec -- tasks/scripts/docker-build-component.sh gateway
+mise exec -- tasks/scripts/docker-build-image.sh cluster
+mise exec -- tasks/scripts/docker-build-image.sh gateway
 
 export OPENSHELL_CLUSTER_IMAGE="openshell/cluster:${IMAGE_TAG}"
 export OPENSHELL_PUSH_IMAGES="openshell/gateway:${IMAGE_TAG}"

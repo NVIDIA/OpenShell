@@ -11,7 +11,7 @@ set -euo pipefail
 VERSION_DOCKER=$(uv run python tasks/scripts/release.py get-version --docker)
 VERSION_PYTHON=$(uv run python tasks/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-IMAGE_TAG=dev TAG_LATEST=true EXTRA_DOCKER_TAGS="$VERSION_DOCKER" mise run docker:publish:cluster:multiarch
+IMAGE_TAG=dev TAG_LATEST=true EXTRA_DOCKER_TAGS="$VERSION_DOCKER" mise run build:docker:cluster:multiarch
 OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:multiarch
 OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:macos
 uv run python tasks/scripts/release.py python-publish --version "$VERSION_PYTHON"
@@ -26,7 +26,7 @@ set -euo pipefail
 VERSION_DOCKER=$(uv run python tasks/scripts/release.py get-version --docker)
 VERSION_PYTHON=$(uv run python tasks/scripts/release.py get-version --python)
 CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo)
-IMAGE_TAG="$VERSION_DOCKER" TAG_LATEST=false mise run docker:publish:cluster:multiarch
+IMAGE_TAG="$VERSION_DOCKER" TAG_LATEST=false mise run build:docker:cluster:multiarch
 OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:multiarch
 OPENSHELL_CARGO_VERSION="$CARGO_VERSION" mise run build:python:wheel:macos
 uv run python tasks/scripts/release.py python-publish --version "$VERSION_PYTHON"

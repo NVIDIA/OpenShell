@@ -49,7 +49,7 @@ done
 
 if [ -z "${resolved_source_image}" ]; then
   echo "Local image not found for ${component}:${IMAGE_TAG}, building..."
-  tasks/scripts/docker-build-component.sh "${component}"
+  tasks/scripts/docker-build-image.sh "${component}"
   resolved_source_image="openshell/${component}:${IMAGE_TAG}"
 fi
 

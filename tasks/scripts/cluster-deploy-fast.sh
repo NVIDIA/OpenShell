@@ -302,7 +302,7 @@ build_start=$(date +%s)
 declare -a built_components=()
 
 if [[ "${build_gateway}" == "1" ]]; then
-  tasks/scripts/docker-build-component.sh gateway
+  tasks/scripts/docker-build-image.sh gateway
 fi
 
 # Build the supervisor binary and docker cp it into the running k3s cluster.
