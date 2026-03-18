@@ -175,21 +175,19 @@ fn diagnose_corrupted_state(gateway_name: &str) -> GatewayFailureDiagnosis {
     GatewayFailureDiagnosis {
         summary: "Corrupted cluster state".to_string(),
         explanation: "The gateway cluster has corrupted internal state, likely from a previous \
-            interrupted startup or unclean shutdown."
+            interrupted startup or unclean shutdown. Resources from the failed deploy have been \
+            automatically cleaned up."
             .to_string(),
         recovery_steps: vec![
+            RecoveryStep::new("Retry the gateway start (cleanup was automatic)"),
             RecoveryStep::with_command(
-                "Destroy and recreate the gateway",
+                "If the retry fails, manually destroy and recreate",
                 format!(
                     "openshell gateway destroy --name {gateway_name} && openshell gateway start"
                 ),
             ),
-            RecoveryStep::with_command(
-                "If that fails, remove the volume for a clean slate",
-                format!("docker volume rm openshell-cluster-{gateway_name}"),
-            ),
         ],
-        retryable: false,
+        retryable: true,
     }
 }
 
