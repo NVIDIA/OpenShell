@@ -64,12 +64,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect, focused: bool) {
             Span::styled("'? [y/n] ", t.status_err),
         ])
     } else {
-        Line::from(vec![
-            Span::styled(" Providers ", t.heading),
-            Span::styled("- ", t.border),
-            Span::styled(&app.gateway_name, t.muted),
-            Span::styled(" ", t.muted),
-        ])
+        super::global_settings::draw_tab_title(app, focused)
     };
 
     let block = Block::default()

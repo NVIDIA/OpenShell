@@ -4,6 +4,7 @@
 pub(crate) mod create_provider;
 pub(crate) mod create_sandbox;
 mod dashboard;
+pub(crate) mod global_settings;
 pub(crate) mod providers;
 pub(crate) mod sandbox_detail;
 mod sandbox_draft;
@@ -161,10 +162,35 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spans = match app.screen {
         Screen::Splash => unreachable!("splash handled before draw_nav_bar"),
         Screen::Dashboard => match app.focus {
+            Focus::Providers if app.middle_pane_tab == app::MiddlePaneTab::GlobalSettings => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Edit", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
             Focus::Providers => vec![
                 Span::styled(" ", t.text),
                 Span::styled("[Tab]", t.key_hint),
                 Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
                 Span::styled("  ", t.text),
                 Span::styled("[j/k]", t.key_hint),
                 Span::styled(" Navigate", t.text),

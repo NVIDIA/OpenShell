@@ -6,7 +6,7 @@ use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Padding, Paragraph, Row, Table};
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, MiddlePaneTab};
 
 pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let chunks = Layout::default()
@@ -19,7 +19,17 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
         .split(area);
 
     draw_gateway_list(frame, app, chunks[0]);
-    super::providers::draw(frame, app, chunks[1], app.focus == Focus::Providers);
+
+    let mid_focused = app.focus == Focus::Providers;
+    match app.middle_pane_tab {
+        MiddlePaneTab::Providers => {
+            super::providers::draw(frame, app, chunks[1], mid_focused);
+        }
+        MiddlePaneTab::GlobalSettings => {
+            super::global_settings::draw(frame, app, chunks[1], mid_focused);
+        }
+    }
+
     super::sandboxes::draw(frame, app, chunks[2], app.focus == Focus::Sandboxes);
 }
 

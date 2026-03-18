@@ -32,6 +32,21 @@ pub enum Event {
     ProviderDeleteResult(Result<bool, String>),
     /// Draft action result: `Ok(status_message)` or `Err(error_message)`.
     DraftActionResult(Result<String, String>),
+    /// Global settings fetched: `Ok((settings, revision))` or `Err(message)`.
+    #[allow(dead_code)]
+    GlobalSettingsFetched(
+        Result<
+            (
+                std::collections::HashMap<String, openshell_core::proto::SettingValue>,
+                u64,
+            ),
+            String,
+        >,
+    ),
+    /// Global setting set result: `Ok(revision)` or `Err(message)`.
+    GlobalSettingSetResult(Result<u64, String>),
+    /// Global setting delete result: `Ok(revision)` or `Err(message)`.
+    GlobalSettingDeleteResult(Result<u64, String>),
 }
 
 pub struct EventHandler {
