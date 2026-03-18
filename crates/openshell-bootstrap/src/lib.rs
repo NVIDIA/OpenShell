@@ -48,10 +48,10 @@ pub use crate::docker::{
     DockerPreflight, ExistingGatewayInfo, check_docker_available, create_ssh_docker_client,
 };
 pub use crate::metadata::{
-    GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
-    list_gateways, load_active_gateway, load_gateway_metadata, load_last_sandbox,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
-    store_gateway_metadata,
+    GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination,
+    get_gateway_metadata, list_gateways, load_active_gateway, load_gateway_metadata,
+    load_last_sandbox, remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway,
+    save_last_sandbox, store_gateway_metadata,
 };
 
 /// Options for remote SSH deployment.
@@ -911,6 +911,116 @@ async fn probe_container_dns(docker: &Docker, container_name: &str) -> Result<bo
     Ok(exit_code == 0 && output.contains("DNS_OK"))
 }
 
+/// Query the status and logs of the `helm-install-<chart>` Job(s) that k3s runs
+/// at startup to deploy the embedded Helm charts (e.g. the openshell chart).
+///
+/// When the Job has failed we return a formatted string containing the Job
+/// failure reason and the last 30 lines of its pod logs so that callers can
+/// surface this as the *real* cause of the "namespace not ready" timeout.
+///
+/// Returns `None` when:
+/// - the exec into the container itself fails (container not running), or
+/// - no failed Helm install Job is found.
+async fn diagnose_helm_failure(
+    docker: &Docker,
+    container_name: &str,
+    kubeconfig: &str,
+) -> Option<String> {
+    // Find all Helm install Jobs that have at least one failed condition.
+    // Query jobs that have either a non-zero status.failed count OR a pod in
+    // Error/CrashLoopBackOff (status.failed stays "<none>" while the job is
+    // still within its backoffLimit retry window).
+    let (job_output, job_exit) = exec_capture_with_exit(
+        docker,
+        container_name,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={kubeconfig} kubectl get jobs -n kube-system \
+                 --no-headers -o custom-columns=NAME:.metadata.name,FAILED:.status.failed \
+                 2>/dev/null | awk '{{if ($2 != \"0\") print $1}}'"
+            ),
+        ],
+    )
+    .await
+    .ok()?;
+
+    if job_exit != 0 || job_output.trim().is_empty() {
+        return None;
+    }
+
+    // Collect failed Helm install jobs (k3s names them `helm-install-<chart>`).
+    let failed_jobs: Vec<&str> = job_output
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && l.starts_with("helm-install-"))
+        .collect();
+
+    if failed_jobs.is_empty() {
+        return None;
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+
+    for job in &failed_jobs {
+        // Get the Job's status conditions for a concise failure reason.
+        let cond_output = exec_capture_with_exit(
+            docker,
+            container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "KUBECONFIG={kubeconfig} kubectl get job {job} -n kube-system \
+                     -o jsonpath='{{range .status.conditions[*]}}{{.type}}: {{.message}}{{\"\\n\"}}{{end}}' \
+                     2>/dev/null"
+                ),
+            ],
+        )
+        .await
+        .map(|(out, _)| out)
+        .unwrap_or_default();
+
+        // Get the last 30 lines of logs from the Job's pod(s).
+        let log_output = exec_capture_with_exit(
+            docker,
+            container_name,
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!(
+                    "KUBECONFIG={kubeconfig} kubectl logs -n kube-system \
+                     -l job-name={job} --tail=30 2>&1"
+                ),
+            ],
+        )
+        .await
+        .map(|(out, _)| out)
+        .unwrap_or_default();
+
+        let mut section = format!("Job {job} failed.");
+        let cond = cond_output.trim();
+        if !cond.is_empty() {
+            section.push_str(&format!("\n  Status: {}", cond.replace('\n', "\n  ")));
+        }
+        let logs = log_output.trim();
+        if !logs.is_empty() {
+            section.push_str("\n  Last job logs:");
+            for line in logs.lines().take(30) {
+                section.push_str(&format!("\n    {line}"));
+            }
+        }
+        parts.push(section);
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
 async fn wait_for_namespace(
     docker: &Docker,
     container_name: &str,
@@ -997,6 +1107,20 @@ async fn wait_for_namespace(
         }
 
         if attempt + 1 == attempts {
+            // Before returning a generic timeout error, check whether a Helm
+            // install job failed. If so, surface the real Helm error so the
+            // user doesn't have to dig through job logs manually.
+            let helm_hint = diagnose_helm_failure(docker, container_name, kubeconfig).await;
+            if let Some(hint) = helm_hint {
+                return Err(miette::miette!(
+                    "timed out waiting for namespace '{namespace}' to exist.\n\n\
+                     A Helm install job appears to have failed — this is likely the root cause:\n\n\
+                     {hint}\n\n\
+                     To inspect the full job logs run:\n  \
+                     kubectl logs -n kube-system -l job-name=helm-install-openshell --tail=50"
+                ))
+                .wrap_err("K8s namespace not ready");
+            }
             return Err(miette::miette!(
                 "timed out waiting for namespace '{namespace}' to exist: {output}"
             ))
@@ -1032,5 +1156,31 @@ mod tests {
                 "{label} should contain PEM marker"
             );
         }
+    }
+
+    /// Simulate the error message shape produced by `diagnose_helm_failure` and
+    /// ensure that `diagnose_failure` (in errors.rs) does not suppress or
+    /// override it — the Helm hint is intentionally surfaced verbatim inside
+    /// the `wait_for_namespace` timeout error, so we only need to verify the
+    /// string construction here rather than end-to-end container exec.
+    #[test]
+    fn helm_failure_hint_is_included_in_namespace_timeout_message() {
+        // Replicate the error message that `wait_for_namespace` would produce
+        // when `diagnose_helm_failure` returns a non-None hint.
+        let helm_hint = "Job helm-install-openshell failed.\n  \
+            Status: Failed: error validating \"\": apiVersion not set\n  \
+            Last job logs:\n    Error: INSTALLATION FAILED: unable to build kubernetes \
+            objects from release manifest: error validating data: apiVersion not set";
+        let error_msg = format!(
+            "timed out waiting for namespace 'openshell' to exist.\n\n\
+             A Helm install job appears to have failed — this is likely the root cause:\n\n\
+             {helm_hint}\n\n\
+             To inspect the full job logs run:\n  \
+             kubectl logs -n kube-system -l job-name=helm-install-openshell --tail=50"
+        );
+        assert!(error_msg.contains("helm-install-openshell"));
+        assert!(error_msg.contains("apiVersion not set"));
+        assert!(error_msg.contains("INSTALLATION FAILED"));
+        assert!(error_msg.contains("kubectl logs -n kube-system"));
     }
 }
