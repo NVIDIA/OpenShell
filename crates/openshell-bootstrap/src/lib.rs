@@ -674,24 +674,38 @@ async fn create_k8s_tls_secrets(
         let docker = docker.clone();
         let cname = cname.clone();
         async move {
-            let (output, exit_code) = exec_capture_with_exit(
-                &docker,
-                &cname,
-                vec![
-                    "sh".to_string(),
-                    "-c".to_string(),
-                    format!(
-                        "KUBECONFIG={kubeconfig} kubectl apply -f - <<'ENDOFMANIFEST'\n{manifest}\nENDOFMANIFEST"
-                    ),
-                ],
-            )
-            .await?;
-            if exit_code != 0 {
-                return Err(miette::miette!(
-                    "kubectl apply failed (exit {exit_code}): {output}"
-                ));
+            let max_attempts = 5;
+            let mut backoff = std::time::Duration::from_millis(500);
+
+            for attempt in 0..max_attempts {
+                let (output, exit_code) = exec_capture_with_exit(
+                    &docker,
+                    &cname,
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "KUBECONFIG={kubeconfig} kubectl apply -f - <<'ENDOFMANIFEST'\n{manifest}\nENDOFMANIFEST"
+                        ),
+                    ],
+                )
+                .await?;
+
+                if exit_code == 0 {
+                    return Ok(());
+                }
+
+                if attempt + 1 == max_attempts {
+                    return Err(miette::miette!(
+                        "kubectl apply failed after {max_attempts} attempts (exit {exit_code}): {output}"
+                    ));
+                }
+
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff.saturating_mul(2),
+                std::time::Duration::from_secs(4));
             }
-            Ok(())
+            unreachable!()
         }
     };
 
@@ -919,7 +933,7 @@ async fn wait_for_namespace(
 ) -> Result<()> {
     use miette::WrapErr;
 
-    let attempts = 60;
+    let attempts = 90;
     let max_backoff = std::time::Duration::from_secs(2);
     let mut backoff = std::time::Duration::from_millis(200);
 
