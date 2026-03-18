@@ -58,3 +58,17 @@ mise run cluster -- supervisor # rebuild supervisor only
 mise run cluster -- chart      # helm upgrade only
 mise run cluster -- all        # rebuild everything
 ```
+
+To validate incremental routing and BuildKit cache reuse locally, run:
+
+```bash
+mise run cluster:test:fast-deploy-cache
+```
+
+The harness runs isolated scenarios in temporary git worktrees, keeps its own state and cache under `.cache/cluster-deploy-fast-test/`, and writes a Markdown summary with:
+
+- auto-detection checks for gateway-only, supervisor-only, shared, Helm-only, unrelated, and explicit-target changes
+- cold vs warm rebuild comparisons for gateway and supervisor code changes
+- container-ID invalidation coverage to verify gateway + Helm are retriggered when the cluster container changes
+
+Nightly CI runs the same harness in `.github/workflows/cluster-deploy-fast-nightly.yml`, uploads the full report directory as an artifact, and publishes the generated JUnit summary through `dorny/test-reporter` so failures and regressions are visible from the workflow run.

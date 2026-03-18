@@ -1,0 +1,98 @@
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+name: Cluster Deploy Fast Nightly
+
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "0 8 * * *" # 12 AM PT (08:00 UTC during PDT)
+
+permissions:
+  contents: read
+  packages: read
+  actions: read
+  checks: write
+
+concurrency:
+  group: cluster-deploy-fast-nightly
+  cancel-in-progress: false
+
+jobs:
+  fast-deploy-cache:
+    name: Fast Deploy Cache
+    runs-on: build-amd64
+    timeout-minutes: 90
+    container:
+      image: ghcr.io/nvidia/openshell/ci:latest
+      credentials:
+        username: ${{ github.actor }}
+        password: ${{ secrets.GITHUB_TOKEN }}
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+    env:
+      MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      FAST_DEPLOY_TEST_REPORT_DIR: ${{ github.workspace }}/.cache/cluster-deploy-fast-test/nightly-${{ github.run_id }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Python dependencies and generate protobuf stubs
+        run: uv sync --frozen && mise run --no-prepare python:proto
+
+      - name: Bootstrap cluster
+        run: mise run --no-prepare --skip-deps cluster
+
+      - name: Run fast deploy cache harness
+        id: harness
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          set +e
+          tasks/scripts/cluster-deploy-fast-test.sh
+          status=$?
+          set -e
+          junit_path="${FAST_DEPLOY_TEST_REPORT_DIR}/junit.xml"
+          if [ -f "${FAST_DEPLOY_TEST_REPORT_DIR}/summary.tsv" ]; then
+            uv run python tasks/scripts/cluster-deploy-fast-test-junit.py \
+              --input "${FAST_DEPLOY_TEST_REPORT_DIR}/summary.tsv" \
+              --output "${junit_path}" \
+              --suite-name "cluster-deploy-fast-nightly"
+            echo "junit_path=${junit_path}" >> "$GITHUB_OUTPUT"
+          fi
+          if [ -f "${FAST_DEPLOY_TEST_REPORT_DIR}/summary.md" ]; then
+            echo "summary_path=${FAST_DEPLOY_TEST_REPORT_DIR}/summary.md" >> "$GITHUB_OUTPUT"
+          fi
+          exit "${status}"
+
+      - name: Publish Markdown summary
+        if: ${{ always() && !cancelled() && steps.harness.outputs.summary_path != '' }}
+        run: cat "${{ steps.harness.outputs.summary_path }}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload fast deploy nightly artifacts
+        if: ${{ always() && !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: cluster-deploy-fast-nightly-${{ github.run_id }}
+          path: ${{ env.FAST_DEPLOY_TEST_REPORT_DIR }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish test report
+        if: ${{ always() && !cancelled() && steps.harness.outputs.junit_path != '' }}
+        uses: dorny/test-reporter@v2
+        with:
+          name: Cluster Deploy Fast Nightly
+          path: ${{ steps.harness.outputs.junit_path }}
+          reporter: java-junit
+          fail-on-error: true
+          use-actions-summary: true
+          report-title: Cluster Deploy Fast Nightly
+          badge-title: fast-deploy

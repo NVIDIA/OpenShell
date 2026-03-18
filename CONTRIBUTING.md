@@ -63,24 +63,24 @@ This project ships with [agent skills](#agent-skills-for-contributors) that can 
 
 Skills live in `.agents/skills/`. Your agent's harness can discover and load them natively. Here is the full inventory:
 
-| Category | Skill | Purpose |
-|----------|-------|---------|
-| Getting Started | `openshell-cli` | CLI usage, sandbox lifecycle, provider management, BYOC workflows |
-| Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues |
-| Getting Started | `debug-inference` | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
-| Contributing | `create-spike` | Investigate a problem, produce a structured GitHub issue |
-| Contributing | `build-from-issue` | Plan and implement work from a GitHub issue (maintainer workflow) |
-| Contributing | `create-github-issue` | Create well-structured GitHub issues |
-| Contributing | `create-github-pr` | Create pull requests with proper conventions |
-| Reviewing | `review-github-pr` | Summarize PR diffs and key design decisions |
-| Reviewing | `review-security-issue` | Assess security issues for severity and remediation |
-| Reviewing | `watch-github-actions` | Monitor CI pipeline status and logs |
-| Triage | `triage-issue` | Assess, classify, and route community-filed issues |
-| Platform | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs |
-| Platform | `tui-development` | Development guide for the ratatui-based terminal UI |
-| Documentation | `update-docs` | Scan recent commits and draft doc updates for user-facing changes |
-| Maintenance | `sync-agent-infra` | Detect and fix drift across agent-first infrastructure files |
-| Reference | `sbom` | Generate SBOMs and resolve dependency licenses |
+| Category        | Skill                     | Purpose                                                                                             |
+| --------------- | ------------------------- | --------------------------------------------------------------------------------------------------- |
+| Getting Started | `openshell-cli`           | CLI usage, sandbox lifecycle, provider management, BYOC workflows                                   |
+| Getting Started | `debug-openshell-cluster` | Diagnose cluster startup failures and health issues                                                 |
+| Getting Started | `debug-inference`         | Diagnose `inference.local`, host-backed local inference, and direct external inference setup issues |
+| Contributing    | `create-spike`            | Investigate a problem, produce a structured GitHub issue                                            |
+| Contributing    | `build-from-issue`        | Plan and implement work from a GitHub issue (maintainer workflow)                                   |
+| Contributing    | `create-github-issue`     | Create well-structured GitHub issues                                                                |
+| Contributing    | `create-github-pr`        | Create pull requests with proper conventions                                                        |
+| Reviewing       | `review-github-pr`        | Summarize PR diffs and key design decisions                                                         |
+| Reviewing       | `review-security-issue`   | Assess security issues for severity and remediation                                                 |
+| Reviewing       | `watch-github-actions`    | Monitor CI pipeline status and logs                                                                 |
+| Triage          | `triage-issue`            | Assess, classify, and route community-filed issues                                                  |
+| Platform        | `generate-sandbox-policy` | Generate YAML sandbox policies from requirements or API docs                                        |
+| Platform        | `tui-development`         | Development guide for the ratatui-based terminal UI                                                 |
+| Documentation   | `update-docs`             | Scan recent commits and draft doc updates for user-facing changes                                   |
+| Maintenance     | `sync-agent-infra`        | Detect and fix drift across agent-first infrastructure files                                        |
+| Reference       | `sbom`                    | Generate SBOMs and resolve dependency licenses                                                      |
 
 ### Workflow Chains
 
@@ -148,10 +148,10 @@ openshell sandbox create -- codex
 
 Two additional scripts in `scripts/bin/` provide gateway-aware wrappers for cluster debugging:
 
-| Script | What it does |
-|--------|-------------|
+| Script    | What it does                                                                         |
+| --------- | ------------------------------------------------------------------------------------ |
 | `kubectl` | Runs `kubectl` inside the active gateway's k3s container via `openshell doctor exec` |
-| `k9s` | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec` |
+| `k9s`     | Runs `k9s` inside the active gateway's k3s container via `openshell doctor exec`     |
 
 These work for both local and remote gateways (SSH is handled automatically). Examples:
 
@@ -168,9 +168,6 @@ These are the primary `mise` tasks for day-to-day development:
 
 | Task               | Purpose                                                 |
 | ------------------ | ------------------------------------------------------- |
-| `mise run build`   | Build the whole project (Rust crates, Docker images, Python wheel) |
-| `mise run build:docker:gateway` | Build one Docker image using the `build:[tool]:[component]` layout |
-| `mise run build:python:wheel` | Build one Python wheel using the `build:[tool]:[component]` layout |
 | `mise run cluster` | Bootstrap or incremental deploy                         |
 | `mise run sandbox` | Create a sandbox on the running cluster                 |
 | `mise run test`    | Default test suite                                      |
