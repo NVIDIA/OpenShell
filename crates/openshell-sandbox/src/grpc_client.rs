@@ -221,6 +221,8 @@ pub struct SettingsPollResult {
     pub policy_hash: String,
     pub config_revision: u64,
     pub policy_source: PolicySource,
+    /// Effective settings keyed by name.
+    pub settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
 }
 
 impl CachedOpenShellClient {
@@ -256,6 +258,7 @@ impl CachedOpenShellClient {
             config_revision: inner.config_revision,
             policy_source: PolicySource::try_from(inner.policy_source)
                 .unwrap_or(PolicySource::Unspecified),
+            settings: inner.settings,
         })
     }
 
