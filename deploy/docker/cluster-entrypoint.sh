@@ -298,7 +298,6 @@ if [ -d "$BUNDLED_MANIFESTS" ]; then
     # Only clean up files that look like openshell manifests (openshell-* or
     # envoy-gateway-* or agent-*) to avoid removing built-in k3s manifests.
     for existing in "$K3S_MANIFESTS"/openshell-*.yaml \
-                    "$K3S_MANIFESTS"/openshell-*.yaml \
                     "$K3S_MANIFESTS"/envoy-gateway-*.yaml \
                     "$K3S_MANIFESTS"/agent-*.yaml; do
         [ ! -f "$existing" ] && continue
