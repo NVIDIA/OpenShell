@@ -185,6 +185,31 @@ write_summary_md() {
     echo "- Cluster: \`${CLUSTER_NAME}\`"
     echo "- Report dir: \`${REPORT_DIR}\`"
     echo
+    echo "## How to read this report"
+    echo
+    echo "Each row is an independent scenario that validates one aspect of the fast-deploy"
+    echo "change-detection and caching system."
+    echo
+    echo "**Columns:**"
+    echo
+    echo "- **Scenario** -- Name of the test. Suffixes like \`:cold\`/\`:warm\` indicate cache comparison phases."
+    echo "- **Mode** -- \`auto\` = change detection decides what to build; \`explicit\` = target forced via CLI arg; \`cache\` = cold vs warm timing comparison."
+    echo "- **Expected / Observed** -- The deploy plan the test expected vs what actually ran. Format: \`build gateway=N, build supervisor=N, helm upgrade=N\` where 1 = triggered, 0 = skipped."
+    echo "- **Pass** -- \`PASS\` = observed matched expected; \`FAIL\` = mismatch; \`INFO\` = informational baseline (no assertion)."
+    echo "- **Total (s)** -- Wall-clock time for the entire deploy including Docker context transfer, image push, and Helm rollout."
+    echo "- **Builds (s)** -- Time spent in cargo compilation and Docker image builds only. The gap between Total and Builds is deploy overhead (image push, Helm upgrade, pod rollout)."
+    echo "- **Cached lines** -- Number of Docker build steps that hit \`CACHED\`. Higher = more layer reuse. In cache scenarios, warm runs should show more cached lines than cold runs."
+    echo "- **Notes** -- Context about what the scenario tests or why it passed/failed."
+    echo
+    echo "**What to look for:**"
+    echo
+    echo "- All \`auto\` and \`explicit\` scenarios should be \`PASS\`. A \`FAIL\` means change detection routed incorrectly."
+    echo "- In \`cache\` scenarios, the \`:warm\` row should show either >= 30% faster build time or more cached lines than the \`:cold\` row."
+    echo "- The \`:cold\` rows are marked \`INFO\` -- they are baselines, not assertions."
+    echo "- If supervisor warm builds are slow, check the logs for full recompilation (many \`Compiling\` lines) vs cache hits (only workspace crates recompiling)."
+    echo
+    echo "## Results"
+    echo
     echo "| Scenario | Mode | Expected | Observed | Pass | Total (s) | Builds (s) | Cached lines | Notes |"
     echo "|---|---|---|---|---|---:|---:|---:|---|"
     awk -F '\t' 'NR > 1 {printf "| %s | %s | `%s` | `%s` | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6, $7, $8, $9}' "${SUMMARY_TSV}"
