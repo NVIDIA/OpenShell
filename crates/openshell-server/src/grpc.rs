@@ -3290,6 +3290,15 @@ async fn delete_provider_record(
         return Err(Status::invalid_argument("name is required"));
     }
 
+    // Early-out: if the provider doesn't exist, nothing to delete.
+    let exists = store
+        .get_by_name(Provider::object_type(), name)
+        .await
+        .map_err(|e| Status::internal(format!("check provider failed: {e}")))?;
+    if exists.is_none() {
+        return Ok(false);
+    }
+
     // Check if any sandbox references this provider.
     let sandbox_records = store
         .list(Sandbox::object_type(), u32::MAX, 0)
@@ -3341,7 +3350,8 @@ async fn delete_provider_record(
             ));
         }
         return Err(Status::failed_precondition(format!(
-            "cannot delete provider '{}': still referenced by {}",
+            "cannot delete provider '{}': still referenced by {}. \
+             Remove or update these references before deleting the provider.",
             name,
             details.join(" and ")
         )));
