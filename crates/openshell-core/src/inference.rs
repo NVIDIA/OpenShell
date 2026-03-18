@@ -223,7 +223,10 @@ mod tests {
     fn bitdeer_ai_profile_has_correct_defaults() {
         let profile = profile_for("bitdeer-ai").expect("bitdeer-ai profile should exist");
         assert_eq!(profile.provider_type, "bitdeer-ai");
-        assert_eq!(profile.default_base_url, "https://api-inference.bitdeer.ai/v1");
+        assert_eq!(
+            profile.default_base_url,
+            "https://api-inference.bitdeer.ai/v1"
+        );
         assert_eq!(profile.credential_key_names, &["BITDEERAI_API_KEY"]);
         assert_eq!(profile.auth, AuthHeader::Bearer);
         assert!(profile.default_headers.is_empty());
