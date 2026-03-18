@@ -48,15 +48,33 @@ The TUI divides the terminal into four horizontal regions:
 
 ### Dashboard (press `1`)
 
-The Dashboard is the home screen. It shows your cluster at a glance:
+The Dashboard is the home screen. It shows your cluster at a glance.
 
-- **Cluster name** and **gateway endpoint** — which cluster you are connected to and how to reach it.
-- **Health status** — a live indicator that polls the cluster every 2 seconds:
+The dashboard is divided into a top info pane and a middle pane with two tabs:
+
+- **Top pane**: Cluster name, gateway endpoint, health status, sandbox count.
+- **Middle pane**: Tabbed view toggled with `Tab`:
+  - **Providers** — provider configurations attached to the cluster.
+  - **Global Settings** — gateway-global runtime settings (fetched via `GetGatewaySettings`).
+
+**Health status** indicators:
   - `●` **Healthy** (green) — everything is running normally.
   - `◐` **Degraded** (yellow) — the cluster is up but something needs attention.
   - `○` **Unhealthy** (red) — the cluster is not operating correctly.
   - `…` — still connecting or status unknown.
-- **Sandbox count** — how many sandboxes exist in the cluster.
+
+#### Global Settings Tab
+
+The Global Settings tab shows all registered setting keys with their current values. Keys without a configured value display as `<unset>`.
+
+| Key | Action |
+|-----|--------|
+| `j` / `↓` | Move selection down |
+| `k` / `↑` | Move selection up |
+| `Enter` | Edit the selected setting (type-aware: bool toggle, string/int text input) |
+| `d` | Delete the selected setting's value |
+
+Both edit and delete operations display a confirmation modal before applying. Changes are sent to the gateway via the `UpdateSandboxPolicy` RPC with `global: true`.
 
 ### Sandboxes (press `2`)
 
@@ -81,6 +99,21 @@ Status colors tell you the sandbox state at a glance:
 Use `j`/`k` or the arrow keys to move through the list. The selected row is highlighted in green.
 
 When there are no sandboxes, the view displays: *"No sandboxes found."*
+
+When viewing a specific sandbox (by pressing `Enter` on a selected row), the bottom pane shows a tabbed view toggled with `l`:
+
+- **Policy** — the sandbox's current active policy, auto-refreshed on version change.
+- **Settings** — effective runtime settings for the sandbox (fetched via `GetSandboxSettings`).
+
+#### Sandbox Settings Tab
+
+The Settings tab shows all registered setting keys with their effective values and scope indicators:
+
+- **(sandbox)** — value is set at sandbox scope
+- **(global)** — value is set at gateway-global scope (overrides sandbox)
+- **(unset)** — no value configured at any scope
+
+Navigation and editing use the same keys as the Global Settings tab (`j`/`k`, `Enter` to edit, `d` to delete). Sandbox-scoped edits to globally-managed keys are rejected by the server with a `FailedPrecondition` error.
 
 ## Keyboard Controls
 
@@ -112,9 +145,11 @@ Press `Esc` to cancel and return to Normal mode. `Backspace` deletes characters 
 
 ## Data Refresh
 
-The TUI automatically polls the cluster every **2 seconds**. Both cluster health and the sandbox list update on each tick, so the display stays current without manual refreshing. This uses the same gRPC calls as the CLI — no additional server-side setup is required.
+The TUI automatically polls the cluster every **2 seconds**. Cluster health, the sandbox list, and global settings all update on each tick, so the display stays current without manual refreshing. This uses the same gRPC calls as the CLI — no additional server-side setup is required.
 
 When viewing a sandbox, the policy pane auto-refreshes when a new policy version is detected. The sandbox list response includes `current_policy_version` for each sandbox; on every tick the TUI compares this against the currently displayed policy version and re-fetches the full policy only when they differ. This avoids extra RPCs during normal operation while ensuring policy updates appear within the polling interval. The user's scroll position is preserved across auto-refreshes.
+
+Global settings are refreshed via `GetGatewaySettings` and tracked by `settings_revision` to detect changes. Sandbox settings are fetched as part of the `GetSandboxSettings` response when viewing a specific sandbox.
 
 ## Theme
 
@@ -143,9 +178,9 @@ The forwarding implementation lives in `openshell-core::forward`, shared between
 
 ## What is Not Yet Available
 
-The TUI is in its initial phase. The following features are planned but not yet implemented:
+The TUI is in active development. The following features are planned but not yet implemented:
 
-- **Inference and provider views** — browsing inference routes and provider configurations.
+- **Inference views** — browsing inference routes and configuration.
 - **Help overlay** — the `?` key is shown in the nav bar but does not open a help screen yet.
 - **Command bar autocomplete** — the command bar accepts text but does not offer suggestions.
 - **Filtering and search** — no `/` search within views yet.

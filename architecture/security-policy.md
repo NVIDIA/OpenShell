@@ -206,33 +206,50 @@ Failure scenarios that trigger LKG behavior include:
 
 ### CLI Commands
 
-The `nav policy` subcommand group manages live policy updates:
+The `openshell policy` subcommand group manages live policy updates:
 
 ```bash
 # Push a new policy to a running sandbox
-nav policy set <sandbox-name> --policy updated-policy.yaml
+openshell policy set <sandbox-name> --policy updated-policy.yaml
 
 # Push and wait for the sandbox to load it (with 60s timeout)
-nav policy set <sandbox-name> --policy updated-policy.yaml --wait
+openshell policy set <sandbox-name> --policy updated-policy.yaml --wait
 
 # Push and wait with a custom timeout
-nav policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
+openshell policy set <sandbox-name> --policy updated-policy.yaml --wait --timeout 120
+
+# Set a gateway-global policy (overrides all sandbox policies)
+openshell policy set --global --policy policy.yaml --yes
+
+# Delete the gateway-global policy (restores sandbox-level control)
+openshell policy delete --global --yes
 
 # View the current active policy and its status
-nav policy get <sandbox-name>
+openshell policy get <sandbox-name>
 
 # Inspect a specific revision
-nav policy get <sandbox-name> --rev 3
+openshell policy get <sandbox-name> --rev 3
 
 # Print the full policy as YAML (round-trips with --policy input format)
-nav policy get <sandbox-name> --full
+openshell policy get <sandbox-name> --full
 
 # Combine: inspect a specific revision's full policy
-nav policy get <sandbox-name> --rev 2 --full
+openshell policy get <sandbox-name> --rev 2 --full
 
 # List policy revision history
-nav policy list <sandbox-name> --limit 20
+openshell policy list <sandbox-name> --limit 20
 ```
+
+#### Global Policy
+
+The `--global` flag on `policy set` and `policy delete` manages a gateway-wide policy override. When a global policy is set, all sandboxes receive it through `GetSandboxSettings` (with `policy_source: GLOBAL`) instead of their own per-sandbox policy. This is implemented via the reserved `policy` key in the gateway settings store. See [Gateway Settings Channel](gateway-settings.md#global-policy-as-a-setting) for implementation details.
+
+| Command | Behavior |
+|---------|----------|
+| `policy set --global --policy FILE` | Stores the policy as a hex-encoded protobuf in the global settings under the reserved `policy` key. All sandboxes pick it up on their next poll. |
+| `policy delete --global` | Removes the `policy` key from global settings. Sandboxes revert to their per-sandbox policy on the next poll. |
+
+Both commands require interactive confirmation (or `--yes` to bypass). The `--wait` flag is not supported for global policy updates because there is no single sandbox to track status for.
 
 #### `policy get` flags
 
@@ -1382,6 +1399,7 @@ An empty `sources`/`log_sources` list means no source filtering (all sources pas
 
 - [Sandbox Architecture](sandbox.md) -- Full sandbox lifecycle, enforcement mechanisms, and component interaction
 - [Gateway Architecture](gateway.md) -- How the gateway stores and delivers policies via gRPC
+- [Gateway Settings Channel](gateway-settings.md) -- Runtime settings channel, global policy override, CLI/TUI settings commands
 - [Inference Routing](inference-routing.md) -- How `inference.local` requests are routed to model backends
 - [Overview](README.md) -- System-level context for how policies fit into the platform
 - [Plain HTTP Forward Proxy Plan](plans/plain-http-forward-proxy.md) -- Design document for the forward proxy feature

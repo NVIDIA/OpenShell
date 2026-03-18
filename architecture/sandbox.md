@@ -315,31 +315,38 @@ The gateway's `UpdateSandboxPolicy` RPC enforces this boundary: it rejects any u
 
 ### Poll loop
 
+The poll loop tracks `config_revision` (a fingerprint of policy + settings + source) as the primary change-detection signal. It separately tracks `policy_hash` to determine whether an OPA reload is needed -- settings-only changes do not trigger OPA reloads.
+
 ```mermaid
 sequenceDiagram
-    participant PL as Policy Poll Loop
+    participant PL as Settings Poll Loop
     participant GW as Gateway (gRPC)
     participant OPA as OPA Engine (Arc)
 
     PL->>GW: GetSandboxSettings(sandbox_id)
-    GW-->>PL: policy + version + hash
-    PL->>PL: Store initial version
+    GW-->>PL: policy + settings + config_revision
+    PL->>PL: Store initial config_revision, policy_hash, settings
 
     loop Every OPENSHELL_POLICY_POLL_INTERVAL_SECS (default 10)
         PL->>GW: GetSandboxSettings(sandbox_id)
-        GW-->>PL: policy + version + hash
-        alt version > current_version
-            PL->>OPA: reload_from_proto(policy)
-            alt Reload succeeds
-                OPA-->>PL: Ok
-                PL->>PL: Update current_version
-                PL->>GW: ReportPolicyStatus(version, LOADED)
-            else Reload fails (validation error)
-                OPA-->>PL: Err (old engine untouched)
-                PL->>GW: ReportPolicyStatus(version, FAILED, error_msg)
+        GW-->>PL: policy + settings + config_revision
+        alt config_revision unchanged
+            PL->>PL: Skip
+        else config_revision changed
+            PL->>PL: log_setting_changes(old_settings, new_settings)
+            alt policy_hash changed
+                PL->>OPA: reload_from_proto(policy)
+                alt Reload succeeds
+                    OPA-->>PL: Ok
+                    PL->>PL: Update tracked state
+                    PL->>GW: ReportPolicyStatus(version, LOADED)
+                else Reload fails (validation error)
+                    OPA-->>PL: Err (old engine untouched)
+                    PL->>GW: ReportPolicyStatus(version, FAILED, error_msg)
+                end
+            else settings-only change
+                PL->>PL: Update tracked state (no OPA reload)
             end
-        else version <= current_version
-            PL->>PL: Skip (no update)
         end
     end
 ```
@@ -347,11 +354,13 @@ sequenceDiagram
 The `run_policy_poll_loop()` function in `crates/openshell-sandbox/src/lib.rs` implements this loop:
 
 1. **Connect once**: Create a `CachedOpenShellClient` that holds a persistent mTLS channel to the gateway. This avoids TLS renegotiation on every poll.
-2. **Fetch initial config revision**: Call `poll_settings(sandbox_id)` to establish baseline `current_config_revision`. On failure, log a warning and retry on the next interval.
+2. **Fetch initial state**: Call `poll_settings(sandbox_id)` to establish baseline `current_config_revision`, `current_policy_hash`, and `current_settings` map. On failure, log a warning and retry on the next interval.
 3. **Poll loop**: Sleep for the configured interval, then call `poll_settings()` again.
 4. **Config comparison**: If `result.config_revision == current_config_revision`, skip.
-5. **Reload attempt**: Call `opa_engine.reload_from_proto(policy)` when a policy payload is present. This runs the full `from_proto()` pipeline on the new policy, then atomically swaps the inner engine.
-6. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still reload, but they do not write per-sandbox policy status history.
+5. **Per-setting diff logging**: Call `log_setting_changes()` to diff old and new settings maps. Each individual change is logged with old and new values.
+6. **Conditional OPA reload**: Only call `opa_engine.reload_from_proto(policy)` when `policy_hash` changes. Settings-only changes (e.g., `log_level` updated) update the tracked state without touching the OPA engine.
+7. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still reload, but they do not write per-sandbox policy status history.
+8. **Update tracked state**: After processing, update `current_config_revision`, `current_policy_hash`, and `current_settings` regardless of whether OPA was reloaded.
 
 ### `CachedOpenShellClient`
 
@@ -370,24 +379,30 @@ pub struct SettingsPollResult {
     pub policy_hash: String,
     pub config_revision: u64,
     pub policy_source: PolicySource,
+    pub settings: HashMap<String, EffectiveSetting>,
 }
 ```
 
 Methods:
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
-- **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, and policy source.
+- **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, policy source, and the effective settings map (for diff logging).
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
 - **`raw_client()`**: Return a clone of the underlying `OpenShellClient<Channel>` for direct RPC calls (used by the log push task).
 
 ### Server-side policy versioning
 
-The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxSettingsResponse` now also carries effective settings and a `config_revision` fingerprint that changes when effective policy/settings change (including global overrides).
+The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxSettingsResponse` carries the full effective configuration: policy payload, effective settings map (with per-key scope indicators), a `config_revision` fingerprint that changes when any effective input changes (policy, settings, or source), and a `policy_source` field indicating whether the policy came from the sandbox's own history or from a global override.
 
 Proto messages involved:
-- `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings`, `config_revision`, `policy_source`
+- `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings` (map of `EffectiveSetting`), `config_revision`, `policy_source`
+- `EffectiveSetting` (`proto/sandbox.proto`): `SettingValue value`, `SettingScope scope`
+- `SettingScope` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
+- `PolicySource` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
 - `ReportPolicyStatusRequest` (`proto/openshell.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
 - `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
 - `SandboxPolicyRevision` (`proto/openshell.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`
+
+See [Gateway Settings Channel](gateway-settings.md) for full details on the settings resolution model, storage, and CLI/TUI commands.
 
 ### Failure modes
 

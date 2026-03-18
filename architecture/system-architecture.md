@@ -123,7 +123,7 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: Sandbox --> Gateway (control plane)
     %% ============================================================
-    Supervisor -- "gRPC (mTLS):<br/>GetSandboxSettings,<br/>GetProviderEnvironment,<br/>GetInferenceBundle,<br/>PushSandboxLogs" --> Gateway
+    Supervisor -- "gRPC (mTLS):<br/>GetSandboxSettings<br/>(policy + settings),<br/>GetProviderEnvironment,<br/>GetInferenceBundle,<br/>PushSandboxLogs" --> Gateway
 
     %% ============================================================
     %% CONNECTIONS: Sandbox --> External (via proxy)
@@ -197,4 +197,4 @@ graph TB
 
 5. **Inference Routing**: Inference requests are handled inside the sandbox by the openshell-router (not through the gateway). The gateway provides route configuration and credentials via gRPC; the sandbox executes HTTP requests directly to inference backends.
 
-6. **Sandbox to Gateway**: The sandbox supervisor uses gRPC (mTLS) to fetch policies, provider credentials, inference bundles, and to push logs back to the gateway.
+6. **Sandbox to Gateway**: The sandbox supervisor uses gRPC (mTLS) to fetch policies and runtime settings (via `GetSandboxSettings`), provider credentials, inference bundles, and to push logs back to the gateway. The settings channel delivers typed key-value pairs alongside policy through a unified poll loop.
