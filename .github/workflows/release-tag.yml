@@ -122,6 +122,7 @@ jobs:
     timeout-minutes: 120
     outputs:
       wheel_version: ${{ needs.compute-versions.outputs.python_version }}
+      wheel_filenames: ${{ steps.filenames.outputs.wheel_filenames }}
     container:
       image: ghcr.io/nvidia/openshell/ci:latest
       credentials:
@@ -158,6 +159,13 @@ jobs:
           OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:multiarch
           OPENSHELL_CARGO_VERSION="${{ needs.compute-versions.outputs.cargo_version }}" mise run python:build:macos
           ls -la target/wheels/*.whl
+
+      - name: Capture wheel filenames
+        id: filenames
+        run: |
+          set -euo pipefail
+          WHEEL_FILENAMES=$(ls target/wheels/*.whl | xargs -n1 basename | paste -sd, -)
+          echo "wheel_filenames=${WHEEL_FILENAMES}" >> "$GITHUB_OUTPUT"
 
       - name: Upload wheel artifacts
         uses: actions/upload-artifact@v4
@@ -391,32 +399,24 @@ jobs:
 
   trigger-wheel-publish:
     name: Trigger Wheel Publish
-    needs: [compute-versions, release]
+    needs: [compute-versions, build-python-wheels, release]
     runs-on: [self-hosted, nv]
     timeout-minutes: 10
     steps:
-      - name: Download wheel artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: python-wheels
-          path: release/
-
       - name: Trigger GitLab CI
         env:
           GITLAB_CI_TRIGGER_TOKEN: ${{ secrets.GITLAB_CI_TRIGGER_TOKEN }}
           GITLAB_CI_TRIGGER_URL: ${{ secrets.GITLAB_CI_TRIGGER_URL }}
           RELEASE_VERSION: ${{ needs.compute-versions.outputs.python_version }}
           RELEASE_TAG: ${{ env.RELEASE_TAG }}
+          WHEEL_FILENAMES: ${{ needs.build-python-wheels.outputs.wheel_filenames }}
         run: |
           set -euo pipefail
-          shopt -s nullglob
-          wheel_files=(release/*.whl)
-          if (( ${#wheel_files[@]} == 0 )); then
-            echo "No wheel artifacts found in release/" >&2
+          if [ -z "${WHEEL_FILENAMES}" ]; then
+            echo "No wheel filenames provided by build job" >&2
             exit 1
           fi
 
-          WHEEL_FILENAMES=$(printf '%s\n' "${wheel_files[@]##*/}" | paste -sd, -)
           response=$(curl -X POST \
             --fail \
             --silent \
