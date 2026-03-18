@@ -3328,10 +3328,7 @@ async fn delete_provider_record(
     if !referencing_sandboxes.is_empty() || !referencing_routes.is_empty() {
         let mut details = Vec::new();
         if !referencing_sandboxes.is_empty() {
-            details.push(format!(
-                "sandbox(es): {}",
-                referencing_sandboxes.join(", ")
-            ));
+            details.push(format!("sandbox(es): {}", referencing_sandboxes.join(", ")));
         }
         if !referencing_routes.is_empty() {
             details.push(format!(
@@ -4689,9 +4686,10 @@ mod tests {
             .await
             .unwrap();
 
-        let provider = create_provider_record(&store, provider_with_values("my-provider", "nvidia"))
-            .await
-            .unwrap();
+        let provider =
+            create_provider_record(&store, provider_with_values("my-provider", "nvidia"))
+                .await
+                .unwrap();
 
         // Create a sandbox that references the provider.
         let sandbox = Sandbox {
