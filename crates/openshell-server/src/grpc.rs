@@ -1160,11 +1160,6 @@ impl OpenShell for OpenShellService {
         let sandbox_id = sandbox.id.clone();
 
         if has_setting {
-            if req.delete_setting {
-                return Err(Status::invalid_argument(
-                    "sandbox-scoped setting delete is not supported; use global delete",
-                ));
-            }
             if key == POLICY_SETTING_KEY {
                 return Err(Status::invalid_argument(
                     "reserved key 'policy' must be set via policy commands",
@@ -1172,7 +1167,40 @@ impl OpenShell for OpenShellService {
             }
 
             let global_settings = load_global_settings(self.state.store.as_ref()).await?;
-            if global_settings.settings.contains_key(key) {
+            let globally_managed = global_settings.settings.contains_key(key);
+
+            if req.delete_setting {
+                // Sandbox-scoped delete: allowed only when the key is not
+                // globally managed.
+                if globally_managed {
+                    return Err(Status::failed_precondition(format!(
+                        "setting '{key}' is managed globally; delete the global setting first"
+                    )));
+                }
+
+                let mut sandbox_settings =
+                    load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
+                let removed = sandbox_settings.settings.remove(key).is_some();
+                if removed {
+                    sandbox_settings.revision = sandbox_settings.revision.saturating_add(1);
+                    save_sandbox_settings(
+                        self.state.store.as_ref(),
+                        &sandbox_id,
+                        &sandbox.name,
+                        &sandbox_settings,
+                    )
+                    .await?;
+                }
+
+                return Ok(Response::new(UpdateSandboxPolicyResponse {
+                    version: 0,
+                    policy_hash: String::new(),
+                    settings_revision: sandbox_settings.revision,
+                    deleted: removed,
+                }));
+            }
+
+            if globally_managed {
                 return Err(Status::failed_precondition(format!(
                     "setting '{key}' is managed globally; delete the global setting before sandbox update"
                 )));

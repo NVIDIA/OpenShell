@@ -4120,6 +4120,45 @@ pub async fn gateway_setting_delete(
     Ok(())
 }
 
+pub async fn sandbox_setting_delete(
+    server: &str,
+    name: &str,
+    key: &str,
+    tls: &TlsOptions,
+) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+            name: name.to_string(),
+            policy: None,
+            setting_key: key.to_string(),
+            setting_value: None,
+            delete_setting: true,
+            global: false,
+        })
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    if response.deleted {
+        println!(
+            "{} Deleted sandbox setting {} for {} (revision {})",
+            "✓".green().bold(),
+            key,
+            name,
+            response.settings_revision
+        );
+    } else {
+        println!(
+            "{} Sandbox setting {} not found for {}",
+            "!".yellow(),
+            key,
+            name,
+        );
+    }
+    Ok(())
+}
+
 pub async fn sandbox_policy_set(
     server: &str,
     name: &str,

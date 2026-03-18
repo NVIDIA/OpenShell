@@ -178,19 +178,45 @@ async fn settings_global_override_round_trip() {
     );
     assert_setting_line_with_scope(&after_sandbox_set.clean_output, TEST_KEY, "true", "sandbox");
 
-    let sandbox_delete_attempt = run_cli(&["settings", "delete", "--key", TEST_KEY]).await;
+    // Sandbox-scoped delete should succeed when not globally managed.
+    let sandbox_delete = run_cli(&[
+        "settings", "delete", &guard.name, "--key", TEST_KEY,
+    ])
+    .await;
     assert!(
-        !sandbox_delete_attempt.success,
-        "sandbox setting delete without --global should fail:\n{}",
-        sandbox_delete_attempt.clean_output
+        sandbox_delete.success,
+        "sandbox setting delete should succeed (exit {:?}):\n{}",
+        sandbox_delete.exit_code,
+        sandbox_delete.clean_output
     );
     assert!(
-        sandbox_delete_attempt
+        sandbox_delete
             .clean_output
-            .contains("sandbox settings cannot be deleted; use --global"),
-        "expected sandbox delete guidance in output:\n{}",
-        sandbox_delete_attempt.clean_output
+            .contains("Deleted sandbox setting"),
+        "expected sandbox delete confirmation:\n{}",
+        sandbox_delete.clean_output
     );
+
+    // After delete, the key should be unset again.
+    let after_sandbox_delete = run_cli(&["settings", "get", &guard.name]).await;
+    assert!(
+        after_sandbox_delete.success,
+        "settings get after sandbox delete should succeed:\n{}",
+        after_sandbox_delete.clean_output
+    );
+    assert_setting_line_with_scope(
+        &after_sandbox_delete.clean_output,
+        TEST_KEY,
+        "<unset>",
+        "unset",
+    );
+
+    // Re-set at sandbox scope so we can test global override next.
+    let re_set = run_cli(&[
+        "settings", "set", &guard.name, "--key", TEST_KEY, "--value", "true",
+    ])
+    .await;
+    assert!(re_set.success, "re-set should succeed:\n{}", re_set.clean_output);
 
     let set_global = run_cli(&[
         "settings", "set", "--global", "--key", TEST_KEY, "--value", "false", "--yes",
@@ -223,6 +249,17 @@ async fn settings_global_override_round_trip() {
         blocked_sandbox_set.clean_output.contains("is managed"),
         "expected 'managed globally' error:\n{}",
         blocked_sandbox_set.clean_output
+    );
+
+    // Sandbox-scoped delete should also be blocked while globally managed.
+    let blocked_sandbox_delete = run_cli(&[
+        "settings", "delete", &guard.name, "--key", TEST_KEY,
+    ])
+    .await;
+    assert!(
+        !blocked_sandbox_delete.success,
+        "sandbox delete should fail while key is global-managed:\n{}",
+        blocked_sandbox_delete.clean_output
     );
 
     let global_get = run_cli(&["settings", "get", "--global"]).await;

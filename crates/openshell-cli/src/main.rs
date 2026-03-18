@@ -1448,9 +1448,13 @@ enum SettingsCommands {
         yes: bool,
     },
 
-    /// Delete a single gateway-global setting key.
+    /// Delete a setting key (sandbox-scoped or gateway-global).
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Delete {
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
         /// Setting key.
         #[arg(long)]
         key: String,
@@ -1903,13 +1907,18 @@ async fn main() -> Result<()> {
                         run::sandbox_setting_set(&ctx.endpoint, &name, &key, &value, &tls).await?;
                     }
                 }
-                SettingsCommands::Delete { key, global, yes } => {
-                    if !global {
-                        return Err(miette::miette!(
-                            "sandbox settings cannot be deleted; use --global"
-                        ));
+                SettingsCommands::Delete {
+                    name,
+                    key,
+                    global,
+                    yes,
+                } => {
+                    if global {
+                        run::gateway_setting_delete(&ctx.endpoint, &key, yes, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_setting_delete(&ctx.endpoint, &name, &key, &tls).await?;
                     }
-                    run::gateway_setting_delete(&ctx.endpoint, &key, yes, &tls).await?;
                 }
             }
         }
