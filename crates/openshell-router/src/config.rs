@@ -39,6 +39,7 @@ pub struct ResolvedRoute {
     pub name: String,
     pub endpoint: String,
     pub model: String,
+    pub provider_type: Option<String>,
     pub api_key: String,
     pub protocols: Vec<String>,
     /// How to inject the API key on outgoing requests.
@@ -53,6 +54,7 @@ impl std::fmt::Debug for ResolvedRoute {
             .field("name", &self.name)
             .field("endpoint", &self.endpoint)
             .field("model", &self.model)
+            .field("provider_type", &self.provider_type)
             .field("api_key", &"[REDACTED]")
             .field("protocols", &self.protocols)
             .field("auth", &self.auth)
@@ -125,6 +127,7 @@ impl RouteConfig {
             name: self.name.clone(),
             endpoint: self.endpoint.clone(),
             model: self.model.clone(),
+            provider_type: self.provider_type.clone(),
             api_key: self.resolve_api_key()?,
             protocols,
             auth,
@@ -252,6 +255,7 @@ routes:
             name: "test".to_string(),
             endpoint: "https://api.example.com/v1".to_string(),
             model: "test-model".to_string(),
+            provider_type: Some("openai".to_string()),
             api_key: "sk-super-secret-key-12345".to_string(),
             protocols: vec!["openai_chat_completions".to_string()],
             auth: AuthHeader::Bearer,

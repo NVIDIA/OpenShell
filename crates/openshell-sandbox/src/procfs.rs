@@ -7,9 +7,16 @@
 //! for process-identity binding in the OPA proxy policy engine.
 
 use miette::{IntoDiagnostic, Result};
-use std::path::Path;
-#[cfg(target_os = "linux")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+/// Process identity snapshot derived from a socket owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SocketProcessIdentity {
+    pub pid: u32,
+    pub binary_path: PathBuf,
+    pub ancestor_binaries: Vec<PathBuf>,
+    pub cmdline_paths: Vec<PathBuf>,
+}
 
 /// Read the binary path of a process via `/proc/{pid}/exe` symlink.
 ///
@@ -52,6 +59,29 @@ pub fn resolve_tcp_peer_identity(entrypoint_pid: u32, peer_port: u16) -> Result<
     let pid = find_pid_by_socket_inode(inode, entrypoint_pid)?;
     let path = binary_path(pid.cast_signed())?;
     Ok((path, pid))
+}
+
+/// Resolve the full process identity for the TCP peer inside a sandbox network namespace.
+///
+/// This combines socket ownership, ancestor binary lookup, and cmdline-derived
+/// absolute paths into one reusable snapshot.
+#[cfg(target_os = "linux")]
+pub fn resolve_tcp_peer_process_identity(
+    entrypoint_pid: u32,
+    peer_port: u16,
+) -> Result<SocketProcessIdentity> {
+    let (binary_path, pid) = resolve_tcp_peer_identity(entrypoint_pid, peer_port)?;
+    let ancestor_binaries = collect_ancestor_binaries(pid, entrypoint_pid);
+    let mut exclude = ancestor_binaries.clone();
+    exclude.push(binary_path.clone());
+    let cmdline_paths = collect_cmdline_paths(pid, entrypoint_pid, &exclude);
+
+    Ok(SocketProcessIdentity {
+        pid,
+        binary_path,
+        ancestor_binaries,
+        cmdline_paths,
+    })
 }
 
 /// Read the `PPid` (parent PID) from `/proc/<pid>/status`.

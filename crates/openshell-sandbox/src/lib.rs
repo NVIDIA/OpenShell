@@ -10,6 +10,7 @@ mod child_env;
 pub mod denial_aggregator;
 mod grpc_client;
 mod identity;
+mod inference_debug;
 pub mod l7;
 pub mod log_push;
 pub mod mechanistic_mapper;
@@ -805,6 +806,7 @@ pub(crate) fn bundle_to_resolved_routes(
                 name: r.name.clone(),
                 endpoint: r.base_url.clone(),
                 model: r.model_id.clone(),
+                provider_type: (!r.provider_type.is_empty()).then(|| r.provider_type.clone()),
                 api_key: r.api_key.clone(),
                 protocols: r.protocols.clone(),
                 auth,
@@ -1474,6 +1476,7 @@ mod tests {
                 name: "inference.local".to_string(),
                 endpoint: "https://api.openai.com/v1".to_string(),
                 model: "gpt-4o".to_string(),
+                provider_type: Some("openai".to_string()),
                 api_key: "key1".to_string(),
                 protocols: vec!["openai_chat_completions".to_string()],
                 auth: openshell_core::inference::AuthHeader::Bearer,
@@ -1483,6 +1486,7 @@ mod tests {
                 name: "sandbox-system".to_string(),
                 endpoint: "https://api.anthropic.com/v1".to_string(),
                 model: "claude-sonnet-4-20250514".to_string(),
+                provider_type: Some("anthropic".to_string()),
                 api_key: "key2".to_string(),
                 protocols: vec!["anthropic_messages".to_string()],
                 auth: openshell_core::inference::AuthHeader::Custom("x-api-key"),
@@ -1771,6 +1775,7 @@ filesystem_policy:
             name: "inference.local".to_string(),
             endpoint: "http://original:8000/v1".to_string(),
             model: "original-model".to_string(),
+            provider_type: Some("openai".to_string()),
             api_key: "key".to_string(),
             auth: openshell_core::inference::AuthHeader::Bearer,
             protocols: vec!["openai_chat_completions".to_string()],

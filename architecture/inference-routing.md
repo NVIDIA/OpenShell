@@ -180,6 +180,15 @@ Before forwarding inference requests, the proxy strips sensitive and hop-by-hop 
 - **Request**: `authorization`, `x-api-key`, `host`, `content-length`, and hop-by-hop headers (`connection`, `keep-alive`, `proxy-authenticate`, `proxy-authorization`, `proxy-connection`, `te`, `trailer`, `transfer-encoding`, `upgrade`).
 - **Response**: `content-length` and hop-by-hop headers.
 
+### Internal debug capture
+
+For Milestone 1 attribution work, the sandbox proxy supports an internal append-only JSONL debug log for `inference.local` traffic.
+
+- Enable it by setting `OPENSHELL_INFERENCE_DEBUG_LOG=/absolute/path/to/inference-debug.jsonl` in the sandbox runtime environment before the proxy starts.
+- Each parsed `inference.local` request appends one JSON object with process attribution (`pid`, binary path, ancestor binaries, cmdline paths), request metadata, selected route metadata, sanitized headers, and capped request/response body capture.
+- Request and response bodies are captured up to 64 KiB each. The record includes total byte counts plus explicit truncation flags and captured-byte counts when the body exceeds that cap.
+- Header logging is separate from forwarding logic. Auth headers are stripped and auth-like values such as cookies or token-bearing headers are redacted before they reach the JSONL file.
+
 ### Response streaming
 
 The router supports two response modes:

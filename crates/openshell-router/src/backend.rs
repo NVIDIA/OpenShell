@@ -411,6 +411,7 @@ mod tests {
             name: "inference.local".to_string(),
             endpoint: endpoint.to_string(),
             model: "test-model".to_string(),
+            provider_type: None,
             api_key: "sk-test".to_string(),
             protocols: protocols.iter().map(|p| (*p).to_string()).collect(),
             auth,

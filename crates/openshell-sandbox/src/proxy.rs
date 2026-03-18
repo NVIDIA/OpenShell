@@ -5,6 +5,10 @@
 
 use crate::denial_aggregator::DenialEvent;
 use crate::identity::BinaryIdentityCache;
+use crate::inference_debug::{
+    BodyCaptureBuffer, InferenceDebugLogger, InferenceDebugOutcome, InferenceDebugRecord,
+    duration_ms, logged_headers, timestamp_ms,
+};
 use crate::l7::tls::ProxyTlsState;
 use crate::opa::{NetworkAction, OpaEngine};
 use crate::policy::ProxyPolicy;
@@ -14,6 +18,7 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU32;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -34,6 +39,20 @@ struct ConnectDecision {
     ancestors: Vec<PathBuf>,
     /// Cmdline-derived absolute paths (for script detection).
     cmdline_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug)]
+struct InferenceAttribution {
+    source_port: u16,
+    identity: Option<crate::procfs::SocketProcessIdentity>,
+    identity_error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SelectedRouteMeta {
+    name: String,
+    provider_type: Option<String>,
+    model: String,
 }
 
 /// Outcome of an inference interception attempt.
@@ -151,6 +170,7 @@ impl ProxyHandle {
         let listener = TcpListener::bind(http_addr).await.into_diagnostic()?;
         let local_addr = listener.local_addr().into_diagnostic()?;
         info!(addr = %local_addr, "Proxy listening (tcp)");
+        let inference_debug = InferenceDebugLogger::from_env().map(Arc::new);
 
         let join = tokio::spawn(async move {
             loop {
@@ -163,9 +183,10 @@ impl ProxyHandle {
                         let inf = inference_ctx.clone();
                         let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
+                        let inf_debug = inference_debug.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, inf_debug,
                             )
                             .await
                             {
@@ -266,6 +287,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    inference_debug: Option<Arc<InferenceDebugLogger>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -316,8 +338,10 @@ async fn handle_tcp_connection(
 
     let (host, port) = parse_target(target)?;
     let host_lc = host.to_ascii_lowercase();
+    let peer_addr = client.peer_addr().into_diagnostic()?;
 
     if host_lc == INFERENCE_LOCAL_HOST {
+        let attribution = build_inference_attribution(peer_addr, &entrypoint_pid);
         respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
         let outcome = handle_inference_interception(
             client,
@@ -325,6 +349,8 @@ async fn handle_tcp_connection(
             port,
             tls_state.as_ref(),
             inference_ctx.as_ref(),
+            &attribution,
+            inference_debug.as_deref(),
         )
         .await?;
         if let InferenceOutcome::Denied { reason } = outcome {
@@ -333,7 +359,6 @@ async fn handle_tcp_connection(
         return Ok(());
     }
 
-    let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
     // Evaluate OPA policy with process-identity binding
@@ -662,6 +687,48 @@ async fn handle_tcp_connection(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn resolve_socket_process_identity(
+    peer_addr: SocketAddr,
+    entrypoint_pid: &AtomicU32,
+) -> std::result::Result<crate::procfs::SocketProcessIdentity, String> {
+    use std::sync::atomic::Ordering;
+
+    let pid = entrypoint_pid.load(Ordering::Acquire);
+    if pid == 0 {
+        return Err("entrypoint process not yet spawned".to_string());
+    }
+
+    crate::procfs::resolve_tcp_peer_process_identity(pid, peer_addr.port())
+        .map_err(|error| format!("failed to resolve peer identity: {error}"))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn resolve_socket_process_identity(
+    _peer_addr: SocketAddr,
+    _entrypoint_pid: &AtomicU32,
+) -> std::result::Result<crate::procfs::SocketProcessIdentity, String> {
+    Err("identity binding unavailable on this platform".to_string())
+}
+
+fn build_inference_attribution(
+    peer_addr: SocketAddr,
+    entrypoint_pid: &AtomicU32,
+) -> InferenceAttribution {
+    match resolve_socket_process_identity(peer_addr, entrypoint_pid) {
+        Ok(identity) => InferenceAttribution {
+            source_port: peer_addr.port(),
+            identity: Some(identity),
+            identity_error: None,
+        },
+        Err(identity_error) => InferenceAttribution {
+            source_port: peer_addr.port(),
+            identity: None,
+            identity_error: Some(identity_error),
+        },
+    }
+}
+
 /// Evaluate OPA policy for a TCP connection with identity binding via /proc/net/tcp.
 #[cfg(target_os = "linux")]
 fn evaluate_opa_tcp(
@@ -673,7 +740,6 @@ fn evaluate_opa_tcp(
     port: u16,
 ) -> ConnectDecision {
     use crate::opa::NetworkInput;
-    use std::sync::atomic::Ordering;
 
     let deny = |reason: String,
                 binary: Option<PathBuf>,
@@ -690,30 +756,16 @@ fn evaluate_opa_tcp(
         }
     };
 
-    let pid = entrypoint_pid.load(Ordering::Acquire);
-    if pid == 0 {
-        return deny(
-            "entrypoint process not yet spawned".into(),
-            None,
-            None,
-            vec![],
-            vec![],
-        );
-    }
-
-    let peer_port = peer_addr.port();
-    let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
-        Ok(r) => r,
-        Err(e) => {
-            return deny(
-                format!("failed to resolve peer binary: {e}"),
-                None,
-                None,
-                vec![],
-                vec![],
-            );
+    let identity = match resolve_socket_process_identity(peer_addr, entrypoint_pid) {
+        Ok(identity) => identity,
+        Err(reason) => {
+            return deny(reason, None, None, vec![], vec![]);
         }
     };
+    let bin_path = identity.binary_path.clone();
+    let binary_pid = identity.pid;
+    let ancestors = identity.ancestor_binaries.clone();
+    let cmdline_paths = identity.cmdline_paths.clone();
 
     // TOFU verify the immediate binary
     let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
@@ -728,9 +780,6 @@ fn evaluate_opa_tcp(
             );
         }
     };
-
-    // Walk the process tree upward to collect ancestor binaries
-    let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
 
     // TOFU verify each ancestor binary
     for ancestor in &ancestors {
@@ -747,12 +796,6 @@ fn evaluate_opa_tcp(
             );
         }
     }
-
-    // Collect cmdline paths for script-based binary detection.
-    // Excludes exe paths already captured in bin_path/ancestors to avoid duplicates.
-    let mut exclude = ancestors.clone();
-    exclude.push(bin_path.clone());
-    let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
 
     let input = NetworkInput {
         host: host.to_string(),
@@ -822,6 +865,8 @@ async fn handle_inference_interception(
     _port: u16,
     tls_state: Option<&Arc<ProxyTlsState>>,
     inference_ctx: Option<&Arc<InferenceContext>>,
+    attribution: &InferenceAttribution,
+    debug_logger: Option<&InferenceDebugLogger>,
 ) -> Result<InferenceOutcome> {
     use crate::l7::inference::{ParseResult, format_http_response, try_parse_http_request};
 
@@ -879,7 +924,14 @@ async fn handle_inference_interception(
         // Try to parse a complete HTTP request
         match try_parse_http_request(&buf[..used]) {
             ParseResult::Complete(request, consumed) => {
-                let was_routed = route_inference_request(&request, ctx, &mut tls_client).await?;
+                let was_routed = route_inference_request(
+                    &request,
+                    ctx,
+                    &mut tls_client,
+                    attribution,
+                    debug_logger,
+                )
+                .await?;
                 if was_routed {
                     routed_any = true;
                 } else if !routed_any {
@@ -922,10 +974,13 @@ async fn route_inference_request(
     request: &crate::l7::inference::ParsedHttpRequest,
     ctx: &InferenceContext,
     tls_client: &mut (impl tokio::io::AsyncWrite + Unpin),
+    attribution: &InferenceAttribution,
+    debug_logger: Option<&InferenceDebugLogger>,
 ) -> Result<bool> {
     use crate::l7::inference::{detect_inference_pattern, format_http_response};
 
     let normalized_path = normalize_inference_path(&request.path);
+    let started_at = Instant::now();
 
     if let Some(pattern) =
         detect_inference_pattern(&request.method, &normalized_path, &ctx.patterns)
@@ -940,8 +995,25 @@ async fn route_inference_request(
 
         // Strip credential + framing/hop-by-hop headers.
         let filtered_headers = sanitize_inference_request_headers(&request.headers);
+        let request_log_headers = debug_logger
+            .map(|_| sanitize_inference_request_log_headers(&request.headers))
+            .unwrap_or_default();
 
         let routes = ctx.routes.read().await;
+        let selected_route = debug_logger
+            .map(|_| select_inference_route_meta(&routes, &pattern.protocol))
+            .unwrap_or(None);
+        let mut debug_record = debug_logger.map(|_| {
+            make_inference_debug_record(
+                attribution,
+                request,
+                &normalized_path,
+                Some(pattern.protocol.as_str()),
+                Some(pattern.kind.as_str()),
+                selected_route.as_ref(),
+                &request_log_headers,
+            )
+        });
 
         if routes.is_empty() {
             let body = serde_json::json!({
@@ -949,12 +1021,26 @@ async fn route_inference_request(
                 "hint": "run: openshell cluster inference set --help"
             });
             let body_bytes = body.to_string();
-            let response = format_http_response(
-                503,
-                &[("content-type".to_string(), "application/json".to_string())],
-                body_bytes.as_bytes(),
-            );
+            let response_headers =
+                vec![("content-type".to_string(), "application/json".to_string())];
+            let response = format_http_response(503, &response_headers, body_bytes.as_bytes());
             write_all(tls_client, &response).await?;
+            if let (Some(logger), Some(mut record)) = (debug_logger, debug_record.take()) {
+                let response_capture = BodyCaptureBuffer::from_slice(body_bytes.as_bytes());
+                finalize_inference_debug_record(
+                    &mut record,
+                    503,
+                    &sanitize_inference_response_log_headers(response_headers),
+                    &response_capture,
+                    false,
+                    None,
+                    started_at.elapsed(),
+                    InferenceDebugOutcome::UpstreamError,
+                    None,
+                    Some("cluster inference is not configured".to_string()),
+                );
+                logger.write_record(&record);
+            }
             return Ok(true);
         }
 
@@ -975,9 +1061,16 @@ async fn route_inference_request(
                     format_chunk, format_chunk_terminator, format_http_response_header,
                 };
 
-                let resp_headers = sanitize_inference_response_headers(
-                    std::mem::take(&mut resp.headers).into_iter().collect(),
-                );
+                let raw_resp_headers: Vec<(String, String)> =
+                    std::mem::take(&mut resp.headers).into_iter().collect();
+                let resp_headers = sanitize_inference_response_headers(raw_resp_headers.clone());
+                let response_log_headers = debug_logger
+                    .map(|_| sanitize_inference_response_log_headers(raw_resp_headers))
+                    .unwrap_or_default();
+                let streaming = request_is_streaming(request, &resp_headers);
+                let mut response_capture = debug_logger.map(|_| BodyCaptureBuffer::default());
+                let mut first_chunk_delay = None;
+                let mut stream_error = None;
 
                 // Write response headers immediately (chunked TE).
                 let header_bytes = format_http_response_header(resp.status, &resp_headers);
@@ -987,12 +1080,19 @@ async fn route_inference_request(
                 loop {
                     match resp.next_chunk().await {
                         Ok(Some(chunk)) => {
+                            if first_chunk_delay.is_none() {
+                                first_chunk_delay = Some(started_at.elapsed());
+                            }
+                            if let Some(capture) = response_capture.as_mut() {
+                                capture.push(&chunk);
+                            }
                             let encoded = format_chunk(&chunk);
                             write_all(tls_client, &encoded).await?;
                         }
                         Ok(None) => break,
                         Err(e) => {
                             warn!(error = %e, "error reading upstream response chunk");
+                            stream_error = Some(e.to_string());
                             break;
                         }
                     }
@@ -1000,18 +1100,55 @@ async fn route_inference_request(
 
                 // Terminate the chunked stream.
                 write_all(tls_client, format_chunk_terminator()).await?;
+                if let (Some(logger), Some(mut record), Some(response_capture)) =
+                    (debug_logger, debug_record.take(), response_capture)
+                {
+                    let outcome = if stream_error.is_some() {
+                        InferenceDebugOutcome::UpstreamError
+                    } else {
+                        InferenceDebugOutcome::Routed
+                    };
+                    finalize_inference_debug_record(
+                        &mut record,
+                        resp.status,
+                        &response_log_headers,
+                        &response_capture,
+                        streaming,
+                        first_chunk_delay,
+                        started_at.elapsed(),
+                        outcome,
+                        None,
+                        stream_error,
+                    );
+                    logger.write_record(&record);
+                }
             }
             Err(e) => {
                 warn!(error = %e, "inference endpoint detected but upstream service failed");
                 let (status, msg) = router_error_to_http(&e);
                 let body = serde_json::json!({"error": msg});
                 let body_bytes = body.to_string();
-                let response = format_http_response(
-                    status,
-                    &[("content-type".to_string(), "application/json".to_string())],
-                    body_bytes.as_bytes(),
-                );
+                let response_headers =
+                    vec![("content-type".to_string(), "application/json".to_string())];
+                let response =
+                    format_http_response(status, &response_headers, body_bytes.as_bytes());
                 write_all(tls_client, &response).await?;
+                if let (Some(logger), Some(mut record)) = (debug_logger, debug_record.take()) {
+                    let response_capture = BodyCaptureBuffer::from_slice(body_bytes.as_bytes());
+                    finalize_inference_debug_record(
+                        &mut record,
+                        status,
+                        &sanitize_inference_response_log_headers(response_headers),
+                        &response_capture,
+                        false,
+                        None,
+                        started_at.elapsed(),
+                        InferenceDebugOutcome::UpstreamError,
+                        None,
+                        Some(e.to_string()),
+                    );
+                    logger.write_record(&record);
+                }
             }
         }
         Ok(true)
@@ -1024,12 +1161,35 @@ async fn route_inference_request(
         );
         let body = serde_json::json!({"error": "connection not allowed by policy"});
         let body_bytes = body.to_string();
-        let response = format_http_response(
-            403,
-            &[("content-type".to_string(), "application/json".to_string())],
-            body_bytes.as_bytes(),
-        );
+        let response_headers = vec![("content-type".to_string(), "application/json".to_string())];
+        let response = format_http_response(403, &response_headers, body_bytes.as_bytes());
         write_all(tls_client, &response).await?;
+        if let Some(logger) = debug_logger {
+            let request_log_headers = sanitize_inference_request_log_headers(&request.headers);
+            let mut record = make_inference_debug_record(
+                attribution,
+                request,
+                &normalized_path,
+                None,
+                None,
+                None,
+                &request_log_headers,
+            );
+            let response_capture = BodyCaptureBuffer::from_slice(body_bytes.as_bytes());
+            finalize_inference_debug_record(
+                &mut record,
+                403,
+                &sanitize_inference_response_log_headers(response_headers),
+                &response_capture,
+                false,
+                None,
+                started_at.elapsed(),
+                InferenceDebugOutcome::Denied,
+                Some("connection not allowed by policy".to_string()),
+                None,
+            );
+            logger.write_record(&record);
+        }
         Ok(false)
     }
 }
@@ -1058,10 +1218,33 @@ fn sanitize_inference_request_headers(headers: &[(String, String)]) -> Vec<(Stri
         .collect()
 }
 
+fn sanitize_inference_request_log_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
+    redact_sensitive_log_headers(sanitize_inference_request_headers(headers))
+}
+
 fn sanitize_inference_response_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
     headers
         .into_iter()
         .filter(|(name, _)| !should_strip_response_header(name))
+        .collect()
+}
+
+fn sanitize_inference_response_log_headers(
+    headers: Vec<(String, String)>,
+) -> Vec<(String, String)> {
+    redact_sensitive_log_headers(sanitize_inference_response_headers(headers))
+}
+
+fn redact_sensitive_log_headers(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .map(|(name, value)| {
+            if should_redact_log_header(&name) {
+                (name, "[REDACTED]".to_string())
+            } else {
+                (name, value)
+            }
+        })
         .collect()
 }
 
@@ -1078,6 +1261,17 @@ fn should_strip_response_header(name: &str) -> bool {
     matches!(name_lc.as_str(), "content-length") || is_hop_by_hop_header(&name_lc)
 }
 
+fn should_redact_log_header(name: &str) -> bool {
+    let name_lc = name.to_ascii_lowercase();
+    matches!(
+        name_lc.as_str(),
+        "authorization" | "proxy-authorization" | "x-api-key" | "cookie" | "set-cookie"
+    ) || name_lc == "api-key"
+        || name_lc.ends_with("-api-key")
+        || name_lc.contains("token")
+        || name_lc.contains("secret")
+}
+
 fn is_hop_by_hop_header(name: &str) -> bool {
     matches!(
         name,
@@ -1091,6 +1285,147 @@ fn is_hop_by_hop_header(name: &str) -> bool {
             | "transfer-encoding"
             | "upgrade"
     )
+}
+
+fn select_inference_route_meta(
+    routes: &[openshell_router::config::ResolvedRoute],
+    protocol: &str,
+) -> Option<SelectedRouteMeta> {
+    let normalized_protocol = protocol.trim().to_ascii_lowercase();
+    routes
+        .iter()
+        .find(|route| route.protocols.iter().any(|p| p == &normalized_protocol))
+        .map(|route| SelectedRouteMeta {
+            name: route.name.clone(),
+            provider_type: route.provider_type.clone(),
+            model: route.model.clone(),
+        })
+}
+
+fn request_is_streaming(
+    request: &crate::l7::inference::ParsedHttpRequest,
+    response_headers: &[(String, String)],
+) -> bool {
+    let request_wants_sse = request.headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("accept")
+            && value.to_ascii_lowercase().contains("text/event-stream")
+    });
+    if request_wants_sse {
+        return true;
+    }
+
+    let response_is_sse = response_headers.iter().any(|(name, value)| {
+        name.eq_ignore_ascii_case("content-type")
+            && value.to_ascii_lowercase().contains("text/event-stream")
+    });
+    if response_is_sse {
+        return true;
+    }
+
+    serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .and_then(|json| json.get("stream").and_then(serde_json::Value::as_bool))
+        .unwrap_or(false)
+}
+
+fn make_inference_debug_record(
+    attribution: &InferenceAttribution,
+    request: &crate::l7::inference::ParsedHttpRequest,
+    normalized_path: &str,
+    protocol: Option<&str>,
+    kind: Option<&str>,
+    selected_route: Option<&SelectedRouteMeta>,
+    request_headers: &[(String, String)],
+) -> InferenceDebugRecord {
+    let request_capture = BodyCaptureBuffer::from_slice(&request.body);
+    let pid = attribution.identity.as_ref().map(|identity| identity.pid);
+    let binary_path = attribution
+        .identity
+        .as_ref()
+        .map(|identity| identity.binary_path.display().to_string());
+    let ancestor_binaries = attribution
+        .identity
+        .as_ref()
+        .map(|identity| {
+            identity
+                .ancestor_binaries
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    let cmdline_paths = attribution
+        .identity
+        .as_ref()
+        .map(|identity| {
+            identity
+                .cmdline_paths
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+
+    InferenceDebugRecord {
+        timestamp_ms: timestamp_ms(),
+        source_port: attribution.source_port,
+        pid,
+        binary_path,
+        ancestor_binaries,
+        cmdline_paths,
+        identity_error: attribution.identity_error.clone(),
+        method: request.method.clone(),
+        raw_path: request.path.clone(),
+        normalized_path: normalized_path.to_string(),
+        protocol: protocol.map(ToString::to_string),
+        kind: kind.map(ToString::to_string),
+        selected_route: selected_route.map(|route| route.name.clone()),
+        selected_provider: selected_route.and_then(|route| route.provider_type.clone()),
+        selected_model: selected_route.map(|route| route.model.clone()),
+        request_headers: logged_headers(request_headers),
+        request_body_bytes: request_capture.total_bytes(),
+        request_body_capture_bytes: request_capture.captured_bytes(),
+        request_body_truncated: request_capture.truncated(),
+        request_body_b64: request_capture.encoded_body(),
+        response_status: 0,
+        response_headers: Vec::new(),
+        response_body_bytes: 0,
+        response_body_capture_bytes: 0,
+        response_body_truncated: false,
+        response_body_b64: None,
+        streaming: false,
+        time_to_first_chunk_ms: None,
+        total_duration_ms: 0,
+        outcome: InferenceDebugOutcome::Denied,
+        deny_reason: None,
+        router_error: None,
+    }
+}
+
+fn finalize_inference_debug_record(
+    record: &mut InferenceDebugRecord,
+    response_status: u16,
+    response_headers: &[(String, String)],
+    response_capture: &BodyCaptureBuffer,
+    streaming: bool,
+    time_to_first_chunk: Option<Duration>,
+    total_duration: Duration,
+    outcome: InferenceDebugOutcome,
+    deny_reason: Option<String>,
+    router_error: Option<String>,
+) {
+    record.response_status = response_status;
+    record.response_headers = logged_headers(response_headers);
+    record.response_body_bytes = response_capture.total_bytes();
+    record.response_body_capture_bytes = response_capture.captured_bytes();
+    record.response_body_truncated = response_capture.truncated();
+    record.response_body_b64 = response_capture.encoded_body();
+    record.streaming = streaming;
+    record.time_to_first_chunk_ms = time_to_first_chunk.map(duration_ms);
+    record.total_duration_ms = duration_ms(total_duration);
+    record.outcome = outcome;
+    record.deny_reason = deny_reason;
+    record.router_error = router_error;
 }
 
 /// Write all bytes to an async writer.
@@ -2063,6 +2398,33 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sanitize_request_log_headers_redacts_cookie_values() {
+        let headers = vec![
+            ("cookie".to_string(), "session=abc".to_string()),
+            ("x-session-token".to_string(), "secret".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+
+        let kept = sanitize_inference_request_log_headers(&headers);
+
+        assert!(
+            kept.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("cookie") && v == "[REDACTED]"),
+            "cookie value should be redacted"
+        );
+        assert!(
+            kept.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("x-session-token") && v == "[REDACTED]"),
+            "token-like value should be redacted"
+        );
+        assert!(
+            kept.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/json"),
+            "non-sensitive headers should be preserved"
+        );
+    }
+
     // -- router_error_to_http --
 
     #[test]
@@ -2155,6 +2517,27 @@ mod tests {
             kept.iter()
                 .any(|(k, _)| k.eq_ignore_ascii_case("cache-control")),
             "cache-control should be preserved"
+        );
+    }
+
+    #[test]
+    fn sanitize_response_log_headers_redacts_set_cookie() {
+        let headers = vec![
+            ("set-cookie".to_string(), "session=abc".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ];
+
+        let kept = sanitize_inference_response_log_headers(headers);
+
+        assert!(
+            kept.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("set-cookie") && v == "[REDACTED]"),
+            "set-cookie value should be redacted"
+        );
+        assert!(
+            kept.iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("content-type") && v == "application/json"),
+            "non-sensitive response headers should be preserved"
         );
     }
 

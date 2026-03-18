@@ -254,11 +254,12 @@ fn resolve_provider_route(provider: &Provider) -> Result<ResolvedProviderRoute, 
     }
 
     Ok(ResolvedProviderRoute {
-        provider_type,
+        provider_type: provider_type.clone(),
         route: RouterResolvedRoute {
             name: provider.name.clone(),
             endpoint: base_url,
             model: String::new(),
+            provider_type: Some(provider_type.clone()),
             api_key,
             protocols: profile.protocols.iter().map(|p| (*p).to_string()).collect(),
             auth: profile.auth.clone(),

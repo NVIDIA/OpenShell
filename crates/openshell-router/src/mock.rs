@@ -127,6 +127,7 @@ mod tests {
             name: "test".to_string(),
             endpoint: endpoint.to_string(),
             model: model.to_string(),
+            provider_type: None,
             api_key: "key".to_string(),
             protocols: protocols.iter().map(ToString::to_string).collect(),
             auth: crate::config::AuthHeader::Bearer,

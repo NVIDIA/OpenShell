@@ -56,8 +56,10 @@ bytes = { workspace = true }
 ipnet = "2"
 
 # Serialization
+serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
+base64 = { workspace = true }
 
 # Logging
 tracing = { workspace = true }

@@ -2923,6 +2923,7 @@ name = "openshell-sandbox"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "bytes",
  "clap",
  "hex",
@@ -2942,6 +2943,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "seccompiler",
+ "serde",
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
