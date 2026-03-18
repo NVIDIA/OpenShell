@@ -1903,7 +1903,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         // Build the typed SettingValue from the validated input.
-        use openshell_core::proto::{SettingValue, UpdateSandboxPolicyRequest, setting_value};
+        use openshell_core::proto::{SettingValue, UpdateSettingsRequest, setting_value};
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
@@ -1919,7 +1919,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
         };
 
-        let req = UpdateSandboxPolicyRequest {
+        let req = UpdateSettingsRequest {
             name: String::new(),
             policy: None,
             setting_key: key,
@@ -1929,7 +1929,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
         };
 
         let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_sandbox_policy(req)).await;
+            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => Event::GlobalSettingSetResult(Ok(resp.into_inner().settings_revision)),
@@ -1952,9 +1952,9 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
 
     tokio::spawn(async move {
-        use openshell_core::proto::UpdateSandboxPolicyRequest;
+        use openshell_core::proto::UpdateSettingsRequest;
 
-        let req = UpdateSandboxPolicyRequest {
+        let req = UpdateSettingsRequest {
             name: String::new(),
             policy: None,
             setting_key: key,
@@ -1964,7 +1964,7 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
         };
 
         let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_sandbox_policy(req)).await;
+            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => {
@@ -1995,7 +1995,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
 
     tokio::spawn(async move {
-        use openshell_core::proto::{SettingValue, UpdateSandboxPolicyRequest, setting_value};
+        use openshell_core::proto::{SettingValue, UpdateSettingsRequest, setting_value};
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
@@ -2011,7 +2011,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
         };
 
-        let req = UpdateSandboxPolicyRequest {
+        let req = UpdateSettingsRequest {
             name,
             policy: None,
             setting_key: key,
@@ -2021,7 +2021,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
         };
 
         let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_sandbox_policy(req)).await;
+            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => Event::SandboxSettingSetResult(Ok(resp.into_inner().settings_revision)),
@@ -2048,9 +2048,9 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
 
     tokio::spawn(async move {
-        use openshell_core::proto::UpdateSandboxPolicyRequest;
+        use openshell_core::proto::UpdateSettingsRequest;
 
-        let req = UpdateSandboxPolicyRequest {
+        let req = UpdateSettingsRequest {
             name,
             policy: None,
             setting_key: key,
@@ -2060,7 +2060,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
         };
 
         let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_sandbox_policy(req)).await;
+            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => {

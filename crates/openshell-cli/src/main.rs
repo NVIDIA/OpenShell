@@ -3032,7 +3032,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Settings {
-                command: Some(SettingsCommands::Get { name, global }),
+                command: Some(SettingsCommands::Get { name, global, .. }),
             }) => {
                 assert!(global);
                 assert!(name.is_none());
@@ -3072,7 +3072,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Settings {
-                command: Some(SettingsCommands::Delete { key, global, yes }),
+                command: Some(SettingsCommands::Delete { key, global, yes, .. }),
             }) => {
                 assert_eq!(key, "log_level");
                 assert!(global);

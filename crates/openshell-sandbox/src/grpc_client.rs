@@ -12,7 +12,7 @@ use openshell_core::proto::{
     DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxSettingsRequest, PolicySource, PolicyStatus,
     ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    UpdateSandboxPolicyRequest, inference_client::InferenceClient,
+    UpdateSettingsRequest, inference_client::InferenceClient,
     open_shell_client::OpenShellClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -127,7 +127,7 @@ async fn sync_policy_with_client(
     policy: &ProtoSandboxPolicy,
 ) -> Result<()> {
     client
-        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+        .update_settings(UpdateSettingsRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
             setting_key: String::new(),

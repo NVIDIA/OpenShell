@@ -171,10 +171,10 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_settings(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateSandboxPolicyResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::UpdateSettingsRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateSettingsResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 

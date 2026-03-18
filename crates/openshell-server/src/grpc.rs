@@ -30,8 +30,8 @@ use openshell_core::proto::{
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
     SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
-    UndoDraftChunkResponse, UpdateProviderRequest, UpdateSandboxPolicyRequest,
-    UpdateSandboxPolicyResponse, WatchSandboxRequest, open_shell_server::OpenShell,
+    UndoDraftChunkResponse, UpdateProviderRequest, UpdateSettingsRequest,
+    UpdateSettingsResponse, WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use openshell_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
@@ -1057,10 +1057,10 @@ impl OpenShell for OpenShellService {
     // Policy update handlers
     // -------------------------------------------------------------------
 
-    async fn update_sandbox_policy(
+    async fn update_settings(
         &self,
-        request: Request<UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<UpdateSandboxPolicyResponse>, Status> {
+        request: Request<UpdateSettingsRequest>,
+    ) -> Result<Response<UpdateSettingsResponse>, Status> {
         let req = request.into_inner();
         let key = req.setting_key.trim();
         let has_policy = req.policy.is_some();
@@ -1107,7 +1107,7 @@ impl OpenShell for OpenShellService {
                     save_global_settings(self.state.store.as_ref(), &global_settings).await?;
                 }
 
-                return Ok(Response::new(UpdateSandboxPolicyResponse {
+                return Ok(Response::new(UpdateSettingsResponse {
                     version: 0,
                     policy_hash: deterministic_policy_hash(&new_policy),
                     settings_revision: global_settings.revision,
@@ -1142,7 +1142,7 @@ impl OpenShell for OpenShellService {
                 save_global_settings(self.state.store.as_ref(), &global_settings).await?;
             }
 
-            return Ok(Response::new(UpdateSandboxPolicyResponse {
+            return Ok(Response::new(UpdateSettingsResponse {
                 version: 0,
                 policy_hash: String::new(),
                 settings_revision: global_settings.revision,
@@ -1203,7 +1203,7 @@ impl OpenShell for OpenShellService {
                     .await?;
                 }
 
-                return Ok(Response::new(UpdateSandboxPolicyResponse {
+                return Ok(Response::new(UpdateSettingsResponse {
                     version: 0,
                     policy_hash: String::new(),
                     settings_revision: sandbox_settings.revision,
@@ -1237,7 +1237,7 @@ impl OpenShell for OpenShellService {
                 .await?;
             }
 
-            return Ok(Response::new(UpdateSandboxPolicyResponse {
+            return Ok(Response::new(UpdateSettingsResponse {
                 version: 0,
                 policy_hash: String::new(),
                 settings_revision: sandbox_settings.revision,
@@ -1293,7 +1293,7 @@ impl OpenShell for OpenShellService {
                 .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
             info!(
                 sandbox_id = %sandbox_id,
-                "UpdateSandboxPolicy: backfilled spec.policy from sandbox-discovered policy"
+                "UpdateSettings: backfilled spec.policy from sandbox-discovered policy"
             );
         }
 
@@ -1312,7 +1312,7 @@ impl OpenShell for OpenShellService {
         if let Some(ref current) = latest
             && current.policy_hash == hash
         {
-            return Ok(Response::new(UpdateSandboxPolicyResponse {
+            return Ok(Response::new(UpdateSettingsResponse {
                 version: u32::try_from(current.version).unwrap_or(0),
                 policy_hash: hash,
                 settings_revision: 0,
@@ -1343,10 +1343,10 @@ impl OpenShell for OpenShellService {
             sandbox_id = %sandbox_id,
             version = next_version,
             policy_hash = %hash,
-            "UpdateSandboxPolicy: new policy version persisted"
+            "UpdateSettings: new policy version persisted"
         );
 
-        Ok(Response::new(UpdateSandboxPolicyResponse {
+        Ok(Response::new(UpdateSettingsResponse {
             version: u32::try_from(next_version).unwrap_or(0),
             policy_hash: hash,
             settings_revision: 0,
@@ -2326,7 +2326,7 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
 /// Merge a draft chunk's proposed rule into the current active sandbox policy.
 ///
 /// Returns `(new_version, policy_hash)`. This reuses the same persistence
-/// pattern as `update_sandbox_policy`: compute hash, check for no-op,
+/// pattern as `update_settings`: compute hash, check for no-op,
 /// persist a new revision, supersede older versions, and notify watchers.
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
@@ -4729,7 +4729,7 @@ mod tests {
         };
         store.put_message(&sandbox).await.unwrap();
 
-        // Simulate what update_sandbox_policy does when spec.policy is None:
+        // Simulate what update_settings does when spec.policy is None:
         // backfill spec.policy with the new policy.
         let new_policy = ProtoSandboxPolicy {
             version: 1,
