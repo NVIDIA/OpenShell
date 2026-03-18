@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use openshell_bootstrap::load_last_sandbox;
+use openshell_bootstrap::{load_last_sandbox, save_last_sandbox};
 use openshell_cli::run;
 use openshell_cli::tls::TlsOptions;
 use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
@@ -715,4 +715,35 @@ async fn sandbox_create_keeps_sandbox_with_forwarding() {
     .expect("sandbox create with forward should succeed");
 
     assert!(deleted_names(&server).await.is_empty());
+}
+
+#[tokio::test]
+async fn sandbox_delete_clears_matching_last_used_sandbox() {
+    let server = run_server().await;
+    let fake_ssh_dir = tempfile::tempdir().unwrap();
+    let xdg_dir = tempfile::tempdir().unwrap();
+    let _env = test_env(&fake_ssh_dir, &xdg_dir);
+    let tls = test_tls(&server);
+
+    save_last_sandbox("openshell", "stale-sandbox").expect("save should succeed");
+    assert_eq!(
+        load_last_sandbox("openshell").as_deref(),
+        Some("stale-sandbox")
+    );
+
+    run::sandbox_delete(
+        &server.endpoint,
+        "openshell",
+        &["stale-sandbox".to_string()],
+        false,
+        &tls,
+    )
+    .await
+    .expect("sandbox delete should succeed");
+
+    assert_eq!(load_last_sandbox("openshell"), None);
+    assert_eq!(
+        deleted_names(&server).await,
+        vec![vec!["stale-sandbox".to_string()]]
+    );
 }

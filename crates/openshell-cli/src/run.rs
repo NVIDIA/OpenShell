@@ -16,10 +16,10 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_bootstrap::{
-    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
-    extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
-    store_gateway_metadata,
+    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, clear_last_sandbox,
+    container_name, extract_host_from_ssh_destination, get_gateway_metadata, list_gateways,
+    load_active_gateway, load_last_sandbox, remove_gateway_metadata, resolve_ssh_hostname,
+    save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
@@ -1819,6 +1819,7 @@ fn sandbox_should_persist(
 
 async fn finalize_sandbox_create_session(
     server: &str,
+    gateway_name: &str,
     sandbox_name: &str,
     persist: bool,
     session_result: Result<()>,
@@ -1829,7 +1830,7 @@ async fn finalize_sandbox_create_session(
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, tls).await {
+    if let Err(err) = sandbox_delete(server, gateway_name, &names, false, tls).await {
         if session_result.is_ok() {
             return Err(err);
         }
@@ -2295,6 +2296,7 @@ pub async fn sandbox_create(
 
                 return finalize_sandbox_create_session(
                     &effective_server,
+                    effective_tls.gateway_name().unwrap_or(gateway_name),
                     &sandbox_name,
                     persist,
                     connect_result,
@@ -2330,6 +2332,7 @@ pub async fn sandbox_create(
 
             finalize_sandbox_create_session(
                 &effective_server,
+                effective_tls.gateway_name().unwrap_or(gateway_name),
                 &sandbox_name,
                 persist,
                 exec_result,
@@ -2740,6 +2743,7 @@ pub async fn sandbox_list(
 /// Delete a sandbox by name, or all sandboxes when `all` is true.
 pub async fn sandbox_delete(
     server: &str,
+    gateway_name: &str,
     names: &[String],
     all: bool,
     tls: &TlsOptions,
@@ -2784,8 +2788,14 @@ pub async fn sandbox_delete(
         let deleted = response.into_inner().deleted;
         if deleted {
             println!("{} Deleted sandbox {name}", "✓".green().bold());
+            if load_last_sandbox(gateway_name).as_deref() == Some(name.as_str()) {
+                clear_last_sandbox(gateway_name)?;
+            }
         } else {
             println!("{} Sandbox {name} not found", "!".yellow());
+            if load_last_sandbox(gateway_name).as_deref() == Some(name.as_str()) {
+                clear_last_sandbox(gateway_name)?;
+            }
         }
     }
 

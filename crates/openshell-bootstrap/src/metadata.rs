@@ -271,6 +271,17 @@ pub fn load_last_sandbox(gateway: &str) -> Option<String> {
     if name.is_empty() { None } else { Some(name) }
 }
 
+/// Remove the persisted last-used sandbox for a gateway.
+pub fn clear_last_sandbox(gateway: &str) -> Result<()> {
+    let path = last_sandbox_path(gateway)?;
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .into_diagnostic()
+            .wrap_err_with(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
 /// List all gateways that have stored metadata.
 ///
 /// Scans `$XDG_CONFIG_HOME/openshell/gateways/` for subdirectories containing
@@ -594,6 +605,21 @@ mod tests {
                 load_last_sandbox("gateway-b"),
                 Some("sandbox-b".to_string())
             );
+        });
+    }
+
+    #[test]
+    fn clear_last_sandbox_removes_saved_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_tmp_xdg(tmp.path(), || {
+            save_last_sandbox("gateway-a", "sandbox-a").unwrap();
+            assert_eq!(
+                load_last_sandbox("gateway-a"),
+                Some("sandbox-a".to_string())
+            );
+
+            clear_last_sandbox("gateway-a").unwrap();
+            assert_eq!(load_last_sandbox("gateway-a"), None);
         });
     }
 }
