@@ -36,7 +36,7 @@ uv tool install -U openshell
 ### Create a sandbox
 
 ```bash
-openshell sandbox create -- claude  # or opencode, codex, ollama
+sudo openshell sandbox create -- claude  # or opencode, codex, ollama
 ```
 
 A gateway is created automatically on first use. To deploy on a remote host instead, pass `--remote user@host` to the create command.
