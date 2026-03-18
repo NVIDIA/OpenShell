@@ -22,7 +22,6 @@ ARG NVIDIA_CONTAINER_TOOLKIT_VERSION=1.18.2-1
 FROM --platform=$BUILDPLATFORM rust:1.88-slim AS rust-builder-base
 ARG TARGETARCH
 ARG BUILDARCH
-ARG OPENSHELL_CARGO_VERSION
 ARG CARGO_TARGET_CACHE_SCOPE=default
 ARG SCCACHE_MEMCACHED_ENDPOINT
 
@@ -80,6 +79,7 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
     . cross-build.sh && cargo_cross_build --release -p openshell-server -p openshell-sandbox
 
 FROM rust-deps AS rust-workspace
+ARG OPENSHELL_CARGO_VERSION
 
 COPY crates/ crates/
 

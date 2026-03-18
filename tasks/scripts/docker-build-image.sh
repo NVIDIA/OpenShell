@@ -105,7 +105,7 @@ fi
 VERSION_ARGS=()
 if [[ -n "${OPENSHELL_CARGO_VERSION:-}" ]]; then
   VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${OPENSHELL_CARGO_VERSION}")
-else
+elif [[ -n "${CI:-}" ]]; then
   CARGO_VERSION=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
   if [[ -n "${CARGO_VERSION}" ]]; then
     VERSION_ARGS=(--build-arg "OPENSHELL_CARGO_VERSION=${CARGO_VERSION}")

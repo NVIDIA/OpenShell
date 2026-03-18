@@ -12,6 +12,7 @@ FROM ${OSXCROSS_IMAGE} AS osxcross
 FROM python:${PYTHON_VERSION}-slim AS builder
 
 ARG TARGETARCH
+ARG OPENSHELL_IMAGE_TAG
 ARG CARGO_TARGET_CACHE_SCOPE=default
 
 ENV PATH="/root/.cargo/bin:/usr/local/bin:/osxcross/bin:${PATH}"
@@ -91,8 +92,6 @@ RUN touch crates/openshell-cli/src/main.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 
-# Declare version ARG here (not earlier) so the git-hash-bearing value does not
-# invalidate the expensive dependency-build layers above on every commit.
 ARG OPENSHELL_CARGO_VERSION
 RUN --mount=type=cache,id=cargo-registry-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-python-wheels-macos-${TARGETARCH},sharing=locked,target=/root/.cargo/git \
