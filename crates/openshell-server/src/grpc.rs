@@ -2650,8 +2650,18 @@ async fn save_global_settings(store: &Store, settings: &StoredSettings) -> Resul
     .await
 }
 
+/// Derive a distinct settings record ID from a sandbox UUID.
+///
+/// The generic `objects` table uses `id` as the primary key.  Sandbox objects
+/// already occupy the row keyed by the raw sandbox UUID, so settings records
+/// must use a different ID to avoid a silent no-op upsert (the `ON CONFLICT`
+/// clause is scoped by `object_type`).
+fn sandbox_settings_id(sandbox_id: &str) -> String {
+    format!("settings:{sandbox_id}")
+}
+
 async fn load_sandbox_settings(store: &Store, sandbox_id: &str) -> Result<StoredSettings, Status> {
-    load_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, sandbox_id).await
+    load_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, &sandbox_settings_id(sandbox_id)).await
 }
 
 async fn save_sandbox_settings(
@@ -2663,7 +2673,7 @@ async fn save_sandbox_settings(
     save_settings_record(
         store,
         SANDBOX_SETTINGS_OBJECT_TYPE,
-        sandbox_id,
+        &sandbox_settings_id(sandbox_id),
         sandbox_name,
         settings,
     )
