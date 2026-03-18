@@ -16,6 +16,7 @@ jobs:
       - name: Check if contributor is vouched
         uses: actions/github-script@v7
         with:
+          github-token: ${{ secrets.ORG_READ_TOKEN || secrets.GITHUB_TOKEN }}
           script: |
             const author = context.payload.pull_request.user.login;
             const authorType = context.payload.pull_request.user.type;
@@ -26,27 +27,40 @@ jobs:
               return;
             }
 
-            // Fetch author_association via the REST API. The webhook payload
-            // field (context.payload.pull_request.author_association) is
-            // unreliable under pull_request_target — it can be absent or stale.
-            // The pulls.get endpoint only needs pull-requests permission, which
-            // we already have, and reliably returns MEMBER for org members even
-            // when their membership is private.
-            const trustedAssociations = ['MEMBER', 'OWNER', 'COLLABORATOR'];
+            // Check org membership. Requires a token with read:org scope
+            // (ORG_READ_TOKEN secret). The default GITHUB_TOKEN cannot see org
+            // membership, so author_association and orgs.checkMembershipForUser
+            // both return NONE/404 for private members.
             try {
-              const { data: pr } = await github.rest.pulls.get({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: context.payload.pull_request.number,
+              const { status } = await github.rest.orgs.checkMembershipForUser({
+                org: context.repo.owner,
+                username: author,
               });
-              const association = pr.author_association;
-              console.log(`${author}: author_association=${association}`);
-              if (trustedAssociations.includes(association)) {
-                console.log(`${author} has author_association=${association}. Skipping vouch check.`);
+              if (status === 204 || status === 302) {
+                console.log(`${author} is an org member. Skipping vouch check.`);
                 return;
               }
             } catch (e) {
-              console.log(`Failed to fetch PR author_association: ${e.message}`);
+              if (e.status !== 404) {
+                console.log(`Org membership check error (status=${e.status}): ${e.message}`);
+              }
+            }
+
+            // Check collaborator status — direct collaborators bypass.
+            try {
+              const { status } = await github.rest.repos.checkCollaborator({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                username: author,
+              });
+              if (status === 204) {
+                console.log(`${author} is a repo collaborator. Skipping vouch check.`);
+                return;
+              }
+            } catch (e) {
+              if (e.status !== 404) {
+                console.log(`Collaborator check error (status=${e.status}): ${e.message}`);
+              }
             }
 
             // Check the VOUCHED.td file on the dedicated "vouched" branch.
