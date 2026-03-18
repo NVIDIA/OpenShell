@@ -257,6 +257,7 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 
 const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
   $ openshell settings get my-sandbox
+  $ openshell settings get --global
   $ openshell settings set my-sandbox --key log_level --value debug
   $ openshell settings set --global --key log_level --value warn
   $ openshell settings set --global --key dummy_bool --value yes
@@ -1411,12 +1412,16 @@ enum PolicyCommands {
 
 #[derive(Subcommand, Debug)]
 enum SettingsCommands {
-    /// Show effective settings for a sandbox.
+    /// Show effective settings for a sandbox or gateway-global scope.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
         /// Sandbox name (defaults to last-used sandbox).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
+
+        /// Show gateway-global settings.
+        #[arg(long)]
+        global: bool,
     },
 
     /// Set a single setting key.
@@ -1871,9 +1876,18 @@ async fn main() -> Result<()> {
             apply_edge_auth(&mut tls, &ctx.name);
 
             match settings_cmd {
-                SettingsCommands::Get { name } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_settings_get(&ctx.endpoint, &name, &tls).await?;
+                SettingsCommands::Get { name, global } => {
+                    if global {
+                        if name.is_some() {
+                            return Err(miette::miette!(
+                                "settings get --global does not accept a sandbox name"
+                            ));
+                        }
+                        run::gateway_settings_get(&ctx.endpoint, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_settings_get(&ctx.endpoint, &name, &tls).await?;
+                    }
                 }
                 SettingsCommands::Set {
                     name,
@@ -2995,6 +3009,22 @@ mod tests {
                 assert_eq!(value, "warn");
             }
             other => panic!("expected settings set command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_get_global_parses() {
+        let cli = Cli::try_parse_from(["openshell", "settings", "get", "--global"])
+            .expect("settings get --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command: Some(SettingsCommands::Get { name, global }),
+            }) => {
+                assert!(global);
+                assert!(name.is_none());
+            }
+            other => panic!("expected settings get command, got: {other:?}"),
         }
     }
 

@@ -8,7 +8,8 @@ use openshell_core::proto::open_shell_server::{OpenShell, OpenShellServer};
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetProviderRequest, GetSandboxProviderEnvironmentRequest,
+    ExecSandboxEvent, ExecSandboxRequest, GetGatewaySettingsRequest, GetGatewaySettingsResponse,
+    GetProviderRequest, GetSandboxProviderEnvironmentRequest,
     GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxSettingsRequest,
     GetSandboxSettingsResponse, HealthRequest, HealthResponse, ListProvidersRequest,
     ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, PlatformEvent,
@@ -161,6 +162,13 @@ impl OpenShell for TestOpenShell {
         _request: tonic::Request<GetSandboxSettingsRequest>,
     ) -> Result<Response<GetSandboxSettingsResponse>, Status> {
         Ok(Response::new(GetSandboxSettingsResponse::default()))
+    }
+
+    async fn get_gateway_settings(
+        &self,
+        _request: tonic::Request<GetGatewaySettingsRequest>,
+    ) -> Result<Response<GetGatewaySettingsResponse>, Status> {
+        Ok(Response::new(GetGatewaySettingsResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(

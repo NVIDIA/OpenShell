@@ -115,6 +115,18 @@ message GetSandboxSettingsRequest {
   string sandbox_id = 1;
 }
 
+// Request to get gateway-global settings.
+message GetGatewaySettingsRequest {}
+
+// Response containing gateway-global settings.
+message GetGatewaySettingsResponse {
+  // Gateway-global settings map excluding the reserved policy key.
+  // Registered keys without a configured value are returned with an empty SettingValue.
+  map<string, SettingValue> settings = 1;
+  // Monotonically increasing revision for gateway-global settings.
+  uint64 settings_revision = 2;
+}
+
 // Scope that currently controls a setting.
 enum SettingScope {
   SETTING_SCOPE_UNSPECIFIED = 0;
@@ -154,6 +166,7 @@ message GetSandboxSettingsResponse {
   // SHA-256 hash of the serialized policy payload.
   string policy_hash = 3;
   // Effective settings resolved for this sandbox, excluding the reserved policy key.
+  // Registered keys without a configured value are returned with an empty EffectiveSetting.value.
   map<string, EffectiveSetting> settings = 4;
   // Fingerprint for effective config (policy + settings). Changes when any effective input changes.
   uint64 config_revision = 5;

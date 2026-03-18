@@ -24,13 +24,13 @@ use openshell_bootstrap::{
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
-    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxPolicyStatusRequest, GetSandboxRequest,
-    GetSandboxSettingsRequest, HealthRequest, ListProvidersRequest, ListSandboxPoliciesRequest,
-    ListSandboxesRequest, PolicyStatus, Provider, RejectDraftChunkRequest, Sandbox, SandboxPhase,
-    SandboxPolicy, SandboxSpec, SandboxTemplate, SetClusterInferenceRequest, SettingScope,
-    SettingValue, UpdateProviderRequest, UpdateSandboxPolicyRequest, WatchSandboxRequest,
-    setting_value,
+    GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
+    GetGatewaySettingsRequest, GetProviderRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxSettingsRequest, HealthRequest,
+    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
+    SetClusterInferenceRequest, SettingScope, SettingValue, UpdateProviderRequest,
+    UpdateSandboxPolicyRequest, WatchSandboxRequest, setting_value,
 };
 use openshell_core::settings::{self, SettingValueKind};
 use openshell_providers::{
@@ -3976,7 +3976,7 @@ pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) ->
             let scope = match SettingScope::try_from(setting.scope) {
                 Ok(SettingScope::Global) => "global",
                 Ok(SettingScope::Sandbox) => "sandbox",
-                _ => "unknown",
+                _ => "unset",
             };
             println!(
                 "  {} = {} ({})",
@@ -3987,6 +3987,33 @@ pub async fn sandbox_settings_get(server: &str, name: &str, tls: &TlsOptions) ->
         }
     }
 
+    Ok(())
+}
+
+pub async fn gateway_settings_get(server: &str, tls: &TlsOptions) -> Result<()> {
+    let mut client = grpc_client(server, tls).await?;
+    let response = client
+        .get_gateway_settings(GetGatewaySettingsRequest {})
+        .await
+        .into_diagnostic()?
+        .into_inner();
+
+    println!("Scope:         global");
+    println!("Settings Rev:  {}", response.settings_revision);
+
+    if response.settings.is_empty() {
+        println!("Settings:      (none)");
+        return Ok(());
+    }
+
+    println!("Settings:");
+    let mut keys: Vec<_> = response.settings.keys().cloned().collect();
+    keys.sort();
+    for key in keys {
+        if let Some(setting) = response.settings.get(&key) {
+            println!("  {} = {}", key, format_setting_value(Some(setting)));
+        }
+    }
     Ok(())
 }
 

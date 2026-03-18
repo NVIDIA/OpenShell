@@ -117,6 +117,15 @@ impl OpenShell for TestOpenShell {
         ))
     }
 
+    async fn get_gateway_settings(
+        &self,
+        _request: tonic::Request<openshell_core::proto::GetGatewaySettingsRequest>,
+    ) -> Result<Response<openshell_core::proto::GetGatewaySettingsResponse>, Status> {
+        Ok(Response::new(
+            openshell_core::proto::GetGatewaySettingsResponse::default(),
+        ))
+    }
+
     async fn get_sandbox_provider_environment(
         &self,
         _request: tonic::Request<openshell_core::proto::GetSandboxProviderEnvironmentRequest>,

@@ -18,17 +18,17 @@ use openshell_core::proto::{
     DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse,
-    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
-    GetSandboxSettingsRequest, GetSandboxSettingsResponse, HealthRequest, HealthResponse,
-    ListProvidersRequest, ListProvidersResponse, ListSandboxPoliciesRequest,
-    ListSandboxPoliciesResponse, ListSandboxesRequest, ListSandboxesResponse, PolicyChunk,
-    PolicySource, PolicyStatus, Provider, ProviderResponse, PushSandboxLogsRequest,
-    PushSandboxLogsResponse, RejectDraftChunkRequest, RejectDraftChunkResponse,
-    ReportPolicyStatusRequest, ReportPolicyStatusResponse, RevokeSshSessionRequest,
-    RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision, SandboxResponse,
-    SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
+    GetGatewaySettingsRequest, GetGatewaySettingsResponse, GetProviderRequest,
+    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
+    GetSandboxPolicyStatusResponse, GetSandboxProviderEnvironmentRequest,
+    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxSettingsRequest,
+    GetSandboxSettingsResponse, HealthRequest, HealthResponse, ListProvidersRequest,
+    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
+    ListSandboxesRequest, ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider,
+    ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
+    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
     SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
     UndoDraftChunkResponse, UpdateProviderRequest, UpdateSandboxPolicyRequest,
     UpdateSandboxPolicyResponse, WatchSandboxRequest, open_shell_server::OpenShell,
@@ -850,6 +850,18 @@ impl OpenShell for OpenShellService {
             settings,
             config_revision,
             policy_source: policy_source.into(),
+        }))
+    }
+
+    async fn get_gateway_settings(
+        &self,
+        _request: Request<GetGatewaySettingsRequest>,
+    ) -> Result<Response<GetGatewaySettingsResponse>, Status> {
+        let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+        let settings = materialize_global_settings(&global_settings)?;
+        Ok(Response::new(GetGatewaySettingsResponse {
+            settings,
+            settings_revision: global_settings.revision,
         }))
     }
 
@@ -2717,6 +2729,16 @@ fn merge_effective_settings(
 ) -> Result<HashMap<String, EffectiveSetting>, Status> {
     let mut merged = HashMap::new();
 
+    for registered in settings::REGISTERED_SETTINGS {
+        merged.insert(
+            registered.key.to_string(),
+            EffectiveSetting {
+                value: None,
+                scope: SettingScope::Unspecified.into(),
+            },
+        );
+    }
+
     for (key, value) in &sandbox.settings {
         if key == POLICY_SETTING_KEY {
             continue;
@@ -2744,6 +2766,24 @@ fn merge_effective_settings(
     }
 
     Ok(merged)
+}
+
+fn materialize_global_settings(
+    global: &StoredSettings,
+) -> Result<HashMap<String, SettingValue>, Status> {
+    let mut materialized = HashMap::new();
+    for registered in settings::REGISTERED_SETTINGS {
+        materialized.insert(registered.key.to_string(), SettingValue { value: None });
+    }
+
+    for (key, value) in &global.settings {
+        if key == POLICY_SETTING_KEY {
+            continue;
+        }
+        materialized.insert(key.clone(), stored_setting_to_proto(value)?);
+    }
+
+    Ok(materialized)
 }
 
 /// Check if a log line's source matches the filter list.
@@ -5107,10 +5147,7 @@ mod tests {
                     "log_level".to_string(),
                     super::StoredSettingValue::String("warn".to_string()),
                 ),
-                (
-                    "region".to_string(),
-                    super::StoredSettingValue::String("us-west".to_string()),
-                ),
+                ("dummy_int".to_string(), super::StoredSettingValue::Int(7)),
             ]
             .into_iter()
             .collect(),
@@ -5123,7 +5160,7 @@ mod tests {
                     super::StoredSettingValue::String("debug".to_string()),
                 ),
                 (
-                    "feature_x".to_string(),
+                    "dummy_bool".to_string(),
                     super::StoredSettingValue::Bool(true),
                 ),
             ]
@@ -5144,11 +5181,55 @@ mod tests {
             ))
         );
 
-        let feature_x = merged.get("feature_x").expect("feature_x present");
+        let dummy_bool = merged.get("dummy_bool").expect("dummy_bool present");
         assert_eq!(
-            feature_x.scope,
+            dummy_bool.scope,
             openshell_core::proto::SettingScope::Sandbox as i32
         );
+
+        let dummy_int = merged.get("dummy_int").expect("dummy_int present");
+        assert_eq!(
+            dummy_int.scope,
+            openshell_core::proto::SettingScope::Global as i32
+        );
+    }
+
+    #[test]
+    fn merge_effective_settings_includes_unset_registered_keys() {
+        let global = super::StoredSettings::default();
+        let sandbox = super::StoredSettings::default();
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+            let setting = merged
+                .get(registered.key)
+                .unwrap_or_else(|| panic!("missing registered key {}", registered.key));
+            assert!(
+                setting.value.is_none(),
+                "expected unset value for {}",
+                registered.key
+            );
+            assert_eq!(
+                setting.scope,
+                openshell_core::proto::SettingScope::Unspecified as i32
+            );
+        }
+    }
+
+    #[test]
+    fn materialize_global_settings_includes_unset_registered_keys() {
+        let global = super::StoredSettings::default();
+        let materialized = super::materialize_global_settings(&global).unwrap();
+        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+            let setting = materialized
+                .get(registered.key)
+                .unwrap_or_else(|| panic!("missing registered key {}", registered.key));
+            assert!(
+                setting.value.is_none(),
+                "expected unset value for {}",
+                registered.key
+            );
+        }
     }
 
     #[test]

@@ -56,6 +56,10 @@ service OpenShell {
   rpc GetSandboxSettings(openshell.sandbox.v1.GetSandboxSettingsRequest)
       returns (openshell.sandbox.v1.GetSandboxSettingsResponse);
 
+  // Get gateway-global settings.
+  rpc GetGatewaySettings(openshell.sandbox.v1.GetGatewaySettingsRequest)
+      returns (openshell.sandbox.v1.GetGatewaySettingsResponse);
+
   // Update sandbox policy on a live sandbox.
   rpc UpdateSandboxPolicy(UpdateSandboxPolicyRequest)
       returns (UpdateSandboxPolicyResponse);
