@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to test (e.g. devel, v1.2.3)"
+        description: "Release tag to test (e.g. dev, v1.2.3)"
         required: true
         type: string
   workflow_run:
@@ -115,7 +115,7 @@ jobs:
           else
             WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
             if [ "$WORKFLOW_NAME" = "Release Dev" ]; then
-              echo "tag=devel" >> "$GITHUB_OUTPUT"
+              echo "tag=dev" >> "$GITHUB_OUTPUT"
             elif [ "$WORKFLOW_NAME" = "Release Tag" ]; then
               TAG="${{ github.event.workflow_run.head_branch }}"
               if [ -z "$TAG" ]; then
