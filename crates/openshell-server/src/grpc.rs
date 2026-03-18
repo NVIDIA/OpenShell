@@ -3300,6 +3300,10 @@ async fn delete_provider_record(
     for record in sandbox_records {
         let sandbox = Sandbox::decode(record.payload.as_slice())
             .map_err(|e| Status::internal(format!("decode sandbox failed: {e}")))?;
+        // Skip sandboxes that are already being deleted.
+        if sandbox.phase == SandboxPhase::Deleting as i32 {
+            continue;
+        }
         if let Some(spec) = &sandbox.spec {
             if spec.providers.iter().any(|p| p == name) {
                 referencing_sandboxes.push(sandbox.name.clone());
@@ -3380,7 +3384,8 @@ mod tests {
     };
     use crate::persistence::Store;
     use openshell_core::proto::{
-        ClusterInferenceConfig, InferenceRoute, Provider, Sandbox, SandboxSpec, SandboxTemplate,
+        ClusterInferenceConfig, InferenceRoute, Provider, Sandbox, SandboxPhase, SandboxSpec,
+        SandboxTemplate,
     };
     use std::collections::HashMap;
     use tonic::Code;
@@ -4768,6 +4773,37 @@ mod tests {
         store.put_message(&sandbox).await.unwrap();
 
         // Deleting the unreferenced provider should succeed.
+        let deleted = delete_provider_record(&store, &provider.name)
+            .await
+            .unwrap();
+        assert!(deleted);
+    }
+
+    #[tokio::test]
+    async fn delete_provider_ignores_deleting_sandboxes() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let provider =
+            create_provider_record(&store, provider_with_values("my-provider", "nvidia"))
+                .await
+                .unwrap();
+
+        // Create a sandbox that references the provider but is already being deleted.
+        let sandbox = Sandbox {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: "dying-sandbox".to_string(),
+            phase: SandboxPhase::Deleting as i32,
+            spec: Some(SandboxSpec {
+                providers: vec!["my-provider".to_string()],
+                ..SandboxSpec::default()
+            }),
+            ..Sandbox::default()
+        };
+        store.put_message(&sandbox).await.unwrap();
+
+        // Deleting sandboxes should not block provider deletion.
         let deleted = delete_provider_record(&store, &provider.name)
             .await
             .unwrap();
