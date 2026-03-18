@@ -1,6 +1,6 @@
 ---
 name: build-from-issue
-description: Given a GitHub issue number, plan and implement the work described in the issue. Operates iteratively - creates an implementation plan, responds to feedback, and only builds when 'agent-ready' label is applied. Includes tests, documentation updates, and PR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
+description: Given a GitHub issue number, plan and implement the work described in the issue. Operates iteratively - creates an implementation plan, responds to feedback, and only builds when the 'state:agent-ready' label is applied. Includes tests, documentation updates, and PR creation. Trigger keywords - build from issue, implement issue, work on issue, build issue, start issue.
 ---
 
 # Build From Issue
@@ -14,11 +14,11 @@ This skill operates as a stateful workflow — it can be run repeatedly against 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
 
-## Critical: `agent-ready` Label Is Human-Only
+## Critical: `state:agent-ready` Label Is Human-Only
 
-The `agent-ready` label is a **human gate**. It signals that a human has reviewed the plan and authorized the agent to build. Under **no circumstances** should this skill or any agent:
+The `state:agent-ready` label is a **human gate**. It signals that a human has reviewed the plan and authorized the agent to build. Under **no circumstances** should this skill or any agent:
 
-- Apply the `agent-ready` label
+- Apply the `state:agent-ready` label
 - Ask the user to let the agent apply it
 - Suggest automating its application
 - Bypass the check by proceeding without it
@@ -57,7 +57,7 @@ Fetch issue + comments
   ├─ No plan comment (🏗️ build-plan) found?
   │   → Generate plan via principal-engineer-reviewer
   │   → Post plan comment
-  │   → Add 'review-ready' label
+  │   → Add 'state:review-ready' label
   │   → STOP
   │
   ├─ Plan exists + new human comments since last agent response?
@@ -65,20 +65,20 @@ Fetch issue + comments
   │   → Update the plan comment if feedback requires plan changes
   │   → STOP
   │
-  ├─ Plan exists + 'agent-ready' label + no 'in-progress' or 'pr-opened' label?
+  ├─ Plan exists + 'state:agent-ready' label + no 'state:in-progress' or 'state:pr-opened' label?
   │   → Run scope check (warn if high complexity)
   │   → Check for conflicting branches/PRs
   │   → BUILD (Steps 6–14)
   │
-  ├─ 'in-progress' label present?
+  ├─ 'state:in-progress' label present?
   │   → Detect existing branch and resume if possible
   │   → Otherwise report current state
   │
-  ├─ 'pr-opened' label present?
+  ├─ 'state:pr-opened' label present?
   │   → Report that PR already exists, link to it
   │   → STOP
   │
-  └─ Plan exists + no new comments + no 'agent-ready'?
+  └─ Plan exists + no new comments + no 'state:agent-ready'?
       → Report: "Plan is posted and awaiting review. No new comments to address."
       → STOP
 ```
@@ -93,7 +93,7 @@ gh issue view <id> --json number,title,body,state,labels,author
 
 If the issue is closed, report that and stop.
 
-If the issue has the `needs-agent-triage` label, report that the issue has not been triaged yet. Suggest using the `triage-issue` skill first to assess and classify the issue before planning implementation. Stop.
+If the issue has the `state:triage-needed` label, report that the issue has not been triaged yet. Suggest using the `triage-issue` skill first to assess and classify the issue before planning implementation. Stop.
 
 ## Step 2: Fetch and Classify Comments
 
@@ -117,7 +117,7 @@ Using the state machine above, determine what to do based on:
 
 1. Whether a plan comment exists
 2. Whether there are human comments newer than the last agent comment (plan or conversation)
-3. Which labels are present (`review-ready`, `agent-ready`, `in-progress`, `pr-opened`)
+3. Which labels are present (`state:review-ready`, `state:agent-ready`, `state:in-progress`, `state:pr-opened`)
 
 Follow the appropriate branch below.
 
@@ -193,10 +193,10 @@ EOF
 )"
 ```
 
-### A3: Add the `review-ready` Label
+### A3: Add the `state:review-ready` Label
 
 ```bash
-gh issue edit <id> --add-label "review-ready"
+gh issue edit <id> --add-label "state:review-ready"
 ```
 
 Report to the user that the plan has been posted and is awaiting review. Stop.
@@ -267,7 +267,7 @@ Report to the user what feedback was addressed and whether the plan was updated.
 
 ## Branch C: Build
 
-If the plan exists and the `agent-ready` label is present (and neither `in-progress` nor `pr-opened` is set), proceed with implementation.
+If the plan exists and the `state:agent-ready` label is present (and neither `state:in-progress` nor `state:pr-opened` is set), proceed with implementation.
 
 ### Step 4: Scope Check
 
@@ -277,7 +277,7 @@ Read the plan comment and check the **Complexity** and **Confidence** fields.
 
   > "This issue is rated High complexity / Low confidence. The plan includes open questions that may need human decisions during implementation. Proceeding, but flagging this for your awareness."
 
-  Continue — do not hard-stop. The human chose to apply `agent-ready`.
+  Continue — do not hard-stop. The human chose to apply `state:agent-ready`.
 
 ### Step 5: Conflict Detection
 
@@ -322,10 +322,10 @@ git pull origin main
 git checkout -b <prefix><issue-id>-<short-description>/$USERNAME
 ```
 
-### Step 7: Add `in-progress` Label
+### Step 7: Add `state:in-progress` Label
 
 ```bash
-gh issue edit <id> --add-label "in-progress"
+gh issue edit <id> --add-label "state:in-progress"
 ```
 
 ### Step 8: Implement the Changes
@@ -599,10 +599,10 @@ Include **every test** that ran (not just the new ones) so the reviewer can see 
 
 #### Update labels
 
-Remove `in-progress` and `review-ready`, add `pr-opened`:
+Remove `state:in-progress` and `state:review-ready`, add `state:pr-opened`:
 
 ```bash
-gh issue edit <id> --remove-label "in-progress" --remove-label "review-ready" --add-label "pr-opened"
+gh issue edit <id> --remove-label "state:in-progress" --remove-label "state:review-ready" --add-label "state:pr-opened"
 ```
 
 #### Report workflow run URL
@@ -620,7 +620,7 @@ Report the workflow run URL and suggest the user can use the `watch-github-actio
 
 ## Branch D: Resume In-Progress Build
 
-If the `in-progress` label is present, the skill was previously started but may not have completed.
+If the `state:in-progress` label is present, the skill was previously started but may not have completed.
 
 1. Check for an existing branch matching the issue ID:
    ```bash
@@ -628,7 +628,7 @@ If the `in-progress` label is present, the skill was previously started but may 
    ```
 2. If found, check it out and inspect the state (are there uncommitted changes? committed but not pushed? pushed but no PR?).
 3. Resume from the appropriate step (9, 10, 12, or 13).
-4. If the state is unrecoverable, report to the user and suggest starting fresh (remove `in-progress` label and re-run).
+4. If the state is unrecoverable, report to the user and suggest starting fresh (remove `state:in-progress` label and re-run).
 
 ---
 
@@ -660,7 +660,7 @@ User says: "Build from issue #42"
 3. Pass issue to `principal-engineer-reviewer` for analysis
 4. Reviewer produces a plan: feat type, Medium complexity, 3 implementation steps, unit + integration tests needed
 5. Post the plan comment with the `🏗️ build-plan` marker
-6. Add `review-ready` label
+6. Add `state:review-ready` label
 7. Report to user: "Plan posted on issue #42. Awaiting review."
 
 ### Second run — human left feedback
@@ -683,15 +683,15 @@ User says: "Check issue #42"
 4. Edit the plan comment to include search endpoint pagination — Revision 2
 5. Report to user: "Updated plan to include search pagination (Revision 2)."
 
-### Fourth run — agent-ready applied
+### Fourth run — state:agent-ready applied
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — labels include `agent-ready`
+1. Fetch issue #42 — labels include `state:agent-ready`
 2. Plan exists (Revision 2), complexity: Medium, confidence: High
 3. No conflicting branches or PRs
 4. Create branch `feat/42-add-pagination/jmyers`
-5. Add `in-progress` label
+5. Add `state:in-progress` label
 6. Implement pagination for both endpoints per the plan
 7. Add unit tests for pagination logic, integration tests for both endpoints
 8. `mise run pre-commit` passes on first attempt
@@ -699,14 +699,14 @@ User says: "Build issue #42"
 10. `arch-doc-writer` updates `architecture/gateway.md` with pagination details
 10. Commit, push, create PR with `Closes #42`
 11. Post summary comment on issue with PR link
-12. Update labels: remove `in-progress` + `review-ready`, add `pr-opened`
+12. Update labels: remove `state:in-progress` + `state:review-ready`, add `state:pr-opened`
 13. Report PR URL and workflow run status to user
 
 ### Run on issue with existing PR
 
 User says: "Build issue #42"
 
-1. Fetch issue #42 — `pr-opened` label present
+1. Fetch issue #42 — `state:pr-opened` label present
 2. Find existing PR #789 linked to the issue
 3. Report: "PR [#789](...) already exists for issue #42. Nothing to build."
 
@@ -714,7 +714,7 @@ User says: "Build issue #42"
 
 User says: "Build issue #99"
 
-1. Fetch issue #99 — `agent-ready` label present
+1. Fetch issue #99 — `state:agent-ready` label present
 2. Plan exists: complexity High, confidence Low, has open questions
 3. Warn user: "Issue #99 is rated High complexity / Low confidence. Proceeding but flagging for your awareness."
 4. Continue with build

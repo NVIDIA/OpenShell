@@ -115,10 +115,10 @@ gh label list --limit 100
 
 Based on the investigation results, select appropriate labels:
 
-- **Always include the issue type** as a label (e.g., `feat`, `fix`, `refactor`, `chore`, `perf`, `docs`)
-- **Include component labels** if they exist in the repo (e.g., `sandbox`, `proxy`, `policy`, `cli`)
+- **Do not add issue type labels** — GitHub built-in issue types are managed manually
+- **Include area labels** if they exist in the repo (e.g., `area:sandbox`, `area:proxy`, `area:policy`, `area:cli`)
 - **Do not invent labels** — only use labels that already exist in the repo
-- **Add `review-ready`** — the issue is ready for human review upon creation
+- **Add `state:review-ready`** — the issue is ready for human review upon creation
 
 ## Step 4: Create the GitHub Issue
 
@@ -127,7 +127,7 @@ Create the issue with a structured body containing both the stakeholder-readable
 ```bash
 gh issue create \
   --title "<type>: <concise description of the problem/feature>" \
-  --label "<type>" --label "<component>" --label "review-ready" \
+  --label "<area:component>" --label "state:review-ready" \
   --body "$(cat <<'EOF'
 ## Problem Statement
 
@@ -259,7 +259,7 @@ User says: "Allow sandbox egress to private IP space via networking policy"
    - Reads `architecture/security-policy.md` and `architecture/sandbox.md`
    - Identifies exact insertion points: policy field addition, SSRF check bypass path, OPA rule extension
    - Assesses: Medium complexity, High confidence, ~6 files
-3. Fetch labels — select `feat`, `sandbox`, `proxy`, `policy`, `review-ready`
+3. Fetch labels — select `area:sandbox`, `area:proxy`, `area:policy`, `state:review-ready`
 4. Create issue: `feat: allow sandbox egress to private IP space via networking policy` — body includes both the summary and full investigation (code references, architecture context, alternative approaches)
 5. Report: "Created issue #59. The investigation found that private IP blocking is enforced at the SSRF check layer in the proxy. The proposed approach adds a policy-level override. Review the issue and use `build-from-issue` when ready."
 
@@ -275,7 +275,7 @@ User says: "The proxy retry logic seems too aggressive — I'm seeing cascading 
    - Maps the failure propagation path
    - Identifies that retries happen without backoff jitter, causing thundering herd
    - Assesses: Low complexity, High confidence, ~2 files
-3. Fetch labels — select `fix`, `proxy`, `review-ready`
+3. Fetch labels — select `area:proxy`, `state:review-ready`
 4. Create issue: `fix: proxy retry logic causes cascading failures under load` — body includes both the summary and full investigation (retry code references, current behavior trace, comparison to standard backoff patterns)
 5. Report: "Created issue #74. The proxy retries without jitter or circuit breaking, which amplifies failures under load. Straightforward fix. Review and use `build-from-issue` when ready."
 
@@ -291,6 +291,6 @@ User says: "Policy evaluation is getting slow — can we cache compiled OPA poli
    - Reads the policy reload/hot-swap mechanism
    - Identifies that policies are recompiled on every evaluation
    - Assesses: Medium complexity, Medium confidence (cache invalidation is a design decision), ~4 files
-3. Fetch labels — select `perf`, `policy`, `review-ready`
+3. Fetch labels — select `area:policy`, `state:review-ready`
 4. Create issue: `perf: cache compiled OPA policies to reduce evaluation latency` — body includes both the summary and full investigation (compilation hot path, per-request overhead, cache invalidation strategies with trade-offs)
 5. Report: "Created issue #81. Policies are recompiled per-request with no caching. The main design decision is the cache invalidation strategy — flagged as an open question. Review and use `build-from-issue` when ready."

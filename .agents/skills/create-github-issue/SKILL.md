@@ -17,12 +17,11 @@ This project uses YAML form issue templates. When creating issues, match the tem
 
 ### Bug Reports
 
-Use the `bug` label. The body must include an **Agent Diagnostic** section — this is required by the template and enforced by project convention.
+Do not add a type label automatically. The body must include an **Agent Diagnostic** section — this is required by the template and enforced by project convention. Apply area or topic labels only when they are clearly known.
 
 ```bash
 gh issue create \
   --title "bug: <concise description>" \
-  --label "bug" \
   --body "$(cat <<'EOF'
 ## Agent Diagnostic
 
@@ -57,12 +56,11 @@ EOF
 
 ### Feature Requests
 
-Use the `feat` label. The body must include a **Proposed Design** — not a "please build this" request.
+Do not add a type label automatically. The body must include a **Proposed Design** — not a "please build this" request. Apply area or topic labels only when they are clearly known.
 
 ```bash
 gh issue create \
   --title "feat: <concise description>" \
-  --label "feat" \
   --body "$(cat <<'EOF'
 ## Problem Statement
 
@@ -106,6 +104,8 @@ gh issue create \
 EOF
 )"
 ```
+
+GitHub built-in issue types (`Bug`, `Feature`, `Task`) are managed manually. Do not try to automate them through labels.
 
 ## Useful Options
 

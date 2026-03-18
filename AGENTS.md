@@ -19,9 +19,9 @@ These pipelines connect skills into end-to-end workflows. Individual skill files
 - **Community inflow:** `triage-issue` → `create-spike` → `build-from-issue`
   - Triage assesses and classifies community-filed issues. Spike investigates unknowns. Build implements.
 - **Internal development:** `create-spike` → `build-from-issue`
-  - Spike explores feasibility, then build executes once `agent-ready` is applied by a human.
+  - Spike explores feasibility, then build executes once `state:agent-ready` is applied by a human.
 - **Security:** `review-security-issue` → `fix-security-issue`
-  - Review produces a severity assessment and remediation plan. Fix implements it. Both require the `security` label; fix also requires `agent-ready`.
+  - Review produces a severity assessment and remediation plan. Fix implements it. Both require the `topic:security` label; fix also requires `state:agent-ready`.
 - **Policy iteration:** `openshell-cli` → `generate-sandbox-policy`
   - CLI manages the sandbox lifecycle; policy generation authors the YAML constraints.
 

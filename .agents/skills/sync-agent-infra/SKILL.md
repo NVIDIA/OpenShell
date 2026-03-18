@@ -18,7 +18,7 @@ Detect and fix drift across the agent-first infrastructure files. These files re
 | `.github/workflows/issue-triage.yml` | Comment text referencing skills |
 | `.agents/skills/triage-issue/SKILL.md` | Skill name references in gate check and diagnosis steps |
 | `.agents/skills/openshell-cli/SKILL.md` | Companion skills table |
-| `.agents/skills/build-from-issue/SKILL.md` | `needs-agent-triage` label awareness |
+| `.agents/skills/build-from-issue/SKILL.md` | `state:triage-needed` label awareness |
 
 ## When to Run
 
@@ -60,7 +60,7 @@ The canonical workflow chains are defined in `AGENTS.md` under "## Workflow Chai
 
 ### Labels
 
-The canonical label set is used by skills and templates. The key labels are: `agent-ready`, `review-ready`, `in-progress`, `pr-opened`, `security`, `bug`, `feat`, `needs-agent-triage`, `good-first-issue`, `spike`.
+The canonical label set is used by skills and templates. The key labels are: `state:agent-ready`, `state:review-ready`, `state:in-progress`, `state:pr-opened`, `state:triage-needed`, `topic:security`, `good first issue`, `spike`, and the relevant `area:*`, `topic:*`, `integration:*`, and `test:*` labels.
 
 ## Step 2: Check Each File for Drift
 

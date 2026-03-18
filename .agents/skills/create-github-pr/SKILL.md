@@ -141,7 +141,7 @@ gh pr create --draft --title "WIP: New feature" --assignee "@me"
 ### With Labels
 
 ```bash
-gh pr create --title "Title" --label "component::evaluator" --label "bug"
+gh pr create --title "Title" --label "area:cli" --label "topic:security"
 ```
 
 ### Target a Different Branch

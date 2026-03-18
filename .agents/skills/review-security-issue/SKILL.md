@@ -40,7 +40,7 @@ gh issue view <id> --json title,body,state,labels,author
 
 First, check the issue's labels from the metadata fetched in Step 1.
 
-- **If the issue has the `agent-ready` label**, the issue has already been reviewed and is ready for implementation. There is no review to perform. Report to the user that this issue is already reviewed and marked as agent-ready, and suggest using the `fix-security-issue` skill instead. Stop.
+- **If the issue has the `state:agent-ready` label**, the issue has already been reviewed and is ready for implementation. There is no review to perform. Report to the user that this issue is already reviewed and marked as `state:agent-ready`, and suggest using the `fix-security-issue` skill instead. Stop.
 
 Next, fetch existing comments on the issue:
 
@@ -133,12 +133,12 @@ EOF
 )"
 ```
 
-## Step 5: Add `review-ready` Label
+## Step 5: Add `state:review-ready` Label
 
-After posting the review comment (whether legitimate or not actionable), add the `review-ready` label to the issue:
+After posting the review comment (whether legitimate or not actionable), add the `state:review-ready` label to the issue:
 
 ```bash
-gh issue edit <id> --add-label "review-ready"
+gh issue edit <id> --add-label "state:review-ready"
 ```
 
 This signals to humans and downstream skills (e.g., `fix-security-issue`) that the review is complete.
@@ -163,7 +163,7 @@ For each unanswered human comment:
 | `gh issue view <id> --json title,body,state,labels,author` | Fetch full issue metadata as JSON |
 | `gh issue view <id> --json comments --jq '.comments[].body'` | Fetch all comments on an issue |
 | `gh issue comment <id> --body "..."` | Post a comment on an issue |
-| `gh issue edit <id> --add-label "review-ready"` | Add a label to an issue |
+| `gh issue edit <id> --add-label "state:review-ready"` | Add a label to an issue |
 
 ## Example Usage
 
@@ -176,7 +176,7 @@ User says: "Review security issue #42"
 3. No prior review found -- pass issue to `principal-engineer-reviewer` with security lens
 4. Reviewer determines it's a legitimate XSS vulnerability in the API response handler
 5. Post a comment with severity assessment and remediation plan
-6. Add the `review-ready` label to the issue
+6. Add the `state:review-ready` label to the issue
 7. Report the finding and posted comment to the user
 
 ### Re-review with new comments

@@ -1,6 +1,6 @@
 ---
 name: fix-security-issue
-description: Implement a fix for a reviewed security issue. Takes an issue number or scans for issues labeled "security" and "agent-ready". Reads the security review from the issue comments and implements the remediation plan. Trigger keywords - fix security issue, remediate security, implement security fix, patch vulnerability.
+description: Implement a fix for a reviewed security issue. Takes an issue number or scans for issues labeled "topic:security" and "state:agent-ready". Reads the security review from the issue comments and implements the remediation plan. Trigger keywords - fix security issue, remediate security, implement security fix, patch vulnerability.
 ---
 
 # Fix Security Issue
@@ -11,7 +11,7 @@ Implement a code fix for a security issue that has already been reviewed by the 
 
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
-- The issue **must** have both the `security` and `agent-ready` labels. If either is missing, do not proceed.
+- The issue **must** have both the `topic:security` and `state:agent-ready` labels. If either is missing, do not proceed.
 - The issue must have a prior security review comment (posted by `review-security-issue`) with a **Legitimate concern** determination and a remediation plan
 
 ## Agent Comment Marker
@@ -34,10 +34,10 @@ Strip any leading `#` and proceed to Step 2 with that issue ID.
 
 ### If no issue number is provided
 
-Scan for open issues labeled `security` and `agent-ready`:
+Scan for open issues labeled `topic:security` and `state:agent-ready`:
 
 ```bash
-gh issue list --label "security" --label "agent-ready" --state open --json number,title,labels,updatedAt
+gh issue list --label "topic:security" --label "state:agent-ready" --state open --json number,title,labels,updatedAt
 ```
 
 - **If no issues are found**, report to the user that there are no security issues ready for fixing and stop.
@@ -52,18 +52,18 @@ Fetch the issue details:
 gh issue view <id> --json number,title,body,state,labels,author
 ```
 
-### Require both `security` and `agent-ready` labels
+### Require both `topic:security` and `state:agent-ready` labels
 
 **This is a hard gate.** Check the issue's `labels` array from the response above. Both of the following labels **must** be present:
 
-- `security`
-- `agent-ready`
+- `topic:security`
+- `state:agent-ready`
 
 If **either label is missing**, do **not** proceed. Report to the user which label(s) are missing and stop. For example:
 
-- Missing `agent-ready`: "Issue #42 has the `security` label but is not marked `agent-ready`. It may still need review or human triage before a fix can be implemented."
-- Missing `security`: "Issue #42 is marked `agent-ready` but does not have the `security` label. This skill only handles security issues."
-- Missing both: "Issue #42 is missing both the `security` and `agent-ready` labels. Cannot proceed."
+- Missing `state:agent-ready`: "Issue #42 has the `topic:security` label but is not marked `state:agent-ready`. It may still need review or human triage before a fix can be implemented."
+- Missing `topic:security`: "Issue #42 is marked `state:agent-ready` but does not have the `topic:security` label. This skill only handles security issues."
+- Missing both: "Issue #42 is missing both the `topic:security` and `state:agent-ready` labels. Cannot proceed."
 
 **Do not offer to add the labels or bypass this check.** The labels are a deliberate human-controlled gate.
 
@@ -208,7 +208,7 @@ Create a PR that closes the security issue. Put the full fix summary in the PR d
 gh pr create \
   --title "fix(security): <short description>" \
   --assignee "@me" \
-  --label "security" \
+  --label "topic:security" \
   --body "$(cat <<'EOF'
 > **🔧 security-fix-agent**
 
@@ -262,7 +262,7 @@ Summarize what was done:
 
 | Command | Description |
 | --- | --- |
-| `gh issue list --label "security" --label "agent-ready" --state open` | Find open security issues ready for fixing |
+| `gh issue list --label "topic:security" --label "state:agent-ready" --state open` | Find open security issues ready for fixing |
 | `gh issue view <id> --json number,title,body,state,labels,author` | Fetch full issue metadata |
 | `gh issue view <id> --json comments` | Fetch all comments on an issue |
 | `gh pr create --title "..." --body "..."` | Create a pull request |
@@ -290,7 +290,7 @@ User says: "Fix security issue #42"
 
 User says: "Fix any ready security issues"
 
-1. Query for open issues with labels `security` + `agent-ready`
+1. Query for open issues with labels `topic:security` + `state:agent-ready`
 2. Find issue #78: "SQL injection in search endpoint"
 3. Fetch the review comment -- determination is "Legitimate concern"
 4. Implement parameterized queries
@@ -307,20 +307,20 @@ User says: "Fix security issue #99"
 3. Report to the user: "Issue #99 was reviewed and determined to be not actionable. No fix is needed."
 4. Stop
 
-### Issue missing `agent-ready` label
+### Issue missing `state:agent-ready` label
 
 User says: "Fix security issue #55"
 
 1. Fetch issue #55 metadata
-2. Labels are `["security"]` -- missing `agent-ready`
-3. Report to the user: "Issue #55 has the `security` label but is not marked `agent-ready`. It may still need review or human triage before a fix can be implemented."
+2. Labels are `["topic:security"]` -- missing `state:agent-ready`
+3. Report to the user: "Issue #55 has the `topic:security` label but is not marked `state:agent-ready`. It may still need review or human triage before a fix can be implemented."
 4. Stop
 
 ### Issue without a review
 
 User says: "Fix security issue #60"
 
-1. Fetch issue #60 metadata -- labels include both `security` and `agent-ready`
+1. Fetch issue #60 metadata -- labels include both `topic:security` and `state:agent-ready`
 2. Fetch comments -- no `security-review-agent` comment found
 3. Report to the user: "Issue #60 has not been reviewed yet. Run the review-security-issue skill first."
 4. Stop

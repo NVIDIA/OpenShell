@@ -37,12 +37,12 @@ jobs:
 
             console.log('Agent diagnostic section missing or placeholder. Flagging.');
 
-            // Add needs-agent-triage label
+            // Add state:triage-needed label
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              labels: ['needs-agent-triage']
+              labels: ['state:triage-needed']
             });
 
             // Post redirect comment

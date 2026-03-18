@@ -1,6 +1,6 @@
 ---
 name: triage-issue
-description: Assess, classify, and route community-filed issues. Takes a specific issue number or processes all open issues with the needs-agent-triage label in batch. Validates agent-first gate compliance, attempts diagnosis using relevant skills, and classifies issues for routing into the spike-build pipeline. Trigger keywords - triage issue, triage, assess issue, review incoming issue, triage issues.
+description: Assess, classify, and route community-filed issues. Takes a specific issue number or processes all open issues with the state:triage-needed label in batch. Validates agent-first gate compliance, attempts diagnosis using relevant skills, and classifies issues for routing into the spike-build pipeline. Trigger keywords - triage issue, triage, assess issue, review incoming issue, triage issues.
 ---
 
 # Triage Issue
@@ -12,9 +12,9 @@ Assess, classify, and route community-filed issues. This is the front door for c
 - The `gh` CLI must be authenticated (`gh auth status`)
 - You must be in a git repository with a GitHub remote
 
-## Critical: `agent-ready` Label Is Human-Only
+## Critical: `state:agent-ready` Label Is Human-Only
 
-The `agent-ready` label is a **human gate**. Triage **never** applies this label. Triage assesses and classifies — humans decide what gets built. This is a non-negotiable safety control.
+The `state:agent-ready` label is a **human gate**. Triage **never** applies this label. Triage assesses and classifies — humans decide what gets built. This is a non-negotiable safety control.
 
 ## Agent Comment Marker
 
@@ -45,10 +45,10 @@ Assess one specific issue. Proceed to Step 1 with the given issue number.
 triage issues
 ```
 
-Query all open issues with the `needs-agent-triage` label and process them in sequence:
+Query all open issues with the `state:triage-needed` label and process them in sequence:
 
 ```bash
-gh issue list --label "needs-agent-triage" --state open --json number,title --jq '.[].number'
+gh issue list --label "state:triage-needed" --state open --json number,title --jq '.[].number'
 ```
 
 For each issue returned, run the full triage workflow (Steps 1-6). Report a summary at the end listing each issue and its classification.
@@ -81,9 +81,9 @@ Check whether the issue body contains a substantive agent diagnostic section. Lo
 
 **If the diagnostic section is missing or clearly placeholder:**
 
-1. Add the `needs-agent-triage` label if not already present:
+1. Add the `state:triage-needed` label if not already present:
    ```bash
-   gh issue edit <id> --add-label "needs-agent-triage"
+   gh issue edit <id> --add-label "state:triage-needed"
    ```
 2. Post a comment with the triage marker:
    ```
@@ -132,12 +132,12 @@ Based on the investigation, classify the issue into one of these categories:
 
 | Classification | Criteria | Action |
 |---------------|----------|--------|
-| **bug-confirmed** | Agent diagnostic and codebase analysis confirm a real defect | Label `bug`, remove `needs-agent-triage` |
-| **feature-valid** | Design proposal is sound, feasible given the architecture | Label `feat`, remove `needs-agent-triage` |
+| **bug-confirmed** | Agent diagnostic and codebase analysis confirm a real defect | Apply relevant `area:*` or `topic:*` labels as needed, remove `state:triage-needed`, and assign the built-in `Bug` issue type manually if needed |
+| **feature-valid** | Design proposal is sound, feasible given the architecture | Apply relevant `area:*` or `topic:*` labels as needed, remove `state:triage-needed`, and assign the built-in `Feature` issue type manually if needed |
 | **duplicate** | An existing open issue covers this | Link the duplicate, close with comment |
 | **user-error** | The reported behavior is expected, or the issue is a misconfiguration | Comment with explanation and guidance, close |
-| **needs-more-info** | Report is substantive but missing critical reproduction details | Comment requesting specifics, keep `needs-agent-triage` |
-| **needs-investigation** | Report appears valid but requires deeper analysis (spike candidate) | Label `spike`, remove `needs-agent-triage` |
+| **needs-more-info** | Report is substantive but missing critical reproduction details | Comment requesting specifics, keep `state:triage-needed` |
+| **needs-investigation** | Report appears valid but requires deeper analysis (spike candidate) | Label `spike`, remove `state:triage-needed` |
 
 ## Step 6: Post Triage Comment
 
@@ -162,7 +162,7 @@ Post a structured comment with the triage marker:
 
 Apply the appropriate labels as determined in Step 5.
 
-**Do not apply `agent-ready`.** That is always a human decision.
+**Do not apply `state:agent-ready`.** That is always a human decision.
 
 ## Relationship to Other Skills
 
@@ -175,7 +175,7 @@ Community issue filed
         |
   create-spike          (if classification is needs-investigation)
         |
-  build-from-issue      (if human applies agent-ready)
+  build-from-issue      (if human applies state:agent-ready)
 ```
 
 - **triage-issue** decides whether an issue is valid and how to classify it.
