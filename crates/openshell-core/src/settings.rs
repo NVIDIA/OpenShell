@@ -53,10 +53,12 @@ pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
         key: "log_level",
         kind: SettingValueKind::String,
     },
+    #[cfg(feature = "dev-settings")]
     RegisteredSetting {
         key: "dummy_int",
         kind: SettingValueKind::Int,
     },
+    #[cfg(feature = "dev-settings")]
     RegisteredSetting {
         key: "dummy_bool",
         kind: SettingValueKind::Bool,
@@ -98,8 +100,17 @@ mod tests {
 
     #[test]
     fn setting_for_key_returns_registered_entry() {
+        let setting = setting_for_key("log_level").expect("log_level should be registered");
+        assert_eq!(setting.kind, SettingValueKind::String);
+    }
+
+    #[cfg(feature = "dev-settings")]
+    #[test]
+    fn setting_for_key_returns_dev_entries() {
         let setting = setting_for_key("dummy_bool").expect("dummy_bool should be registered");
         assert_eq!(setting.kind, SettingValueKind::Bool);
+        let setting = setting_for_key("dummy_int").expect("dummy_int should be registered");
+        assert_eq!(setting.kind, SettingValueKind::Int);
     }
 
     #[test]

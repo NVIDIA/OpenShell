@@ -638,6 +638,20 @@ impl OpenShell for OpenShellService {
             }
         }
 
+        // Clean up sandbox-scoped settings record.
+        if let Err(e) = self
+            .state
+            .store
+            .delete(SANDBOX_SETTINGS_OBJECT_TYPE, &sandbox_settings_id(&id))
+            .await
+        {
+            warn!(
+                sandbox_id = %id,
+                error = %e,
+                "Failed to delete sandbox settings during cleanup"
+            );
+        }
+
         let deleted = match self.state.sandbox_client.delete(&sandbox.name).await {
             Ok(deleted) => deleted,
             Err(err) => {
@@ -1126,7 +1140,7 @@ impl OpenShell for OpenShellService {
             }
 
             let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
-            let deleted = if req.delete_setting {
+            let changed = if req.delete_setting {
                 global_settings.settings.remove(key).is_some()
             } else {
                 let setting = req
@@ -1137,7 +1151,7 @@ impl OpenShell for OpenShellService {
                 upsert_setting_value(&mut global_settings.settings, key, stored)
             };
 
-            if deleted {
+            if changed {
                 global_settings.revision = global_settings.revision.wrapping_add(1);
                 save_global_settings(self.state.store.as_ref(), &global_settings).await?;
             }
@@ -1146,7 +1160,7 @@ impl OpenShell for OpenShellService {
                 version: 0,
                 policy_hash: String::new(),
                 settings_revision: global_settings.revision,
-                deleted: req.delete_setting && deleted,
+                deleted: req.delete_setting && changed,
             }));
         }
 
@@ -2554,6 +2568,18 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
     hex::encode(hasher.finalize())
 }
 
+/// Compute a fingerprint for the effective sandbox configuration.
+///
+/// Returns the first 8 bytes of a SHA-256 hash over the policy, settings,
+/// and policy source. The sandbox poll loop compares this value to detect
+/// changes -- if it differs from the previously seen revision, the sandbox
+/// reloads.
+///
+/// This is a content hash, not a monotonic counter. With 64 bits of hash
+/// space the birthday-bound collision probability is ~50% at 2^32
+/// configurations. A collision would cause one poll cycle to miss a change,
+/// but the next mutation will almost certainly produce a different hash.
+/// This trade-off is acceptable for the poll-based change detection use case.
 fn compute_config_revision(
     policy: Option<&ProtoSandboxPolicy>,
     settings: &HashMap<String, EffectiveSetting>,

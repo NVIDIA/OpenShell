@@ -1907,13 +1907,25 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
-                let parsed = openshell_core::settings::parse_bool_like(&raw).unwrap_or(false);
-                setting_value::Value::BoolValue(parsed)
+                match openshell_core::settings::parse_bool_like(&raw) {
+                    Some(v) => setting_value::Value::BoolValue(v),
+                    None => {
+                        let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                            "invalid bool value: {raw}"
+                        ))));
+                        return;
+                    }
+                }
             }
-            openshell_core::settings::SettingValueKind::Int => {
-                let parsed = raw.parse::<i64>().unwrap_or(0);
-                setting_value::Value::IntValue(parsed)
-            }
+            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
+                Ok(v) => setting_value::Value::IntValue(v),
+                Err(_) => {
+                    let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                        "invalid int value: {raw}"
+                    ))));
+                    return;
+                }
+            },
             openshell_core::settings::SettingValueKind::String => {
                 setting_value::Value::StringValue(raw)
             }
@@ -1999,13 +2011,25 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
-                let parsed = openshell_core::settings::parse_bool_like(&raw).unwrap_or(false);
-                setting_value::Value::BoolValue(parsed)
+                match openshell_core::settings::parse_bool_like(&raw) {
+                    Some(v) => setting_value::Value::BoolValue(v),
+                    None => {
+                        let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                            "invalid bool value: {raw}"
+                        ))));
+                        return;
+                    }
+                }
             }
-            openshell_core::settings::SettingValueKind::Int => {
-                let parsed = raw.parse::<i64>().unwrap_or(0);
-                setting_value::Value::IntValue(parsed)
-            }
+            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
+                Ok(v) => setting_value::Value::IntValue(v),
+                Err(_) => {
+                    let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                        "invalid int value: {raw}"
+                    ))));
+                    return;
+                }
+            },
             openshell_core::settings::SettingValueKind::String => {
                 setting_value::Value::StringValue(raw)
             }
