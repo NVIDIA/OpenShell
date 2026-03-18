@@ -105,7 +105,7 @@ EOF
 )"
 ```
 
-GitHub built-in issue types (`Bug`, `Feature`, `Task`) are managed manually. Do not try to automate them through labels.
+GitHub built-in issue types (`Bug`, `Feature`, `Task`) should come from the matching issue template when possible, or be set manually afterward. Do not try to emulate them through labels.
 
 ## Useful Options
 

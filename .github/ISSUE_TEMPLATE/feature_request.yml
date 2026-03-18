@@ -1,6 +1,6 @@
 name: Feature Request
 description: Propose a feature with a design. Not a "please build this" request.
-title: "feat: "
+type: Feature
 body:
   - type: markdown
     attributes:

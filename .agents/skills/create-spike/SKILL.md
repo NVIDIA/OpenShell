@@ -115,7 +115,7 @@ gh label list --limit 100
 
 Based on the investigation results, select appropriate labels:
 
-- **Do not add issue type labels** — GitHub built-in issue types are managed manually
+- **Do not add issue type labels** — GitHub built-in issue types come from issue templates or manual follow-up, not labels
 - **Include area labels** if they exist in the repo (e.g., `area:sandbox`, `area:proxy`, `area:policy`, `area:cli`)
 - **Do not invent labels** — only use labels that already exist in the repo
 - **Add `state:review-ready`** — the issue is ready for human review upon creation
