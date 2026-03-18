@@ -6,7 +6,7 @@
 set -euo pipefail
 
 usage() {
-  echo "Usage: docker-publish-multiarch.sh --mode <registry|ecr>" >&2
+  echo "Usage: docker-publish-multiarch.sh --mode registry" >&2
   exit 1
 }
 
@@ -42,11 +42,6 @@ fi
 case "${MODE}" in
   registry)
     REGISTRY=${DOCKER_REGISTRY:?Set DOCKER_REGISTRY to push multi-arch images (e.g. ghcr.io/myorg)}
-    ;;
-  ecr)
-    AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID:-012345678901}
-    AWS_REGION=${AWS_REGION:-us-west-2}
-    REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/openshell"
     ;;
   *)
     echo "Unknown mode: ${MODE}" >&2
