@@ -136,6 +136,7 @@ The following provider types are supported.
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to {doc}`/tutorials/github-sandbox` |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
+| `bitdeer-ai` | `BITDEERAI_API_KEY` | Bitdeer AI inference API |
 | `generic` | User-defined | Any service with custom credentials |
 
 :::{tip}

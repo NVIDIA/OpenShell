@@ -81,6 +81,7 @@ impl ProviderRegistry {
         registry.register(providers::generic::GenericProvider);
         registry.register(providers::openai::OpenaiProvider);
         registry.register(providers::anthropic::AnthropicProvider);
+        registry.register(providers::bitdeer_ai::BitdeerAiProvider);
         registry.register(providers::nvidia::NvidiaProvider);
         registry.register(providers::gitlab::GitlabProvider);
         registry.register(providers::github::GithubProvider);
@@ -132,6 +133,7 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
         "generic" => Some("generic"),
         "openai" => Some("openai"),
         "anthropic" => Some("anthropic"),
+        "bitdeer-ai" | "bitdeer" => Some("bitdeer-ai"),
         "nvidia" => Some("nvidia"),
         "gitlab" | "glab" => Some("gitlab"),
         "github" | "gh" => Some("github"),
@@ -164,6 +166,8 @@ mod tests {
         assert_eq!(normalize_provider_type("openai"), Some("openai"));
         assert_eq!(normalize_provider_type("anthropic"), Some("anthropic"));
         assert_eq!(normalize_provider_type("nvidia"), Some("nvidia"));
+        assert_eq!(normalize_provider_type("bitdeer-ai"), Some("bitdeer-ai"));
+        assert_eq!(normalize_provider_type("bitdeer"), Some("bitdeer-ai"));
         assert_eq!(normalize_provider_type("unknown"), None);
     }
 

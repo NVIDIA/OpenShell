@@ -86,6 +86,16 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     default_headers: &[],
 };
 
+static BITDEER_AI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "bitdeer-ai",
+    default_base_url: "https://api-inference.bitdeer.ai/v1",
+    protocols: OPENAI_PROTOCOLS,
+    credential_key_names: &["BITDEERAI_API_KEY"],
+    base_url_config_keys: &["BITDEERAI_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+};
+
 /// Look up the inference provider profile for a given provider type.
 ///
 /// Returns `None` for provider types that don't support inference routing
@@ -95,6 +105,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
+        "bitdeer-ai" => Some(&BITDEER_AI_PROFILE),
         _ => None,
     }
 }
@@ -176,6 +187,7 @@ mod tests {
         assert!(profile_for("openai").is_some());
         assert!(profile_for("anthropic").is_some());
         assert!(profile_for("nvidia").is_some());
+        assert!(profile_for("bitdeer-ai").is_some());
         assert!(profile_for("OpenAI").is_some()); // case insensitive
     }
 
@@ -205,5 +217,15 @@ mod tests {
         let (auth, headers) = auth_for_provider_type("unknown");
         assert_eq!(auth, AuthHeader::Bearer);
         assert!(headers.is_empty());
+    }
+
+    #[test]
+    fn bitdeer_ai_profile_has_correct_defaults() {
+        let profile = profile_for("bitdeer-ai").expect("bitdeer-ai profile should exist");
+        assert_eq!(profile.provider_type, "bitdeer-ai");
+        assert_eq!(profile.default_base_url, "https://api-inference.bitdeer.ai/v1");
+        assert_eq!(profile.credential_key_names, &["BITDEERAI_API_KEY"]);
+        assert_eq!(profile.auth, AuthHeader::Bearer);
+        assert!(profile.default_headers.is_empty());
     }
 }
