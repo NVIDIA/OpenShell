@@ -107,11 +107,13 @@ pub struct DockerPreflight {
 /// - `/var/run/docker.sock` — default for Docker Desktop, `OrbStack`, Colima
 /// - `$HOME/.colima/docker.sock` — Colima (older installs)
 /// - `$HOME/.orbstack/run/docker.sock` — `OrbStack` (if symlink is missing)
+/// - `$HOME/Library/Containers/com.docker.docker/Data/docker-cli.sock` — Docker Desktop on macOS
 const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
     "/var/run/docker.sock",
     // Expanded at runtime via home_dir():
     // ~/.colima/docker.sock
     // ~/.orbstack/run/docker.sock
+    // ~/Library/Containers/com.docker.docker/Data/docker-cli.sock
 ];
 
 /// Check that a Docker-compatible runtime is installed, running, and reachable.
@@ -120,11 +122,18 @@ const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
 /// deploy work begins. On failure it produces a user-friendly error with
 /// actionable recovery steps instead of a raw bollard connection error.
 pub async fn check_docker_available() -> Result<DockerPreflight> {
+    if let Some(preflight) = try_alternative_sockets(None).await {
+        return Ok(preflight);
+    }
+
     // Step 1: Try to connect using bollard's default resolution
     // (respects DOCKER_HOST, then falls back to /var/run/docker.sock).
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(err) => {
+            if let Some(preflight) = try_alternative_sockets(None).await {
+                return Ok(preflight);
+            }
             return Err(docker_not_reachable_error(
                 &format!("{err}"),
                 "Failed to create Docker client",
@@ -134,6 +143,9 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
 
     // Step 2: Ping the daemon to confirm it's responsive.
     if let Err(err) = docker.ping().await {
+        if let Some(preflight) = try_alternative_sockets(Some("/var/run/docker.sock")).await {
+            return Ok(preflight);
+        }
         return Err(docker_not_reachable_error(
             &format!("{err}"),
             "Docker socket exists but the daemon is not responding",
@@ -147,6 +159,30 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
     };
 
     Ok(DockerPreflight { docker, version })
+}
+
+async fn try_alternative_sockets(skip_path: Option<&str>) -> Option<DockerPreflight> {
+    if env_non_empty("DOCKER_HOST").is_some() {
+        return None;
+    }
+
+    for path in find_alternative_sockets() {
+        if skip_path.is_some_and(|skip| skip == path) {
+            continue;
+        }
+
+        let Ok(docker) = Docker::connect_with_socket(&path, 120, API_DEFAULT_VERSION) else {
+            continue;
+        };
+        if docker.ping().await.is_err() {
+            continue;
+        }
+
+        let version = docker.version().await.ok().and_then(|v| v.version);
+        return Some(DockerPreflight { docker, version });
+    }
+
+    None
 }
 
 /// Build a rich, user-friendly error when Docker is not reachable.
@@ -218,10 +254,7 @@ fn find_alternative_sockets() -> Vec<String> {
 
     // Check home-relative paths
     if let Some(home) = home_dir() {
-        let home_sockets = [
-            format!("{home}/.colima/docker.sock"),
-            format!("{home}/.orbstack/run/docker.sock"),
-        ];
+        let home_sockets = home_relative_socket_paths(&home);
         for path in &home_sockets {
             if std::path::Path::new(path).exists() && !found.contains(path) {
                 found.push(path.clone());
@@ -234,6 +267,14 @@ fn find_alternative_sockets() -> Vec<String> {
 
 fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
+}
+
+fn home_relative_socket_paths(home: &str) -> Vec<String> {
+    vec![
+        format!("{home}/.colima/docker.sock"),
+        format!("{home}/.orbstack/run/docker.sock"),
+        format!("{home}/Library/Containers/com.docker.docker/Data/docker-cli.sock"),
+    ]
 }
 
 /// Create an SSH Docker client from remote options.
@@ -1193,6 +1234,19 @@ mod tests {
         assert!(
             sockets.len() <= 10,
             "should return a reasonable number of sockets"
+        );
+    }
+
+    #[test]
+    fn home_relative_socket_paths_include_docker_desktop_socket() {
+        let home = "/tmp/test-home";
+        let sockets = home_relative_socket_paths(home);
+
+        assert!(
+            sockets.contains(&format!(
+                "{home}/Library/Containers/com.docker.docker/Data/docker-cli.sock"
+            )),
+            "should probe Docker Desktop's macOS socket path"
         );
     }
 }
