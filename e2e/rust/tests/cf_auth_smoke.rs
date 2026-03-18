@@ -21,8 +21,9 @@ async fn run_isolated(args: &[&str]) -> (String, i32) {
         .env("XDG_CONFIG_HOME", tmpdir.path())
         .env("HOME", tmpdir.path())
         .env_remove("OPENSHELL_GATEWAY")
-        // `gateway add` may enter the browser auth flow, which prompts on stdin.
-        // Use a closed stdin so auth is skipped instead of hanging the test.
+        // Suppress browser popup during auth flow.
+        .env("OPENSHELL_NO_BROWSER", "1")
+        // Use a closed stdin so auth prompts don't hang the test.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -43,8 +44,9 @@ async fn run_with_config(tmpdir: &std::path::Path, args: &[&str]) -> (String, i3
         .env("XDG_CONFIG_HOME", tmpdir)
         .env("HOME", tmpdir)
         .env_remove("OPENSHELL_GATEWAY")
-        // `gateway add` may enter the browser auth flow, which prompts on stdin.
-        // Use a closed stdin so auth is skipped instead of hanging the test.
+        // Suppress browser popup during auth flow.
+        .env("OPENSHELL_NO_BROWSER", "1")
+        // Use a closed stdin so auth prompts don't hang the test.
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());

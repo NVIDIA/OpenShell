@@ -108,23 +108,37 @@ pub async fn browser_auth_flow(gateway_endpoint: &str) -> Result<String> {
         gateway_endpoint.to_string(),
     ));
 
+    // Allow suppressing the browser popup via environment variable (useful for
+    // CI, e2e tests, and headless environments).
+    let no_browser = std::env::var("OPENSHELL_NO_BROWSER")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // Prompt the user before opening the browser.
     eprintln!("  Confirmation code: {code}");
     eprintln!("  Verify this code matches your browser before clicking Connect.");
     eprintln!();
-    eprint!("Press Enter to open the browser for authentication...");
-    std::io::stderr().flush().ok();
-    let mut _input = String::new();
-    std::io::stdin().read_line(&mut _input).ok();
 
-    if let Err(e) = open_browser(&auth_url) {
-        debug!(error = %e, "failed to open browser");
-        eprintln!("Could not open browser automatically.");
+    if no_browser {
+        eprintln!("Browser opening suppressed (OPENSHELL_NO_BROWSER is set).");
         eprintln!("Open this URL in your browser:");
         eprintln!("  {auth_url}");
         eprintln!();
     } else {
-        eprintln!("Browser opened.");
+        eprint!("Press Enter to open the browser for authentication...");
+        std::io::stderr().flush().ok();
+        let mut _input = String::new();
+        std::io::stdin().read_line(&mut _input).ok();
+
+        if let Err(e) = open_browser(&auth_url) {
+            debug!(error = %e, "failed to open browser");
+            eprintln!("Could not open browser automatically.");
+            eprintln!("Open this URL in your browser:");
+            eprintln!("  {auth_url}");
+            eprintln!();
+        } else {
+            eprintln!("Browser opened.");
+        }
     }
 
     // Wait for the callback or timeout.
