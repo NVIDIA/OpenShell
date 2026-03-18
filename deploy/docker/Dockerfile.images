@@ -10,6 +10,7 @@
 #   cluster             Final cluster image
 #   gateway-builder     Release openshell-server binary
 #   supervisor-builder  Release openshell-sandbox binary
+#   supervisor-output   Minimal stage exporting only the supervisor binary
 
 ARG K3S_VERSION=v1.35.2-k3s1
 ARG K9S_VERSION=v0.50.18
@@ -24,6 +25,9 @@ ARG TARGETARCH
 ARG BUILDARCH
 ARG CARGO_TARGET_CACHE_SCOPE=default
 ARG SCCACHE_MEMCACHED_ENDPOINT
+# CI sets this to 1 for maximum optimization; local builds leave it unset
+# so cargo uses the Cargo.toml default (parallel codegen for fast linking).
+ARG CARGO_CODEGEN_UNITS
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     cmake g++ make protobuf-compiler curl && rm -rf /var/lib/apt/lists/*
@@ -78,21 +82,34 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
     --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && cargo_cross_build --release -p openshell-server -p openshell-sandbox
 
-FROM rust-deps AS rust-workspace
+# ---------------------------------------------------------------------------
+# Per-target workspace stages
+# ---------------------------------------------------------------------------
+# Copy only the crates needed for each target so that a change to
+# openshell-sandbox does not invalidate the gateway build and vice versa.
+# The skeleton stage already has stub Cargo.toml + src/ for every crate,
+# so cargo workspace resolution continues to work — we just overwrite the
+# crates whose real source is needed for compilation.
+
+FROM rust-deps AS gateway-workspace
 ARG OPENSHELL_CARGO_VERSION
 
-COPY crates/ crates/
+COPY crates/openshell-core/ crates/openshell-core/
+COPY crates/openshell-policy/ crates/openshell-policy/
+COPY crates/openshell-providers/ crates/openshell-providers/
+COPY crates/openshell-router/ crates/openshell-router/
+COPY crates/openshell-server/ crates/openshell-server/
 
 RUN touch \
     crates/openshell-core/build.rs \
-    crates/openshell-sandbox/src/main.rs \
     crates/openshell-server/src/main.rs \
     proto/*.proto && \
     if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
       sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
     fi
 
-FROM rust-workspace AS gateway-builder
+FROM gateway-workspace AS gateway-builder
+ARG CARGO_CODEGEN_UNITS
 
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
@@ -103,7 +120,24 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
     mkdir -p /build/out && \
     cp "$(cross_output_dir release)/openshell-server" /build/out/
 
-FROM rust-workspace AS supervisor-builder
+FROM rust-deps AS supervisor-workspace
+ARG OPENSHELL_CARGO_VERSION
+
+COPY crates/openshell-core/ crates/openshell-core/
+COPY crates/openshell-policy/ crates/openshell-policy/
+COPY crates/openshell-router/ crates/openshell-router/
+COPY crates/openshell-sandbox/ crates/openshell-sandbox/
+
+RUN touch \
+    crates/openshell-core/build.rs \
+    crates/openshell-sandbox/src/main.rs \
+    proto/*.proto && \
+    if [ -n "${OPENSHELL_CARGO_VERSION:-}" ]; then \
+      sed -i -E '/^\[workspace\.package\]/,/^\[/{s/^version[[:space:]]*=[[:space:]]*".*"/version = "'"${OPENSHELL_CARGO_VERSION}"'"/}' Cargo.toml; \
+    fi
+
+FROM supervisor-workspace AS supervisor-builder
+ARG CARGO_CODEGEN_UNITS
 
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
@@ -113,6 +147,11 @@ RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/us
     cargo_cross_build --release -p openshell-sandbox && \
     mkdir -p /build/out && \
     cp "$(cross_output_dir release)/openshell-sandbox" /build/out/
+
+# Minimal extraction stage for fast-deploy: exports only the supervisor
+# binary (~20-40 MB) instead of the entire build environment (~968 MB).
+FROM scratch AS supervisor-output
+COPY --from=supervisor-builder /build/out/openshell-sandbox /openshell-sandbox
 
 # ---------------------------------------------------------------------------
 # Final gateway image

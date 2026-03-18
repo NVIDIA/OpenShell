@@ -315,6 +315,14 @@ if [[ "${build_supervisor}" == "1" ]]; then
   _cluster_image=$(docker inspect --format '{{.Config.Image}}' "${CONTAINER_NAME}" 2>/dev/null)
   CLUSTER_ARCH=$(docker image inspect --format '{{.Architecture}}' "${_cluster_image}" 2>/dev/null || echo "amd64")
 
+  # Detect the host (build) architecture in Docker's naming convention.
+  HOST_ARCH=$(docker info --format '{{.Architecture}}' 2>/dev/null || echo "amd64")
+  # Normalize: Docker reports "aarch64" on ARM hosts but uses "arm64" elsewhere.
+  case "${HOST_ARCH}" in
+    aarch64) HOST_ARCH=arm64 ;;
+    x86_64)  HOST_ARCH=amd64 ;;
+  esac
+
   # Build the supervisor binary from the shared image build graph, then
   # extract it via --output so fast deploys reuse the same Rust cache.
   SUPERVISOR_BUILD_DIR=$(mktemp -d)
@@ -326,14 +334,24 @@ if [[ "${build_supervisor}" == "1" ]]; then
     _cargo_version=$(uv run python tasks/scripts/release.py get-version --cargo 2>/dev/null || true)
   fi
 
-  DOCKER_PLATFORM="linux/${CLUSTER_ARCH}" \
+  # Only set DOCKER_PLATFORM when actually cross-compiling.  Omitting it
+  # for native builds lets docker-build-image.sh pick the fast "docker"
+  # driver (same as gateway), which shares BuildKit cache mounts (sccache,
+  # cargo registry/target) and avoids docker-container IPC overhead.
+  _platform_env=()
+  if [[ "${CLUSTER_ARCH}" != "${HOST_ARCH}" ]]; then
+    _platform_env=(DOCKER_PLATFORM="linux/${CLUSTER_ARCH}")
+  fi
+
+  env \
+  "${_platform_env[@]+"${_platform_env[@]}"}" \
   DOCKER_OUTPUT="type=local,dest=${SUPERVISOR_BUILD_DIR}" \
   OPENSHELL_CARGO_VERSION="${_cargo_version}" \
-    tasks/scripts/docker-build-image.sh supervisor-builder
+    tasks/scripts/docker-build-image.sh supervisor-output
 
   # Copy the built binary into the running k3s container
   docker exec "${CONTAINER_NAME}" mkdir -p /opt/openshell/bin
-  docker cp "${SUPERVISOR_BUILD_DIR}/build/out/openshell-sandbox" \
+  docker cp "${SUPERVISOR_BUILD_DIR}/openshell-sandbox" \
     "${CONTAINER_NAME}:/opt/openshell/bin/openshell-sandbox"
   docker exec "${CONTAINER_NAME}" chmod 755 /opt/openshell/bin/openshell-sandbox
 

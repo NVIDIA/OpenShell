@@ -6,7 +6,7 @@ resolver = "2"
 members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.0.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
@@ -124,8 +124,6 @@ ref_option = "allow"  # Common pattern for optional references
 missing_fields_in_debug = "allow"  # Manual Debug impls often intentionally omit fields
 
 [profile.release]
-lto = "thin"
-codegen-units = 1
 strip = true
 
 [profile.dev]

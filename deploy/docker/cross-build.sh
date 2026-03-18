@@ -90,6 +90,11 @@ cargo_cross_build() {
   if [ -z "${SCCACHE_MEMCACHED_ENDPOINT:-}" ]; then
     unset SCCACHE_MEMCACHED_ENDPOINT 2>/dev/null || true
   fi
+  # When CARGO_CODEGEN_UNITS is set (e.g. CI=1), override the Cargo.toml
+  # release profile to use that many codegen units.
+  if [ -n "${CARGO_CODEGEN_UNITS:-}" ]; then
+    export CARGO_PROFILE_RELEASE_CODEGEN_UNITS="${CARGO_CODEGEN_UNITS}"
+  fi
   # Default sccache local disk cache to /tmp/sccache (matches BuildKit
   # cache mount target in Dockerfiles) when no dir is explicitly set.
   export SCCACHE_DIR="${SCCACHE_DIR:-/tmp/sccache}"

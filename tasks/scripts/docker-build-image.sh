@@ -38,7 +38,7 @@ detect_rust_scope() {
   echo "no-rust"
 }
 
-TARGET=${1:?"Usage: docker-build-image.sh <gateway|cluster|supervisor-builder> [extra-args...]"}
+TARGET=${1:?"Usage: docker-build-image.sh <gateway|cluster|supervisor-builder|supervisor-output> [extra-args...]"}
 shift
 
 DOCKERFILE="deploy/docker/Dockerfile.images"
@@ -63,6 +63,9 @@ case "${TARGET}" in
     ;;
   supervisor-builder)
     DOCKER_TARGET="supervisor-builder"
+    ;;
+  supervisor-output)
+    DOCKER_TARGET="supervisor-output"
     ;;
   *)
     echo "Error: unsupported target '${TARGET}'" >&2
@@ -122,6 +125,13 @@ if [[ "${TARGET}" == "cluster" && -n "${K3S_VERSION:-}" ]]; then
   K3S_ARGS=(--build-arg "K3S_VERSION=${K3S_VERSION}")
 fi
 
+# CI builds use codegen-units=1 for maximum optimization; local builds omit
+# the arg so cargo uses the Cargo.toml default (parallel codegen, fast links).
+CODEGEN_ARGS=()
+if [[ -n "${CI:-}" ]]; then
+  CODEGEN_ARGS=(--build-arg "CARGO_CODEGEN_UNITS=1")
+fi
+
 TAG_ARGS=()
 if [[ "${IS_FINAL_IMAGE}" == "1" ]]; then
   TAG_ARGS=(-t "${IMAGE_NAME}:${IMAGE_TAG}")
@@ -150,6 +160,7 @@ docker buildx build \
   ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
   ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
   ${K3S_ARGS[@]+"${K3S_ARGS[@]}"} \
+  ${CODEGEN_ARGS[@]+"${CODEGEN_ARGS[@]}"} \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
   -f "${DOCKERFILE}" \
   --target "${DOCKER_TARGET}" \

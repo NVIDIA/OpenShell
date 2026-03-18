@@ -17,7 +17,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // --- Protobuf compilation ---
-    // Use bundled protoc from protobuf-src
+    // Use bundled protoc from protobuf-src.  The system protoc (from apt-get)
+    // does not bundle the well-known type includes (google/protobuf/struct.proto
+    // etc.), so we must use protobuf-src which ships both the binary and the
+    // include tree.
     // SAFETY: This is run at build time in a single-threaded build script context.
     // No other threads are reading environment variables concurrently.
     #[allow(unsafe_code)]
