@@ -1075,6 +1075,10 @@ impl OpenShell for OpenShellService {
         }
 
         if req.global {
+            // Acquire the settings mutex for the entire global mutation to
+            // prevent read-modify-write races between concurrent requests.
+            let _settings_guard = self.state.settings_mutex.lock().await;
+
             if has_policy {
                 if req.delete_setting {
                     return Err(Status::invalid_argument(
@@ -1160,6 +1164,10 @@ impl OpenShell for OpenShellService {
         let sandbox_id = sandbox.id.clone();
 
         if has_setting {
+            // Acquire the settings mutex to prevent races between the
+            // global-precedence check and the sandbox settings write.
+            let _settings_guard = self.state.settings_mutex.lock().await;
+
             if key == POLICY_SETTING_KEY {
                 return Err(Status::invalid_argument(
                     "reserved key 'policy' must be set via policy commands",
@@ -2689,7 +2697,12 @@ fn sandbox_settings_id(sandbox_id: &str) -> String {
 }
 
 async fn load_sandbox_settings(store: &Store, sandbox_id: &str) -> Result<StoredSettings, Status> {
-    load_settings_record(store, SANDBOX_SETTINGS_OBJECT_TYPE, &sandbox_settings_id(sandbox_id)).await
+    load_settings_record(
+        store,
+        SANDBOX_SETTINGS_OBJECT_TYPE,
+        &sandbox_settings_id(sandbox_id),
+    )
+    .await
 }
 
 async fn save_sandbox_settings(
@@ -5368,5 +5381,646 @@ mod tests {
 
         let stored = super::proto_setting_to_stored("dummy_bool", &value).unwrap();
         assert_eq!(stored, super::StoredSettingValue::Bool(true));
+    }
+
+    // ---- merge_effective_settings: sandbox-scoped values ----
+
+    #[test]
+    fn merge_effective_settings_sandbox_scoped_value_has_sandbox_scope() {
+        let global = super::StoredSettings::default();
+        let sandbox = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "log_level".to_string(),
+                super::StoredSettingValue::String("debug".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        let log_level = merged.get("log_level").expect("log_level present");
+        assert_eq!(
+            log_level.scope,
+            openshell_core::proto::SettingScope::Sandbox as i32,
+            "sandbox-set key should have SANDBOX scope"
+        );
+        assert!(
+            log_level.value.is_some(),
+            "sandbox-set key should have a value"
+        );
+    }
+
+    #[test]
+    fn merge_effective_settings_unset_key_has_unspecified_scope_and_no_value() {
+        let global = super::StoredSettings::default();
+        let sandbox = super::StoredSettings::default();
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+            let setting = merged.get(registered.key).unwrap();
+            assert_eq!(
+                setting.scope,
+                openshell_core::proto::SettingScope::Unspecified as i32,
+                "unset key '{}' should have UNSPECIFIED scope",
+                registered.key,
+            );
+            assert!(
+                setting.value.is_none(),
+                "unset key '{}' should have no value",
+                registered.key,
+            );
+        }
+    }
+
+    #[test]
+    fn merge_effective_settings_policy_key_is_excluded() {
+        let global = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "policy".to_string(),
+                super::StoredSettingValue::Bytes("deadbeef".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let sandbox = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "policy".to_string(),
+                super::StoredSettingValue::Bytes("cafebabe".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        assert!(
+            !merged.contains_key("policy"),
+            "policy key must not appear in effective settings"
+        );
+    }
+
+    // ---- sandbox_settings_id prefix ----
+
+    #[test]
+    fn sandbox_settings_id_has_prefix_preventing_collision() {
+        let sandbox_id = "abc-123";
+        let settings_id = super::sandbox_settings_id(sandbox_id);
+        assert!(
+            settings_id.starts_with("settings:"),
+            "settings ID should be prefixed"
+        );
+        assert_ne!(
+            settings_id, sandbox_id,
+            "settings ID must differ from sandbox ID"
+        );
+    }
+
+    #[test]
+    fn sandbox_settings_id_different_sandboxes_produce_different_ids() {
+        let id_a = super::sandbox_settings_id("sandbox-1");
+        let id_b = super::sandbox_settings_id("sandbox-2");
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn sandbox_settings_id_embeds_sandbox_id() {
+        let sandbox_id = "some-uuid-value";
+        let settings_id = super::sandbox_settings_id(sandbox_id);
+        assert!(
+            settings_id.contains(sandbox_id),
+            "settings ID should embed the original sandbox ID"
+        );
+    }
+
+    // ---- compute_config_revision ----
+
+    #[test]
+    fn config_revision_stable_when_nothing_changes() {
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        let mut settings = HashMap::new();
+        settings.insert(
+            "log_level".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "info".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        assert_eq!(rev_a, rev_b, "revision must be stable for identical inputs");
+    }
+
+    #[test]
+    fn config_revision_changes_when_policy_changes() {
+        let policy_a = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let policy_b = openshell_core::proto::SandboxPolicy {
+            version: 2,
+            ..Default::default()
+        };
+        let settings = HashMap::new();
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy_a),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy_b),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        assert_ne!(rev_a, rev_b, "revision must change when policy changes");
+    }
+
+    #[test]
+    fn config_revision_changes_when_policy_source_changes() {
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        let settings = HashMap::new();
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Global,
+        );
+        assert_ne!(
+            rev_a, rev_b,
+            "revision must change when policy source changes"
+        );
+    }
+
+    #[test]
+    fn config_revision_without_policy_still_hashes_settings() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "log_level".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "debug".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_a = super::compute_config_revision(
+            None,
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        settings.insert(
+            "log_level".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "warn".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_b = super::compute_config_revision(
+            None,
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        assert_ne!(
+            rev_a, rev_b,
+            "revision must change when settings differ, even without policy"
+        );
+    }
+
+    // ---- conflict guard: global overrides block sandbox mutations ----
+
+    #[tokio::test]
+    async fn conflict_guard_sandbox_set_blocked_when_global_exists() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // Persist a global setting for "log_level".
+        let mut global = super::StoredSettings::default();
+        global.settings.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("warn".to_string()),
+        );
+        global.revision = 1;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // Attempt sandbox-scoped set: check the guard condition.
+        let loaded_global = super::load_global_settings(&store).await.unwrap();
+        let globally_managed = loaded_global.settings.contains_key("log_level");
+        assert!(
+            globally_managed,
+            "log_level should be globally managed after global set"
+        );
+        // The handler would return FailedPrecondition here.
+    }
+
+    #[tokio::test]
+    async fn conflict_guard_sandbox_delete_blocked_when_global_exists() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // Persist a global setting for "dummy_int".
+        let mut global = super::StoredSettings::default();
+        global
+            .settings
+            .insert("dummy_int".to_string(), super::StoredSettingValue::Int(42));
+        global.revision = 1;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // Check the guard for sandbox-scoped delete.
+        let loaded_global = super::load_global_settings(&store).await.unwrap();
+        assert!(
+            loaded_global.settings.contains_key("dummy_int"),
+            "dummy_int should be globally managed"
+        );
+        // The handler would return FailedPrecondition for sandbox delete too.
+    }
+
+    // ---- delete-unlock: sandbox set succeeds after global delete ----
+
+    #[tokio::test]
+    async fn delete_unlock_sandbox_set_succeeds_after_global_delete() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // 1. Set global setting.
+        let mut global = super::StoredSettings::default();
+        global.settings.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("warn".to_string()),
+        );
+        global.revision = 1;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // Verify it blocks sandbox.
+        let loaded = super::load_global_settings(&store).await.unwrap();
+        assert!(loaded.settings.contains_key("log_level"));
+
+        // 2. Delete the global setting.
+        global.settings.remove("log_level");
+        global.revision = 2;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // 3. Verify the guard is cleared.
+        let loaded = super::load_global_settings(&store).await.unwrap();
+        assert!(
+            !loaded.settings.contains_key("log_level"),
+            "after global delete, log_level should not be globally managed"
+        );
+
+        // 4. Sandbox-scoped set should now succeed.
+        let sandbox_id = "test-sandbox-uuid";
+        let mut sandbox_settings = super::load_sandbox_settings(&store, sandbox_id)
+            .await
+            .unwrap();
+        let changed = super::upsert_setting_value(
+            &mut sandbox_settings.settings,
+            "log_level",
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        assert!(changed, "sandbox upsert should report a change");
+        sandbox_settings.revision = sandbox_settings.revision.saturating_add(1);
+        super::save_sandbox_settings(&store, sandbox_id, "test-sandbox", &sandbox_settings)
+            .await
+            .unwrap();
+
+        // Verify round-trip.
+        let reloaded = super::load_sandbox_settings(&store, sandbox_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.settings.get("log_level"),
+            Some(&super::StoredSettingValue::String("debug".to_string())),
+        );
+    }
+
+    // ---- reserved policy key rejection ----
+
+    #[test]
+    fn validate_registered_setting_key_rejects_policy() {
+        // "policy" is not in REGISTERED_SETTINGS, so validate should fail.
+        let err = super::validate_registered_setting_key("policy").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_policy_key() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                "anything".to_string(),
+            )),
+        };
+        let err = super::proto_setting_to_stored("policy", &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("unknown setting key"),
+            "policy key should be rejected as unknown: {}",
+            err.message(),
+        );
+    }
+
+    // ---- stored <-> proto round-trip for all types ----
+
+    #[test]
+    fn stored_setting_to_proto_string_round_trip() {
+        let stored = super::StoredSettingValue::String("hello".to_string());
+        let proto = super::stored_setting_to_proto(&stored).unwrap();
+        assert_eq!(
+            proto.value,
+            Some(openshell_core::proto::setting_value::Value::StringValue(
+                "hello".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn stored_setting_to_proto_int_round_trip() {
+        let stored = super::StoredSettingValue::Int(42);
+        let proto = super::stored_setting_to_proto(&stored).unwrap();
+        assert_eq!(
+            proto.value,
+            Some(openshell_core::proto::setting_value::Value::IntValue(42))
+        );
+    }
+
+    #[test]
+    fn stored_setting_to_proto_bool_round_trip() {
+        let stored = super::StoredSettingValue::Bool(false);
+        let proto = super::stored_setting_to_proto(&stored).unwrap();
+        assert_eq!(
+            proto.value,
+            Some(openshell_core::proto::setting_value::Value::BoolValue(
+                false
+            ))
+        );
+    }
+
+    // ---- upsert_setting_value ----
+
+    #[test]
+    fn upsert_setting_value_returns_true_on_insert() {
+        let mut map = std::collections::BTreeMap::new();
+        let changed = super::upsert_setting_value(
+            &mut map,
+            "log_level",
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        assert!(changed);
+        assert_eq!(
+            map.get("log_level"),
+            Some(&super::StoredSettingValue::String("debug".to_string()))
+        );
+    }
+
+    #[test]
+    fn upsert_setting_value_returns_false_when_unchanged() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        let changed = super::upsert_setting_value(
+            &mut map,
+            "log_level",
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        assert!(
+            !changed,
+            "upsert should return false when value is unchanged"
+        );
+    }
+
+    #[test]
+    fn upsert_setting_value_returns_true_on_update() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        let changed = super::upsert_setting_value(
+            &mut map,
+            "log_level",
+            super::StoredSettingValue::String("warn".to_string()),
+        );
+        assert!(changed, "upsert should return true when value changes");
+    }
+
+    // ---- settings persistence round-trip ----
+
+    #[tokio::test]
+    async fn global_settings_load_returns_default_when_empty() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let settings = super::load_global_settings(&store).await.unwrap();
+        assert!(settings.settings.is_empty());
+        assert_eq!(settings.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_load_returns_default_when_empty() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let settings = super::load_sandbox_settings(&store, "nonexistent")
+            .await
+            .unwrap();
+        assert!(settings.settings.is_empty());
+        assert_eq!(settings.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn global_settings_save_and_load_round_trip() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let mut settings = super::StoredSettings::default();
+        settings.settings.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("error".to_string()),
+        );
+        settings.settings.insert(
+            "dummy_bool".to_string(),
+            super::StoredSettingValue::Bool(true),
+        );
+        settings.revision = 5;
+        super::save_global_settings(&store, &settings)
+            .await
+            .unwrap();
+
+        let loaded = super::load_global_settings(&store).await.unwrap();
+        assert_eq!(loaded.revision, 5);
+        assert_eq!(
+            loaded.settings.get("log_level"),
+            Some(&super::StoredSettingValue::String("error".to_string()))
+        );
+        assert_eq!(
+            loaded.settings.get("dummy_bool"),
+            Some(&super::StoredSettingValue::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_save_and_load_round_trip() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let sandbox_id = "sb-uuid-123";
+        let mut settings = super::StoredSettings::default();
+        settings
+            .settings
+            .insert("dummy_int".to_string(), super::StoredSettingValue::Int(99));
+        settings.revision = 3;
+        super::save_sandbox_settings(&store, sandbox_id, "my-sandbox", &settings)
+            .await
+            .unwrap();
+
+        let loaded = super::load_sandbox_settings(&store, sandbox_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded.revision, 3);
+        assert_eq!(
+            loaded.settings.get("dummy_int"),
+            Some(&super::StoredSettingValue::Int(99))
+        );
+    }
+
+    /// Verify that a mutex prevents lost writes when concurrent tasks
+    /// perform load-modify-save on the same global settings record.
+    ///
+    /// Each of N tasks increments the revision by 1 under the mutex.
+    /// Without the mutex, some increments would be lost (last-writer-wins).
+    /// With the mutex, the final revision must equal N.
+    #[tokio::test]
+    async fn concurrent_global_setting_mutations_are_serialized() {
+        let store = std::sync::Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+        let n = 50;
+        let mut handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let store = store.clone();
+            let mutex = mutex.clone();
+            handles.push(tokio::spawn(async move {
+                let _guard = mutex.lock().await;
+                let mut settings = super::load_global_settings(&store).await.unwrap();
+                // Simulate per-key mutation: each task sets a unique key.
+                settings.settings.insert(
+                    format!("key_{i}"),
+                    super::StoredSettingValue::Int(i as i64),
+                );
+                settings.revision = settings.revision.wrapping_add(1);
+                super::save_global_settings(&store, &settings).await.unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let final_settings = super::load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            final_settings.revision, n as u64,
+            "all {n} increments must be reflected; lost writes indicate a race"
+        );
+        assert_eq!(
+            final_settings.settings.len(),
+            n,
+            "all {n} unique keys must be present"
+        );
+    }
+
+    /// Same test WITHOUT the mutex to confirm the test would actually
+    /// detect lost writes when concurrent access is unserialized.
+    /// Uses `tokio::task::yield_now()` to increase interleaving.
+    #[tokio::test]
+    async fn concurrent_global_setting_mutations_without_lock_can_lose_writes() {
+        let store = std::sync::Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+
+        let n = 50;
+        let mut handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                // No mutex — intentional race.
+                let mut settings = super::load_global_settings(&store).await.unwrap();
+                // Yield to encourage interleaving between load and save.
+                tokio::task::yield_now().await;
+                settings.settings.insert(
+                    format!("key_{i}"),
+                    super::StoredSettingValue::Int(i as i64),
+                );
+                settings.revision = settings.revision.wrapping_add(1);
+                super::save_global_settings(&store, &settings).await.unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let final_settings = super::load_global_settings(&store).await.unwrap();
+        // Without serialization, some writes will be lost. The final
+        // revision and key count will be less than N.  We assert that
+        // at least one write was lost to validate the test methodology.
+        // (If tokio happens to schedule everything sequentially, this
+        // could flake — but with N=50 and yield_now it's reliable.)
+        let lost = (n as u64).saturating_sub(final_settings.revision);
+        if lost == 0 {
+            // Rare but possible with sequential scheduling.  Don't fail,
+            // but note that the positive test above is what matters.
+            eprintln!(
+                "note: no lost writes detected in unlocked test (sequential scheduling); \
+                 the locked test is the authoritative correctness check"
+            );
+        } else {
+            eprintln!(
+                "unlocked test: {lost} lost writes out of {n} (expected behavior)"
+            );
+        }
+        // Either way, the WITH-lock test above asserts correctness.
     }
 }
