@@ -149,13 +149,13 @@ matches_gateway() {
     Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
       return 0
       ;;
+    deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
+      return 0
+      ;;
     crates/openshell-core/*|crates/openshell-policy/*|crates/openshell-providers/*)
       return 0
       ;;
-    crates/openshell-router/*)
-      return 0
-      ;;
-    crates/openshell-server/*|deploy/docker/Dockerfile.images)
+    crates/openshell-router/*|crates/openshell-server/*)
       return 0
       ;;
     *)
@@ -170,10 +170,13 @@ matches_supervisor() {
     Cargo.toml|Cargo.lock|proto/*|deploy/docker/cross-build.sh)
       return 0
       ;;
+    deploy/docker/Dockerfile.images|tasks/scripts/docker-build-image.sh)
+      return 0
+      ;;
     crates/openshell-core/*|crates/openshell-policy/*|crates/openshell-router/*)
       return 0
       ;;
-    crates/openshell-sandbox/*|deploy/docker/Dockerfile.images)
+    crates/openshell-sandbox/*)
       return 0
       ;;
     *)
@@ -206,10 +209,10 @@ compute_fingerprint() {
   local committed_trees=""
   case "${component}" in
     gateway)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ deploy/docker/Dockerfile.images 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-providers/ crates/openshell-router/ crates/openshell-server/ 2>/dev/null || true)
       ;;
     supervisor)
-      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
+      committed_trees=$(git ls-tree HEAD Cargo.toml Cargo.lock proto/ deploy/docker/cross-build.sh deploy/docker/Dockerfile.images tasks/scripts/docker-build-image.sh crates/openshell-core/ crates/openshell-policy/ crates/openshell-router/ crates/openshell-sandbox/ 2>/dev/null || true)
       ;;
     helm)
       committed_trees=$(git ls-tree HEAD deploy/helm/openshell/ 2>/dev/null || true)
