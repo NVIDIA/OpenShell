@@ -19,12 +19,24 @@ jobs:
           script: |
             const author = context.payload.pull_request.user.login;
             const authorType = context.payload.pull_request.user.type;
+            const authorAssociation = context.payload.pull_request.author_association;
 
             // Skip bots (dependabot, renovate, github-actions, etc.).
             if (authorType === 'Bot') {
               console.log(`${author} is a bot. Skipping vouch check.`);
               return;
             }
+
+            // Check author_association from the webhook payload. This is set by
+            // GitHub itself and doesn't require extra token permissions, so it
+            // works reliably for org members even when their membership is private.
+            const trustedAssociations = ['MEMBER', 'OWNER', 'COLLABORATOR'];
+            if (trustedAssociations.includes(authorAssociation)) {
+              console.log(`${author} has author_association=${authorAssociation}. Skipping vouch check.`);
+              return;
+            }
+
+            // Fallback: explicit API checks in case author_association is unexpected.
 
             // Check org membership — members bypass the vouch gate.
             try {
@@ -33,7 +45,7 @@ jobs:
                 username: author,
               });
               if (status === 204 || status === 302) {
-                console.log(`${author} is an org member. Skipping vouch check.`);
+                console.log(`${author} is an org member (API). Skipping vouch check.`);
                 return;
               }
             } catch (e) {
@@ -50,7 +62,7 @@ jobs:
                 username: author,
               });
               if (status === 204) {
-                console.log(`${author} is a collaborator. Skipping vouch check.`);
+                console.log(`${author} is a collaborator (API). Skipping vouch check.`);
                 return;
               }
             } catch (e) {
