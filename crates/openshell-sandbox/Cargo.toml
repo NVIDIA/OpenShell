@@ -67,6 +67,10 @@ tracing-appender = { workspace = true }
 # Unix/Process
 nix = { workspace = true }
 
+# VM-based sandbox (optional) — talks to BoxLite REST API via HTTP
+reqwest = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
@@ -74,6 +78,10 @@ libc = "0.2"
 landlock = "0.4"
 seccompiler = "0.5"
 uuid = { version = "1", features = ["v4"] }
+
+[features]
+default = []
+boxlite = ["dep:reqwest", "dep:serde"]
 
 [dev-dependencies]
 tempfile = "3"

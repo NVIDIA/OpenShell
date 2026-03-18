@@ -18,6 +18,7 @@ mod policy;
 mod process;
 pub mod procfs;
 pub mod proxy;
+pub mod runtime;
 mod sandbox;
 mod secrets;
 mod ssh;
@@ -162,6 +163,7 @@ pub async fn run_sandbox(
     _health_check: bool,
     _health_port: u16,
     inference_routes: Option<String>,
+    runtime_kind: runtime::RuntimeKind,
 ) -> Result<i32> {
     let (program, args) = command
         .split_first()
@@ -252,11 +254,12 @@ pub async fn run_sandbox(
         (None, None)
     };
 
-    // Create network namespace for proxy mode (Linux only)
-    // This must be created before the proxy AND SSH server so that SSH
-    // sessions can enter the namespace for network isolation.
+    // Create network namespace for proxy mode (Linux only).
+    // Skip when the runtime backend provides its own network isolation (e.g. BoxLite VM).
     #[cfg(target_os = "linux")]
-    let netns = if matches!(policy.network.mode, NetworkMode::Proxy) {
+    let netns = if matches!(policy.network.mode, NetworkMode::Proxy)
+        && !runtime_kind.provides_network_isolation()
+    {
         match NetworkNamespace::create() {
             Ok(ns) => {
                 // Install bypass detection rules (iptables LOG + REJECT).
@@ -541,32 +544,56 @@ pub async fn run_sandbox(
         }
     }
 
-    #[cfg(target_os = "linux")]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        workdir.as_deref(),
-        interactive,
-        &policy,
-        netns.as_ref(),
-        ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
-
-    #[cfg(not(target_os = "linux"))]
-    let mut handle = ProcessHandle::spawn(
-        program,
-        args,
-        workdir.as_deref(),
-        interactive,
-        &policy,
-        ca_file_paths.as_ref(),
-        &provider_env,
-    )?;
+    let mut handle = match runtime_kind {
+        runtime::RuntimeKind::Process => {
+            #[cfg(target_os = "linux")]
+            {
+                runtime::ProcessBackend::spawn(
+                    program,
+                    args,
+                    workdir.as_deref(),
+                    interactive,
+                    &policy,
+                    netns.as_ref(),
+                    ca_file_paths.as_ref(),
+                    &provider_env,
+                )?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                runtime::ProcessBackend::spawn(
+                    program,
+                    args,
+                    workdir.as_deref(),
+                    interactive,
+                    &policy,
+                    ca_file_paths.as_ref(),
+                    &provider_env,
+                )?
+            }
+        }
+        #[cfg(feature = "boxlite")]
+        runtime::RuntimeKind::Boxlite => {
+            let backend = runtime::BoxliteBackend::new()?;
+            let spawn_config = runtime::SpawnConfig {
+                program: program.to_string(),
+                args: args.to_vec(),
+                workdir: workdir.clone(),
+                interactive,
+                env: provider_env.clone(),
+                image: None, // Uses default (alpine:latest) or could be derived from sandbox spec
+            };
+            backend.spawn(&spawn_config).await?
+        }
+    };
 
     // Store the entrypoint PID so the proxy can resolve TCP peer identity
-    entrypoint_pid.store(handle.pid(), Ordering::Release);
-    info!(pid = handle.pid(), "Process started");
+    entrypoint_pid.store(handle.id(), Ordering::Release);
+    info!(
+        pid = handle.id(),
+        runtime = runtime_kind.name(),
+        "Process started"
+    );
 
     // Spawn background policy poll task (gRPC mode only).
     if let (Some(id), Some(endpoint), Some(engine)) =

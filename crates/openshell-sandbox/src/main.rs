@@ -89,6 +89,13 @@ struct Args {
     /// Port for health check endpoint.
     #[arg(long, default_value = "8080")]
     health_port: u16,
+
+    /// Runtime backend for process isolation.
+    ///
+    /// - "process" (default): Linux kernel isolation (Landlock, seccomp, netns)
+    /// - "boxlite": Hardware-level VM isolation via BoxLite (requires `boxlite` feature)
+    #[arg(long, default_value = "process", env = "OPENSHELL_RUNTIME")]
+    runtime: String,
 }
 
 #[tokio::main]
@@ -170,7 +177,8 @@ async fn main() -> Result<()> {
         vec!["/bin/bash".to_string()]
     };
 
-    info!(command = ?command, "Starting sandbox");
+    let runtime_kind = openshell_sandbox::runtime::RuntimeKind::parse(&args.runtime)?;
+    info!(command = ?command, runtime = runtime_kind.name(), "Starting sandbox");
 
     let exit_code = run_sandbox(
         command,
@@ -188,6 +196,7 @@ async fn main() -> Result<()> {
         args.health_check,
         args.health_port,
         args.inference_routes,
+        runtime_kind,
     )
     .await?;
 
