@@ -65,7 +65,7 @@ $ openshell provider create \
     --config OPENAI_BASE_URL=https://api.example.com/v1
 ```
 
-Replace the base URL and API key with the values from your provider. Refer to your provider's documentation for the correct base URL, available models, and API key setup.
+Replace the base URL and API key with the values from your provider. For supported providers out of the box, refer to [Supported Inference Providers](../sandboxes/manage-providers.md#supported-inference-providers). For other providers, refer to your provider's documentation for the correct base URL, available models, and API key setup.
 
 ::::
 
