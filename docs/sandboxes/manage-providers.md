@@ -132,11 +132,12 @@ The following provider types are supported.
 |---|---|---|
 | `claude` | `ANTHROPIC_API_KEY`, `CLAUDE_API_KEY` | Claude Code, Anthropic API |
 | `codex` | `OPENAI_API_KEY` | OpenAI Codex |
-| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
+| `generic` | User-defined | Any service with custom credentials |
 | `github` | `GITHUB_TOKEN`, `GH_TOKEN` | GitHub API, `gh` CLI — refer to {doc}`/tutorials/github-sandbox` |
 | `gitlab` | `GITLAB_TOKEN`, `GLAB_TOKEN`, `CI_JOB_TOKEN` | GitLab API, `glab` CLI |
 | `nvidia` | `NVIDIA_API_KEY` | NVIDIA API Catalog |
-| `generic` | User-defined | Any service with custom credentials |
+| `openai` | `OPENAI_API_KEY` | Any OpenAI-compatible endpoint. Set `--config OPENAI_BASE_URL` to point to the provider. Refer to {doc}`/inference/configure`. |
+| `opencode` | `OPENCODE_API_KEY`, `OPENROUTER_API_KEY`, `OPENAI_API_KEY` | opencode tool |
 
 :::{tip}
 Use the `generic` type for any service not listed above. You define the

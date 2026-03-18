@@ -51,6 +51,22 @@ This reads `NVIDIA_API_KEY` from your environment.
 
 ::::
 
+::::{tab-item} OpenAI-compatible provider
+
+Any cloud provider that exposes an OpenAI-compatible API works with the `openai` provider type. You need three values from the provider: the base URL, an API key, and a model name.
+
+```console
+$ openshell provider create \
+    --name my-cloud-provider \
+    --type openai \
+    --credential OPENAI_API_KEY=<your_api_key> \
+    --config OPENAI_BASE_URL=https://api.example.com/v1
+```
+
+Replace the base URL and API key with the values from your provider. Refer to your provider's documentation for the correct base URL, available models, and API key setup.
+
+::::
+
 ::::{tab-item} Local / self-hosted endpoint
 
 ```console
