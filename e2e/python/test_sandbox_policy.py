@@ -168,14 +168,25 @@ def _proxy_connect_then_http():
 
 
 def _read_openshell_log():
-    """Return a closure that reads the openshell log file."""
+    """Return a closure that reads the openshell log file(s).
+
+    Since the sandbox uses a rolling file appender, logs are written to
+    date-stamped files like ``/var/log/openshell.YYYY-MM-DD.log`` instead
+    of a single ``/var/log/openshell.log``.  This helper globs for all
+    matching files so tests work with both the legacy and rolling layouts.
+    """
 
     def fn():
-        try:
-            with open("/var/log/openshell.log") as f:
-                return f.read()
-        except FileNotFoundError:
-            return ""
+        import glob
+
+        logs = []
+        for path in sorted(glob.glob("/var/log/openshell*.log*")):
+            try:
+                with open(path) as f:
+                    logs.append(f.read())
+            except (FileNotFoundError, PermissionError):
+                pass
+        return "\n".join(logs)
 
     return fn
 
@@ -1542,8 +1553,10 @@ def _verify_sandbox_functional():
             os.unlink(sb_path)
         except Exception as e:
             checks["sandbox_write"] = str(e)
-        # Can read openshell log
-        checks["var_log"] = os.path.exists("/var/log/openshell.log")
+        # Can read openshell log (rolling appender writes date-stamped files)
+        import glob
+
+        checks["var_log"] = len(glob.glob("/var/log/openshell*.log*")) > 0
         return json.dumps(checks)
 
     return fn
