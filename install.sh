@@ -5,7 +5,7 @@
 # Install the OpenShell CLI binary.
 #
 # Usage:
-#   curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+#   curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | sh
 #
 # Or run directly:
 #   ./install.sh
@@ -13,12 +13,15 @@
 # Environment variables:
 #   OPENSHELL_VERSION     - Release tag to install (default: latest tagged release)
 #   OPENSHELL_INSTALL_DIR - Directory to install into (default: ~/.local/bin)
+#   OPENSHELL_RELEASE_REPO - GitHub release repo override (default: linuxdevel/OpenShell)
+#   OPENSHELL_TOOL        - Optional setup selection hint (claude-code, opencode)
+#   OPENSHELL_VENDOR      - Optional setup selection hint (anthropic, github-copilot)
+#   OPENSHELL_MODEL_PATH  - Optional setup model path hint for later setup flow
 #
 set -eu
 
 APP_NAME="openshell"
-REPO="NVIDIA/OpenShell"
-GITHUB_URL="https://github.com/${REPO}"
+DEFAULT_RELEASE_REPO="linuxdevel/OpenShell"
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -46,25 +49,38 @@ usage() {
 install.sh — Install the OpenShell CLI
 
 USAGE:
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | sh
     ./install.sh [OPTIONS]
 
 OPTIONS:
-    --help    Print this help message
+    --help                 Print this help message
+    --tool <tool>          Validate later setup tool selection
+    --vendor <vendor>      Validate later setup vendor selection
+    --model-path <path>    Validate later setup model path selection
 
 ENVIRONMENT VARIABLES:
     OPENSHELL_VERSION       Release tag to install (default: latest tagged release)
     OPENSHELL_INSTALL_DIR   Directory to install into (default: ~/.local/bin)
+    OPENSHELL_RELEASE_REPO  GitHub release repo override (default: linuxdevel/OpenShell)
+    OPENSHELL_TOOL          Optional setup selection hint (claude-code, opencode)
+    OPENSHELL_VENDOR        Optional setup selection hint (anthropic, github-copilot)
+    OPENSHELL_MODEL_PATH    Optional setup model path hint for later setup flow
 
 EXAMPLES:
     # Install latest release
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | sh
 
     # Install a specific version
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=v0.0.9  sh
+    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | OPENSHELL_VERSION=v0.0.9 sh
 
     # Install to /usr/local/bin
-    curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_INSTALL_DIR=/usr/local/bin sh
+    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | OPENSHELL_INSTALL_DIR=/usr/local/bin sh
+
+    # Install from a different fork release repo
+    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | OPENSHELL_RELEASE_REPO=example/custom-openshell sh
+
+    # Validate later setup selections while installing the CLI
+    ./install.sh --tool claude-code --vendor anthropic --model-path claude-sonnet-4
 EOF
 }
 
@@ -74,6 +90,104 @@ EOF
 
 has_cmd() {
   command -v "$1" >/dev/null 2>&1
+}
+
+validate_choice() {
+  _value="$1"
+  _label="$2"
+  shift 2
+
+  [ -z "$_value" ] && return 0
+
+  for _allowed in "$@"; do
+    if [ "$_value" = "$_allowed" ]; then
+      return 0
+    fi
+  done
+
+  error "unsupported ${_label}: ${_value}"
+}
+
+validate_selection() {
+  _tool="${OPENSHELL_TOOL:-}"
+  _vendor="${OPENSHELL_VENDOR:-}"
+  _model_path="${OPENSHELL_MODEL_PATH:-}"
+
+  validate_choice "$_tool" "tool" "claude-code" "opencode"
+  validate_choice "$_vendor" "vendor" "anthropic" "github-copilot"
+
+  if [ -n "$_vendor" ] && [ -z "$_tool" ]; then
+    error "OPENSHELL_VENDOR requires OPENSHELL_TOOL"
+  fi
+
+  if [ -n "$_model_path" ] && [ -z "$_vendor" ]; then
+    error "OPENSHELL_MODEL_PATH requires OPENSHELL_VENDOR"
+  fi
+
+  case "${_tool}:${_vendor}" in
+    ""|":")
+      ;;
+    "claude-code:"|"claude-code:anthropic")
+      ;;
+    "opencode:"|"opencode:github-copilot")
+      ;;
+    *)
+      error "unsupported installer selection: ${_tool} + ${_vendor}"
+      ;;
+  esac
+}
+
+validate_release_repo() {
+  _repo="${OPENSHELL_RELEASE_REPO:-$DEFAULT_RELEASE_REPO}"
+
+  case "$_repo" in
+    */*)
+      _owner="${_repo%%/*}"
+      _name="${_repo#*/}"
+      ;;
+    *)
+      error "invalid OPENSHELL_RELEASE_REPO: ${_repo} (expected <owner>/<repo>)"
+      ;;
+  esac
+
+  case "$_owner" in
+    ""|*/*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+      error "invalid OPENSHELL_RELEASE_REPO: ${_repo} (expected <owner>/<repo>)"
+      ;;
+  esac
+
+  case "$_name" in
+    ""|*/*|*[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_.-]*)
+      error "invalid OPENSHELL_RELEASE_REPO: ${_repo} (expected <owner>/<repo>)"
+      ;;
+  esac
+
+  printf '%s\n' "$_repo"
+}
+
+print_selection() {
+  _printed=0
+
+  if [ -n "${OPENSHELL_TOOL:-}" ]; then
+    info "validated setup tool selection: ${OPENSHELL_TOOL}"
+    _printed=1
+  fi
+
+  if [ -n "${OPENSHELL_VENDOR:-}" ]; then
+    info "validated setup vendor selection: ${OPENSHELL_VENDOR}"
+    _printed=1
+  fi
+
+  if [ -n "${OPENSHELL_MODEL_PATH:-}" ]; then
+    info "validated setup model path selection: ${OPENSHELL_MODEL_PATH}"
+    _printed=1
+  fi
+
+  if [ "$_printed" -eq 1 ]; then
+    info "selection validation applies to later OpenShell setup and still installs the openshell CLI"
+  fi
+
+  return 0
 }
 
 check_downloader() {
@@ -96,6 +210,20 @@ download() {
   elif has_cmd wget; then
     wget -q --tries=3 -O "$_output" "$_url"
   fi
+}
+
+download_optional() {
+  _url="$1"
+  _output="$2"
+
+  rm -f "$_output"
+
+  if download "$_url" "$_output"; then
+    return 0
+  fi
+
+  rm -f "$_output"
+  return 1
 }
 
 # Follow a URL and print the final resolved URL (for detecting redirect targets).
@@ -150,6 +278,8 @@ get_target() {
 # ---------------------------------------------------------------------------
 
 resolve_version() {
+  _github_url="$1"
+
   if [ -n "${OPENSHELL_VERSION:-}" ]; then
     echo "$OPENSHELL_VERSION"
     return 0
@@ -158,7 +288,7 @@ resolve_version() {
   # Resolve "latest" by following the GitHub releases/latest redirect.
   # GitHub redirects /releases/latest -> /releases/tag/<tag>
   info "resolving latest version..."
-  _latest_url="${GITHUB_URL}/releases/latest"
+  _latest_url="${_github_url}/releases/latest"
   _resolved="$(resolve_redirect "$_latest_url")" || error "failed to resolve latest release from ${_latest_url}"
 
   # Extract the tag from the resolved URL: .../releases/tag/v0.0.4 -> v0.0.4
@@ -183,8 +313,7 @@ verify_checksum() {
   _vc_expected="$(grep "$_vc_filename" "$_vc_checksums" | awk '{print $1}')"
 
   if [ -z "$_vc_expected" ]; then
-    warn "no checksum found for $_vc_filename, skipping verification"
-    return 0
+    error "missing checksum entry for $_vc_filename in ${_vc_checksums##*/}"
   fi
 
   if has_cmd shasum; then
@@ -192,8 +321,7 @@ verify_checksum() {
   elif has_cmd sha256sum; then
     echo "$_vc_expected  $_vc_archive" | sha256sum -c --quiet 2>/dev/null
   else
-    warn "sha256sum/shasum not found, skipping checksum verification"
-    return 0
+    error "sha256sum/shasum not found, cannot verify release checksum"
   fi
 }
 
@@ -223,45 +351,66 @@ is_on_path() {
 # ---------------------------------------------------------------------------
 
 main() {
-  # Parse CLI flags
-  for arg in "$@"; do
-    case "$arg" in
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
       --help)
         usage
         exit 0
         ;;
+      --tool)
+        [ "$#" -ge 2 ] || error "missing value for --tool"
+        OPENSHELL_TOOL="$2"
+        shift 2
+        ;;
+      --vendor)
+        [ "$#" -ge 2 ] || error "missing value for --vendor"
+        OPENSHELL_VENDOR="$2"
+        shift 2
+        ;;
+      --model-path)
+        [ "$#" -ge 2 ] || error "missing value for --model-path"
+        OPENSHELL_MODEL_PATH="$2"
+        shift 2
+        ;;
       *)
-        error "unknown option: $arg"
+        error "unknown option: $1"
         ;;
     esac
   done
 
   check_downloader
+  validate_selection
+  print_selection
 
-  _version="$(resolve_version)"
+  _release_repo="$(validate_release_repo)"
+  _github_url="https://github.com/${_release_repo}"
+  _version="$(resolve_version "$_github_url")"
   _target="$(get_target)"
   _filename="${APP_NAME}-${_target}.tar.gz"
-  _download_url="${GITHUB_URL}/releases/download/${_version}/${_filename}"
-  _checksums_url="${GITHUB_URL}/releases/download/${_version}/${APP_NAME}-checksums-sha256.txt"
+  _checksums_filename="${APP_NAME}-checksums-sha256.txt"
+  _checksums_path="${_tmpdir:-}/unused"
+  _download_url="${_github_url}/releases/download/${_version}/${_filename}"
+  _checksums_url="${_github_url}/releases/download/${_version}/${_checksums_filename}"
   _install_dir="$(get_install_dir)"
 
   info "downloading ${APP_NAME} ${_version} (${_target})..."
 
   _tmpdir="$(mktemp -d)"
   trap 'rm -rf "$_tmpdir"' EXIT
+  _checksums_path="${_tmpdir}/${_checksums_filename}"
 
   if ! download "$_download_url" "${_tmpdir}/${_filename}"; then
     error "failed to download ${_download_url}"
   fi
 
+  if ! download "$_checksums_url" "$_checksums_path"; then
+    error "missing checksum manifest: ${_checksums_filename}"
+  fi
+
   # Verify checksum
   info "verifying checksum..."
-  if download "$_checksums_url" "${_tmpdir}/checksums.txt"; then
-    if ! verify_checksum "${_tmpdir}/${_filename}" "${_tmpdir}/checksums.txt" "$_filename"; then
-      error "checksum verification failed for ${_filename}"
-    fi
-  else
-    warn "could not download checksums file, skipping verification"
+  if ! verify_checksum "${_tmpdir}/${_filename}" "$_checksums_path" "$_filename"; then
+    error "checksum verification failed for ${_filename}"
   fi
 
   # Extract

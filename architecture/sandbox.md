@@ -36,6 +36,24 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 
 ## Startup and Orchestration
 
+## First-Class Sandbox Tools
+
+The sandbox runtime is intentionally generic about the child process it launches, but OpenShell still needs an explicit first-class tool matrix so credential projection, config-file layout, and network policy stay predictable. The current first-class tool targets are:
+
+- `claude code`
+- `opencode`
+
+Future tools should fit the same adapter shape rather than bypassing it with tool-specific ad hoc logic in the supervisor.
+
+Phase 1 only enforces this boundary for detected first-class tool commands (`claude`, `opencode`). Other commands still use the legacy generic provider-env projection path until later phases tighten the adapter model further.
+
+The key separation is:
+
+- **tool adapter**: defines what a specific CLI tool needs inside the sandbox (env vars, config-file projection, trust-store expectations, endpoint categories)
+- **provider/model routing**: defines how OpenShell discovers credentials, resolves providers, and routes model traffic such as Anthropic-compatible or OpenAI-compatible inference
+
+That separation matters because one provider may support multiple tools, and one tool may need credentials from multiple providers. The sandbox should therefore project a stable tool contract while the provider and inference layers remain the source of truth for credential discovery and backend routing.
+
 The `run_sandbox()` function in `crates/openshell-sandbox/src/lib.rs` is the main orchestration entry point. It executes the following steps in order.
 
 ### Orchestration flow

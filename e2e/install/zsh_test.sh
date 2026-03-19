@@ -61,6 +61,48 @@ test_guidance_mentions_not_on_path() {
   assert_output_contains "$INSTALL_OUTPUT" "$INSTALL_DIR" "includes install dir in guidance"
 }
 
+test_selects_claude_code() {
+  printf 'TEST: installer accepts claude code selection\n'
+
+  SHELL="/bin/zsh" run_install_with_env \
+    OPENSHELL_TOOL=claude-code
+
+  assert_setup_selection "tool" "claude-code" "shows claude code selection"
+  assert_setup_selection_notice
+}
+
+test_selects_opencode() {
+  printf 'TEST: installer accepts opencode selection\n'
+
+  SHELL="/bin/zsh" run_install_with_env \
+    OPENSHELL_TOOL=opencode
+
+  assert_setup_selection "tool" "opencode" "shows opencode selection"
+}
+
+test_selects_vendor_model_path() {
+  printf 'TEST: installer accepts vendor and model path selection\n'
+
+  SHELL="/bin/zsh" run_install_with_env \
+    OPENSHELL_TOOL=claude-code \
+    OPENSHELL_VENDOR=anthropic \
+    OPENSHELL_MODEL_PATH=claude-sonnet-4
+
+  assert_setup_selection "vendor" "anthropic" "shows vendor selection"
+  assert_setup_selection "model path" "claude-sonnet-4" "shows model path selection"
+}
+
+test_rejects_unsupported_combination() {
+  printf 'TEST: installer rejects unsupported tool and vendor selection\n'
+
+  SHELL="/bin/zsh" run_install_expect_failure \
+    OPENSHELL_TOOL=claude-code \
+    OPENSHELL_VENDOR=github-copilot
+
+  assert_output_contains "$INSTALL_OUTPUT" "unsupported installer selection" "reports unsupported combination"
+  assert_output_contains "$INSTALL_OUTPUT" "claude-code + github-copilot" "includes unsupported pair"
+}
+
 # ---------------------------------------------------------------------------
 # Runner
 # ---------------------------------------------------------------------------
@@ -75,6 +117,10 @@ test_binary_installed;              echo ""
 test_binary_executable;             echo ""
 test_binary_runs;                   echo ""
 test_guidance_shows_export_path;    echo ""
-test_guidance_mentions_not_on_path
+test_guidance_mentions_not_on_path; echo ""
+test_selects_claude_code;           echo ""
+test_selects_opencode;              echo ""
+test_selects_vendor_model_path;     echo ""
+test_rejects_unsupported_combination
 
 print_summary

@@ -47,6 +47,26 @@ on:
         required: false
         type: string
         default: ""
+      runtime-bundle-github-repo:
+        description: "Runtime bundle producer GitHub repository"
+        required: false
+        type: string
+        default: ""
+      runtime-bundle-release-tag:
+        description: "Runtime bundle release tag used for derived defaults"
+        required: false
+        type: string
+        default: ""
+      runtime-bundle-filename-prefix:
+        description: "Runtime bundle asset filename prefix"
+        required: false
+        type: string
+        default: ""
+      runtime-bundle-version:
+        description: "Runtime bundle version token used in asset filenames"
+        required: false
+        type: string
+        default: ""
 
 env:
   MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -116,6 +136,10 @@ jobs:
           OPENSHELL_RUNTIME_BUNDLE_URL: ${{ inputs.runtime-bundle-url }}
           OPENSHELL_RUNTIME_BUNDLE_URL_AMD64: ${{ inputs.runtime-bundle-url-amd64 }}
           OPENSHELL_RUNTIME_BUNDLE_URL_ARM64: ${{ inputs.runtime-bundle-url-arm64 }}
+          OPENSHELL_RUNTIME_BUNDLE_GITHUB_REPO: ${{ inputs.runtime-bundle-github-repo }}
+          OPENSHELL_RUNTIME_BUNDLE_RELEASE_TAG: ${{ inputs.runtime-bundle-release-tag }}
+          OPENSHELL_RUNTIME_BUNDLE_FILENAME_PREFIX: ${{ inputs.runtime-bundle-filename-prefix }}
+          OPENSHELL_RUNTIME_BUNDLE_VERSION: ${{ inputs.runtime-bundle-version }}
         run: |
           set -euo pipefail
 
@@ -123,9 +147,19 @@ jobs:
             bash tasks/scripts/ci-build-cluster-image.sh \
               --platform "${DOCKER_PLATFORM}" \
               --runtime-bundle-url-amd64 "${OPENSHELL_RUNTIME_BUNDLE_URL_AMD64}" \
-              --runtime-bundle-url-arm64 "${OPENSHELL_RUNTIME_BUNDLE_URL_ARM64}"
+              --runtime-bundle-url-arm64 "${OPENSHELL_RUNTIME_BUNDLE_URL_ARM64}" \
+              --runtime-bundle-github-repo "${OPENSHELL_RUNTIME_BUNDLE_GITHUB_REPO}" \
+              --runtime-bundle-release-tag "${OPENSHELL_RUNTIME_BUNDLE_RELEASE_TAG}" \
+              --runtime-bundle-filename-prefix "${OPENSHELL_RUNTIME_BUNDLE_FILENAME_PREFIX}" \
+              --runtime-bundle-version "${OPENSHELL_RUNTIME_BUNDLE_VERSION}"
           else
             bash tasks/scripts/ci-build-cluster-image.sh \
               --platform "${DOCKER_PLATFORM}" \
-              --runtime-bundle-url "${OPENSHELL_RUNTIME_BUNDLE_URL}"
+              --runtime-bundle-url "${OPENSHELL_RUNTIME_BUNDLE_URL}" \
+              --runtime-bundle-url-amd64 "${OPENSHELL_RUNTIME_BUNDLE_URL_AMD64}" \
+              --runtime-bundle-url-arm64 "${OPENSHELL_RUNTIME_BUNDLE_URL_ARM64}" \
+              --runtime-bundle-github-repo "${OPENSHELL_RUNTIME_BUNDLE_GITHUB_REPO}" \
+              --runtime-bundle-release-tag "${OPENSHELL_RUNTIME_BUNDLE_RELEASE_TAG}" \
+              --runtime-bundle-filename-prefix "${OPENSHELL_RUNTIME_BUNDLE_FILENAME_PREFIX}" \
+              --runtime-bundle-version "${OPENSHELL_RUNTIME_BUNDLE_VERSION}"
           fi

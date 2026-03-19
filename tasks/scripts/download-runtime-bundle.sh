@@ -43,7 +43,8 @@ if [[ -z "$filename" || "$filename" == "/" || "$filename" == "." ]]; then
   filename="runtime-bundle-${ARCH}.tar.gz"
 fi
 
-target_path="$CACHE_DIR/${ARCH}-${filename}"
+url_cache_key="$(printf '%s' "$URL" | sha256sum | cut -d' ' -f1)"
+target_path="$CACHE_DIR/${ARCH}-${url_cache_key}-${filename}"
 
 if [[ ! -f "$target_path" ]]; then
   curl --fail --location --silent --show-error --output "$target_path" "$URL"

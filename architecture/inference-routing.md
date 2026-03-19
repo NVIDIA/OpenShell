@@ -53,6 +53,16 @@ Each profile also defines `credential_key_names` (e.g. `["OPENAI_API_KEY"]`) and
 
 Unknown provider types return `None` from `profile_for()` and default to `Bearer` auth with no default headers via `auth_for_provider_type()`.
 
+## Vendor Auth Projection Boundaries
+
+Inference provider profiles describe backend request shape, not full sandbox tool auth projection. The next phase keeps these concerns separate:
+
+- **Anthropic path:** `claude code` and any other Anthropic-facing tool may rely on provider records that discover `ANTHROPIC_API_KEY` or related fields, but the decision to expose those values to the child process belongs to the tool adapter contract in the sandbox layer.
+- **GitHub / Copilot path:** GitHub token discovery (`GITHUB_TOKEN`, `GH_TOKEN`) is not enough on its own to define a GitHub Copilot model-access contract. Any Copilot-backed model flow must explicitly document which endpoints, token shapes, and tool adapters are supported.
+- **Fail-closed rule:** if a tool/vendor combination is not explicitly documented, OpenShell should not silently treat generic provider discovery as authorization to project those credentials into a sandbox child process.
+
+In other words, provider profiles remain the source of truth for upstream inference protocol handling once traffic is routed, but tool adapters remain the source of truth for what vendor-facing auth material can enter the child process before routing begins.
+
 ## Control Plane (Gateway)
 
 File: `crates/openshell-server/src/inference.rs`

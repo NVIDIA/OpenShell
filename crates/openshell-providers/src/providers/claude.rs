@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
+    discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
 };
 
 pub struct ClaudeProvider;
@@ -41,6 +41,19 @@ mod tests {
         assert_eq!(
             discovered.credentials.get("ANTHROPIC_API_KEY"),
             Some(&"test-key".to_string())
+        );
+    }
+
+    #[test]
+    fn discovers_legacy_claude_env_alias() {
+        let ctx = MockDiscoveryContext::new().with_env("CLAUDE_API_KEY", "legacy-key");
+        let discovered = discover_with_spec(&SPEC, &ctx)
+            .expect("discovery")
+            .expect("provider");
+
+        assert_eq!(
+            discovered.credentials.get("CLAUDE_API_KEY"),
+            Some(&"legacy-key".to_string())
         );
     }
 }

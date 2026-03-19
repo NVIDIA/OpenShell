@@ -44,6 +44,7 @@ use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
+use crate::child_env::detect_tool_adapter;
 pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
@@ -202,7 +203,7 @@ pub async fn run_sandbox(
         std::collections::HashMap::new()
     };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    let (provider_env, secret_resolver) = project_provider_env_for_command(&command, provider_env)?;
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
@@ -1153,6 +1154,20 @@ fn validate_sandbox_user(policy: &SandboxPolicy) -> Result<()> {
     Ok(())
 }
 
+fn project_provider_env_for_command(
+    command: &[String],
+    provider_env: std::collections::HashMap<String, String>,
+) -> Result<(
+    std::collections::HashMap<String, String>,
+    Option<SecretResolver>,
+)> {
+    match detect_tool_adapter(command) {
+        Some(tool) => SecretResolver::from_tool_provider_env(tool, provider_env)
+            .map_err(|msg| miette::miette!(msg)),
+        None => Ok(SecretResolver::from_provider_env(provider_env)),
+    }
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
@@ -1495,6 +1510,22 @@ mod tests {
         assert_eq!(user[0].name, "inference.local");
         assert_eq!(system.len(), 1);
         assert_eq!(system[0].name, "sandbox-system");
+    }
+
+    #[test]
+    fn project_provider_env_for_command_rejects_disallowed_tool_keys() {
+        let command = vec!["claude".to_string(), "code".to_string()];
+        let provider_env = [
+            ("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string()),
+            ("GITHUB_TOKEN".to_string(), "gh-test".to_string()),
+        ]
+        .into_iter()
+        .collect();
+
+        let error = project_provider_env_for_command(&command, provider_env)
+            .expect_err("claude tool adapter must reject unrelated provider keys");
+
+        assert!(error.to_string().contains("GITHUB_TOKEN"));
     }
 
     // -- build_inference_context tests --
