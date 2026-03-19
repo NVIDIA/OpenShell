@@ -74,6 +74,9 @@ tracing-subscriber = { workspace = true }
 [lints]
 workspace = true
 
+[features]
+dev-settings = ["openshell-core/dev-settings"]
+
 [dev-dependencies]
 futures = { workspace = true }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }

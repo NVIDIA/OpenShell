@@ -5062,6 +5062,7 @@ mod tests {
         ));
     }
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_parses_bool_aliases() {
         let yes_value = parse_cli_setting_value("dummy_bool", "yes").expect("parse yes");
@@ -5079,6 +5080,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_parses_int_key() {
         let int_value = parse_cli_setting_value("dummy_int", "42").expect("parse int");
@@ -5088,6 +5090,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn parse_cli_setting_value_rejects_invalid_bool() {
         let err =
