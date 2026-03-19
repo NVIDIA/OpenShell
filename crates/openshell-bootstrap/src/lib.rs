@@ -417,6 +417,7 @@ where
             registry_username.as_deref(),
             registry_token.as_deref(),
             gpu,
+            remote_opts.is_some(),
         )
         .await?;
         start_container(&target_docker, &name).await?;
