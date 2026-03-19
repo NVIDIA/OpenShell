@@ -168,7 +168,7 @@ WORKDIR /app
 COPY --from=gateway-builder /build/out/openshell-server /usr/local/bin/
 
 RUN mkdir -p /build/crates/openshell-server
-COPY crates/openshell-server/migrations /build/crates/openshell-server/migrations
+COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
 
 USER openshell
 EXPOSE 8080
