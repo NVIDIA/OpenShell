@@ -139,7 +139,7 @@ pub async fn run_bootstrap(
     eprintln!();
     eprintln!(
         "  Manage it later with: {} or {}",
-        "openshell gateway status".bold(),
+        "openshell status".bold(),
         "openshell gateway stop".bold(),
     );
     eprintln!();
