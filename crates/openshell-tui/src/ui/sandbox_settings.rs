@@ -89,7 +89,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &App, area: Rect) {
             width: area.width.saturating_sub(4),
             height: area.height.saturating_sub(3),
         };
-        let msg = Paragraph::new(Span::styled(" Loading settings...", t.muted));
+        let msg = Paragraph::new(Span::styled(" No settings available.", t.muted));
         frame.render_widget(msg, inner);
     }
 

@@ -74,6 +74,9 @@ russh = "0.57"
 rand = "0.9"
 petname = "2"
 
+[features]
+dev-settings = ["openshell-core/dev-settings"]
+
 [dev-dependencies]
 hyper-rustls = { version = "0.27", default-features = false, features = ["native-tokio", "http1", "tls12", "logging", "ring", "webpki-tokio"] }
 rcgen = { version = "0.13", features = ["crypto", "pem"] }

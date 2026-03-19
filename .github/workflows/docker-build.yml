@@ -90,4 +90,7 @@ jobs:
         env:
           DOCKER_BUILDER: openshell
           OPENSHELL_CARGO_VERSION: ${{ steps.version.outputs.cargo_version }}
+          # Enable dev-settings feature for test settings (dummy_bool, dummy_int)
+          # used by e2e tests.
+          EXTRA_CARGO_FEATURES: openshell-core/dev-settings
         run: mise run --no-prepare docker:build:${{ inputs.component }}

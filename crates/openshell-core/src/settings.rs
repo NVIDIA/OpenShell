@@ -49,10 +49,10 @@ pub struct RegisteredSetting {
 ///    keys are accepted.
 /// 5. Add a unit test in this module's `tests` section to cover the new key.
 pub const REGISTERED_SETTINGS: &[RegisteredSetting] = &[
-    RegisteredSetting {
-        key: "log_level",
-        kind: SettingValueKind::String,
-    },
+    // Production settings go here. Add entries following the steps above.
+    //
+    // Test-only keys live behind the `dev-settings` feature flag so they
+    // don't appear in production builds.
     #[cfg(feature = "dev-settings")]
     RegisteredSetting {
         key: "dummy_int",
@@ -94,15 +94,9 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
-        registered_keys_csv, setting_for_key,
+        parse_bool_like, registered_keys_csv, setting_for_key, RegisteredSetting, SettingValueKind,
+        REGISTERED_SETTINGS,
     };
-
-    #[test]
-    fn setting_for_key_returns_registered_entry() {
-        let setting = setting_for_key("log_level").expect("log_level should be registered");
-        assert_eq!(setting.kind, SettingValueKind::String);
-    }
 
     #[cfg(feature = "dev-settings")]
     #[test]

@@ -3975,7 +3975,7 @@ pub async fn sandbox_settings_get(
     println!("Policy Hash:   {}", response.policy_hash);
 
     if response.settings.is_empty() {
-        println!("Settings:      (none)");
+        println!("Settings:      No settings available.");
         return Ok(());
     }
 
@@ -4019,7 +4019,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
     println!("Settings Rev:  {}", response.settings_revision);
 
     if response.settings.is_empty() {
-        println!("Settings:      (none)");
+        println!("Settings:      No settings available.");
         return Ok(());
     }
 

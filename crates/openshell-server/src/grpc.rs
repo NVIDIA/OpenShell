@@ -2910,7 +2910,7 @@ fn merge_effective_settings(
     }
 
     for (key, value) in &sandbox.settings {
-        if key == POLICY_SETTING_KEY {
+        if key == POLICY_SETTING_KEY || settings::setting_for_key(key).is_none() {
             continue;
         }
         merged.insert(
@@ -2923,7 +2923,7 @@ fn merge_effective_settings(
     }
 
     for (key, value) in &global.settings {
-        if key == POLICY_SETTING_KEY {
+        if key == POLICY_SETTING_KEY || settings::setting_for_key(key).is_none() {
             continue;
         }
         merged.insert(
@@ -2948,6 +2948,11 @@ fn materialize_global_settings(
 
     for (key, value) in &global.settings {
         if key == POLICY_SETTING_KEY {
+            continue;
+        }
+        // Only include keys that are in the current registry. Stale keys
+        // from a previous build are ignored.
+        if settings::setting_for_key(key).is_none() {
             continue;
         }
         materialized.insert(key.clone(), stored_setting_to_proto(value)?);
@@ -5308,6 +5313,7 @@ mod tests {
         assert!(err.message().contains("value"));
     }
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn merge_effective_settings_global_overrides_sandbox_key() {
         let global = super::StoredSettings {
@@ -5479,6 +5485,7 @@ mod tests {
         assert!(err.message().contains("unknown setting key"));
     }
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn proto_setting_to_stored_rejects_type_mismatch() {
         let value = openshell_core::proto::SettingValue {
@@ -5492,6 +5499,7 @@ mod tests {
         assert!(err.message().contains("expects bool value"));
     }
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn proto_setting_to_stored_accepts_bool_for_registered_bool_key() {
         let value = openshell_core::proto::SettingValue {
@@ -5504,6 +5512,7 @@ mod tests {
 
     // ---- merge_effective_settings: sandbox-scoped values ----
 
+    #[cfg(feature = "dev-settings")]
     #[test]
     fn merge_effective_settings_sandbox_scoped_value_has_sandbox_scope() {
         let global = super::StoredSettings::default();
