@@ -77,6 +77,10 @@ jobs:
       cargo-version: ${{ needs.compute-versions.outputs.cargo_version }}
       runtime-bundle-url-amd64: ${{ vars.OPENSHELL_RUNTIME_BUNDLE_URL_AMD64 }}
       runtime-bundle-url-arm64: ${{ vars.OPENSHELL_RUNTIME_BUNDLE_URL_ARM64 }}
+      runtime-bundle-github-repo: ${{ github.repository_owner }}/nvidia-container-toolkit
+      runtime-bundle-release-tag: ${{ inputs.tag || github.ref_name }}
+      runtime-bundle-filename-prefix: openshell-gpu-runtime-bundle
+      runtime-bundle-version: ${{ needs.compute-versions.outputs.semver }}
 
   e2e:
     needs: [build-gateway, build-cluster]
@@ -347,12 +351,18 @@ jobs:
           name: python-wheels
           path: release/
 
-      - name: Generate checksums
+      - name: Generate required checksum manifest
         run: |
           set -euo pipefail
           cd release
           sha256sum *.tar.gz *.whl > openshell-checksums-sha256.txt
           cat openshell-checksums-sha256.txt
+
+      - name: Note deferred detached checksum signing
+        run: |
+          set -euo pipefail
+          echo "Tagged releases require release/openshell-checksums-sha256.txt in the active path."
+          echo "Detached checksum signing remains deferred backlog work and is not enforced by this workflow yet."
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -362,12 +372,14 @@ jobs:
           tag_name: ${{ env.RELEASE_TAG }}
           generate_release_notes: true
           body: |
-            ## OpenShell ${{ env.RELEASE_TAG }}
+           ## OpenShell ${{ env.RELEASE_TAG }}
+
+            Checksum manifest generation is required for tagged releases. Detached checksum signing remains deferred backlog work and is not enforced in the active release path.
 
             ### Quick install
 
             ```bash
-            curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
+            curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ env.RELEASE_TAG }} sh
             ```
 
           files: |

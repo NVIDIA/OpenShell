@@ -5,6 +5,34 @@ use std::path::Path;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ToolAdapter {
+    ClaudeCode,
+    OpenCode,
+}
+
+impl ToolAdapter {
+    pub(crate) fn command_name(self) -> &'static str {
+        match self {
+            Self::ClaudeCode => "claude",
+            Self::OpenCode => "opencode",
+        }
+    }
+}
+
+pub(crate) fn detect_tool_adapter(command: &[String]) -> Option<ToolAdapter> {
+    let first = command.first()?;
+    let basename = std::path::Path::new(first)
+        .file_name()
+        .and_then(|name| name.to_str())?;
+
+    match basename {
+        "claude" => Some(ToolAdapter::ClaudeCode),
+        "opencode" => Some(ToolAdapter::OpenCode),
+        _ => None,
+    }
+}
+
 pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
     [
         ("ALL_PROXY", proxy_url.to_owned()),
@@ -79,5 +107,26 @@ mod tests {
 
         assert!(stdout.contains("NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem"));
         assert!(stdout.contains("SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem"));
+    }
+
+    #[test]
+    fn detects_claude_tool_adapter_from_command_basename() {
+        let command = vec!["/usr/local/bin/claude".to_string(), "code".to_string()];
+
+        assert_eq!(detect_tool_adapter(&command), Some(ToolAdapter::ClaudeCode));
+    }
+
+    #[test]
+    fn detects_opencode_tool_adapter_from_command_basename() {
+        let command = vec!["opencode".to_string(), "sandbox".to_string()];
+
+        assert_eq!(detect_tool_adapter(&command), Some(ToolAdapter::OpenCode));
+    }
+
+    #[test]
+    fn rejects_unsupported_tool_adapter_command() {
+        let command = vec!["python".to_string(), "script.py".to_string()];
+
+        assert_eq!(detect_tool_adapter(&command), None);
     }
 }

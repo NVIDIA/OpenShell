@@ -18,6 +18,8 @@ supervisor rewrites those placeholders back to the real secret values before for
 Access is enforced through the sandbox policy — the policy decides which outbound
 requests are allowed or denied based on the providers attached to that sandbox.
 
+Providers are only one half of the runtime contract. The other half is the tool adapter that defines how a sandboxed CLI actually receives provider context. OpenShell's first-class tool targets are currently `claude code` and `opencode`, with the expectation that future tools follow the same adapter model instead of adding bespoke credential plumbing to the sandbox supervisor.
+
 Core goals:
 
 - manage providers directly via CLI,
@@ -25,6 +27,65 @@ Core goals:
 - require providers during sandbox creation,
 - project provider context into sandbox runtime,
 - drive sandbox policy to allow or deny outbound access to third-party services.
+
+## Tool Adapter Matrix
+
+The tool adapter layer sits between generic provider discovery and the sandbox child process. It answers four questions for each first-class tool:
+
+- which env vars are allowed to appear in the child process
+- which config file paths may be projected or synthesized
+- whether a value must remain a placeholder until proxy rewrite time or may be projected directly
+- which outbound endpoint categories the tool is expected to use
+
+Current first-class targets:
+
+| Tool | Primary purpose | Expected vendor families | Notes |
+|---|---|---|---|
+| `claude code` | Anthropic-oriented coding agent CLI | Anthropic first, future adapter growth possible | Should prefer placeholder env projection and explicit config-file mapping rather than raw secret sprawl |
+| `opencode` | Open coding/runtime CLI with multiple provider backends | GitHub/Copilot, Anthropic, OpenAI-compatible families | Needs an adapter boundary that does not collapse GitHub auth, inference routing, and tool configuration into one concept |
+| Future tool adapters | Extension point | Tool-specific | Must define env/config/endpoint needs explicitly before sandbox projection is allowed |
+
+This matrix is intentionally separate from provider discovery. For example, a `github` provider may supply credentials that `opencode` can use, but the decision to project those credentials into an `opencode` child process belongs to the tool adapter contract, not the provider plugin alone.
+
+## Tool Projection Contract
+
+The sandbox projection contract is per tool, not global. The current design target is:
+
+### `claude code`
+
+- **Environment variables:** only adapter-approved Anthropic-related variables should appear in the child process, and they should prefer placeholder values that are resolved at the proxy boundary rather than raw secret values.
+- **Config files:** adapter-managed projection may eventually populate Claude-specific config or credential file locations, but only from an explicit allowlist of paths.
+- **Direct secret projection:** disallowed by default; any exception must be documented as a tool-specific requirement.
+- **Outbound endpoints:** Anthropic API endpoints plus any documented non-model support endpoints required by the tool.
+- **Vendor-auth boundary:** Anthropic credential discovery and inference routing remain provider-layer responsibilities; the `claude code` adapter only decides which approved Anthropic-facing fields can enter the child process and whether they remain placeholders until proxy rewrite time.
+
+### `opencode`
+
+- **Environment variables:** adapter-approved variables may include provider-specific keys used by `opencode`, but only when the tool contract explicitly allows them.
+- **Config files:** adapter-managed projection may populate `opencode` config file paths from an allowlisted set.
+- **Direct secret projection:** disallowed by default; exceptions require an explicit tool/vendor contract.
+- **Outbound endpoints:** GitHub/Copilot-related endpoints plus OpenAI-compatible or Anthropic-compatible inference endpoints only when the selected `opencode` adapter path explicitly supports them.
+- **Vendor-auth boundary:** GitHub token projection and any future GitHub Copilot model access must be treated as an explicit adapter contract rather than inferred from generic `github` or `opencode` provider discovery alone.
+
+### Future tool adapters
+
+Before a new tool becomes first-class, it must define:
+
+- env-var projection needs
+- config-file projection needs
+- whether any direct secret projection is unavoidable
+- outbound endpoint categories
+
+If that contract is not defined, the intended end state is for OpenShell to fail closed rather than guessing how to inject provider state into the child process. In the current Phase 1 slice, fail-closed enforcement only applies to detected first-class tool commands; all other commands still use the legacy generic projection path until later phases replace that fallback.
+
+## Vendor Auth Risk Notes
+
+The next phase of this work adds vendor-native auth/model design on top of the tool adapter layer. The critical constraints are:
+
+- Anthropic and GitHub/Copilot auth flows may require different projection shapes even when both ultimately drive model access.
+- Provider discovery does not automatically imply that a credential is safe to inject into a child process for a given tool.
+- Endpoint allowlists must be tied to explicit tool/vendor contracts, not to broad assumptions like "all GitHub endpoints" or "all Anthropic-compatible hosts".
+- If a vendor flow depends on direct config-file or session-state projection rather than placeholder env vars, that must be documented as a deliberate exception and tested separately.
 
 ## Data Model
 

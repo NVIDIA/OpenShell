@@ -3,6 +3,8 @@
 
 use std::collections::HashMap;
 
+use crate::child_env::ToolAdapter;
+
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
 #[derive(Debug, Clone, Default)]
@@ -30,6 +32,31 @@ impl SecretResolver {
         (child_env, Some(Self { by_placeholder }))
     }
 
+    pub(crate) fn from_tool_provider_env(
+        tool: ToolAdapter,
+        provider_env: HashMap<String, String>,
+    ) -> Result<(HashMap<String, String>, Option<Self>), String> {
+        if provider_env.is_empty() {
+            return Ok((HashMap::new(), None));
+        }
+
+        let allowed_keys = allowed_env_keys(tool);
+        let mut filtered = HashMap::with_capacity(provider_env.len());
+
+        for (key, value) in provider_env {
+            if !allowed_keys.contains(&key.as_str()) {
+                return Err(format!(
+                    "tool '{}' does not allow projecting provider env key '{}'",
+                    tool.command_name(),
+                    key
+                ));
+            }
+            filtered.insert(key, value);
+        }
+
+        Ok(Self::from_provider_env(filtered))
+    }
+
     pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
         self.by_placeholder.get(value).map(String::as_str)
     }
@@ -45,6 +72,19 @@ impl SecretResolver {
         let candidate = trimmed[split_at..].trim();
         let secret = self.resolve_placeholder(candidate)?;
         Some(format!("{prefix} {secret}"))
+    }
+}
+
+fn allowed_env_keys(tool: ToolAdapter) -> &'static [&'static str] {
+    match tool {
+        ToolAdapter::ClaudeCode => &["ANTHROPIC_API_KEY", "CLAUDE_API_KEY"],
+        ToolAdapter::OpenCode => &[
+            "OPENCODE_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENAI_API_KEY",
+            "GITHUB_TOKEN",
+            "GH_TOKEN",
+        ],
     }
 }
 
@@ -170,10 +210,9 @@ mod tests {
         assert!(rewritten.ends_with("\r\n\r\nhello"));
     }
 
-    /// Simulates the full round-trip: provider env → child placeholders →
-    /// HTTP headers → rewrite. This is the exact flow that occurs when a
-    /// sandbox child process reads placeholder env vars, constructs an HTTP
-    /// request, and the proxy rewrites headers before forwarding upstream.
+    /// Exercises the placeholder lifecycle in this module: provider env values
+    /// become child-visible placeholders, and placeholder-bearing HTTP headers
+    /// are rewritten to real secrets before forwarding.
     #[test]
     fn full_round_trip_child_env_to_rewritten_headers() {
         let provider_env: HashMap<String, String> = [
@@ -251,6 +290,153 @@ mod tests {
         let (child_env, resolver) = SecretResolver::from_provider_env(HashMap::new());
         assert!(child_env.is_empty());
         assert!(resolver.is_none());
+    }
+
+    #[test]
+    fn tool_projection_allows_only_documented_claude_keys() {
+        let (child_env, resolver) = SecretResolver::from_tool_provider_env(
+            ToolAdapter::ClaudeCode,
+            [
+                ("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string()),
+                ("CLAUDE_API_KEY".to_string(), "sk-alt".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("claude projection succeeds");
+
+        assert_eq!(child_env.len(), 2);
+        assert!(resolver.is_some());
+    }
+
+    #[test]
+    fn tool_projection_rejects_disallowed_claude_key() {
+        let error = SecretResolver::from_tool_provider_env(
+            ToolAdapter::ClaudeCode,
+            [
+                ("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string()),
+                ("GITHUB_TOKEN".to_string(), "gh-test".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect_err("unexpected github token must be rejected for claude tool adapter");
+
+        assert!(error
+            .contains("tool 'claude' does not allow projecting provider env key 'GITHUB_TOKEN'"));
+    }
+
+    #[test]
+    fn tool_projection_allows_documented_opencode_keys() {
+        let (child_env, resolver) = SecretResolver::from_tool_provider_env(
+            ToolAdapter::OpenCode,
+            [
+                ("OPENCODE_API_KEY".to_string(), "opc-test".to_string()),
+                ("GITHUB_TOKEN".to_string(), "gh-test".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("opencode projection succeeds");
+
+        assert_eq!(child_env.len(), 2);
+        assert!(resolver.is_some());
+    }
+
+    #[test]
+    fn tool_projection_allows_both_documented_opencode_github_tokens() {
+        let (child_env, resolver) = SecretResolver::from_tool_provider_env(
+            ToolAdapter::OpenCode,
+            [
+                ("GITHUB_TOKEN".to_string(), "ghu-test".to_string()),
+                ("GH_TOKEN".to_string(), "ghs-test".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("opencode projection succeeds for github token aliases");
+        let resolver = resolver.expect("resolver");
+
+        assert_eq!(
+            child_env.get("GITHUB_TOKEN"),
+            Some(&placeholder_for_env_key("GITHUB_TOKEN"))
+        );
+        assert_eq!(
+            child_env.get("GH_TOKEN"),
+            Some(&placeholder_for_env_key("GH_TOKEN"))
+        );
+        assert_eq!(
+            resolver.resolve_placeholder(&placeholder_for_env_key("GITHUB_TOKEN")),
+            Some("ghu-test")
+        );
+        assert_eq!(
+            resolver.resolve_placeholder(&placeholder_for_env_key("GH_TOKEN")),
+            Some("ghs-test")
+        );
+    }
+
+    #[test]
+    fn tool_projection_rejects_unrelated_opencode_key() {
+        let error = SecretResolver::from_tool_provider_env(
+            ToolAdapter::OpenCode,
+            [
+                ("GITHUB_TOKEN".to_string(), "gh-test".to_string()),
+                ("UNRELATED_TOKEN".to_string(), "nope".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect_err("unexpected keys must be rejected for opencode tool adapter");
+
+        assert!(error.contains(
+            "tool 'opencode' does not allow projecting provider env key 'UNRELATED_TOKEN'"
+        ));
+    }
+
+    #[test]
+    fn opencode_token_placeholders_resolve_only_when_forwarding_headers() {
+        let (child_env, resolver) = SecretResolver::from_tool_provider_env(
+            ToolAdapter::OpenCode,
+            [
+                ("GITHUB_TOKEN".to_string(), "ghu-test".to_string()),
+                ("GH_TOKEN".to_string(), "ghs-test".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+        )
+        .expect("opencode projection succeeds for github token aliases");
+
+        let github_placeholder = child_env.get("GITHUB_TOKEN").expect("github placeholder");
+        let gh_placeholder = child_env.get("GH_TOKEN").expect("gh placeholder");
+
+        assert_eq!(github_placeholder, &placeholder_for_env_key("GITHUB_TOKEN"));
+        assert_eq!(gh_placeholder, &placeholder_for_env_key("GH_TOKEN"));
+        assert!(!github_placeholder.contains("ghu-test"));
+        assert!(!gh_placeholder.contains("ghs-test"));
+
+        let body = format!("body={gh_placeholder}");
+
+        let raw = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Authorization: Bearer {github_placeholder}\r\n\
+             X-GitHub-Token: {gh_placeholder}\r\n\
+             Content-Length: {}\r\n\r\n\
+             {body}",
+            body.len()
+        );
+
+        assert!(raw.contains(github_placeholder));
+        assert!(raw.contains(gh_placeholder));
+        assert!(!raw.contains("ghu-test"));
+        assert!(!raw.contains("ghs-test"));
+
+        let rewritten = rewrite_http_header_block(raw.as_bytes(), resolver.as_ref());
+        let rewritten = String::from_utf8(rewritten).expect("utf8");
+
+        assert!(rewritten.contains("Authorization: Bearer ghu-test\r\n"));
+        assert!(rewritten.contains("X-GitHub-Token: ghs-test\r\n"));
+        assert!(rewritten.contains(&format!("Content-Length: {}\r\n", body.len())));
+        assert!(rewritten.ends_with(&format!("\r\n\r\nbody={gh_placeholder}")));
     }
 
     #[test]

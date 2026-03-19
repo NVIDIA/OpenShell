@@ -25,6 +25,10 @@ jobs:
       platform: linux/arm64
       runner: build-arm64
       runtime-bundle-url: ${{ vars.OPENSHELL_RUNTIME_BUNDLE_URL_ARM64 }}
+      runtime-bundle-github-repo: ${{ github.repository_owner }}/nvidia-container-toolkit
+      runtime-bundle-release-tag: devel
+      runtime-bundle-filename-prefix: openshell-gpu-runtime-bundle
+      runtime-bundle-version: devel
 
   e2e:
     needs: [build-gateway, build-cluster]
@@ -32,3 +36,4 @@ jobs:
     with:
       image-tag: ${{ github.sha }}
       runner: build-arm64
+      run-tool-smoke-validations: true

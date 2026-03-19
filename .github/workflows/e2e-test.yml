@@ -1,6 +1,27 @@
 name: E2E Test
 
 on:
+  workflow_dispatch:
+    inputs:
+      image-tag:
+        description: "Image tag to test (typically the commit SHA)"
+        required: true
+        type: string
+      runner:
+        description: "GitHub Actions runner label for the core E2E suite and optional smoke slices"
+        required: false
+        type: string
+        default: "build-amd64"
+      run-tool-smoke-validations:
+        description: "Add the first-class tool smoke evidence slice after the core E2E suite"
+        required: false
+        type: boolean
+        default: false
+      run-installer-selection-smoke:
+        description: "Add the installer selection smoke slice after the core E2E suite"
+        required: false
+        type: boolean
+        default: false
   workflow_call:
     inputs:
       image-tag:
@@ -8,10 +29,20 @@ on:
         required: true
         type: string
       runner:
-        description: "GitHub Actions runner label"
+        description: "GitHub Actions runner label for the core E2E suite and optional smoke slices"
         required: false
         type: string
         default: "build-amd64"
+      run-tool-smoke-validations:
+        description: "Add the first-class tool smoke evidence slice after the core E2E suite"
+        required: false
+        type: boolean
+        default: false
+      run-installer-selection-smoke:
+        description: "Add the installer selection smoke slice after the core E2E suite"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -62,7 +93,26 @@ jobs:
       - name: Install SSH client for Rust CLI e2e tests
         run: apt-get update && apt-get install -y --no-install-recommends openssh-client && rm -rf /var/lib/apt/lists/*
 
-      - name: Run E2E tests
+      - name: Run core E2E suite
         run: |
           mise run --no-prepare --skip-deps e2e:python
           mise run --no-prepare --skip-deps e2e:rust
+
+      - name: Record tool smoke evidence slice
+        if: ${{ inputs.run-tool-smoke-validations }}
+        run: |
+          printf 'Enabled first-class tool smoke evidence slice for image-tag=%s\n' "${IMAGE_TAG}"
+          {
+            printf '## Tool Smoke Evidence Slice\n\n'
+            printf -- '- Trigger: `run-tool-smoke-validations=true`\n'
+            printf -- '- Image tag: `%s`\n' "${IMAGE_TAG}"
+            printf -- '- Contract: run `tool_adapter_smoke` after the core E2E suite\n'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run first-class tool smoke evidence slice
+        if: ${{ inputs.run-tool-smoke-validations }}
+        run: cargo test --manifest-path e2e/rust/Cargo.toml --features e2e --test tool_adapter_smoke -- --nocapture
+
+      - name: Run installer selection smoke slice
+        if: ${{ inputs.run-installer-selection-smoke }}
+        run: bash e2e/install/bash_test.sh

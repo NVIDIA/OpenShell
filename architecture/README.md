@@ -162,6 +162,8 @@ The provider system handles:
 
 This approach means users configure credentials once, and every sandbox that needs them receives them automatically at runtime.
 
+Provider records are not the same thing as sandbox tool adapters. A provider answers "which external account or secret material does this sandbox need?" A tool adapter answers "how should a specific CLI tool such as `claude code` or `opencode` receive and use that provider context inside the sandbox?" The long-term design keeps both layers explicit so OpenShell can support multiple first-class tools without turning each provider plugin into a tool-specific one-off.
+
 For more detail, see [Providers](sandbox-providers.md).
 
 ### Inference Routing
@@ -210,6 +212,15 @@ The platform produces three container images:
 | **Cluster** | An airgapped Kubernetes image with k3s, pre-loaded sandbox and gateway images, Helm charts, and an API gateway. This is the single container that users deploy. |
 
 Builds use multi-stage Dockerfiles with caching to keep rebuild times fast. A Helm chart handles Kubernetes-level configuration (service ports, health checks, security contexts, resource limits). Build automation is managed through mise tasks.
+
+OpenShell is the top-level orchestrator, not the only producer in the install chain. The coordinated fork-owned path is split across four repos:
+
+- `libnvidia-container/` produces the low-level GPU library payload.
+- `nvidia-container-toolkit/` produces the verified runtime-bundle release assets that cluster builds consume.
+- `OpenShell-Community/` produces sandbox and base images that carry packaged tool environments.
+- `OpenShell/` consumes those outputs to assemble cluster and gateway images, apply tool/provider behavior, and expose the currently expected final setup/install interface.
+
+The final installer/setup owner is still an explicit workspace decision, but the current direction is for `OpenShell/` to remain the user-facing composition layer rather than rebuilding the other repos' responsibilities internally.
 
 For more detail, see [Container Management](build-containers.md).
 
