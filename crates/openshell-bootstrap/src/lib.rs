@@ -288,6 +288,18 @@ where
         (preflight.docker, None)
     };
 
+    // CDI is considered enabled when the daemon reports at least one CDI spec
+    // directory via `GET /info` (`SystemInfo.CDISpecDirs`). An empty list or
+    // missing field means CDI is not configured and we fall back to the legacy
+    // NVIDIA `DeviceRequest` (driver="nvidia"). Detection is best-effort —
+    // failure to query daemon info is non-fatal.
+    let cdi_supported = target_docker
+        .info()
+        .await
+        .ok()
+        .and_then(|info| info.cdi_spec_dirs)
+        .is_some_and(|dirs| !dirs.is_empty());
+
     // If an existing gateway is found, either tear it down (when recreate is
     // requested) or bail out so the caller can prompt the user / reuse it.
     if let Some(existing) = check_existing_gateway(&target_docker, &name).await? {
@@ -417,6 +429,7 @@ where
             registry_username.as_deref(),
             registry_token.as_deref(),
             gpu,
+            cdi_supported,
         )
         .await?;
         start_container(&target_docker, &name).await?;

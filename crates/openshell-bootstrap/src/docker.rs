@@ -22,6 +22,29 @@ use std::collections::HashMap;
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 
+/// Resolve the raw GPU device-ID list, replacing the `"auto"` sentinel with a
+/// concrete device ID based on whether CDI is enabled on the daemon.
+///
+/// | Input        | Output                                                       |
+/// |--------------|--------------------------------------------------------------|
+/// | `[]`         | `[]`  — no GPU                                               |
+/// | `["legacy"]` | `["legacy"]`  — pass through                                 |
+/// | `["auto"]`   | `["nvidia.com/gpu=all"]` if CDI enabled, else `["legacy"]`   |
+/// | `[cdi-ids…]` | unchanged                                                    |
+pub(crate) fn resolve_gpu_device_ids(gpu: &[String], cdi_enabled: bool) -> Vec<String> {
+    match gpu {
+        [] => vec![],
+        [v] if v == "auto" => {
+            if cdi_enabled {
+                vec!["nvidia.com/gpu=all".to_string()]
+            } else {
+                vec!["legacy".to_string()]
+            }
+        }
+        other => other.to_vec(),
+    }
+}
+
 const REGISTRY_MODE_EXTERNAL: &str = "external";
 
 fn env_non_empty(key: &str) -> Option<String> {
@@ -455,6 +478,7 @@ pub async fn ensure_container(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: bool,
+    cdi_enabled: bool,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -542,20 +566,38 @@ pub async fn ensure_container(
         ..Default::default()
     };
 
-    // When GPU support is requested, add NVIDIA device requests.
-    // This is the programmatic equivalent of `docker run --gpus all`.
-    // The NVIDIA Container Toolkit runtime hook injects /dev/nvidia* devices
-    // and GPU driver libraries from the host into the container.
+    // When GPU support is requested, inject GPU devices into the container.
+    //
+    // When the daemon reports CDI spec directories (SystemInfo.CDISpecDirs) we
+    // use an explicit CDI device request: driver="cdi" with the CDI-qualified
+    // device name "nvidia.com/gpu=all". Docker resolves this against the host
+    // CDI spec. This makes the injection declarative and decouples spec
+    // generation from spec consumption.
+    //
+    // When CDI is not enabled on the daemon, we fall back to the legacy NVIDIA
+    // device request (driver="nvidia", count=-1) which triggers the NVIDIA
+    // Container Runtime hook to inject /dev/nvidia* devices and driver libraries
+    // at container start. The failure modes for both paths are similar: if the
+    // NVIDIA Container Toolkit is not installed, or the CDI specs are
+    // stale/missing, the request will fail at container-start time.
     if gpu {
-        host_config.device_requests = Some(vec![DeviceRequest {
-            driver: Some("nvidia".to_string()),
-            count: Some(-1), // all GPUs
-            capabilities: Some(vec![vec![
-                "gpu".to_string(),
-                "utility".to_string(),
-                "compute".to_string(),
-            ]]),
-            ..Default::default()
+        host_config.device_requests = Some(vec![if cdi_enabled {
+            DeviceRequest {
+                driver: Some("cdi".to_string()),
+                device_ids: Some(vec!["nvidia.com/gpu=all".to_string()]),
+                ..Default::default()
+            }
+        } else {
+            DeviceRequest {
+                driver: Some("nvidia".to_string()),
+                count: Some(-1), // all GPUs
+                capabilities: Some(vec![vec![
+                    "gpu".to_string(),
+                    "utility".to_string(),
+                    "compute".to_string(),
+                ]]),
+                ..Default::default()
+            }
         }]);
     }
 
@@ -1194,5 +1236,54 @@ mod tests {
             sockets.len() <= 10,
             "should return a reasonable number of sockets"
         );
+    }
+
+    // --- resolve_gpu_device_ids ---
+
+    #[test]
+    fn resolve_gpu_empty_returns_empty() {
+        assert_eq!(resolve_gpu_device_ids(&[], true), Vec::<String>::new());
+        assert_eq!(resolve_gpu_device_ids(&[], false), Vec::<String>::new());
+    }
+
+    #[test]
+    fn resolve_gpu_auto_cdi_enabled() {
+        assert_eq!(
+            resolve_gpu_device_ids(&["auto".to_string()], true),
+            vec!["nvidia.com/gpu=all"],
+        );
+    }
+
+    #[test]
+    fn resolve_gpu_auto_cdi_disabled() {
+        assert_eq!(
+            resolve_gpu_device_ids(&["auto".to_string()], false),
+            vec!["legacy"],
+        );
+    }
+
+    #[test]
+    fn resolve_gpu_legacy_passthrough() {
+        assert_eq!(
+            resolve_gpu_device_ids(&["legacy".to_string()], true),
+            vec!["legacy"],
+        );
+        assert_eq!(
+            resolve_gpu_device_ids(&["legacy".to_string()], false),
+            vec!["legacy"],
+        );
+    }
+
+    #[test]
+    fn resolve_gpu_cdi_ids_passthrough() {
+        let ids = vec!["nvidia.com/gpu=all".to_string()];
+        assert_eq!(resolve_gpu_device_ids(&ids, true), ids);
+        assert_eq!(resolve_gpu_device_ids(&ids, false), ids);
+
+        let multi = vec![
+            "nvidia.com/gpu=0".to_string(),
+            "nvidia.com/gpu=1".to_string(),
+        ];
+        assert_eq!(resolve_gpu_device_ids(&multi, true), multi);
     }
 }
