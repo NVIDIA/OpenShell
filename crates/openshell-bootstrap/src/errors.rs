@@ -175,21 +175,19 @@ fn diagnose_corrupted_state(gateway_name: &str) -> GatewayFailureDiagnosis {
     GatewayFailureDiagnosis {
         summary: "Corrupted cluster state".to_string(),
         explanation: "The gateway cluster has corrupted internal state, likely from a previous \
-            interrupted startup or unclean shutdown."
+            interrupted startup or unclean shutdown. Resources from the failed deploy have been \
+            automatically cleaned up."
             .to_string(),
         recovery_steps: vec![
+            RecoveryStep::new("Retry the gateway start (cleanup was automatic)"),
             RecoveryStep::with_command(
-                "Destroy and recreate the gateway",
+                "If the retry fails, manually destroy and recreate",
                 format!(
                     "openshell gateway destroy --name {gateway_name} && openshell gateway start"
                 ),
             ),
-            RecoveryStep::with_command(
-                "If that fails, remove the volume for a clean slate",
-                format!("docker volume rm openshell-cluster-{gateway_name}"),
-            ),
         ],
-        retryable: false,
+        retryable: true,
     }
 }
 
@@ -481,6 +479,87 @@ mod tests {
         assert!(diagnosis.is_some());
         let d = diagnosis.unwrap();
         assert!(d.summary.contains("Corrupted"));
+    }
+
+    #[test]
+    fn test_diagnose_corrupted_state_is_retryable_after_auto_cleanup() {
+        // After the auto-cleanup fix (#463), corrupted state errors should be
+        // marked retryable because deploy_gateway_with_logs now automatically
+        // cleans up Docker resources on failure.
+        let d = diagnose_failure(
+            "mygw",
+            "K8s namespace not ready",
+            Some("configmaps \"extension-apiserver-authentication\" is forbidden"),
+        )
+        .expect("should match corrupted state pattern");
+        assert!(
+            d.retryable,
+            "corrupted state should be retryable after auto-cleanup"
+        );
+        assert!(
+            d.explanation.contains("automatically cleaned up"),
+            "explanation should mention automatic cleanup, got: {}",
+            d.explanation
+        );
+    }
+
+    #[test]
+    fn test_diagnose_corrupted_state_recovery_no_manual_volume_rm() {
+        // The recovery steps should no longer include a manual docker volume rm
+        // command, since cleanup is now automatic. The first step should tell
+        // the user to simply retry.
+        let d = diagnose_failure("mygw", "cannot get resource \"namespaces\"", None)
+            .expect("should match corrupted state pattern");
+
+        let all_commands: Vec<String> = d
+            .recovery_steps
+            .iter()
+            .filter_map(|s| s.command.clone())
+            .collect();
+        let all_commands_joined = all_commands.join(" ");
+
+        assert!(
+            !all_commands_joined.contains("docker volume rm"),
+            "recovery steps should not include manual docker volume rm, got: {all_commands_joined}"
+        );
+
+        // First step should be a description-only step (no command) about retrying
+        assert!(
+            d.recovery_steps[0].command.is_none(),
+            "first recovery step should be description-only (automatic cleanup)"
+        );
+        assert!(
+            d.recovery_steps[0]
+                .description
+                .contains("cleanup was automatic"),
+            "first recovery step should mention automatic cleanup"
+        );
+    }
+
+    #[test]
+    fn test_diagnose_corrupted_state_fallback_step_includes_gateway_name() {
+        // The fallback recovery step should interpolate the gateway name so
+        // users can copy-paste the command.
+        let d = diagnose_failure("my-gateway", "is forbidden", None)
+            .expect("should match corrupted state pattern");
+
+        assert!(
+            d.recovery_steps.len() >= 2,
+            "should have at least 2 recovery steps"
+        );
+        let fallback = &d.recovery_steps[1];
+        let cmd = fallback
+            .command
+            .as_deref()
+            .expect("fallback step should have a command");
+        assert!(
+            cmd.contains("my-gateway"),
+            "fallback command should contain gateway name, got: {cmd}"
+        );
+        assert!(
+            cmd.contains("openshell gateway destroy"),
+            "fallback command should include gateway destroy, got: {cmd}"
+        );
     }
 
     #[test]

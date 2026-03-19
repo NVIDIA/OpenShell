@@ -400,119 +400,143 @@ where
         ));
     }
 
-    ensure_container(
-        &target_docker,
-        &name,
-        &image_ref,
-        &extra_sans,
-        ssh_gateway_host.as_deref(),
-        port,
-        disable_tls,
-        disable_gateway_auth,
-        registry_username.as_deref(),
-        registry_token.as_deref(),
-        gpu,
-    )
-    .await?;
-    start_container(&target_docker, &name).await?;
+    // From this point on, Docker resources (container, volume, network) are
+    // being created. If any subsequent step fails, we must clean up to avoid
+    // leaving an orphaned volume in a corrupted state that blocks retries.
+    // See: https://github.com/NVIDIA/OpenShell/issues/463
+    let deploy_result: Result<GatewayMetadata> = async {
+        ensure_container(
+            &target_docker,
+            &name,
+            &image_ref,
+            &extra_sans,
+            ssh_gateway_host.as_deref(),
+            port,
+            disable_tls,
+            disable_gateway_auth,
+            registry_username.as_deref(),
+            registry_token.as_deref(),
+            gpu,
+        )
+        .await?;
+        start_container(&target_docker, &name).await?;
 
-    // Clean up stale k3s nodes left over from previous container instances that
-    // used the same persistent volume. Without this, pods remain scheduled on
-    // NotReady ghost nodes and the health check will time out.
-    match clean_stale_nodes(&target_docker, &name).await {
-        Ok(0) => {}
-        Ok(n) => tracing::debug!("removed {n} stale node(s)"),
-        Err(err) => {
-            tracing::debug!("stale node cleanup failed (non-fatal): {err}");
+        // Clean up stale k3s nodes left over from previous container instances that
+        // used the same persistent volume. Without this, pods remain scheduled on
+        // NotReady ghost nodes and the health check will time out.
+        match clean_stale_nodes(&target_docker, &name).await {
+            Ok(0) => {}
+            Ok(n) => tracing::debug!("removed {n} stale node(s)"),
+            Err(err) => {
+                tracing::debug!("stale node cleanup failed (non-fatal): {err}");
+            }
         }
-    }
 
-    // Reconcile PKI: reuse existing cluster TLS secrets if they are complete and
-    // valid; only generate fresh PKI when secrets are missing, incomplete,
-    // malformed, or expiring within MIN_REMAINING_VALIDITY_DAYS.
-    //
-    // Ordering is: reconcile secrets -> (if rotated and workload exists:
-    // rollout restart and wait) -> persist CLI-side bundle.
-    //
-    // We check workload presence before reconciliation. On a fresh/recreated
-    // cluster, secrets are always newly generated and a restart is unnecessary.
-    // Restarting only when workload pre-existed avoids extra rollout latency.
-    let workload_existed_before_pki = openshell_workload_exists(&target_docker, &name).await?;
-    let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
+        // Reconcile PKI: reuse existing cluster TLS secrets if they are complete and
+        // valid; only generate fresh PKI when secrets are missing, incomplete,
+        // malformed, or expiring within MIN_REMAINING_VALIDITY_DAYS.
+        //
+        // Ordering is: reconcile secrets -> (if rotated and workload exists:
+        // rollout restart and wait) -> persist CLI-side bundle.
+        //
+        // We check workload presence before reconciliation. On a fresh/recreated
+        // cluster, secrets are always newly generated and a restart is unnecessary.
+        // Restarting only when workload pre-existed avoids extra rollout latency.
+        let workload_existed_before_pki = openshell_workload_exists(&target_docker, &name).await?;
+        let (pki_bundle, rotated) = reconcile_pki(&target_docker, &name, &extra_sans, &log).await?;
 
-    if rotated && workload_existed_before_pki {
-        // If an openshell workload is already running, it must be restarted so
-        // it picks up the new TLS secrets before we write CLI-side certs.
-        // A failed rollout is a hard error — CLI certs must not be persisted
-        // if the server cannot come up with the new PKI.
-        restart_openshell_deployment(&target_docker, &name).await?;
-    }
+        if rotated && workload_existed_before_pki {
+            // If an openshell workload is already running, it must be restarted so
+            // it picks up the new TLS secrets before we write CLI-side certs.
+            // A failed rollout is a hard error — CLI certs must not be persisted
+            // if the server cannot come up with the new PKI.
+            restart_openshell_deployment(&target_docker, &name).await?;
+        }
 
-    store_pki_bundle(&name, &pki_bundle)?;
+        store_pki_bundle(&name, &pki_bundle)?;
 
-    // Push locally-built component images into the k3s containerd runtime.
-    // This is the "push" path for local development — images are exported from
-    // the local Docker daemon and streamed into the cluster's containerd so
-    // k3s can resolve them without pulling from the remote registry.
-    if remote_opts.is_none()
-        && let Ok(push_images_str) = std::env::var("OPENSHELL_PUSH_IMAGES")
-    {
-        let images: Vec<&str> = push_images_str
-            .split(',')
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .collect();
-        if !images.is_empty() {
-            log("[status] Deploying components".to_string());
-            let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
-            let container = container_name(&name);
+        // Push locally-built component images into the k3s containerd runtime.
+        // This is the "push" path for local development — images are exported from
+        // the local Docker daemon and streamed into the cluster's containerd so
+        // k3s can resolve them without pulling from the remote registry.
+        if remote_opts.is_none()
+            && let Ok(push_images_str) = std::env::var("OPENSHELL_PUSH_IMAGES")
+        {
+            let images: Vec<&str> = push_images_str
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !images.is_empty() {
+                log("[status] Deploying components".to_string());
+                let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
+                let container = container_name(&name);
+                let on_log_ref = Arc::clone(&on_log);
+                let mut push_log = move |msg: String| {
+                    if let Ok(mut f) = on_log_ref.lock() {
+                        f(msg);
+                    }
+                };
+                push::push_local_images(
+                    &local_docker,
+                    &target_docker,
+                    &container,
+                    &images,
+                    &mut push_log,
+                )
+                .await?;
+
+                restart_openshell_deployment(&target_docker, &name).await?;
+            }
+        }
+
+        log("[status] Starting gateway".to_string());
+        {
+            // Create a short-lived closure that locks on each call rather than holding
+            // the MutexGuard across await points.
             let on_log_ref = Arc::clone(&on_log);
-            let mut push_log = move |msg: String| {
+            let mut gateway_log = move |msg: String| {
                 if let Ok(mut f) = on_log_ref.lock() {
                     f(msg);
                 }
             };
-            push::push_local_images(
-                &local_docker,
-                &target_docker,
-                &container,
-                &images,
-                &mut push_log,
-            )
-            .await?;
+            wait_for_gateway_ready(&target_docker, &name, &mut gateway_log).await?;
+        }
 
-            restart_openshell_deployment(&target_docker, &name).await?;
+        // Create and store gateway metadata.
+        let metadata = create_gateway_metadata_with_host(
+            &name,
+            remote_opts.as_ref(),
+            port,
+            ssh_gateway_host.as_deref(),
+            disable_tls,
+        );
+        store_gateway_metadata(&name, &metadata)?;
+
+        Ok(metadata)
+    }
+    .await;
+
+    match deploy_result {
+        Ok(metadata) => Ok(GatewayHandle {
+            name,
+            metadata,
+            docker: target_docker,
+        }),
+        Err(deploy_err) => {
+            // Automatically clean up Docker resources (volume, container, network,
+            // image) so the environment is left in a retryable state.
+            tracing::info!("deploy failed, cleaning up gateway resources for '{name}'");
+            if let Err(cleanup_err) = destroy_gateway_resources(&target_docker, &name).await {
+                tracing::warn!(
+                    "automatic cleanup after failed deploy also failed: {cleanup_err}. \
+                     Manual cleanup may be required: \
+                     openshell gateway destroy --name {name}"
+                );
+            }
+            Err(deploy_err)
         }
     }
-
-    log("[status] Starting gateway".to_string());
-    {
-        // Create a short-lived closure that locks on each call rather than holding
-        // the MutexGuard across await points.
-        let on_log_ref = Arc::clone(&on_log);
-        let mut gateway_log = move |msg: String| {
-            if let Ok(mut f) = on_log_ref.lock() {
-                f(msg);
-            }
-        };
-        wait_for_gateway_ready(&target_docker, &name, &mut gateway_log).await?;
-    }
-
-    // Create and store gateway metadata.
-    let metadata = create_gateway_metadata_with_host(
-        &name,
-        remote_opts.as_ref(),
-        port,
-        ssh_gateway_host.as_deref(),
-        disable_tls,
-    );
-    store_gateway_metadata(&name, &metadata)?;
-
-    Ok(GatewayHandle {
-        name,
-        metadata,
-        docker: target_docker,
-    })
 }
 
 /// Get a handle to an existing gateway.
