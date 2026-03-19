@@ -1248,19 +1248,27 @@ pub(crate) async fn deploy_gateway_with_panel(
                     "x".red().bold(),
                     "Gateway failed:".red().bold(),
                 );
+                // Fetch container logs for pattern-based diagnosis
+                let container_logs = openshell_bootstrap::fetch_gateway_logs(name, 80).await;
+                let logs_opt = if container_logs.is_empty() {
+                    None
+                } else {
+                    Some(container_logs.as_str())
+                };
                 // Try to diagnose the failure and provide guidance
                 let err_str = format!("{err:?}");
-                if let Some(diagnosis) =
-                    openshell_bootstrap::errors::diagnose_failure(name, &err_str, None)
-                {
-                    print_failure_diagnosis(&diagnosis);
-                }
+                let diagnosis =
+                    openshell_bootstrap::errors::diagnose_failure(name, &err_str, logs_opt)
+                        .unwrap_or_else(|| {
+                            openshell_bootstrap::errors::generic_failure_diagnosis(name)
+                        });
+                print_failure_diagnosis(&diagnosis);
                 Err(err)
             }
         }
     } else {
         eprintln!("Deploying {location} gateway {name}...");
-        let handle = openshell_bootstrap::deploy_gateway_with_logs(options, |line| {
+        let result = openshell_bootstrap::deploy_gateway_with_logs(options, |line| {
             if let Some(status) = line.strip_prefix("[status] ") {
                 eprintln!("  {status}");
             } else if line.strip_prefix("[progress] ").is_some() {
@@ -1269,9 +1277,35 @@ pub(crate) async fn deploy_gateway_with_panel(
                 eprintln!("  {line}");
             }
         })
-        .await?;
-        eprintln!("Gateway {name} ready.");
-        Ok(handle)
+        .await;
+        match result {
+            Ok(handle) => {
+                eprintln!("Gateway {name} ready.");
+                Ok(handle)
+            }
+            Err(err) => {
+                eprintln!(
+                    "{} {} {name}",
+                    "x".red().bold(),
+                    "Gateway failed:".red().bold(),
+                );
+                // Fetch container logs for pattern-based diagnosis
+                let container_logs = openshell_bootstrap::fetch_gateway_logs(name, 80).await;
+                let logs_opt = if container_logs.is_empty() {
+                    None
+                } else {
+                    Some(container_logs.as_str())
+                };
+                let err_str = format!("{err:?}");
+                let diagnosis =
+                    openshell_bootstrap::errors::diagnose_failure(name, &err_str, logs_opt)
+                        .unwrap_or_else(|| {
+                            openshell_bootstrap::errors::generic_failure_diagnosis(name)
+                        });
+                print_failure_diagnosis(&diagnosis);
+                Err(err)
+            }
+        }
     }
 }
 

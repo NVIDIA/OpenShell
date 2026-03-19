@@ -450,14 +450,18 @@ pub fn generic_failure_diagnosis(gateway_name: &str) -> GatewayFailureDiagnosis 
         explanation: "The gateway encountered an unexpected error during startup.".to_string(),
         recovery_steps: vec![
             RecoveryStep::with_command(
+                "Check container logs for details",
+                format!("openshell doctor logs --name {gateway_name}"),
+            ),
+            RecoveryStep::with_command(
+                "Run diagnostics",
+                format!("openshell doctor check --name {gateway_name}"),
+            ),
+            RecoveryStep::with_command(
                 "Try destroying and recreating the gateway",
                 format!(
                     "openshell gateway destroy --name {gateway_name} && openshell gateway start"
                 ),
-            ),
-            RecoveryStep::with_command(
-                "Check container logs for details",
-                format!("docker logs openshell-cluster-{gateway_name}"),
             ),
             RecoveryStep::new(
                 "If the issue persists, report it at https://github.com/nvidia/openshell/issues",
