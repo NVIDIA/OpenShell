@@ -236,6 +236,57 @@ fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
 }
 
+/// Discover upstream DNS resolvers from systemd-resolved's configuration.
+///
+/// Only reads `/run/systemd/resolve/resolv.conf` — the upstream resolver file
+/// maintained by systemd-resolved. This file is only present on Linux hosts
+/// running systemd-resolved (e.g., Ubuntu), so the function is a no-op on
+/// macOS, Windows/WSL, and non-systemd Linux distributions.
+///
+/// We intentionally do NOT fall back to `/etc/resolv.conf` here. On Docker
+/// Desktop (macOS/Windows), `/etc/resolv.conf` may contain non-loopback
+/// resolvers that appear valid but are unreachable via direct UDP from inside
+/// the container's network stack. Those environments rely on the entrypoint's
+/// iptables DNAT proxy to Docker's embedded DNS — sniffing host resolvers
+/// would bypass that proxy and break DNS.
+///
+/// Returns an empty vec if no usable resolvers are found.
+fn resolve_upstream_dns() -> Vec<String> {
+    let paths = ["/run/systemd/resolve/resolv.conf"];
+
+    for path in &paths {
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let resolvers: Vec<String> = contents
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim();
+                    if !line.starts_with("nameserver") {
+                        return None;
+                    }
+                    let ip = line.split_whitespace().nth(1)?;
+                    if ip.starts_with("127.") || ip == "::1" {
+                        return None;
+                    }
+                    Some(ip.to_string())
+                })
+                .collect();
+
+            if !resolvers.is_empty() {
+                tracing::debug!(
+                    "Discovered {} upstream DNS resolver(s) from {}: {}",
+                    resolvers.len(),
+                    path,
+                    resolvers.join(", "),
+                );
+                return resolvers;
+            }
+        }
+    }
+
+    tracing::debug!("No upstream DNS resolvers found in host resolver config");
+    Vec::new()
+}
+
 /// Create an SSH Docker client from remote options.
 pub async fn create_ssh_docker_client(remote: &RemoteOptions) -> Result<Docker> {
     // Ensure destination has ssh:// prefix
@@ -455,6 +506,7 @@ pub async fn ensure_container(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: bool,
+    is_remote: bool,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -673,6 +725,17 @@ pub async fn ensure_container(
     // HelmChart CR so k8s workloads can request nvidia.com/gpu resources.
     if gpu {
         env_vars.push("GPU_ENABLED=true".to_string());
+    }
+
+    // Pass upstream DNS resolvers discovered on the host so the entrypoint
+    // can configure k3s without probing files inside the container.
+    // Skip for remote deploys — the local host's resolvers are likely wrong
+    // for the remote Docker host (different network, split-horizon DNS, etc.).
+    if !is_remote {
+        let upstream_dns = resolve_upstream_dns();
+        if !upstream_dns.is_empty() {
+            env_vars.push(format!("UPSTREAM_DNS={}", upstream_dns.join(",")));
+        }
     }
 
     let env = Some(env_vars);
@@ -1194,5 +1257,113 @@ mod tests {
             sockets.len() <= 10,
             "should return a reasonable number of sockets"
         );
+    }
+
+    #[test]
+    fn resolve_upstream_dns_filters_loopback() {
+        // This test validates the function runs without panic on the current host.
+        // The exact output depends on the host's DNS config, but loopback
+        // addresses must never appear in the result.
+        let resolvers = resolve_upstream_dns();
+        for r in &resolvers {
+            assert!(
+                !r.starts_with("127."),
+                "IPv4 loopback should be filtered: {r}"
+            );
+            assert_ne!(r, "::1", "IPv6 loopback should be filtered");
+        }
+    }
+
+    #[test]
+    fn resolve_upstream_dns_returns_vec() {
+        // Verify the function returns a vec (may be empty in some CI environments
+        // where no resolv.conf exists, but should never panic).
+        let resolvers = resolve_upstream_dns();
+        assert!(
+            resolvers.len() <= 20,
+            "should return a reasonable number of resolvers"
+        );
+    }
+
+    /// Helper: parse resolv.conf content using the same logic as resolve_upstream_dns().
+    /// Allows deterministic testing without depending on host DNS config.
+    fn parse_resolv_conf(contents: &str) -> Vec<String> {
+        contents
+            .lines()
+            .filter_map(|line| {
+                let line = line.trim();
+                if !line.starts_with("nameserver") {
+                    return None;
+                }
+                let ip = line.split_whitespace().nth(1)?;
+                if ip.starts_with("127.") || ip == "::1" {
+                    return None;
+                }
+                Some(ip.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn parse_resolv_conf_filters_ipv4_loopback() {
+        let input = "nameserver 127.0.0.1\nnameserver 127.0.0.53\nnameserver 127.0.0.11\n";
+        assert!(parse_resolv_conf(input).is_empty());
+    }
+
+    #[test]
+    fn parse_resolv_conf_filters_ipv6_loopback() {
+        let input = "nameserver ::1\n";
+        assert!(parse_resolv_conf(input).is_empty());
+    }
+
+    #[test]
+    fn parse_resolv_conf_passes_real_resolvers() {
+        let input = "nameserver 8.8.8.8\nnameserver 1.1.1.1\n";
+        assert_eq!(parse_resolv_conf(input), vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_mixed_loopback_and_real() {
+        let input =
+            "nameserver 127.0.0.53\nnameserver ::1\nnameserver 10.0.0.1\nnameserver 172.16.0.1\n";
+        assert_eq!(parse_resolv_conf(input), vec!["10.0.0.1", "172.16.0.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_ignores_comments_and_other_lines() {
+        let input =
+            "# nameserver 8.8.8.8\nsearch example.com\noptions ndots:5\nnameserver 1.1.1.1\n";
+        assert_eq!(parse_resolv_conf(input), vec!["1.1.1.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_handles_tabs_and_extra_spaces() {
+        let input = "nameserver\t8.8.8.8\nnameserver     1.1.1.1\n";
+        assert_eq!(parse_resolv_conf(input), vec!["8.8.8.8", "1.1.1.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_empty_input() {
+        assert!(parse_resolv_conf("").is_empty());
+        assert!(parse_resolv_conf("   \n\n").is_empty());
+    }
+
+    #[test]
+    fn parse_resolv_conf_bare_nameserver_keyword() {
+        assert!(parse_resolv_conf("nameserver\n").is_empty());
+        assert!(parse_resolv_conf("nameserver   \n").is_empty());
+    }
+
+    #[test]
+    fn parse_resolv_conf_systemd_resolved_typical() {
+        let input =
+            "# This is /run/systemd/resolve/resolv.conf\nnameserver 192.168.1.1\nsearch lan\n";
+        assert_eq!(parse_resolv_conf(input), vec!["192.168.1.1"]);
+    }
+
+    #[test]
+    fn parse_resolv_conf_crlf_line_endings() {
+        let input = "nameserver 8.8.8.8\r\nnameserver 1.1.1.1\r\n";
+        assert_eq!(parse_resolv_conf(input), vec!["8.8.8.8", "1.1.1.1"]);
     }
 }

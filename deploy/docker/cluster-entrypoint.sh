@@ -69,7 +69,46 @@ wait_for_default_route() {
 #   3. Adding DNAT rules so traffic to <eth0_ip>:53 reaches Docker's DNS
 #   4. Writing that IP into the k3s resolv.conf
 
+# Extract upstream DNS resolvers reachable from k3s pod namespaces.
+# Docker's embedded DNS (127.0.0.11) is namespace-local — DNAT to it from
+# pod traffic is dropped as a martian packet. Use real upstream servers instead.
+#
+# Priority:
+#   1. UPSTREAM_DNS env var (set by bootstrap, comma-separated)
+#   2. /etc/resolv.conf (fallback for non-bootstrap launches)
+get_upstream_resolvers() {
+    local resolvers=""
+
+    # Bootstrap-provided resolvers (sniffed from host by the Rust bootstrap crate)
+    if [ -n "${UPSTREAM_DNS:-}" ]; then
+        resolvers=$(printf '%s\n' "$UPSTREAM_DNS" | tr ',' '\n' | \
+            awk '{ip=$1; if(ip !~ /^127\./ && ip != "::1" && ip != "") print ip}')
+    fi
+
+    # Fallback: Docker-generated resolv.conf may have non-loopback servers
+    if [ -z "$resolvers" ]; then
+        resolvers=$(awk '/^nameserver/{ip=$2; gsub(/\r/,"",ip); if(ip !~ /^127\./ && ip != "::1") print ip}' \
+            /etc/resolv.conf)
+    fi
+
+    echo "$resolvers"
+}
+
 setup_dns_proxy() {
+    # Prefer upstream resolvers that work across network namespaces.
+    # This avoids the DNAT-to-loopback problem on systemd-resolved hosts.
+    UPSTREAM_DNS=$(get_upstream_resolvers)
+    if [ -n "$UPSTREAM_DNS" ]; then
+        : > "$RESOLV_CONF"
+        echo "$UPSTREAM_DNS" | while read -r ns; do
+            [ -n "$ns" ] && echo "nameserver $ns" >> "$RESOLV_CONF"
+        done
+        echo "DNS: using upstream resolvers directly (avoids cross-namespace DNAT)"
+        cat "$RESOLV_CONF"
+        return 0
+    fi
+
+    # Fall back to DNAT proxy when no upstream resolvers are available.
     # Extract Docker's actual DNS listener ports from the DOCKER_OUTPUT chain.
     # Docker sets up rules like:
     #   -A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j DNAT --to-destination 127.0.0.11:<port>
@@ -160,6 +199,8 @@ verify_dns() {
         sleep 1
         i=$((i + 1))
     done
+    echo "Warning: DNS verification failed for $lookup_host after $attempts attempts"
+    echo "  resolv.conf: $(head -3 "$RESOLV_CONF" 2>/dev/null)"
     return 1
 }
 
