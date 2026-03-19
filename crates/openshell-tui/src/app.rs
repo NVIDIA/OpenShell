@@ -431,6 +431,10 @@ pub struct App {
     // Middle pane tab (providers vs global settings)
     pub middle_pane_tab: MiddlePaneTab,
 
+    // Global policy indicator (dashboard)
+    pub global_policy_active: bool,
+    pub global_policy_version: u32,
+
     // Global settings
     pub global_settings: Vec<GlobalSettingEntry>,
     pub global_settings_selected: usize,
@@ -563,6 +567,8 @@ impl App {
             gateway_selected: 0,
             pending_gateway_switch: None,
             middle_pane_tab: MiddlePaneTab::Providers,
+            global_policy_active: false,
+            global_policy_version: 0,
             global_settings: Vec::new(),
             global_settings_selected: 0,
             global_settings_revision: 0,

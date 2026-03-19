@@ -1881,6 +1881,31 @@ async fn refresh_global_settings(app: &mut App) {
             app.apply_global_settings(inner.settings, inner.settings_revision);
         }
     }
+
+    // Check for active global policy.
+    let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
+        name: String::new(),
+        limit: 1,
+        offset: 0,
+        global: true,
+    };
+    if let Ok(Ok(resp)) = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.client.list_sandbox_policies(policy_req),
+    )
+    .await
+    {
+        let revisions = resp.into_inner().revisions;
+        if let Some(latest) = revisions.first() {
+            let status =
+                openshell_core::proto::PolicyStatus::try_from(latest.status).unwrap_or_default();
+            app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
+            app.global_policy_version = latest.version;
+        } else {
+            app.global_policy_active = false;
+            app.global_policy_version = 0;
+        }
+    }
 }
 
 fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
