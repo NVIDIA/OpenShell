@@ -94,8 +94,8 @@ pub fn parse_bool_like(raw: &str) -> Option<bool> {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_bool_like, registered_keys_csv, setting_for_key, RegisteredSetting, SettingValueKind,
-        REGISTERED_SETTINGS,
+        REGISTERED_SETTINGS, RegisteredSetting, SettingValueKind, parse_bool_like,
+        registered_keys_csv, setting_for_key,
     };
 
     #[cfg(feature = "dev-settings")]
