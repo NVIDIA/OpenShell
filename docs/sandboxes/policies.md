@@ -73,7 +73,7 @@ Dynamic sections can be updated on a running sandbox with `openshell policy set`
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (use the highest ABI the host kernel supports) or `hard_requirement` (fail if the required ABI is unavailable). |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to reach them. <br>Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). <br>Additionally, `external_resolver` can be used to dynamically fetch secrets (like API keys) and inject them into the `Authorization` header. <br>Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
 
 ## Apply a Custom Policy
 
@@ -229,6 +229,28 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
 ```
 
 Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspection — the proxy decrypts TLS and checks each HTTP request against the `rules` list.
+::::
+
+::::{tab-item} External secrets
+Dynamically fetch an API key from an internal sidecar before forwarding the request to OpenAI. The key is injected into the `Authorization: Bearer` header.
+
+```yaml
+  openai:
+    name: openai
+    endpoints:
+      - host: api.openai.com
+        port: 443
+        protocol: rest
+        tls: terminate
+        external_resolver:
+          url: "http://secret-resolver:8080/token"
+          method: "POST"
+          body_template: '{"sandbox_id": "{sandbox_id}", "target": "{host}"}'
+    binaries:
+      - { path: /usr/local/bin/claude }
+```
+
+When the `claude` binary connects to `api.openai.com`, the supervisor first calls the `external_resolver` URL, extracts the secret from the JSON response, and injects it as a Bearer token.
 ::::
 
 :::::

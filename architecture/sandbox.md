@@ -31,7 +31,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers |
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation |
-| `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
+| `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing, deny response generation, and **Authorization header injection** |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
 
 ## Startup and Orchestration
@@ -281,7 +281,9 @@ The proxy calls `evaluate_network_action()` (not `evaluate_network()`) as its ma
 
 ### L7 endpoint config query
 
-After L4 allows a connection, `query_endpoint_config(input)` evaluates `data.openshell.sandbox.matched_endpoint_config` to get the full endpoint object. If the endpoint has a `protocol` field, `l7::parse_l7_config()` extracts the L7 config for protocol-aware inspection.
+After L4 allows a connection, `query_endpoint_config(input)` evaluates `data.openshell.sandbox.matched_endpoint_config` to get the full endpoint object. If the endpoint has a `protocol` field, `l7::parse_l7_config()` extracts the L7 config (including any `external_resolver` settings) for protocol-aware inspection.
+
+If an `external_resolver` is present, `l7::relay::resolve_external_secret()` is called to fetch a dynamic secret from an external API using a configurable HTTP method and JSON body template. This secret is then passed to the L7 REST relay and injected into the outbound request's `Authorization: Bearer` header.
 
 ### Engine cloning for L7
 

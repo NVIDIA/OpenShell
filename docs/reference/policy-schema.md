@@ -164,6 +164,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
+| `external_resolver` | object | No | Configuration for fetching secrets from an external API. Only relevant when `protocol` is `rest`. |
 
 #### Access Levels
 
@@ -183,6 +184,16 @@ Used when `access` is not set. Each rule explicitly allows a method and path com
 |---|---|---|---|
 | `allow.method` | string | Yes | HTTP method to allow (for example, `GET`, `POST`). |
 | `allow.path` | string | Yes | URL path pattern. Supports `*` and `**` glob syntax. |
+
+#### External Resolver Object
+
+Used to fetch dynamic secrets (like API keys) from an external service before forwarding a request.
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `url` | string | Yes | The URL of the external resolver service. |
+| `method` | string | No | HTTP method to use (e.g., `POST`, `GET`). Default: `GET`. |
+| `body_template` | string | No | JSON body template for the request. Supports placeholders: `{sandbox_id}`, `{host}`, `{port}`, `{binary}`. |
 
 Example with rules:
 

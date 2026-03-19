@@ -415,6 +415,17 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
 | `allowed_ips`  | `string[]` | `[]`            | IP allowlist for SSRF override. See [Private IP Access via `allowed_ips`](#private-ip-access-via-allowed_ips).       |
+| `external_resolver` | `ExternalResolver`| `None` | Configuration for dynamic secret resolution via external API. Only for `protocol: rest`. |
+
+#### `ExternalResolver`
+
+Defines an external API to call for fetching secrets (e.g., API keys) before forwarding a request.
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `url` | `string` | Yes | The URL of the external resolver service. |
+| `method` | `string` | No | HTTP method to use (e.g., `POST`, `GET`). Default: `GET`. |
+| `body_template` | `string` | No | JSON body template with placeholders: `{sandbox_id}`, `{host}`, `{port}`, `{binary}`. |
 
 #### `NetworkBinary`
 
