@@ -1,0 +1,167 @@
+{
+    "attributes": [
+        {
+            "args": {
+                "type": "string_t",
+                "description": "The arguments sent along with the HTTP request.",
+                "requirement": "optional",
+                "caption": "HTTP Arguments",
+                "type_name": "String",
+                "_source": "http_request"
+            }
+        },
+        {
+            "version": {
+                "type": "string_t",
+                "description": "The Hypertext Transfer Protocol (HTTP) version.",
+                "requirement": "recommended",
+                "caption": "HTTP Version",
+                "type_name": "String",
+                "_source": "http_request"
+            }
+        },
+        {
+            "length": {
+                "type": "integer_t",
+                "description": "The length of the entire HTTP request, in number of bytes.",
+                "requirement": "optional",
+                "caption": "Request Length",
+                "type_name": "Integer",
+                "_source": "http_request"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the http request.",
+                "requirement": "optional",
+                "caption": "Unique ID",
+                "type_name": "String",
+                "_source": "http_request"
+            }
+        },
+        {
+            "url": {
+                "type": "object_t",
+                "description": "The URL object that pertains to the request.",
+                "requirement": "recommended",
+                "caption": "URL",
+                "object_name": "Uniform Resource Locator",
+                "object_type": "url",
+                "_source": "http_request"
+            }
+        },
+        {
+            "body_length": {
+                "type": "integer_t",
+                "description": "The actual length of the HTTP request body, in number of bytes, independent of a potentially existing Content-Length header.",
+                "requirement": "optional",
+                "caption": "Request Body Length",
+                "type_name": "Integer",
+                "_source": "http_request"
+            }
+        },
+        {
+            "user_agent": {
+                "type": "string_t",
+                "description": "The request header that identifies the operating system and web browser.",
+                "requirement": "recommended",
+                "caption": "HTTP User-Agent",
+                "type_name": "String",
+                "observable": 16,
+                "_source": "http_request"
+            }
+        },
+        {
+            "http_headers": {
+                "type": "object_t",
+                "description": "Additional HTTP headers of an HTTP request or response.",
+                "is_array": true,
+                "requirement": "recommended",
+                "caption": "HTTP Headers",
+                "object_name": "HTTP Header",
+                "object_type": "http_header",
+                "_source": "http_request"
+            }
+        },
+        {
+            "http_method": {
+                "type": "string_t",
+                "enum": {
+                    "OPTIONS": {
+                        "description": "The OPTIONS method describes the communication options for the target resource.",
+                        "caption": "Options"
+                    },
+                    "GET": {
+                        "description": "The GET method requests a representation of the specified resource. Requests using GET should only retrieve data.",
+                        "caption": "Get"
+                    },
+                    "HEAD": {
+                        "description": "The HEAD method asks for a response identical to a GET request, but without the response body.",
+                        "caption": "Head"
+                    },
+                    "POST": {
+                        "description": "The POST method submits an entity to the specified resource, often causing a change in state or side effects on the server.",
+                        "caption": "Post"
+                    },
+                    "PUT": {
+                        "description": "The PUT method replaces all current representations of the target resource with the request payload.",
+                        "caption": "Put"
+                    },
+                    "DELETE": {
+                        "description": "The DELETE method deletes the specified resource.",
+                        "caption": "Delete"
+                    },
+                    "TRACE": {
+                        "description": "The TRACE method performs a message loop-back test along the path to the target resource.",
+                        "caption": "Trace"
+                    },
+                    "CONNECT": {
+                        "description": "The CONNECT method establishes a tunnel to the server identified by the target resource.",
+                        "caption": "Connect"
+                    },
+                    "PATCH": {
+                        "description": "The PATCH method applies partial modifications to a resource.",
+                        "caption": "Patch"
+                    }
+                },
+                "description": "The <a target='_blank' href='https://developer.mozilla.org/en-US/docs/Web/HTTP/Methods'>HTTP request method</a> indicates the desired action to be performed for a given resource.",
+                "requirement": "recommended",
+                "caption": "HTTP Method",
+                "type_name": "String",
+                "_source": "http_request"
+            }
+        },
+        {
+            "referrer": {
+                "type": "string_t",
+                "description": "The request header that identifies the address of the previous web page, which is linked to the current web page or resource being requested.",
+                "requirement": "optional",
+                "caption": "HTTP Referrer",
+                "type_name": "String",
+                "_source": "http_request"
+            }
+        },
+        {
+            "x_forwarded_for": {
+                "type": "ip_t",
+                "description": "The X-Forwarded-For header identifying the originating IP address(es) of a client connecting to a web server through an HTTP proxy or a load balancer.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "X-Forwarded-For",
+                "type_name": "IP Address",
+                "_source": "http_request"
+            }
+        }
+    ],
+    "name": "http_request",
+    "description": "The HTTP Request object represents the attributes of a request made to a web server. It encapsulates the details and metadata associated with an HTTP request, including the request method, headers, URL, query parameters, body content, and other relevant information.",
+    "extends": "object",
+    "references": [
+        {
+            "description": "D3FEND\u2122 Ontology d3f:OutboundInternetNetworkTraffic.",
+            "url": "https://d3fend.mitre.org/dao/artifact/d3f:OutboundInternetNetworkTraffic/"
+        }
+    ],
+    "caption": "HTTP Request"
+}

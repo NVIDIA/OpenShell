@@ -1,0 +1,74 @@
+{
+    "attributes": [
+        {
+            "desc": {
+                "type": "string_t",
+                "description": "The description of the remediation strategy.",
+                "requirement": "required",
+                "caption": "Description",
+                "type_name": "String",
+                "_source": "remediation"
+            }
+        },
+        {
+            "references": {
+                "type": "string_t",
+                "description": "A list of supporting URL/s, references that help describe the remediation strategy.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "References",
+                "type_name": "String",
+                "_source": "remediation"
+            }
+        },
+        {
+            "cis_controls": {
+                "type": "object_t",
+                "description": "An array of Center for Internet Security (CIS) Controls that can be optionally mapped to provide additional remediation details.",
+                "is_array": true,
+                "references": [
+                    {
+                        "description": "Center For Internet Security Controls",
+                        "url": "https://www.cisecurity.org/controls/"
+                    }
+                ],
+                "requirement": "optional",
+                "caption": "CIS Controls",
+                "object_name": "CIS Control",
+                "object_type": "cis_control",
+                "_source": "remediation"
+            }
+        },
+        {
+            "kb_article_list": {
+                "type": "object_t",
+                "description": "A list of KB articles or patches related to an endpoint. A KB Article contains metadata that describes the patch or an update.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Knowledgebase Articles",
+                "object_name": "KB Article",
+                "object_type": "kb_article",
+                "_source": "remediation"
+            }
+        },
+        {
+            "kb_articles": {
+                "type": "string_t",
+                "description": "The KB article/s related to the entity. A KB Article contains metadata that describes the patch or an update.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Knowledgebase Articles",
+                "type_name": "String",
+                "@deprecated": {
+                    "message": "Use the <code>kb_article_list</code> attribute instead.",
+                    "since": "1.1.0"
+                },
+                "_source": "remediation"
+            }
+        }
+    ],
+    "name": "remediation",
+    "description": "The Remediation object describes the recommended remediation steps to address identified issue(s).",
+    "extends": "object",
+    "caption": "Remediation"
+}

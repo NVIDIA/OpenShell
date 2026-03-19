@@ -1,0 +1,428 @@
+{
+    "attributes": [
+        {
+            "data": {
+                "type": "json_t",
+                "description": "Additional evidence data that is not accounted for in the specific evidence attributes.<code> Use only when absolutely necessary.</code>",
+                "requirement": "optional",
+                "caption": "Data",
+                "type_name": "JSON",
+                "_source": "evidences"
+            }
+        },
+        {
+            "http_response": {
+                "type": "object_t",
+                "description": "Describes details about the http response associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "HTTP Response",
+                "object_name": "HTTP Response",
+                "object_type": "http_response",
+                "_source": "evidences"
+            }
+        },
+        {
+            "http_request": {
+                "type": "object_t",
+                "description": "Describes details about the http request associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "HTTP Request",
+                "object_name": "HTTP Request",
+                "object_type": "http_request",
+                "_source": "evidences"
+            }
+        },
+        {
+            "name": {
+                "type": "string_t",
+                "description": "The naming convention or type identifier of the evidence associated with the security detection. For example, the <code>@odata.type</code> from Microsoft Graph Alerts V2 or <code>display_name</code> from CrowdStrike Falcon Incident Behaviors.",
+                "requirement": "optional",
+                "caption": "Name",
+                "type_name": "String",
+                "_source": "evidences"
+            }
+        },
+        {
+            "process": {
+                "type": "object_t",
+                "description": "Describes details about the process associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Process",
+                "object_name": "Process",
+                "object_type": "process",
+                "_source": "evidences"
+            }
+        },
+        {
+            "file": {
+                "type": "object_t",
+                "description": "Describes details about the file associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "File",
+                "object_name": "File",
+                "object_type": "file",
+                "_source": "evidences"
+            }
+        },
+        {
+            "user": {
+                "type": "object_t",
+                "description": "Describes details about the user that was the target or somehow else associated with the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "User",
+                "object_name": "User",
+                "object_type": "user",
+                "_source": "evidences"
+            }
+        },
+        {
+            "script": {
+                "type": "object_t",
+                "description": "Describes details about the script that was associated with the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Script",
+                "object_name": "Script",
+                "object_type": "script",
+                "_source": "evidences"
+            }
+        },
+        {
+            "device": {
+                "type": "object_t",
+                "description": "An addressable device, computer system or host associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Device",
+                "object_name": "Device",
+                "object_type": "device",
+                "_source": "evidences"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "The unique identifier of the evidence associated with the security detection. For example, the <code>activity_id</code> from CrowdStrike Falcon Alerts or <code>behavior_id</code> from CrowdStrike Falcon Incident Behaviors.",
+                "requirement": "optional",
+                "caption": "Unique ID",
+                "type_name": "String",
+                "_source": "evidences"
+            }
+        },
+        {
+            "query": {
+                "type": "object_t",
+                "description": "Describes details about the DNS query associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "DNS Query",
+                "object_name": "DNS Query",
+                "object_type": "dns_query",
+                "_source": "evidences"
+            }
+        },
+        {
+            "connection_info": {
+                "type": "object_t",
+                "description": "Describes details about the network connection associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Connection Info",
+                "object_name": "Network Connection Information",
+                "object_type": "network_connection_info",
+                "_source": "evidences"
+            }
+        },
+        {
+            "url": {
+                "type": "object_t",
+                "description": "The URL object that pertains to the event or object associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "URL",
+                "object_name": "Uniform Resource Locator",
+                "object_type": "url",
+                "_source": "evidences"
+            }
+        },
+        {
+            "email": {
+                "type": "object_t",
+                "description": "The email object associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Email",
+                "object_name": "Email",
+                "object_type": "email",
+                "_source": "evidences"
+            }
+        },
+        {
+            "tls": {
+                "type": "object_t",
+                "description": "Describes details about the Transport Layer Security (TLS) activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "TLS",
+                "object_name": "Transport Layer Security (TLS)",
+                "object_type": "tls",
+                "_source": "evidences"
+            }
+        },
+        {
+            "api": {
+                "type": "object_t",
+                "description": "Describes details about the API call associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "API Details",
+                "object_name": "API",
+                "object_type": "api",
+                "_source": "evidences"
+            }
+        },
+        {
+            "resources": {
+                "type": "object_t",
+                "description": "Describes details about the cloud resources directly related to activity that triggered the detection. For resources impacted by the detection, use <code>Affected Resources</code> at the top-level of the finding.",
+                "is_array": true,
+                "requirement": "recommended",
+                "caption": "Cloud Resources",
+                "object_name": "Resource Details",
+                "object_type": "resource_details",
+                "_source": "evidences"
+            }
+        },
+        {
+            "actor": {
+                "type": "object_t",
+                "description": "Describes details about the user/role/process that was the source of the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Actor",
+                "object_name": "Actor",
+                "object_type": "actor",
+                "_source": "evidences"
+            }
+        },
+        {
+            "container": {
+                "type": "object_t",
+                "description": "Describes details about the container associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Container",
+                "object_name": "Container",
+                "object_type": "container",
+                "_source": "evidences"
+            }
+        },
+        {
+            "database": {
+                "type": "object_t",
+                "description": "Describes details about the database associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Database",
+                "object_name": "Database",
+                "object_type": "database",
+                "_source": "evidences"
+            }
+        },
+        {
+            "databucket": {
+                "type": "object_t",
+                "description": "Describes details about the databucket associated to the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Databucket",
+                "object_name": "Databucket",
+                "object_type": "databucket",
+                "_source": "evidences"
+            }
+        },
+        {
+            "dst_endpoint": {
+                "type": "object_t",
+                "description": "Describes details about the destination of the network activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Destination Endpoint",
+                "object_name": "Network Endpoint",
+                "object_type": "network_endpoint",
+                "_source": "evidences"
+            }
+        },
+        {
+            "ja4_fingerprint_list": {
+                "type": "object_t",
+                "description": "Describes details about the JA4+ fingerprints that triggered the detection.",
+                "is_array": true,
+                "requirement": "recommended",
+                "caption": "JA4+ Fingerprints",
+                "object_name": "JA4+ Fingerprint",
+                "object_type": "ja4_fingerprint",
+                "_source": "evidences"
+            }
+        },
+        {
+            "job": {
+                "type": "object_t",
+                "description": "Describes details about the scheduled job that was associated with the activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Job",
+                "object_name": "Job",
+                "object_type": "job",
+                "_source": "evidences"
+            }
+        },
+        {
+            "src_endpoint": {
+                "type": "object_t",
+                "description": "Describes details about the source of the network activity that triggered the detection.",
+                "requirement": "recommended",
+                "caption": "Source Endpoint",
+                "object_name": "Network Endpoint",
+                "object_type": "network_endpoint",
+                "_source": "evidences"
+            }
+        },
+        {
+            "verdict": {
+                "type": "string_t",
+                "description": "The normalized verdict of the evidence associated with the security detection. ",
+                "requirement": "optional",
+                "caption": "Verdict",
+                "type_name": "String",
+                "_source": "evidences",
+                "_sibling_of": "verdict_id"
+            }
+        },
+        {
+            "verdict_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "description": "The verdict for the evidence is that is should be Disregarded.",
+                        "caption": "Disregard"
+                    },
+                    "6": {
+                        "description": "The evidence is part of a Test, or other sanctioned behavior(s).",
+                        "caption": "Test"
+                    },
+                    "0": {
+                        "description": "The type is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "1": {
+                        "description": "The verdict for the evidence has been identified as a False Positive.",
+                        "caption": "False Positive"
+                    },
+                    "2": {
+                        "description": "The verdict for the evidence has been identified as a True Positive.",
+                        "caption": "True Positive"
+                    },
+                    "99": {
+                        "description": "The type is not mapped. See the <code>type</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "4": {
+                        "description": "The verdict for the evidence is that the behavior has been identified as Suspicious.",
+                        "caption": "Suspicious"
+                    },
+                    "5": {
+                        "description": "The verdict for the evidence is that the behavior has been identified as Benign.",
+                        "caption": "Benign"
+                    },
+                    "7": {
+                        "description": "There is insufficient data to render a verdict on the evidence.",
+                        "caption": "Insufficient Data"
+                    },
+                    "8": {
+                        "description": "The verdict for the evidence is that the behavior has been identified as a Security Risk.",
+                        "caption": "Security Risk"
+                    },
+                    "9": {
+                        "description": "The verdict for the evidence is Managed Externally, such as in a case management tool.",
+                        "caption": "Managed Externally"
+                    },
+                    "10": {
+                        "description": "This evidence duplicates existing evidence related to this finding.",
+                        "caption": "Duplicate"
+                    }
+                },
+                "description": "The normalized verdict (or status) ID of the evidence associated with the security detection. For example, Microsoft Graph Security Alerts contain a <code>verdict</code> enumeration for each type of <code>evidence</code> associated with the Alert. This is typically set by an automated investigation process or an analyst/investigator assigned to the finding.",
+                "requirement": "optional",
+                "caption": "Verdict ID",
+                "type_name": "Integer",
+                "sibling": "verdict",
+                "_source": "evidences"
+            }
+        },
+        {
+            "reg_key": {
+                "type": "object_t",
+                "description": "Describes details about the registry key that triggered the detection.",
+                "group": "primary",
+                "extension": "win",
+                "requirement": "recommended",
+                "extension_id": 2,
+                "caption": "Registry Key",
+                "object_name": "Registry Key",
+                "object_type": "win/reg_key",
+                "_source": "win/evidences",
+                "_source_patched": "evidences"
+            }
+        },
+        {
+            "reg_value": {
+                "type": "object_t",
+                "description": "Describes details about the registry value that triggered the detection.",
+                "group": "primary",
+                "extension": "win",
+                "requirement": "recommended",
+                "extension_id": 2,
+                "caption": "Registry Value",
+                "object_name": "Registry Value",
+                "object_type": "win/reg_value",
+                "_source": "win/evidences",
+                "_source_patched": "evidences"
+            }
+        },
+        {
+            "win_service": {
+                "type": "object_t",
+                "description": "Describes details about the Windows service that triggered the detection.",
+                "extension": "win",
+                "requirement": "recommended",
+                "extension_id": 2,
+                "caption": "Windows Service",
+                "object_name": "Windows Service",
+                "object_type": "win/win_service",
+                "_source": "win/evidences",
+                "_source_patched": "evidences"
+            }
+        }
+    ],
+    "name": "evidences",
+    "description": "A collection of evidence artifacts associated to the activity/activities that triggered a security detection.",
+    "extends": "_entity",
+    "constraints": {
+        "at_least_one": [
+            "actor",
+            "api",
+            "connection_info",
+            "data",
+            "database",
+            "databucket",
+            "device",
+            "dst_endpoint",
+            "email",
+            "file",
+            "process",
+            "query",
+            "src_endpoint",
+            "url",
+            "user",
+            "job",
+            "script",
+            "reg_key",
+            "reg_value",
+            "win_service"
+        ]
+    },
+    "profiles": [
+        "data_classification",
+        "cloud",
+        "container",
+        "linux/linux_users"
+    ],
+    "caption": "Evidence Artifacts"
+}

@@ -2883,6 +2883,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "openshell-ocsf"
+version = "0.0.0"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "serde_repr",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "openshell-policy"
 version = "0.0.0"
 dependencies = [

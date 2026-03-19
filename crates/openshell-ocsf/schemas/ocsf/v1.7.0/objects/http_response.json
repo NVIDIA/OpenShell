@@ -1,0 +1,96 @@
+{
+    "attributes": [
+        {
+            "code": {
+                "type": "integer_t",
+                "description": "The Hypertext Transfer Protocol (HTTP) status code returned from the web server to the client. For example, 200.",
+                "requirement": "required",
+                "caption": "Response Code",
+                "type_name": "Integer",
+                "_source": "http_response"
+            }
+        },
+        {
+            "message": {
+                "type": "string_t",
+                "description": "The description of the event/finding, as defined by the source.",
+                "requirement": "optional",
+                "caption": "Message",
+                "type_name": "String",
+                "_source": "http_response"
+            }
+        },
+        {
+            "status": {
+                "type": "string_t",
+                "description": "The response status. For example: A successful HTTP status of 'OK' which corresponds to a code of 200.",
+                "requirement": "optional",
+                "caption": "Status",
+                "type_name": "String",
+                "_source": "http_response"
+            }
+        },
+        {
+            "length": {
+                "type": "integer_t",
+                "description": "The length of the entire HTTP response, in number of bytes.",
+                "requirement": "optional",
+                "caption": "Response Length",
+                "type_name": "Integer",
+                "_source": "http_response"
+            }
+        },
+        {
+            "content_type": {
+                "type": "string_t",
+                "description": "The request header that identifies the original <a target='_blank' href='https://www.iana.org/assignments/media-types/media-types.xhtml'>media type </a> of the resource (prior to any content encoding applied for sending).",
+                "requirement": "optional",
+                "caption": "HTTP Content Type",
+                "type_name": "String",
+                "_source": "http_response"
+            }
+        },
+        {
+            "body_length": {
+                "type": "integer_t",
+                "description": "The actual length of the HTTP response body, in number of bytes, independent of a potentially existing Content-Length header.",
+                "requirement": "optional",
+                "caption": "Response Body Length",
+                "type_name": "Integer",
+                "_source": "http_response"
+            }
+        },
+        {
+            "http_headers": {
+                "type": "object_t",
+                "description": "Additional HTTP headers of an HTTP request or response.",
+                "is_array": true,
+                "requirement": "recommended",
+                "caption": "HTTP Headers",
+                "object_name": "HTTP Header",
+                "object_type": "http_header",
+                "_source": "http_response"
+            }
+        },
+        {
+            "latency": {
+                "type": "integer_t",
+                "description": "The HTTP response latency measured in milliseconds.",
+                "requirement": "optional",
+                "caption": "Latency",
+                "type_name": "Integer",
+                "_source": "http_response"
+            }
+        }
+    ],
+    "name": "http_response",
+    "description": "The HTTP Response object contains detailed information about the response sent from a web server to the requester. It encompasses attributes and metadata that describe the response status, headers, body content, and other relevant information.",
+    "extends": "object",
+    "references": [
+        {
+            "description": "D3FEND\u2122 Ontology d3f:InboundInternetNetworkTraffic.",
+            "url": "https://d3fend.mitre.org/dao/artifact/d3f:InboundInternetNetworkTraffic/"
+        }
+    ],
+    "caption": "HTTP Response"
+}
