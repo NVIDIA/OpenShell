@@ -681,6 +681,13 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                     if !e.allowed_ips.is_empty() {
                         ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
+                    if let Some(er) = e.external_resolver.as_ref() {
+                        ep["external_resolver"] = serde_json::json!({
+                            "url": er.url,
+                            "method": er.method,
+                            "body_template": er.body_template,
+                        });
+                    }
                     ep
                 })
                 .collect();

@@ -133,6 +133,7 @@ impl ProxyHandle {
         inference_ctx: Option<Arc<InferenceContext>>,
         secret_resolver: Option<Arc<SecretResolver>>,
         denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+        sandbox_id: Option<String>,
     ) -> Result<Self> {
         // Use override bind_addr, fall back to policy http_addr, then default
         // to loopback:3128.  The default allows the proxy to function when no
@@ -163,9 +164,10 @@ impl ProxyHandle {
                         let inf = inference_ctx.clone();
                         let resolver = secret_resolver.clone();
                         let dtx = denial_tx.clone();
+                        let sid = sandbox_id.clone();
                         tokio::spawn(async move {
                             if let Err(err) = handle_tcp_connection(
-                                stream, opa, cache, spid, tls, inf, resolver, dtx,
+                                stream, opa, cache, spid, tls, inf, resolver, dtx, sid,
                             )
                             .await
                             {
@@ -266,6 +268,7 @@ async fn handle_tcp_connection(
     inference_ctx: Option<Arc<InferenceContext>>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+    sandbox_id: Option<String>, // Added
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
     let mut used = 0usize;
@@ -310,6 +313,7 @@ async fn handle_tcp_connection(
             entrypoint_pid,
             secret_resolver,
             denial_tx.as_ref(),
+            sandbox_id.clone(),
         )
         .await;
     }
@@ -554,6 +558,7 @@ async fn handle_tcp_connection(
                 .map(|p| p.to_string_lossy().into_owned())
                 .collect(),
             secret_resolver: secret_resolver.clone(),
+            sandbox_id,
         };
 
         if l7_config.tls == crate::l7::TlsMode::Terminate {
@@ -1569,7 +1574,9 @@ async fn handle_forward_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
+    sandbox_id: Option<String>,
 ) -> Result<()> {
+    let _ = sandbox_id; // Added to avoid unused warning in this specific function if not used yet
     // 1. Parse the absolute-form URI
     let (scheme, host, port, path) = match parse_proxy_uri(target_uri) {
         Ok(parsed) => parsed,

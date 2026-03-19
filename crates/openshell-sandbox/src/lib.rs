@@ -350,6 +350,7 @@ pub async fn run_sandbox(
             inference_ctx,
             secret_resolver.clone(),
             denial_tx,
+            sandbox_id.clone(),
         )
         .await?;
         (Some(proxy_handle), denial_rx, bypass_denial_tx)

@@ -123,7 +123,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None).await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -131,6 +131,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     client: &mut C,
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
+    external_secret: Option<&str>,
 ) -> Result<bool>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -143,9 +144,14 @@ where
         .map_or(req.raw_header.len(), |p| p + 4);
 
     let rewritten_header = rewrite_http_header_block(&req.raw_header[..header_end], resolver);
+    let final_header = if let Some(secret) = external_secret {
+        inject_auth_header(&rewritten_header, secret)
+    } else {
+        rewritten_header
+    };
 
     upstream
-        .write_all(&rewritten_header)
+        .write_all(&final_header)
         .await
         .into_diagnostic()?;
 
@@ -169,6 +175,41 @@ where
     }
     upstream.flush().await.into_diagnostic()?;
     relay_response(&req.action, upstream, client).await
+}
+
+/// Inject or override Authorization header with a Bearer token.
+fn inject_auth_header(raw: &[u8], secret: &str) -> Vec<u8> {
+    let header_str = String::from_utf8_lossy(raw);
+    let mut lines = header_str.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return raw.to_vec();
+    };
+
+    let mut output = Vec::with_capacity(raw.len() + secret.len() + 32);
+    output.extend_from_slice(request_line.as_bytes());
+    output.extend_from_slice(b"\r\n");
+
+    let mut auth_injected = false;
+    for line in lines {
+        if line.is_empty() {
+            break;
+        }
+
+        if line.to_lowercase().starts_with("authorization:") {
+            output.extend_from_slice(format!("Authorization: Bearer {secret}\r\n").as_bytes());
+            auth_injected = true;
+        } else {
+            output.extend_from_slice(line.as_bytes());
+            output.extend_from_slice(b"\r\n");
+        }
+    }
+
+    if !auth_injected {
+        output.extend_from_slice(format!("Authorization: Bearer {secret}\r\n").as_bytes());
+    }
+
+    output.extend_from_slice(b"\r\n");
+    output
 }
 
 /// Send a 403 Forbidden JSON deny response.

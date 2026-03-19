@@ -99,6 +99,18 @@ struct NetworkEndpointDef {
     rules: Vec<L7RuleDef>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     allowed_ips: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    external_resolver: Option<ExternalResolverDef>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ExternalResolverDef {
+    url: String,
+    #[serde(default)]
+    method: String,
+    #[serde(default)]
+    body_template: String,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -180,6 +192,13 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips,
+                            external_resolver: e.external_resolver.map(|er| {
+                                openshell_core::proto::ExternalResolver {
+                                    url: er.url,
+                                    method: er.method,
+                                    body_template: er.body_template,
+                                }
+                            }),
                         }
                     })
                     .collect(),
@@ -280,6 +299,13 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                 })
                                 .collect(),
                             allowed_ips: e.allowed_ips.clone(),
+                            external_resolver: e.external_resolver.as_ref().map(|er| {
+                                ExternalResolverDef {
+                                    url: er.url.clone(),
+                                    method: er.method.clone(),
+                                    body_template: er.body_template.clone(),
+                                }
+                            }),
                         }
                     })
                     .collect(),

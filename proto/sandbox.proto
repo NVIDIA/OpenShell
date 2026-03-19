@@ -85,6 +85,18 @@ message NetworkEndpoint {
   // If `port` is set and `ports` is empty, `port` is normalized to `ports: [port]`.
   // If both are set, `ports` takes precedence.
   repeated uint32 ports = 9;
+  // External secret resolver configuration.
+  ExternalResolver external_resolver = 10;
+}
+
+// External secret resolver configuration.
+message ExternalResolver {
+  // Resolver endpoint URL (HTTPS).
+  string url = 1;
+  // HTTP method (e.g. "POST").
+  string method = 2;
+  // JSON body template for the resolver request.
+  string body_template = 3;
 }
 
 // An L7 policy rule (allow-only).

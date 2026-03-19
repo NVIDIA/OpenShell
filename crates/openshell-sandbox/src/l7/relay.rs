@@ -31,6 +31,8 @@ pub struct L7EvalContext {
     pub cmdline_paths: Vec<String>,
     /// Supervisor-only placeholder resolver for outbound headers.
     pub(crate) secret_resolver: Option<Arc<SecretResolver>>,
+    /// Sandbox ID for external secret resolution.
+    pub sandbox_id: Option<String>,
 }
 
 /// Run protocol-aware L7 inspection on a tunnel.
@@ -133,12 +135,25 @@ where
         );
 
         if allowed || config.enforcement == EnforcementMode::Audit {
+            let external_secret = if let Some(resolver) = &config.external_resolver {
+                match resolve_external_secret(resolver, ctx.sandbox_id.as_deref().unwrap_or("-"), ctx).await {
+                    Ok(secret) => Some(secret),
+                    Err(e) => {
+                         warn!(error = %e, "External secret resolution failed");
+                         None
+                    }
+                }
+            } else {
+                None
+            };
+
             // Forward request to upstream and relay response
             let reusable = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
                 client,
                 upstream,
                 ctx.secret_resolver.as_deref(),
+                external_secret.as_deref(),
             )
             .await?;
             if !reusable {
@@ -228,4 +243,60 @@ fn evaluate_l7_request(
     };
 
     Ok((allowed, reason))
+}
+
+async fn resolve_external_secret(
+    resolver: &crate::l7::ExternalResolverConfig,
+    sandbox_id: &str,
+    ctx: &L7EvalContext,
+) -> Result<String> {
+    let client = reqwest::Client::new();
+
+    let body = resolver
+        .body_template
+        .replace("{sandbox_id}", sandbox_id)
+        .replace("{host}", &ctx.host)
+        .replace("{port}", &ctx.port.to_string())
+        .replace("{binary}", &ctx.binary_path);
+
+    let mut builder = match resolver.method.to_uppercase().as_str() {
+        "POST" => client.post(&resolver.url),
+        "PUT" => client.put(&resolver.url),
+        _ => client.get(&resolver.url),
+    };
+
+    if !body.is_empty() {
+        builder = builder
+            .header("Content-Type", "application/json")
+            .body(body);
+    }
+
+    let resp = builder
+        .send()
+        .await
+        .map_err(|e| miette::miette!("external resolver request failed: {e}"))?;
+
+    if !resp.status().is_success() {
+        return Err(miette::miette!(
+            "external resolver returned error {}: {}",
+            resp.status(),
+            resp.text().await.unwrap_or_default()
+        ));
+    }
+
+    let json: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| miette::miette!("failed to parse resolver response: {e}"))?;
+
+    let secret = json
+        .get("secret")
+        .or_else(|| json.get("token"))
+        .or_else(|| json.get("key"))
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            miette::miette!("external resolver response missing 'secret', 'token', or 'key' field")
+        })?;
+
+    Ok(secret.to_string())
 }

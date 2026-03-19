@@ -51,12 +51,21 @@ pub enum EnforcementMode {
     Enforce,
 }
 
+/// External secret resolver configuration.
+#[derive(Debug, Clone)]
+pub struct ExternalResolverConfig {
+    pub url: String,
+    pub method: String,
+    pub body_template: String,
+}
+
 /// L7 configuration for an endpoint, extracted from policy data.
 #[derive(Debug, Clone)]
 pub struct L7EndpointConfig {
     pub protocol: L7Protocol,
     pub tls: TlsMode,
     pub enforcement: EnforcementMode,
+    pub external_resolver: Option<ExternalResolverConfig>,
 }
 
 /// Result of an L7 policy decision for a single request.
@@ -94,10 +103,24 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         _ => EnforcementMode::Audit,
     };
 
+    let external_resolver = (|| {
+        let obj = val.as_object().ok()?;
+        let v = obj.get(&regorus::Value::from("external_resolver"))?;
+        let url = get_object_str(v, "url")?;
+        let method = get_object_str(v, "method")?;
+        let body_template = get_object_str(v, "body_template").unwrap_or_default();
+        Some(ExternalResolverConfig {
+            url,
+            method,
+            body_template,
+        })
+    })();
+
     Some(L7EndpointConfig {
         protocol,
         tls,
         enforcement,
+        external_resolver,
     })
 }
 

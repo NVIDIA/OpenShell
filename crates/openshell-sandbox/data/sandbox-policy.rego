@@ -285,3 +285,20 @@ endpoint_has_extended_config(ep) if {
 endpoint_has_extended_config(ep) if {
 	count(object.get(ep, "allowed_ips", [])) > 0
 }
+
+# --- External secret resolution (queried per-request within a tunnel) ---
+# Returns the resolver metadata (url, method, body_template) if the request
+# matches a policy that specifies an external_resolver.
+
+default external_resolver = undefined
+
+external_resolver := resolver if {
+	some name
+	policy := data.network_policies[name]
+	endpoint_allowed(policy, input.network)
+	binary_allowed(policy, input.exec)
+	some ep
+	ep := policy.endpoints[_]
+	endpoint_matches_request(ep, input.network)
+	resolver := ep.external_resolver
+}

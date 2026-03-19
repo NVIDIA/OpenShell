@@ -50,6 +50,7 @@ rcgen = { workspace = true }
 webpki-roots = { workspace = true }
 
 # HTTP
+reqwest = { workspace = true }
 bytes = { workspace = true }
 
 # IP network / CIDR parsing
