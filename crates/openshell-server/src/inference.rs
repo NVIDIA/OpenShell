@@ -854,7 +854,7 @@ mod tests {
             .and(header("content-type", "application/json"))
             .and(body_partial_json(serde_json::json!({
                 "model": "gpt-4o-mini",
-                "max_tokens": 1,
+                "max_tokens": 32,
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "id": "chatcmpl-123",
