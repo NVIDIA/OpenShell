@@ -77,7 +77,10 @@ spec:
               value: {{ .Values.server.hostGatewayIP | quote }}
             {{- end }}
             - name: OPENSHELL_SSH_HANDSHAKE_SECRET
-              value: {{ required "server.sshHandshakeSecret is required" .Values.server.sshHandshakeSecret | quote }}
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.server.sshHandshakeSecretName | quote }}
+                  key: secret
             {{- if .Values.server.disableTls }}
             - name: OPENSHELL_DISABLE_TLS
               value: "true"

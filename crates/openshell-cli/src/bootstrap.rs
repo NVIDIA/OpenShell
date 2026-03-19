@@ -144,47 +144,62 @@ pub async fn run_bootstrap(
     );
     eprintln!();
 
-    // Auto-bootstrap always recreates if stale Docker resources are found
-    // (e.g. metadata was deleted but container/volume still exist).
-    let mut options = openshell_bootstrap::DeployOptions::new(&gateway_name).with_recreate(true);
-    if let Some(dest) = remote {
-        let mut remote_opts = openshell_bootstrap::RemoteOptions::new(dest);
-        if let Some(key) = ssh_key {
-            remote_opts = remote_opts.with_ssh_key(key);
+    // Build base deploy options. The auto-bootstrap path tries to resume from
+    // existing state first (preserving sandboxes and secrets), falling back to
+    // a full recreate if the resume fails.
+    let build_options = |resume: bool, recreate: bool| {
+        let mut opts = openshell_bootstrap::DeployOptions::new(&gateway_name)
+            .with_resume(resume)
+            .with_recreate(recreate)
+            .with_gpu(gpu);
+        if let Some(dest) = remote {
+            let mut remote_opts = openshell_bootstrap::RemoteOptions::new(dest);
+            if let Some(key) = ssh_key {
+                remote_opts = remote_opts.with_ssh_key(key);
+            }
+            opts = opts.with_remote(remote_opts);
         }
-        options = options.with_remote(remote_opts);
-    }
-    // Read registry credentials from environment for the auto-bootstrap path.
-    // The explicit `--registry-username` / `--registry-token` flags are only
-    // on `gateway start`; when bootstrapping via `sandbox create`, the env
-    // vars are the mechanism.
-    if let Ok(username) = std::env::var("OPENSHELL_REGISTRY_USERNAME")
-        && !username.trim().is_empty()
-    {
-        options = options.with_registry_username(username);
-    }
-    if let Ok(token) = std::env::var("OPENSHELL_REGISTRY_TOKEN")
-        && !token.trim().is_empty()
-    {
-        options = options.with_registry_token(token);
-    }
-    // Read gateway host override from environment. Needed whenever the
-    // client cannot reach the Docker host at 127.0.0.1 — CI containers,
-    // WSL, remote Docker hosts, etc. The explicit `--gateway-host` flag
-    // is only on `gateway start`; this env var covers the auto-bootstrap
-    // path triggered by `sandbox create`.
-    if let Ok(host) = std::env::var("OPENSHELL_GATEWAY_HOST")
-        && !host.trim().is_empty()
-    {
-        options = options.with_gateway_host(host);
-    }
-    options = options.with_gpu(if gpu {
-        vec!["auto".to_string()]
-    } else {
-        vec![]
-    });
+        // Read registry credentials from environment for the auto-bootstrap path.
+        // The explicit `--registry-username` / `--registry-token` flags are only
+        // on `gateway start`; when bootstrapping via `sandbox create`, the env
+        // vars are the mechanism.
+        if let Ok(username) = std::env::var("OPENSHELL_REGISTRY_USERNAME")
+            && !username.trim().is_empty()
+        {
+            opts = opts.with_registry_username(username);
+        }
+        if let Ok(token) = std::env::var("OPENSHELL_REGISTRY_TOKEN")
+            && !token.trim().is_empty()
+        {
+            opts = opts.with_registry_token(token);
+        }
+        // Read gateway host override from environment. Needed whenever the
+        // client cannot reach the Docker host at 127.0.0.1 — CI containers,
+        // WSL, remote Docker hosts, etc. The explicit `--gateway-host` flag
+        // is only on `gateway start`; this env var covers the auto-bootstrap
+        // path triggered by `sandbox create`.
+        if let Ok(host) = std::env::var("OPENSHELL_GATEWAY_HOST")
+            && !host.trim().is_empty()
+        {
+            opts = opts.with_gateway_host(host);
+        }
+        opts
+    };
 
-    let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
+    // Try resume first to preserve existing sandboxes and secrets.
+    let handle = match deploy_gateway_with_panel(
+        build_options(true, false),
+        &gateway_name,
+        location,
+    )
+    .await
+    {
+        Ok(handle) => handle,
+        Err(resume_err) => {
+            tracing::warn!("auto-bootstrap resume failed, falling back to recreate: {resume_err}");
+            deploy_gateway_with_panel(build_options(false, true), &gateway_name, location).await?
+        }
+    };
     let server = handle.gateway_endpoint().to_string();
 
     print_deploy_summary(&gateway_name, &handle);

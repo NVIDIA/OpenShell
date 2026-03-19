@@ -68,3 +68,6 @@ if [ "${DISABLE_TLS:-}" != "true" ]; then
     kubectl -n openshell get secret openshell-server-tls >/dev/null 2>&1 || exit 1
     kubectl -n openshell get secret openshell-client-tls >/dev/null 2>&1 || exit 1
 fi
+
+# Verify SSH handshake secret exists (created by openshell-bootstrap alongside TLS secrets)
+kubectl -n openshell get secret openshell-ssh-handshake >/dev/null 2>&1 || exit 1

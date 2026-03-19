@@ -408,12 +408,13 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
   # terminates mTLS (there is no server.tls.enabled toggle). Without this,
   # a prior Helm override or chart default change could silently regress
   # sandbox callbacks to plaintext.
-  # Retrieve the existing handshake secret from the running release, or generate
-  # a new one if this is the first deploy with the mandatory secret.
-  EXISTING_SECRET=$(cluster_exec "helm get values openshell -n openshell -o json 2>/dev/null \
-    | grep -o '\"sshHandshakeSecret\":\"[^\"]*\"' \
-    | cut -d'\"' -f4") || true
-  SSH_HANDSHAKE_SECRET="${EXISTING_SECRET:-$(openssl rand -hex 32)}"
+  # Ensure the SSH handshake K8s secret exists. The bootstrap process normally
+  # creates it, but fast-deploy may run before bootstrap on a fresh cluster.
+  EXISTING_SECRET=$(cluster_exec "kubectl -n openshell get secret openshell-ssh-handshake -o jsonpath='{.data.secret}' 2>/dev/null | base64 -d" 2>/dev/null) || true
+  if [ -z "${EXISTING_SECRET}" ]; then
+    SSH_HANDSHAKE_SECRET="$(openssl rand -hex 32)"
+    cluster_exec "kubectl -n openshell create secret generic openshell-ssh-handshake --from-literal=secret='${SSH_HANDSHAKE_SECRET}' --dry-run=client -o yaml | kubectl apply -f -"
+  fi
 
   # Retrieve the host gateway IP from the entrypoint-rendered HelmChart CR so
   # that hostAliases for host.openshell.internal are preserved across fast deploys.
@@ -433,7 +434,6 @@ if [[ "${needs_helm_upgrade}" == "1" ]]; then
     --set server.tls.certSecretName=openshell-server-tls \
     --set server.tls.clientCaSecretName=openshell-server-client-ca \
     --set server.tls.clientTlsSecretName=openshell-client-tls \
-    --set server.sshHandshakeSecret=${SSH_HANDSHAKE_SECRET} \
     ${HOST_GATEWAY_ARGS} \
     ${helm_wait_args}"
   helm_end=$(date +%s)

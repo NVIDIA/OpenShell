@@ -9,7 +9,8 @@ use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
     ContainerCreateBody, DeviceRequest, HostConfig, HostConfigCgroupnsModeEnum,
-    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, VolumeCreateRequest,
+    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, RestartPolicy,
+    RestartPolicyNameEnum, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -555,6 +556,12 @@ pub async fn ensure_container(
         port_bindings: Some(port_bindings),
         binds: Some(vec![format!("{}:/var/lib/rancher/k3s", volume_name(name))]),
         network_mode: Some(network_name(name)),
+        // Automatically restart the container when Docker restarts, unless the
+        // user explicitly stopped it with `gateway stop`.
+        restart_policy: Some(RestartPolicy {
+            name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+            maximum_retry_count: None,
+        }),
         // Add host gateway aliases for DNS resolution.
         // This allows both the entrypoint script and the running gateway
         // process to reach services on the Docker host.
@@ -951,6 +958,48 @@ pub async fn destroy_gateway_resources(docker: &Docker, name: &str) -> Result<()
     // disconnect any stale endpoints that Docker may still report (race
     // between container removal and network bookkeeping), then remove the
     // network itself.
+    force_remove_network(docker, &net_name).await?;
+
+    Ok(())
+}
+
+/// Clean up the gateway container and network, preserving the persistent volume.
+///
+/// Used when a resume attempt fails — we want to remove the container we may
+/// have just created but keep the volume so the user can retry without losing
+/// their k3s/etcd state and sandbox data.
+pub async fn cleanup_gateway_container(docker: &Docker, name: &str) -> Result<()> {
+    let container_name = container_name(name);
+    let net_name = network_name(name);
+
+    // Disconnect container from network
+    let _ = docker
+        .disconnect_network(
+            &net_name,
+            NetworkDisconnectRequest {
+                container: container_name.clone(),
+                force: Some(true),
+            },
+        )
+        .await;
+
+    let _ = stop_container(docker, &container_name).await;
+
+    let remove_container = docker
+        .remove_container(
+            &container_name,
+            Some(RemoveContainerOptions {
+                force: true,
+                ..Default::default()
+            }),
+        )
+        .await;
+    if let Err(err) = remove_container
+        && !is_not_found(&err)
+    {
+        return Err(err).into_diagnostic();
+    }
+
     force_remove_network(docker, &net_name).await?;
 
     Ok(())

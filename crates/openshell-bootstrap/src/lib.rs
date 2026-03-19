@@ -26,13 +26,13 @@ use miette::{IntoDiagnostic, Result};
 use std::sync::{Arc, Mutex};
 
 use crate::constants::{
-    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME, network_name,
-    volume_name,
+    CLIENT_TLS_SECRET_NAME, SERVER_CLIENT_CA_SECRET_NAME, SERVER_TLS_SECRET_NAME,
+    SSH_HANDSHAKE_SECRET_NAME, network_name, volume_name,
 };
 use crate::docker::{
-    check_existing_gateway, check_port_conflicts, destroy_gateway_resources, ensure_container,
-    ensure_image, ensure_network, ensure_volume, resolve_gpu_device_ids, start_container,
-    stop_container,
+    check_existing_gateway, check_port_conflicts, cleanup_gateway_container,
+    destroy_gateway_resources, ensure_container, ensure_image, ensure_network, ensure_volume,
+    resolve_gpu_device_ids, start_container, stop_container,
 };
 use crate::metadata::{
     create_gateway_metadata, create_gateway_metadata_with_host, local_gateway_host,
@@ -123,6 +123,11 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
+    /// When true, resume from existing state (volume, stopped container)
+    /// instead of erroring out. The deploy flow reuses the existing volume
+    /// and creates a new container if needed, preserving k3s/etcd state,
+    /// sandbox pods, and secrets.
+    pub resume: bool,
 }
 
 impl DeployOptions {
@@ -139,6 +144,7 @@ impl DeployOptions {
             registry_token: None,
             gpu: vec![],
             recreate: false,
+            resume: false,
         }
     }
 
@@ -208,6 +214,13 @@ impl DeployOptions {
         self.recreate = recreate;
         self
     }
+
+    /// Set whether to resume from existing state (volume, stopped container).
+    #[must_use]
+    pub fn with_resume(mut self, resume: bool) -> Self {
+        self.resume = resume;
+        self
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -272,6 +285,7 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
+    let resume = options.resume;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -308,12 +322,28 @@ where
         .and_then(|info| info.cdi_spec_dirs)
         .is_some_and(|dirs| !dirs.is_empty());
 
-    // If an existing gateway is found, either tear it down (when recreate is
-    // requested) or bail out so the caller can prompt the user / reuse it.
+    // Guard: recreate takes precedence if both are set (shouldn't happen in practice).
+    if resume && recreate {
+        tracing::warn!("both resume and recreate set; recreate takes precedence");
+    }
+
+    // If an existing gateway is found, decide how to proceed:
+    // - recreate: destroy everything and start fresh
+    // - resume: keep existing state and create/start the container
+    // - neither: error out (caller should prompt the user)
     if let Some(existing) = check_existing_gateway(&target_docker, &name).await? {
         if recreate {
             log("[status] Removing existing gateway".to_string());
             destroy_gateway_resources(&target_docker, &name).await?;
+        } else if resume {
+            if existing.container_running {
+                log("[status] Gateway is already running".to_string());
+            } else {
+                log("[status] Resuming gateway from existing state".to_string());
+            }
+            // Fall through to ensure_* calls — they are idempotent and will
+            // reuse the existing volume, create a container if needed, and
+            // start it.
         } else {
             return Err(miette::miette!(
                 "Gateway '{name}' already exists (container_running={}).\n\
@@ -476,6 +506,11 @@ where
 
         store_pki_bundle(&name, &pki_bundle)?;
 
+        // Reconcile SSH handshake secret: reuse existing K8s secret if present,
+        // generate and persist a new one otherwise. This secret is stored in etcd
+        // (on the persistent volume) so it survives container restarts.
+        reconcile_ssh_handshake_secret(&target_docker, &name, &log).await?;
+
         // Push locally-built component images into the k3s containerd runtime.
         // This is the "push" path for local development — images are exported from
         // the local Docker daemon and streamed into the cluster's containerd so
@@ -545,15 +580,30 @@ where
             docker: target_docker,
         }),
         Err(deploy_err) => {
-            // Automatically clean up Docker resources (volume, container, network,
-            // image) so the environment is left in a retryable state.
-            tracing::info!("deploy failed, cleaning up gateway resources for '{name}'");
-            if let Err(cleanup_err) = destroy_gateway_resources(&target_docker, &name).await {
-                tracing::warn!(
-                    "automatic cleanup after failed deploy also failed: {cleanup_err}. \
-                     Manual cleanup may be required: \
-                     openshell gateway destroy --name {name}"
+            if resume {
+                // When resuming, preserve the volume so the user can retry.
+                // Only clean up the container and network that we may have created.
+                tracing::info!(
+                    "resume failed, cleaning up container for '{name}' (preserving volume)"
                 );
+                if let Err(cleanup_err) = cleanup_gateway_container(&target_docker, &name).await {
+                    tracing::warn!(
+                        "automatic cleanup after failed resume also failed: {cleanup_err}. \
+                         Manual cleanup may be required: \
+                         openshell gateway destroy --name {name}"
+                    );
+                }
+            } else {
+                // Automatically clean up Docker resources (volume, container, network,
+                // image) so the environment is left in a retryable state.
+                tracing::info!("deploy failed, cleaning up gateway resources for '{name}'");
+                if let Err(cleanup_err) = destroy_gateway_resources(&target_docker, &name).await {
+                    tracing::warn!(
+                        "automatic cleanup after failed deploy also failed: {cleanup_err}. \
+                         Manual cleanup may be required: \
+                         openshell gateway destroy --name {name}"
+                    );
+                }
             }
             Err(deploy_err)
         }
@@ -856,6 +906,72 @@ where
         .wrap_err("failed to apply new TLS secrets")?;
 
     Ok((bundle, true))
+}
+
+/// Reconcile the SSH handshake HMAC secret as a Kubernetes Secret.
+///
+/// If the secret already exists in the cluster, this is a no-op. Otherwise a
+/// fresh 32-byte hex secret is generated and applied. Because the secret lives
+/// in etcd (backed by the persistent Docker volume), it survives container
+/// restarts without regeneration — existing sandbox SSH sessions remain valid.
+async fn reconcile_ssh_handshake_secret<F>(docker: &Docker, name: &str, log: &F) -> Result<()>
+where
+    F: Fn(String) + Sync,
+{
+    use miette::WrapErr;
+
+    let cname = container_name(name);
+    let kubeconfig = constants::KUBECONFIG_PATH;
+
+    // Check if the secret already exists.
+    let (output, exit_code) = exec_capture_with_exit(
+        docker,
+        &cname,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "KUBECONFIG={kubeconfig} kubectl -n openshell get secret {SSH_HANDSHAKE_SECRET_NAME} -o jsonpath='{{.data.secret}}' 2>/dev/null"
+            ),
+        ],
+    )
+    .await?;
+
+    if exit_code == 0 && !output.trim().is_empty() {
+        tracing::debug!(
+            "existing SSH handshake secret found ({} bytes encoded)",
+            output.trim().len()
+        );
+        log("[progress] Reusing existing SSH handshake secret".to_string());
+        return Ok(());
+    }
+
+    // Generate a new 32-byte hex secret and create the K8s secret.
+    log("[progress] Generating SSH handshake secret".to_string());
+    let (output, exit_code) = exec_capture_with_exit(
+        docker,
+        &cname,
+        vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "SECRET=$(head -c 32 /dev/urandom | od -A n -t x1 | tr -d ' \\n') && \
+                 KUBECONFIG={kubeconfig} kubectl -n openshell create secret generic {SSH_HANDSHAKE_SECRET_NAME} \
+                 --from-literal=secret=$SECRET --dry-run=client -o yaml | \
+                 KUBECONFIG={kubeconfig} kubectl apply -f -"
+            ),
+        ],
+    )
+    .await?;
+
+    if exit_code != 0 {
+        return Err(miette::miette!(
+            "failed to create SSH handshake secret (exit {exit_code}): {output}"
+        ))
+        .wrap_err("failed to apply SSH handshake secret");
+    }
+
+    Ok(())
 }
 
 /// Load existing TLS secrets from the cluster and reconstruct a [`PkiBundle`].

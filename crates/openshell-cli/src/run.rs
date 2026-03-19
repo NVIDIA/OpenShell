@@ -1369,49 +1369,27 @@ pub async fn gateway_admin_deploy(
         opts
     });
 
-    // Check whether a gateway already exists. If so, prompt the user (unless
-    // --recreate was passed or we're in non-interactive mode).
-    let mut should_recreate = recreate;
+    // Check whether a gateway already exists and decide how to proceed:
+    // - --recreate: always destroy and start fresh
+    // - existing state (stopped container / volume only): auto-resume
+    // - already running: return immediately (nothing to do)
+    let should_recreate = recreate;
+    let mut should_resume = false;
     if let Some(existing) =
         openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
     {
-        if !should_recreate {
-            let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-            if interactive {
-                let status = if existing.container_running {
-                    "running"
-                } else if existing.container_exists {
-                    "stopped"
-                } else {
-                    "volume only"
-                };
-                eprintln!();
-                eprintln!(
-                    "{} Gateway '{name}' already exists ({status}).",
-                    "!".yellow().bold()
-                );
-                if let Some(image) = &existing.container_image {
-                    eprintln!("  {} {}", "Image:".dimmed(), image);
-                }
-                eprintln!();
-                eprint!("Destroy and recreate? [y/N] ");
-                std::io::stderr().flush().ok();
-                let mut input = String::new();
-                std::io::stdin()
-                    .read_line(&mut input)
-                    .into_diagnostic()
-                    .wrap_err("failed to read user input")?;
-                let choice = input.trim().to_lowercase();
-                should_recreate = choice == "y" || choice == "yes";
-                if !should_recreate {
-                    eprintln!("Keeping existing gateway.");
-                    return Ok(());
-                }
-            } else {
-                // Non-interactive mode: reuse existing gateway silently.
-                eprintln!("Gateway '{name}' already exists, reusing.");
-                return Ok(());
-            }
+        if should_recreate {
+            // --recreate flag: fall through to destroy and redeploy.
+        } else if existing.container_running {
+            // Already running — nothing to do.
+            eprintln!(
+                "{} Gateway '{name}' is already running.",
+                "✓".green().bold()
+            );
+            return Ok(());
+        } else {
+            // Stopped container or volume-only: auto-resume from existing state.
+            should_resume = true;
         }
     }
 
@@ -1420,7 +1398,8 @@ pub async fn gateway_admin_deploy(
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
-        .with_recreate(should_recreate);
+        .with_recreate(should_recreate)
+        .with_resume(should_resume);
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }
