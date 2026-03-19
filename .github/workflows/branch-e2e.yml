@@ -37,3 +37,4 @@ jobs:
       image-tag: ${{ github.sha }}
       runner: build-arm64
       run-tool-smoke-validations: true
+      run-installer-selection-smoke: true

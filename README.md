@@ -24,7 +24,7 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 **Binary (recommended):**
 
 ```bash
-curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | sh
 ```
 
 **From PyPI (requires [uv](https://docs.astral.sh/uv/)):**

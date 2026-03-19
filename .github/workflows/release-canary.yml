@@ -47,7 +47,7 @@ jobs:
       - name: Install CLI (default / latest)
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+          curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | sh
 
       - name: Verify CLI installation
         run: |
@@ -132,7 +132,7 @@ jobs:
       - name: Install CLI from published install script
         run: |
           set -euo pipefail
-          curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ steps.release.outputs.tag }} OPENSHELL_INSTALL_DIR=/usr/local/bin sh
+          curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | OPENSHELL_VERSION=${{ steps.release.outputs.tag }} OPENSHELL_INSTALL_DIR=/usr/local/bin sh
 
       - name: Verify CLI installation
         run: |

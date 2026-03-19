@@ -41,7 +41,7 @@ For a complete list of requirements, refer to {doc}`../reference/support-matrix`
 Run the install script:
 
 ```console
-$ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | sh
+$ curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | sh
 ```
 
 If you prefer [uv](https://docs.astral.sh/uv/):

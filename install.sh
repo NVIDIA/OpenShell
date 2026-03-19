@@ -5,7 +5,7 @@
 # Install the OpenShell CLI binary.
 #
 # Usage:
-#   curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | sh
+#   curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | sh
 #
 # Or run directly:
 #   ./install.sh
@@ -49,7 +49,7 @@ usage() {
 install.sh — Install the OpenShell CLI
 
 USAGE:
-    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | sh
+    curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | sh
     ./install.sh [OPTIONS]
 
 OPTIONS:
@@ -68,16 +68,16 @@ ENVIRONMENT VARIABLES:
 
 EXAMPLES:
     # Install latest release
-    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | sh
+    curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | sh
 
     # Install a specific version
-    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | OPENSHELL_VERSION=v0.0.9 sh
+    curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | OPENSHELL_VERSION=v0.0.9 sh
 
     # Install to /usr/local/bin
-    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | OPENSHELL_INSTALL_DIR=/usr/local/bin sh
+    curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | OPENSHELL_INSTALL_DIR=/usr/local/bin sh
 
     # Install from a different fork release repo
-    curl -LsSf https://raw.githubusercontent.com/abols/OpenShell/main/install.sh | OPENSHELL_RELEASE_REPO=example/custom-openshell sh
+    curl -LsSf https://raw.githubusercontent.com/linuxdevel/OpenShell/main/install.sh | OPENSHELL_RELEASE_REPO=example/custom-openshell sh
 
     # Validate later setup selections while installing the CLI
     ./install.sh --tool claude-code --vendor anthropic --model-path claude-sonnet-4
