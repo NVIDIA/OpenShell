@@ -144,18 +144,6 @@ pub fn normalize_provider_type(input: &str) -> Option<&'static str> {
 
 #[must_use]
 pub fn detect_provider_from_command(command: &[String]) -> Option<&'static str> {
-    // Two-token subcommand patterns (e.g., `gh copilot`)
-    if command.len() >= 2 {
-        let first = &command[0];
-        let basename = Path::new(first)
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or(first);
-        if basename.eq_ignore_ascii_case("gh") && command[1].eq_ignore_ascii_case("copilot") {
-            return Some("copilot");
-        }
-    }
-    // Single-token detection
     let first = command.first()?;
     let basename = Path::new(first)
         .file_name()
@@ -205,11 +193,6 @@ mod tests {
         );
         assert_eq!(
             detect_provider_from_command(&["/usr/local/bin/copilot".to_string()]),
-            Some("copilot")
-        );
-        // gh copilot wrapper
-        assert_eq!(
-            detect_provider_from_command(&["gh".to_string(), "copilot".to_string()]),
             Some("copilot")
         );
         // gh alone still maps to github
