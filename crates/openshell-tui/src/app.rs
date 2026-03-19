@@ -1138,7 +1138,7 @@ impl App {
                 self.policy_scroll = 0;
             }
             KeyCode::Char('q') => self.running = false,
-            KeyCode::Char('h') | KeyCode::Right => {
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Right => {
                 self.sandbox_policy_tab = self.sandbox_policy_tab.next();
             }
             _ => {}
@@ -1154,7 +1154,7 @@ impl App {
                 self.screen = Screen::Dashboard;
                 self.focus = Focus::Sandboxes;
             }
-            KeyCode::Char('h') | KeyCode::Right => {
+            KeyCode::Char('h') | KeyCode::Left | KeyCode::Right => {
                 self.sandbox_policy_tab = self.sandbox_policy_tab.next();
             }
             KeyCode::Char('l') => {
