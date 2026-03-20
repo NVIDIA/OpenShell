@@ -12,6 +12,9 @@ pub struct FirewallRule {
     pub name: String,
 
     /// Rule type / engine (e.g., "mechanistic", "opa", "iptables").
+    ///
+    /// Kept as `String` because this is a project-specific extension field
+    /// (not OCSF-enumerated) with runtime-dynamic values from the policy engine.
     #[serde(rename = "type")]
     pub rule_type: String,
 }

@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConnectionInfo {
     /// Protocol name (e.g., "tcp", "udp").
+    ///
+    /// Kept as `String` because the OCSF spec defines this as free-form
+    /// `string_t`, and sandbox integration passes runtime-dynamic values.
     pub protocol_name: String,
 }
 
