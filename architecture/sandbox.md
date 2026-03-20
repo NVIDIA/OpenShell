@@ -311,7 +311,7 @@ In gRPC mode, the sandbox can receive policy updates at runtime without restarti
 | `landlock` | No | Landlock LSM in pre_exec | Configuration for the above; same restriction |
 | `process` | No | `setuid`/`setgid` in pre-exec | Privileges dropped irrevocably before exec |
 
-The gateway's `UpdateSandboxPolicy` RPC enforces this boundary: it rejects any update where the static fields (`filesystem`, `landlock`, `process`) differ from the version 1 (creation-time) policy. It also rejects updates that would change the network mode (e.g., adding `network_policies` to a sandbox that started in `Block` mode), because the network namespace and proxy infrastructure are set up once at startup.
+The gateway's `UpdateSandboxPolicy` RPC enforces this boundary: it rejects any update where the static fields (`filesystem`, `landlock`, `process`) differ from the version 1 (creation-time) policy. `network_policies` remain live-editable, including transitions between an empty rule set and a non-empty one, because proto-backed sandboxes already start with the proxy and network namespace infrastructure in place.
 
 ### Poll loop
 
