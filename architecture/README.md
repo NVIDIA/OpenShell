@@ -34,7 +34,7 @@ flowchart TB
     subgraph EXT["External Services"]
         HOSTS["Allowed Hosts (github.com, api.anthropic.com, ...)"]
         CREDS["Provider APIs (Claude, GitHub, GitLab, ...)"]
-        BACKEND["Inference Backends (OpenAI, Anthropic, NVIDIA, local)"]
+        BACKEND["Inference Backends (OpenAI, Anthropic, NVIDIA, Groq, local)"]
     end
 
     CLI -- "gRPC / HTTPS" --> SERVER
@@ -155,7 +155,7 @@ AI agents typically need credentials to access external services -- an API key f
 
 The provider system handles:
 
-- **Automatic discovery**: The CLI scans the user's local machine for existing credentials (environment variables, configuration files) and offers to upload them to the gateway. Supported providers include Claude, Codex, OpenCode, OpenAI, Anthropic, NVIDIA, GitHub, GitLab, and others.
+- **Automatic discovery**: The CLI scans the user's local machine for existing credentials (environment variables, configuration files) and offers to upload them to the gateway. Supported providers include Claude, Codex, OpenCode, OpenAI, Anthropic, NVIDIA, Groq, GitHub, GitLab, and others.
 - **Secure storage**: Credentials are stored on the gateway, separate from sandbox definitions. They never appear in Kubernetes pod specifications.
 - **Runtime injection**: When a sandbox starts, the supervisor process fetches the credentials from the gateway via gRPC and injects them as environment variables into every process it spawns (both the initial agent process and any SSH sessions).
 - **CLI management**: Users can create, update, list, and delete providers through standard CLI commands.

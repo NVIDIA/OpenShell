@@ -41,13 +41,14 @@ File: `crates/openshell-core/src/inference.rs`
 
 `InferenceProviderProfile` is the single source of truth for provider-specific inference knowledge: default endpoint, supported protocols, credential key lookup order, auth header style, and default headers.
 
-Three profiles are defined:
+Four profiles are defined:
 
 | Provider | Default Base URL | Protocols | Auth | Default Headers |
 |----------|-----------------|-----------|------|-----------------|
 | `openai` | `https://api.openai.com/v1` | `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` | `Authorization: Bearer` | (none) |
 | `anthropic` | `https://api.anthropic.com/v1` | `anthropic_messages`, `model_discovery` | `x-api-key` | `anthropic-version: 2023-06-01` |
 | `nvidia` | `https://integrate.api.nvidia.com/v1` | `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` | `Authorization: Bearer` | (none) |
+| `groq` | `https://api.groq.com/openai/v1` | `openai_chat_completions`, `openai_completions`, `openai_responses`, `model_discovery` | `Authorization: Bearer` | (none) |
 
 Each profile also defines `credential_key_names` (e.g. `["OPENAI_API_KEY"]`) and `base_url_config_keys` (e.g. `["OPENAI_BASE_URL"]`) used by the gateway to resolve credentials and endpoint overrides from provider records.
 
@@ -302,7 +303,7 @@ Cluster inference commands:
 - `openshell inference get` -- displays both user and system inference configuration
 - `openshell inference get --system` -- displays only the system inference configuration
 
-The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, or `nvidia`).
+The `--provider` flag references a provider record name (not a provider type). The provider must already exist in the cluster and have a supported inference type (`openai`, `anthropic`, `nvidia`, or `groq`).
 
 Inference writes verify by default. `--no-verify` is the explicit opt-out for endpoints that are not up yet.
 
@@ -314,10 +315,11 @@ Files:
 - `crates/openshell-providers/src/providers/openai.rs` -- `OpenaiProvider`
 - `crates/openshell-providers/src/providers/anthropic.rs` -- `AnthropicProvider`
 - `crates/openshell-providers/src/providers/nvidia.rs` -- `NvidiaProvider`
+- `crates/openshell-providers/src/providers/groq.rs` -- `GroqProvider`
 
 Provider discovery and inference routing are separate concerns:
 
 - `ProviderPlugin` (in `openshell-providers`) handles credential *discovery* -- scanning environment variables to find API keys.
 - `InferenceProviderProfile` (in `openshell-core`) handles how to *use* discovered credentials to make inference API calls.
 
-The `openai`, `anthropic`, and `nvidia` provider plugins each discover credentials from their canonical environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NVIDIA_API_KEY`). These credentials are stored in provider records and looked up by the gateway at bundle resolution time.
+The `openai`, `anthropic`, `nvidia`, and `groq` provider plugins each discover credentials from their canonical environment variable (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `NVIDIA_API_KEY`, `GROQ_API_KEY`). These credentials are stored in provider records and looked up by the gateway at bundle resolution time.

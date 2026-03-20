@@ -56,6 +56,13 @@ const OPENAI_PROTOCOLS: &[&str] = &[
 
 const ANTHROPIC_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 
+const GROQ_PROTOCOLS: &[&str] = &[
+    "openai_chat_completions",
+    "openai_completions",
+    "openai_responses",
+    "model_discovery",
+];
+
 static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "openai",
     default_base_url: "https://api.openai.com/v1",
@@ -86,6 +93,16 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     default_headers: &[],
 };
 
+static GROQ_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "groq",
+    default_base_url: "https://api.groq.com/openai/v1",
+    protocols: GROQ_PROTOCOLS,
+    credential_key_names: &["GROQ_API_KEY"],
+    base_url_config_keys: &["GROQ_BASE_URL"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+};
+
 /// Look up the inference provider profile for a given provider type.
 ///
 /// Returns `None` for provider types that don't support inference routing
@@ -95,6 +112,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
+        "groq" => Some(&GROQ_PROFILE),
         _ => None,
     }
 }
@@ -176,7 +194,9 @@ mod tests {
         assert!(profile_for("openai").is_some());
         assert!(profile_for("anthropic").is_some());
         assert!(profile_for("nvidia").is_some());
+        assert!(profile_for("groq").is_some());
         assert!(profile_for("OpenAI").is_some()); // case insensitive
+        assert!(profile_for("GROQ").is_some()); // case insensitive
     }
 
     #[test]

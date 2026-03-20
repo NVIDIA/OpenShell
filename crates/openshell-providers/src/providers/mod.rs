@@ -7,6 +7,7 @@ pub mod codex;
 pub mod generic;
 pub mod github;
 pub mod gitlab;
+pub mod groq;
 pub mod nvidia;
 pub mod openai;
 pub mod opencode;

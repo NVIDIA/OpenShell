@@ -13,9 +13,9 @@ experimental = true
 
 [tools]
 python = "3.13.12"
-rust = "stable"
+rust = "1.94.0"
 kubectl = "1.35.1"
-uv = "0.10.2"
+uv = "0.10.12"
 protoc = "29.6"
 helm = "4.1.1"
 "ubi:mozilla/sccache" = { version = "0.14.0", matching = "sccache-v" }
