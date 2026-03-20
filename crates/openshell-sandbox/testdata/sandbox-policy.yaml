@@ -63,15 +63,19 @@ network_policies:
       - { host: github.com, port: 443 }
       - { host: api.github.com, port: 443 }
       - { host: api.githubcopilot.com, port: 443 }
+      - { host: api.individual.githubcopilot.com, port: 443 }
+      - { host: api.business.githubcopilot.com, port: 443 }
       - { host: api.enterprise.githubcopilot.com, port: 443 }
+      - { host: copilot-proxy.githubusercontent.com, port: 443 }
+      - { host: copilot-telemetry.githubusercontent.com, port: 443 }
+      - { host: default.exp-tas.com, port: 443 }
+      - { host: origin-tracker.githubusercontent.com, port: 443 }
       - { host: release-assets.githubusercontent.com, port: 443 }
     binaries:
       - { path: "/usr/lib/node_modules/@github/copilot/node_modules/@github/**/copilot" }
       - { path: /usr/local/bin/copilot }
       - { path: "/home/*/.local/bin/copilot" }
       - { path: /usr/bin/node }
-      - { path: /usr/bin/gh }
-      - { path: /usr/local/bin/gh }
 
   gitlab:
     name: gitlab
