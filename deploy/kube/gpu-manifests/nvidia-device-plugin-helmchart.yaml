@@ -33,6 +33,7 @@ spec:
   valuesContent: |-
     runtimeClassName: nvidia
     deviceListStrategy: cdi-cri
+    deviceIDStrategy: index
     cdi:
       nvidiaHookPath: /usr/bin/nvidia-cdi-hook
     nvidiaDriverRoot: "/"
