@@ -107,6 +107,8 @@ pub struct DockerPreflight {
 /// - `/var/run/docker.sock` — default for Docker Desktop, `OrbStack`, Colima
 /// - `$HOME/.colima/docker.sock` — Colima (older installs)
 /// - `$HOME/.orbstack/run/docker.sock` — `OrbStack` (if symlink is missing)
+/// - `$HOME/Library/Containers/com.docker.docker/Data/docker-cli.sock` — Docker Desktop on macOS
+///   (recent versions may not create `/var/run/docker.sock`)
 const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
     "/var/run/docker.sock",
     // Expanded at runtime via home_dir():
@@ -125,6 +127,10 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
     let docker = match Docker::connect_with_local_defaults() {
         Ok(d) => d,
         Err(err) => {
+            // Default connection failed — try alternative sockets before giving up.
+            if let Some(preflight) = try_alternative_sockets().await {
+                return Ok(preflight);
+            }
             return Err(docker_not_reachable_error(
                 &format!("{err}"),
                 "Failed to create Docker client",
@@ -134,6 +140,10 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
 
     // Step 2: Ping the daemon to confirm it's responsive.
     if let Err(err) = docker.ping().await {
+        // Ping failed — try alternative sockets before giving up.
+        if let Some(preflight) = try_alternative_sockets().await {
+            return Ok(preflight);
+        }
         return Err(docker_not_reachable_error(
             &format!("{err}"),
             "Docker socket exists but the daemon is not responding",
@@ -147,6 +157,25 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
     };
 
     Ok(DockerPreflight { docker, version })
+}
+
+/// Try connecting to Docker through alternative socket paths.
+///
+/// Returns `Some(DockerPreflight)` if a working socket was found.
+async fn try_alternative_sockets() -> Option<DockerPreflight> {
+    for path in find_alternative_sockets() {
+        let socket_url = format!("unix://{path}");
+        let docker = match Docker::connect_with_socket(&socket_url, 120, API_DEFAULT_VERSION) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        if docker.ping().await.is_ok() {
+            let version = docker.version().await.ok().and_then(|v| v.version);
+            eprintln!("→ Connected to Docker via alternative socket: {path}");
+            return Some(DockerPreflight { docker, version });
+        }
+    }
+    None
 }
 
 /// Build a rich, user-friendly error when Docker is not reachable.
@@ -221,6 +250,7 @@ fn find_alternative_sockets() -> Vec<String> {
         let home_sockets = [
             format!("{home}/.colima/docker.sock"),
             format!("{home}/.orbstack/run/docker.sock"),
+            format!("{home}/Library/Containers/com.docker.docker/Data/docker-cli.sock"),
         ];
         for path in &home_sockets {
             if std::path::Path::new(path).exists() && !found.contains(path) {
