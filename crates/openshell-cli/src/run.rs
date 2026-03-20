@@ -1415,6 +1415,15 @@ pub async fn gateway_admin_deploy(
 
     let handle = deploy_gateway_with_panel(options, name, location).await?;
 
+    // Wait for the gRPC endpoint to actually accept connections before
+    // declaring the gateway ready. The Docker health check may pass before
+    // the gRPC listener inside the pod is fully bound.
+    let server = handle.gateway_endpoint().to_string();
+    let tls = TlsOptions::default()
+        .with_gateway_name(name)
+        .with_default_paths(&server);
+    crate::bootstrap::wait_for_grpc_ready(&server, &tls).await?;
+
     print_deploy_summary(name, &handle);
 
     // Auto-activate: set this gateway as the active gateway.

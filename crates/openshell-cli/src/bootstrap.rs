@@ -226,7 +226,7 @@ pub async fn run_bootstrap(
 /// Retry connecting to the gateway gRPC endpoint until it succeeds or a
 /// timeout is reached. Uses exponential backoff starting at 500 ms, doubling
 /// up to 4 s, with a total deadline of 30 s.
-async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
+pub(crate) async fn wait_for_grpc_ready(server: &str, tls: &TlsOptions) -> Result<()> {
     const MAX_WAIT: Duration = Duration::from_secs(30);
     const INITIAL_BACKOFF: Duration = Duration::from_millis(500);
 

@@ -880,6 +880,14 @@ where
     let cname = container_name(name);
     let kubeconfig = constants::KUBECONFIG_PATH;
 
+    // Wait for the k3s API server and openshell namespace before attempting
+    // to read secrets. Without this, kubectl fails transiently on resume
+    // (k3s hasn't booted yet), the code assumes secrets are gone, and
+    // regenerates PKI unnecessarily — triggering a server rollout restart
+    // and TLS errors for in-flight connections.
+    log("[progress] Waiting for openshell namespace".to_string());
+    wait_for_namespace(docker, &cname, kubeconfig, "openshell").await?;
+
     // Try to load existing secrets.
     match load_existing_pki_bundle(docker, &cname, kubeconfig).await {
         Ok(bundle) => {
@@ -894,10 +902,6 @@ where
     }
 
     // Generate fresh PKI and apply to cluster.
-    // Namespace may still be creating on first bootstrap, so wait here only
-    // when rotation is actually needed.
-    log("[progress] Waiting for openshell namespace".to_string());
-    wait_for_namespace(docker, &cname, kubeconfig, "openshell").await?;
     log("[progress] Generating TLS certificates".to_string());
     let bundle = generate_pki(extra_sans)?;
     log("[progress] Applying TLS secrets to gateway".to_string());

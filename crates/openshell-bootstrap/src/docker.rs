@@ -8,9 +8,9 @@ use bollard::API_DEFAULT_VERSION;
 use bollard::Docker;
 use bollard::errors::Error as BollardError;
 use bollard::models::{
-    ContainerCreateBody, DeviceRequest, HostConfig, HostConfigCgroupnsModeEnum,
-    NetworkCreateRequest, NetworkDisconnectRequest, PortBinding, RestartPolicy,
-    RestartPolicyNameEnum, VolumeCreateRequest,
+    ContainerCreateBody, DeviceRequest, EndpointSettings, HostConfig, HostConfigCgroupnsModeEnum,
+    NetworkConnectRequest, NetworkCreateRequest, NetworkDisconnectRequest, PortBinding,
+    RestartPolicy, RestartPolicyNameEnum, VolumeCreateRequest,
 };
 use bollard::query_parameters::{
     CreateContainerOptions, CreateImageOptions, InspectContainerOptions, InspectNetworkOptions,
@@ -506,6 +506,17 @@ pub async fn ensure_container(
             };
 
             if image_matches {
+                // The container exists with the correct image, but its network
+                // attachment may be stale. When the gateway is resumed after a
+                // container kill, `ensure_network` destroys and recreates the
+                // Docker network (giving it a new ID). The stopped container
+                // still references the old network ID, so `docker start` would
+                // fail with "network <old-id> not found".
+                //
+                // Fix: disconnect from any existing networks and reconnect to
+                // the current (just-created) network before returning.
+                let expected_net = network_name(name);
+                reconcile_container_network(docker, &container_name, &expected_net).await?;
                 return Ok(());
             }
 
@@ -1040,6 +1051,71 @@ async fn force_remove_network(docker: &Docker, net_name: &str) -> Result<()> {
             .into_diagnostic()
             .wrap_err("failed to remove Docker network"),
     }
+}
+
+/// Ensure a stopped container is connected to the expected Docker network.
+///
+/// When a gateway is resumed after the container was killed (but not removed),
+/// `ensure_network` destroys and recreates the network with a new ID. The
+/// stopped container still holds a reference to the old network ID in its
+/// config, so `docker start` would fail with a 404 "network not found" error.
+///
+/// This function disconnects the container from any networks that no longer
+/// match the expected network name and connects it to the correct one.
+async fn reconcile_container_network(
+    docker: &Docker,
+    container_name: &str,
+    expected_network: &str,
+) -> Result<()> {
+    let info = docker
+        .inspect_container(container_name, None::<InspectContainerOptions>)
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to inspect container for network reconciliation")?;
+
+    // Check the container's current network attachments via NetworkSettings.
+    let attached_networks: Vec<String> = info
+        .network_settings
+        .as_ref()
+        .and_then(|ns| ns.networks.as_ref())
+        .map(|nets| nets.keys().cloned().collect())
+        .unwrap_or_default();
+
+    // If the container is already attached to the expected network (by name),
+    // Docker will resolve the name to the current network ID on start.
+    // However, when the network was destroyed and recreated, the container's
+    // stored endpoint references the old ID. Disconnect and reconnect to
+    // pick up the new network ID.
+    for net_name in &attached_networks {
+        let _ = docker
+            .disconnect_network(
+                net_name,
+                NetworkDisconnectRequest {
+                    container: container_name.to_string(),
+                    force: Some(true),
+                },
+            )
+            .await;
+    }
+
+    // Connect to the (freshly created) expected network.
+    docker
+        .connect_network(
+            expected_network,
+            NetworkConnectRequest {
+                container: container_name.to_string(),
+                endpoint_config: Some(EndpointSettings::default()),
+            },
+        )
+        .await
+        .into_diagnostic()
+        .wrap_err("failed to connect container to gateway network")?;
+
+    tracing::debug!(
+        "Reconciled network for container {container_name}: disconnected from {attached_networks:?}, connected to {expected_network}"
+    );
+
+    Ok(())
 }
 
 fn is_not_found(err: &BollardError) -> bool {

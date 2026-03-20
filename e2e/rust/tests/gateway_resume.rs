@@ -277,6 +277,116 @@ async fn gateway_start_resumes_after_container_removal() {
 }
 
 // -------------------------------------------------------------------
+// Test: container killed → gateway start resumes, sandboxes survive,
+//       new sandbox create works
+// -------------------------------------------------------------------
+
+/// When a container is killed (stopped but NOT removed), `gateway start`
+/// should resume from existing state. This validates three things:
+///
+/// 1. The stale Docker network reference is reconciled (ensure_network
+///    destroys and recreates the network with a new ID).
+/// 2. Existing sandboxes created before the kill survive the restart.
+/// 3. New `sandbox create` works after resume — the TLS certificates
+///    are reused (not needlessly regenerated), so the CLI's mTLS certs
+///    still match the server.
+#[tokio::test]
+async fn gateway_start_resumes_after_container_kill() {
+    // Precondition: gateway is healthy.
+    wait_for_healthy(Duration::from_secs(30)).await;
+
+    let cname = container_name();
+    let net_name = format!("openshell-cluster-{GATEWAY_NAME}");
+
+    // Create a sandbox before the kill to verify state persistence.
+    let (create_output, create_code) =
+        run_cli(&["sandbox", "create", "--", "echo", "kill-resume-test"]).await;
+    let clean_create = strip_ansi(&create_output);
+    assert_eq!(
+        create_code, 0,
+        "sandbox create should succeed:\n{clean_create}"
+    );
+
+    let sandbox_before = clean_create
+        .lines()
+        .find_map(|line| {
+            if let Some((_, rest)) = line.split_once("Created sandbox:") {
+                rest.split_whitespace().next().map(ToOwned::to_owned)
+            } else if let Some((_, rest)) = line.split_once("Name:") {
+                rest.split_whitespace().next().map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .expect("should extract sandbox name from create output");
+
+    // Kill the container (it remains as a stopped container, unlike `docker rm`).
+    let (_, kill_code) = docker_cmd(&["kill", &cname]);
+    assert_eq!(kill_code, 0, "docker kill should succeed");
+
+    sleep(Duration::from_secs(3)).await;
+
+    // Remove the Docker network to simulate a stale network reference.
+    // The bootstrap `ensure_network` always destroys and recreates, so
+    // after this the container's stored network ID will be invalid.
+    let _ = docker_cmd(&["network", "disconnect", "-f", &net_name, &cname]);
+    let (_, net_rm_code) = docker_cmd(&["network", "rm", &net_name]);
+    assert_eq!(
+        net_rm_code, 0,
+        "docker network rm should succeed (or network already gone)"
+    );
+
+    // Start the gateway — must handle stale network + reuse existing PKI.
+    let (start_output, start_code) = run_cli(&["gateway", "start"]).await;
+    let clean_start = strip_ansi(&start_output);
+    assert_eq!(
+        start_code, 0,
+        "gateway start after kill should succeed:\n{clean_start}"
+    );
+
+    // Wait for the gateway to become healthy again.
+    wait_for_healthy(Duration::from_secs(180)).await;
+
+    // Verify the pre-existing sandbox survived.
+    let (list_output, list_code) = run_cli(&["sandbox", "list", "--names"]).await;
+    let clean_list = strip_ansi(&list_output);
+    assert_eq!(
+        list_code, 0,
+        "sandbox list should succeed after resume:\n{clean_list}"
+    );
+    assert!(
+        clean_list.contains(&sandbox_before),
+        "sandbox '{sandbox_before}' should survive container kill + resume.\nList output:\n{clean_list}"
+    );
+
+    // Create a new sandbox to verify TLS is working end-to-end.
+    let (new_create_output, new_create_code) =
+        run_cli(&["sandbox", "create", "--", "echo", "post-resume-test"]).await;
+    let clean_new = strip_ansi(&new_create_output);
+    assert_eq!(
+        new_create_code, 0,
+        "sandbox create after resume should succeed (TLS must work):\n{clean_new}"
+    );
+
+    let sandbox_after = clean_new
+        .lines()
+        .find_map(|line| {
+            if let Some((_, rest)) = line.split_once("Created sandbox:") {
+                rest.split_whitespace().next().map(ToOwned::to_owned)
+            } else if let Some((_, rest)) = line.split_once("Name:") {
+                rest.split_whitespace().next().map(ToOwned::to_owned)
+            } else {
+                None
+            }
+        })
+        .expect("should extract sandbox name from post-resume create output");
+
+    // Cleanup.
+    let _ = run_cli(&["sandbox", "delete", &sandbox_before]).await;
+    let _ = run_cli(&["sandbox", "delete", &sandbox_after]).await;
+}
+
+// -------------------------------------------------------------------
 // Test: SSH handshake secret persists across container restart
 // -------------------------------------------------------------------
 
