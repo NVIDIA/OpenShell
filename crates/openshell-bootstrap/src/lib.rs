@@ -123,11 +123,6 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
-    /// When true, resume from existing state (volume, stopped container)
-    /// instead of erroring out. The deploy flow reuses the existing volume
-    /// and creates a new container if needed, preserving k3s/etcd state,
-    /// sandbox pods, and secrets.
-    pub resume: bool,
 }
 
 impl DeployOptions {
@@ -144,7 +139,6 @@ impl DeployOptions {
             registry_token: None,
             gpu: vec![],
             recreate: false,
-            resume: false,
         }
     }
 
@@ -214,13 +208,6 @@ impl DeployOptions {
         self.recreate = recreate;
         self
     }
-
-    /// Set whether to resume from existing state (volume, stopped container).
-    #[must_use]
-    pub fn with_resume(mut self, resume: bool) -> Self {
-        self.resume = resume;
-        self
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -285,7 +272,6 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
-    let resume = options.resume;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -322,35 +308,22 @@ where
         .and_then(|info| info.cdi_spec_dirs)
         .is_some_and(|dirs| !dirs.is_empty());
 
-    // Guard: recreate takes precedence if both are set (shouldn't happen in practice).
-    if resume && recreate {
-        tracing::warn!("both resume and recreate set; recreate takes precedence");
-    }
-
     // If an existing gateway is found, decide how to proceed:
     // - recreate: destroy everything and start fresh
-    // - resume: keep existing state and create/start the container
-    // - neither: error out (caller should prompt the user)
+    // - otherwise: auto-resume from existing state (the ensure_* calls are
+    //   idempotent and will reuse the volume, create a container if needed,
+    //   and start it)
+    let mut resume = false;
     if let Some(existing) = check_existing_gateway(&target_docker, &name).await? {
         if recreate {
             log("[status] Removing existing gateway".to_string());
             destroy_gateway_resources(&target_docker, &name).await?;
-        } else if resume {
-            if existing.container_running {
-                log("[status] Gateway is already running".to_string());
-            } else {
-                log("[status] Resuming gateway from existing state".to_string());
-            }
-            // Fall through to ensure_* calls — they are idempotent and will
-            // reuse the existing volume, create a container if needed, and
-            // start it.
+        } else if existing.container_running {
+            log("[status] Gateway is already running".to_string());
+            resume = true;
         } else {
-            return Err(miette::miette!(
-                "Gateway '{name}' already exists (container_running={}).\n\
-                 Use --recreate to destroy and redeploy, or destroy it first with:\n\n    \
-                 openshell gateway destroy --name {name}",
-                existing.container_running,
-            ));
+            log("[status] Resuming gateway from existing state".to_string());
+            resume = true;
         }
     }
 

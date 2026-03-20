@@ -144,12 +144,11 @@ pub async fn run_bootstrap(
     );
     eprintln!();
 
-    // Build base deploy options. The auto-bootstrap path tries to resume from
-    // existing state first (preserving sandboxes and secrets), falling back to
-    // a full recreate if the resume fails.
-    let build_options = |resume: bool, recreate: bool| {
+    // Build deploy options. The deploy flow auto-resumes from existing state
+    // (preserving sandboxes and secrets) when it finds an existing gateway.
+    // If the initial attempt fails, fall back to a full recreate.
+    let build_options = |recreate: bool| {
         let mut opts = openshell_bootstrap::DeployOptions::new(&gateway_name)
-            .with_resume(resume)
             .with_recreate(recreate)
             .with_gpu(gpu);
         if let Some(dest) = remote {
@@ -186,18 +185,15 @@ pub async fn run_bootstrap(
         opts
     };
 
-    // Try resume first to preserve existing sandboxes and secrets.
-    let handle = match deploy_gateway_with_panel(
-        build_options(true, false),
-        &gateway_name,
-        location,
-    )
-    .await
+    // Deploy the gateway. The deploy flow auto-resumes from existing state
+    // when it finds one. If that fails, fall back to a full recreate.
+    let handle = match deploy_gateway_with_panel(build_options(false), &gateway_name, location)
+        .await
     {
         Ok(handle) => handle,
         Err(resume_err) => {
             tracing::warn!("auto-bootstrap resume failed, falling back to recreate: {resume_err}");
-            deploy_gateway_with_panel(build_options(false, true), &gateway_name, location).await?
+            deploy_gateway_with_panel(build_options(true), &gateway_name, location).await?
         }
     };
     let server = handle.gateway_endpoint().to_string();

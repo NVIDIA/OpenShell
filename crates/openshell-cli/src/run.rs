@@ -1369,27 +1369,18 @@ pub async fn gateway_admin_deploy(
         opts
     });
 
-    // Check whether a gateway already exists and decide how to proceed:
-    // - --recreate: always destroy and start fresh
-    // - existing state (stopped container / volume only): auto-resume
-    // - already running: return immediately (nothing to do)
-    let should_recreate = recreate;
-    let mut should_resume = false;
-    if let Some(existing) =
-        openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
-    {
-        if should_recreate {
-            // --recreate flag: fall through to destroy and redeploy.
-        } else if existing.container_running {
-            // Already running — nothing to do.
-            eprintln!(
-                "{} Gateway '{name}' is already running.",
-                "✓".green().bold()
-            );
-            return Ok(());
-        } else {
-            // Stopped container or volume-only: auto-resume from existing state.
-            should_resume = true;
+    // If the gateway is already running and we're not recreating, short-circuit.
+    if !recreate {
+        if let Some(existing) =
+            openshell_bootstrap::check_existing_deployment(name, remote_opts.as_ref()).await?
+        {
+            if existing.container_running {
+                eprintln!(
+                    "{} Gateway '{name}' is already running.",
+                    "✓".green().bold()
+                );
+                return Ok(());
+            }
         }
     }
 
@@ -1398,8 +1389,7 @@ pub async fn gateway_admin_deploy(
         .with_disable_tls(disable_tls)
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
-        .with_recreate(should_recreate)
-        .with_resume(should_resume);
+        .with_recreate(recreate);
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }
