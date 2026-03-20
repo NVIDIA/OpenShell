@@ -60,7 +60,7 @@ async fn wait_for_healthy(timeout: Duration) {
     loop {
         let (output, code) = run_cli(&["status"]).await;
         let clean = strip_ansi(&output).to_lowercase();
-        if code == 0 && (clean.contains("healthy") || clean.contains("running") || clean.contains("✓")) {
+        if code == 0 && (clean.contains("healthy") || clean.contains("running") || clean.contains("connected") || clean.contains("✓")) {
             return;
         }
         if start.elapsed() > timeout {
