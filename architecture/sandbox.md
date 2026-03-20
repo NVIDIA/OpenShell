@@ -54,6 +54,10 @@ The key separation is:
 
 That separation matters because one provider may support multiple tools, and one tool may need credentials from multiple providers. The sandbox should therefore project a stable tool contract while the provider and inference layers remain the source of truth for credential discovery and backend routing.
 
+For the current local `opencode` + Copilot validation slice, the approved tool contract includes one explicit compatibility exception: upstream `opencode` stores device-flow auth in `~/.local/share/opencode/auth.json` and then uses the stored OAuth token for `Authorization: Bearer` requests to `api.githubcopilot.com`. OpenShell's preferred model remains placeholder env projection with proxy-time secret rewrite, but this narrow `opencode`-specific path may project that auth file to preserve upstream behavior during local validation. This is not a general projection framework, and it is not the final design.
+
+Security caveat: projecting `auth.json` likely makes readable auth material available to the agent process inside the sandbox. Treat that as a temporary local compatibility trade-off only. TODO: replace raw readable auth-file projection with a hardened adapter path that preserves upstream compatibility without exposing bearer material directly to child processes.
+
 The `run_sandbox()` function in `crates/openshell-sandbox/src/lib.rs` is the main orchestration entry point. It executes the following steps in order.
 
 ### Orchestration flow

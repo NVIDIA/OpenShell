@@ -2,8 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::path::Path;
+use std::path::PathBuf;
 
 const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
+const OPENCODE_AUTH_RELATIVE_PATH: &str = ".local/share/opencode/auth.json";
+const SANDBOX_XDG_DATA_HOME: &str = "/sandbox/.local/share";
+const SANDBOX_OPENCODE_AUTH_PATH: &str = "/sandbox/.local/share/opencode/auth.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolAdapter {
@@ -22,7 +26,7 @@ impl ToolAdapter {
 
 pub(crate) fn detect_tool_adapter(command: &[String]) -> Option<ToolAdapter> {
     let first = command.first()?;
-    let basename = std::path::Path::new(first)
+    let basename = Path::new(first)
         .file_name()
         .and_then(|name| name.to_str())?;
 
@@ -31,6 +35,38 @@ pub(crate) fn detect_tool_adapter(command: &[String]) -> Option<ToolAdapter> {
         "opencode" => Some(ToolAdapter::OpenCode),
         _ => None,
     }
+}
+
+pub(crate) fn auth_file_projection(
+    command: &[String],
+    host_home: &Path,
+    provider_env: &std::collections::HashMap<String, String>,
+) -> Option<(PathBuf, PathBuf)> {
+    match detect_tool_adapter(command)? {
+        ToolAdapter::OpenCode if is_github_copilot_targeted(provider_env) => Some((
+            host_home.join(OPENCODE_AUTH_RELATIVE_PATH),
+            PathBuf::from(SANDBOX_OPENCODE_AUTH_PATH),
+        )),
+        ToolAdapter::ClaudeCode => None,
+        ToolAdapter::OpenCode => None,
+    }
+}
+
+pub(crate) fn tool_runtime_env_vars(
+    command: &[String],
+    provider_env: &std::collections::HashMap<String, String>,
+) -> Option<[(&'static str, String); 1]> {
+    match detect_tool_adapter(command)? {
+        ToolAdapter::OpenCode if is_github_copilot_targeted(provider_env) => {
+            Some([("XDG_DATA_HOME", SANDBOX_XDG_DATA_HOME.to_owned())])
+        }
+        ToolAdapter::ClaudeCode => None,
+        ToolAdapter::OpenCode => None,
+    }
+}
+
+fn is_github_copilot_targeted(provider_env: &std::collections::HashMap<String, String>) -> bool {
+    provider_env.contains_key("GITHUB_TOKEN") || provider_env.contains_key("GH_TOKEN")
 }
 
 pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
@@ -128,5 +164,80 @@ mod tests {
         let command = vec!["python".to_string(), "script.py".to_string()];
 
         assert_eq!(detect_tool_adapter(&command), None);
+    }
+
+    #[test]
+    fn opencode_auth_file_projection_uses_approved_source_and_destination_paths() {
+        let command = vec!["/usr/local/bin/opencode".to_string(), "run".to_string()];
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+        let projection = auth_file_projection(&command, Path::new("/home/alice"), &provider_env)
+            .expect("opencode should request auth.json projection");
+
+        assert_eq!(
+            projection.0,
+            PathBuf::from("/home/alice/.local/share/opencode/auth.json")
+        );
+        assert_eq!(
+            projection.1,
+            PathBuf::from("/sandbox/.local/share/opencode/auth.json")
+        );
+    }
+
+    #[test]
+    fn claude_does_not_request_auth_file_projection() {
+        let command = vec!["claude".to_string(), "code".to_string()];
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+
+        assert_eq!(
+            auth_file_projection(&command, Path::new("/home/alice"), &provider_env),
+            None
+        );
+    }
+
+    #[test]
+    fn unsupported_tool_paths_do_not_request_auth_file_projection() {
+        let command = vec!["/usr/bin/python3".to_string(), "script.py".to_string()];
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+
+        assert_eq!(
+            auth_file_projection(&command, Path::new("/home/alice"), &provider_env),
+            None
+        );
+    }
+
+    #[test]
+    fn opencode_runtime_env_vars_use_sandbox_xdg_data_dir_for_github_path() {
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+
+        assert_eq!(
+            tool_runtime_env_vars(&command, &provider_env),
+            Some([("XDG_DATA_HOME", "/sandbox/.local/share".to_string())])
+        );
+    }
+
+    #[test]
+    fn unsupported_tools_do_not_receive_runtime_env_vars() {
+        let command = vec!["python".to_string(), "script.py".to_string()];
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+
+        assert_eq!(tool_runtime_env_vars(&command, &provider_env), None);
+    }
+
+    #[test]
+    fn opencode_without_github_provider_does_not_request_auth_projection_or_xdg_override() {
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = std::collections::HashMap::new();
+
+        assert_eq!(
+            auth_file_projection(&command, Path::new("/home/alice"), &provider_env),
+            None
+        );
+        assert_eq!(tool_runtime_env_vars(&command, &provider_env), None);
     }
 }

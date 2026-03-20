@@ -44,7 +44,7 @@ use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
-use crate::child_env::detect_tool_adapter;
+use crate::child_env::{auth_file_projection, detect_tool_adapter};
 pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
@@ -213,6 +213,16 @@ pub async fn run_sandbox(
 
     // Prepare filesystem: create and chown read_write directories
     prepare_filesystem(&policy)?;
+
+    if let Some(host_home) = resolve_host_home_dir()? {
+        stage_tool_auth_projection(
+            &command,
+            &host_home,
+            std::path::Path::new("/sandbox"),
+            &policy,
+            &provider_env,
+        )?;
+    }
 
     // Generate ephemeral CA and TLS state for HTTPS L7 inspection.
     // The CA cert is written to disk so sandbox processes can trust it.
@@ -1168,6 +1178,119 @@ fn project_provider_env_for_command(
     }
 }
 
+fn stage_tool_auth_projection(
+    command: &[String],
+    host_home: &std::path::Path,
+    sandbox_root: &std::path::Path,
+    policy: &SandboxPolicy,
+    provider_env: &std::collections::HashMap<String, String>,
+) -> Result<Option<std::path::PathBuf>> {
+    #[cfg(unix)]
+    use nix::unistd::{Group, User, chown};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+
+    let Some((source, destination)) = auth_file_projection(command, host_home, provider_env) else {
+        return Ok(None);
+    };
+
+    if !source.exists() {
+        return Ok(None);
+    }
+
+    if let Ok(metadata) = std::fs::symlink_metadata(&source)
+        && metadata.file_type().is_symlink()
+    {
+        return Err(miette::miette!(
+            "tool auth projection source must not be a symlink: '{}'",
+            source.display()
+        ));
+    }
+
+    let relative_destination = destination
+        .strip_prefix("/sandbox")
+        .or_else(|_| destination.strip_prefix("/"))
+        .into_diagnostic()
+        .map_err(|_| miette::miette!("tool auth projection destination must be absolute"))?;
+    let staged_destination = sandbox_root.join(relative_destination);
+    let parent = staged_destination.parent().ok_or_else(|| {
+        miette::miette!("tool auth projection destination must have a parent directory")
+    })?;
+
+    let mut current = sandbox_root.to_path_buf();
+    for component in relative_destination.components() {
+        current.push(component.as_os_str());
+        if let Ok(metadata) = std::fs::symlink_metadata(&current)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(miette::miette!(
+                "tool auth projection destination contains symlinked path component '{}'",
+                current.display()
+            ));
+        }
+    }
+
+    std::fs::create_dir_all(parent).into_diagnostic()?;
+
+    let staged_bytes = std::fs::read(&source).into_diagnostic()?;
+    std::fs::write(&staged_destination, staged_bytes).into_diagnostic()?;
+    #[cfg(unix)]
+    std::fs::set_permissions(&staged_destination, std::fs::Permissions::from_mode(0o400))
+        .into_diagnostic()?;
+
+    #[cfg(unix)]
+    {
+        let user_name = match policy.process.run_as_user.as_deref() {
+            Some(name) if !name.is_empty() => Some(name),
+            _ => None,
+        };
+        let group_name = match policy.process.run_as_group.as_deref() {
+            Some(name) if !name.is_empty() => Some(name),
+            _ => None,
+        };
+
+        let uid = if let Some(name) = user_name {
+            Some(
+                User::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                    .uid,
+            )
+        } else {
+            None
+        };
+        let gid = if let Some(name) = group_name {
+            Some(
+                Group::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                    .gid,
+            )
+        } else {
+            None
+        };
+
+        chown(&staged_destination, uid, gid).into_diagnostic()?;
+    }
+
+    Ok(Some(staged_destination))
+}
+
+fn resolve_host_home_dir() -> Result<Option<std::path::PathBuf>> {
+    #[cfg(unix)]
+    {
+        let user = nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .into_diagnostic()?
+            .map(|user| user.dir);
+        return Ok(user);
+    }
+
+    #[cfg(not(unix))]
+    {
+        Ok(std::env::var_os("HOME").map(std::path::PathBuf::from))
+    }
+}
+
 /// Prepare filesystem for the sandboxed process.
 ///
 /// Creates `read_write` directories if they don't exist and sets ownership
@@ -1397,10 +1520,21 @@ async fn run_policy_poll_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
     use temp_env::with_vars;
 
     static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
         std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process,
+        }
+    }
 
     #[test]
     fn bundle_to_resolved_routes_converts_all_fields() {
@@ -1526,6 +1660,183 @@ mod tests {
             .expect_err("claude tool adapter must reject unrelated provider keys");
 
         assert!(error.to_string().contains("GITHUB_TOKEN"));
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_copies_existing_opencode_auth_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        let source_dir = host_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+
+        let source = source_dir.join("auth.json");
+        std::fs::write(&source, r#"{"token":"copilot"}"#).expect("write auth file");
+
+        let current_user = nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .expect("get current user")
+            .expect("current user entry");
+        let current_group = nix::unistd::Group::from_gid(nix::unistd::getegid())
+            .expect("get current group")
+            .expect("current group entry");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: Some(current_group.name),
+        });
+
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
+            .collect();
+        let staged = stage_tool_auth_projection(
+            &command,
+            &host_home,
+            &sandbox_root,
+            &policy,
+            &provider_env,
+        )
+            .expect("staging should succeed")
+            .expect("opencode auth file should be staged");
+
+        assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
+        assert_eq!(std::fs::read_to_string(staged).expect("read staged auth"), r#"{"token":"copilot"}"#);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            use std::os::unix::fs::PermissionsExt;
+
+            let metadata = std::fs::metadata(sandbox_root.join(".local/share/opencode/auth.json"))
+                .expect("staged metadata");
+            assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
+            assert_eq!(metadata.uid(), nix::unistd::geteuid().as_raw());
+        }
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_skips_missing_opencode_auth_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        std::fs::create_dir_all(&host_home).expect("create host home");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+
+        let command = vec!["opencode".to_string(), "run".to_string()];
+
+        assert_eq!(
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect())
+                .expect("staging should not error for missing auth"),
+            None
+        );
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_skips_unsupported_tools() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        std::fs::create_dir_all(&host_home).expect("create host home");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+
+        let command = vec!["claude".to_string(), "code".to_string()];
+
+        assert_eq!(
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect())
+                .expect("unsupported tool should not error"),
+            None
+        );
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_rejects_symlinked_destination_components() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        let source_dir = host_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+        std::fs::create_dir_all(tempdir.path().join("redirected")).expect("create redirected dir");
+        std::os::unix::fs::symlink(
+            tempdir.path().join("redirected"),
+            sandbox_root.join(".local"),
+        )
+        .expect("create symlinked component");
+        std::fs::write(source_dir.join("auth.json"), r#"{"token":"copilot"}"#)
+            .expect("write auth file");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+        let command = vec!["opencode".to_string(), "run".to_string()];
+
+        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
+            .collect();
+        let error = stage_tool_auth_projection(
+            &command,
+            &host_home,
+            &sandbox_root,
+            &policy,
+            &provider_env,
+        )
+            .expect_err("symlinked destination path must be rejected");
+
+        assert!(error.to_string().contains("symlink"));
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_rejects_symlinked_source_file() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        let source_dir = host_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+        let redirected = tempdir.path().join("redirected-secret.json");
+        std::fs::write(&redirected, r#"{"token":"copilot"}"#).expect("write redirected file");
+        std::os::unix::fs::symlink(&redirected, source_dir.join("auth.json"))
+            .expect("create source symlink");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
+            .collect();
+
+        let error = stage_tool_auth_projection(
+            &command,
+            &host_home,
+            &sandbox_root,
+            &policy,
+            &provider_env,
+        )
+        .expect_err("symlinked source path must be rejected");
+
+        assert!(error.to_string().contains("source must not be a symlink"));
+    }
+
+    #[test]
+    fn resolve_host_home_dir_uses_current_user_directory() {
+        let resolved = resolve_host_home_dir().expect("resolve home");
+        #[cfg(unix)]
+        {
+            let current_user = nix::unistd::User::from_uid(nix::unistd::geteuid())
+                .expect("lookup user")
+                .expect("user entry");
+            assert_eq!(resolved, Some(current_user.dir));
+        }
     }
 
     // -- build_inference_context tests --

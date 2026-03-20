@@ -62,10 +62,10 @@ The sandbox projection contract is per tool, not global. The current design targ
 ### `opencode`
 
 - **Environment variables:** adapter-approved variables may include provider-specific keys used by `opencode`, but only when the tool contract explicitly allows them.
-- **Config files:** adapter-managed projection may populate `opencode` config file paths from an allowlisted set.
-- **Direct secret projection:** disallowed by default; exceptions require an explicit tool/vendor contract.
+- **Config files:** adapter-managed projection may populate `opencode` config file paths from an allowlisted set. For the current local `opencode` + Copilot validation slice, the approved compatibility contract includes projecting upstream `opencode` device-flow auth state at `~/.local/share/opencode/auth.json`.
+- **Direct secret projection:** disallowed by default; exceptions require an explicit tool/vendor contract. The `auth.json` projection above is an `opencode`-specific compatibility exception, not a general sandbox framework rule.
 - **Outbound endpoints:** GitHub/Copilot-related endpoints plus OpenAI-compatible or Anthropic-compatible inference endpoints only when the selected `opencode` adapter path explicitly supports them.
-- **Vendor-auth boundary:** GitHub token projection and any future GitHub Copilot model access must be treated as an explicit adapter contract rather than inferred from generic `github` or `opencode` provider discovery alone.
+- **Vendor-auth boundary:** Upstream `opencode` persists device-flow auth in `~/.local/share/opencode/auth.json` and uses the stored OAuth token for `Authorization: Bearer` requests to `api.githubcopilot.com`. OpenShell normally prefers placeholder env projection, but this local validation slice documents a narrow compatibility exception for that upstream contract rather than inferring it from generic `github` or `opencode` provider discovery alone.
 
 ### Future tool adapters
 
@@ -86,6 +86,8 @@ The next phase of this work adds vendor-native auth/model design on top of the t
 - Provider discovery does not automatically imply that a credential is safe to inject into a child process for a given tool.
 - Endpoint allowlists must be tied to explicit tool/vendor contracts, not to broad assumptions like "all GitHub endpoints" or "all Anthropic-compatible hosts".
 - If a vendor flow depends on direct config-file or session-state projection rather than placeholder env vars, that must be documented as a deliberate exception and tested separately.
+- For the current `opencode` + Copilot local path, projecting `~/.local/share/opencode/auth.json` likely makes readable auth material available to the agent process inside the sandbox. Treat that as a temporary compatibility trade-off, not the final security design.
+- TODO: replace raw readable `auth.json` projection with a harder boundary, such as adapter-mediated token handoff, short-lived derived credentials, or a projection format that keeps bearer material out of the child-visible filesystem.
 
 ## Data Model
 
