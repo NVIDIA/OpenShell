@@ -1915,6 +1915,8 @@ impl OpenShell for OpenShellService {
             return Err(Status::invalid_argument("chunk_id is required"));
         }
 
+        require_no_global_policy(&self.state).await?;
+
         // Resolve sandbox.
         let sandbox = self
             .state
@@ -2035,7 +2037,10 @@ impl OpenShell for OpenShellService {
         );
 
         // If the chunk was approved, remove its rule from the active policy.
+        // Block revoke when a global policy is active since the sandbox policy
+        // isn't in use anyway.
         if was_approved {
+            require_no_global_policy(&self.state).await?;
             remove_chunk_from_policy(&self.state, &sandbox_id, &chunk).await?;
         }
 
@@ -2062,6 +2067,8 @@ impl OpenShell for OpenShellService {
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
+
+        require_no_global_policy(&self.state).await?;
 
         // Resolve sandbox.
         let sandbox = self
@@ -2434,6 +2441,20 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
 /// persist a new revision, supersede older versions, and notify watchers.
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
+
+/// Check whether a global policy is active. Returns an error suitable for
+/// blocking draft chunk approval/revoke when global policy overrides sandbox
+/// policy.
+async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {
+    let global = load_global_settings(state.store.as_ref()).await?;
+    if global.settings.contains_key(POLICY_SETTING_KEY) {
+        return Err(Status::failed_precondition(
+            "cannot approve rules while a global policy is active; \
+             delete the global policy to manage per-sandbox rules",
+        ));
+    }
+    Ok(())
+}
 
 async fn merge_chunk_into_policy(
     store: &crate::persistence::Store,

@@ -1318,22 +1318,32 @@ impl App {
                 }
                 // Allow approve/reject toggle from within the popup.
                 KeyCode::Char('a') => {
-                    let abs = self.draft_scroll + self.draft_selected;
-                    if abs < self.draft_chunks.len() {
-                        let st = self.draft_chunks[abs].status.as_str();
-                        if st == "pending" || st == "rejected" {
-                            self.pending_draft_approve = true;
-                            self.draft_detail_open = false;
+                    if self.sandbox_policy_is_global {
+                        self.status_text =
+                            "Cannot approve rules while a global policy is active".to_string();
+                    } else {
+                        let abs = self.draft_scroll + self.draft_selected;
+                        if abs < self.draft_chunks.len() {
+                            let st = self.draft_chunks[abs].status.as_str();
+                            if st == "pending" || st == "rejected" {
+                                self.pending_draft_approve = true;
+                                self.draft_detail_open = false;
+                            }
                         }
                     }
                 }
                 KeyCode::Char('x') => {
-                    let abs = self.draft_scroll + self.draft_selected;
-                    if abs < self.draft_chunks.len() {
-                        let st = self.draft_chunks[abs].status.as_str();
-                        if st == "pending" || st == "approved" {
-                            self.pending_draft_reject = true;
-                            self.draft_detail_open = false;
+                    if self.sandbox_policy_is_global {
+                        self.status_text =
+                            "Cannot modify rules while a global policy is active".to_string();
+                    } else {
+                        let abs = self.draft_scroll + self.draft_selected;
+                        if abs < self.draft_chunks.len() {
+                            let st = self.draft_chunks[abs].status.as_str();
+                            if st == "pending" || st == "approved" {
+                                self.pending_draft_reject = true;
+                                self.draft_detail_open = false;
+                            }
                         }
                     }
                 }
@@ -1401,7 +1411,10 @@ impl App {
             }
             // Approve selected chunk (pending → approved, rejected → approved).
             KeyCode::Char('a') => {
-                if !self.draft_chunks.is_empty() {
+                if self.sandbox_policy_is_global {
+                    self.status_text =
+                        "Cannot approve rules while a global policy is active".to_string();
+                } else if !self.draft_chunks.is_empty() {
                     let abs = self.draft_scroll + self.draft_selected;
                     if abs < total {
                         let st = self.draft_chunks[abs].status.as_str();
@@ -1413,7 +1426,10 @@ impl App {
             }
             // Reject selected chunk (pending → rejected, approved → rejected).
             KeyCode::Char('x') => {
-                if !self.draft_chunks.is_empty() {
+                if self.sandbox_policy_is_global {
+                    self.status_text =
+                        "Cannot modify rules while a global policy is active".to_string();
+                } else if !self.draft_chunks.is_empty() {
                     let abs = self.draft_scroll + self.draft_selected;
                     if abs < total {
                         let st = self.draft_chunks[abs].status.as_str();
@@ -1425,15 +1441,20 @@ impl App {
             }
             // Approve all pending chunks — show confirmation modal.
             KeyCode::Char('A') => {
-                let pending: Vec<_> = self
-                    .draft_chunks
-                    .iter()
-                    .filter(|c| c.status == "pending")
-                    .cloned()
-                    .collect();
-                if !pending.is_empty() {
-                    self.approve_all_confirm_chunks = pending;
-                    self.approve_all_confirm_open = true;
+                if self.sandbox_policy_is_global {
+                    self.status_text =
+                        "Cannot approve rules while a global policy is active".to_string();
+                } else {
+                    let pending: Vec<_> = self
+                        .draft_chunks
+                        .iter()
+                        .filter(|c| c.status == "pending")
+                        .cloned()
+                        .collect();
+                    if !pending.is_empty() {
+                        self.approve_all_confirm_chunks = pending;
+                        self.approve_all_confirm_open = true;
+                    }
                 }
             }
             KeyCode::Char('q') => self.running = false,
