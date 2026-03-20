@@ -25,9 +25,9 @@ use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
     CreateProviderRequest, CreateSandboxRequest, DeleteProviderRequest, DeleteSandboxRequest,
     GetClusterInferenceRequest, GetDraftHistoryRequest, GetDraftPolicyRequest,
-    GetGatewaySettingsRequest, GetProviderRequest, GetSandboxLogsRequest,
-    GetSandboxPolicyStatusRequest, GetSandboxRequest, GetSandboxSettingsRequest, HealthRequest,
-    ListProvidersRequest, ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
+    GetGatewayConfigRequest, GetProviderRequest, GetSandboxConfigRequest, GetSandboxLogsRequest,
+    GetSandboxPolicyStatusRequest, GetSandboxRequest, HealthRequest, ListProvidersRequest,
+    ListSandboxPoliciesRequest, ListSandboxesRequest, PolicyStatus, Provider,
     RejectDraftChunkRequest, Sandbox, SandboxPhase, SandboxPolicy, SandboxSpec, SandboxTemplate,
     SetClusterInferenceRequest, SettingScope, SettingValue, UpdateProviderRequest,
     UpdateSettingsRequest, WatchSandboxRequest, setting_value,
@@ -3949,7 +3949,7 @@ pub async fn sandbox_settings_get(
         .ok_or_else(|| miette::miette!("sandbox not found"))?;
 
     let response = client
-        .get_sandbox_settings(GetSandboxSettingsRequest {
+        .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox.id.clone(),
         })
         .await
@@ -4004,7 +4004,7 @@ pub async fn sandbox_settings_get(
 pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
     let response = client
-        .get_gateway_settings(GetGatewaySettingsRequest {})
+        .get_gateway_config(GetGatewayConfigRequest {})
         .await
         .into_diagnostic()?
         .into_inner();
@@ -4036,7 +4036,7 @@ pub async fn gateway_settings_get(server: &str, json: bool, tls: &TlsOptions) ->
 
 fn settings_to_json_sandbox(
     name: &str,
-    response: &openshell_core::proto::GetSandboxSettingsResponse,
+    response: &openshell_core::proto::GetSandboxConfigResponse,
 ) -> serde_json::Value {
     let policy_source =
         if response.policy_source == openshell_core::proto::PolicySource::Global as i32 {
@@ -4075,7 +4075,7 @@ fn settings_to_json_sandbox(
 }
 
 fn settings_to_json_global(
-    response: &openshell_core::proto::GetGatewaySettingsResponse,
+    response: &openshell_core::proto::GetGatewayConfigResponse,
 ) -> serde_json::Value {
     let mut settings = serde_json::Map::new();
     let mut keys: Vec<_> = response.settings.keys().cloned().collect();

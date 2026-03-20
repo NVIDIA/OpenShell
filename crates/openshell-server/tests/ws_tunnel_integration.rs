@@ -40,13 +40,13 @@ use hyper_util::{
 use openshell_core::proto::{
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    ExecSandboxEvent, ExecSandboxRequest, GetGatewaySettingsRequest, GetGatewaySettingsResponse,
-    GetProviderRequest, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxSettingsRequest,
-    GetSandboxSettingsResponse, HealthRequest, HealthResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxesRequest, ListSandboxesResponse, ProviderResponse,
-    RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent,
-    ServiceStatus, UpdateProviderRequest, WatchSandboxRequest,
+    ExecSandboxEvent, ExecSandboxRequest, GetGatewayConfigRequest, GetGatewayConfigResponse,
+    GetProviderRequest, GetSandboxConfigRequest, GetSandboxConfigResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxesRequest, ListSandboxesResponse, ProviderResponse, RevokeSshSessionRequest,
+    RevokeSshSessionResponse, SandboxResponse, SandboxStreamEvent, ServiceStatus,
+    UpdateProviderRequest, WatchSandboxRequest,
     open_shell_client::OpenShellClient,
     open_shell_server::{OpenShell, OpenShellServer},
 };
@@ -106,18 +106,18 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(DeleteSandboxResponse { deleted: true }))
     }
 
-    async fn get_sandbox_settings(
+    async fn get_sandbox_config(
         &self,
-        _request: tonic::Request<GetSandboxSettingsRequest>,
-    ) -> Result<Response<GetSandboxSettingsResponse>, Status> {
-        Ok(Response::new(GetSandboxSettingsResponse::default()))
+        _request: tonic::Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
+        Ok(Response::new(GetSandboxConfigResponse::default()))
     }
 
-    async fn get_gateway_settings(
+    async fn get_gateway_config(
         &self,
-        _request: tonic::Request<GetGatewaySettingsRequest>,
-    ) -> Result<Response<GetGatewaySettingsResponse>, Status> {
-        Ok(Response::new(GetGatewaySettingsResponse::default()))
+        _request: tonic::Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        Ok(Response::new(GetGatewayConfigResponse::default()))
     }
 
     async fn get_sandbox_provider_environment(

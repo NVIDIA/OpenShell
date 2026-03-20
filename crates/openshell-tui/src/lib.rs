@@ -698,7 +698,7 @@ async fn handle_sandbox_delete(app: &mut App) {
 
 /// Fetch sandbox details (policy + providers) when entering the sandbox screen.
 ///
-/// Uses `GetSandbox` for metadata/providers, then `GetSandboxSettings` for the
+/// Uses `GetSandbox` for metadata/providers, then `GetSandboxConfig` for the
 /// current live policy (which may have been updated since creation).
 async fn fetch_sandbox_detail(app: &mut App) {
     let sandbox_name = match app.selected_sandbox_name() {
@@ -739,11 +739,11 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     // Step 2: Fetch the current live policy (includes updates since creation).
     if let Some(id) = sandbox_id {
-        let policy_req = openshell_core::proto::GetSandboxSettingsRequest { sandbox_id: id };
+        let policy_req = openshell_core::proto::GetSandboxConfigRequest { sandbox_id: id };
 
         match tokio::time::timeout(
             Duration::from_secs(5),
-            app.client.get_sandbox_settings(policy_req),
+            app.client.get_sandbox_config(policy_req),
         )
         .await
         {
@@ -1866,9 +1866,9 @@ async fn refresh_providers(app: &mut App) {
 }
 
 async fn refresh_global_settings(app: &mut App) {
-    let req = openshell_core::proto::GetGatewaySettingsRequest {};
+    let req = openshell_core::proto::GetGatewayConfigRequest {};
     let result =
-        tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_settings(req)).await;
+        tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
     match result {
         Ok(Err(e)) => {
             tracing::warn!("failed to fetch global settings: {}", e.message());
@@ -2206,11 +2206,11 @@ async fn refresh_sandbox_policy(app: &mut App) {
         None => return,
     };
 
-    let policy_req = openshell_core::proto::GetSandboxSettingsRequest { sandbox_id };
+    let policy_req = openshell_core::proto::GetSandboxConfigRequest { sandbox_id };
 
     match tokio::time::timeout(
         Duration::from_secs(5),
-        app.client.get_sandbox_settings(policy_req),
+        app.client.get_sandbox_config(policy_req),
     )
     .await
     {

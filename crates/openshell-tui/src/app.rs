@@ -652,7 +652,7 @@ impl App {
     // Filtered log helpers
     // ------------------------------------------------------------------
 
-    /// Apply fetched global settings from the `GetGatewaySettings` response.
+    /// Apply fetched global settings from the `GetGatewayConfig` response.
     pub fn apply_global_settings(
         &mut self,
         settings: HashMap<String, openshell_core::proto::SettingValue>,
@@ -677,7 +677,7 @@ impl App {
         }
     }
 
-    /// Apply fetched sandbox settings from the `GetSandboxSettings` response.
+    /// Apply fetched sandbox settings from the `GetSandboxConfig` response.
     pub fn apply_sandbox_settings(
         &mut self,
         settings: HashMap<String, openshell_core::proto::EffectiveSetting>,

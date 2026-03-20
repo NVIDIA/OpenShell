@@ -18,14 +18,14 @@ use openshell_core::proto::{
     DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
     ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetGatewaySettingsRequest, GetGatewaySettingsResponse, GetProviderRequest,
-    GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyStatusRequest,
-    GetSandboxPolicyStatusResponse, GetSandboxProviderEnvironmentRequest,
-    GetSandboxProviderEnvironmentResponse, GetSandboxRequest, GetSandboxSettingsRequest,
-    GetSandboxSettingsResponse, HealthRequest, HealthResponse, ListProvidersRequest,
-    ListProvidersResponse, ListSandboxPoliciesRequest, ListSandboxPoliciesResponse,
-    ListSandboxesRequest, ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider,
-    ProviderResponse, PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
+    HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
+    ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
+    ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider, ProviderResponse,
+    PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
     SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
@@ -751,10 +751,10 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(DeleteProviderResponse { deleted }))
     }
 
-    async fn get_sandbox_settings(
+    async fn get_sandbox_config(
         &self,
-        request: Request<GetSandboxSettingsRequest>,
-    ) -> Result<Response<GetSandboxSettingsResponse>, Status> {
+        request: Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
         let sandbox_id = request.into_inner().sandbox_id;
 
         let sandbox = self
@@ -780,7 +780,7 @@ impl OpenShell for OpenShellService {
             debug!(
                 sandbox_id = %sandbox_id,
                 version = record.version,
-                "GetSandboxSettings served from policy history"
+                "GetSandboxConfig served from policy history"
             );
             (
                 Some(decoded),
@@ -800,7 +800,7 @@ impl OpenShell for OpenShellService {
                 None => {
                     debug!(
                         sandbox_id = %sandbox_id,
-                        "GetSandboxSettings: no policy configured, returning empty response"
+                        "GetSandboxConfig: no policy configured, returning empty response"
                     );
                     (None, 0, String::new())
                 }
@@ -837,7 +837,7 @@ impl OpenShell for OpenShellService {
 
                     info!(
                         sandbox_id = %sandbox_id,
-                        "GetSandboxSettings served from spec (backfilled version 1)"
+                        "GetSandboxConfig served from spec (backfilled version 1)"
                     );
 
                     (Some(spec_policy), 1, hash)
@@ -874,7 +874,7 @@ impl OpenShell for OpenShellService {
         let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
         let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
 
-        Ok(Response::new(GetSandboxSettingsResponse {
+        Ok(Response::new(GetSandboxConfigResponse {
             policy,
             version,
             policy_hash,
@@ -885,13 +885,13 @@ impl OpenShell for OpenShellService {
         }))
     }
 
-    async fn get_gateway_settings(
+    async fn get_gateway_config(
         &self,
-        _request: Request<GetGatewaySettingsRequest>,
-    ) -> Result<Response<GetGatewaySettingsResponse>, Status> {
+        _request: Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
         let global_settings = load_global_settings(self.state.store.as_ref()).await?;
         let settings = materialize_global_settings(&global_settings)?;
-        Ok(Response::new(GetGatewaySettingsResponse {
+        Ok(Response::new(GetGatewayConfigResponse {
             settings,
             settings_revision: global_settings.revision,
         }))
@@ -1208,7 +1208,7 @@ impl OpenShell for OpenShellService {
                     .await;
 
                 // Also store in the settings blob (delivery mechanism for
-                // GetSandboxSettings).
+                // GetSandboxConfig).
                 let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
                 let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
                 let changed = upsert_setting_value(

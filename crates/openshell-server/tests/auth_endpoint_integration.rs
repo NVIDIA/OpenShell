@@ -435,23 +435,23 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_sandbox_settings(
+    async fn get_sandbox_config(
         &self,
-        _: tonic::Request<openshell_core::proto::GetSandboxSettingsRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxSettingsResponse>, tonic::Status>
+        _: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxConfigResponse>, tonic::Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::GetSandboxSettingsResponse::default(),
+            openshell_core::proto::GetSandboxConfigResponse::default(),
         ))
     }
 
-    async fn get_gateway_settings(
+    async fn get_gateway_config(
         &self,
-        _: tonic::Request<openshell_core::proto::GetGatewaySettingsRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetGatewaySettingsResponse>, tonic::Status>
+        _: tonic::Request<openshell_core::proto::GetGatewayConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetGatewayConfigResponse>, tonic::Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::GetGatewaySettingsResponse::default(),
+            openshell_core::proto::GetGatewayConfigResponse::default(),
         ))
     }
 

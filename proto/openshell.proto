@@ -53,12 +53,12 @@ service OpenShell {
   rpc DeleteProvider(DeleteProviderRequest) returns (DeleteProviderResponse);
 
   // Get sandbox settings by id (called by sandbox entrypoint and poll loop).
-  rpc GetSandboxSettings(openshell.sandbox.v1.GetSandboxSettingsRequest)
-      returns (openshell.sandbox.v1.GetSandboxSettingsResponse);
+  rpc GetSandboxConfig(openshell.sandbox.v1.GetSandboxConfigRequest)
+      returns (openshell.sandbox.v1.GetSandboxConfigResponse);
 
   // Get gateway-global settings.
-  rpc GetGatewaySettings(openshell.sandbox.v1.GetGatewaySettingsRequest)
-      returns (openshell.sandbox.v1.GetGatewaySettingsResponse);
+  rpc GetGatewayConfig(openshell.sandbox.v1.GetGatewayConfigRequest)
+      returns (openshell.sandbox.v1.GetGatewayConfigResponse);
 
   // Update settings or policy at sandbox or global scope.
   rpc UpdateSettings(UpdateSettingsRequest)

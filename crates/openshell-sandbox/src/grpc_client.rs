@@ -9,10 +9,10 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse,
-    GetSandboxProviderEnvironmentRequest, GetSandboxSettingsRequest, PolicySource, PolicyStatus,
-    ReportPolicyStatusRequest, SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest,
-    UpdateSettingsRequest, inference_client::InferenceClient, open_shell_client::OpenShellClient,
+    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
+    GetSandboxProviderEnvironmentRequest, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateSettingsRequest,
+    inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::debug;
@@ -101,7 +101,7 @@ async fn fetch_policy_with_client(
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
-        .get_sandbox_settings(GetSandboxSettingsRequest {
+        .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
         })
         .await
@@ -244,7 +244,7 @@ impl CachedOpenShellClient {
         let response = self
             .client
             .clone()
-            .get_sandbox_settings(GetSandboxSettingsRequest {
+            .get_sandbox_config(GetSandboxConfigRequest {
                 sandbox_id: sandbox_id.to_string(),
             })
             .await

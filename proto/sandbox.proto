@@ -110,16 +110,16 @@ message NetworkBinary {
 }
 
 // Request to get sandbox settings by sandbox ID.
-message GetSandboxSettingsRequest {
+message GetSandboxConfigRequest {
   // The sandbox ID.
   string sandbox_id = 1;
 }
 
 // Request to get gateway-global settings.
-message GetGatewaySettingsRequest {}
+message GetGatewayConfigRequest {}
 
 // Response containing gateway-global settings.
-message GetGatewaySettingsResponse {
+message GetGatewayConfigResponse {
   // Gateway-global settings map excluding the reserved policy key.
   // Registered keys without a configured value are returned with an empty SettingValue.
   map<string, SettingValue> settings = 1;
@@ -150,7 +150,7 @@ message EffectiveSetting {
   SettingScope scope = 2;
 }
 
-// Source used for the policy payload in GetSandboxSettingsResponse.
+// Source used for the policy payload in GetSandboxConfigResponse.
 enum PolicySource {
   POLICY_SOURCE_UNSPECIFIED = 0;
   POLICY_SOURCE_SANDBOX = 1;
@@ -158,7 +158,7 @@ enum PolicySource {
 }
 
 // Response containing effective sandbox settings and policy.
-message GetSandboxSettingsResponse {
+message GetSandboxConfigResponse {
   // The sandbox policy configuration.
   SandboxPolicy policy = 1;
   // Current policy version (monotonically increasing per sandbox).
