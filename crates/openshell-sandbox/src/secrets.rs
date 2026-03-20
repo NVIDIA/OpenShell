@@ -62,7 +62,7 @@ pub(crate) struct RewriteTargetResult {
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SecretResolver {
+pub struct SecretResolver {
     by_placeholder: HashMap<String, String>,
 }
 

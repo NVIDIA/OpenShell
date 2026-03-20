@@ -701,8 +701,8 @@ pub async fn sandbox_ssh_proxy(
     // exists but hasn't reached Ready phase yet. This is a transient state
     // after sandbox allocation — retry with backoff instead of failing
     // immediately.
-    const MAX_CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
-    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+    const MAX_CONNECT_WAIT: Duration = Duration::from_secs(60);
+    const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
 
     let start = std::time::Instant::now();
     let mut backoff = INITIAL_BACKOFF;
@@ -734,7 +734,7 @@ pub async fn sandbox_ssh_proxy(
                 "sandbox not yet ready (HTTP 412), retrying in {backoff:?}"
             );
             tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(std::time::Duration::from_secs(8));
+            backoff = (backoff * 2).min(Duration::from_secs(8));
             continue;
         }
         return Err(miette::miette!(
