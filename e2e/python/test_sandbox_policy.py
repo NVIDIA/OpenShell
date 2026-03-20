@@ -1306,8 +1306,8 @@ def test_live_policy_update_from_empty_network_policies(
         )
         initial_version = initial_status.revision.version
 
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
+        update_resp = stub.UpdateSettings(
+            openshell_pb2.UpdateSettingsRequest(
                 name=sandbox_name,
                 policy=updated_policy,
             )
