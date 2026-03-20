@@ -5,13 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::{ActionId, ConfidenceId, DispositionId, RiskLevelId};
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Attack, Evidence, FindingInfo, Remediation};
 
 /// OCSF Detection Finding Event [2004].
 ///
 /// Security-relevant findings from policy enforcement.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DetectionFindingEvent {
     /// Common base event fields.
     #[serde(flatten)]
@@ -36,43 +37,58 @@ pub struct DetectionFindingEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_alert: Option<bool>,
 
-    /// Confidence ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence_id: Option<u8>,
+    #[serde(
+        rename = "confidence_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub confidence: Option<ConfidenceId>,
 
-    /// Confidence label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub confidence: Option<String>,
+    #[serde(
+        rename = "risk_level_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub risk_level: Option<RiskLevelId>,
 
-    /// Risk level ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk_level_id: Option<u8>,
+    #[serde(rename = "action_id", default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionId>,
 
-    /// Risk level label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub risk_level: Option<String>,
+    #[serde(
+        rename = "disposition_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disposition: Option<DispositionId>,
+}
 
-    /// Action ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_id: Option<u8>,
+impl Serialize for DetectionFindingEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::events::serde_helpers::{insert_enum_pair, insert_optional, insert_required};
 
-    /// Action label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+        let mut base_val = serde_json::to_value(&self.base).map_err(serde::ser::Error::custom)?;
+        let obj = base_val
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("expected object"))?;
 
-    /// Disposition ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition_id: Option<u8>,
+        insert_required!(obj, "finding_info", self.finding_info);
+        insert_optional!(obj, "evidences", self.evidences);
+        insert_optional!(obj, "attacks", self.attacks);
+        insert_optional!(obj, "remediation", self.remediation);
+        insert_optional!(obj, "is_alert", self.is_alert);
+        insert_enum_pair!(obj, "confidence", self.confidence);
+        insert_enum_pair!(obj, "risk_level", self.risk_level);
+        insert_enum_pair!(obj, "action", self.action);
+        insert_enum_pair!(obj, "disposition", self.disposition);
 
-    /// Disposition label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<String>,
+        base_val.serialize(serializer)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::SeverityId;
+    use crate::enums::{ActionId, ConfidenceId, DispositionId, RiskLevelId, SeverityId};
     use crate::objects::{Metadata, Product};
 
     #[test]
@@ -108,14 +124,10 @@ mod tests {
             )]),
             remediation: None,
             is_alert: Some(true),
-            confidence_id: Some(3),
-            confidence: Some("High".to_string()),
-            risk_level_id: Some(4),
-            risk_level: Some("High".to_string()),
-            action_id: Some(2),
-            action: Some("Denied".to_string()),
-            disposition_id: Some(2),
-            disposition: Some("Blocked".to_string()),
+            confidence: Some(ConfidenceId::High),
+            risk_level: Some(RiskLevelId::High),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
         };
 
         let json = serde_json::to_value(&event).unwrap();

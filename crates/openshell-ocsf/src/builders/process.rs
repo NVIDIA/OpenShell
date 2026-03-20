@@ -120,13 +120,10 @@ impl<'a> ProcessActivityBuilder<'a> {
             base,
             process: self.process.unwrap_or_else(|| Process::new("unknown", 0)),
             actor: self.actor,
-            launch_type_id: self.launch_type.map(LaunchTypeId::as_u8),
-            launch_type: self.launch_type.map(|lt| lt.label().to_string()),
+            launch_type: self.launch_type,
             exit_code: self.exit_code,
-            action_id: self.action.map(ActionId::as_u8),
-            action: self.action.map(|a| a.label().to_string()),
-            disposition_id: self.disposition.map(DispositionId::as_u8),
-            disposition: self.disposition.map(|d| d.label().to_string()),
+            action: self.action,
+            disposition: self.disposition,
         })
     }
 }

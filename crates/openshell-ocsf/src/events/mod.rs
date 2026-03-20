@@ -10,6 +10,7 @@ mod detection_finding;
 mod http_activity;
 mod network_activity;
 mod process_activity;
+pub(crate) mod serde_helpers;
 mod ssh_activity;
 
 pub use app_lifecycle::ApplicationLifecycleEvent;
@@ -21,12 +22,11 @@ pub use network_activity::NetworkActivityEvent;
 pub use process_activity::ProcessActivityEvent;
 pub use ssh_activity::SshActivityEvent;
 
-use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 /// Top-level OCSF event enum encompassing all supported event classes.
 ///
-/// Serialization uses the inner event struct directly (untagged).
+/// Serialization delegates directly to the inner event struct (untagged).
 /// Deserialization dispatches on the `class_uid` field to select the
 /// correct variant, avoiding the ambiguity of `#[serde(untagged)]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,38 +51,15 @@ pub enum OcsfEvent {
 
 impl Serialize for OcsfEvent {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        // Serialize the inner event struct directly — produces flat OCSF JSON.
-        // We serialize to a Value first to get the map, then re-serialize.
-        let value = match self {
-            Self::NetworkActivity(e) => {
-                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
-            }
-            Self::HttpActivity(e) => serde_json::to_value(e).map_err(serde::ser::Error::custom)?,
-            Self::SshActivity(e) => serde_json::to_value(e).map_err(serde::ser::Error::custom)?,
-            Self::ProcessActivity(e) => {
-                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
-            }
-            Self::DetectionFinding(e) => {
-                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
-            }
-            Self::ApplicationLifecycle(e) => {
-                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
-            }
-            Self::DeviceConfigStateChange(e) => {
-                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
-            }
-            Self::Base(e) => serde_json::to_value(e).map_err(serde::ser::Error::custom)?,
-        };
-
-        // Re-serialize the flat JSON object
-        if let serde_json::Value::Object(map) = value {
-            let mut ser_map = serializer.serialize_map(Some(map.len()))?;
-            for (k, v) in &map {
-                ser_map.serialize_entry(k, v)?;
-            }
-            ser_map.end()
-        } else {
-            Err(serde::ser::Error::custom("expected JSON object"))
+        match self {
+            Self::NetworkActivity(e) => e.serialize(serializer),
+            Self::HttpActivity(e) => e.serialize(serializer),
+            Self::SshActivity(e) => e.serialize(serializer),
+            Self::ProcessActivity(e) => e.serialize(serializer),
+            Self::DetectionFinding(e) => e.serialize(serializer),
+            Self::ApplicationLifecycle(e) => e.serialize(serializer),
+            Self::DeviceConfigStateChange(e) => e.serialize(serializer),
+            Self::Base(e) => e.serialize(serializer),
         }
     }
 }

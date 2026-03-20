@@ -170,14 +170,10 @@ impl<'a> DetectionFindingBuilder<'a> {
             },
             remediation: self.remediation,
             is_alert: self.is_alert,
-            confidence_id: self.confidence.map(ConfidenceId::as_u8),
-            confidence: self.confidence.map(|c| c.label().to_string()),
-            risk_level_id: self.risk_level.map(RiskLevelId::as_u8),
-            risk_level: self.risk_level.map(|r| r.label().to_string()),
-            action_id: self.action.map(ActionId::as_u8),
-            action: self.action.map(|a| a.label().to_string()),
-            disposition_id: self.disposition.map(DispositionId::as_u8),
-            disposition: self.disposition.map(|d| d.label().to_string()),
+            confidence: self.confidence,
+            risk_level: self.risk_level,
+            action: self.action,
+            disposition: self.disposition,
         })
     }
 }

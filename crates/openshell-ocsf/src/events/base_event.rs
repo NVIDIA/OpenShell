@@ -11,7 +11,7 @@ use crate::objects::{Container, Device, Metadata};
 /// Common fields shared by all OCSF event classes.
 ///
 /// Every event class embeds this struct via `#[serde(flatten)]`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct BaseEventData {
     /// OCSF class UID (e.g., 4001 for Network Activity).
     pub class_uid: u32,
@@ -40,19 +40,13 @@ pub struct BaseEventData {
     /// Event timestamp in milliseconds since epoch.
     pub time: i64,
 
-    /// Severity ID.
-    pub severity_id: u8,
+    /// Severity (typed enum, serialized as `severity_id` + `severity` pair).
+    #[serde(rename = "severity_id")]
+    pub severity: SeverityId,
 
-    /// Severity label.
-    pub severity: String,
-
-    /// Status ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status_id: Option<u8>,
-
-    /// Status label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub status: Option<String>,
+    /// Status (typed enum, serialized as `status_id` + `status` pair).
+    #[serde(rename = "status_id", default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatusId>,
 
     /// Human-readable event message.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -76,6 +70,54 @@ pub struct BaseEventData {
     /// Unmapped fields that don't fit the OCSF schema.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unmapped: Option<serde_json::Value>,
+}
+
+impl Serialize for BaseEventData {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        // Count fields: 9 required + severity pair (2) + up to 6 optional
+        let mut map = serializer.serialize_map(None)?;
+
+        map.serialize_entry("class_uid", &self.class_uid)?;
+        map.serialize_entry("class_name", &self.class_name)?;
+        map.serialize_entry("category_uid", &self.category_uid)?;
+        map.serialize_entry("category_name", &self.category_name)?;
+        map.serialize_entry("activity_id", &self.activity_id)?;
+        map.serialize_entry("activity_name", &self.activity_name)?;
+        map.serialize_entry("type_uid", &self.type_uid)?;
+        map.serialize_entry("type_name", &self.type_name)?;
+        map.serialize_entry("time", &self.time)?;
+
+        // Severity — typed enum → id + label pair
+        map.serialize_entry("severity_id", &self.severity.as_u8())?;
+        map.serialize_entry("severity", self.severity.label())?;
+
+        // Status — optional typed enum → id + label pair
+        if let Some(status) = self.status {
+            map.serialize_entry("status_id", &status.as_u8())?;
+            map.serialize_entry("status", status.label())?;
+        }
+
+        if let Some(ref msg) = self.message {
+            map.serialize_entry("message", msg)?;
+        }
+        if let Some(ref detail) = self.status_detail {
+            map.serialize_entry("status_detail", detail)?;
+        }
+        map.serialize_entry("metadata", &self.metadata)?;
+        if let Some(ref device) = self.device {
+            map.serialize_entry("device", device)?;
+        }
+        if let Some(ref container) = self.container {
+            map.serialize_entry("container", container)?;
+        }
+        if let Some(ref unmapped) = self.unmapped {
+            map.serialize_entry("unmapped", unmapped)?;
+        }
+
+        map.end()
+    }
 }
 
 impl BaseEventData {
@@ -105,9 +147,7 @@ impl BaseEventData {
             type_uid,
             type_name,
             time: chrono::Utc::now().timestamp_millis(),
-            severity_id: severity_id.as_u8(),
-            severity: severity_id.label().to_string(),
-            status_id: None,
+            severity: severity_id,
             status: None,
             message: None,
             status_detail: None,
@@ -125,8 +165,7 @@ impl BaseEventData {
 
     /// Set status.
     pub fn set_status(&mut self, status_id: StatusId) {
-        self.status_id = Some(status_id.as_u8());
-        self.status = Some(status_id.label().to_string());
+        self.status = Some(status_id);
     }
 
     /// Set message.
@@ -199,8 +238,7 @@ mod tests {
         assert_eq!(base.class_uid, 0);
         assert_eq!(base.type_uid, 99); // 0 * 100 + 99
         assert_eq!(base.type_name, "Base Event: Other");
-        assert_eq!(base.severity_id, 1);
-        assert_eq!(base.severity, "Informational");
+        assert_eq!(base.severity, SeverityId::Informational);
     }
 
     #[test]

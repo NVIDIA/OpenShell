@@ -5,13 +5,14 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::{ActionId, DispositionId};
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Actor, ConnectionInfo, Endpoint, FirewallRule};
 
 /// OCSF Network Activity Event [4001].
 ///
 /// Proxy CONNECT tunnel events and iptables-level bypass detection.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NetworkActivityEvent {
     /// Common base event fields.
     #[serde(flatten)]
@@ -41,21 +42,17 @@ pub struct NetworkActivityEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub connection_info: Option<ConnectionInfo>,
 
-    /// Action ID (Security Control profile).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_id: Option<u8>,
+    /// Action (Security Control profile).
+    #[serde(rename = "action_id", default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionId>,
 
-    /// Action label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
-
-    /// Disposition ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition_id: Option<u8>,
-
-    /// Disposition label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<String>,
+    /// Disposition.
+    #[serde(
+        rename = "disposition_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disposition: Option<DispositionId>,
 
     /// Observation point ID (v1.6.0+).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -64,6 +61,34 @@ pub struct NetworkActivityEvent {
     /// Whether src/dst assignment is known (v1.6.0+).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub is_src_dst_assignment_known: Option<bool>,
+}
+
+impl Serialize for NetworkActivityEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::events::serde_helpers::{insert_enum_pair, insert_optional};
+
+        let mut base_val = serde_json::to_value(&self.base).map_err(serde::ser::Error::custom)?;
+        let obj = base_val
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("expected object"))?;
+
+        insert_optional!(obj, "src_endpoint", self.src_endpoint);
+        insert_optional!(obj, "dst_endpoint", self.dst_endpoint);
+        insert_optional!(obj, "proxy_endpoint", self.proxy_endpoint);
+        insert_optional!(obj, "actor", self.actor);
+        insert_optional!(obj, "firewall_rule", self.firewall_rule);
+        insert_optional!(obj, "connection_info", self.connection_info);
+        insert_enum_pair!(obj, "action", self.action);
+        insert_enum_pair!(obj, "disposition", self.disposition);
+        insert_optional!(obj, "observation_point_id", self.observation_point_id);
+        insert_optional!(
+            obj,
+            "is_src_dst_assignment_known",
+            self.is_src_dst_assignment_known
+        );
+
+        base_val.serialize(serializer)
+    }
 }
 
 #[cfg(test)]
@@ -97,10 +122,8 @@ mod tests {
             actor: None,
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
-            action_id: Some(ActionId::Allowed.as_u8()),
-            action: Some(ActionId::Allowed.label().to_string()),
-            disposition_id: Some(DispositionId::Allowed.as_u8()),
-            disposition: Some(DispositionId::Allowed.label().to_string()),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
             observation_point_id: Some(2),
             is_src_dst_assignment_known: Some(true),
         };

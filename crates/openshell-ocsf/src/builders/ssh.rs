@@ -136,13 +136,11 @@ impl<'a> SshActivityBuilder<'a> {
             src_endpoint: self.src_endpoint,
             dst_endpoint: self.dst_endpoint,
             actor: self.actor,
-            auth_type_id: self.auth_type_id.map(AuthTypeId::as_u8),
-            auth_type: self.auth_type_label,
+            auth_type: self.auth_type_id,
+            auth_type_custom_label: self.auth_type_label,
             protocol_ver: self.protocol_ver,
-            action_id: self.action.map(ActionId::as_u8),
-            action: self.action.map(|a| a.label().to_string()),
-            disposition_id: self.disposition.map(DispositionId::as_u8),
-            disposition: self.disposition.map(|d| d.label().to_string()),
+            action: self.action,
+            disposition: self.disposition,
         })
     }
 }

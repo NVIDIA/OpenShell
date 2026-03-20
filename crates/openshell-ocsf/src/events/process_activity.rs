@@ -5,11 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::{ActionId, DispositionId, LaunchTypeId};
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Actor, Process};
 
 /// OCSF Process Activity Event [1007].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ProcessActivityEvent {
     /// Common base event fields.
     #[serde(flatten)]
@@ -22,39 +23,55 @@ pub struct ProcessActivityEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<Actor>,
 
-    /// Launch type ID (new in v1.7.0).
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub launch_type_id: Option<u8>,
-
-    /// Launch type label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub launch_type: Option<String>,
+    /// Launch type.
+    #[serde(
+        rename = "launch_type_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub launch_type: Option<LaunchTypeId>,
 
     /// Process exit code (for Terminate activity).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub exit_code: Option<i32>,
 
-    /// Action ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_id: Option<u8>,
+    /// Action (Security Control profile).
+    #[serde(rename = "action_id", default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionId>,
 
-    /// Action label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+    /// Disposition.
+    #[serde(
+        rename = "disposition_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disposition: Option<DispositionId>,
+}
 
-    /// Disposition ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition_id: Option<u8>,
+impl Serialize for ProcessActivityEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::events::serde_helpers::{insert_enum_pair, insert_optional, insert_required};
 
-    /// Disposition label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<String>,
+        let mut base_val = serde_json::to_value(&self.base).map_err(serde::ser::Error::custom)?;
+        let obj = base_val
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("expected object"))?;
+
+        insert_required!(obj, "process", self.process);
+        insert_optional!(obj, "actor", self.actor);
+        insert_enum_pair!(obj, "launch_type", self.launch_type);
+        insert_optional!(obj, "exit_code", self.exit_code);
+        insert_enum_pair!(obj, "action", self.action);
+        insert_enum_pair!(obj, "disposition", self.disposition);
+
+        base_val.serialize(serializer)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::SeverityId;
+    use crate::enums::{ActionId, DispositionId, LaunchTypeId, SeverityId};
     use crate::objects::{Metadata, Product};
 
     #[test]
@@ -80,13 +97,10 @@ mod tests {
             actor: Some(Actor {
                 process: Process::new("openshell-sandbox", 1),
             }),
-            launch_type_id: Some(1),
-            launch_type: Some("Spawn".to_string()),
+            launch_type: Some(LaunchTypeId::Spawn),
             exit_code: None,
-            action_id: Some(1),
-            action: Some("Allowed".to_string()),
-            disposition_id: Some(1),
-            disposition: Some("Allowed".to_string()),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
         };
 
         let json = serde_json::to_value(&event).unwrap();

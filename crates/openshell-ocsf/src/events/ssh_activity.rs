@@ -5,11 +5,12 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::{ActionId, AuthTypeId, DispositionId};
 use crate::events::base_event::BaseEventData;
 use crate::objects::{Actor, Endpoint};
 
 /// OCSF SSH Activity Event [4007].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SshActivityEvent {
     /// Common base event fields.
     #[serde(flatten)]
@@ -27,39 +28,67 @@ pub struct SshActivityEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub actor: Option<Actor>,
 
-    /// Auth type ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_type_id: Option<u8>,
+    /// Auth type.
+    #[serde(
+        rename = "auth_type_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub auth_type: Option<AuthTypeId>,
 
-    /// Auth type label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub auth_type: Option<String>,
+    /// Custom auth type label (used when `auth_type` is Other).
+    #[serde(rename = "auth_type", default, skip_serializing_if = "Option::is_none")]
+    pub auth_type_custom_label: Option<String>,
 
     /// SSH protocol version.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub protocol_ver: Option<String>,
 
-    /// Action ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action_id: Option<u8>,
+    /// Action (Security Control profile).
+    #[serde(rename = "action_id", default, skip_serializing_if = "Option::is_none")]
+    pub action: Option<ActionId>,
 
-    /// Action label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub action: Option<String>,
+    /// Disposition.
+    #[serde(
+        rename = "disposition_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub disposition: Option<DispositionId>,
+}
 
-    /// Disposition ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition_id: Option<u8>,
+impl Serialize for SshActivityEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::events::serde_helpers::{
+            insert_enum_pair, insert_enum_pair_custom, insert_optional,
+        };
 
-    /// Disposition label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub disposition: Option<String>,
+        let mut base_val = serde_json::to_value(&self.base).map_err(serde::ser::Error::custom)?;
+        let obj = base_val
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("expected object"))?;
+
+        insert_optional!(obj, "src_endpoint", self.src_endpoint);
+        insert_optional!(obj, "dst_endpoint", self.dst_endpoint);
+        insert_optional!(obj, "actor", self.actor);
+        insert_enum_pair_custom!(
+            obj,
+            "auth_type",
+            self.auth_type,
+            self.auth_type_custom_label
+        );
+        insert_optional!(obj, "protocol_ver", self.protocol_ver);
+        insert_enum_pair!(obj, "action", self.action);
+        insert_enum_pair!(obj, "disposition", self.disposition);
+
+        base_val.serialize(serializer)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::{AuthTypeId, SeverityId};
+    use crate::enums::{ActionId, AuthTypeId, DispositionId, SeverityId};
     use crate::objects::{Metadata, Product};
 
     #[test]
@@ -84,13 +113,11 @@ mod tests {
             src_endpoint: Some(Endpoint::from_ip_str("10.42.0.1", 48201)),
             dst_endpoint: Some(Endpoint::from_ip_str("10.42.0.2", 2222)),
             actor: None,
-            auth_type_id: Some(AuthTypeId::Other.as_u8()),
-            auth_type: Some("NSSH1".to_string()),
+            auth_type: Some(AuthTypeId::Other),
+            auth_type_custom_label: Some("NSSH1".to_string()),
             protocol_ver: Some("NSSH1".to_string()),
-            action_id: Some(1),
-            action: Some("Allowed".to_string()),
-            disposition_id: Some(1),
-            disposition: Some("Allowed".to_string()),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
         };
 
         let json = serde_json::to_value(&event).unwrap();

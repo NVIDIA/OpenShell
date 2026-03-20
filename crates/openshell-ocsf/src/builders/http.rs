@@ -139,10 +139,8 @@ impl<'a> HttpActivityBuilder<'a> {
             proxy_endpoint: Some(self.ctx.proxy_endpoint()),
             actor: self.actor,
             firewall_rule: self.firewall_rule,
-            action_id: self.action.map(ActionId::as_u8),
-            action: self.action.map(|a| a.label().to_string()),
-            disposition_id: self.disposition.map(DispositionId::as_u8),
-            disposition: self.disposition.map(|d| d.label().to_string()),
+            action: self.action,
+            disposition: self.disposition,
             observation_point_id: Some(2),
             is_src_dst_assignment_known: Some(true),
         })

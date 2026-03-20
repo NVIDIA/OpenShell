@@ -106,12 +106,10 @@ impl<'a> ConfigStateChangeBuilder<'a> {
 
         OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
             base,
-            state_id: self.state_id.map(StateId::as_u8),
-            state: self.state_label,
-            security_level_id: self.security_level.map(SecurityLevelId::as_u8),
-            security_level: self.security_level.map(|s| s.label().to_string()),
-            prev_security_level_id: self.prev_security_level.map(SecurityLevelId::as_u8),
-            prev_security_level: self.prev_security_level.map(|s| s.label().to_string()),
+            state: self.state_id,
+            state_custom_label: self.state_label,
+            security_level: self.security_level,
+            prev_security_level: self.prev_security_level,
         })
     }
 }

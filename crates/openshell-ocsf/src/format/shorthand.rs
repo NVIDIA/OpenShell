@@ -44,12 +44,12 @@ impl OcsfEvent {
     pub fn format_shorthand(&self) -> String {
         let base = self.base();
         let ts = format_ts(base.time);
-        let sev = severity_char(base.severity_id);
+        let sev = severity_char(base.severity.as_u8());
 
         match self {
             Self::NetworkActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let action = e.action.as_deref().unwrap_or("").to_uppercase();
+                let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
                 let actor_str = e
                     .actor
                     .as_ref()
@@ -93,7 +93,7 @@ impl OcsfEvent {
                     .http_request
                     .as_ref()
                     .map_or("UNKNOWN", |r| r.http_method.as_str());
-                let action = e.action.as_deref().unwrap_or("").to_uppercase();
+                let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
                 let actor_str = e
                     .actor
                     .as_ref()
@@ -121,7 +121,7 @@ impl OcsfEvent {
 
             Self::SshActivity(e) => {
                 let activity = e.base.activity_name.to_uppercase();
-                let action = e.action.as_deref().unwrap_or("").to_uppercase();
+                let action = e.action.map_or(String::new(), |a| a.label().to_uppercase());
                 let peer = e
                     .src_endpoint
                     .as_ref()
@@ -134,7 +134,13 @@ impl OcsfEvent {
                 let auth_ctx = e
                     .auth_type
                     .as_ref()
-                    .map(|a| format!(" [auth:{a}]"))
+                    .map(|id| {
+                        let label = e
+                            .auth_type_custom_label
+                            .as_deref()
+                            .unwrap_or_else(|| id.label());
+                        format!(" [auth:{label}]")
+                    })
                     .unwrap_or_default();
 
                 format!("{ts} {sev} SSH:{activity} {action} {peer}{auth_ctx}")
@@ -158,12 +164,13 @@ impl OcsfEvent {
             }
 
             Self::DetectionFinding(e) => {
-                let disposition = e.disposition.as_deref().unwrap_or("UNKNOWN").to_uppercase();
+                let disposition = e
+                    .disposition
+                    .map_or_else(|| "UNKNOWN".to_string(), |d| d.label().to_uppercase());
                 let title = &e.finding_info.title;
                 let confidence_ctx = e
                     .confidence
-                    .as_ref()
-                    .map(|c| format!(" [confidence:{}]", c.to_lowercase()))
+                    .map(|c| format!(" [confidence:{}]", c.label().to_lowercase()))
                     .unwrap_or_default();
 
                 format!("{ts} {sev} FINDING:{disposition} \"{title}\"{confidence_ctx}")
@@ -172,13 +179,25 @@ impl OcsfEvent {
             Self::ApplicationLifecycle(e) => {
                 let activity = e.base.activity_name.to_uppercase();
                 let app = &e.app.name;
-                let status = e.base.status.as_deref().unwrap_or("").to_lowercase();
+                let status = e
+                    .base
+                    .status
+                    .map(|s| s.label().to_lowercase())
+                    .unwrap_or_default();
 
                 format!("{ts} {sev} LIFECYCLE:{activity} {app} {status}")
             }
 
             Self::DeviceConfigStateChange(e) => {
-                let state = e.state.as_deref().unwrap_or("UNKNOWN").to_uppercase();
+                let state = e.state.map_or_else(
+                    || "UNKNOWN".to_string(),
+                    |s| {
+                        e.state_custom_label
+                            .as_deref()
+                            .unwrap_or_else(|| s.label())
+                            .to_uppercase()
+                    },
+                );
                 let what = e.base.message.as_deref().unwrap_or("config");
                 let version_ctx = e
                     .base
@@ -230,7 +249,7 @@ impl OcsfEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::{ActionId, DispositionId};
+    use crate::enums::{ActionId, AuthTypeId, ConfidenceId, DispositionId, LaunchTypeId, StateId};
     use crate::events::base_event::BaseEventData;
     use crate::events::{
         ApplicationLifecycleEvent, BaseEvent, DetectionFindingEvent, DeviceConfigStateChangeEvent,
@@ -309,10 +328,8 @@ mod tests {
             }),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
             connection_info: None,
-            action_id: Some(ActionId::Allowed.as_u8()),
-            action: Some("Allowed".to_string()),
-            disposition_id: Some(DispositionId::Allowed.as_u8()),
-            disposition: Some("Allowed".to_string()),
+            action: Some(ActionId::Allowed),
+            disposition: Some(DispositionId::Allowed),
             observation_point_id: None,
             is_src_dst_assignment_known: None,
         });
@@ -329,8 +346,7 @@ mod tests {
         let event = OcsfEvent::NetworkActivity(NetworkActivityEvent {
             base: {
                 let mut b = base(4001, "Network Activity", 4, "Network Activity", 5, "Refuse");
-                b.severity_id = 3;
-                b.severity = "Medium".to_string();
+                b.severity = crate::enums::SeverityId::Medium;
                 b
             },
             src_endpoint: None,
@@ -341,10 +357,8 @@ mod tests {
             }),
             firewall_rule: Some(FirewallRule::new("bypass-detect", "iptables")),
             connection_info: Some(ConnectionInfo::new("tcp")),
-            action_id: Some(ActionId::Denied.as_u8()),
-            action: Some("Denied".to_string()),
-            disposition_id: Some(DispositionId::Blocked.as_u8()),
-            disposition: Some("Blocked".to_string()),
+            action: Some(ActionId::Denied),
+            disposition: Some(DispositionId::Blocked),
             observation_point_id: Some(3),
             is_src_dst_assignment_known: Some(true),
         });
@@ -372,9 +386,7 @@ mod tests {
                 process: Process::new("curl", 88),
             }),
             firewall_rule: Some(FirewallRule::new("default-egress", "mechanistic")),
-            action_id: Some(ActionId::Allowed.as_u8()),
-            action: Some("Allowed".to_string()),
-            disposition_id: None,
+            action: Some(ActionId::Allowed),
             disposition: None,
             observation_point_id: None,
             is_src_dst_assignment_known: None,
@@ -394,12 +406,10 @@ mod tests {
             src_endpoint: Some(Endpoint::from_ip_str("10.42.0.1", 48201)),
             dst_endpoint: None,
             actor: None,
-            auth_type_id: Some(99),
-            auth_type: Some("NSSH1".to_string()),
+            auth_type: Some(AuthTypeId::Other),
+            auth_type_custom_label: Some("NSSH1".to_string()),
             protocol_ver: None,
-            action_id: Some(ActionId::Allowed.as_u8()),
-            action: Some("Allowed".to_string()),
-            disposition_id: None,
+            action: Some(ActionId::Allowed),
             disposition: None,
         });
 
@@ -416,12 +426,9 @@ mod tests {
             base: base(1007, "Process Activity", 1, "System Activity", 1, "Launch"),
             process: Process::new("python3", 42).with_cmd_line("python3 /app/main.py"),
             actor: None,
-            launch_type_id: Some(1),
-            launch_type: Some("Spawn".to_string()),
+            launch_type: Some(LaunchTypeId::Spawn),
             exit_code: None,
-            action_id: None,
             action: None,
-            disposition_id: None,
             disposition: None,
         });
 
@@ -445,12 +452,9 @@ mod tests {
             ),
             process: Process::new("python3", 42),
             actor: None,
-            launch_type_id: None,
             launch_type: None,
             exit_code: Some(0),
-            action_id: None,
             action: None,
-            disposition_id: None,
             disposition: None,
         });
 
@@ -466,8 +470,7 @@ mod tests {
         let event = OcsfEvent::DetectionFinding(DetectionFindingEvent {
             base: {
                 let mut b = base(2004, "Detection Finding", 2, "Findings", 1, "Create");
-                b.severity_id = 4;
-                b.severity = "High".to_string();
+                b.severity = crate::enums::SeverityId::High;
                 b
             },
             finding_info: FindingInfo::new("nssh1-replay-abc", "NSSH1 Nonce Replay Attack"),
@@ -475,14 +478,10 @@ mod tests {
             attacks: None,
             remediation: None,
             is_alert: Some(true),
-            confidence_id: Some(3),
-            confidence: Some("High".to_string()),
-            risk_level_id: None,
+            confidence: Some(ConfidenceId::High),
             risk_level: None,
-            action_id: None,
             action: None,
-            disposition_id: Some(2),
-            disposition: Some("Blocked".to_string()),
+            disposition: Some(DispositionId::Blocked),
         });
 
         let shorthand = event.format_shorthand();
@@ -528,11 +527,9 @@ mod tests {
 
         let event = OcsfEvent::DeviceConfigStateChange(DeviceConfigStateChangeEvent {
             base: b,
-            state_id: Some(2),
-            state: Some("LOADED".to_string()),
-            security_level_id: None,
+            state: Some(StateId::Enabled),
+            state_custom_label: Some("LOADED".to_string()),
             security_level: None,
-            prev_security_level_id: None,
             prev_security_level: None,
         });
 

@@ -5,40 +5,55 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::{SecurityLevelId, StateId};
 use crate::events::base_event::BaseEventData;
 
 /// OCSF Device Config State Change Event [5019].
 ///
 /// Policy engine and inference routing configuration changes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct DeviceConfigStateChangeEvent {
     /// Common base event fields.
     #[serde(flatten)]
     pub base: BaseEventData,
 
-    /// State ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state_id: Option<u8>,
+    #[serde(rename = "state_id", default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<StateId>,
 
-    /// State label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub state: Option<String>,
+    /// Custom state label (used when `state_id` maps to a non-standard label).
+    #[serde(rename = "state", default, skip_serializing_if = "Option::is_none")]
+    pub state_custom_label: Option<String>,
 
-    /// Security level ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security_level_id: Option<u8>,
+    #[serde(
+        rename = "security_level_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub security_level: Option<SecurityLevelId>,
 
-    /// Security level label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub security_level: Option<String>,
+    #[serde(
+        rename = "prev_security_level_id",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub prev_security_level: Option<SecurityLevelId>,
+}
 
-    /// Previous security level ID.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev_security_level_id: Option<u8>,
+impl Serialize for DeviceConfigStateChangeEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use crate::events::serde_helpers::{insert_enum_pair, insert_enum_pair_custom};
 
-    /// Previous security level label.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub prev_security_level: Option<String>,
+        let mut base_val = serde_json::to_value(&self.base).map_err(serde::ser::Error::custom)?;
+        let obj = base_val
+            .as_object_mut()
+            .ok_or_else(|| serde::ser::Error::custom("expected object"))?;
+
+        insert_enum_pair_custom!(obj, "state", self.state, self.state_custom_label);
+        insert_enum_pair!(obj, "security_level", self.security_level);
+        insert_enum_pair!(obj, "prev_security_level", self.prev_security_level);
+
+        base_val.serialize(serializer)
+    }
 }
 
 #[cfg(test)]
@@ -71,12 +86,10 @@ mod tests {
 
         let event = DeviceConfigStateChangeEvent {
             base,
-            state_id: Some(StateId::Enabled.as_u8()),
-            state: Some("Enabled".to_string()),
-            security_level_id: Some(SecurityLevelId::Secure.as_u8()),
-            security_level: Some("Secure".to_string()),
-            prev_security_level_id: Some(SecurityLevelId::Unknown.as_u8()),
-            prev_security_level: Some("Unknown".to_string()),
+            state: Some(StateId::Enabled),
+            state_custom_label: None,
+            security_level: Some(SecurityLevelId::Secure),
+            prev_security_level: Some(SecurityLevelId::Unknown),
         };
 
         let json = serde_json::to_value(&event).unwrap();

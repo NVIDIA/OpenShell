@@ -5,11 +5,13 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::enums::HttpMethod;
+
 /// OCSF HTTP Request object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HttpRequest {
     /// HTTP method (e.g., "GET", "POST").
-    pub http_method: String,
+    pub http_method: HttpMethod,
 
     /// Request URL.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -70,7 +72,7 @@ impl HttpRequest {
     #[must_use]
     pub fn new(method: &str, url: Url) -> Self {
         Self {
-            http_method: method.to_string(),
+            http_method: method.parse().unwrap(),
             url: Some(url),
         }
     }
