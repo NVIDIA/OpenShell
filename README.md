@@ -33,6 +33,8 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 uv tool install -U openshell
 ```
 
+Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. The `dev` tag tracks the latest commit on `main` and is used for container images (`ghcr.io/nvidia/openshell/cluster:dev`); it is not recommended for general use.
+
 ### Create a sandbox
 
 ```bash
@@ -117,7 +119,9 @@ Policies are declarative YAML files. Static sections (filesystem, process) are l
 
 Agents need credentials — API keys, tokens, service accounts. OpenShell manages these as **providers**: named credential bundles that are injected into sandboxes at creation. The CLI auto-discovers credentials for recognized agents (Claude, Codex, OpenCode) from your shell environment, or you can create providers explicitly with `openshell provider create`. Credentials never leak into the sandbox filesystem; they are injected as environment variables at runtime.
 
-## GPU Support
+## GPU Support (Experimental)
+
+> **Experimental** — GPU passthrough works on supported hosts but is under active development. Expect rough edges and breaking changes.
 
 OpenShell can pass host GPUs into sandboxes for local inference, fine-tuning, or any GPU workload. Add `--gpu` when creating a sandbox:
 
