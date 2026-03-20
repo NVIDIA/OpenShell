@@ -1137,7 +1137,10 @@ impl OpenShell for OpenShellService {
                     })?;
 
                 if let Some(ref current) = latest {
-                    if current.policy_hash == hash {
+                    // Only dedup if the latest revision is still active
+                    // (loaded). If it was superseded (e.g. after a global
+                    // policy delete), always create a new revision.
+                    if current.policy_hash == hash && current.status == "loaded" {
                         // Same policy hash — skip creating a new revision but
                         // still ensure the settings blob has the policy key
                         // (it may have been lost to a pod restart while the
