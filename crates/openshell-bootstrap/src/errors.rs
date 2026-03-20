@@ -403,11 +403,15 @@ fn diagnose_docker_not_running(_gateway_name: &str) -> GatewayFailureDiagnosis {
             a Docker-compatible container runtime to manage gateway clusters."
             .to_string(),
         recovery_steps: vec![
-            RecoveryStep::new("Start your Docker runtime"),
+            RecoveryStep::new(
+                "Start your container runtime (Docker Desktop, Colima, or `podman machine start`)",
+            ),
             RecoveryStep::with_command("Verify Docker is accessible", "docker info"),
             RecoveryStep::new(
                 "If using a non-default Docker socket, set DOCKER_HOST:\n     \
-                 export DOCKER_HOST=unix:///var/run/docker.sock",
+                 export DOCKER_HOST=unix:///var/run/docker.sock\n     \
+                 Or for Podman on macOS:\n     \
+                 export DOCKER_HOST=unix://$HOME/.local/share/containers/podman/machine/podman.sock",
             ),
             RecoveryStep::new("Then retry: openshell gateway start"),
         ],

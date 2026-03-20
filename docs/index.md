@@ -228,6 +228,7 @@ reference/gateway-auth
 reference/default-policy
 reference/policy-schema
 reference/support-matrix
+reference/troubleshooting
 ```
 
 ```{toctree}

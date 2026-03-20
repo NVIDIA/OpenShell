@@ -30,9 +30,10 @@ This page gets you from zero to a running, policy-enforced sandbox in two comman
 
 ## Prerequisites
 
-Before you begin, make sure you have:
+Before you begin, make sure you have a container runtime running on your machine:
 
-- Docker Desktop running on your machine.
+- Docker Desktop (recommended), or
+- Podman in rootful mode (macOS). See {ref}`podman-macos-setup` for setup instructions.
 
 For a complete list of requirements, refer to {doc}`../reference/support-matrix`.
 
@@ -55,6 +56,28 @@ After installing the CLI, run `openshell --help` in your terminal to see the ful
 :::{tip}
 You can also clone the [NVIDIA OpenShell GitHub repository](https://github.com/NVIDIA/OpenShell) and use the `/openshell-cli` skill to load the CLI reference into your agent.
 :::
+
+(podman-macos-setup)=
+## Set Up Podman on macOS
+
+Podman is supported on macOS as an alternative to Docker Desktop. OpenShell requires Podman to run in rootful mode.
+
+Install Podman and configure a machine:
+
+```console
+$ brew install podman
+$ podman machine init --memory 8192 --cpus 4
+$ podman machine set --rootful
+$ podman machine start
+```
+
+OpenShell automatically discovers the Podman socket through `podman machine inspect`. No manual `DOCKER_HOST` configuration is needed.
+
+:::{note}
+The Podman machine must run in rootful mode (`--rootful`). A minimum of 8 GiB memory is recommended for the VM.
+:::
+
+If you use Docker Desktop instead, skip this section.
 
 ## Create Your First OpenShell Sandbox
 

@@ -469,7 +469,8 @@ where
                 .collect();
             if !images.is_empty() {
                 log("[status] Deploying components".to_string());
-                let local_docker = Docker::connect_with_local_defaults().into_diagnostic()?;
+                let local_docker =
+                    docker::connect_local_with_extended_timeout().into_diagnostic()?;
                 let container = container_name(&name);
                 let on_log_ref = Arc::clone(&on_log);
                 let mut push_log = move |msg: String| {

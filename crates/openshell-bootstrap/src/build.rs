@@ -47,7 +47,7 @@ pub async fn build_and_push_image(
     on_log(format!(
         "Pushing image {tag} into gateway \"{gateway_name}\""
     ));
-    let local_docker = Docker::connect_with_local_defaults()
+    let local_docker = crate::docker::connect_local_with_extended_timeout()
         .into_diagnostic()
         .wrap_err("failed to connect to local Docker daemon")?;
     let container = container_name(gateway_name);

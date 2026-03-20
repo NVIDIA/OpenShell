@@ -16,6 +16,7 @@ OpenShell publishes multi-architecture container images for `linux/amd64` and `l
 | Linux (Debian/Ubuntu)            | x86_64 (amd64)        | Supported |
 | Linux (Debian/Ubuntu)            | aarch64 (arm64)       | Supported |
 | macOS (Docker Desktop)           | Apple Silicon (arm64) | Supported |
+| macOS (Podman)                   | Apple Silicon (arm64) | Supported |
 | Windows (WSL 2 + Docker Desktop) | x86_64                | Experimental  |
 
 ## Software Prerequisites
@@ -25,6 +26,7 @@ The following software must be installed on the host before using the OpenShell 
 | Component                       | Minimum Version | Notes                                           |
 | ------------------------------- | --------------- | ----------------------------------------------- |
 | Docker Desktop or Docker Engine | 28.04           | Must be running before any `openshell` command. |
+| Podman (macOS alternative)      | 5.0             | Requires rootful mode. See {ref}`podman-macos-setup`. |
 
 ## Sandbox Runtime Versions
 

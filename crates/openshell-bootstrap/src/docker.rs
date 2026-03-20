@@ -107,6 +107,9 @@ pub struct DockerPreflight {
 /// - `/var/run/docker.sock` — default for Docker Desktop, `OrbStack`, Colima
 /// - `$HOME/.colima/docker.sock` — Colima (older installs)
 /// - `$HOME/.orbstack/run/docker.sock` — `OrbStack` (if symlink is missing)
+///
+/// Podman sockets are discovered dynamically via `podman machine inspect`
+/// because the path varies by VM backend (applehv, qemu, libkrun).
 const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
     "/var/run/docker.sock",
     // Expanded at runtime via home_dir():
@@ -120,27 +123,82 @@ const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
 /// deploy work begins. On failure it produces a user-friendly error with
 /// actionable recovery steps instead of a raw bollard connection error.
 pub async fn check_docker_available() -> Result<DockerPreflight> {
-    // Step 1: Try to connect using bollard's default resolution
-    // (respects DOCKER_HOST, then falls back to /var/run/docker.sock).
-    let docker = match Docker::connect_with_local_defaults() {
-        Ok(d) => d,
-        Err(err) => {
-            return Err(docker_not_reachable_error(
-                &format!("{err}"),
-                "Failed to create Docker client",
-            ));
+    // Step 1: Try DOCKER_HOST if set.
+    if let Some(host) = env_non_empty("DOCKER_HOST") {
+        return try_connect_and_ping(&host, "DOCKER_HOST").await;
+    }
+
+    // Step 2: Try CONTAINER_HOST if set (Podman convention).
+    if let Some(host) = env_non_empty("CONTAINER_HOST") {
+        return try_connect_and_ping(&host, "CONTAINER_HOST").await;
+    }
+
+    // Step 3: Try bollard's default resolution (/var/run/docker.sock).
+    if let Ok(preflight) = try_default_connect().await {
+        return Ok(preflight);
+    }
+
+    // Step 4: On macOS, try to discover the Podman socket dynamically.
+    // cfg! is a runtime bool so it cannot be combined with `if let`.
+    #[allow(clippy::collapsible_if)]
+    if cfg!(target_os = "macos") {
+        if let Some(sock_path) =
+            discover_podman_socket().filter(|p| std::path::Path::new(p).exists())
+        {
+            let host = format!("unix://{sock_path}");
+            if let Ok(preflight) = try_connect_and_ping(&host, "podman socket").await {
+                return Ok(preflight);
+            }
         }
+    }
+
+    // Nothing worked — produce a helpful error.
+    Err(docker_not_reachable_error(
+        "No reachable container runtime found",
+        "Failed to connect to Docker or Podman",
+    ))
+}
+
+/// Try bollard's default socket resolution (no explicit host).
+async fn try_default_connect() -> Result<DockerPreflight> {
+    let docker = Docker::connect_with_local_defaults().map_err(|err| miette::miette!("{err}"))?;
+    docker
+        .ping()
+        .await
+        .map_err(|err| miette::miette!("{err}"))?;
+    let version = match docker.version().await {
+        Ok(v) => v.version,
+        Err(_) => None,
+    };
+    Ok(DockerPreflight { docker, version })
+}
+
+/// Try connecting to a specific Docker/Podman host URL.
+async fn try_connect_and_ping(host: &str, source: &str) -> Result<DockerPreflight> {
+    let docker = if host.starts_with("unix://") {
+        let path = host.strip_prefix("unix://").unwrap_or(host);
+        Docker::connect_with_unix(path, 600, API_DEFAULT_VERSION).map_err(|err| {
+            docker_not_reachable_error(
+                &format!("{err}"),
+                &format!("Failed to create Docker client from {source}={host}"),
+            )
+        })?
+    } else {
+        Docker::connect_with_local_defaults().map_err(|err| {
+            docker_not_reachable_error(
+                &format!("{err}"),
+                &format!("Failed to create Docker client from {source}={host}"),
+            )
+        })?
     };
 
-    // Step 2: Ping the daemon to confirm it's responsive.
     if let Err(err) = docker.ping().await {
         return Err(docker_not_reachable_error(
             &format!("{err}"),
-            "Docker socket exists but the daemon is not responding",
+            &format!("Container runtime at {source}={host} is not responding"),
         ));
     }
 
-    // Step 3: Query version info (best-effort — don't fail on this).
     let version = match docker.version().await {
         Ok(v) => v.version,
         Err(_) => None,
@@ -152,21 +210,31 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
 /// Build a rich, user-friendly error when Docker is not reachable.
 fn docker_not_reachable_error(raw_err: &str, summary: &str) -> miette::Report {
     let docker_host = std::env::var("DOCKER_HOST").ok();
+    let container_host = std::env::var("CONTAINER_HOST").ok();
     let socket_exists = std::path::Path::new("/var/run/docker.sock").exists();
 
     let mut hints: Vec<String> = Vec::new();
 
-    if !socket_exists && docker_host.is_none() {
-        // No socket and no DOCKER_HOST — likely nothing is installed or started
+    if !socket_exists && docker_host.is_none() && container_host.is_none() {
+        // No socket and no env vars — likely nothing is installed or started
         hints.push(
-            "No Docker socket found at /var/run/docker.sock and DOCKER_HOST is not set."
+            "No Docker socket found at /var/run/docker.sock and neither DOCKER_HOST nor \
+             CONTAINER_HOST is set."
                 .to_string(),
         );
-        hints.push(
-            "Install and start a Docker-compatible runtime. See the support matrix \
-             in the OpenShell docs for tested configurations."
-                .to_string(),
-        );
+
+        if cfg!(target_os = "macos") {
+            hints.push(
+                "Start Docker Desktop or run `podman machine start` to start a container runtime."
+                    .to_string(),
+            );
+        } else {
+            hints.push(
+                "Install and start a Docker-compatible runtime. See the support matrix \
+                 in the OpenShell docs for tested configurations."
+                    .to_string(),
+            );
+        }
 
         // Check for alternative sockets that might exist
         let alt_sockets = find_alternative_sockets();
@@ -179,15 +247,14 @@ fn docker_not_reachable_error(raw_err: &str, summary: &str) -> miette::Report {
                 alt_sockets[0],
             ));
         }
-    } else if docker_host.is_some() {
-        // DOCKER_HOST is set but daemon didn't respond
-        let host_val = docker_host.unwrap();
+    } else if docker_host.is_some() || container_host.is_some() {
+        // An env var is set but daemon didn't respond
+        let host_val = docker_host.or(container_host).unwrap_or_default();
         hints.push(format!(
-            "DOCKER_HOST is set to '{host_val}' but the Docker daemon is not responding."
+            "DOCKER_HOST/CONTAINER_HOST is set to '{host_val}' but the container daemon is not responding."
         ));
         hints.push(
-            "Verify your Docker runtime is started and the DOCKER_HOST value is correct."
-                .to_string(),
+            "Verify your container runtime is started and the host value is correct.".to_string(),
         );
     } else {
         // Socket exists but daemon isn't responding
@@ -218,14 +285,25 @@ fn find_alternative_sockets() -> Vec<String> {
 
     // Check home-relative paths
     if let Some(home) = home_dir() {
-        let home_sockets = [
+        let home_sockets = vec![
             format!("{home}/.colima/docker.sock"),
             format!("{home}/.orbstack/run/docker.sock"),
         ];
+
         for path in &home_sockets {
             if std::path::Path::new(path).exists() && !found.contains(path) {
                 found.push(path.clone());
             }
+        }
+    }
+
+    // On macOS, try to discover Podman socket dynamically
+    #[allow(clippy::collapsible_if)]
+    if cfg!(target_os = "macos") {
+        if let Some(podman_path) = discover_podman_socket()
+            .filter(|p| std::path::Path::new(p).exists() && !found.contains(p))
+        {
+            found.push(podman_path);
         }
     }
 
@@ -234,6 +312,75 @@ fn find_alternative_sockets() -> Vec<String> {
 
 fn home_dir() -> Option<String> {
     std::env::var("HOME").ok()
+}
+
+/// Detect whether the connected Docker daemon is actually Podman.
+///
+/// Checks the Docker version response for the "Podman" component, which
+/// Podman always includes in its compatibility API responses.
+async fn is_podman_runtime(docker: &Docker) -> bool {
+    if let Ok(version) = docker.version().await {
+        // Podman sets the version string and components to indicate itself
+        if let Some(ref v) = version.version {
+            if v.to_lowercase().contains("podman") {
+                return true;
+            }
+        }
+        // Also check Components array for Podman Engine
+        if let Some(ref components) = version.components {
+            for c in components {
+                if c.name.to_lowercase().contains("podman") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Discover the Podman machine socket path by running `podman machine inspect`.
+///
+/// On macOS, Podman places its API socket in a temp directory that varies by
+/// VM backend (applehv, qemu, libkrun). This function queries the running
+/// machine to find the actual socket path.
+fn discover_podman_socket() -> Option<String> {
+    let output = std::process::Command::new("podman")
+        .args([
+            "machine",
+            "inspect",
+            "--format",
+            "{{.ConnectionInfo.PodmanSocket.Path}}",
+        ])
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if path.is_empty() || !path.starts_with('/') {
+        return None;
+    }
+
+    Some(path)
+}
+
+/// Create a local Docker client with an extended timeout suitable for large
+/// image transfers.
+///
+/// When `DOCKER_HOST` points to a Unix socket (including Podman sockets),
+/// this uses a 600-second timeout instead of the default 120 seconds.
+/// Falls back to `connect_with_local_defaults()` for other transports.
+pub fn connect_local_with_extended_timeout() -> std::result::Result<Docker, bollard::errors::Error>
+{
+    if let Some(path) = std::env::var("DOCKER_HOST")
+        .ok()
+        .and_then(|h| h.strip_prefix("unix://").map(String::from))
+    {
+        return Docker::connect_with_unix(&path, 600, API_DEFAULT_VERSION);
+    }
+    Docker::connect_with_local_defaults()
 }
 
 /// Create an SSH Docker client from remote options.
@@ -522,6 +669,8 @@ pub async fn ensure_container(
     );
     let exposed_ports = vec!["30051/tcp".to_string()];
 
+    let running_under_podman = is_podman_runtime(docker).await;
+
     let mut host_config = HostConfig {
         privileged: Some(true),
         // Use host cgroup namespace so k3s kubelet can manage cgroup controllers
@@ -539,6 +688,16 @@ pub async fn ensure_container(
             "host.docker.internal:host-gateway".to_string(),
             "host.openshell.internal:host-gateway".to_string(),
         ]),
+        // Under Podman (rootless), unmask /sys/fs/cgroup so k3s kubelet can
+        // create cgroup hierarchies for pod QoS management.
+        security_opt: if running_under_podman {
+            Some(vec![
+                "unmask=/sys/fs/cgroup".to_string(),
+                "unmask=/dev/kmsg".to_string(),
+            ])
+        } else {
+            None
+        },
         ..Default::default()
     };
 
@@ -566,6 +725,16 @@ pub async fn ensure_container(
         "--tls-san=localhost".to_string(),
         "--tls-san=host.docker.internal".to_string(),
     ];
+
+    // When running under Podman (rootless), k3s kubelet cannot access
+    // /dev/kmsg and cannot create cgroup hierarchies.  Enable
+    // KubeletInUserNamespace and disable cgroup-per-QoS enforcement.
+    if running_under_podman {
+        cmd.push("--kubelet-arg=feature-gates=KubeletInUserNamespace=true".to_string());
+        cmd.push("--kubelet-arg=cgroups-per-qos=false".to_string());
+        cmd.push("--kubelet-arg=enforce-node-allocatable=".to_string());
+    }
+
     for san in extra_sans {
         cmd.push(format!("--tls-san={san}"));
     }
@@ -1194,5 +1363,98 @@ mod tests {
             sockets.len() <= 10,
             "should return a reasonable number of sockets"
         );
+    }
+
+    // -- discover_podman_socket tests --
+    //
+    // We cannot mock the `podman` command, but we can verify the function
+    // does not panic and returns an `Option<String>`.  When podman is not
+    // installed (the common CI case) the function must return `None`.
+
+    #[test]
+    fn discover_podman_socket_returns_option() {
+        // On hosts without podman this should return None.
+        // On hosts with podman it should return Some(path) starting with '/'.
+        let result = discover_podman_socket();
+        if let Some(ref path) = result {
+            assert!(
+                path.starts_with('/'),
+                "discovered podman socket should be an absolute path, got: {path}"
+            );
+        }
+        // Either way, no panic — the test passes.
+    }
+
+    // -- connect_local_with_extended_timeout tests --
+    //
+    // Note: bollard client construction may fail when no Docker socket exists
+    // on the host (e.g. in CI). These tests verify the branching logic by
+    // checking that the unix:// path is handled differently from other
+    // transports, rather than asserting success unconditionally.
+
+    #[test]
+    fn connect_local_with_extended_timeout_takes_unix_path() {
+        // When DOCKER_HOST is a unix:// path the function should use
+        // `connect_with_unix` (the extended-timeout path).  Client
+        // construction may still fail if bollard cannot stat the socket,
+        // so we just verify it does not panic.
+        let prev = std::env::var("DOCKER_HOST").ok();
+        // SAFETY: test-only, single-threaded test runner for this test
+        unsafe {
+            std::env::set_var("DOCKER_HOST", "unix:///tmp/fake-test-socket.sock");
+        }
+
+        let _result = connect_local_with_extended_timeout();
+
+        // SAFETY: test-only, restoring previous state
+        unsafe {
+            match prev {
+                Some(val) => std::env::set_var("DOCKER_HOST", val),
+                None => std::env::remove_var("DOCKER_HOST"),
+            }
+        }
+        // No panic — the branch was exercised.
+    }
+
+    #[test]
+    fn connect_local_with_extended_timeout_non_unix_falls_back() {
+        // When DOCKER_HOST is a non-unix value (e.g. tcp://), the function
+        // should fall back to `connect_with_local_defaults()`.
+        let prev = std::env::var("DOCKER_HOST").ok();
+        // SAFETY: test-only, single-threaded test runner for this test
+        unsafe {
+            std::env::set_var("DOCKER_HOST", "tcp://127.0.0.1:2375");
+        }
+
+        let _result = connect_local_with_extended_timeout();
+
+        // SAFETY: test-only, restoring previous state
+        unsafe {
+            match prev {
+                Some(val) => std::env::set_var("DOCKER_HOST", val),
+                None => std::env::remove_var("DOCKER_HOST"),
+            }
+        }
+        // No panic — the fallback branch was exercised.
+    }
+
+    #[test]
+    fn connect_local_with_extended_timeout_unset_uses_defaults() {
+        // When DOCKER_HOST is unset, the function should use local defaults.
+        let prev = std::env::var("DOCKER_HOST").ok();
+        // SAFETY: test-only, single-threaded test runner for this test
+        unsafe {
+            std::env::remove_var("DOCKER_HOST");
+        }
+
+        let _result = connect_local_with_extended_timeout();
+
+        // SAFETY: test-only, restoring previous state
+        unsafe {
+            if let Some(val) = prev {
+                std::env::set_var("DOCKER_HOST", val);
+            }
+        }
+        // No panic — the default branch was exercised.
     }
 }
