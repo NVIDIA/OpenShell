@@ -1138,10 +1138,27 @@ impl OpenShell for OpenShellService {
 
                 if let Some(ref current) = latest {
                     if current.policy_hash == hash {
+                        // Same policy hash — skip creating a new revision but
+                        // still ensure the settings blob has the policy key
+                        // (it may have been lost to a pod restart while the
+                        // sandbox_policies table retained the revision).
+                        let mut global_settings =
+                            load_global_settings(self.state.store.as_ref()).await?;
+                        let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
+                        let changed = upsert_setting_value(
+                            &mut global_settings.settings,
+                            POLICY_SETTING_KEY,
+                            stored_value,
+                        );
+                        if changed {
+                            global_settings.revision = global_settings.revision.wrapping_add(1);
+                            save_global_settings(self.state.store.as_ref(), &global_settings)
+                                .await?;
+                        }
                         return Ok(Response::new(UpdateSettingsResponse {
                             version: u32::try_from(current.version).unwrap_or(0),
                             policy_hash: hash,
-                            settings_revision: 0,
+                            settings_revision: global_settings.revision,
                             deleted: false,
                         }));
                     }
