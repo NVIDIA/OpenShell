@@ -250,14 +250,17 @@ async fn resolve_external_secret(
     sandbox_id: &str,
     ctx: &L7EvalContext,
 ) -> Result<String> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| miette::miette!("failed to build reqwest client: {e}"))?;
 
     let body = resolver
         .body_template
-        .replace("{sandbox_id}", sandbox_id)
-        .replace("{host}", &ctx.host)
-        .replace("{port}", &ctx.port.to_string())
-        .replace("{binary}", &ctx.binary_path);
+        .replace("{{.SandboxID}}", sandbox_id)
+        .replace("{{.Host}}", &ctx.host)
+        .replace("{{.Port}}", &ctx.port.to_string())
+        .replace("{{.Binary}}", &ctx.binary_path);
 
     let mut builder = match resolver.method.to_uppercase().as_str() {
         "POST" => client.post(&resolver.url),
@@ -298,5 +301,6 @@ async fn resolve_external_secret(
             miette::miette!("external resolver response missing 'secret', 'token', or 'key' field")
         })?;
 
+    info!(host = %ctx.host, "Resolved external secret for L7 request");
     Ok(secret.to_string())
 }
