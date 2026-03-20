@@ -425,7 +425,8 @@ Defines an external API to call for fetching secrets (e.g., API keys) before for
 |-------|------|----------|-------------|
 | `url` | `string` | Yes | The URL of the external resolver service. |
 | `method` | `string` | No | HTTP method to use (e.g., `POST`, `GET`). Default: `GET`. |
-| `body_template` | `string` | No | JSON body template with placeholders: `{sandbox_id}`, `{host}`, `{port}`, `{binary}`. |
+| `header` | `string` | No | HTTP header name to inject the secret into. Default: `Authorization`. |
+| `body_template` | `string` | No | JSON body template with placeholders: `{{.SandboxID}}`, `{{.Host}}`, `{{.Port}}`, `{{.Binary}}`. |
 
 #### `NetworkBinary`
 

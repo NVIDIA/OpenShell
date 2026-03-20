@@ -97,6 +97,8 @@ message ExternalResolver {
   string method = 2;
   // JSON body template for the resolver request.
   string body_template = 3;
+  // Optional: Header name to inject the secret into (default: "Authorization").
+  string header = 4;
 }
 
 // An L7 policy rule (allow-only).

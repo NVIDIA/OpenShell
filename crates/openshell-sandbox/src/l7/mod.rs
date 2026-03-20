@@ -8,6 +8,8 @@
 //! doing a raw `copy_bidirectional`. Each request within the tunnel is parsed,
 //! evaluated against OPA policy, and either forwarded or denied.
 
+use tracing::info;
+
 pub mod inference;
 pub mod provider;
 pub mod relay;
@@ -57,6 +59,7 @@ pub struct ExternalResolverConfig {
     pub url: String,
     pub method: String,
     pub body_template: String,
+    pub header: String,
 }
 
 /// L7 configuration for an endpoint, extracted from policy data.
@@ -98,6 +101,7 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         _ => TlsMode::Passthrough,
     };
 
+    info!(val = ?val, "Parsing L7 config from OPA value");
     let enforcement = match get_object_str(val, "enforcement").as_deref() {
         Some("enforce") => EnforcementMode::Enforce,
         _ => EnforcementMode::Audit,
@@ -105,15 +109,21 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
 
     let external_resolver = (|| {
         let obj = val.as_object().ok()?;
+        let found = obj.get(&regorus::Value::from("external_resolver")).is_some();
+        info!(has_external_resolver = found, "Checking for external_resolver in OPA object");
         let v = obj.get(&regorus::Value::from("external_resolver"))?;
         let url = get_object_str(v, "url")?;
         let method = get_object_str(v, "method")?;
         let body_template = get_object_str(v, "body_template").unwrap_or_default();
-        Some(ExternalResolverConfig {
+        let header = get_object_str(v, "header").unwrap_or_else(|| "Authorization".to_string());
+        let config = ExternalResolverConfig {
             url,
             method,
             body_template,
-        })
+            header,
+        };
+        info!(config = ?config, "Parsed external resolver config from OPA");
+        Some(config)
     })();
 
     Some(L7EndpointConfig {

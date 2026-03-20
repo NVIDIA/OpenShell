@@ -31,7 +31,7 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
 | `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers |
 | `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation |
-| `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing, deny response generation, and **Authorization header injection** |
+| `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing, deny response generation, and **custom header injection** |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
 
 ## Startup and Orchestration

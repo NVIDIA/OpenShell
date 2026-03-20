@@ -111,6 +111,8 @@ struct ExternalResolverDef {
     method: String,
     #[serde(default)]
     body_template: String,
+    #[serde(default)]
+    header: String,
 }
 
 fn is_zero(v: &u32) -> bool {
@@ -197,6 +199,7 @@ fn to_proto(raw: PolicyFile) -> SandboxPolicy {
                                     url: er.url,
                                     method: er.method,
                                     body_template: er.body_template,
+                                    header: er.header,
                                 }
                             }),
                         }
@@ -304,6 +307,7 @@ fn from_proto(policy: &SandboxPolicy) -> PolicyFile {
                                     url: er.url.clone(),
                                     method: er.method.clone(),
                                     body_template: er.body_template.clone(),
+                                    header: er.header.clone(),
                                 }
                             }),
                         }
@@ -1142,5 +1146,34 @@ network_policies:
             proto1.network_policies["test"].endpoints[0].host,
             proto2.network_policies["test"].endpoints[0].host
         );
+    }
+
+    #[test]
+    fn parse_external_resolver() {
+        let yaml = r#"
+version: 1
+network_policies:
+  test:
+    name: test
+    endpoints:
+      - host: "api.openai.com"
+        port: 443
+        protocol: "rest"
+        external_resolver:
+          url: "http://host.openshell.internal:5000/v1/resolve-secret"
+          method: "POST"
+          header: "X-OpenShell-Token"
+          body_template: '{"foo": "bar"}'
+    binaries:
+      - { path: /usr/bin/curl }
+"#;
+        let policy = parse_sandbox_policy(yaml).expect("should parse");
+        let ep = &policy.network_policies["test"].endpoints[0];
+        assert_eq!(ep.host, "api.openai.com");
+        let er = ep.external_resolver.as_ref().expect("external_resolver missing");
+        assert_eq!(er.url, "http://host.openshell.internal:5000/v1/resolve-secret");
+        assert_eq!(er.method, "POST");
+        assert_eq!(er.header, "X-OpenShell-Token");
+        assert_eq!(er.body_template, "{\"foo\": \"bar\"}");
     }
 }

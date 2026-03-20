@@ -82,6 +82,13 @@ where
     C: AsyncRead + AsyncWrite + Unpin + Send,
     U: AsyncRead + AsyncWrite + Unpin + Send,
 {
+    info!(
+        host = %ctx.host,
+        port = ctx.port,
+        protocol = ?config.protocol,
+        has_resolver = config.external_resolver.is_some(),
+        "Starting REST L7 relay"
+    );
     loop {
         // Parse one HTTP request from client
         let req = match crate::l7::rest::RestProvider.parse_request(client).await {
@@ -137,13 +144,21 @@ where
         if allowed || config.enforcement == EnforcementMode::Audit {
             let external_secret = if let Some(resolver) = &config.external_resolver {
                 match resolve_external_secret(resolver, ctx.sandbox_id.as_deref().unwrap_or("-"), ctx).await {
-                    Ok(secret) => Some(secret),
+                    Ok(secret) => {
+                        info!(
+                            host = %ctx.host,
+                            header = %resolver.header,
+                            "Successfully resolved external secret"
+                        );
+                        Some(secret)
+                    }
                     Err(e) => {
-                         warn!(error = %e, "External secret resolution failed");
-                         None
+                        warn!(error = %e, "External secret resolution failed");
+                        None
                     }
                 }
             } else {
+                info!(host = %ctx.host, "No external resolver configured for this endpoint");
                 None
             };
 
@@ -154,6 +169,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 external_secret.as_deref(),
+                &config.external_resolver.as_ref().unwrap().header,
             )
             .await?;
             if !reusable {
@@ -262,7 +278,15 @@ async fn resolve_external_secret(
         .replace("{{.Port}}", &ctx.port.to_string())
         .replace("{{.Binary}}", &ctx.binary_path);
 
-    let mut builder = match resolver.method.to_uppercase().as_str() {
+    let method = resolver.method.to_uppercase();
+    info!(
+        url = %resolver.url,
+        method = %method,
+        body = %body,
+        "Resolving external secret"
+    );
+
+    let mut builder = match method.as_str() {
         "POST" => client.post(&resolver.url),
         "PUT" => client.put(&resolver.url),
         _ => client.get(&resolver.url),

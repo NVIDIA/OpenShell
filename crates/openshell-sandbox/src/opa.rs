@@ -9,6 +9,7 @@
 
 use crate::policy::{FilesystemPolicy, LandlockCompatibility, LandlockPolicy, ProcessPolicy};
 use miette::Result;
+use tracing::info;
 use openshell_core::proto::SandboxPolicy as ProtoSandboxPolicy;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -96,6 +97,7 @@ impl OpaEngine {
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
         let data_json = preprocess_yaml_data(data_yaml)?;
+        info!(data = %data_json.to_string(), "Loading OPA data");
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;
@@ -681,11 +683,13 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                     if !e.allowed_ips.is_empty() {
                         ep["allowed_ips"] = e.allowed_ips.clone().into();
                     }
+                    info!(has_er = e.external_resolver.is_some(), "Checking NetworkEndpoint proto for external_resolver");
                     if let Some(er) = e.external_resolver.as_ref() {
                         ep["external_resolver"] = serde_json::json!({
                             "url": er.url,
                             "method": er.method,
                             "body_template": er.body_template,
+                            "header": er.header,
                         });
                     }
                     ep
@@ -707,13 +711,17 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
         })
         .collect();
 
-    serde_json::json!({
+    let mut data = serde_json::json!({
         "filesystem_policy": filesystem_policy,
         "landlock": landlock,
         "process": process,
         "network_policies": network_policies,
-    })
-    .to_string()
+    });
+
+    // Expand access presets to explicit rules so Rego can match them
+    crate::l7::expand_access_presets(&mut data);
+
+    serde_json::to_string(&data).unwrap_or_default()
 }
 
 #[cfg(test)]

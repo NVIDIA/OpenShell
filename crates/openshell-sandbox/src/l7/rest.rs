@@ -123,7 +123,7 @@ where
     C: AsyncRead + AsyncWrite + Unpin,
     U: AsyncRead + AsyncWrite + Unpin,
 {
-    relay_http_request_with_resolver(req, client, upstream, None, None).await
+    relay_http_request_with_resolver(req, client, upstream, None, None, "").await
 }
 
 pub(crate) async fn relay_http_request_with_resolver<C, U>(
@@ -132,6 +132,7 @@ pub(crate) async fn relay_http_request_with_resolver<C, U>(
     upstream: &mut U,
     resolver: Option<&crate::secrets::SecretResolver>,
     external_secret: Option<&str>,
+    external_header: &str,
 ) -> Result<bool>
 where
     C: AsyncRead + AsyncWrite + Unpin,
@@ -145,7 +146,7 @@ where
 
     let rewritten_header = rewrite_http_header_block(&req.raw_header[..header_end], resolver);
     let final_header = if let Some(secret) = external_secret {
-        inject_auth_header(&rewritten_header, secret)
+        inject_custom_header(&rewritten_header, external_header, secret)
     } else {
         rewritten_header
     };
@@ -177,8 +178,8 @@ where
     relay_response(&req.action, upstream, client).await
 }
 
-/// Inject or override Authorization header with a Bearer token.
-fn inject_auth_header(raw: &[u8], secret: &str) -> Vec<u8> {
+/// Inject or override a custom header with the given secret.
+fn inject_custom_header(raw: &[u8], header_name: &str, secret: &str) -> Vec<u8> {
     let header_str = String::from_utf8_lossy(raw);
     let mut lines = header_str.split("\r\n");
     let Some(request_line) = lines.next() else {
@@ -189,23 +190,35 @@ fn inject_auth_header(raw: &[u8], secret: &str) -> Vec<u8> {
     output.extend_from_slice(request_line.as_bytes());
     output.extend_from_slice(b"\r\n");
 
-    let mut auth_injected = false;
+    let header_lower = header_name.to_lowercase();
+
+    let mut injected = false;
     for line in lines {
         if line.is_empty() {
             break;
         }
 
-        if line.to_lowercase().starts_with("authorization:") {
-            output.extend_from_slice(format!("Authorization: Bearer {secret}\r\n").as_bytes());
-            auth_injected = true;
+        if line.to_lowercase().starts_with(&format!("{}:", header_lower)) {
+            let value = if header_lower == "authorization" {
+                format!("Bearer {secret}")
+            } else {
+                secret.to_string()
+            };
+            output.extend_from_slice(format!("{header_name}: {value}\r\n").as_bytes());
+            injected = true;
         } else {
             output.extend_from_slice(line.as_bytes());
             output.extend_from_slice(b"\r\n");
         }
     }
 
-    if !auth_injected {
-        output.extend_from_slice(format!("Authorization: Bearer {secret}\r\n").as_bytes());
+    if !injected {
+        let value = if header_lower == "authorization" {
+            format!("Bearer {secret}")
+        } else {
+            secret.to_string()
+        };
+        output.extend_from_slice(format!("{header_name}: {value}\r\n").as_bytes());
     }
 
     output.extend_from_slice(b"\r\n");
