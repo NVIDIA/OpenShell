@@ -165,9 +165,9 @@ impl OcsfEvent {
 mod tests {
     use super::*;
     use crate::builders::{
-        test_sandbox_context, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
-        DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder,
-        ProcessActivityBuilder, SshActivityBuilder,
+        AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder, DetectionFindingBuilder,
+        HttpActivityBuilder, NetworkActivityBuilder, ProcessActivityBuilder, SshActivityBuilder,
+        test_sandbox_context,
     };
     use crate::enums::*;
     use crate::objects::*;

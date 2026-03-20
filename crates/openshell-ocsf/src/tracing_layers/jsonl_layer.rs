@@ -7,10 +7,10 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use tracing::Subscriber;
-use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
+use tracing_subscriber::layer::Context;
 
-use crate::tracing_layers::event_bridge::{clone_current_event, OCSF_TARGET};
+use crate::tracing_layers::event_bridge::{OCSF_TARGET, clone_current_event};
 
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
 ///

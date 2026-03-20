@@ -8,3 +8,6 @@ python/openshell/_proto/*_pb2.pyi linguist-generated
 
 # Generated Rust protobuf code (excludes hand-written mod.rs)
 crates/openshell-core/src/proto/openshell.*.rs linguist-generated
+
+# Vendored OCSF schemas fetched from schema.ocsf.io
+crates/openshell-ocsf/schemas/** linguist-generated
