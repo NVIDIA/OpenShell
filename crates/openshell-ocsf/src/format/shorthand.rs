@@ -9,11 +9,16 @@ use crate::events::OcsfEvent;
 use crate::objects::Url;
 
 /// Format a timestamp (ms since epoch) as `HH:MM:SS.mmm`.
+///
+/// Returns a placeholder `"??:??:??.???"` for out-of-range timestamps
+/// instead of panicking.
 #[must_use]
 pub fn format_ts(time_ms: i64) -> String {
-    use chrono::{TimeZone, Utc};
-    let dt = Utc.timestamp_millis_opt(time_ms).unwrap();
-    dt.format("%H:%M:%S%.3f").to_string()
+    use chrono::{MappedLocalTime, TimeZone, Utc};
+    match Utc.timestamp_millis_opt(time_ms) {
+        MappedLocalTime::Single(dt) => dt.format("%H:%M:%S%.3f").to_string(),
+        _ => "??:??:??.???".to_string(),
+    }
 }
 
 /// Map a severity ID byte to its single-character shorthand.
@@ -269,6 +274,16 @@ mod tests {
     fn test_format_ts() {
         let ts = format_ts(1_742_047_200_000);
         assert_eq!(ts, "14:00:00.000");
+    }
+
+    #[test]
+    fn test_format_ts_invalid_timestamp_does_not_panic() {
+        // Out-of-range timestamp should return placeholder, not panic
+        let ts = format_ts(i64::MAX);
+        assert_eq!(ts, "??:??:??.???");
+
+        let ts = format_ts(i64::MIN);
+        assert_eq!(ts, "??:??:??.???");
     }
 
     #[test]
