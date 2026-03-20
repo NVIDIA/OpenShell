@@ -9,7 +9,7 @@ The following table summarizes the agents that run in OpenShell sandboxes. All a
 | [Codex](https://developers.openai.com/codex) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | No coverage | Pre-installed. Requires a custom policy with OpenAI endpoints and Codex binary paths. Requires `OPENAI_API_KEY`. |
 | [GitHub Copilot CLI](https://docs.github.com/en/copilot/github-copilot-in-the-cli) | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Full coverage | Pre-installed. Works out of the box. Requires `GITHUB_TOKEN` or `COPILOT_GITHUB_TOKEN`. |
 | [OpenClaw](https://openclaw.ai/) | [`openclaw`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/openclaw) | Bundled | Agent orchestration layer. Launch with `openshell sandbox create --from openclaw`. |
-| [Ollama](https://ollama.com/) | [`ollama`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/ollama) | Bundled | Run cloud and local models. Includes Claude Code, Codex, and OpenClaw. Launch with `openshell sandbox create --from ollama`. |
+| [Ollama](https://ollama.com/) | [`ollama`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/ollama) | Bundled | Run cloud and local models. Includes Claude Code, Codex, and OpenCode. Launch with `openshell sandbox create --from ollama`. |
 
 More community agent sandboxes are available in the {doc}`../sandboxes/community-sandboxes` catalog.
 

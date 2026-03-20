@@ -81,6 +81,12 @@ $ openshell provider create \
 
 Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running where the gateway runs. For host-backed local inference, use `host.openshell.internal` or the host's LAN IP. Avoid `127.0.0.1` and `localhost`. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
 
+:::{tip}
+For a self-contained setup, the Ollama community sandbox bundles Ollama inside the sandbox itself — no host-level provider needed. See {doc}`/tutorials/local-inference-ollama` for details.
+:::
+
+Ollama also supports cloud-hosted models using the `:cloud` tag suffix (e.g., `qwen3.5:cloud`). 
+
 ::::
 
 ::::{tab-item} Anthropic
