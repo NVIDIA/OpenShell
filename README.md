@@ -14,7 +14,6 @@ OpenShell is built agent-first. The project ships with agent skills for everythi
 
 ## Quickstart
 
-
 ### Prerequisites
 
 - **Docker** — Docker Desktop (or a Docker daemon) must be running.
@@ -33,7 +32,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 uv tool install -U openshell
 ```
 
-Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. The [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) tracks the latest commit on `main` and is used for container images (`ghcr.io/nvidia/openshell/cluster:dev`); it is not recommended for general use.
+Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. A [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) is also available that tracks the latest commit on `main`.
 
 ### Create a sandbox
 
@@ -141,7 +140,7 @@ The CLI auto-bootstraps a GPU-enabled gateway on first use. GPU intent is also i
 | [OpenCode](https://opencode.ai/)                              | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY` or `OPENROUTER_API_KEY`. |
 | [Codex](https://developers.openai.com/codex)                  | [`base`](https://github.com/NVIDIA/OpenShell-Community/tree/main/sandboxes/base) | Works out of the box. Provider uses `OPENAI_API_KEY`.                         |
 | [OpenClaw](https://openclaw.ai/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from openclaw`.                       |
-| [Ollama](https://ollama.com/)                              | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                       |
+| [Ollama](https://ollama.com/)                                 | [Community](https://github.com/NVIDIA/OpenShell-Community)                       | Launch with `openshell sandbox create --from ollama`.                         |
 
 ## Key Commands
 
