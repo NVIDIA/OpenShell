@@ -18,7 +18,8 @@ use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
     extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
+    clear_last_sandbox_if_matches, remove_gateway_metadata, resolve_ssh_hostname,
+    save_active_gateway, save_last_sandbox,
     store_gateway_metadata,
 };
 use openshell_core::proto::{
@@ -2824,6 +2825,7 @@ pub async fn sandbox_delete(
     names: &[String],
     all: bool,
     tls: &TlsOptions,
+    gateway: &str,
 ) -> Result<()> {
     let mut client = grpc_client(server, tls).await?;
 
@@ -2864,6 +2866,7 @@ pub async fn sandbox_delete(
 
         let deleted = response.into_inner().deleted;
         if deleted {
+            clear_last_sandbox_if_matches(gateway, name);
             println!("{} Deleted sandbox {name}", "✓".green().bold());
         } else {
             println!("{} Sandbox {name} not found", "!".yellow());

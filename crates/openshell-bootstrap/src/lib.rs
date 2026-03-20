@@ -49,8 +49,9 @@ pub use crate::docker::{
 };
 pub use crate::metadata::{
     GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
-    list_gateways, load_active_gateway, load_gateway_metadata, load_last_sandbox,
-    remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway, save_last_sandbox,
+    clear_last_sandbox_if_matches, list_gateways, load_active_gateway, load_gateway_metadata,
+    load_last_sandbox, remove_gateway_metadata, resolve_ssh_hostname, save_active_gateway,
+    save_last_sandbox,
     store_gateway_metadata,
 };
 

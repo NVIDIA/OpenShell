@@ -2268,7 +2268,8 @@ async fn main() -> Result<()> {
                             run::sandbox_list(endpoint, limit, offset, ids, names, &tls).await?;
                         }
                         SandboxCommands::Delete { names, all } => {
-                            run::sandbox_delete(endpoint, &names, all, &tls).await?;
+                            run::sandbox_delete(endpoint, &names, all, &tls, &ctx.name)
+                                .await?;
                         }
                         SandboxCommands::Connect { name, editor } => {
                             let name = resolve_sandbox_name(name, &ctx.name)?;
