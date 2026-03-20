@@ -21,11 +21,15 @@ pub use network_activity::NetworkActivityEvent;
 pub use process_activity::ProcessActivityEvent;
 pub use ssh_activity::SshActivityEvent;
 
+use serde::ser::SerializeMap;
 use serde::{Deserialize, Serialize};
 
 /// Top-level OCSF event enum encompassing all supported event classes.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(untagged)]
+///
+/// Serialization uses the inner event struct directly (untagged).
+/// Deserialization dispatches on the `class_uid` field to select the
+/// correct variant, avoiding the ambiguity of `#[serde(untagged)]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OcsfEvent {
     /// Network Activity [4001]
     NetworkActivity(NetworkActivityEvent),
@@ -43,6 +47,86 @@ pub enum OcsfEvent {
     DeviceConfigStateChange(DeviceConfigStateChangeEvent),
     /// Base Event [0]
     Base(BaseEvent),
+}
+
+impl Serialize for OcsfEvent {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        // Serialize the inner event struct directly — produces flat OCSF JSON.
+        // We serialize to a Value first to get the map, then re-serialize.
+        let value = match self {
+            Self::NetworkActivity(e) => {
+                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
+            }
+            Self::HttpActivity(e) => serde_json::to_value(e).map_err(serde::ser::Error::custom)?,
+            Self::SshActivity(e) => serde_json::to_value(e).map_err(serde::ser::Error::custom)?,
+            Self::ProcessActivity(e) => {
+                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
+            }
+            Self::DetectionFinding(e) => {
+                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
+            }
+            Self::ApplicationLifecycle(e) => {
+                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
+            }
+            Self::DeviceConfigStateChange(e) => {
+                serde_json::to_value(e).map_err(serde::ser::Error::custom)?
+            }
+            Self::Base(e) => serde_json::to_value(e).map_err(serde::ser::Error::custom)?,
+        };
+
+        // Re-serialize the flat JSON object
+        if let serde_json::Value::Object(map) = value {
+            let mut ser_map = serializer.serialize_map(Some(map.len()))?;
+            for (k, v) in &map {
+                ser_map.serialize_entry(k, v)?;
+            }
+            ser_map.end()
+        } else {
+            Err(serde::ser::Error::custom("expected JSON object"))
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for OcsfEvent {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // Deserialize into a raw JSON value first, then dispatch on class_uid.
+        let value = serde_json::Value::deserialize(deserializer)?;
+
+        let class_uid = value
+            .get("class_uid")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or_else(|| serde::de::Error::missing_field("class_uid"))?;
+
+        match class_uid {
+            4001 => serde_json::from_value::<NetworkActivityEvent>(value)
+                .map(Self::NetworkActivity)
+                .map_err(serde::de::Error::custom),
+            4002 => serde_json::from_value::<HttpActivityEvent>(value)
+                .map(Self::HttpActivity)
+                .map_err(serde::de::Error::custom),
+            4007 => serde_json::from_value::<SshActivityEvent>(value)
+                .map(Self::SshActivity)
+                .map_err(serde::de::Error::custom),
+            1007 => serde_json::from_value::<ProcessActivityEvent>(value)
+                .map(Self::ProcessActivity)
+                .map_err(serde::de::Error::custom),
+            2004 => serde_json::from_value::<DetectionFindingEvent>(value)
+                .map(Self::DetectionFinding)
+                .map_err(serde::de::Error::custom),
+            6002 => serde_json::from_value::<ApplicationLifecycleEvent>(value)
+                .map(Self::ApplicationLifecycle)
+                .map_err(serde::de::Error::custom),
+            5019 => serde_json::from_value::<DeviceConfigStateChangeEvent>(value)
+                .map(Self::DeviceConfigStateChange)
+                .map_err(serde::de::Error::custom),
+            0 => serde_json::from_value::<BaseEvent>(value)
+                .map(Self::Base)
+                .map_err(serde::de::Error::custom),
+            other => Err(serde::de::Error::custom(format!(
+                "unknown OCSF class_uid: {other}"
+            ))),
+        }
+    }
 }
 
 impl OcsfEvent {
@@ -74,5 +158,159 @@ impl OcsfEvent {
             Self::DeviceConfigStateChange(e) => &e.base,
             Self::Base(e) => &e.base,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::builders::{
+        test_sandbox_context, AppLifecycleBuilder, BaseEventBuilder, ConfigStateChangeBuilder,
+        DetectionFindingBuilder, HttpActivityBuilder, NetworkActivityBuilder,
+        ProcessActivityBuilder, SshActivityBuilder,
+    };
+    use crate::enums::*;
+    use crate::objects::*;
+
+    /// Verify that every event class round-trips through JSON and deserializes
+    /// to the correct `OcsfEvent` variant (not silently matching the wrong one).
+    #[test]
+    fn test_roundtrip_network_activity() {
+        let ctx = test_sandbox_context();
+        let event = NetworkActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .disposition(DispositionId::Allowed)
+            .severity(SeverityId::Informational)
+            .dst_endpoint(Endpoint::from_domain("example.com", 443))
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::NetworkActivity(_)));
+        assert_eq!(deserialized.class_uid(), 4001);
+    }
+
+    #[test]
+    fn test_roundtrip_http_activity() {
+        let ctx = test_sandbox_context();
+        let event = HttpActivityBuilder::new(&ctx)
+            .activity(ActivityId::Reset)
+            .action(ActionId::Allowed)
+            .severity(SeverityId::Informational)
+            .http_request(HttpRequest::new(
+                "GET",
+                Url::new("https", "example.com", "/", 443),
+            ))
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::HttpActivity(_)));
+        assert_eq!(deserialized.class_uid(), 4002);
+    }
+
+    #[test]
+    fn test_roundtrip_ssh_activity() {
+        let ctx = test_sandbox_context();
+        let event = SshActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .action(ActionId::Allowed)
+            .severity(SeverityId::Informational)
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::SshActivity(_)));
+        assert_eq!(deserialized.class_uid(), 4007);
+    }
+
+    #[test]
+    fn test_roundtrip_process_activity() {
+        let ctx = test_sandbox_context();
+        let event = ProcessActivityBuilder::new(&ctx)
+            .activity(ActivityId::Open)
+            .severity(SeverityId::Informational)
+            .process(Process::new("test", 1))
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::ProcessActivity(_)));
+        assert_eq!(deserialized.class_uid(), 1007);
+    }
+
+    #[test]
+    fn test_roundtrip_detection_finding() {
+        let ctx = test_sandbox_context();
+        let event = DetectionFindingBuilder::new(&ctx)
+            .severity(SeverityId::High)
+            .finding_info(FindingInfo::new("test-uid", "Test Finding"))
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::DetectionFinding(_)));
+        assert_eq!(deserialized.class_uid(), 2004);
+    }
+
+    #[test]
+    fn test_roundtrip_application_lifecycle() {
+        let ctx = test_sandbox_context();
+        let event = AppLifecycleBuilder::new(&ctx)
+            .activity(ActivityId::Reset)
+            .severity(SeverityId::Informational)
+            .status(StatusId::Success)
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::ApplicationLifecycle(_)));
+        assert_eq!(deserialized.class_uid(), 6002);
+    }
+
+    #[test]
+    fn test_roundtrip_config_state_change() {
+        let ctx = test_sandbox_context();
+        let event = ConfigStateChangeBuilder::new(&ctx)
+            .state(StateId::Enabled, "loaded")
+            .severity(SeverityId::Informational)
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(
+            deserialized,
+            OcsfEvent::DeviceConfigStateChange(_)
+        ));
+        assert_eq!(deserialized.class_uid(), 5019);
+    }
+
+    #[test]
+    fn test_roundtrip_base_event() {
+        let ctx = test_sandbox_context();
+        let event = BaseEventBuilder::new(&ctx)
+            .severity(SeverityId::Informational)
+            .message("test")
+            .build();
+
+        let json = serde_json::to_value(&event).unwrap();
+        let deserialized: OcsfEvent = serde_json::from_value(json).unwrap();
+        assert!(matches!(deserialized, OcsfEvent::Base(_)));
+        assert_eq!(deserialized.class_uid(), 0);
+    }
+
+    #[test]
+    fn test_deserialize_unknown_class_uid_errors() {
+        let json = serde_json::json!({"class_uid": 9999});
+        let result = serde_json::from_value::<OcsfEvent>(json);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_deserialize_missing_class_uid_errors() {
+        let json = serde_json::json!({"severity_id": 1});
+        let result = serde_json::from_value::<OcsfEvent>(json);
+        assert!(result.is_err());
     }
 }
