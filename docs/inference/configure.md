@@ -82,7 +82,7 @@ $ openshell provider create \
 Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running where the gateway runs. For host-backed local inference, use `host.openshell.internal` or the host's LAN IP. Avoid `127.0.0.1` and `localhost`. Set `OPENAI_API_KEY` to a dummy value if the server does not require authentication.
 
 :::{tip}
-For a self-contained setup, the Ollama community sandbox bundles Ollama inside the sandbox itself — no host-level provider needed. See {doc}`/tutorials/local-inference-ollama` for details.
+For a self-contained setup, the Ollama community sandbox bundles Ollama inside the sandbox itself — no host-level provider needed. See {doc}`/tutorials/inference-ollama` for details.
 :::
 
 Ollama also supports cloud-hosted models using the `:cloud` tag suffix (e.g., `qwen3.5:cloud`). 
@@ -189,7 +189,7 @@ A successful response confirms the privacy router can reach the configured backe
 Explore related topics:
 
 - To understand the inference routing flow and supported API patterns, refer to {doc}`index`.
-- To follow a complete Ollama-based local setup, refer to {doc}`/tutorials/local-inference-ollama`.
+- To follow a complete Ollama-based local setup, refer to {doc}`/tutorials/inference-ollama`.
 - To follow a complete LM Studio-based local setup, refer to {doc}`/tutorials/local-inference-lmstudio`.
 - To control external endpoints, refer to [Policies](/sandboxes/policies.md).
 - To manage provider records, refer to {doc}`../sandboxes/manage-providers`.
