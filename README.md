@@ -33,7 +33,7 @@ curl -LsSf https://raw.githubusercontent.com/NVIDIA/OpenShell/main/install.sh | 
 uv tool install -U openshell
 ```
 
-Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. The `dev` tag tracks the latest commit on `main` and is used for container images (`ghcr.io/nvidia/openshell/cluster:dev`); it is not recommended for general use.
+Both methods install the latest stable release by default. To install a specific version, set `OPENSHELL_VERSION` (binary) or pin the version with `uv tool install openshell==<version>`. The [`dev` release](https://github.com/NVIDIA/OpenShell/releases/tag/dev) tracks the latest commit on `main` and is used for container images (`ghcr.io/nvidia/openshell/cluster:dev`); it is not recommended for general use.
 
 ### Create a sandbox
 
