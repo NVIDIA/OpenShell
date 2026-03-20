@@ -1017,8 +1017,10 @@ impl OpenShell for OpenShellService {
             // Validate static fields haven't changed.
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
 
-            // Validate network mode hasn't changed (Block ↔ Proxy).
-            validate_network_mode_unchanged(baseline_policy, &new_policy)?;
+            // Allow network policy additions/removals on live sandboxes. The
+            // cluster runtime always uses proxy mode for proto-backed sandbox
+            // policies, so an empty `network_policies` map is no longer a real
+            // mode boundary.
 
             // Validate policy safety (no root, no path traversal, etc.).
             validate_policy_safety(&new_policy)?;
@@ -1590,7 +1592,8 @@ impl OpenShell for OpenShellService {
         );
 
         // Merge the approved rule into the current policy (with optimistic retry).
-        let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, &chunk).await?;
+        let (version, hash) =
+            merge_chunk_into_policy(self.state.store.as_ref(), &sandbox_id, &chunk).await?;
 
         // Mark chunk as approved.
         let now_ms =
@@ -1757,7 +1760,8 @@ impl OpenShell for OpenShellService {
             );
 
             // Merge each chunk into the policy (with optimistic retry).
-            let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, chunk).await?;
+            let (version, hash) =
+                merge_chunk_into_policy(self.state.store.as_ref(), &sandbox_id, chunk).await?;
             last_version = version;
             last_hash = hash;
 
@@ -2071,7 +2075,7 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
 const MERGE_RETRY_LIMIT: usize = 5;
 
 async fn merge_chunk_into_policy(
-    state: &ServerState,
+    store: &crate::persistence::Store,
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
@@ -2083,8 +2087,7 @@ async fn merge_chunk_into_policy(
 
     for attempt in 1..=MERGE_RETRY_LIMIT {
         // Get the current active policy (re-read on each attempt).
-        let latest = state
-            .store
+        let latest = store
             .get_latest_policy(sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
@@ -2129,14 +2132,12 @@ async fn merge_chunk_into_policy(
         let next_version = base_version + 1;
         let policy_id = uuid::Uuid::new_v4().to_string();
 
-        match state
-            .store
+        match store
             .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
             .await
         {
             Ok(()) => {
-                let _ = state
-                    .store
+                let _ = store
                     .supersede_older_policies(sandbox_id, next_version)
                     .await;
 
@@ -2605,25 +2606,6 @@ fn validate_filesystem_additive(
             ));
         }
         (None, None) => {}
-    }
-    Ok(())
-}
-
-/// Validate that network mode hasn't changed (Block ↔ Proxy).
-/// Adding `network_policies` when none existed (or removing all) changes the mode.
-fn validate_network_mode_unchanged(
-    baseline: &ProtoSandboxPolicy,
-    new: &ProtoSandboxPolicy,
-) -> Result<(), Status> {
-    let baseline_has_policies = !baseline.network_policies.is_empty();
-    let new_has_policies = !new.network_policies.is_empty();
-    if baseline_has_policies != new_has_policies {
-        let msg = if new_has_policies {
-            "cannot add network policies to a sandbox created without them (Block → Proxy mode change requires restart)"
-        } else {
-            "cannot remove all network policies from a sandbox created with them (Proxy → Block mode change requires restart)"
-        };
-        return Err(Status::invalid_argument(msg));
     }
     Ok(())
 }
@@ -3322,11 +3304,12 @@ mod tests {
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
         MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE, clamp_limit,
         create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, resolve_provider_environment, update_provider_record,
-        validate_provider_fields, validate_sandbox_spec,
+        list_provider_records, merge_chunk_into_policy, resolve_provider_environment,
+        update_provider_record, validate_provider_fields, validate_sandbox_spec,
     };
-    use crate::persistence::Store;
+    use crate::persistence::{DraftChunkRecord, Store};
     use openshell_core::proto::{Provider, SandboxSpec, SandboxTemplate};
+    use prost::Message;
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -4012,7 +3995,7 @@ mod tests {
 
     #[test]
     fn validate_static_fields_allows_unchanged() {
-        use super::{validate_network_mode_unchanged, validate_static_fields_unchanged};
+        use super::validate_static_fields_unchanged;
         use openshell_core::proto::{
             FilesystemPolicy, LandlockPolicy, ProcessPolicy, SandboxPolicy as ProtoSandboxPolicy,
         };
@@ -4034,7 +4017,6 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&policy, &policy).is_ok());
-        assert!(validate_network_mode_unchanged(&policy, &policy).is_ok());
     }
 
     #[test]
@@ -4152,23 +4134,6 @@ mod tests {
         assert!(result.unwrap_err().message().contains("include_workdir"));
     }
 
-    #[test]
-    fn validate_network_mode_rejects_block_to_proxy() {
-        use super::validate_network_mode_unchanged;
-        use openshell_core::proto::{NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy};
-
-        let baseline = ProtoSandboxPolicy::default(); // no network policies = Block
-        let mut changed = ProtoSandboxPolicy::default();
-        changed.network_policies.insert(
-            "test".into(),
-            NetworkPolicyRule {
-                name: "test".into(),
-                ..Default::default()
-            },
-        );
-        assert!(validate_network_mode_unchanged(&baseline, &changed).is_err());
-    }
-
     // ---- Sandbox creation without policy ----
 
     #[tokio::test]
@@ -4260,6 +4225,65 @@ mod tests {
         assert_eq!(policy.version, 1);
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
+    }
+
+    #[tokio::test]
+    async fn merge_chunk_into_policy_adds_first_network_rule_to_empty_policy() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let rule = NetworkPolicyRule {
+            name: "google".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "google.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-1".to_string(),
+            sandbox_id: "sb-empty".to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "google".to_string(),
+            proposed_rule: rule.encode_to_vec(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 1.0,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "google.com".to_string(),
+            port: 443,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+
+        let (version, _) = merge_chunk_into_policy(&store, &chunk.sandbox_id, &chunk)
+            .await
+            .unwrap();
+
+        assert_eq!(version, 1);
+
+        let latest = store
+            .get_latest_policy(&chunk.sandbox_id)
+            .await
+            .unwrap()
+            .expect("policy revision should be persisted");
+        let policy = openshell_core::proto::SandboxPolicy::decode(latest.policy_payload.as_slice())
+            .expect("policy payload should decode");
+        let stored_rule = policy
+            .network_policies
+            .get("google")
+            .expect("merged rule should be present");
+        assert_eq!(stored_rule.endpoints[0].host, "google.com");
+        assert_eq!(stored_rule.endpoints[0].port, 443);
+        assert_eq!(stored_rule.binaries[0].path, "/usr/bin/curl");
     }
 
     // ── petname default name generation ───────────────────────────────

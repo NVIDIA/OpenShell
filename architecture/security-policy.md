@@ -90,12 +90,9 @@ Attempting to change a static field in an update request returns an `INVALID_ARG
 
 ### Network Mode Immutability
 
-The network mode (Block vs. Proxy) cannot change after sandbox creation. This is because switching modes requires infrastructure changes that only happen at startup:
+Proto-backed sandboxes always run with proxy networking. The proxy, network namespace, and OPA evaluation path are created at sandbox startup and stay in place for the lifetime of the sandbox.
 
-- **Block to Proxy**: Requires creating a network namespace, veth pair, and starting the CONNECT proxy -- none of which exist if the sandbox started in Block mode.
-- **Proxy to Block**: Requires removing the proxy, veth pair, and network namespace, and applying a stricter seccomp filter that blocks `AF_INET`/`AF_INET6` -- not possible on a running process.
-
-An update that adds `network_policies` to a sandbox created without them (or removes all `network_policies` from a sandbox created with them) is rejected. See `crates/openshell-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
+That means `network_policies` can change freely at runtime, including transitions between an empty map (proxy-backed deny-all) and a non-empty map (proxy-backed allowlist). The immutable boundary is the proxy infrastructure itself, not whether the current policy has any rules.
 
 ### Update Flow
 
@@ -110,7 +107,6 @@ sequenceDiagram
 
     CLI->>GW: UpdateSandboxPolicy(name, new_policy)
     GW->>GW: Validate static fields unchanged
-    GW->>GW: Validate network mode unchanged
     GW->>DB: put_policy_revision(version=N, status=pending)
     GW->>DB: supersede_pending_policies(before_version=N)
     GW-->>CLI: UpdateSandboxPolicyResponse(version=N, hash)
@@ -377,7 +373,7 @@ process:
 
 ### `network_policies`
 
-A map of named network policy rules. Each rule defines which binary/endpoint pairs are allowed to make outbound network connections. This is the core of the network access control system. **Dynamic field** -- can be updated on a running sandbox via live policy updates (see [Live Policy Updates](#live-policy-updates)). However, the overall network mode (Block vs. Proxy) is immutable.
+A map of named network policy rules. Each rule defines which binary/endpoint pairs are allowed to make outbound network connections. This is the core of the network access control system. **Dynamic field** -- can be updated on a running sandbox via live policy updates (see [Live Policy Updates](#live-policy-updates)).
 
 **Behavioral trigger**: The sandbox always starts in **proxy mode** regardless of whether `network_policies` is present. The proxy is required so that all egress can be evaluated by OPA and the virtual hostname `inference.local` is always addressable for inference routing. When `network_policies` is empty, the OPA engine denies all connections.
 
@@ -621,7 +617,7 @@ In proxy mode:
 
 When `network_policies` is empty, the OPA engine denies all outbound connections (except `inference.local` which is handled separately by the proxy before OPA evaluation).
 
-**Gateway-side validation**: The `validate_network_mode_unchanged()` function on the server still rejects live policy updates that would add `network_policies` to a sandbox created without them or remove all `network_policies` from a sandbox created with them. This prevents unexpected behavioral changes in the OPA allow/deny logic. See `crates/openshell-server/src/grpc.rs` -- `validate_network_mode_unchanged()`.
+The gateway validates that static fields stay unchanged across live policy updates, then persists a new policy revision for the supervisor to load. Empty and non-empty `network_policies` revisions follow the same live-update path.
 
 **Proxy sub-modes**: In proxy mode, the proxy handles two distinct request types:
 
@@ -937,8 +933,6 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 | `filesystem_policy` differs from version 1 | `filesystem policy cannot be changed on a live sandbox (applied at startup)` |
 | `landlock` differs from version 1 | `landlock policy cannot be changed on a live sandbox (applied at startup)` |
 | `process` differs from version 1 | `process policy cannot be changed on a live sandbox (applied at startup)` |
-| Adding `network_policies` when version 1 had none | `cannot add network policies to a sandbox created without them (Block -> Proxy mode change requires restart)` |
-| Removing all `network_policies` when version 1 had some | `cannot remove all network policies from a sandbox created with them (Proxy -> Block mode change requires restart)` |
 
 ### Warnings (Log Only)
 
