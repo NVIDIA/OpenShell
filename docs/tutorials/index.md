@@ -45,7 +45,7 @@ Launch Claude Code in a sandbox, diagnose a policy denial, and iterate on a cust
 :::
 
 :::{grid-item-card} Inference with Ollama
-:link: local-inference-ollama
+:link: inference-ollama
 :link-type: doc
 
 Route inference through Ollama using cloud-hosted or local models, and verify it from a sandbox.
@@ -68,6 +68,6 @@ Route inference to a local LM Studio server via the OpenAI or Anthropic compatib
 
 First Network Policy <first-network-policy>
 GitHub Push Access <github-sandbox>
-Inference with Ollama <local-inference-ollama>
+Inference with Ollama <inference-ollama>
 Local Inference with LM Studio <local-inference-lmstudio>
 ```
