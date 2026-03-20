@@ -61,8 +61,8 @@ service OpenShell {
       returns (openshell.sandbox.v1.GetGatewayConfigResponse);
 
   // Update settings or policy at sandbox or global scope.
-  rpc UpdateSettings(UpdateSettingsRequest)
-      returns (UpdateSettingsResponse);
+  rpc UpdateConfig(UpdateConfigRequest)
+      returns (UpdateConfigResponse);
 
   // Get the load status of a specific policy version.
   rpc GetSandboxPolicyStatus(GetSandboxPolicyStatusRequest)
@@ -440,7 +440,7 @@ message GetSandboxProviderEnvironmentResponse {
 // ---------------------------------------------------------------------------
 
 // Update sandbox policy request.
-message UpdateSettingsRequest {
+message UpdateConfigRequest {
   // Sandbox name (canonical lookup key). Required for sandbox-scoped updates.
   // Not required when `global=true`.
   string name = 1;
@@ -465,7 +465,7 @@ message UpdateSettingsRequest {
 }
 
 // Update sandbox policy response.
-message UpdateSettingsResponse {
+message UpdateConfigResponse {
   // Assigned policy version (monotonically increasing per sandbox).
   uint32 version = 1;
   // SHA-256 hash of the serialized policy payload.

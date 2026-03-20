@@ -126,7 +126,7 @@ def test_update_policy_rejects_immutable_fields(
     sandbox: Callable[..., Sandbox],
     sandbox_client: SandboxClient,
 ) -> None:
-    """UpdateSettings rejects removal of filesystem paths on a live sandbox.
+    """UpdateConfig rejects removal of filesystem paths on a live sandbox.
 
     Filesystem paths are enforced by Landlock at sandbox startup and cannot be
     removed after the fact. This test verifies that the server rejects updates
@@ -153,8 +153,8 @@ def test_update_policy_rejects_immutable_fields(
         )
 
         with pytest.raises(grpc.RpcError) as exc_info:
-            stub.UpdateSettings(
-                openshell_pb2.UpdateSettingsRequest(
+            stub.UpdateConfig(
+                openshell_pb2.UpdateConfigRequest(
                     name=sandbox_name,
                     policy=unsafe_policy,
                 )

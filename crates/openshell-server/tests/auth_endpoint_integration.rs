@@ -549,10 +549,10 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn update_settings(
+    async fn update_config(
         &self,
-        _: tonic::Request<openshell_core::proto::UpdateSettingsRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::UpdateSettingsResponse>, tonic::Status> {
+        _: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::UpdateConfigResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("test"))
     }
 

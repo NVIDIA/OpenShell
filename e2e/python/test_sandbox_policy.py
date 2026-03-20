@@ -1156,8 +1156,8 @@ def test_live_policy_update_and_logs(
         initial_hash = status_resp.revision.policy_hash
 
         # --- LPU-2: Set the same policy -> no new version ---
-        update_resp = stub.UpdateSettings(
-            openshell_pb2.UpdateSettingsRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=policy_a,
             )
@@ -1169,8 +1169,8 @@ def test_live_policy_update_and_logs(
         assert update_resp.policy_hash == initial_hash
 
         # --- LPU-3: Push policy B -> new version ---
-        update_resp = stub.UpdateSettings(
-            openshell_pb2.UpdateSettingsRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=policy_b,
             )
@@ -1213,8 +1213,8 @@ def test_live_policy_update_and_logs(
         )
 
         # --- LPU-4: Push policy B again -> unchanged ---
-        update_resp = stub.UpdateSettings(
-            openshell_pb2.UpdateSettingsRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=policy_b,
             )
@@ -1306,8 +1306,8 @@ def test_live_policy_update_from_empty_network_policies(
         )
         initial_version = initial_status.revision.version
 
-        update_resp = stub.UpdateSettings(
-            openshell_pb2.UpdateSettingsRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=updated_policy,
             )

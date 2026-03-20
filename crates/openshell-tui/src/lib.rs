@@ -1923,7 +1923,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
 
     tokio::spawn(async move {
         // Build the typed SettingValue from the validated input.
-        use openshell_core::proto::{SettingValue, UpdateSettingsRequest, setting_value};
+        use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
@@ -1951,7 +1951,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
         };
 
-        let req = UpdateSettingsRequest {
+        let req = UpdateConfigRequest {
             name: String::new(),
             policy: None,
             setting_key: key,
@@ -1960,8 +1960,7 @@ fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             global: true,
         };
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => Event::GlobalSettingSetResult(Ok(resp.into_inner().settings_revision)),
@@ -1984,9 +1983,9 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
 
     tokio::spawn(async move {
-        use openshell_core::proto::UpdateSettingsRequest;
+        use openshell_core::proto::UpdateConfigRequest;
 
-        let req = UpdateSettingsRequest {
+        let req = UpdateConfigRequest {
             name: String::new(),
             policy: None,
             setting_key: key,
@@ -1995,8 +1994,7 @@ fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             global: true,
         };
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => {
@@ -2027,7 +2025,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
 
     tokio::spawn(async move {
-        use openshell_core::proto::{SettingValue, UpdateSettingsRequest, setting_value};
+        use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
 
         let value = match kind {
             openshell_core::settings::SettingValueKind::Bool => {
@@ -2055,7 +2053,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             }
         };
 
-        let req = UpdateSettingsRequest {
+        let req = UpdateConfigRequest {
             name,
             policy: None,
             setting_key: key,
@@ -2064,8 +2062,7 @@ fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             global: false,
         };
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => Event::SandboxSettingSetResult(Ok(resp.into_inner().settings_revision)),
@@ -2092,9 +2089,9 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
     let mut client = app.client.clone();
 
     tokio::spawn(async move {
-        use openshell_core::proto::UpdateSettingsRequest;
+        use openshell_core::proto::UpdateConfigRequest;
 
-        let req = UpdateSettingsRequest {
+        let req = UpdateConfigRequest {
             name,
             policy: None,
             setting_key: key,
@@ -2103,8 +2100,7 @@ fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
             global: false,
         };
 
-        let result =
-            tokio::time::timeout(Duration::from_secs(5), client.update_settings(req)).await;
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
 
         let event = match result {
             Ok(Ok(resp)) => {

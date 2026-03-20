@@ -171,10 +171,10 @@ impl OpenShell for TestOpenShell {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
-    async fn update_settings(
+    async fn update_config(
         &self,
-        _request: tonic::Request<openshell_core::proto::UpdateSettingsRequest>,
-    ) -> Result<Response<openshell_core::proto::UpdateSettingsResponse>, Status> {
+        _request: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<Response<openshell_core::proto::UpdateConfigResponse>, Status> {
         Err(Status::unimplemented("not implemented in test"))
     }
 
