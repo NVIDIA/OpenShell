@@ -693,27 +693,50 @@ pub async fn sandbox_ssh_proxy(
         .ok_or_else(|| miette::miette!("gateway URL missing port"))?;
     let connect_path = url.path();
 
-    let mut stream: Box<dyn ProxyStream> =
-        connect_gateway(scheme, gateway_host, gateway_port, tls).await?;
-
     let request = format!(
         "CONNECT {connect_path} HTTP/1.1\r\nHost: {gateway_host}\r\nX-Sandbox-Id: {sandbox_id}\r\nX-Sandbox-Token: {token}\r\n\r\n"
     );
-    stream
-        .write_all(request.as_bytes())
-        .await
-        .into_diagnostic()?;
 
-    // Wrap in a BufReader **before** reading the HTTP response.  The gateway
-    // may send the 200 OK response and the first SSH protocol bytes in the
-    // same TCP segment / WebSocket frame.  A plain `read()` would consume
-    // those SSH bytes into our buffer and discard them, causing SSH to see a
-    // truncated protocol banner and exit with code 255.  BufReader ensures
-    // any bytes read past the `\r\n\r\n` header boundary stay buffered and
-    // are returned by subsequent reads during the bidirectional copy phase.
-    let mut buf_stream = BufReader::new(stream);
-    let status = read_connect_status(&mut buf_stream).await?;
-    if status != 200 {
+    // The gateway returns 412 (Precondition Failed) when the sandbox pod
+    // exists but hasn't reached Ready phase yet. This is a transient state
+    // after sandbox allocation — retry with backoff instead of failing
+    // immediately.
+    const MAX_CONNECT_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+    const INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
+
+    let start = std::time::Instant::now();
+    let mut backoff = INITIAL_BACKOFF;
+    let mut buf_stream;
+
+    loop {
+        let mut stream: Box<dyn ProxyStream> =
+            connect_gateway(scheme, gateway_host, gateway_port, tls).await?;
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .into_diagnostic()?;
+
+        // Wrap in a BufReader **before** reading the HTTP response.  The gateway
+        // may send the 200 OK response and the first SSH protocol bytes in the
+        // same TCP segment / WebSocket frame.  A plain `read()` would consume
+        // those SSH bytes into our buffer and discard them, causing SSH to see a
+        // truncated protocol banner and exit with code 255.  BufReader ensures
+        // any bytes read past the `\r\n\r\n` header boundary stay buffered and
+        // are returned by subsequent reads during the bidirectional copy phase.
+        buf_stream = BufReader::new(stream);
+        let status = read_connect_status(&mut buf_stream).await?;
+        if status == 200 {
+            break;
+        }
+        if status == 412 && start.elapsed() < MAX_CONNECT_WAIT {
+            tracing::debug!(
+                elapsed = ?start.elapsed(),
+                "sandbox not yet ready (HTTP 412), retrying in {backoff:?}"
+            );
+            tokio::time::sleep(backoff).await;
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(8));
+            continue;
+        }
         return Err(miette::miette!(
             "gateway CONNECT failed with status {status}"
         ));
