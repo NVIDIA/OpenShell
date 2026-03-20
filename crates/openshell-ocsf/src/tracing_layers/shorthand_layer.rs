@@ -10,7 +10,7 @@ use tracing::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::Layer;
 
-use super::event_bridge::{clone_current_event, OCSF_TARGET};
+use crate::tracing_layers::event_bridge::{clone_current_event, OCSF_TARGET};
 
 /// A tracing `Layer` that intercepts OCSF events and writes shorthand output.
 ///

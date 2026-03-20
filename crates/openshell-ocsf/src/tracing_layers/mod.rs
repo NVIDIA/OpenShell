@@ -7,7 +7,7 @@
 //! - [`OcsfJsonlLayer`] writes OCSF JSONL to a writer
 //! - [`emit_ocsf_event`] bridges `OcsfEvent` structs into the tracing system
 
-mod event_bridge;
+pub(crate) mod event_bridge;
 mod jsonl_layer;
 mod shorthand_layer;
 
