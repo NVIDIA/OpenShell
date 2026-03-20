@@ -7,10 +7,10 @@ use std::io::Write;
 use std::sync::Mutex;
 
 use tracing::Subscriber;
-use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
+use tracing_subscriber::Layer;
 
-use super::event_bridge::{OCSF_TARGET, take_current_event};
+use super::event_bridge::{clone_current_event, OCSF_TARGET};
 
 /// A tracing `Layer` that intercepts OCSF events and writes JSONL output.
 ///
@@ -39,7 +39,7 @@ where
             return;
         }
 
-        if let Some(ocsf_event) = take_current_event() {
+        if let Some(ocsf_event) = clone_current_event() {
             let line = ocsf_event.to_json_line();
             if let Ok(mut w) = self.writer.lock() {
                 let _ = w.write_all(line.as_bytes());

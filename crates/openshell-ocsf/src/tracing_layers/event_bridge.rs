@@ -3,35 +3,37 @@
 
 //! Bridge between `OcsfEvent` structs and the tracing system.
 //!
-//! The `emit_ocsf_event` function serializes an `OcsfEvent` and emits it
-//! as a tracing event with target `ocsf`. The custom layers intercept
-//! events with this target and format them.
-
-use std::sync::OnceLock;
+//! The `emit_ocsf_event` function stores an `OcsfEvent` in thread-local
+//! storage, then emits a tracing event with target `ocsf`. The custom
+//! layers intercept this target, clone the event, and format it.
+//! After dispatch, `emit_ocsf_event` clears the thread-local.
 
 use crate::events::OcsfEvent;
 
 std::thread_local! {
     // Thread-local storage for the current OCSF event being emitted.
-    // Used by the tracing layers to retrieve the full OcsfEvent struct.
+    // Layers clone from this; only emit_ocsf_event clears it.
     static CURRENT_EVENT: std::cell::RefCell<Option<OcsfEvent>> = const { std::cell::RefCell::new(None) };
 }
 
 /// Target string used to identify OCSF tracing events.
-pub static OCSF_TARGET: &str = "ocsf";
+pub const OCSF_TARGET: &str = "ocsf";
 
-/// Sentinel field name on the tracing event that signals an OCSF event is available.
-static _OCSF_FIELD: OnceLock<&str> = OnceLock::new();
-
-/// Retrieve (and take) the current thread-local OCSF event, if any.
-pub fn take_current_event() -> Option<OcsfEvent> {
-    CURRENT_EVENT.with(|cell| cell.borrow_mut().take())
+/// Clone the current thread-local OCSF event, if any.
+///
+/// Multiple layers can call this for the same event — each receives
+/// an independent clone. The thread-local is only cleared by
+/// `emit_ocsf_event` after tracing dispatch completes.
+pub fn clone_current_event() -> Option<OcsfEvent> {
+    CURRENT_EVENT.with(|cell| cell.borrow().clone())
 }
 
 /// Emit an `OcsfEvent` through the tracing subscriber.
 ///
 /// The OCSF layers (`OcsfShorthandLayer`, `OcsfJsonlLayer`) format it
 /// as shorthand (`openshell.log`) and JSONL (`openshell-ocsf.log`).
+///
+/// Both layers receive the event — `clone_current_event()` is non-consuming.
 pub fn emit_ocsf_event(event: OcsfEvent) {
     // Store the event in thread-local so layers can access it
     CURRENT_EVENT.with(|cell| {
@@ -39,10 +41,10 @@ pub fn emit_ocsf_event(event: OcsfEvent) {
     });
 
     // Emit a tracing event with the `ocsf` target.
-    // The layers detect this target and pull the OcsfEvent from thread-local.
+    // The layers detect this target and clone the OcsfEvent from thread-local.
     tracing::info!(target: "ocsf", "ocsf_event");
 
-    // Clean up if layers didn't consume it (e.g., no OCSF layers registered)
+    // Clear the thread-local after dispatch completes.
     CURRENT_EVENT.with(|cell| {
         cell.borrow_mut().take();
     });
@@ -69,9 +71,8 @@ mod tests {
     use crate::events::{BaseEvent, OcsfEvent};
     use crate::objects::{Metadata, Product};
 
-    #[test]
-    fn test_thread_local_store_and_take() {
-        let event = OcsfEvent::Base(BaseEvent {
+    fn test_event() -> OcsfEvent {
+        OcsfEvent::Base(BaseEvent {
             base: BaseEventData::new(
                 0,
                 "Base Event",
@@ -88,17 +89,44 @@ mod tests {
                     log_source: None,
                 },
             ),
-        });
+        })
+    }
 
+    #[test]
+    fn test_clone_current_event_is_non_consuming() {
         CURRENT_EVENT.with(|cell| {
-            *cell.borrow_mut() = Some(event);
+            *cell.borrow_mut() = Some(test_event());
         });
 
-        let taken = take_current_event();
-        assert!(taken.is_some());
-        assert_eq!(taken.unwrap().class_uid(), 0);
+        // First clone succeeds
+        let first = clone_current_event();
+        assert!(first.is_some());
+        assert_eq!(first.unwrap().class_uid(), 0);
 
-        // Second take should be None
-        assert!(take_current_event().is_none());
+        // Second clone also succeeds — non-consuming
+        let second = clone_current_event();
+        assert!(second.is_some());
+        assert_eq!(second.unwrap().class_uid(), 0);
+
+        // Clean up
+        CURRENT_EVENT.with(|cell| {
+            cell.borrow_mut().take();
+        });
+    }
+
+    #[test]
+    fn test_emit_clears_thread_local_after_dispatch() {
+        // Manually store an event
+        CURRENT_EVENT.with(|cell| {
+            *cell.borrow_mut() = Some(test_event());
+        });
+
+        // Clear it the same way emit_ocsf_event does after dispatch
+        CURRENT_EVENT.with(|cell| {
+            cell.borrow_mut().take();
+        });
+
+        // Should be empty now
+        assert!(clone_current_event().is_none());
     }
 }
