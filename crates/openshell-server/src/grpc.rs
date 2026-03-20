@@ -1238,7 +1238,24 @@ impl OpenShell for OpenShellService {
 
             let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
             let changed = if req.delete_setting {
-                global_settings.settings.remove(key).is_some()
+                let removed = global_settings.settings.remove(key).is_some();
+                // When deleting the global policy key, supersede all global
+                // policy revisions so they no longer appear as "Loaded".
+                if removed && key == POLICY_SETTING_KEY {
+                    if let Ok(Some(latest)) = self
+                        .state
+                        .store
+                        .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                        .await
+                    {
+                        let _ = self
+                            .state
+                            .store
+                            .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
+                            .await;
+                    }
+                }
+                removed
             } else {
                 let setting = req
                     .setting_value
