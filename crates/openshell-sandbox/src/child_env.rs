@@ -17,6 +17,7 @@ pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
         ("grpc_proxy", proxy_url.to_owned()),
         // Node.js only honors HTTP(S)_PROXY for built-in fetch/http clients when
         // proxy support is explicitly enabled at process startup.
+        // Rscript automatically respects lowercase http_proxy/https_proxy.
         ("NODE_USE_ENV_PROXY", "1".to_owned()),
     ]
 }
@@ -28,9 +29,13 @@ pub(crate) fn tls_env_vars(
     let ca_cert_path = ca_cert_path.display().to_string();
     let combined_bundle_path = combined_bundle_path.display().to_string();
     [
+        // Node.js extra CA certificates for TLS verification
         ("NODE_EXTRA_CA_CERTS", ca_cert_path.clone()),
+        // OpenSSL-based tools (Python urllib, Ruby, R, etc.)
         ("SSL_CERT_FILE", combined_bundle_path.clone()),
+        // Python requests library
         ("REQUESTS_CA_BUNDLE", combined_bundle_path.clone()),
+        // libcurl-based tools (R httr, curl CLI, etc.)
         ("CURL_CA_BUNDLE", combined_bundle_path),
     ]
 }
@@ -59,6 +64,9 @@ mod tests {
         assert!(stdout.contains("NO_PROXY=127.0.0.1,localhost,::1"));
         assert!(stdout.contains("NODE_USE_ENV_PROXY=1"));
         assert!(stdout.contains("no_proxy=127.0.0.1,localhost,::1"));
+        // Verify lowercase proxy vars for Rscript/Python compatibility
+        assert!(stdout.contains("http_proxy=http://10.200.0.1:3128"));
+        assert!(stdout.contains("https_proxy=http://10.200.0.1:3128"));
     }
 
     #[test]
@@ -79,5 +87,7 @@ mod tests {
 
         assert!(stdout.contains("NODE_EXTRA_CA_CERTS=/etc/openshell-tls/openshell-ca.pem"));
         assert!(stdout.contains("SSL_CERT_FILE=/etc/openshell-tls/ca-bundle.pem"));
+        // Verify CURL_CA_BUNDLE for Rscript (httr package) and curl CLI
+        assert!(stdout.contains("CURL_CA_BUNDLE=/etc/openshell-tls/ca-bundle.pem"));
     }
 }
