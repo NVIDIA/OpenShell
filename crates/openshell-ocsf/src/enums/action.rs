@@ -15,10 +15,10 @@ pub enum ActionId {
     Allowed = 1,
     /// 2 — Denied
     Denied = 2,
-    /// 3 — Alerted
-    Alerted = 3,
-    /// 4 — Dropped
-    Dropped = 4,
+    /// 3 — Observed
+    Observed = 3,
+    /// 4 — Modified
+    Modified = 4,
     /// 99 — Other
     Other = 99,
 }
@@ -30,8 +30,8 @@ impl ActionId {
             Self::Unknown => "Unknown",
             Self::Allowed => "Allowed",
             Self::Denied => "Denied",
-            Self::Alerted => "Alerted",
-            Self::Dropped => "Dropped",
+            Self::Observed => "Observed",
+            Self::Modified => "Modified",
             Self::Other => "Other",
         }
     }
@@ -51,8 +51,8 @@ mod tests {
         assert_eq!(ActionId::Unknown.label(), "Unknown");
         assert_eq!(ActionId::Allowed.label(), "Allowed");
         assert_eq!(ActionId::Denied.label(), "Denied");
-        assert_eq!(ActionId::Alerted.label(), "Alerted");
-        assert_eq!(ActionId::Dropped.label(), "Dropped");
+        assert_eq!(ActionId::Observed.label(), "Observed");
+        assert_eq!(ActionId::Modified.label(), "Modified");
         assert_eq!(ActionId::Other.label(), "Other");
     }
 
