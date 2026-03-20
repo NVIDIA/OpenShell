@@ -195,6 +195,7 @@ Used to fetch dynamic secrets (like API keys) from an external service before fo
 | `method` | string | No | HTTP method to use (e.g., `POST`, `GET`). Default: `GET`. |
 | `header` | string | No | The HTTP header name to inject the secret into. Default: `Authorization` (injects as `Bearer {secret}`). |
 | `body_template` | string | No | JSON body template for the request. Supports placeholders: `{{.SandboxID}}`, `{{.Host}}`, `{{.Port}}`, `{{.Binary}}`. |
+| `response_path` | string | No | Dot-separated path to read the secret from resolver JSON response (e.g., `data.token`). If omitted, fallback keys `secret`, `token`, `key` are used. |
 
 Example with rules:
 

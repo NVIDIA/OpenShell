@@ -427,6 +427,7 @@ Defines an external API to call for fetching secrets (e.g., API keys) before for
 | `method` | `string` | No | HTTP method to use (e.g., `POST`, `GET`). Default: `GET`. |
 | `header` | `string` | No | HTTP header name to inject the secret into. Default: `Authorization`. |
 | `body_template` | `string` | No | JSON body template with placeholders: `{{.SandboxID}}`, `{{.Host}}`, `{{.Port}}`, `{{.Binary}}`. |
+| `response_path` | `string` | No | Dot-separated response path for extracting the secret (e.g., `data.token`). If omitted, fallback keys `secret`, `token`, `key` are used. |
 
 #### `NetworkBinary`
 

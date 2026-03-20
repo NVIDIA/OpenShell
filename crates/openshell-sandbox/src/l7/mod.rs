@@ -60,6 +60,7 @@ pub struct ExternalResolverConfig {
     pub method: String,
     pub body_template: String,
     pub header: String,
+    pub response_path: String,
 }
 
 /// L7 configuration for an endpoint, extracted from policy data.
@@ -116,11 +117,13 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
         let method = get_object_str(v, "method")?;
         let body_template = get_object_str(v, "body_template").unwrap_or_default();
         let header = get_object_str(v, "header").unwrap_or_else(|| "Authorization".to_string());
+        let response_path = get_object_str(v, "response_path").unwrap_or_default();
         let config = ExternalResolverConfig {
             url,
             method,
             body_template,
             header,
+            response_path,
         };
         info!(config = ?config, "Parsed external resolver config from OPA");
         Some(config)

@@ -99,6 +99,9 @@ message ExternalResolver {
   string body_template = 3;
   // Optional: Header name to inject the secret into (default: "Authorization").
   string header = 4;
+  // Optional: dot-separated path to read the secret from resolver JSON response.
+  // Example: "data.token".
+  string response_path = 5;
 }
 
 // An L7 policy rule (allow-only).

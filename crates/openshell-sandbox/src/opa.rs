@@ -690,6 +690,7 @@ fn proto_to_opa_data_json(proto: &ProtoSandboxPolicy) -> String {
                             "method": er.method,
                             "body_template": er.body_template,
                             "header": er.header,
+                            "response_path": er.response_path,
                         });
                     }
                     ep

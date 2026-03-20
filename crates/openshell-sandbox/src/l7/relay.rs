@@ -162,6 +162,12 @@ where
                 None
             };
 
+            let external_header = config
+                .external_resolver
+                .as_ref()
+                .map(|r| r.header.as_str())
+                .unwrap_or("");
+
             // Forward request to upstream and relay response
             let reusable = crate::l7::rest::relay_http_request_with_resolver(
                 &req,
@@ -169,7 +175,7 @@ where
                 upstream,
                 ctx.secret_resolver.as_deref(),
                 external_secret.as_deref(),
-                &config.external_resolver.as_ref().unwrap().header,
+                external_header,
             )
             .await?;
             if !reusable {
@@ -316,6 +322,25 @@ async fn resolve_external_secret(
         .await
         .map_err(|e| miette::miette!("failed to parse resolver response: {e}"))?;
 
+    if !resolver.response_path.is_empty() {
+        let value = extract_json_value_by_path(&json, &resolver.response_path).ok_or_else(|| {
+            miette::miette!(
+                "external resolver response missing value at response_path '{}'",
+                resolver.response_path
+            )
+        })?;
+
+        let secret = value.as_str().ok_or_else(|| {
+            miette::miette!(
+                "external resolver value at response_path '{}' must be a string",
+                resolver.response_path
+            )
+        })?;
+
+        info!(host = %ctx.host, response_path = %resolver.response_path, "Resolved external secret for L7 request");
+        return Ok(secret.to_string());
+    }
+
     let secret = json
         .get("secret")
         .or_else(|| json.get("token"))
@@ -327,4 +352,10 @@ async fn resolve_external_secret(
 
     info!(host = %ctx.host, "Resolved external secret for L7 request");
     Ok(secret.to_string())
+}
+
+fn extract_json_value_by_path<'a>(root: &'a serde_json::Value, path: &str) -> Option<&'a serde_json::Value> {
+    path.split('.')
+        .filter(|segment| !segment.is_empty())
+        .try_fold(root, |current, segment| current.get(segment))
 }

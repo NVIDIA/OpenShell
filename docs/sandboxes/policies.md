@@ -247,11 +247,12 @@ Dynamically fetch an API key from an internal sidecar before forwarding the requ
           method: "POST"
           header: "Authorization" # Optional: defaults to Authorization
           body_template: '{"sandbox_id": "{{.SandboxID}}", "target": "{{.Host}}"}'
+          response_path: "data.token" # Optional: defaults to secret/token/key fallback
     binaries:
       - { path: /usr/local/bin/claude }
 ```
 
-When the `claude` binary connects to `api.openai.com`, the supervisor first calls the `external_resolver` URL, extracts the secret from the JSON response, and injects it into the specified header.
+When the `claude` binary connects to `api.openai.com`, the supervisor first calls the `external_resolver` URL, extracts the secret from the JSON response (using `response_path` if provided), and injects it into the specified header.
 ::::
 
 :::::
