@@ -40,9 +40,10 @@ where
         }
 
         if let Some(ocsf_event) = clone_current_event() {
-            let line = ocsf_event.to_json_line();
-            if let Ok(mut w) = self.writer.lock() {
-                let _ = w.write_all(line.as_bytes());
+            if let Ok(line) = ocsf_event.to_json_line() {
+                if let Ok(mut w) = self.writer.lock() {
+                    let _ = w.write_all(line.as_bytes());
+                }
             }
         }
     }

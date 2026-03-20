@@ -150,7 +150,7 @@ mod tests {
             .message("Process started: python3 /app/main.py")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 1007);
         assert_eq!(json["launch_type"], "Spawn");
         assert_eq!(json["process"]["name"], "python3");
@@ -167,7 +167,7 @@ mod tests {
             .exit_code(0)
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["exit_code"], 0);
     }
 }

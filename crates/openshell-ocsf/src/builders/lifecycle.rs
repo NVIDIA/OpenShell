@@ -95,7 +95,7 @@ mod tests {
             .message("Starting sandbox")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 6002);
         assert_eq!(json["activity_name"], "Start");
         assert_eq!(json["app"]["name"], "OpenShell Sandbox Supervisor");

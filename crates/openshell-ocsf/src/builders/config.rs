@@ -135,7 +135,7 @@ mod tests {
             .message("Policy reloaded successfully")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 5019);
         assert_eq!(json["state_id"], 2);
         assert_eq!(json["security_level"], "Secure");

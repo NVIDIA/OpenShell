@@ -8,19 +8,16 @@ use crate::events::OcsfEvent;
 impl OcsfEvent {
     /// Serialize to a `serde_json::Value`.
     ///
-    /// Returns the full OCSF JSON object.
-    #[must_use]
-    pub fn to_json(&self) -> serde_json::Value {
-        serde_json::to_value(self).expect("OcsfEvent serialization should never fail")
+    /// Returns the full OCSF JSON object, or an error if serialization fails.
+    pub fn to_json(&self) -> Result<serde_json::Value, serde_json::Error> {
+        serde_json::to_value(self)
     }
 
     /// Serialize as a single JSONL line (no pretty-printing, trailing newline).
-    #[must_use]
-    pub fn to_json_line(&self) -> String {
-        let mut line =
-            serde_json::to_string(self).expect("OcsfEvent serialization should never fail");
+    pub fn to_json_line(&self) -> Result<String, serde_json::Error> {
+        let mut line = serde_json::to_string(self)?;
         line.push('\n');
-        line
+        Ok(line)
     }
 }
 
@@ -56,7 +53,7 @@ mod tests {
     #[test]
     fn test_to_json_has_required_fields() {
         let event = test_event();
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
 
         assert_eq!(json["class_uid"], 0);
         assert_eq!(json["class_name"], "Base Event");
@@ -72,7 +69,7 @@ mod tests {
     #[test]
     fn test_to_json_line_format() {
         let event = test_event();
-        let line = event.to_json_line();
+        let line = event.to_json_line().unwrap();
 
         // Must be a single line ending with \n
         assert!(line.ends_with('\n'));
@@ -80,13 +77,13 @@ mod tests {
 
         // Must parse back to the same JSON
         let parsed: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
-        assert_eq!(parsed, event.to_json());
+        assert_eq!(parsed, event.to_json().unwrap());
     }
 
     #[test]
     fn test_optional_fields_omitted() {
         let event = test_event();
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
 
         // Optional fields should not appear when None
         assert!(json.get("device").is_none());

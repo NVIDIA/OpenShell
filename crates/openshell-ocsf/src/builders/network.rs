@@ -220,7 +220,7 @@ mod tests {
             .message("CONNECT api.example.com:443 allowed")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 4001);
         assert_eq!(json["activity_name"], "Open");
         assert_eq!(json["action"], "Allowed");

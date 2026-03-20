@@ -171,7 +171,7 @@ mod tests {
             .firewall_rule("default-egress", "mechanistic")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 4002);
         assert_eq!(json["activity_name"], "Get");
         assert_eq!(json["http_request"]["http_method"], "GET");

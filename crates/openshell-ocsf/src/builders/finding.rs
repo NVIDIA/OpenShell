@@ -212,7 +212,7 @@ mod tests {
             .message("NSSH1 nonce replay detected")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 2004);
         assert_eq!(json["finding_info"]["title"], "NSSH1 Nonce Replay Attack");
         assert_eq!(json["is_alert"], true);

@@ -166,7 +166,7 @@ mod tests {
             .message("SSH handshake accepted via NSSH1")
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 4007);
         assert_eq!(json["auth_type"], "NSSH1");
         assert_eq!(json["auth_type_id"], 99);

@@ -105,7 +105,7 @@ mod tests {
             .unmapped("host_ip", serde_json::json!("10.42.0.1"))
             .build();
 
-        let json = event.to_json();
+        let json = event.to_json().unwrap();
         assert_eq!(json["class_uid"], 0);
         assert_eq!(json["activity_name"], "Network Namespace Created");
         assert_eq!(json["message"], "Network namespace created");
