@@ -63,6 +63,8 @@ The dashboard is divided into a top info pane and a middle pane with two tabs:
   - `○` **Unhealthy** (red) — the cluster is not operating correctly.
   - `…` — still connecting or status unknown.
 
+**Global policy indicator**: When a global policy is active, the gateway row shows `Global Policy Active (vN)` in yellow (the `status_warn` style). The TUI detects this by polling `ListSandboxPolicies` with `global: true, limit: 1` on each tick and checking if the latest revision has `PolicyStatus::Loaded`. See `crates/openshell-tui/src/ui/dashboard.rs`.
+
 #### Global Settings Tab
 
 The Global Settings tab shows all registered setting keys with their current values. Keys without a configured value display as `<unset>`.
@@ -104,6 +106,8 @@ When viewing a specific sandbox (by pressing `Enter` on a selected row), the bot
 
 - **Policy** — the sandbox's current active policy, auto-refreshed on version change.
 - **Settings** — effective runtime settings for the sandbox (fetched via `GetSandboxSettings`).
+
+**Global policy indicator on sandbox detail**: When the sandbox's policy is managed globally (`policy_source == GLOBAL` in the `GetSandboxSettings` response), the metadata pane shows `Policy: managed globally (vN)` in yellow. Draft chunks in the **Network Rules** pane are greyed out and a yellow warning reads `"Cannot approve rules while global policy is active"`. Approve (`a`), reject/revoke (`x`), and approve-all actions are blocked client-side with status messages. See `crates/openshell-tui/src/ui/sandbox_detail.rs` and `crates/openshell-tui/src/ui/sandbox_draft.rs`.
 
 #### Sandbox Settings Tab
 

@@ -359,8 +359,9 @@ The `run_policy_poll_loop()` function in `crates/openshell-sandbox/src/lib.rs` i
 4. **Config comparison**: If `result.config_revision == current_config_revision`, skip.
 5. **Per-setting diff logging**: Call `log_setting_changes()` to diff old and new settings maps. Each individual change is logged with old and new values.
 6. **Conditional OPA reload**: Only call `opa_engine.reload_from_proto(policy)` when `policy_hash` changes. Settings-only changes (e.g., `log_level` updated) update the tracked state without touching the OPA engine.
-7. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still reload, but they do not write per-sandbox policy status history.
-8. **Update tracked state**: After processing, update `current_config_revision`, `current_policy_hash`, and `current_settings` regardless of whether OPA was reloaded.
+7. **Status reporting**: On success/failure, report status only for sandbox-scoped policy revisions (`policy_source = SANDBOX`, `version > 0`). Global policy overrides still trigger OPA reload, but they do not write per-sandbox policy status history.
+8. **Global policy logging**: When `global_policy_version > 0`, the sandbox logs `"Policy reloaded successfully (global)"` with the `global_version` field. This distinguishes global reloads from sandbox-scoped reloads in the log stream.
+9. **Update tracked state**: After processing, update `current_config_revision`, `current_policy_hash`, and `current_settings` regardless of whether OPA was reloaded.
 
 ### `CachedOpenShellClient`
 
@@ -380,12 +381,13 @@ pub struct SettingsPollResult {
     pub config_revision: u64,
     pub policy_source: PolicySource,
     pub settings: HashMap<String, EffectiveSetting>,
+    pub global_policy_version: u32,
 }
 ```
 
 Methods:
 - **`connect(endpoint)`**: Establish an mTLS channel and return a new client.
-- **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, policy source, and the effective settings map (for diff logging).
+- **`poll_settings(sandbox_id)`**: Call `GetSandboxSettings` RPC and return a `SettingsPollResult` containing policy payload (optional), policy metadata, effective config revision, policy source, global policy version, and the effective settings map (for diff logging).
 - **`report_policy_status(sandbox_id, version, loaded, error_msg)`**: Call `ReportPolicyStatus` RPC with the appropriate `PolicyStatus` enum value (`Loaded` or `Failed`).
 - **`raw_client()`**: Return a clone of the underlying `OpenShellClient<Channel>` for direct RPC calls (used by the log push task).
 
@@ -394,13 +396,15 @@ Methods:
 The gateway assigns a monotonically increasing version number to each sandbox policy revision. `GetSandboxSettingsResponse` carries the full effective configuration: policy payload, effective settings map (with per-key scope indicators), a `config_revision` fingerprint that changes when any effective input changes (policy, settings, or source), and a `policy_source` field indicating whether the policy came from the sandbox's own history or from a global override.
 
 Proto messages involved:
-- `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings` (map of `EffectiveSetting`), `config_revision`, `policy_source`
+- `GetSandboxSettingsResponse` (`proto/sandbox.proto`): `policy`, `version`, `policy_hash`, `settings` (map of `EffectiveSetting`), `config_revision`, `policy_source`, `global_policy_version`
 - `EffectiveSetting` (`proto/sandbox.proto`): `SettingValue value`, `SettingScope scope`
 - `SettingScope` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
 - `PolicySource` enum: `UNSPECIFIED`, `SANDBOX`, `GLOBAL`
 - `ReportPolicyStatusRequest` (`proto/openshell.proto`): `sandbox_id`, `version`, `status` (enum), `load_error`
 - `PolicyStatus` enum: `PENDING`, `LOADED`, `FAILED`, `SUPERSEDED`
 - `SandboxPolicyRevision` (`proto/openshell.proto`): Full revision metadata including `created_at_ms`, `loaded_at_ms`
+
+The `global_policy_version` field is zero when no global policy is active or when `policy_source` is `SANDBOX`. When `policy_source` is `GLOBAL`, it carries the version number of the active global revision. The sandbox logs this value on reload (`"Policy reloaded successfully (global)" global_version=N`) and the TUI displays it in the dashboard and sandbox metadata pane.
 
 See [Gateway Settings Channel](gateway-settings.md) for full details on the settings resolution model, storage, and CLI/TUI commands.
 

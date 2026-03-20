@@ -141,6 +141,9 @@ pub struct ServerState {
     pub sandbox_index: SandboxIndex,
     pub sandbox_watch_bus: SandboxWatchBus,
     pub tracing_log_bus: TracingLogBus,
+    pub ssh_connections_by_token: Mutex<HashMap<String, u32>>,
+    pub ssh_connections_by_sandbox: Mutex<HashMap<String, u32>>,
+    pub settings_mutex: tokio::sync::Mutex<()>,
 }
 ```
 
@@ -149,6 +152,7 @@ pub struct ServerState {
 - **`sandbox_index`** -- in-memory bidirectional index mapping sandbox names and agent pod names to sandbox IDs. Used by the event tailer to correlate Kubernetes events.
 - **`sandbox_watch_bus`** -- `broadcast`-based notification bus keyed by sandbox ID. Producers call `notify(&id)` when the persisted sandbox record changes; consumers in `WatchSandbox` streams receive `()` signals and re-read the record.
 - **`tracing_log_bus`** -- captures `tracing` events that include a `sandbox_id` field and republishes them as `SandboxLogLine` messages. Maintains a per-sandbox tail buffer (default 200 entries). Also contains a nested `PlatformEventBus` for Kubernetes events.
+- **`settings_mutex`** -- serializes settings mutations (global and sandbox) to prevent read-modify-write races. Held for the duration of any setting set/delete or global policy set/delete operation. See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle).
 
 ## Protocol Multiplexing
 
@@ -231,7 +235,7 @@ These RPCs are called by sandbox pods at startup and during runtime polling.
 
 | RPC | Description |
 |-----|-------------|
-| `GetSandboxSettings` | Returns effective sandbox config looked up by sandbox ID: policy payload, policy metadata (version, hash, source), merged effective settings, and a `config_revision` fingerprint for change detection. Two-tier resolution: registered keys start unset, sandbox values overlay, global values override. The reserved `policy` key in global settings can override the sandbox's own policy. See [Gateway Settings Channel](gateway-settings.md). |
+| `GetSandboxSettings` | Returns effective sandbox config looked up by sandbox ID: policy payload, policy metadata (version, hash, source, `global_policy_version`), merged effective settings, and a `config_revision` fingerprint for change detection. Two-tier resolution: registered keys start unset, sandbox values overlay, global values override. The reserved `policy` key in global settings can override the sandbox's own policy. When a global policy is active, `policy_source` is `GLOBAL` and `global_policy_version` carries the active revision number. See [Gateway Settings Channel](gateway-settings.md). |
 | `GetGatewaySettings` | Returns gateway-global settings only (excluding the reserved `policy` key). Returns registered keys with empty values when unconfigured, and a monotonic `settings_revision`. |
 | `GetSandboxProviderEnvironment` | Resolves provider credentials into environment variables for a sandbox. Iterates the sandbox's `spec.providers` list, fetches each `Provider`, and collects credential key-value pairs. First provider wins on duplicate keys. Skips credential keys that do not match `^[A-Za-z_][A-Za-z0-9_]*$`. |
 
@@ -243,9 +247,9 @@ These RPCs support the sandbox-initiated policy recommendation pipeline. The san
 |-----|-------------|
 | `SubmitPolicyAnalysis` | Receives pre-formed `PolicyChunk` proposals from a sandbox. Validates each chunk, persists via upsert on `(sandbox_id, host, port, binary)` dedup key, notifies watch bus. |
 | `GetDraftPolicy` | Returns all draft chunks for a sandbox with current draft version. |
-| `ApproveDraftChunk` | Approves a pending or rejected chunk. Merges the proposed rule into the active policy (appends binary to existing rule or inserts new rule). |
-| `RejectDraftChunk` | Rejects a pending chunk or revokes an approved chunk. If revoking, removes the binary from the active policy rule. |
-| `ApproveAllDraftChunks` | Bulk approves all pending chunks for a sandbox. |
+| `ApproveDraftChunk` | Approves a pending or rejected chunk. Merges the proposed rule into the active policy (appends binary to existing rule or inserts new rule). **Blocked when a global policy is active** -- returns `FailedPrecondition`. |
+| `RejectDraftChunk` | Rejects a pending chunk or revokes an approved chunk. If revoking, removes the binary from the active policy rule. Rejection of `pending` chunks is always allowed. **Revoking approved chunks is blocked when a global policy is active** -- returns `FailedPrecondition`. |
+| `ApproveAllDraftChunks` | Bulk approves all pending chunks for a sandbox. **Blocked when a global policy is active** -- returns `FailedPrecondition`. |
 | `EditDraftChunk` | Updates the proposed rule on a pending chunk. |
 | `GetDraftHistory` | Returns all chunks (including rejected) for audit trail. |
 
@@ -464,8 +468,10 @@ Objects are identified by `(object_type, id)` with a unique constraint on `(obje
 | `"provider"` | `Provider` | `ObjectType`, `ObjectId`, `ObjectName` | |
 | `"ssh_session"` | `SshSession` | `ObjectType`, `ObjectId`, `ObjectName` | |
 | `"inference_route"` | `InferenceRoute` | `ObjectType`, `ObjectId`, `ObjectName` | |
-| `"gateway_settings"` | JSON `StoredSettings` | Generic `put`/`get` | Singleton, id=`"global"` |
+| `"gateway_settings"` | JSON `StoredSettings` | Generic `put`/`get` | Singleton, id=`"global"`. Contains the reserved `policy` key for global policy delivery. |
 | `"sandbox_settings"` | JSON `StoredSettings` | Generic `put`/`get` | Per-sandbox, id=`"settings:{sandbox_uuid}"` |
+
+The `sandbox_policies` table stores versioned policy revisions for both sandbox-scoped and global policies. Global revisions use the sentinel `sandbox_id = "__global__"`. See [Gateway Settings Channel](gateway-settings.md#storage-model) for schema details.
 
 ### Generic Protobuf Codec
 

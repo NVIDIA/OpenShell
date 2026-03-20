@@ -10,13 +10,15 @@ The settings channel provides a two-tier key-value configuration system that the
 graph TD
     CLI["CLI / TUI"]
     GW["Gateway<br/>(openshell-server)"]
-    DB["Store<br/>(objects table)"]
+    OBJ["Store: objects table<br/>(gateway_settings,<br/>sandbox_settings blobs)"]
+    POL["Store: sandbox_policies table<br/>(revisions for sandbox-scoped<br/>and __global__ policies)"]
     SB["Sandbox<br/>(poll loop)"]
 
-    CLI -- "UpdateSandboxPolicy<br/>(setting_key + value)" --> GW
-    CLI -- "GetSandboxSettings<br/>GetGatewaySettings" --> GW
-    GW -- "load/save<br/>gateway_settings<br/>sandbox_settings" --> DB
-    GW -- "GetSandboxSettingsResponse<br/>(policy + settings + config_revision)" --> SB
+    CLI -- "UpdateSettings<br/>(policy / setting_key + value)" --> GW
+    CLI -- "GetSandboxSettings<br/>GetGatewaySettings<br/>ListSandboxPolicies<br/>GetSandboxPolicyStatus" --> GW
+    GW -- "load/save settings blobs<br/>(delivery mechanism)" --> OBJ
+    GW -- "put/list/update<br/>policy revisions<br/>(audit + versioning)" --> POL
+    GW -- "GetSandboxSettingsResponse<br/>(policy + settings +<br/>config_revision +<br/>global_policy_version)" --> SB
     SB -- "diff settings<br/>reload OPA on policy change" --> SB
 ```
 
@@ -66,12 +68,12 @@ Helper functions:
 
 | RPC | Request | Response | Called by |
 |-----|---------|----------|-----------|
-| `GetSandboxSettings` | `GetSandboxSettingsRequest { sandbox_id }` | `GetSandboxSettingsResponse { policy, version, policy_hash, settings, config_revision, policy_source }` | Sandbox poll loop, CLI `settings get` |
+| `GetSandboxSettings` | `GetSandboxSettingsRequest { sandbox_id }` | `GetSandboxSettingsResponse { policy, version, policy_hash, settings, config_revision, policy_source, global_policy_version }` | Sandbox poll loop, CLI `settings get` |
 | `GetGatewaySettings` | `GetGatewaySettingsRequest {}` | `GetGatewaySettingsResponse { settings, settings_revision }` | CLI `settings get --global`, TUI dashboard |
 
-### Extended `UpdateSandboxPolicyRequest`
+### `UpdateSettingsRequest`
 
-The existing `UpdateSandboxPolicy` RPC now multiplexes policy and setting mutations through additional fields:
+The `UpdateSettings` RPC multiplexes policy and setting mutations through a single request message:
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -93,11 +95,15 @@ Validation rules:
 
 ### Storage Model
 
-Settings are persisted using the existing generic `objects` table with two new object types:
+The settings channel uses two storage mechanisms: the `objects` table for settings blobs (fast delivery) and the `sandbox_policies` table for versioned policy revisions (audit/history).
+
+#### Settings blobs (`objects` table)
+
+Settings are persisted using the existing generic `objects` table with two object types:
 
 | Object type string | Record ID | Record name | Purpose |
 |--------------------|-----------|-------------|---------|
-| `gateway_settings` | `"global"` | `"global"` | Singleton global settings |
+| `gateway_settings` | `"global"` | `"global"` | Singleton global settings (includes reserved `policy` key for delivery) |
 | `sandbox_settings` | `"settings:{sandbox_uuid}"` | sandbox name | Per-sandbox settings |
 
 The sandbox settings ID is prefixed with `settings:` to avoid a primary key collision with the sandbox's own record in the `objects` table. The `sandbox_settings_id()` function computes this key.
@@ -117,6 +123,24 @@ enum StoredSettingValue {
     Bytes(String),  // Hex-encoded binary (used for global policy)
 }
 ```
+
+#### Policy revisions (`sandbox_policies` table)
+
+Global policy revisions are stored in the `sandbox_policies` table using the sentinel `sandbox_id = "__global__"` (`GLOBAL_POLICY_SANDBOX_ID` constant). This reuses the same schema as sandbox-scoped policy revisions:
+
+| Column | Type | Description |
+|--------|------|-------------|
+| `id` | `TEXT` | UUID primary key |
+| `sandbox_id` | `TEXT` | `"__global__"` for global revisions, sandbox UUID for sandbox-scoped |
+| `version` | `INTEGER` | Monotonically increasing per `sandbox_id` |
+| `policy_payload` | `BLOB` | Protobuf-encoded `SandboxPolicy` |
+| `policy_hash` | `TEXT` | Deterministic SHA-256 hash of the policy |
+| `status` | `TEXT` | `pending`, `loaded`, `failed`, or `superseded` |
+| `load_error` | `TEXT` | Error message (populated on `failed` status) |
+| `created_at_ms` | `INTEGER` | Epoch milliseconds when the revision was created |
+| `loaded_at_ms` | `INTEGER` | Epoch milliseconds when the revision was marked loaded |
+
+The `sandbox_policies` table provides history and audit trail (queried by `policy list --global` and `policy get --global`). The `gateway_settings` blob's `policy` key is the authoritative source that `GetSandboxSettings` reads for fast poll resolution. Both are written on `policy set --global` -- this dual-write is intentional.
 
 ### Two-Tier Resolution (`merge_effective_settings`)
 
@@ -141,25 +165,87 @@ flowchart LR
 
 ### Global Policy as a Setting
 
-The reserved `policy` key in global settings stores a protobuf-encoded `SandboxPolicy`. When present, `GetSandboxSettings` uses the global policy instead of the sandbox's own policy:
+The reserved `policy` key in global settings stores a hex-encoded protobuf `SandboxPolicy`. When present, `GetSandboxSettings` uses the global policy instead of the sandbox's own policy:
 
 1. `decode_policy_from_global_settings()` checks for the `policy` key in global settings
 2. If present, the global policy replaces the sandbox policy in the response
 3. `policy_source` is set to `GLOBAL`
 4. The sandbox policy version counter is preserved for status APIs
+5. The `global_policy_version` field is populated from the latest `__global__` revision in the `sandbox_policies` table
 
 This allows operators to push a single policy that applies to all sandboxes via `openshell policy set --global --policy FILE`.
 
-### Config Revision (`compute_config_revision`)
+### Global Policy Lifecycle
 
-The `config_revision` field is a 64-bit fingerprint that changes whenever the effective configuration changes. The sandbox poll loop compares this value to detect changes without re-parsing the full response.
+Global policies are versioned through a full revision lifecycle stored alongside sandbox policies. The sentinel `sandbox_id = "__global__"` (constant `GLOBAL_POLICY_SANDBOX_ID`) distinguishes global revisions from sandbox-scoped revisions in the same `sandbox_policies` table.
 
-Computation:
-1. Hash `policy_source` as 4 little-endian bytes
-2. Hash the deterministic policy hash (if policy present)
-3. Sort settings entries by key
-4. For each entry: hash key bytes, scope as 4 LE bytes, then a type tag byte + value bytes
-5. Truncate the SHA-256 digest to 8 bytes and interpret as `u64` (little-endian)
+#### State Machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> NoGlobalPolicy
+
+    NoGlobalPolicy --> v1_Loaded : policy set --global<br/>(creates v1, marks loaded)
+    
+    v1_Loaded --> v1_Loaded : policy set --global<br/>(same hash, dedup no-op)
+    v1_Loaded --> v2_Loaded : policy set --global<br/>(different hash)
+    v1_Loaded --> AllSuperseded : policy delete --global
+
+    v2_Loaded --> v2_Loaded : policy set --global<br/>(same hash, dedup no-op)
+    v2_Loaded --> v3_Loaded : policy set --global<br/>(different hash)
+    v2_Loaded --> AllSuperseded : policy delete --global
+
+    v3_Loaded --> v3_Loaded : policy set --global<br/>(same hash, dedup no-op)
+    v3_Loaded --> AllSuperseded : policy delete --global
+
+    AllSuperseded --> NewVersion_Loaded : policy set --global<br/>(any hash, no dedup)
+
+    state "No Global Policy" as NoGlobalPolicy
+    state "v1: Loaded" as v1_Loaded
+    state "v2: Loaded, v1: Superseded" as v2_Loaded
+    state "v3: Loaded, v1-v2: Superseded" as v3_Loaded
+    state "All Revisions Superseded<br/>(no active global policy)" as AllSuperseded
+    state "vN: Loaded, older: Superseded" as NewVersion_Loaded
+```
+
+#### Key behaviors
+
+- **Dedup on set**: When the latest global revision has status `loaded` and its hash matches the submitted policy, no new revision is created. The settings blob is still ensured to have the `policy` key (reconciliation against potential data loss from a pod restart while the `sandbox_policies` table retained the revision). See `crates/openshell-server/src/grpc.rs` -- `update_settings()`, lines around the `current.policy_hash == hash && current.status == "loaded"` check.
+
+- **No dedup against superseded**: If the latest revision has status `superseded` (e.g., after a `policy delete --global`), the same hash creates a new revision. This supports the toggle pattern: delete the global policy, then re-set the same policy. The dedup check explicitly requires `status == "loaded"`.
+
+- **Immediate load**: Global policy revisions are marked `loaded` immediately upon creation (no sandbox confirmation needed). The gateway calls `update_policy_status(GLOBAL_POLICY_SANDBOX_ID, next_version, "loaded", ...)` right after `put_policy_revision()`. Sandboxes pick up changes via the 10-second poll loop.
+
+- **Supersede on set**: When a new global revision is created, `supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, next_version)` marks all older revisions with `pending` or `loaded` status as `superseded`.
+
+- **Delete supersedes all**: `policy delete --global` removes the `policy` key from the `gateway_settings` blob and calls `supersede_older_policies()` with `latest.version + 1` to mark ALL `__global__` revisions as `superseded`. This restores sandbox-level policy control.
+
+- **Dual-write**: `policy set --global` writes to BOTH the `sandbox_policies` revision table (for audit/listing via `policy list --global`) AND the `gateway_settings` blob (for fast delivery via `GetSandboxSettings`). The revision table provides history; the settings blob is the authoritative source that sandboxes poll.
+
+- **Concurrency**: All global mutations acquire `ServerState.settings_mutex` (a `tokio::sync::Mutex<()>`) for the duration of the read-modify-write cycle. This prevents races between concurrent global policy set/delete operations and global setting mutations.
+
+#### Global policy effects on sandboxes
+
+When a global policy is active (the `policy` key exists in `gateway_settings`):
+
+| Operation | Effect |
+|-----------|--------|
+| `GetSandboxSettings` | Returns the global policy payload instead of the sandbox's own policy. `policy_source = GLOBAL`. `global_policy_version` set to the active revision's version number. |
+| `policy set <sandbox>` | Rejected with `FailedPrecondition: "policy is managed globally; delete global policy before sandbox policy update"` |
+| `rule approve <chunk>` | Rejected with `FailedPrecondition: "cannot approve rules while a global policy is active; delete the global policy to manage per-sandbox rules"` |
+| `rule approve-all` | Rejected with same `FailedPrecondition` as `rule approve` |
+| Revoking an approved chunk (via `rule reject` on an `approved` chunk) | Rejected with same `FailedPrecondition` -- revoking would modify the sandbox policy which is not in use |
+| Rejecting a `pending` chunk | Allowed -- rejection does not modify the sandbox policy |
+| `settings set/delete` at sandbox scope | Allowed -- settings and policy are independent channels |
+| Draft chunk collection | Continues normally -- sandbox proxy still generates proposals. Chunks are visible but cannot be approved. |
+
+The blocking logic is implemented by `require_no_global_policy()` in `crates/openshell-server/src/grpc.rs`, which checks for the `policy` key in global settings and returns `FailedPrecondition` if present.
+
+### `config_revision` and `global_policy_version`
+
+**`config_revision`** (`u64`): Content hash of the merged effective config. Computed by `compute_config_revision()` from three inputs: `policy_source` (as 4 LE bytes), the deterministic policy hash (if policy present), and sorted settings entries (key bytes + scope as 4 LE bytes + type tag byte + value bytes). The SHA-256 digest is truncated to 8 bytes and interpreted as `u64` (little-endian). Changes when the global policy, sandbox policy, settings, or policy source changes. Used by the sandbox poll loop for change detection.
+
+**`global_policy_version`** (`u32`): The version number of the active global policy revision. Populated in `GetSandboxSettingsResponse` when `policy_source == GLOBAL` by looking up the latest revision for `GLOBAL_POLICY_SANDBOX_ID`. Zero when no global policy is active or when `policy_source == SANDBOX`. Displayed in the TUI dashboard and sandbox metadata pane, and logged by the sandbox on reload.
 
 ### Per-Key Mutual Exclusion
 
@@ -178,7 +264,7 @@ This prevents conflicting values at different scopes. An operator must delete a 
 
 ### Sandbox-Scoped Policy Update Interaction
 
-When a global policy is set, sandbox-scoped policy updates via `UpdateSandboxPolicy` are rejected with `FailedPrecondition`:
+When a global policy is set, sandbox-scoped policy updates via `UpdateSettings` are rejected with `FailedPrecondition`:
 
 ```
 policy is managed globally; delete global policy before sandbox policy update
@@ -253,10 +339,11 @@ pub struct SettingsPollResult {
     pub config_revision: u64,
     pub policy_source: PolicySource,
     pub settings: HashMap<String, EffectiveSetting>,
+    pub global_policy_version: u32,
 }
 ```
 
-The `poll_settings()` method maps the full `GetSandboxSettingsResponse` into this struct. The `settings` field carries the effective settings map for diff logging.
+The `poll_settings()` method maps the full `GetSandboxSettingsResponse` into this struct. The `settings` field carries the effective settings map for diff logging. The `global_policy_version` field is propagated from the response and used for logging when the sandbox reloads a global policy.
 
 ## CLI Commands
 
@@ -308,20 +395,46 @@ openshell settings delete --global --key log_level --yes
 
 ### `policy set --global --policy FILE [--yes]`
 
-Set a gateway-global policy that overrides all sandbox policies.
+Set a gateway-global policy that overrides all sandbox policies. Creates a versioned revision in the `sandbox_policies` table and writes the policy to the `gateway_settings` blob for delivery.
 
 ```bash
 openshell policy set --global --policy policy.yaml --yes
 ```
 
-The `--wait` flag is not supported for global policy updates.
+The `--wait` flag is rejected for global policy updates with: `"--wait is not supported for global policies; global policies are effective immediately"`. See `crates/openshell-cli/src/main.rs`.
 
 ### `policy delete --global [--yes]`
 
-Delete the gateway-global policy, restoring sandbox-level policy control.
+Delete the gateway-global policy, restoring sandbox-level policy control. Removes the `policy` key from the `gateway_settings` blob and supersedes all `__global__` revisions.
 
 ```bash
 openshell policy delete --global --yes
+```
+
+Note: `policy delete` without `--global` is not supported (sandbox policies are managed through versioned updates, not deletion). The CLI returns: `"sandbox policy delete is not supported; use --global to remove global policy lock"`.
+
+### `policy list --global [--limit N]`
+
+List global policy revision history. Uses `ListSandboxPolicies` with `global: true`, which routes to the `__global__` sentinel in the `sandbox_policies` table.
+
+```bash
+openshell policy list --global
+openshell policy list --global --limit 10
+```
+
+### `policy get --global [--rev N] [--full]`
+
+Show a specific global policy revision (or the latest). Uses `GetSandboxPolicyStatus` with `global: true`.
+
+```bash
+# Latest global revision
+openshell policy get --global
+
+# Specific version
+openshell policy get --global --rev 3
+
+# Full policy payload as YAML
+openshell policy get --global --full
 ```
 
 ### HITL Confirmation
@@ -338,6 +451,12 @@ The confirmation message varies:
 
 **File:** `crates/openshell-tui/src/`
 
+### Dashboard: Global Policy Indicator
+
+**File:** `crates/openshell-tui/src/ui/dashboard.rs`
+
+The gateway row in the dashboard shows a yellow `Global Policy Active (vN)` indicator when a global policy is active. The TUI detects this by calling `ListSandboxPolicies` with `global: true, limit: 1` on each polling tick and checking if the latest revision has `PolicyStatus::Loaded`. The version number and active flag are tracked in `App.global_policy_active` and `App.global_policy_version`.
+
 ### Dashboard: Global Settings Tab
 
 The dashboard's middle pane has a tabbed interface: **Providers** | **Global Settings**. Press `Tab` to switch.
@@ -352,6 +471,18 @@ The Global Settings tab displays registered keys with their current values, fetc
 - **Confirmation modals**: Both edit and delete operations show a confirmation dialog before applying
 - **Scope indicators**: Each key shows its current value or `<unset>`
 
+### Sandbox Metadata Pane: Global Policy Indicator
+
+**File:** `crates/openshell-tui/src/ui/sandbox_detail.rs`
+
+When the sandbox's policy source is `GLOBAL` (detected via `policy_source` in the `GetSandboxSettings` response), the metadata pane shows `Policy: managed globally (vN)` in yellow. The version comes from `global_policy_version` in the response. Tracked in `App.sandbox_policy_is_global` and `App.sandbox_global_policy_version`.
+
+### Network Rules Pane: Global Policy Warning
+
+**File:** `crates/openshell-tui/src/ui/sandbox_draft.rs`
+
+When `sandbox_policy_is_global` is true, the Network Rules pane displays a yellow bottom title: `" Cannot approve rules while global policy is active "`. Draft chunks are still rendered but their status styles are greyed out (`t.muted`). Keyboard actions for approve (`a`), reject/revoke (`x`), and approve-all are intercepted client-side with status messages like `"Cannot approve rules while a global policy is active"` and `"Cannot modify rules while a global policy is active"`. See `crates/openshell-tui/src/app.rs` -- draft key handling.
+
 ### Sandbox Screen: Settings Tab
 
 The sandbox detail view's bottom pane has a tabbed interface: **Policy** | **Settings**. Press `l` to switch tabs.
@@ -364,7 +495,7 @@ The Settings tab shows effective settings for the selected sandbox, fetched as p
 
 ### Data Refresh
 
-Settings are refreshed on each 2-second polling tick alongside the sandbox list and health status. The global settings revision is tracked to detect changes. Sandbox settings are refreshed when viewing a specific sandbox.
+Settings are refreshed on each 2-second polling tick alongside the sandbox list and health status. The global settings revision is tracked to detect changes. Sandbox settings are refreshed when viewing a specific sandbox. Global policy active status is detected on each tick via `ListSandboxPolicies` with `global: true`.
 
 ## Data Flow: Setting a Global Key
 
@@ -373,22 +504,54 @@ End-to-end trace for `openshell settings set --global --key log_level --value de
 1. **CLI** (`crates/openshell-cli/src/run.rs` -- `gateway_setting_set()`):
    - `parse_cli_setting_value("log_level", "debug")` -- looks up `SettingValueKind::String` in the registry, wraps as `SettingValue { string_value: "debug" }`
    - `confirm_global_setting_takeover()` -- skipped because `--yes`
-   - Sends `UpdateSandboxPolicyRequest { setting_key: "log_level", setting_value: Some(...), global: true }`
+   - Sends `UpdateSettingsRequest { setting_key: "log_level", setting_value: Some(...), global: true }`
 
-2. **Gateway** (`crates/openshell-server/src/grpc.rs` -- `update_sandbox_policy()`):
+2. **Gateway** (`crates/openshell-server/src/grpc.rs` -- `update_settings()`):
+   - Acquires `settings_mutex` for the duration of the operation
    - Detects `global=true`, `has_setting=true`
    - `validate_registered_setting_key("log_level")` -- passes (key is in registry)
    - `load_global_settings()` -- reads `gateway_settings` record from store
    - `proto_setting_to_stored()` -- converts proto value to `StoredSettingValue::String("debug")`
    - `upsert_setting_value()` -- inserts into `BTreeMap`, returns `true` (changed)
    - Increments `revision`, calls `save_global_settings()`
-   - Returns `UpdateSandboxPolicyResponse { settings_revision: N }`
+   - Returns `UpdateSettingsResponse { settings_revision: N }`
 
 3. **Sandbox** (next poll tick in `run_policy_poll_loop()`):
    - `poll_settings(sandbox_id)` returns new `config_revision`
    - `log_setting_changes()` logs: `Setting changed key="log_level" old="<unset>" new="debug"`
    - `policy_hash` unchanged -- no OPA reload
    - Updates tracked `current_config_revision` and `current_settings`
+
+## Data Flow: Setting a Global Policy
+
+End-to-end trace for `openshell policy set --global --policy policy.yaml --yes`:
+
+1. **CLI** (`crates/openshell-cli/src/main.rs`, `crates/openshell-cli/src/run.rs` -- `sandbox_policy_set_global()`):
+   - Rejects `--wait` flag with `"--wait is not supported for global policies; global policies are effective immediately"`
+   - Loads and parses the YAML policy file into a `SandboxPolicy` protobuf
+   - Sends `UpdateSettingsRequest { policy: Some(sandbox_policy), global: true }`
+
+2. **Gateway** (`crates/openshell-server/src/grpc.rs` -- `update_settings()`):
+   - Acquires `settings_mutex`
+   - Detects `global=true`, `has_policy=true`
+   - `ensure_sandbox_process_identity()` -- ensures process identity defaults to "sandbox"
+   - `validate_policy_safety()` -- rejects unsafe policies (e.g., root process)
+   - `deterministic_policy_hash()` -- computes SHA-256 hash of the policy
+   - **Dedup check**: Fetches `get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)`
+     - If latest exists with `status == "loaded"` and same hash → no-op (ensures settings blob has `policy` key, returns existing version)
+     - If no latest, or latest is `superseded`, or hash differs → create new revision
+   - `put_policy_revision(id, "__global__", next_version, payload, hash)` -- persists revision
+   - `update_policy_status("__global__", next_version, "loaded")` -- marks loaded immediately
+   - `supersede_older_policies("__global__", next_version)` -- marks all older revisions as superseded
+   - Stores hex-encoded payload in `gateway_settings` blob under `policy` key via `upsert_setting_value()`
+   - Returns `UpdateSettingsResponse { version: N, policy_hash: "..." }`
+
+3. **Sandbox** (next poll tick, ~10 seconds):
+   - `poll_settings(sandbox_id)` returns response with `policy_source: GLOBAL`, `global_policy_version: N`
+   - `config_revision` changed → enters change processing
+   - `policy_hash` changed → calls `opa_engine.reload_from_proto(global_policy)`
+   - Logs `"Policy reloaded successfully (global)"` with `global_version=N`
+   - Does NOT call `ReportPolicyStatus` (global policies skip per-sandbox status reporting)
 
 ## Cross-References
 

@@ -242,14 +242,24 @@ openshell policy list <sandbox-name> --limit 20
 
 #### Global Policy
 
-The `--global` flag on `policy set` and `policy delete` manages a gateway-wide policy override. When a global policy is set, all sandboxes receive it through `GetSandboxSettings` (with `policy_source: GLOBAL`) instead of their own per-sandbox policy. This is implemented via the reserved `policy` key in the gateway settings store. See [Gateway Settings Channel](gateway-settings.md#global-policy-as-a-setting) for implementation details.
+The `--global` flag on `policy set`, `policy delete`, `policy list`, and `policy get` manages a gateway-wide policy override. When a global policy is set, all sandboxes receive it through `GetSandboxSettings` (with `policy_source: GLOBAL`) instead of their own per-sandbox policy. Global policies are versioned through the `sandbox_policies` table using the sentinel `sandbox_id = "__global__"` and delivered to sandboxes via the reserved `policy` key in the `gateway_settings` blob.
 
 | Command | Behavior |
 |---------|----------|
-| `policy set --global --policy FILE` | Stores the policy as a hex-encoded protobuf in the global settings under the reserved `policy` key. All sandboxes pick it up on their next poll. |
-| `policy delete --global` | Removes the `policy` key from global settings. Sandboxes revert to their per-sandbox policy on the next poll. |
+| `policy set --global --policy FILE` | Creates a versioned revision (marked `loaded` immediately) and stores the policy in the global settings blob. Sandboxes pick it up on their next poll (~10s). Deduplicates against the latest `loaded` revision by hash. |
+| `policy delete --global` | Removes the `policy` key from global settings and supersedes all `__global__` revisions. Sandboxes revert to their per-sandbox policy on the next poll. |
+| `policy list --global [--limit N]` | Lists global policy revision history (version, hash, status, timestamps). |
+| `policy get --global [--rev N] [--full]` | Shows a specific global revision's metadata, or the latest. `--full` includes the full policy as YAML. |
 
-Both commands require interactive confirmation (or `--yes` to bypass). The `--wait` flag is not supported for global policy updates because there is no single sandbox to track status for.
+Both `set` and `delete` require interactive confirmation (or `--yes` to bypass). The `--wait` flag is rejected for global policy updates: `"--wait is not supported for global policies; global policies are effective immediately"`.
+
+When a global policy is active, sandbox-scoped policy mutations are blocked:
+- `policy set <sandbox>` returns `FailedPrecondition: "policy is managed globally"`
+- `rule approve`, `rule approve-all` return `FailedPrecondition: "cannot approve rules while a global policy is active"`
+- Revoking a previously approved draft chunk is blocked (it would modify the sandbox policy)
+- Rejecting pending chunks is allowed (does not modify the sandbox policy)
+
+See [Gateway Settings Channel](gateway-settings.md#global-policy-lifecycle) for the full state machine, storage model, and implementation details.
 
 #### `policy get` flags
 
