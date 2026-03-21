@@ -114,7 +114,6 @@ pub async fn generate_proposals(summaries: &[DenialSummary]) -> Vec<PolicyChunk>
                 port: *port,
                 ports: vec![*port],
                 protocol: "rest".to_string(),
-                tls: "terminate".to_string(),
                 enforcement: "enforce".to_string(),
                 rules: l7_rules,
                 allowed_ips: allowed_ips.clone(),
@@ -606,7 +605,8 @@ mod tests {
 
         // L7 fields should be set.
         assert_eq!(ep.protocol, "rest");
-        assert_eq!(ep.tls, "terminate");
+        // tls field is no longer set (auto-detection handles it).
+        assert!(ep.tls.is_empty());
         assert_eq!(ep.enforcement, "enforce");
 
         // Should have L7 rules.

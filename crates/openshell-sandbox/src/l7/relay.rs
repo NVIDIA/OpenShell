@@ -229,3 +229,70 @@ fn evaluate_l7_request(
 
     Ok((allowed, reason))
 }
+
+/// Relay HTTP traffic with credential injection only (no L7 OPA evaluation).
+///
+/// Used when TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`)
+/// is configured. Parses HTTP requests minimally to rewrite credential
+/// placeholders and log requests for observability, then forwards everything.
+pub async fn relay_passthrough_with_credentials<C, U>(
+    client: &mut C,
+    upstream: &mut U,
+    ctx: &L7EvalContext,
+) -> Result<()>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send,
+    U: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let provider = crate::l7::rest::RestProvider;
+    let mut request_count: u64 = 0;
+    let resolver = ctx.secret_resolver.as_deref();
+
+    loop {
+        // Read next request from client.
+        let req = match provider.parse_request(client).await {
+            Ok(Some(req)) => req,
+            Ok(None) => break, // Client closed connection.
+            Err(e) => {
+                if is_benign_connection_error(&e) {
+                    break;
+                }
+                return Err(e);
+            }
+        };
+
+        request_count += 1;
+
+        // Log for observability.
+        info!(
+            host = %ctx.host,
+            port = ctx.port,
+            method = %req.action,
+            path = %req.target,
+            request_num = request_count,
+            "HTTP relay (credential injection)"
+        );
+
+        // Forward request with credential rewriting.
+        let keep_alive =
+            crate::l7::rest::relay_http_request_with_resolver(&req, client, upstream, resolver)
+                .await?;
+
+        // Relay response back to client.
+        let reusable =
+            crate::l7::rest::relay_response_to_client(upstream, client, &req.action).await?;
+
+        if !keep_alive || !reusable {
+            break;
+        }
+    }
+
+    debug!(
+        host = %ctx.host,
+        port = ctx.port,
+        total_requests = request_count,
+        "Credential injection relay completed"
+    );
+
+    Ok(())
+}

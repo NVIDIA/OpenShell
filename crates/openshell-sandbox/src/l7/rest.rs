@@ -416,6 +416,21 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 ///
 /// Returns `true` if the upstream connection is reusable (keep-alive),
 /// `false` if it was consumed (read-until-EOF or `Connection: close`).
+/// Relay an HTTP response from upstream back to the client.
+///
+/// Returns `true` if the connection should stay alive for further requests.
+pub(crate) async fn relay_response_to_client<U, C>(
+    upstream: &mut U,
+    client: &mut C,
+    request_method: &str,
+) -> Result<bool>
+where
+    U: AsyncRead + Unpin,
+    C: AsyncWrite + Unpin,
+{
+    relay_response(request_method, upstream, client).await
+}
+
 async fn relay_response<U, C>(
     request_method: &str,
     upstream: &mut U,

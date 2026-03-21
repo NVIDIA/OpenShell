@@ -118,7 +118,7 @@ graph TB
     NetNS -- "proxied traffic" --> Proxy
     Proxy -- "policy evaluation" --> OPA
     Proxy -- "inference requests" --> InferenceRouter
-    Proxy -- "TLS inspection<br/>(optional L7)" --> CertCache
+    Proxy -- "Auto TLS termination<br/>+ optional L7 inspection" --> CertCache
 
     %% ============================================================
     %% CONNECTIONS: Sandbox --> Gateway (control plane)
@@ -128,7 +128,7 @@ graph TB
     %% ============================================================
     %% CONNECTIONS: Sandbox --> External (via proxy)
     %% ============================================================
-    Proxy -- "HTTPS<br/>(TLS passthrough<br/>or MITM)" --> Anthropic
+    Proxy -- "HTTPS<br/>(auto TLS termination)" --> Anthropic
     Proxy -- "HTTPS" --> OpenAI
     Proxy -- "HTTPS" --> NVIDIA_API
     Proxy -- "HTTPS" --> GitHub
@@ -193,7 +193,7 @@ graph TB
 
 3. **File Sync**: tar archives streamed over the SSH tunnel (no rsync dependency).
 
-4. **Sandbox to External**: All agent outbound traffic is forced through the HTTP CONNECT proxy (10.200.0.1:3128) via a network namespace veth pair. OPA/Rego policies evaluate every connection. Optional TLS MITM enables L7 inspection.
+4. **Sandbox to External**: All agent outbound traffic is forced through the HTTP CONNECT proxy (10.200.0.1:3128) via a network namespace veth pair. OPA/Rego policies evaluate every connection. TLS is automatically detected and terminated for credential injection; endpoints with `protocol` configured also get L7 request-level inspection.
 
 5. **Inference Routing**: Inference requests are handled inside the sandbox by the openshell-router (not through the gateway). The gateway provides route configuration and credentials via gRPC; the sandbox executes HTTP requests directly to inference backends.
 

@@ -160,7 +160,7 @@ Each endpoint defines a reachable destination and optional inspection rules.
 | `host` | string | Yes | Hostname or IP address. Supports wildcards: `*.example.com` matches any subdomain. |
 | `port` | integer | Yes | TCP port number. |
 | `protocol` | string | No | Set to `rest` to enable HTTP request inspection. Omit for TCP passthrough. |
-| `tls` | string | No | TLS handling mode. `terminate` decrypts TLS at the proxy for inspection. `passthrough` forwards encrypted traffic without inspection. Only relevant when `protocol` is `rest`. |
+| `tls` | string | No | TLS handling mode. The proxy auto-detects TLS by peeking the first bytes of each connection and terminates it when `protocol` is `rest`, so this field is optional in most cases. Set to `skip` to disable auto-detection for edge cases such as client-certificate mTLS or non-standard protocols. The values `terminate` and `passthrough` are deprecated and log a warning; they are still accepted for backward compatibility but have no effect on behavior. |
 | `enforcement` | string | No | `enforce` actively blocks disallowed requests. `audit` logs violations but allows traffic through. |
 | `access` | string | No | HTTP access level. One of `read-only`, `read-write`, or `full`. Mutually exclusive with `rules`. |
 | `rules` | list of rule objects | No | Fine-grained per-method, per-path allow rules. Mutually exclusive with `access`. |
@@ -216,7 +216,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:

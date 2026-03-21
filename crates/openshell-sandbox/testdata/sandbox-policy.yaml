@@ -45,7 +45,6 @@ network_policies:
       - host: github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:

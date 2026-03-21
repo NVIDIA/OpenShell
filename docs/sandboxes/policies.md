@@ -57,7 +57,6 @@ network_policies:
       - host: api.example.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: full
     binaries:
@@ -73,7 +72,7 @@ Dynamic sections can be updated on a running sandbox with `openshell policy set`
 | `filesystem_policy` | Static | Controls which directories the agent can access on disk. Paths are split into `read_only` and `read_write` lists. Any path not listed in either list is inaccessible. Set `include_workdir: true` to automatically add the agent's working directory to `read_write`. [Landlock LSM](https://docs.kernel.org/security/landlock.html) enforces these restrictions at the kernel level. |
 | `landlock` | Static | Configures Landlock LSM enforcement behavior. Set `compatibility` to `best_effort` (use the highest ABI the host kernel supports) or `hard_requirement` (fail if the required ABI is unavailable). |
 | `process` | Static | Sets the OS-level identity for the agent process. `run_as_user` and `run_as_group` default to `sandbox`. Root (`root` or `0`) is rejected. The agent also runs with seccomp filters that block dangerous system calls. |
-| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest` and `tls: terminate`, each HTTP request is also checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` or `tls` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
+| `network_policies` | Dynamic | Controls network access for ordinary outbound traffic from the sandbox. Each block has a name, a list of endpoints (host, port, protocol, and optional rules), and a list of binaries allowed to use those endpoints. <br>Every outbound connection except `https://inference.local` goes through the proxy, which queries the {doc}`policy engine <../about/architecture>` with the destination and calling binary. A connection is allowed only when both match an entry in the same policy block. <br>For endpoints with `protocol: rest`, the proxy auto-detects TLS and terminates it so each HTTP request is checked against that endpoint's `rules` (method and path). <br>Endpoints without `protocol` allow the TCP stream through without inspecting payloads. <br>If no endpoint matches, the connection is denied. Configure managed inference separately through {doc}`../inference/configure`. |
 
 ## Apply a Custom Policy
 
@@ -207,7 +206,7 @@ Allow `pip install` and `uv pip install` to reach PyPI:
       - { path: /usr/local/bin/uv }
 ```
 
-Endpoints without `protocol` or `tls` use TCP passthrough — the proxy allows the stream without inspecting payloads.
+Endpoints without `protocol` use TCP passthrough, where the proxy allows the stream without inspecting payloads.
 ::::
 
 ::::{tab-item} Granular rules
@@ -224,7 +223,6 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -253,7 +251,7 @@ For an end-to-end walkthrough that combines this policy with a GitHub credential
       - { path: /usr/bin/gh }
 ```
 
-Endpoints with `protocol: rest` and `tls: terminate` enable HTTP request inspection — the proxy decrypts TLS and checks each HTTP request against the `rules` list.
+Endpoints with `protocol: rest` enable HTTP request inspection. The proxy auto-detects TLS on HTTPS endpoints, terminates it, and checks each HTTP request against the `rules` list.
 ::::
 
 :::::

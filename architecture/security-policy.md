@@ -326,7 +326,7 @@ Controls which filesystem paths the sandboxed process can access. Enforced via L
 
 **Working directory**: When `include_workdir` is `true` and a `--workdir` is specified, the working directory path is appended to `read_write` if not already present. See `crates/openshell-sandbox/src/sandbox/linux/landlock.rs` -- `apply()`.
 
-**TLS directory**: When network proxy mode is active with TLS termination enabled, the directory `/etc/openshell-tls` is automatically appended to `read_only` so sandbox processes can read the ephemeral CA certificate files.
+**TLS directory**: When network proxy mode is active, the directory `/etc/openshell-tls` is automatically appended to `read_only` so sandbox processes can read the ephemeral CA certificate files (used for auto-TLS termination).
 
 ```yaml
 filesystem_policy:
@@ -433,7 +433,7 @@ Each endpoint defines a network destination and, optionally, L7 inspection behav
 | `port`         | `integer`  | _(required)_    | TCP port to match. Mutually exclusive with `ports` — if both are set, `ports` takes precedence. See [Multi-Port Endpoints](#multi-port-endpoints). |
 | `ports`        | `integer[]`| `[]`            | Multiple TCP ports to match. When non-empty, the endpoint covers all listed ports. Backwards compatible with `port`. See [Multi-Port Endpoints](#multi-port-endpoints). |
 | `protocol`     | `string`   | `""`            | Application protocol for L7 inspection. See [Behavioral Trigger: L7 Inspection](#behavioral-trigger-l7-inspection). |
-| `tls`          | `string`   | `"passthrough"` | TLS handling mode. See [Behavioral Trigger: TLS Termination](#behavioral-trigger-tls-termination).                  |
+| `tls`          | `string`   | `""` (auto)      | TLS handling mode. Absent or empty: auto-detect and terminate TLS if detected. `"skip"`: bypass TLS detection entirely. `"terminate"` and `"passthrough"` are deprecated (treated as auto). See [Behavioral Trigger: TLS Handling](#behavioral-trigger-tls-handling). |
 | `enforcement`  | `string`   | `"audit"`       | L7 enforcement mode: `"enforce"` or `"audit"`                                                                       |
 | `access`       | `string`   | `""`            | Shorthand preset for common L7 rule sets. Mutually exclusive with `rules`.                                          |
 | `rules`        | `L7Rule[]` | `[]`            | Explicit L7 allow rules. Mutually exclusive with `access`.                                                          |
@@ -528,7 +528,7 @@ network_policies:
       - { path: /usr/bin/curl }
 ```
 
-Host wildcards compose with all other endpoint features — L7 inspection, TLS termination, multi-port, and `allowed_ips`:
+Host wildcards compose with all other endpoint features — L7 inspection, auto-TLS termination, multi-port, and `allowed_ips`:
 
 ```yaml
 network_policies:
@@ -538,7 +538,6 @@ network_policies:
       - host: "*.example.com"
         port: 8080
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -597,7 +596,6 @@ network_policies:
       - host: "*.example.com"
         ports: [443, 8443]
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -773,25 +771,32 @@ resp = httpx.get("http://10.86.8.223:8000/screenshot/",
                  proxy="http://10.200.0.1:3128")
 ```
 
-### Behavioral Trigger: TLS Termination
+### Behavioral Trigger: TLS Handling
 
 **Trigger**: The `tls` field on a `NetworkEndpoint`.
 
+TLS termination is automatic. The proxy peeks the first bytes of every CONNECT tunnel and terminates TLS whenever a ClientHello is detected. This removes the need for explicit `tls: terminate` in policy — all HTTPS connections are automatically terminated for credential injection and (when configured) L7 inspection.
+
 | Condition                       | Behavior                                                                                                                                                                                                                                                            |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `tls` absent or `"passthrough"` | For L7 endpoints: the proxy inspects plaintext only. For HTTPS endpoints (port 443), L7 rules will not be evaluated because the traffic is encrypted. A validation warning is emitted.                                                                              |
-| `tls: "terminate"`              | The proxy performs MITM TLS termination: it presents a dynamically-generated certificate (signed by an ephemeral per-sandbox CA) to the client, decrypts the traffic, inspects the plaintext HTTP, then re-encrypts to upstream using real root CAs (webpki-roots). |
+| `tls` absent or `""` (default)  | **Auto-detect**: The proxy peeks the first bytes of the tunnel. If TLS is detected (ClientHello pattern), the proxy terminates TLS transparently (MITM), enabling credential injection and L7 inspection. If plaintext HTTP is detected, the proxy inspects directly. If neither, traffic is relayed raw. |
+| `tls: "skip"`                   | **Explicit opt-out**: No TLS detection, no termination, no credential injection. The tunnel is a raw `copy_bidirectional` relay. Use for client-cert mTLS to upstream or non-standard binary protocols. |
+| `tls: "terminate"` *(deprecated)* | Treated as auto-detect. Emits a deprecation warning: "TLS termination is now automatic. Use `tls: skip` to explicitly disable." |
+| `tls: "passthrough"` *(deprecated)* | Treated as auto-detect. Emits the same deprecation warning. |
 
-**Prerequisites for TLS termination**:
+**Prerequisites for TLS termination (auto-detect path)**:
 
-- The `protocol` field must also be set. `tls: terminate` without `protocol` is rejected at validation time.
 - The sandbox supervisor generates an ephemeral CA at startup (`SandboxCa::generate()`) and writes it to `/etc/openshell-tls/`.
 - Trust store environment variables are set on the child process: `NODE_EXTRA_CA_CERTS`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`.
 - A combined CA bundle (system CAs + sandbox CA) is written to `/etc/openshell-tls/ca-bundle.pem` so `SSL_CERT_FILE` replaces the default trust store while still trusting real CAs.
 
 **Certificate caching**: Per-hostname leaf certificates are cached (up to 256 entries, then the entire cache is cleared). See `crates/openshell-sandbox/src/l7/tls.rs` -- `CertCache`.
 
-**Validation warning**: When `protocol: rest` is set on port 443 without `tls: terminate`, the validator emits a warning: "L7 rules won't be evaluated on encrypted traffic without `tls: terminate`".
+**Credential injection**: When TLS is auto-terminated but no L7 policy is configured (no `protocol` field), the proxy enters a passthrough relay that rewrites credential placeholders in HTTP headers (via `SecretResolver`) and logs requests for observability, but does not evaluate L7 OPA rules. This means credential injection works on all HTTPS endpoints automatically.
+
+**Validation warnings**:
+- `tls: terminate` or `tls: passthrough`: deprecated, emits a warning.
+- `tls: skip` with `protocol: rest` on port 443: emits a warning ("L7 inspection cannot work on encrypted traffic").
 
 ### Behavioral Trigger: Enforcement Mode
 
@@ -897,9 +902,10 @@ sequenceDiagram
 
     Note over Proxy: Query L7 config for matched endpoint
     Proxy->>OPA: query_endpoint_config(host, port, binary)
-    OPA-->>Proxy: {protocol: rest, tls: terminate, enforcement: enforce}
+    OPA-->>Proxy: {protocol: rest, enforcement: enforce}
 
-    Note over Proxy: TLS termination (if configured)
+    Note over Proxy: Auto-detect TLS (peek first bytes)
+    Note over Proxy: TLS ClientHello detected → terminate
     Client->>Proxy: TLS ClientHello
     Proxy-->>Client: TLS ServerHello (ephemeral cert for host)
     Note over Proxy: Decrypt client traffic
@@ -944,7 +950,6 @@ The following validation rules are enforced during policy loading (both file mod
 | ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Both `rules` and `access` on the same endpoint | `rules and access are mutually exclusive`                                                  |
 | `protocol` set without `rules` or `access`     | `protocol requires rules or access to define allowed traffic`                              |
-| `tls: terminate` without `protocol`            | `TLS termination requires a protocol for L7 inspection`                                    |
 | `protocol: sql` with `enforcement: enforce`    | `SQL enforcement requires full SQL parsing (not available in v1). Use enforcement: audit.` |
 | `rules: []` (empty list)                       | `rules list cannot be empty (would deny all traffic). Use access: full or remove rules.`   |
 | Host wildcard is bare `*` or `**`              | `host wildcard '*' matches all hosts; use specific patterns like '*.example.com'`          |
@@ -965,7 +970,8 @@ These errors are returned by the gateway's `UpdateSandboxPolicy` handler and rej
 
 | Condition                                                                    | Warning Message                                                                                   |
 | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| `protocol: rest` on port 443 without `tls: terminate`                        | `L7 rules won't be evaluated on encrypted traffic without tls: terminate`                         |
+| `tls: terminate` or `tls: passthrough` on any endpoint                       | `'tls: {value}' is deprecated; TLS termination is now automatic. Use 'tls: skip' to disable.`    |
+| `tls: skip` with L7 rules on port 443                                       | `'tls: skip' with L7 rules on port 443 — L7 inspection cannot work on encrypted traffic`         |
 | Host wildcard with ≤2 labels (e.g., `*.com`)                                | `host wildcard '*.com' is very broad (covers all subdomains of a TLD)`                            |
 | Unknown HTTP method in rules (not GET/HEAD/POST/PUT/DELETE/PATCH/OPTIONS/\*) | `Unknown HTTP method '{method}'. Standard methods: GET, HEAD, POST, PUT, DELETE, PATCH, OPTIONS.` |
 
@@ -1152,14 +1158,13 @@ network_policies:
     binaries:
       - { path: /usr/local/bin/claude }
 
-  # L7 + TLS termination: Full access with HTTPS inspection
+  # L7 + auto-TLS: Full access with HTTPS inspection (TLS terminated automatically)
   claude_code_inspected:
     name: claude_code_inspected
     endpoints:
       - host: api.anthropic.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: full
     binaries:
@@ -1244,14 +1249,13 @@ network_policies:
     binaries:
       - { path: /usr/bin/curl }
 
-  # Multi-port with L7: same L7 rules applied across two ports
+  # Multi-port with L7: same L7 rules applied across two ports (TLS auto-terminated)
   multi_port_l7:
     name: multi_port_l7
     endpoints:
       - host: api.internal.svc
         ports: [8080, 9090]
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:

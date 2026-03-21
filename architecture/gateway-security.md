@@ -420,7 +420,7 @@ This section defines the primary attacker profiles, what the current design prot
 
 Separate from the cluster mTLS infrastructure, each sandbox has an independent TLS capability for inspecting outbound HTTPS traffic. This is documented here for completeness because it involves a distinct, per-sandbox PKI.
 
-When a sandbox policy configures `tls: terminate` on an endpoint, the sandbox proxy performs TLS man-in-the-middle inspection:
+The sandbox proxy automatically detects and terminates TLS on outbound HTTPS connections by peeking the first bytes of each tunnel. This enables credential injection and L7 inspection without requiring explicit policy configuration. The proxy performs TLS man-in-the-middle inspection:
 
 1. **Ephemeral sandbox CA**: a per-sandbox CA (`CN=OpenShell Sandbox CA, O=OpenShell`) is generated at sandbox startup. This CA is completely independent of the cluster mTLS CA.
 2. **Trust injection**: the sandbox CA is written to the sandbox filesystem and injected via `NODE_EXTRA_CA_CERTS` and `SSL_CERT_FILE` so processes inside the sandbox trust it.

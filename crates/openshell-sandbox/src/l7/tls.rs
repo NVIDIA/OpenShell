@@ -259,6 +259,31 @@ pub fn parse_pem_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>> {
         .into_diagnostic()
 }
 
+/// Peek the first bytes of a stream and determine if it looks like a TLS
+/// ClientHello handshake.
+///
+/// A TLS record starts with:
+/// - byte 0: `0x16` (ContentType::Handshake)
+/// - bytes 1-2: TLS version (0x0301 = TLS 1.0, 0x0302 = TLS 1.1, 0x0303 = TLS 1.2/1.3)
+///
+/// Returns `true` if the peeked bytes match the TLS handshake pattern.
+/// Returns `false` for plaintext HTTP, raw binary, or insufficient data.
+pub fn looks_like_tls(peek: &[u8]) -> bool {
+    if peek.len() < 3 {
+        return false;
+    }
+    // ContentType::Handshake
+    if peek[0] != 0x16 {
+        return false;
+    }
+    // TLS version major must be 0x03 (SSL 3.0 / TLS 1.x)
+    if peek[1] != 0x03 {
+        return false;
+    }
+    // TLS version minor: 0x00 (SSL 3.0) through 0x04 (TLS 1.3 record layer)
+    peek[2] <= 0x04
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,6 +332,42 @@ mod tests {
         // Cache should now have just one entry
         let cache_inner = cache.cache.lock().unwrap();
         assert_eq!(cache_inner.len(), 1);
+    }
+
+    #[test]
+    fn looks_like_tls_valid_clienthello() {
+        // TLS 1.0 ClientHello
+        assert!(looks_like_tls(&[0x16, 0x03, 0x01, 0x00, 0x05]));
+        // TLS 1.2
+        assert!(looks_like_tls(&[0x16, 0x03, 0x03, 0x01, 0x00]));
+        // TLS 1.3 record layer (minor 0x01, but hello advertises 1.3 via extension)
+        assert!(looks_like_tls(&[0x16, 0x03, 0x01]));
+        // SSL 3.0
+        assert!(looks_like_tls(&[0x16, 0x03, 0x00]));
+    }
+
+    #[test]
+    fn looks_like_tls_rejects_http() {
+        assert!(!looks_like_tls(b"GET / HTTP/1.1"));
+        assert!(!looks_like_tls(b"POST /api"));
+        assert!(!looks_like_tls(b"CONNECT host:443"));
+    }
+
+    #[test]
+    fn looks_like_tls_rejects_short_input() {
+        assert!(!looks_like_tls(&[]));
+        assert!(!looks_like_tls(&[0x16]));
+        assert!(!looks_like_tls(&[0x16, 0x03]));
+    }
+
+    #[test]
+    fn looks_like_tls_rejects_non_tls_binary() {
+        // SSH protocol
+        assert!(!looks_like_tls(b"SSH-2.0-OpenSSH"));
+        // Random binary
+        assert!(!looks_like_tls(&[0xFF, 0xFE, 0x00]));
+        // Wrong content type
+        assert!(!looks_like_tls(&[0x17, 0x03, 0x03])); // Application data, not handshake
     }
 
     #[test]

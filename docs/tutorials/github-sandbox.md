@@ -230,7 +230,7 @@ network_policies:
   claude_code:
     name: claude-code
     endpoints:
-      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full, tls: terminate }
+      - { host: api.anthropic.com, port: 443, protocol: rest, enforcement: enforce, access: full }
       - { host: statsig.anthropic.com, port: 443 }
       - { host: sentry.io, port: 443 }
       - { host: raw.githubusercontent.com, port: 443 }
@@ -257,7 +257,6 @@ network_policies:
       - host: github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -280,7 +279,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           # GraphQL API (used by gh CLI)
@@ -337,8 +335,8 @@ The following table summarizes the two GitHub-specific blocks:
 
 | Block | Endpoint | Behavior |
 |---|---|---|
-| `github_git` | `github.com:443` | Git Smart HTTP protocol with TLS termination. Permits `info/refs` (clone/fetch), `git-upload-pack` (fetch data), and `git-receive-pack` (push) for the specified repository. Denies all operations on unlisted repositories. |
-| `github_api` | `api.github.com:443` | REST API with TLS termination. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories. |
+| `github_git` | `github.com:443` | Git Smart HTTP protocol. The proxy auto-detects and terminates TLS to inspect requests. Permits `info/refs` (clone/fetch), `git-upload-pack` (fetch data), and `git-receive-pack` (push) for the specified repository. Denies all operations on unlisted repositories. |
+| `github_api` | `api.github.com:443` | REST API. The proxy auto-detects and terminates TLS to inspect requests. Permits all HTTP methods for the specified repository and GraphQL queries. Denies API access to unlisted repositories. |
 
 The remaining blocks (`claude_code`, `nvidia_inference`, `pypi`, `vscode`) are identical to the {doc}`default policy </reference/default-policy>`. The default policy's `github_ssh_over_https` and `github_rest_api` blocks are replaced by the `github_git` and `github_api` blocks above, which grant write access to the specified repository. Sandbox behavior outside of GitHub operations is unchanged.
 

@@ -59,7 +59,7 @@ The `mechanistic_mapper` module (`crates/openshell-sandbox/src/mechanistic_mappe
    - Port recognition (well-known ports like 443, 5432 get a boost)
    - SSRF origin (SSRF denials get lower confidence)
 6. Generates security notes for private IPs, database ports, and ephemeral port ranges
-7. If L7 request samples are present, generates specific L7 rules (method + path) with `protocol: rest` and `tls: terminate` (plumbed but not yet fed data — see issue #205)
+7. If L7 request samples are present, generates specific L7 rules (method + path) with `protocol: rest` (TLS termination is automatic — no `tls` field needed). Plumbed but not yet fed data — see issue #205.
 
 The mapper runs in `flush_proposals_to_gateway` after the aggregator drains. It produces `PolicyChunk` protos that are sent alongside the raw `DenialSummary` protos to the gateway.
 

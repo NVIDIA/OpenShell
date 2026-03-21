@@ -2,6 +2,12 @@
 
 Examples organized by detail tier — from minimal (just host + intent) to full (complete API docs).
 
+> **TLS note:** TLS termination is automatic. The proxy auto-detects TLS by
+> peeking the first bytes of each connection, so there is no need to specify
+> `tls: terminate` in policies. The `tls` field is deprecated. If you have an
+> edge case where auto-detection must be bypassed, you can set `tls: skip` to
+> disable TLS interception for that endpoint.
+
 ---
 
 ## Minimal Tier Examples (host + intent, no API docs)
@@ -23,7 +29,7 @@ network_policies:
       - { path: /usr/local/bin/claude }
 ```
 
-No `protocol`, `tls`, `rules`, or `access` — this is pure L4 (host:port + binary identity check).
+No `protocol`, `rules`, or `access` — this is pure L4 (host:port + binary identity check).
 
 ---
 
@@ -41,7 +47,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -64,7 +69,6 @@ network_policies:
       - host: integrate.api.nvidia.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: full
     binaries:
@@ -109,13 +113,11 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
       - host: api.gitlab.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -155,7 +157,6 @@ network_policies:
       - host: api.openai.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -202,7 +203,6 @@ network_policies:
       - host: integrate.api.nvidia.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -236,7 +236,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -291,7 +290,6 @@ Endpoints:
 - Methods: GET, HEAD, OPTIONS only
 - Paths: All paths (user wants to browse freely)
 - This maps exactly to the `read-only` preset
-- Port 443 + L7 rules → needs `tls: terminate`
 
 ### Output
 
@@ -303,7 +301,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -343,7 +340,6 @@ Endpoints:
 - Scope: `integrate.api.nvidia.com:443`
 - Methods: POST on `/v1/chat/completions`, GET on `/v1/models` and `/v1/models/*`
 - No preset fits — need explicit rules
-- Port 443 + L7 → `tls: terminate`
 - Two binaries
 
 ### Output
@@ -356,7 +352,6 @@ network_policies:
       - host: integrate.api.nvidia.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -490,7 +485,6 @@ paths:
 - Tasks: GET, POST, PUT, DELETE on `/projects/*/tasks` and `/projects/*/tasks/*`
 - Members: GET only on `/projects/*/members`
 - Admin: No rules = denied by default
-- Port 443 + L7 → `tls: terminate`
 
 ### Output
 
@@ -502,7 +496,6 @@ network_policies:
       - host: pm-api.example.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           # Projects — full CRUD
@@ -606,7 +599,6 @@ network_policies:
       - host: metrics.corp.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         rules:
           - allow:
@@ -747,7 +739,6 @@ An exact IP is treated as `/32` — only that specific address is permitted.
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -849,7 +840,6 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
@@ -861,7 +851,6 @@ network_policies:
       - host: api.anthropic.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: full
     binaries:

@@ -27,10 +27,10 @@ All paths are relative to `crates/openshell-sandbox/src/`.
 | `sandbox/linux/seccomp.rs` | Syscall filtering via BPF on `SYS_socket` |
 | `bypass_monitor.rs` | Background `/dev/kmsg` reader for iptables bypass detection events |
 | `sandbox/linux/netns.rs` | Network namespace creation, veth pair setup, bypass detection iptables rules, cleanup on drop |
-| `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion |
+| `l7/mod.rs` | L7 types (`L7Protocol`, `TlsMode`, `EnforcementMode`, `L7EndpointConfig`), config parsing, validation, access preset expansion, deprecated `tls` value handling |
 | `l7/inference.rs` | Inference API pattern detection (`detect_inference_pattern()`), HTTP request/response parsing and formatting for intercepted inference connections |
-| `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers |
-| `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation |
+| `l7/tls.rs` | Ephemeral CA generation (`SandboxCa`), per-hostname leaf cert cache (`CertCache`), TLS termination/connection helpers, `looks_like_tls()` auto-detection |
+| `l7/relay.rs` | Protocol-aware bidirectional relay with per-request OPA evaluation, credential-injection-only passthrough relay |
 | `l7/rest.rs` | HTTP/1.1 request/response parsing, body framing (Content-Length, chunked), deny response generation |
 | `l7/provider.rs` | `L7Provider` trait and `L7Request`/`BodyLength` types |
 
@@ -674,11 +674,26 @@ sequenceDiagram
             else All IPs public
                 P->>U: TCP connect (resolved addrs)
                 P-->>S: HTTP/1.1 200 Connection Established
-                alt L7 config present
-                    P->>P: TLS termination / protocol detection
-                    P->>P: Per-request L7 evaluation
-                else L4-only
+                alt tls: skip
                     P->>P: copy_bidirectional (raw tunnel)
+                else Auto-detect
+                    P->>P: Peek first bytes
+                    alt TLS detected
+                        P->>P: TLS terminate (MITM)
+                        alt L7 config present
+                            P->>P: relay_with_inspection (per-request L7 evaluation)
+                        else No L7 config
+                            P->>P: relay_passthrough_with_credentials (credential injection)
+                        end
+                    else HTTP detected
+                        alt L7 config present
+                            P->>P: relay_with_inspection
+                        else No L7 config
+                            P->>P: relay_passthrough_with_credentials
+                        end
+                    else Neither TLS nor HTTP
+                        P->>P: copy_bidirectional (raw tunnel)
+                    end
                 end
             end
         end
@@ -876,20 +891,45 @@ flowchart TD
 
 `ResolvedRoute` has a custom `Debug` implementation in `crates/openshell-router/src/config.rs` that redacts the `api_key` field, printing `[REDACTED]` instead of the actual value. This prevents key leakage in log output and debug traces.
 
-### Post-decision: L7 dispatch or raw tunnel (`Allow` path)
+### Post-decision: auto-TLS detection, L7 dispatch, or raw tunnel (`Allow` path)
 
-After a CONNECT is allowed, the SSRF check passes, and the upstream TCP connection is established:
+After a CONNECT is allowed, the SSRF check passes, and the upstream TCP connection is established, the proxy determines how to handle the tunnel traffic. TLS detection is automatic — the proxy peeks the first bytes of the client stream to decide.
 
 1. **Query L7 config**: `query_l7_config()` asks the OPA engine for `matched_endpoint_config`. If the endpoint has a `protocol` field, parse it into `L7EndpointConfig`.
 
-2. **L7 inspection** (if config present):
-   - Clone the OPA engine for per-tunnel evaluation (`clone_engine_for_tunnel()`)
-   - Build `L7EvalContext` with host, port, policy name, binary path, ancestors, cmdline paths
-   - Branch on TLS mode:
-     - `TlsMode::Terminate`: MITM via `tls_terminate_client()` + `tls_connect_upstream()`, then `relay_with_inspection()`
-     - `TlsMode::Passthrough`: Peek first bytes on raw TCP; if `looks_like_http()` matches, run `relay_with_inspection()`; reject on protocol mismatch
+2. **Check for `tls: skip`**: If the endpoint has `tls: skip`, bypass all auto-detection and relay raw bytes via `copy_bidirectional()`. This is the escape hatch for client-cert mTLS or non-standard protocols.
 
-3. **L4-only** (no L7 config): `tokio::io::copy_bidirectional()` for a raw tunnel
+3. **Peek and auto-detect**: Read up to 8 bytes from the client stream via `TcpStream::peek()`. Classify the traffic using `looks_like_tls()` (checks for TLS ClientHello record: byte 0 = `0x16`, bytes 1-2 = TLS version `0x03xx`) and `looks_like_http()` (checks for HTTP method prefix).
+
+4. **TLS detected** (`is_tls = true`):
+   - Terminate TLS unconditionally via `tls_terminate_client()` + `tls_connect_upstream()`. This happens for all HTTPS endpoints, not just those with L7 config.
+   - If L7 config is present: clone the OPA engine (`clone_engine_for_tunnel()`), run `relay_with_inspection()` for per-request policy evaluation.
+   - If no L7 config: run `relay_passthrough_with_credentials()` — parses HTTP minimally to inject credentials (via `SecretResolver`) and log requests, but does not evaluate L7 OPA rules. This enables credential injection on all HTTPS endpoints without requiring `protocol` in the policy.
+   - If TLS state is not configured: fall back to raw `copy_bidirectional()` with a warning.
+
+5. **Plaintext HTTP detected** (`is_http = true`, `is_tls = false`):
+   - If L7 config present: clone OPA engine, run `relay_with_inspection()` directly on the plaintext streams.
+   - If no L7 config: run `relay_passthrough_with_credentials()` for credential injection and observability.
+
+6. **Neither TLS nor HTTP**: Raw `copy_bidirectional()` tunnel (binary protocols, SSH-over-CONNECT, etc.).
+
+```mermaid
+flowchart TD
+    A["CONNECT allowed + upstream connected"] --> B["Query L7 config"]
+    B --> C{"tls: skip?"}
+    C -- Yes --> D["Raw copy_bidirectional"]
+    C -- No --> E["Peek first bytes"]
+    E --> F{"looks_like_tls?"}
+    F -- Yes --> G["TLS terminate client + upstream"]
+    G --> H{"L7 config?"}
+    H -- Yes --> I["relay_with_inspection"]
+    H -- No --> J["relay_passthrough_with_credentials<br/>(credential injection, no L7 rules)"]
+    F -- No --> K{"looks_like_http?"}
+    K -- Yes --> L{"L7 config?"}
+    L -- Yes --> M["relay_with_inspection"]
+    L -- No --> N["relay_passthrough_with_credentials"]
+    K -- No --> O["Raw copy_bidirectional<br/>(binary protocol)"]
+```
 
 ## L7 Protocol-Aware Inspection
 
@@ -918,7 +958,7 @@ flowchart LR
 | Type | Definition | Purpose |
 |------|-----------|---------|
 | `L7Protocol` | `Rest`, `Sql` | Supported application protocols |
-| `TlsMode` | `Passthrough`, `Terminate` | TLS handling strategy |
+| `TlsMode` | `Auto` (default), `Skip` | TLS handling strategy — `Auto` peeks first bytes and terminates if TLS is detected; `Skip` bypasses detection entirely |
 | `EnforcementMode` | `Audit`, `Enforce` | What to do on L7 deny (log-only vs block) |
 | `L7EndpointConfig` | `{ protocol, tls, enforcement }` | Per-endpoint L7 configuration |
 | `L7Decision` | `{ allowed, reason, matched_rule }` | Result of L7 evaluation |
@@ -943,19 +983,19 @@ Expansion happens in `expand_access_presets()` before the Rego engine loads the 
 **Errors** (block startup):
 - `rules` and `access` both specified on same endpoint
 - `protocol` specified without `rules` or `access`
-- `tls: terminate` without a `protocol`
 - `protocol: sql` with `enforcement: enforce` (SQL parsing not available in v1)
 - Empty `rules` array (would deny all traffic)
 
 **Warnings** (logged):
-- `protocol: rest` on port 443 without `tls: terminate` (L7 rules ineffective on encrypted traffic)
+- `tls: terminate` or `tls: passthrough` on any endpoint (deprecated — TLS termination is now automatic; use `tls: skip` to disable)
+- `tls: skip` with L7 rules on port 443 (L7 inspection cannot work on encrypted traffic)
 - Unknown HTTP method in rules
 
-### TLS termination
+### TLS termination (auto-detect)
 
 **File:** `crates/openshell-sandbox/src/l7/tls.rs`
 
-TLS termination enables the proxy to inspect HTTPS traffic by performing MITM decryption.
+TLS termination is automatic. The proxy peeks the first bytes of every CONNECT tunnel and terminates TLS whenever a ClientHello is detected. This enables credential injection and L7 inspection on all HTTPS endpoints without requiring explicit `tls: terminate` in the policy. The `tls` field defaults to `Auto`; use `tls: skip` to opt out entirely (e.g., for client-cert mTLS to upstream).
 
 **Ephemeral CA lifecycle:**
 1. At sandbox startup, `SandboxCa::generate()` creates a self-signed CA (CN: "OpenShell Sandbox CA") using `rcgen`
@@ -963,18 +1003,37 @@ TLS termination enables the proxy to inspect HTTPS traffic by performing MITM de
 3. The sandbox CA cert path is set as `NODE_EXTRA_CA_CERTS` (additive for Node.js)
 4. The combined bundle is set as `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` (replaces defaults for OpenSSL, Python requests, curl)
 
+**TLS auto-detection** (`looks_like_tls()`):
+- Peeks up to 8 bytes from the client stream
+- Checks for TLS ClientHello pattern: byte 0 = `0x16` (ContentType::Handshake), byte 1 = `0x03` (TLS major version), byte 2 ≤ `0x04` (minor version, covering SSL 3.0 through TLS 1.3)
+- Returns `false` for plaintext HTTP, SSH, or other binary protocols
+
 **Per-hostname leaf cert generation:**
 - `CertCache` maps hostnames to `CertifiedLeaf` structs (cert chain + private key)
 - First request for a hostname generates a leaf cert signed by the sandbox CA via `rcgen`
 - Cache has a hard limit of 256 entries; on overflow, the entire cache is cleared (sufficient for sandbox scale)
 - Each leaf cert chain contains two certs: the leaf and the CA
 
-**Connection flow:**
+**Connection flow (when TLS is detected):**
 1. `tls_terminate_client()`: Accept TLS from the sandboxed client using a `ServerConfig` with the hostname-specific leaf cert. ALPN: `http/1.1`.
 2. `tls_connect_upstream()`: Connect TLS to the real upstream using a `ClientConfig` with Mozilla root CAs (`webpki_roots`). ALPN: `http/1.1`.
-3. Proxy now holds plaintext on both sides and runs `relay_with_inspection()`.
+3. Proxy now holds plaintext on both sides. If L7 config is present, runs `relay_with_inspection()`. Otherwise, runs `relay_passthrough_with_credentials()` for credential injection without L7 evaluation.
 
 System CA bundles are searched at well-known paths: `/etc/ssl/certs/ca-certificates.crt` (Debian/Ubuntu), `/etc/pki/tls/certs/ca-bundle.crt` (RHEL), `/etc/ssl/ca-bundle.pem` (openSUSE), `/etc/ssl/cert.pem` (Alpine/macOS).
+
+### Credential-injection-only relay
+
+**File:** `crates/openshell-sandbox/src/l7/relay.rs` (`relay_passthrough_with_credentials()`)
+
+When TLS is auto-terminated but no L7 policy (`protocol` + `access`/`rules`) is configured on the endpoint, the proxy enters a passthrough mode that still provides value: it parses HTTP requests minimally to rewrite credential placeholders (via `SecretResolver`) and logs each request for observability. This relay:
+
+1. Reads each HTTP request from the client via `RestProvider::parse_request()`
+2. Logs the request method, path, host, and port at `info!()` level (tagged `"HTTP relay (credential injection)"`)
+3. Forwards the request to upstream via `relay_http_request_with_resolver()`, which rewrites headers containing `openshell:resolve:env:*` placeholders with actual provider credential values
+4. Relays the upstream response back to the client
+5. Loops for HTTP keep-alive; exits on client close or non-reusable response
+
+This enables credential injection on all HTTPS endpoints automatically, without requiring the policy author to add `protocol: rest` and `access: full` just to get credentials injected.
 
 ### REST protocol provider
 

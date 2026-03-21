@@ -526,107 +526,129 @@ async fn handle_tcp_connection(
         connect_msg,
     );
 
-    if let Some(l7_config) = l7_config {
-        // Clone engine for per-tunnel L7 evaluation (cheap: shares compiled policy via Arc)
-        let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
-            warn!(error = %e, "Failed to clone OPA engine for L7, falling back to L4-only");
-            // This shouldn't happen, but if it does fall through to copy_bidirectional
-            regorus::Engine::new()
-        });
+    // Determine effective TLS mode. If an endpoint has L7 config with
+    // `tls: skip`, bypass auto-detection entirely. Otherwise auto-detect.
+    let effective_tls_skip = l7_config
+        .as_ref()
+        .is_some_and(|c| c.tls == crate::l7::TlsMode::Skip);
 
-        let ctx = crate::l7::relay::L7EvalContext {
-            host: host_lc.clone(),
-            port,
-            policy_name: matched_policy.clone().unwrap_or_default(),
-            binary_path: decision
-                .binary
-                .as_ref()
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default(),
-            ancestors: decision
-                .ancestors
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            cmdline_paths: decision
-                .cmdline_paths
-                .iter()
-                .map(|p| p.to_string_lossy().into_owned())
-                .collect(),
-            secret_resolver: secret_resolver.clone(),
-        };
+    // Build L7 eval context (shared by TLS-terminated and plaintext paths).
+    let ctx = crate::l7::relay::L7EvalContext {
+        host: host_lc.clone(),
+        port,
+        policy_name: matched_policy.clone().unwrap_or_default(),
+        binary_path: decision
+            .binary
+            .as_ref()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        ancestors: decision
+            .ancestors
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        cmdline_paths: decision
+            .cmdline_paths
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect(),
+        secret_resolver: secret_resolver.clone(),
+    };
 
-        if l7_config.tls == crate::l7::TlsMode::Terminate {
-            // TLS termination: MITM decrypt, inspect, re-encrypt
-            if let Some(ref tls) = tls_state {
-                let l7_result = async {
-                    let mut tls_client =
-                        crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
-                    let mut tls_upstream = crate::l7::tls::tls_connect_upstream(
-                        upstream,
-                        &host_lc,
-                        tls.upstream_config(),
-                    )
-                    .await?;
-                    // No protocol detection needed — ALPN proves HTTP
+    if effective_tls_skip {
+        // tls: skip — raw tunnel, no termination, no credential injection.
+        debug!(
+            host = %host_lc,
+            port = port,
+            "tls: skip — bypassing TLS auto-detection, raw tunnel"
+        );
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await
+            .into_diagnostic()?;
+        return Ok(());
+    }
+
+    // Auto-detect TLS by peeking the first bytes.
+    let mut peek_buf = [0u8; 8];
+    let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
+    if n == 0 {
+        return Ok(());
+    }
+
+    let is_tls = crate::l7::tls::looks_like_tls(&peek_buf[..n]);
+    let is_http = crate::l7::rest::looks_like_http(&peek_buf[..n]);
+
+    if is_tls {
+        // TLS detected — terminate unconditionally.
+        if let Some(ref tls) = tls_state {
+            let tls_result = async {
+                let mut tls_client =
+                    crate::l7::tls::tls_terminate_client(client, tls, &host_lc).await?;
+                let mut tls_upstream =
+                    crate::l7::tls::tls_connect_upstream(upstream, &host_lc, tls.upstream_config())
+                        .await?;
+
+                if let Some(ref l7_config) = l7_config {
+                    // L7 inspection on terminated TLS traffic.
+                    let tunnel_engine =
+                        opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                            warn!(error = %e, "Failed to clone OPA engine for L7, falling back to relay-only");
+                            regorus::Engine::new()
+                        });
                     crate::l7::relay::relay_with_inspection(
-                        &l7_config,
+                        l7_config,
                         std::sync::Mutex::new(tunnel_engine),
                         &mut tls_client,
                         &mut tls_upstream,
                         &ctx,
                     )
                     .await
-                };
-                if let Err(e) = l7_result.await {
-                    if is_benign_relay_error(&e) {
-                        debug!(
-                            host = %host_lc,
-                            port = port,
-                            error = %e,
-                            "TLS L7 connection closed"
-                        );
-                    } else {
-                        warn!(
-                            host = %host_lc,
-                            port = port,
-                            error = %e,
-                            "TLS L7 relay error"
-                        );
-                    }
-                }
-            } else {
-                warn!(
-                    host = %host_lc,
-                    port = port,
-                    "TLS termination requested but TLS state not configured, falling back to L4"
-                );
-                let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                } else {
+                    // No L7 config — relay with credential injection only.
+                    crate::l7::relay::relay_passthrough_with_credentials(
+                        &mut tls_client,
+                        &mut tls_upstream,
+                        &ctx,
+                    )
                     .await
-                    .into_diagnostic()?;
-            }
-        } else {
-            // Plaintext: protocol detection via peek on raw TcpStream
-            if l7_config.protocol == crate::l7::L7Protocol::Rest {
-                let mut peek_buf = [0u8; 8];
-                let n = client.peek(&mut peek_buf).await.into_diagnostic()?;
-                if n == 0 {
-                    return Ok(());
                 }
-                if !crate::l7::rest::looks_like_http(&peek_buf[..n]) {
+            };
+            if let Err(e) = tls_result.await {
+                if is_benign_relay_error(&e) {
+                    debug!(
+                        host = %host_lc,
+                        port = port,
+                        error = %e,
+                        "TLS connection closed"
+                    );
+                } else {
                     warn!(
                         host = %host_lc,
                         port = port,
-                        policy = %ctx.policy_name,
-                        "Expected REST protocol but received non-matching bytes. Connection rejected."
+                        error = %e,
+                        "TLS relay error"
                     );
-                    return Err(miette::miette!(
-                        "Protocol mismatch: expected HTTP but received non-HTTP bytes"
-                    ));
                 }
             }
+        } else {
+            warn!(
+                host = %host_lc,
+                port = port,
+                "TLS detected but TLS state not configured, falling back to raw tunnel"
+            );
+            let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+                .await
+                .into_diagnostic()?;
+        }
+    } else if is_http {
+        // Plaintext HTTP detected.
+        if let Some(ref l7_config) = l7_config {
+            let tunnel_engine = opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                warn!(error = %e, "Failed to clone OPA engine for L7, falling back to relay-only");
+                regorus::Engine::new()
+            });
             if let Err(e) = crate::l7::relay::relay_with_inspection(
-                &l7_config,
+                l7_config,
                 std::sync::Mutex::new(tunnel_engine),
                 &mut client,
                 &mut upstream,
@@ -635,29 +657,38 @@ async fn handle_tcp_connection(
             .await
             {
                 if is_benign_relay_error(&e) {
-                    debug!(
-                        host = %host_lc,
-                        port = port,
-                        error = %e,
-                        "L7 connection closed"
-                    );
+                    debug!(host = %host_lc, port = port, error = %e, "L7 connection closed");
                 } else {
-                    warn!(
-                        host = %host_lc,
-                        port = port,
-                        error = %e,
-                        "L7 relay error"
-                    );
+                    warn!(host = %host_lc, port = port, error = %e, "L7 relay error");
+                }
+            }
+        } else {
+            // Plaintext HTTP, no L7 config — relay with credential injection.
+            if let Err(e) = crate::l7::relay::relay_passthrough_with_credentials(
+                &mut client,
+                &mut upstream,
+                &ctx,
+            )
+            .await
+            {
+                if is_benign_relay_error(&e) {
+                    debug!(host = %host_lc, port = port, error = %e, "HTTP relay closed");
+                } else {
+                    warn!(host = %host_lc, port = port, error = %e, "HTTP relay error");
                 }
             }
         }
-        return Ok(());
+    } else {
+        // Neither TLS nor HTTP — raw binary relay.
+        debug!(
+            host = %host_lc,
+            port = port,
+            "Non-TLS non-HTTP traffic detected, raw tunnel"
+        );
+        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await
+            .into_diagnostic()?;
     }
-
-    // L4-only: raw bidirectional copy (existing behavior)
-    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
-        .await
-        .into_diagnostic()?;
 
     Ok(())
 }

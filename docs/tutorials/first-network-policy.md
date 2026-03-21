@@ -127,14 +127,13 @@ network_policies:
       - host: api.github.com
         port: 443
         protocol: rest
-        tls: terminate
         enforcement: enforce
         access: read-only
     binaries:
       - { path: /usr/bin/curl }
 ```
 
-The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` may make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy terminates TLS using `tls: terminate` to inspect each HTTP request and enforce the `read-only` access preset at the method level.
+The `filesystem_policy`, `landlock`, and `process` sections preserve the default sandbox settings. This is required because `policy set` replaces the entire policy. The `network_policies` section is the key part: `curl` may make GET, HEAD, and OPTIONS requests to `api.github.com` over HTTPS. Everything else is denied. The proxy auto-detects TLS on HTTPS endpoints and terminates it to inspect each HTTP request and enforce the `read-only` access preset at the method level.
 
 Apply it:
 
