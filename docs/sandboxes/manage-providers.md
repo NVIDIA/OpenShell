@@ -155,6 +155,7 @@ The following providers have been tested with `inference.local`. Any provider th
 | Baseten | `baseten` | `openai` | `https://inference.baseten.co/v1` | `OPENAI_API_KEY` |
 | Bitdeer AI | `bitdeer` | `openai` | `https://api-inference.bitdeer.ai/v1` | `OPENAI_API_KEY` |
 | Deepinfra | `deepinfra` | `openai` | `https://api.deepinfra.com/v1/openai` | `OPENAI_API_KEY` |
+| Groq | `groq` | `openai` | `https://api.groq.com/openai/v1` | `OPENAI_API_KEY` |
 | Ollama (local) | `ollama` | `openai` | `http://host.openshell.internal:11434/v1` | `OPENAI_API_KEY` |
 | LM Studio (local) | `lmstudio` | `openai` | `http://host.openshell.internal:1234/v1` | `OPENAI_API_KEY` |
 
