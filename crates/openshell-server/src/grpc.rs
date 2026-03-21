@@ -92,7 +92,7 @@ const MAX_TEMPLATE_STRING_LEN: usize = 1024;
 /// Maximum number of entries in template map fields (`labels`, `annotations`, `environment`).
 const MAX_TEMPLATE_MAP_ENTRIES: usize = 128;
 
-/// Maximum serialized size (bytes) for template Struct fields (`resources`, `pod_template`,
+/// Maximum serialized size (bytes) for template Struct fields (`resources`,
 /// `volume_claim_templates`).
 const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
 
@@ -3158,14 +3158,6 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         if size > MAX_TEMPLATE_STRUCT_SIZE {
             return Err(Status::invalid_argument(format!(
                 "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
-    if let Some(ref s) = tmpl.pod_template {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.pod_template serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
     }
