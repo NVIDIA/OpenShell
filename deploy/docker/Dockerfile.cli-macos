@@ -103,9 +103,10 @@ RUN touch crates/openshell-cli/src/main.rs \
     crates/openshell-core/build.rs \
     proto/*.proto
 
-# Declare version ARG here (not earlier) so the git-hash-bearing value does not
+# Declare version ARGs here (not earlier) so the git-hash-bearing values do not
 # invalidate the expensive dependency-build layers above on every commit.
 ARG OPENSHELL_CARGO_VERSION
+ARG OPENSHELL_IMAGE_TAG
 RUN --mount=type=cache,id=cargo-registry-cli-macos,sharing=locked,target=/root/.cargo/registry \
     --mount=type=cache,id=cargo-git-cli-macos,sharing=locked,target=/root/.cargo/git \
     --mount=type=cache,id=cargo-target-cli-macos-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
