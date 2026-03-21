@@ -55,8 +55,6 @@ pub struct SandboxTemplate {
         ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     #[prost(message, optional, tag = "7")]
     pub resources: ::core::option::Option<::prost_types::Struct>,
-    #[prost(message, optional, tag = "8")]
-    pub pod_template: ::core::option::Option<::prost_types::Struct>,
     #[prost(message, optional, tag = "9")]
     pub volume_claim_templates: ::core::option::Option<::prost_types::Struct>,
 }
@@ -100,16 +98,12 @@ pub struct Provider {
     pub r#type: ::prost::alloc::string::String,
     /// Secret values used for authentication.
     #[prost(map = "string, string", tag = "4")]
-    pub credentials: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub credentials:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
     /// Non-secret provider configuration.
     #[prost(map = "string, string", tag = "5")]
-    pub config: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub config:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 /// High-level sandbox lifecycle phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
