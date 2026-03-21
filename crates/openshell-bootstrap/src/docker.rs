@@ -251,25 +251,30 @@ fn home_dir() -> Option<String> {
 /// would bypass that proxy and break DNS.
 ///
 /// Returns an empty vec if no usable resolvers are found.
+/// Parse resolv.conf content, extracting nameserver IPs and filtering loopback addresses.
+fn parse_resolv_conf(contents: &str) -> Vec<String> {
+    contents
+        .lines()
+        .filter_map(|line| {
+            let line = line.trim();
+            if !line.starts_with("nameserver") {
+                return None;
+            }
+            let ip = line.split_whitespace().nth(1)?;
+            if ip.starts_with("127.") || ip == "::1" {
+                return None;
+            }
+            Some(ip.to_string())
+        })
+        .collect()
+}
+
 fn resolve_upstream_dns() -> Vec<String> {
     let paths = ["/run/systemd/resolve/resolv.conf"];
 
     for path in &paths {
         if let Ok(contents) = std::fs::read_to_string(path) {
-            let resolvers: Vec<String> = contents
-                .lines()
-                .filter_map(|line| {
-                    let line = line.trim();
-                    if !line.starts_with("nameserver") {
-                        return None;
-                    }
-                    let ip = line.split_whitespace().nth(1)?;
-                    if ip.starts_with("127.") || ip == "::1" {
-                        return None;
-                    }
-                    Some(ip.to_string())
-                })
-                .collect();
+            let resolvers = parse_resolv_conf(&contents);
 
             if !resolvers.is_empty() {
                 tracing::debug!(
@@ -1283,25 +1288,6 @@ mod tests {
             resolvers.len() <= 20,
             "should return a reasonable number of resolvers"
         );
-    }
-
-    /// Helper: parse resolv.conf content using the same logic as resolve_upstream_dns().
-    /// Allows deterministic testing without depending on host DNS config.
-    fn parse_resolv_conf(contents: &str) -> Vec<String> {
-        contents
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim();
-                if !line.starts_with("nameserver") {
-                    return None;
-                }
-                let ip = line.split_whitespace().nth(1)?;
-                if ip.starts_with("127.") || ip == "::1" {
-                    return None;
-                }
-                Some(ip.to_string())
-            })
-            .collect()
     }
 
     #[test]
