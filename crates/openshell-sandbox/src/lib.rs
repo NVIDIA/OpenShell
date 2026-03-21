@@ -202,7 +202,25 @@ pub async fn run_sandbox(
         std::collections::HashMap::new()
     };
 
-    let (provider_env, secret_resolver) = SecretResolver::from_provider_env(provider_env);
+    // Use the placeholder mechanism only when the policy has at least one
+    // `tls: terminate` endpoint. Without TLS termination the proxy cannot
+    // intercept HTTPS traffic to rewrite credential placeholders in request
+    // headers, so placeholder values would reach upstream APIs verbatim and
+    // cause 401 errors. When no such endpoint exists, pass real credentials
+    // directly so API calls succeed.
+    let (provider_env, secret_resolver) = if policy.has_tls_terminate_endpoints {
+        SecretResolver::from_provider_env(provider_env)
+    } else {
+        if !provider_env.is_empty() {
+            warn!(
+                "Sandbox policy has no `tls: terminate` endpoints; \
+                 provider credentials are passed directly to the child process. \
+                 Add `protocol: rest` and `tls: terminate` to HTTPS endpoints \
+                 that use provider credentials to enable secure credential rewriting."
+            );
+        }
+        (provider_env, None)
+    };
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
@@ -981,6 +999,9 @@ async fn load_policy(
             },
             landlock: config.landlock,
             process: config.process,
+            // File-mode is a dev/operator override — assume the operator has
+            // configured `tls: terminate` where needed.
+            has_tls_terminate_endpoints: true,
         };
         enrich_sandbox_baseline_paths(&mut policy);
         return Ok((policy, Some(Arc::new(engine))));

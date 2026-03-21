@@ -524,6 +524,7 @@ mod tests {
             network: NetworkPolicy::default(),
             landlock: LandlockPolicy::default(),
             process,
+            has_tls_terminate_endpoints: false,
         }
     }
 

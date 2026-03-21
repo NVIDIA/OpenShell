@@ -17,6 +17,13 @@ pub struct SandboxPolicy {
     pub network: NetworkPolicy,
     pub landlock: LandlockPolicy,
     pub process: ProcessPolicy,
+    /// True when at least one network endpoint has `tls: terminate` configured.
+    ///
+    /// When false, the proxy cannot rewrite credential placeholder values in
+    /// HTTP headers (TLS MITM is required for that). Provider credentials are
+    /// passed directly to the child process instead of using the placeholder
+    /// mechanism so that API calls succeed.
+    pub has_tls_terminate_endpoints: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -106,6 +113,12 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
             proxy: Some(ProxyPolicy { http_addr: None }),
         };
 
+        let has_tls_terminate_endpoints = proto
+            .network_policies
+            .values()
+            .flat_map(|r| r.endpoints.iter())
+            .any(|ep| ep.tls == "terminate");
+
         Ok(Self {
             version: proto.version,
             filesystem: proto
@@ -115,6 +128,7 @@ impl TryFrom<ProtoSandboxPolicy> for SandboxPolicy {
             network,
             landlock: proto.landlock.map(LandlockPolicy::from).unwrap_or_default(),
             process: proto.process.map(ProcessPolicy::from).unwrap_or_default(),
+            has_tls_terminate_endpoints,
         })
     }
 }
