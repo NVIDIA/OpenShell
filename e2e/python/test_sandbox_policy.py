@@ -6,12 +6,14 @@ from __future__ import annotations
 import json
 from typing import TYPE_CHECKING
 
+import pytest
+
 from openshell._proto import datamodel_pb2, sandbox_pb2
 
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-    from openshell import Sandbox
+    from openshell import Sandbox, SandboxClient
 
 
 # =============================================================================
@@ -168,14 +170,25 @@ def _proxy_connect_then_http():
 
 
 def _read_openshell_log():
-    """Return a closure that reads the openshell log file."""
+    """Return a closure that reads the openshell log file(s).
+
+    Since the sandbox uses a rolling file appender, logs are written to
+    date-stamped files like ``/var/log/openshell.YYYY-MM-DD.log`` instead
+    of a single ``/var/log/openshell.log``.  This helper globs for all
+    matching files so tests work with both the legacy and rolling layouts.
+    """
 
     def fn():
-        try:
-            with open("/var/log/openshell.log") as f:
-                return f.read()
-        except FileNotFoundError:
-            return ""
+        import glob
+
+        logs = []
+        for path in sorted(glob.glob("/var/log/openshell*.log*")):
+            try:
+                with open(path) as f:
+                    logs.append(f.read())
+            except (FileNotFoundError, PermissionError):
+                pass
+        return "\n".join(logs)
 
     return fn
 
@@ -1090,7 +1103,7 @@ def test_l7_tls_log_fields(
 
 def test_live_policy_update_and_logs(
     sandbox: Callable[..., Sandbox],
-    sandbox_client: "SandboxClient",
+    sandbox_client: SandboxClient,
 ) -> None:
     """End-to-end: live policy update lifecycle with log verification."""
     from openshell._proto import openshell_pb2, sandbox_pb2
@@ -1143,8 +1156,8 @@ def test_live_policy_update_and_logs(
         initial_hash = status_resp.revision.policy_hash
 
         # --- LPU-2: Set the same policy -> no new version ---
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=policy_a,
             )
@@ -1156,8 +1169,8 @@ def test_live_policy_update_and_logs(
         assert update_resp.policy_hash == initial_hash
 
         # --- LPU-3: Push policy B -> new version ---
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=policy_b,
             )
@@ -1200,8 +1213,8 @@ def test_live_policy_update_and_logs(
         )
 
         # --- LPU-4: Push policy B again -> unchanged ---
-        update_resp = stub.UpdateSandboxPolicy(
-            openshell_pb2.UpdateSandboxPolicyRequest(
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
                 name=sandbox_name,
                 policy=policy_b,
             )
@@ -1256,6 +1269,81 @@ def test_live_policy_update_and_logs(
             connect_logs = [l for l in sandbox_logs if "CONNECT" in l.message]
             if connect_logs:
                 assert has_fields, "CONNECT logs should have structured fields"
+
+
+def test_live_policy_update_from_empty_network_policies(
+    sandbox: Callable[..., Sandbox],
+    sandbox_client: SandboxClient,
+) -> None:
+    """End-to-end: add the first network rule to a running sandbox."""
+    from openshell._proto import openshell_pb2, sandbox_pb2
+
+    initial_policy = _base_policy()
+    updated_policy = _base_policy(
+        network_policies={
+            "example": sandbox_pb2.NetworkPolicyRule(
+                name="example",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(host="example.com", port=443),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+
+    spec = datamodel_pb2.SandboxSpec(policy=initial_policy)
+    stub = sandbox_client._stub
+
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        sandbox_name = sb.sandbox.name
+
+        denied = sb.exec_python(_proxy_connect(), args=("example.com", 443))
+        assert denied.exit_code == 0, denied.stderr
+        assert "403" in denied.stdout, denied.stdout
+
+        initial_status = stub.GetSandboxPolicyStatus(
+            openshell_pb2.GetSandboxPolicyStatusRequest(name=sandbox_name, version=0)
+        )
+        initial_version = initial_status.revision.version
+
+        update_resp = stub.UpdateConfig(
+            openshell_pb2.UpdateConfigRequest(
+                name=sandbox_name,
+                policy=updated_policy,
+            )
+        )
+        new_version = update_resp.version
+        assert new_version > initial_version, (
+            f"Adding the first network rule should create a new version > {initial_version}, "
+            f"got {new_version}"
+        )
+
+        import time
+
+        deadline = time.time() + 90
+        loaded = False
+        while time.time() < deadline:
+            status_resp = stub.GetSandboxPolicyStatus(
+                openshell_pb2.GetSandboxPolicyStatusRequest(
+                    name=sandbox_name, version=new_version
+                )
+            )
+            status = status_resp.revision.status
+            if status == openshell_pb2.POLICY_STATUS_LOADED:
+                loaded = True
+                break
+            if status == openshell_pb2.POLICY_STATUS_FAILED:
+                pytest.fail(
+                    f"Policy v{new_version} failed to load: "
+                    f"{status_resp.revision.load_error}"
+                )
+            time.sleep(2)
+
+        assert loaded, f"Policy v{new_version} was not loaded within 90s"
+
+        allowed = sb.exec_python(_proxy_connect(), args=("example.com", 443))
+        assert allowed.exit_code == 0, allowed.stderr
+        assert "200" in allowed.stdout, allowed.stdout
 
 
 # =============================================================================
@@ -1542,8 +1630,10 @@ def _verify_sandbox_functional():
             os.unlink(sb_path)
         except Exception as e:
             checks["sandbox_write"] = str(e)
-        # Can read openshell log
-        checks["var_log"] = os.path.exists("/var/log/openshell.log")
+        # Can read openshell log (rolling appender writes date-stamped files)
+        import glob
+
+        checks["var_log"] = len(glob.glob("/var/log/openshell*.log*")) > 0
         return json.dumps(checks)
 
     return fn

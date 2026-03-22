@@ -4,11 +4,13 @@
 pub(crate) mod create_provider;
 pub(crate) mod create_sandbox;
 mod dashboard;
+pub(crate) mod global_settings;
 pub(crate) mod providers;
 pub(crate) mod sandbox_detail;
 mod sandbox_draft;
 pub(crate) mod sandbox_logs;
 mod sandbox_policy;
+pub(crate) mod sandbox_settings;
 pub(crate) mod sandboxes;
 mod splash;
 
@@ -80,7 +82,10 @@ fn draw_sandbox_screen(frame: &mut Frame<'_>, app: &mut App, area: Rect) {
     match app.focus {
         Focus::SandboxLogs => sandbox_logs::draw(frame, app, chunks[1]),
         Focus::SandboxDraft => sandbox_draft::draw(frame, app, chunks[1]),
-        _ => sandbox_policy::draw(frame, app, chunks[1]),
+        _ => match app.sandbox_policy_tab {
+            app::SandboxPolicyTab::Settings => sandbox_settings::draw(frame, app, chunks[1]),
+            app::SandboxPolicyTab::Policy => sandbox_policy::draw(frame, app, chunks[1]),
+        },
     }
 
     // Log detail popup renders over the full frame (not constrained to pane).
@@ -161,10 +166,35 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
     let spans = match app.screen {
         Screen::Splash => unreachable!("splash handled before draw_nav_bar"),
         Screen::Dashboard => match app.focus {
+            Focus::Providers if app.middle_pane_tab == app::MiddlePaneTab::GlobalSettings => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[Tab]", t.key_hint),
+                Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Edit", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[:]", t.muted),
+                Span::styled(" Command  ", t.muted),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
             Focus::Providers => vec![
                 Span::styled(" ", t.text),
                 Span::styled("[Tab]", t.key_hint),
                 Span::styled(" Switch Panel", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
                 Span::styled("  ", t.text),
                 Span::styled("[j/k]", t.key_hint),
                 Span::styled(" Navigate", t.text),
@@ -354,8 +384,31 @@ fn draw_nav_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
                 ]);
                 spans
             }
+            _ if app.sandbox_policy_tab == app::SandboxPolicyTab::Settings => vec![
+                Span::styled(" ", t.text),
+                Span::styled("[h/l]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[j/k]", t.key_hint),
+                Span::styled(" Navigate", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[Enter]", t.key_hint),
+                Span::styled(" Edit", t.text),
+                Span::styled("  ", t.text),
+                Span::styled("[d]", t.key_hint),
+                Span::styled(" Delete", t.text),
+                Span::styled("  |  ", t.border),
+                Span::styled("[Esc]", t.muted),
+                Span::styled(" Back", t.muted),
+                Span::styled("  ", t.text),
+                Span::styled("[q]", t.muted),
+                Span::styled(" Quit", t.muted),
+            ],
             _ => vec![
                 Span::styled(" ", t.text),
+                Span::styled("[h]", t.key_hint),
+                Span::styled(" Switch Tab", t.text),
+                Span::styled("  ", t.text),
                 Span::styled("[j/k]", t.key_hint),
                 Span::styled(" Scroll", t.text),
                 Span::styled("  ", t.text),
@@ -399,4 +452,25 @@ fn draw_command_bar(frame: &mut Frame<'_>, app: &App, area: Rect) {
 
     let bar = Paragraph::new(line).block(Block::default().borders(Borders::NONE));
     frame.render_widget(bar, area);
+}
+
+/// Center a popup rectangle within `area` using percentage-based width and
+/// an absolute height (in rows).
+pub(crate) fn centered_popup(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let vert = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - height.min(100)) / 2),
+            Constraint::Length(height),
+            Constraint::Percentage((100 - height.min(100)) / 2),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vert[1])[1]
 }

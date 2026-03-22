@@ -662,6 +662,21 @@ pub async fn gateway_container_logs<W: std::io::Write>(
     Ok(())
 }
 
+/// Fetch the last `n` lines of container logs for a local gateway as a
+/// `String`.  This is a convenience wrapper for diagnostic call sites (e.g.
+/// failure diagnosis in the CLI) that do not hold a Docker client handle.
+///
+/// Returns an empty string on any Docker/connection error so callers don't
+/// need to worry about error handling.
+pub async fn fetch_gateway_logs(name: &str, n: usize) -> String {
+    let docker = match Docker::connect_with_local_defaults() {
+        Ok(d) => d,
+        Err(_) => return String::new(),
+    };
+    let container = container_name(name);
+    fetch_recent_logs(&docker, &container, n).await
+}
+
 fn default_gateway_image_ref() -> String {
     if let Ok(image) = std::env::var("OPENSHELL_CLUSTER_IMAGE")
         && !image.trim().is_empty()
@@ -1008,7 +1023,11 @@ async fn wait_for_namespace(
                 }
 
                 if attempt + 1 == attempts {
-                    return Err(err).wrap_err("K8s namespace not ready");
+                    let logs = fetch_recent_logs(docker, container_name, 40).await;
+                    return Err(miette::miette!(
+                        "exec failed on final attempt while waiting for namespace '{namespace}': {err}\n{logs}"
+                    ))
+                    .wrap_err("K8s namespace not ready");
                 }
                 tokio::time::sleep(backoff).await;
                 backoff = std::cmp::min(backoff.saturating_mul(2), max_backoff);
@@ -1021,8 +1040,9 @@ async fn wait_for_namespace(
         }
 
         if attempt + 1 == attempts {
+            let logs = fetch_recent_logs(docker, container_name, 40).await;
             return Err(miette::miette!(
-                "timed out waiting for namespace '{namespace}' to exist: {output}"
+                "timed out waiting for namespace '{namespace}' to exist: {output}\n{logs}"
             ))
             .wrap_err("K8s namespace not ready");
         }

@@ -1,0 +1,446 @@
+{
+    "attributes": [
+        {
+            "name": {
+                "type": "process_name_t",
+                "description": "The friendly name of the process, for example: <code>Notepad++</code>.",
+                "requirement": "recommended",
+                "caption": "Name",
+                "type_name": "String",
+                "_source": "process_entity"
+            }
+        },
+        {
+            "pid": {
+                "type": "integer_t",
+                "description": "The process identifier, as reported by the operating system. Process ID (PID) is a number used by the operating system to uniquely identify an active process.",
+                "requirement": "recommended",
+                "caption": "Process ID",
+                "type_name": "Integer",
+                "observable": 15,
+                "_source": "process_entity"
+            }
+        },
+        {
+            "session": {
+                "type": "object_t",
+                "description": "The user session under which this process is running.",
+                "requirement": "optional",
+                "caption": "Session",
+                "object_name": "Session",
+                "object_type": "session",
+                "_source": "process"
+            }
+        },
+        {
+            "file": {
+                "type": "object_t",
+                "description": "The process file object.",
+                "requirement": "recommended",
+                "caption": "File",
+                "object_name": "File",
+                "object_type": "file",
+                "_source": "process"
+            }
+        },
+        {
+            "user": {
+                "type": "object_t",
+                "description": "The user under which this process is running.",
+                "requirement": "recommended",
+                "caption": "User",
+                "object_name": "User",
+                "object_type": "user",
+                "_source": "process"
+            }
+        },
+        {
+            "path": {
+                "type": "string_t",
+                "description": "The process file path.",
+                "requirement": "optional",
+                "caption": "Path",
+                "type_name": "String",
+                "_source": "process_entity"
+            }
+        },
+        {
+            "group": {
+                "profile": "linux/linux_users",
+                "type": "object_t",
+                "description": "The group under which this process is running.",
+                "requirement": "recommended",
+                "caption": "Group",
+                "object_name": "Group",
+                "object_type": "group",
+                "_source": "linux/process",
+                "_source_patched": "process"
+            }
+        },
+        {
+            "tid": {
+                "type": "integer_t",
+                "description": "The identifier of the thread associated with the event, as returned by the operating system.",
+                "requirement": "optional",
+                "caption": "Thread ID",
+                "type_name": "Integer",
+                "@deprecated": {
+                    "message": "<code>tid</code> is deprecated in favor of <code>ptid</code>. <code>ptid</code> has type <code>long_t</code> which can accommodate the thread identifiers returned by all platforms (e.g. 64-bit on MacOS).",
+                    "since": "1.6.0"
+                },
+                "_source": "process"
+            }
+        },
+        {
+            "uid": {
+                "type": "string_t",
+                "description": "A unique identifier for this process assigned by the producer (tool).  Facilitates correlation of a process event with other events for that process.",
+                "requirement": "recommended",
+                "caption": "Unique ID",
+                "type_name": "String",
+                "observable": 39,
+                "_source": "process_entity"
+            }
+        },
+        {
+            "loaded_modules": {
+                "type": "string_t",
+                "description": "The list of loaded module names.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Loaded Modules",
+                "type_name": "String",
+                "_source": "process"
+            }
+        },
+        {
+            "ancestry": {
+                "type": "object_t",
+                "description": "An array of Process Entities describing the extended parentage of this process object. Direct parent information should be expressed through the <code>parent_process</code> attribute. The first array element is the direct parent of this process object. Subsequent list elements go up the process parentage hierarchy. That is, the array is sorted from newest to oldest process. It is recommended to only populate this field for the top-level process object.",
+                "is_array": true,
+                "references": [
+                    {
+                        "description": "Guidance on Representing Process Parentage",
+                        "url": "https://github.com/ocsf/ocsf-docs/blob/main/articles/representing-process-parentage.md"
+                    }
+                ],
+                "requirement": "optional",
+                "caption": "Ancestry",
+                "object_name": "Process Entity",
+                "object_type": "process_entity",
+                "_source": "process"
+            }
+        },
+        {
+            "cmd_line": {
+                "type": "string_t",
+                "description": "The full command line used to launch an application, service, process, or job. For example: <code>ssh user@10.0.0.10</code>. If the command line is unavailable or missing, the empty string <code>''</code> is to be used.",
+                "requirement": "recommended",
+                "caption": "Command Line",
+                "type_name": "String",
+                "observable": 13,
+                "_source": "process_entity"
+            }
+        },
+        {
+            "container": {
+                "profile": "container",
+                "type": "object_t",
+                "description": "The information describing an instance of a container. A container is a prepackaged, portable system image that runs isolated on an existing system using a container runtime like containerd.",
+                "group": "context",
+                "requirement": "recommended",
+                "caption": "Container",
+                "object_name": "Container",
+                "object_type": "container",
+                "_source": "process"
+            }
+        },
+        {
+            "cpid": {
+                "type": "uuid_t",
+                "description": "A unique process identifier that can be assigned deterministically by multiple system data producers.",
+                "source": "cpid",
+                "references": [
+                    {
+                        "description": "OCSF Common Process Identifier (CPID) Specification",
+                        "url": "https://github.com/ocsf/common-process-id"
+                    }
+                ],
+                "requirement": "recommended",
+                "caption": "Common Process Identifier",
+                "type_name": "UUID",
+                "_source": "process_entity"
+            }
+        },
+        {
+            "created_time": {
+                "type": "timestamp_t",
+                "description": "The time when the process was created/started.",
+                "requirement": "recommended",
+                "caption": "Created Time",
+                "type_name": "Timestamp",
+                "_source": "process_entity"
+            }
+        },
+        {
+            "environment_variables": {
+                "type": "object_t",
+                "description": "Environment variables associated with the process.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Environment Variables",
+                "object_name": "Environment Variable",
+                "object_type": "environment_variable",
+                "_source": "process"
+            }
+        },
+        {
+            "integrity": {
+                "type": "string_t",
+                "description": "The process integrity level, normalized to the caption of the integrity_id value. In the case of 'Other', it is defined by the event source (Windows only).",
+                "requirement": "optional",
+                "caption": "Integrity",
+                "type_name": "String",
+                "_source": "process",
+                "_sibling_of": "integrity_id"
+            }
+        },
+        {
+            "integrity_id": {
+                "type": "integer_t",
+                "enum": {
+                    "3": {
+                        "caption": "Medium"
+                    },
+                    "6": {
+                        "caption": "Protected"
+                    },
+                    "0": {
+                        "description": "The integrity level is unknown.",
+                        "caption": "Unknown"
+                    },
+                    "1": {
+                        "caption": "Untrusted"
+                    },
+                    "2": {
+                        "caption": "Low"
+                    },
+                    "99": {
+                        "description": "The integrity level is not mapped. See the <code>integrity</code> attribute, which contains a data source specific value.",
+                        "caption": "Other"
+                    },
+                    "4": {
+                        "caption": "High"
+                    },
+                    "5": {
+                        "caption": "System"
+                    }
+                },
+                "description": "The normalized identifier of the process integrity level (Windows only).",
+                "requirement": "optional",
+                "caption": "Integrity Level",
+                "type_name": "Integer",
+                "sibling": "integrity",
+                "_source": "process"
+            }
+        },
+        {
+            "lineage": {
+                "type": "file_path_t",
+                "description": "The lineage of the process, represented by a list of paths for each ancestor process. For example: <code>['/usr/sbin/sshd', '/usr/bin/bash', '/usr/bin/whoami']</code>.",
+                "is_array": true,
+                "requirement": "optional",
+                "caption": "Lineage",
+                "type_name": "File Path",
+                "@deprecated": {
+                    "message": "Use the <code>ancestry</code> attribute.",
+                    "since": "1.4.0"
+                },
+                "_source": "process"
+            }
+        },
+        {
+            "namespace_pid": {
+                "profile": "container",
+                "type": "integer_t",
+                "description": "If running under a process namespace (such as in a container), the process identifier within that process namespace.",
+                "group": "context",
+                "requirement": "recommended",
+                "caption": "Namespace PID",
+                "type_name": "Integer",
+                "_source": "process"
+            }
+        },
+        {
+            "parent_process": {
+                "type": "object_t",
+                "description": "The parent process of this process object. It is recommended to only populate this field for the top-level process object, to prevent deep nesting. Additional ancestry information can be supplied in the <code>ancestry</code> attribute.",
+                "references": [
+                    {
+                        "description": "Guidance on Representing Process Parentage",
+                        "url": "https://github.com/ocsf/ocsf-docs/blob/main/articles/representing-process-parentage.md"
+                    }
+                ],
+                "requirement": "recommended",
+                "caption": "Parent Process",
+                "object_name": "Process",
+                "object_type": "process",
+                "_source": "process"
+            }
+        },
+        {
+            "ptid": {
+                "type": "long_t",
+                "description": "The identifier of the process thread associated with the event, as returned by the operating system.",
+                "requirement": "optional",
+                "caption": "Process Thread ID",
+                "type_name": "Long",
+                "_source": "process"
+            }
+        },
+        {
+            "sandbox": {
+                "type": "string_t",
+                "description": "The name of the containment jail (i.e., sandbox). For example, hardened_ps, high_security_ps, oracle_ps, netsvcs_ps, or default_ps.",
+                "requirement": "optional",
+                "caption": "Sandbox",
+                "type_name": "String",
+                "_source": "process"
+            }
+        },
+        {
+            "terminated_time": {
+                "type": "timestamp_t",
+                "description": "The time when the process was terminated.",
+                "requirement": "optional",
+                "caption": "Terminated Time",
+                "type_name": "Timestamp",
+                "_source": "process"
+            }
+        },
+        {
+            "working_directory": {
+                "type": "string_t",
+                "description": "The working directory of a process.",
+                "requirement": "optional",
+                "caption": "Working Directory",
+                "type_name": "String",
+                "_source": "process"
+            }
+        },
+        {
+            "xattributes": {
+                "type": "object_t",
+                "description": "An unordered collection of zero or more name/value pairs that represent a process extended attribute.",
+                "requirement": "optional",
+                "caption": "Extended Attributes",
+                "object_name": "Object",
+                "object_type": "object",
+                "_source": "process"
+            }
+        },
+        {
+            "auid": {
+                "profile": "linux/linux_users",
+                "type": "integer_t",
+                "description": "The audit user assigned at login by the audit subsystem.",
+                "extension": "linux",
+                "requirement": "optional",
+                "extension_id": 1,
+                "caption": "Audit User ID",
+                "type_name": "Integer",
+                "_source": "linux/process",
+                "_source_patched": "process"
+            }
+        },
+        {
+            "egid": {
+                "profile": "linux/linux_users",
+                "type": "integer_t",
+                "description": "The effective group under which this process is running.",
+                "extension": "linux",
+                "requirement": "optional",
+                "extension_id": 1,
+                "caption": "Effective Group ID",
+                "type_name": "Integer",
+                "_source": "linux/process",
+                "_source_patched": "process"
+            }
+        },
+        {
+            "euid": {
+                "profile": "linux/linux_users",
+                "type": "integer_t",
+                "description": "The effective user under which this process is running.",
+                "extension": "linux",
+                "requirement": "optional",
+                "extension_id": 1,
+                "caption": "Effective User ID",
+                "type_name": "Integer",
+                "_source": "linux/process",
+                "_source_patched": "process"
+            }
+        },
+        {
+            "hosted_services": {
+                "type": "object_t",
+                "description": "The Windows services that this process is hosting.",
+                "extension": "win",
+                "is_array": true,
+                "requirement": "optional",
+                "extension_id": 2,
+                "caption": "Hosted Services",
+                "object_name": "Windows Service",
+                "object_type": "win/win_service",
+                "_source": "win/process",
+                "_source_patched": "process"
+            }
+        },
+        {
+            "terminated_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The time when the process was terminated.",
+                "requirement": "optional",
+                "caption": "Terminated Time",
+                "type_name": "Datetime",
+                "_source": "process"
+            }
+        },
+        {
+            "created_time_dt": {
+                "profile": "datetime",
+                "type": "datetime_t",
+                "description": "The time when the process was created/started.",
+                "requirement": "optional",
+                "caption": "Created Time",
+                "type_name": "Datetime",
+                "_source": "process_entity"
+            }
+        }
+    ],
+    "name": "process",
+    "description": "The Process object describes a running instance of a launched program.",
+    "extends": "process_entity",
+    "constraints": {
+        "at_least_one": [
+            "pid",
+            "uid",
+            "cpid"
+        ]
+    },
+    "references": [
+        {
+            "description": "D3FEND\u2122 Ontology d3f:Process",
+            "url": "https://d3fend.mitre.org/dao/artifact/d3f:Process/"
+        }
+    ],
+    "profiles": [
+        "container",
+        "linux/linux_users",
+        "data_classification",
+        "datetime"
+    ],
+    "caption": "Process",
+    "observable": 25
+}

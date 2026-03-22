@@ -435,13 +435,23 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        _: tonic::Request<openshell_core::proto::GetSandboxPolicyRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxPolicyResponse>, tonic::Status>
+        _: tonic::Request<openshell_core::proto::GetSandboxConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetSandboxConfigResponse>, tonic::Status>
     {
         Ok(tonic::Response::new(
-            openshell_core::proto::GetSandboxPolicyResponse::default(),
+            openshell_core::proto::GetSandboxConfigResponse::default(),
+        ))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _: tonic::Request<openshell_core::proto::GetGatewayConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::GetGatewayConfigResponse>, tonic::Status>
+    {
+        Ok(tonic::Response::new(
+            openshell_core::proto::GetGatewayConfigResponse::default(),
         ))
     }
 
@@ -539,11 +549,10 @@ impl openshell_core::proto::open_shell_server::OpenShell for TestOpenShell {
         ))
     }
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        _: tonic::Request<openshell_core::proto::UpdateSandboxPolicyRequest>,
-    ) -> Result<tonic::Response<openshell_core::proto::UpdateSandboxPolicyResponse>, tonic::Status>
-    {
+        _: tonic::Request<openshell_core::proto::UpdateConfigRequest>,
+    ) -> Result<tonic::Response<openshell_core::proto::UpdateConfigResponse>, tonic::Status> {
         Err(tonic::Status::unimplemented("test"))
     }
 

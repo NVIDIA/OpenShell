@@ -43,7 +43,7 @@ The following community sandboxes are available in the catalog.
 | Sandbox | Description |
 |---|---|
 | `base` | Foundational image with system tools and dev environment |
-| `ollama` | Ollama with cloud and local model support, Claude Code, Codex, and OpenClaw pre-installed |
+| `ollama` | Ollama with cloud and local model support, Claude Code, OpenCode, and Codex pre-installed. Use `ollama launch` inside the sandbox to start coding agents with zero config.
 | `openclaw` | Open agent manipulation and control |
 | `sdg` | Synthetic data generation workflows |
 

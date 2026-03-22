@@ -1310,18 +1310,29 @@ async fn run_policy_poll_loop(
     interval_secs: u64,
 ) -> Result<()> {
     use crate::grpc_client::CachedOpenShellClient;
+    use openshell_core::proto::PolicySource;
 
     let client = CachedOpenShellClient::connect(endpoint).await?;
-    let mut current_version: u32 = 0;
+    let mut current_config_revision: u64 = 0;
+    let mut current_policy_hash = String::new();
+    let mut current_settings: std::collections::HashMap<
+        String,
+        openshell_core::proto::EffectiveSetting,
+    > = std::collections::HashMap::new();
 
-    // Initialize current_version from the first poll.
-    match client.poll_policy(sandbox_id).await {
+    // Initialize revision from the first poll.
+    match client.poll_settings(sandbox_id).await {
         Ok(result) => {
-            current_version = result.version;
-            debug!(version = current_version, "Policy poll: initial version");
+            current_config_revision = result.config_revision;
+            current_policy_hash = result.policy_hash.clone();
+            current_settings = result.settings;
+            debug!(
+                config_revision = current_config_revision,
+                "Settings poll: initial config revision"
+            );
         }
         Err(e) => {
-            warn!(error = %e, "Policy poll: failed to fetch initial version, will retry");
+            warn!(error = %e, "Settings poll: failed to fetch initial version, will retry");
         }
     }
 
@@ -1329,54 +1340,124 @@ async fn run_policy_poll_loop(
     loop {
         tokio::time::sleep(interval).await;
 
-        let result = match client.poll_policy(sandbox_id).await {
+        let result = match client.poll_settings(sandbox_id).await {
             Ok(r) => r,
             Err(e) => {
-                debug!(error = %e, "Policy poll: server unreachable, will retry");
+                debug!(error = %e, "Settings poll: server unreachable, will retry");
                 continue;
             }
         };
 
-        if result.version <= current_version {
+        if result.config_revision == current_config_revision {
             continue;
         }
 
+        let policy_changed = result.policy_hash != current_policy_hash;
+
+        // Log which settings changed.
+        log_setting_changes(&current_settings, &result.settings);
+
         info!(
-            old_version = current_version,
-            new_version = result.version,
-            policy_hash = %result.policy_hash,
-            "Policy poll: new version detected, reloading"
+            old_config_revision = current_config_revision,
+            new_config_revision = result.config_revision,
+            policy_changed,
+            "Settings poll: config change detected"
         );
 
-        match opa_engine.reload_from_proto(&result.policy) {
-            Ok(()) => {
-                current_version = result.version;
-                info!(
-                    version = current_version,
-                    policy_hash = %result.policy_hash,
-                    "Policy reloaded successfully"
-                );
-                if let Err(e) = client
-                    .report_policy_status(sandbox_id, result.version, true, "")
-                    .await
-                {
-                    warn!(error = %e, "Failed to report policy load success");
-                }
-            }
-            Err(e) => {
+        // Only reload OPA when the policy payload actually changed.
+        if policy_changed {
+            let Some(policy) = result.policy.as_ref() else {
                 warn!(
-                    version = result.version,
-                    error = %e,
-                    "Policy reload failed, keeping last-known-good policy"
+                    "Settings poll: policy hash changed but no policy payload present; skipping reload"
                 );
-                if let Err(report_err) = client
-                    .report_policy_status(sandbox_id, result.version, false, &e.to_string())
-                    .await
-                {
-                    warn!(error = %report_err, "Failed to report policy load failure");
+                current_config_revision = result.config_revision;
+                current_policy_hash = result.policy_hash;
+                current_settings = result.settings;
+                continue;
+            };
+
+            match opa_engine.reload_from_proto(policy) {
+                Ok(()) => {
+                    if result.global_policy_version > 0 {
+                        info!(
+                            policy_hash = %result.policy_hash,
+                            global_version = result.global_policy_version,
+                            "Policy reloaded successfully (global)"
+                        );
+                    } else {
+                        info!(
+                            policy_hash = %result.policy_hash,
+                            "Policy reloaded successfully"
+                        );
+                    }
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        if let Err(e) = client
+                            .report_policy_status(sandbox_id, result.version, true, "")
+                            .await
+                        {
+                            warn!(error = %e, "Failed to report policy load success");
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                            version = result.version,
+                        error = %e,
+                        "Policy reload failed, keeping last-known-good policy"
+                    );
+                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
+                        if let Err(report_err) = client
+                            .report_policy_status(sandbox_id, result.version, false, &e.to_string())
+                            .await
+                        {
+                            warn!(error = %report_err, "Failed to report policy load failure");
+                        }
+                    }
                 }
             }
         }
+
+        current_config_revision = result.config_revision;
+        current_policy_hash = result.policy_hash;
+        current_settings = result.settings;
+    }
+}
+
+/// Log individual setting changes between two snapshots.
+fn log_setting_changes(
+    old: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    new: &std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+) {
+    for (key, new_es) in new {
+        let new_val = format_setting_value(new_es);
+        match old.get(key) {
+            Some(old_es) => {
+                let old_val = format_setting_value(old_es);
+                if old_val != new_val {
+                    info!(key, old = %old_val, new = %new_val, "Setting changed");
+                }
+            }
+            None => {
+                info!(key, value = %new_val, "Setting added");
+            }
+        }
+    }
+    for key in old.keys() {
+        if !new.contains_key(key) {
+            info!(key, "Setting removed");
+        }
+    }
+}
+
+/// Format an `EffectiveSetting` value for log display.
+fn format_setting_value(es: &openshell_core::proto::EffectiveSetting) -> String {
+    use openshell_core::proto::setting_value;
+    match es.value.as_ref().and_then(|sv| sv.value.as_ref()) {
+        None => "<unset>".to_string(),
+        Some(setting_value::Value::StringValue(v)) => v.clone(),
+        Some(setting_value::Value::BoolValue(v)) => v.to_string(),
+        Some(setting_value::Value::IntValue(v)) => v.to_string(),
+        Some(setting_value::Value::BytesValue(_)) => "<bytes>".to_string(),
     }
 }
 

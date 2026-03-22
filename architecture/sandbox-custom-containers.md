@@ -67,7 +67,7 @@ The server applies these transforms to every sandbox pod template (`sandbox/mod.
 3. Overrides the agent container's `command` to `/opt/openshell/bin/openshell-sandbox`.
 4. Sets `runAsUser: 0` so the supervisor has root privileges for namespace creation, proxy setup, and Landlock/seccomp.
 
-These transforms apply to both generated templates and user-provided `pod_template` overrides.
+These transforms apply to every generated pod template.
 
 ## CLI Usage
 

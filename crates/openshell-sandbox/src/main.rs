@@ -95,15 +95,18 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Try to open the log file; fall back to stdout-only logging if it fails
+    // Try to open a rolling log file; fall back to stdout-only logging if it fails
     // (e.g., /var/log is not writable in custom workload images).
-    let file_logging = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/var/log/openshell.log")
+    // Rotates daily, keeps the 3 most recent files to bound disk usage.
+    let file_logging = tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("openshell")
+        .filename_suffix("log")
+        .max_log_files(3)
+        .build("/var/log")
         .ok()
-        .map(|file| {
-            let (writer, guard) = tracing_appender::non_blocking(file);
+        .map(|roller| {
+            let (writer, guard) = tracing_appender::non_blocking(roller);
             (writer, guard)
         });
 
@@ -156,7 +159,7 @@ async fn main() -> Result<()> {
             .with(push_layer)
             .init();
         // Log the warning after the subscriber is initialized
-        warn!("Could not open /var/log/openshell.log; using stdout-only logging");
+        warn!("Could not open /var/log for log rotation; using stdout-only logging");
         None
     };
 

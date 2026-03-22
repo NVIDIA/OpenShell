@@ -164,6 +164,7 @@ const HELP_TEMPLATE: &str = "\
   forward:     Manage port forwarding to a sandbox
   logs:        View sandbox logs
   policy:      Manage sandbox policy
+  settings:    Manage sandbox and global settings
   provider:    Manage provider configuration
 
 \x1b[1mGATEWAY COMMANDS\x1b[0m
@@ -249,7 +250,19 @@ const POLICY_EXAMPLES: &str = "\x1b[1mALIAS\x1b[0m
 \x1b[1mEXAMPLES\x1b[0m
   $ openshell policy get my-sandbox
   $ openshell policy set my-sandbox --policy policy.yaml
+  $ openshell policy set --global --policy policy.yaml
+  $ openshell policy delete --global
   $ openshell policy list my-sandbox
+";
+
+const SETTINGS_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
+  $ openshell settings get my-sandbox
+  $ openshell settings get --global
+  $ openshell settings set my-sandbox --key log_level --value debug
+  $ openshell settings set --global --key log_level --value warn
+  $ openshell settings set --global --key dummy_bool --value yes
+  $ openshell settings set --global --key dummy_int --value 42
+  $ openshell settings delete --global --key log_level
 ";
 
 const PROVIDER_EXAMPLES: &str = "\x1b[1mEXAMPLES\x1b[0m
@@ -395,6 +408,13 @@ enum Commands {
     Policy {
         #[command(subcommand)]
         command: Option<PolicyCommands>,
+    },
+
+    /// Manage sandbox and gateway settings.
+    #[command(after_help = SETTINGS_EXAMPLES, help_template = SUBCOMMAND_HELP_TEMPLATE)]
+    Settings {
+        #[command(subcommand)]
+        command: Option<SettingsCommands>,
     },
 
     /// Manage network rules for a sandbox.
@@ -1324,13 +1344,21 @@ enum PolicyCommands {
     /// Update policy on a live sandbox.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Set {
-        /// Sandbox name (defaults to last-used sandbox).
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Path to the policy YAML file.
         #[arg(long, value_hint = ValueHint::FilePath)]
         policy: String,
+
+        /// Apply as a gateway-global policy for all sandboxes.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global policy updates.
+        #[arg(long)]
+        yes: bool,
 
         /// Wait for the sandbox to load the policy.
         #[arg(long)]
@@ -1341,10 +1369,10 @@ enum PolicyCommands {
         timeout: u64,
     },
 
-    /// Show current active policy for a sandbox.
+    /// Show current active policy for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     Get {
-        /// Sandbox name (defaults to last-used sandbox).
+        /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
@@ -1355,18 +1383,101 @@ enum PolicyCommands {
         /// Print the full policy as YAML.
         #[arg(long)]
         full: bool,
+
+        /// Show the global policy revision.
+        #[arg(long)]
+        global: bool,
     },
 
-    /// List policy history for a sandbox.
+    /// List policy history for a sandbox or the global policy.
     #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
     List {
-        /// Sandbox name (defaults to last-used sandbox).
+        /// Sandbox name (defaults to last-used sandbox). Ignored with --global.
         #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
         name: Option<String>,
 
         /// Maximum number of revisions to return.
         #[arg(long, default_value_t = 20)]
         limit: u32,
+
+        /// List global policy revisions.
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Delete the gateway-global policy lock, restoring sandbox-level policy control.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Delete the global policy setting.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global policy delete.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum SettingsCommands {
+    /// Show effective settings for a sandbox or gateway-global scope.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Get {
+        /// Sandbox name (defaults to last-used sandbox).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Show gateway-global settings.
+        #[arg(long)]
+        global: bool,
+
+        /// Output as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Set a single setting key.
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Set {
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Setting key.
+        #[arg(long)]
+        key: String,
+
+        /// Setting value (string input; bool keys accept true/false/yes/no/1/0).
+        #[arg(long)]
+        value: String,
+
+        /// Apply at gateway-global scope.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global setting updates.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Delete a setting key (sandbox-scoped or gateway-global).
+    #[command(help_template = LEAF_HELP_TEMPLATE, next_help_heading = "FLAGS")]
+    Delete {
+        /// Sandbox name (defaults to last-used sandbox when not using --global).
+        #[arg(add = ArgValueCompleter::new(completers::complete_sandbox_names))]
+        name: Option<String>,
+
+        /// Setting key.
+        #[arg(long)]
+        key: String,
+
+        /// Delete at gateway-global scope.
+        #[arg(long)]
+        global: bool,
+
+        /// Skip the confirmation prompt for global setting delete.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -1730,20 +1841,119 @@ async fn main() -> Result<()> {
                 PolicyCommands::Set {
                     name,
                     policy,
+                    global,
+                    yes,
                     wait,
                     timeout,
                 } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
+                    if global {
+                        if wait {
+                            return Err(miette::miette!(
+                                "--wait is not supported for global policies; \
+                                 global policies are effective immediately"
+                            ));
+                        }
+                        run::sandbox_policy_set_global(
+                            &ctx.endpoint,
+                            &policy,
+                            yes,
+                            wait,
+                            timeout,
+                            &tls,
+                        )
                         .await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_policy_set(&ctx.endpoint, &name, &policy, wait, timeout, &tls)
+                            .await?;
+                    }
                 }
-                PolicyCommands::Get { name, rev, full } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                PolicyCommands::Get {
+                    name,
+                    rev,
+                    full,
+                    global,
+                } => {
+                    if global {
+                        run::sandbox_policy_get_global(&ctx.endpoint, rev, full, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_policy_get(&ctx.endpoint, &name, rev, full, &tls).await?;
+                    }
                 }
-                PolicyCommands::List { name, limit } => {
-                    let name = resolve_sandbox_name(name, &ctx.name)?;
-                    run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                PolicyCommands::List {
+                    name,
+                    limit,
+                    global,
+                } => {
+                    if global {
+                        run::sandbox_policy_list_global(&ctx.endpoint, limit, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_policy_list(&ctx.endpoint, &name, limit, &tls).await?;
+                    }
+                }
+                PolicyCommands::Delete { global, yes } => {
+                    if !global {
+                        return Err(miette::miette!(
+                            "sandbox policy delete is not supported; use --global to remove global policy lock"
+                        ));
+                    }
+                    run::gateway_setting_delete(&ctx.endpoint, "policy", yes, &tls).await?;
+                }
+            }
+        }
+
+        // -----------------------------------------------------------
+        // Settings commands
+        // -----------------------------------------------------------
+        Some(Commands::Settings {
+            command: Some(settings_cmd),
+        }) => {
+            let ctx = resolve_gateway(&cli.gateway, &cli.gateway_endpoint)?;
+            let mut tls = tls.with_gateway_name(&ctx.name);
+            apply_edge_auth(&mut tls, &ctx.name);
+
+            match settings_cmd {
+                SettingsCommands::Get { name, global, json } => {
+                    if global {
+                        if name.is_some() {
+                            return Err(miette::miette!(
+                                "settings get --global does not accept a sandbox name"
+                            ));
+                        }
+                        run::gateway_settings_get(&ctx.endpoint, json, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_settings_get(&ctx.endpoint, &name, json, &tls).await?;
+                    }
+                }
+                SettingsCommands::Set {
+                    name,
+                    key,
+                    value,
+                    global,
+                    yes,
+                } => {
+                    if global {
+                        run::gateway_setting_set(&ctx.endpoint, &key, &value, yes, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_setting_set(&ctx.endpoint, &name, &key, &value, &tls).await?;
+                    }
+                }
+                SettingsCommands::Delete {
+                    name,
+                    key,
+                    global,
+                    yes,
+                } => {
+                    if global {
+                        run::gateway_setting_delete(&ctx.endpoint, &key, yes, &tls).await?;
+                    } else {
+                        let name = resolve_sandbox_name(name, &ctx.name)?;
+                        run::sandbox_setting_delete(&ctx.endpoint, &name, &key, &tls).await?;
+                    }
                 }
             }
         }
@@ -2226,6 +2436,13 @@ async fn main() -> Result<()> {
             Cli::command()
                 .find_subcommand_mut("policy")
                 .expect("policy subcommand exists")
+                .print_help()
+                .expect("Failed to print help");
+        }
+        Some(Commands::Settings { command: None }) => {
+            Cli::command()
+                .find_subcommand_mut("settings")
+                .expect("settings subcommand exists")
                 .print_help()
                 .expect("Failed to print help");
         }
@@ -2801,6 +3018,101 @@ mod tests {
                 assert_eq!(gateway_name.as_deref(), Some("my-gateway"));
             }
             other => panic!("expected SshProxy, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_set_global_parses_yes_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "settings",
+            "set",
+            "--global",
+            "--key",
+            "log_level",
+            "--value",
+            "warn",
+            "--yes",
+        ])
+        .expect("settings set --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command:
+                    Some(SettingsCommands::Set {
+                        global,
+                        yes,
+                        key,
+                        value,
+                        ..
+                    }),
+            }) => {
+                assert!(global);
+                assert!(yes);
+                assert_eq!(key, "log_level");
+                assert_eq!(value, "warn");
+            }
+            other => panic!("expected settings set command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_get_global_parses() {
+        let cli = Cli::try_parse_from(["openshell", "settings", "get", "--global"])
+            .expect("settings get --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command: Some(SettingsCommands::Get { name, global, .. }),
+            }) => {
+                assert!(global);
+                assert!(name.is_none());
+            }
+            other => panic!("expected settings get command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn policy_delete_global_parses() {
+        let cli = Cli::try_parse_from(["openshell", "policy", "delete", "--global", "--yes"])
+            .expect("policy delete --global should parse");
+
+        match cli.command {
+            Some(Commands::Policy {
+                command: Some(PolicyCommands::Delete { global, yes }),
+            }) => {
+                assert!(global);
+                assert!(yes);
+            }
+            other => panic!("expected policy delete command, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn settings_delete_global_parses_yes_flag() {
+        let cli = Cli::try_parse_from([
+            "openshell",
+            "settings",
+            "delete",
+            "--global",
+            "--key",
+            "log_level",
+            "--yes",
+        ])
+        .expect("settings delete --global should parse");
+
+        match cli.command {
+            Some(Commands::Settings {
+                command:
+                    Some(SettingsCommands::Delete {
+                        key, global, yes, ..
+                    }),
+            }) => {
+                assert_eq!(key, "log_level");
+                assert!(global);
+                assert!(yes);
+            }
+            other => panic!("expected settings delete command, got: {other:?}"),
         }
     }
 }

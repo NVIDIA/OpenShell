@@ -448,14 +448,18 @@ pub fn generic_failure_diagnosis(gateway_name: &str) -> GatewayFailureDiagnosis 
         explanation: "The gateway encountered an unexpected error during startup.".to_string(),
         recovery_steps: vec![
             RecoveryStep::with_command(
+                "Check container logs for details",
+                format!("openshell doctor logs --name {gateway_name}"),
+            ),
+            RecoveryStep::with_command(
+                "Run diagnostics",
+                format!("openshell doctor check --name {gateway_name}"),
+            ),
+            RecoveryStep::with_command(
                 "Try destroying and recreating the gateway",
                 format!(
                     "openshell gateway destroy --name {gateway_name} && openshell gateway start"
                 ),
-            ),
-            RecoveryStep::with_command(
-                "Check container logs for details",
-                format!("docker logs openshell-cluster-{gateway_name}"),
             ),
             RecoveryStep::new(
                 "If the issue persists, report it at https://github.com/nvidia/openshell/issues",
@@ -728,5 +732,197 @@ mod tests {
             d.summary
         );
         assert!(d.retryable);
+    }
+
+    // -- generic_failure_diagnosis tests --
+
+    #[test]
+    fn generic_diagnosis_suggests_doctor_logs() {
+        let d = generic_failure_diagnosis("my-gw");
+        let commands: Vec<String> = d
+            .recovery_steps
+            .iter()
+            .filter_map(|s| s.command.clone())
+            .collect();
+        assert!(
+            commands.iter().any(|c| c.contains("openshell doctor logs")),
+            "expected 'openshell doctor logs' in recovery commands, got: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn generic_diagnosis_suggests_doctor_check() {
+        let d = generic_failure_diagnosis("my-gw");
+        let commands: Vec<String> = d
+            .recovery_steps
+            .iter()
+            .filter_map(|s| s.command.clone())
+            .collect();
+        assert!(
+            commands
+                .iter()
+                .any(|c| c.contains("openshell doctor check")),
+            "expected 'openshell doctor check' in recovery commands, got: {commands:?}"
+        );
+    }
+
+    #[test]
+    fn generic_diagnosis_includes_gateway_name() {
+        let d = generic_failure_diagnosis("custom-name");
+        let all_text: String = d
+            .recovery_steps
+            .iter()
+            .filter_map(|s| s.command.clone())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            all_text.contains("custom-name"),
+            "expected gateway name in recovery commands, got: {all_text}"
+        );
+    }
+
+    // -- fallback behavior tests --
+
+    #[test]
+    fn namespace_timeout_without_logs_returns_none() {
+        // This is the most common user-facing error: a plain timeout with only
+        // kubectl output. It must NOT match any specific pattern so the caller
+        // can fall back to generic_failure_diagnosis.
+        let diagnosis = diagnose_failure(
+            "test",
+            "K8s namespace not ready\n\nCaused by:\n    \
+             timed out waiting for namespace 'openshell' to exist: \
+             error: the server doesn't have a resource type \"namespace\"",
+            None,
+        );
+        assert!(
+            diagnosis.is_none(),
+            "plain namespace timeout should not match any specific pattern, got: {:?}",
+            diagnosis.map(|d| d.summary)
+        );
+    }
+
+    #[test]
+    fn namespace_timeout_with_pressure_logs_matches() {
+        // When container logs reveal node pressure, the diagnosis engine
+        // should detect it even though the error message itself is generic.
+        let diagnosis = diagnose_failure(
+            "test",
+            "K8s namespace not ready\n\nCaused by:\n    \
+             timed out waiting for namespace 'openshell' to exist: <kubectl output>",
+            Some("HEALTHCHECK_NODE_PRESSURE: DiskPressure"),
+        );
+        assert!(diagnosis.is_some(), "expected node pressure diagnosis");
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("pressure"),
+            "expected pressure in summary, got: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn namespace_timeout_with_corrupted_state_logs_matches() {
+        // Container logs revealing RBAC corruption should be caught.
+        let diagnosis = diagnose_failure(
+            "test",
+            "K8s namespace not ready\n\nCaused by:\n    \
+             timed out waiting for namespace 'openshell' to exist: <output>",
+            Some(
+                "configmaps \"extension-apiserver-authentication\" is forbidden: \
+                 User cannot get resource",
+            ),
+        );
+        assert!(diagnosis.is_some(), "expected corrupted state diagnosis");
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("Corrupted"),
+            "expected Corrupted in summary, got: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn namespace_timeout_with_no_route_logs_matches() {
+        let diagnosis = diagnose_failure(
+            "test",
+            "K8s namespace not ready",
+            Some("Error: no default route present before starting k3s"),
+        );
+        assert!(diagnosis.is_some(), "expected networking diagnosis");
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("networking"),
+            "expected networking in summary, got: {}",
+            d.summary
+        );
+    }
+
+    #[test]
+    fn diagnose_failure_with_logs_uses_combined_text() {
+        // Verify that diagnose_failure combines error_message + container_logs
+        // for pattern matching. The pattern "connection refused" is in logs,
+        // not in the error message.
+        let diagnosis = diagnose_failure(
+            "test",
+            "K8s namespace not ready",
+            Some("dial tcp 127.0.0.1:6443: connect: connection refused"),
+        );
+        assert!(
+            diagnosis.is_some(),
+            "expected diagnosis from container logs pattern"
+        );
+        let d = diagnosis.unwrap();
+        assert!(
+            d.summary.contains("Network") || d.summary.contains("connectivity"),
+            "expected network diagnosis, got: {}",
+            d.summary
+        );
+    }
+
+    // -- end-to-end fallback pattern (mirrors CLI code) --
+
+    #[test]
+    fn fallback_to_generic_produces_actionable_diagnosis() {
+        // This mirrors the actual CLI pattern:
+        //   diagnose_failure(...).unwrap_or_else(|| generic_failure_diagnosis(name))
+        // For a plain namespace timeout with no useful container logs, the
+        // specific matcher returns None and we must fall back to the generic
+        // diagnosis that suggests doctor commands.
+        let err_str = "K8s namespace not ready\n\nCaused by:\n    \
+                        timed out waiting for namespace 'openshell' to exist: \
+                        error: the server doesn't have a resource type \"namespace\"";
+        let container_logs = Some("k3s is starting\nwaiting for kube-apiserver");
+
+        let diagnosis = diagnose_failure("my-gw", err_str, container_logs)
+            .unwrap_or_else(|| generic_failure_diagnosis("my-gw"));
+
+        // Should have gotten the generic diagnosis (no specific pattern matched)
+        assert_eq!(diagnosis.summary, "Gateway failed to start");
+        // Must contain actionable recovery steps
+        assert!(
+            !diagnosis.recovery_steps.is_empty(),
+            "generic diagnosis should have recovery steps"
+        );
+        // Must mention doctor commands
+        let all_commands: String = diagnosis
+            .recovery_steps
+            .iter()
+            .filter_map(|s| s.command.as_ref())
+            .cloned()
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            all_commands.contains("doctor logs"),
+            "should suggest 'doctor logs', got: {all_commands}"
+        );
+        assert!(
+            all_commands.contains("doctor check"),
+            "should suggest 'doctor check', got: {all_commands}"
+        );
+        assert!(
+            all_commands.contains("my-gw"),
+            "commands should include gateway name, got: {all_commands}"
+        );
     }
 }

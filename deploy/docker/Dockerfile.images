@@ -110,13 +110,14 @@ RUN touch \
 
 FROM gateway-workspace AS gateway-builder
 ARG CARGO_CODEGEN_UNITS
+ARG EXTRA_CARGO_FEATURES=""
 
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
-    cargo_cross_build --release -p openshell-server && \
+    cargo_cross_build --release -p openshell-server ${EXTRA_CARGO_FEATURES:+--features "$EXTRA_CARGO_FEATURES"} && \
     mkdir -p /build/out && \
     cp "$(cross_output_dir release)/openshell-server" /build/out/
 
@@ -138,13 +139,14 @@ RUN touch \
 
 FROM supervisor-workspace AS supervisor-builder
 ARG CARGO_CODEGEN_UNITS
+ARG EXTRA_CARGO_FEATURES=""
 
 RUN --mount=type=cache,id=cargo-registry-${TARGETARCH},sharing=locked,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git-${TARGETARCH},sharing=locked,target=/usr/local/cargo/git \
     --mount=type=cache,id=cargo-target-${TARGETARCH}-${CARGO_TARGET_CACHE_SCOPE},sharing=locked,target=/build/target \
     --mount=type=cache,id=sccache-${TARGETARCH},sharing=locked,target=/tmp/sccache \
     . cross-build.sh && \
-    cargo_cross_build --release -p openshell-sandbox && \
+    cargo_cross_build --release -p openshell-sandbox ${EXTRA_CARGO_FEATURES:+--features "$EXTRA_CARGO_FEATURES"} && \
     mkdir -p /build/out && \
     cp "$(cross_output_dir release)/openshell-sandbox" /build/out/
 
@@ -168,7 +170,7 @@ WORKDIR /app
 COPY --from=gateway-builder /build/out/openshell-server /usr/local/bin/
 
 RUN mkdir -p /build/crates/openshell-server
-COPY crates/openshell-server/migrations /build/crates/openshell-server/migrations
+COPY --chmod=755 crates/openshell-server/migrations /build/crates/openshell-server/migrations
 
 USER openshell
 EXPOSE 8080

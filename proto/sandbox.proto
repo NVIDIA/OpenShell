@@ -126,18 +126,70 @@ message NetworkBinary {
   bool harness = 2 [deprecated = true];
 }
 
-// Request to get sandbox policy by sandbox ID.
-message GetSandboxPolicyRequest {
+// Request to get sandbox settings by sandbox ID.
+message GetSandboxConfigRequest {
   // The sandbox ID.
   string sandbox_id = 1;
 }
 
-// Response containing sandbox policy.
-message GetSandboxPolicyResponse {
+// Request to get gateway-global settings.
+message GetGatewayConfigRequest {}
+
+// Response containing gateway-global settings.
+message GetGatewayConfigResponse {
+  // Gateway-global settings map excluding the reserved policy key.
+  // Registered keys without a configured value are returned with an empty SettingValue.
+  map<string, SettingValue> settings = 1;
+  // Monotonically increasing revision for gateway-global settings.
+  uint64 settings_revision = 2;
+}
+
+// Scope that currently controls a setting.
+enum SettingScope {
+  SETTING_SCOPE_UNSPECIFIED = 0;
+  SETTING_SCOPE_SANDBOX = 1;
+  SETTING_SCOPE_GLOBAL = 2;
+}
+
+// Type-aware setting value for sandbox/gateway settings.
+message SettingValue {
+  oneof value {
+    string string_value = 1;
+    bool bool_value = 2;
+    int64 int_value = 3;
+    bytes bytes_value = 4;
+  }
+}
+
+// Effective setting value and the scope it was resolved from.
+message EffectiveSetting {
+  SettingValue value = 1;
+  SettingScope scope = 2;
+}
+
+// Source used for the policy payload in GetSandboxConfigResponse.
+enum PolicySource {
+  POLICY_SOURCE_UNSPECIFIED = 0;
+  POLICY_SOURCE_SANDBOX = 1;
+  POLICY_SOURCE_GLOBAL = 2;
+}
+
+// Response containing effective sandbox settings and policy.
+message GetSandboxConfigResponse {
   // The sandbox policy configuration.
   SandboxPolicy policy = 1;
   // Current policy version (monotonically increasing per sandbox).
   uint32 version = 2;
   // SHA-256 hash of the serialized policy payload.
   string policy_hash = 3;
+  // Effective settings resolved for this sandbox, excluding the reserved policy key.
+  // Registered keys without a configured value are returned with an empty EffectiveSetting.value.
+  map<string, EffectiveSetting> settings = 4;
+  // Fingerprint for effective config (policy + settings). Changes when any effective input changes.
+  uint64 config_revision = 5;
+  // Source of the policy payload for this response.
+  PolicySource policy_source = 6;
+  // When policy_source is GLOBAL, the version of the global policy revision.
+  // Zero when no global policy is active or when policy_source is SANDBOX.
+  uint32 global_policy_version = 7;
 }

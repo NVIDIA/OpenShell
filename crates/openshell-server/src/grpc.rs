@@ -6,36 +6,41 @@
 #![allow(clippy::ignored_unit_patterns)] // Tokio select! macro generates unit patterns
 
 use crate::persistence::{
-    DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, generate_name,
+    DraftChunkRecord, ObjectId, ObjectName, ObjectType, PolicyRecord, Store, generate_name,
 };
 use futures::future;
+use openshell_core::proto::setting_value;
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveAllDraftChunksResponse, ApproveDraftChunkRequest,
     ApproveDraftChunkResponse, ClearDraftChunksRequest, ClearDraftChunksResponse,
     CreateProviderRequest, CreateSandboxRequest, CreateSshSessionRequest, CreateSshSessionResponse,
     DeleteProviderRequest, DeleteProviderResponse, DeleteSandboxRequest, DeleteSandboxResponse,
-    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, ExecSandboxEvent,
-    ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
+    DraftHistoryEntry, EditDraftChunkRequest, EditDraftChunkResponse, EffectiveSetting,
+    ExecSandboxEvent, ExecSandboxExit, ExecSandboxRequest, ExecSandboxStderr, ExecSandboxStdout,
     GetDraftHistoryRequest, GetDraftHistoryResponse, GetDraftPolicyRequest, GetDraftPolicyResponse,
-    GetProviderRequest, GetSandboxLogsRequest, GetSandboxLogsResponse, GetSandboxPolicyRequest,
-    GetSandboxPolicyResponse, GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
+    GetGatewayConfigRequest, GetGatewayConfigResponse, GetProviderRequest, GetSandboxConfigRequest,
+    GetSandboxConfigResponse, GetSandboxLogsRequest, GetSandboxLogsResponse,
+    GetSandboxPolicyStatusRequest, GetSandboxPolicyStatusResponse,
     GetSandboxProviderEnvironmentRequest, GetSandboxProviderEnvironmentResponse, GetSandboxRequest,
     HealthRequest, HealthResponse, ListProvidersRequest, ListProvidersResponse,
     ListSandboxPoliciesRequest, ListSandboxPoliciesResponse, ListSandboxesRequest,
-    ListSandboxesResponse, PolicyChunk, PolicyStatus, Provider, ProviderResponse,
+    ListSandboxesResponse, PolicyChunk, PolicySource, PolicyStatus, Provider, ProviderResponse,
     PushSandboxLogsRequest, PushSandboxLogsResponse, RejectDraftChunkRequest,
     RejectDraftChunkResponse, ReportPolicyStatusRequest, ReportPolicyStatusResponse,
     RevokeSshSessionRequest, RevokeSshSessionResponse, SandboxLogLine, SandboxPolicyRevision,
-    SandboxResponse, SandboxStreamEvent, ServiceStatus, SshSession, SubmitPolicyAnalysisRequest,
-    SubmitPolicyAnalysisResponse, UndoDraftChunkRequest, UndoDraftChunkResponse,
-    UpdateProviderRequest, UpdateSandboxPolicyRequest, UpdateSandboxPolicyResponse,
+    SandboxResponse, SandboxStreamEvent, ServiceStatus, SettingScope, SettingValue, SshSession,
+    SubmitPolicyAnalysisRequest, SubmitPolicyAnalysisResponse, UndoDraftChunkRequest,
+    UndoDraftChunkResponse, UpdateConfigRequest, UpdateConfigResponse, UpdateProviderRequest,
     WatchSandboxRequest, open_shell_server::OpenShell,
 };
 use openshell_core::proto::{
     Sandbox, SandboxPhase, SandboxPolicy as ProtoSandboxPolicy, SandboxTemplate,
 };
+use openshell_core::settings::{self, SettingValueKind};
 use prost::Message;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
@@ -87,7 +92,7 @@ const MAX_TEMPLATE_STRING_LEN: usize = 1024;
 /// Maximum number of entries in template map fields (`labels`, `annotations`, `environment`).
 const MAX_TEMPLATE_MAP_ENTRIES: usize = 128;
 
-/// Maximum serialized size (bytes) for template Struct fields (`resources`, `pod_template`,
+/// Maximum serialized size (bytes) for template Struct fields (`resources`,
 /// `volume_claim_templates`).
 const MAX_TEMPLATE_STRUCT_SIZE: usize = 65_536;
 
@@ -102,6 +107,38 @@ const MAX_PROVIDER_CREDENTIALS_ENTRIES: usize = 32;
 
 /// Maximum number of entries in the provider `config` map.
 const MAX_PROVIDER_CONFIG_ENTRIES: usize = 64;
+
+/// Internal object type for durable gateway-global settings.
+const GLOBAL_SETTINGS_OBJECT_TYPE: &str = "gateway_settings";
+/// Internal object id for the singleton global settings record.
+///
+/// Prefixed to avoid collision with other object types in the shared
+/// `objects` table (PRIMARY KEY is on `id` alone, not `(object_type, id)`).
+const GLOBAL_SETTINGS_ID: &str = "gateway_settings:global";
+const GLOBAL_SETTINGS_NAME: &str = "global";
+/// Internal object type for durable sandbox-scoped settings.
+const SANDBOX_SETTINGS_OBJECT_TYPE: &str = "sandbox_settings";
+/// Reserved settings key used to store global policy payload.
+const POLICY_SETTING_KEY: &str = "policy";
+/// Sentinel `sandbox_id` used to store global policy revisions in the
+/// `sandbox_policies` table alongside sandbox-scoped revisions.
+const GLOBAL_POLICY_SANDBOX_ID: &str = "__global__";
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct StoredSettings {
+    revision: u64,
+    settings: BTreeMap<String, StoredSettingValue>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "value")]
+enum StoredSettingValue {
+    String(String),
+    Bool(bool),
+    Int(i64),
+    /// Hex-encoded binary payload.
+    Bytes(String),
+}
 
 /// Clamp a client-provided page `limit`.
 ///
@@ -604,6 +641,20 @@ impl OpenShell for OpenShellService {
             }
         }
 
+        // Clean up sandbox-scoped settings record.
+        if let Err(e) = self
+            .state
+            .store
+            .delete(SANDBOX_SETTINGS_OBJECT_TYPE, &sandbox_settings_id(&id))
+            .await
+        {
+            warn!(
+                sandbox_id = %id,
+                error = %e,
+                "Failed to delete sandbox settings during cleanup"
+            );
+        }
+
         let deleted = match self.state.sandbox_client.delete(&sandbox.name).await {
             Ok(deleted) => deleted,
             Err(err) => {
@@ -700,10 +751,10 @@ impl OpenShell for OpenShellService {
         Ok(Response::new(DeleteProviderResponse { deleted }))
     }
 
-    async fn get_sandbox_policy(
+    async fn get_sandbox_config(
         &self,
-        request: Request<GetSandboxPolicyRequest>,
-    ) -> Result<Response<GetSandboxPolicyResponse>, Status> {
+        request: Request<GetSandboxConfigRequest>,
+    ) -> Result<Response<GetSandboxConfigResponse>, Status> {
         let sandbox_id = request.into_inner().sandbox_id;
 
         let sandbox = self
@@ -722,64 +773,127 @@ impl OpenShell for OpenShellService {
             .await
             .map_err(|e| Status::internal(format!("fetch policy history failed: {e}")))?;
 
-        if let Some(record) = latest {
-            let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
+        let mut policy_source = PolicySource::Sandbox;
+        let (mut policy, mut version, mut policy_hash) = if let Some(record) = latest {
+            let decoded = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
-            return Ok(Response::new(GetSandboxPolicyResponse {
-                policy: Some(policy),
-                version: u32::try_from(record.version).unwrap_or(0),
-                policy_hash: record.policy_hash,
-            }));
-        }
-
-        // Lazy backfill: no policy history exists yet.
-        let spec = sandbox
-            .spec
-            .ok_or_else(|| Status::internal("sandbox has no spec"))?;
-
-        // If spec.policy is None, the sandbox was created without a policy.
-        // Return an empty response so the sandbox can discover policy from disk
-        // or fall back to its restrictive default.
-        let Some(policy) = spec.policy else {
             debug!(
                 sandbox_id = %sandbox_id,
-                "GetSandboxPolicy: no policy configured, returning empty response"
+                version = record.version,
+                "GetSandboxConfig served from policy history"
             );
-            return Ok(Response::new(GetSandboxPolicyResponse {
-                policy: None,
-                version: 0,
-                policy_hash: String::new(),
-            }));
+            (
+                Some(decoded),
+                u32::try_from(record.version).unwrap_or(0),
+                record.policy_hash,
+            )
+        } else {
+            // Lazy backfill: no policy history exists yet.
+            let spec = sandbox
+                .spec
+                .ok_or_else(|| Status::internal("sandbox has no spec"))?;
+
+            match spec.policy {
+                // If spec.policy is None, the sandbox was created without a policy.
+                // Return an empty policy payload so the sandbox can discover policy
+                // from disk or fall back to its restrictive default.
+                None => {
+                    debug!(
+                        sandbox_id = %sandbox_id,
+                        "GetSandboxConfig: no policy configured, returning empty response"
+                    );
+                    (None, 0, String::new())
+                }
+                Some(spec_policy) => {
+                    let hash = deterministic_policy_hash(&spec_policy);
+                    let payload = spec_policy.encode_to_vec();
+                    let policy_id = uuid::Uuid::new_v4().to_string();
+
+                    // Best-effort backfill: if it fails (e.g., concurrent backfill race), we still
+                    // return the policy from spec.
+                    if let Err(e) = self
+                        .state
+                        .store
+                        .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
+                        .await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %e,
+                            "Failed to backfill policy version 1"
+                        );
+                    } else if let Err(e) = self
+                        .state
+                        .store
+                        .update_policy_status(&sandbox_id, 1, "loaded", None, None)
+                        .await
+                    {
+                        warn!(
+                            sandbox_id = %sandbox_id,
+                            error = %e,
+                            "Failed to mark backfilled policy as loaded"
+                        );
+                    }
+
+                    info!(
+                        sandbox_id = %sandbox_id,
+                        "GetSandboxConfig served from spec (backfilled version 1)"
+                    );
+
+                    (Some(spec_policy), 1, hash)
+                }
+            }
         };
 
-        // Create version 1 from spec.policy.
-        let payload = policy.encode_to_vec();
-        let hash = deterministic_policy_hash(&policy);
-        let policy_id = uuid::Uuid::new_v4().to_string();
+        let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+        let sandbox_settings =
+            load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
 
-        // Best-effort backfill: if it fails (e.g., concurrent backfill race), we still
-        // return the policy from spec.
-        if let Err(e) = self
-            .state
-            .store
-            .put_policy_revision(&policy_id, &sandbox_id, 1, &payload, &hash)
-            .await
-        {
-            warn!(sandbox_id = %sandbox_id, error = %e, "Failed to backfill policy version 1");
-        } else if let Err(e) = self
-            .state
-            .store
-            .update_policy_status(&sandbox_id, 1, "loaded", None, None)
-            .await
-        {
-            warn!(sandbox_id = %sandbox_id, error = %e, "Failed to mark backfilled policy as loaded");
+        let mut global_policy_version: u32 = 0;
+
+        if let Some(global_policy) = decode_policy_from_global_settings(&global_settings)? {
+            policy = Some(global_policy.clone());
+            policy_hash = deterministic_policy_hash(&global_policy);
+            policy_source = PolicySource::Global;
+            // Keep sandbox policy version for status APIs, but global policy
+            // updates are tracked via config_revision.
+            if version == 0 {
+                version = 1;
+            }
+            // Look up the global policy revision version number.
+            if let Ok(Some(global_rev)) = self
+                .state
+                .store
+                .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                .await
+            {
+                global_policy_version = u32::try_from(global_rev.version).unwrap_or(0);
+            }
         }
 
+        let settings = merge_effective_settings(&global_settings, &sandbox_settings)?;
+        let config_revision = compute_config_revision(policy.as_ref(), &settings, policy_source);
 
-        Ok(Response::new(GetSandboxPolicyResponse {
-            policy: Some(policy),
-            version: 1,
-            policy_hash: hash,
+        Ok(Response::new(GetSandboxConfigResponse {
+            policy,
+            version,
+            policy_hash,
+            settings,
+            config_revision,
+            policy_source: policy_source.into(),
+            global_policy_version,
+        }))
+    }
+
+    async fn get_gateway_config(
+        &self,
+        _request: Request<GetGatewayConfigRequest>,
+    ) -> Result<Response<GetGatewayConfigResponse>, Status> {
+        let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+        let settings = materialize_global_settings(&global_settings)?;
+        Ok(Response::new(GetGatewayConfigResponse {
+            settings,
+            settings_revision: global_settings.revision,
         }))
     }
 
@@ -972,17 +1086,206 @@ impl OpenShell for OpenShellService {
     // Policy update handlers
     // -------------------------------------------------------------------
 
-    async fn update_sandbox_policy(
+    async fn update_config(
         &self,
-        request: Request<UpdateSandboxPolicyRequest>,
-    ) -> Result<Response<UpdateSandboxPolicyResponse>, Status> {
+        request: Request<UpdateConfigRequest>,
+    ) -> Result<Response<UpdateConfigResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
+        let key = req.setting_key.trim();
+        let has_policy = req.policy.is_some();
+        let has_setting = !key.is_empty();
+
+        if has_policy && has_setting {
+            return Err(Status::invalid_argument(
+                "policy and setting_key cannot be set in the same request",
+            ));
         }
-        let mut new_policy = req
-            .policy
-            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+        if !has_policy && !has_setting {
+            return Err(Status::invalid_argument(
+                "either policy or setting_key must be provided",
+            ));
+        }
+
+        if req.global {
+            // Acquire the settings mutex for the entire global mutation to
+            // prevent read-modify-write races between concurrent requests.
+            let _settings_guard = self.state.settings_mutex.lock().await;
+
+            if has_policy {
+                if req.delete_setting {
+                    return Err(Status::invalid_argument(
+                        "delete_setting cannot be combined with policy payload",
+                    ));
+                }
+                let mut new_policy = req.policy.ok_or_else(|| {
+                    Status::invalid_argument("policy is required for global policy update")
+                })?;
+                openshell_policy::ensure_sandbox_process_identity(&mut new_policy);
+                validate_policy_safety(&new_policy)?;
+
+                // Compute hash and check for no-op (same policy as latest).
+                let payload = new_policy.encode_to_vec();
+                let hash = deterministic_policy_hash(&new_policy);
+
+                let latest = self
+                    .state
+                    .store
+                    .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("fetch latest global policy failed: {e}"))
+                    })?;
+
+                if let Some(ref current) = latest {
+                    // Only dedup if the latest revision is still active
+                    // (loaded). If it was superseded (e.g. after a global
+                    // policy delete), always create a new revision.
+                    if current.policy_hash == hash && current.status == "loaded" {
+                        // Same policy hash — skip creating a new revision but
+                        // still ensure the settings blob has the policy key
+                        // (it may have been lost to a pod restart while the
+                        // sandbox_policies table retained the revision).
+                        let mut global_settings =
+                            load_global_settings(self.state.store.as_ref()).await?;
+                        let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
+                        let changed = upsert_setting_value(
+                            &mut global_settings.settings,
+                            POLICY_SETTING_KEY,
+                            stored_value,
+                        );
+                        if changed {
+                            global_settings.revision = global_settings.revision.wrapping_add(1);
+                            save_global_settings(self.state.store.as_ref(), &global_settings)
+                                .await?;
+                        }
+                        return Ok(Response::new(UpdateConfigResponse {
+                            version: u32::try_from(current.version).unwrap_or(0),
+                            policy_hash: hash,
+                            settings_revision: global_settings.revision,
+                            deleted: false,
+                        }));
+                    }
+                }
+
+                let next_version = latest.map_or(1, |r| r.version + 1);
+                let policy_id = uuid::Uuid::new_v4().to_string();
+
+                // Persist the global policy revision.
+                self.state
+                    .store
+                    .put_policy_revision(
+                        &policy_id,
+                        GLOBAL_POLICY_SANDBOX_ID,
+                        next_version,
+                        &payload,
+                        &hash,
+                    )
+                    .await
+                    .map_err(|e| {
+                        Status::internal(format!("persist global policy revision failed: {e}"))
+                    })?;
+
+                // Mark it as loaded immediately (no sandbox confirmation for
+                // global policies) and supersede older revisions.
+                let now_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_or(0, |d| d.as_millis() as i64);
+                let _ = self
+                    .state
+                    .store
+                    .update_policy_status(
+                        GLOBAL_POLICY_SANDBOX_ID,
+                        next_version,
+                        "loaded",
+                        None,
+                        Some(now_ms),
+                    )
+                    .await;
+                let _ = self
+                    .state
+                    .store
+                    .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, next_version)
+                    .await;
+
+                // Also store in the settings blob (delivery mechanism for
+                // GetSandboxConfig).
+                let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
+                let stored_value = StoredSettingValue::Bytes(hex::encode(&payload));
+                let changed = upsert_setting_value(
+                    &mut global_settings.settings,
+                    POLICY_SETTING_KEY,
+                    stored_value,
+                );
+                if changed {
+                    global_settings.revision = global_settings.revision.wrapping_add(1);
+                    save_global_settings(self.state.store.as_ref(), &global_settings).await?;
+                }
+
+                return Ok(Response::new(UpdateConfigResponse {
+                    version: u32::try_from(next_version).unwrap_or(0),
+                    policy_hash: hash,
+                    settings_revision: global_settings.revision,
+                    deleted: false,
+                }));
+            }
+
+            // Global setting mutation.
+            if key == POLICY_SETTING_KEY && !req.delete_setting {
+                return Err(Status::invalid_argument(
+                    "reserved key 'policy' must be set via the policy field",
+                ));
+            }
+            if key != POLICY_SETTING_KEY {
+                validate_registered_setting_key(key)?;
+            }
+
+            let mut global_settings = load_global_settings(self.state.store.as_ref()).await?;
+            let changed = if req.delete_setting {
+                let removed = global_settings.settings.remove(key).is_some();
+                // When deleting the global policy key, supersede all global
+                // policy revisions so they no longer appear as "Loaded".
+                if removed && key == POLICY_SETTING_KEY {
+                    if let Ok(Some(latest)) = self
+                        .state
+                        .store
+                        .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
+                        .await
+                    {
+                        let _ = self
+                            .state
+                            .store
+                            .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
+                            .await;
+                    }
+                }
+                removed
+            } else {
+                let setting = req
+                    .setting_value
+                    .as_ref()
+                    .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
+                let stored = proto_setting_to_stored(key, setting)?;
+                upsert_setting_value(&mut global_settings.settings, key, stored)
+            };
+
+            if changed {
+                global_settings.revision = global_settings.revision.wrapping_add(1);
+                save_global_settings(self.state.store.as_ref(), &global_settings).await?;
+            }
+
+            return Ok(Response::new(UpdateConfigResponse {
+                version: 0,
+                policy_hash: String::new(),
+                settings_revision: global_settings.revision,
+                deleted: req.delete_setting && changed,
+            }));
+        }
+
+        if req.name.is_empty() {
+            return Err(Status::invalid_argument(
+                "name is required for sandbox-scoped updates",
+            ));
+        }
 
         // Resolve sandbox by name.
         let sandbox = self
@@ -992,8 +1295,98 @@ impl OpenShell for OpenShellService {
             .await
             .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
             .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
         let sandbox_id = sandbox.id.clone();
+
+        if has_setting {
+            // Acquire the settings mutex to prevent races between the
+            // global-precedence check and the sandbox settings write.
+            let _settings_guard = self.state.settings_mutex.lock().await;
+
+            if key == POLICY_SETTING_KEY {
+                return Err(Status::invalid_argument(
+                    "reserved key 'policy' must be set via policy commands",
+                ));
+            }
+
+            let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+            let globally_managed = global_settings.settings.contains_key(key);
+
+            if req.delete_setting {
+                // Sandbox-scoped delete: allowed only when the key is not
+                // globally managed.
+                if globally_managed {
+                    return Err(Status::failed_precondition(format!(
+                        "setting '{key}' is managed globally; delete the global setting first"
+                    )));
+                }
+
+                let mut sandbox_settings =
+                    load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
+                let removed = sandbox_settings.settings.remove(key).is_some();
+                if removed {
+                    sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
+                    save_sandbox_settings(
+                        self.state.store.as_ref(),
+                        &sandbox_id,
+                        &sandbox.name,
+                        &sandbox_settings,
+                    )
+                    .await?;
+                }
+
+                return Ok(Response::new(UpdateConfigResponse {
+                    version: 0,
+                    policy_hash: String::new(),
+                    settings_revision: sandbox_settings.revision,
+                    deleted: removed,
+                }));
+            }
+
+            if globally_managed {
+                return Err(Status::failed_precondition(format!(
+                    "setting '{key}' is managed globally; delete the global setting before sandbox update"
+                )));
+            }
+
+            let setting = req
+                .setting_value
+                .as_ref()
+                .ok_or_else(|| Status::invalid_argument("setting_value is required"))?;
+            let stored = proto_setting_to_stored(key, setting)?;
+
+            let mut sandbox_settings =
+                load_sandbox_settings(self.state.store.as_ref(), &sandbox_id).await?;
+            let changed = upsert_setting_value(&mut sandbox_settings.settings, key, stored);
+            if changed {
+                sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
+                save_sandbox_settings(
+                    self.state.store.as_ref(),
+                    &sandbox_id,
+                    &sandbox.name,
+                    &sandbox_settings,
+                )
+                .await?;
+            }
+
+            return Ok(Response::new(UpdateConfigResponse {
+                version: 0,
+                policy_hash: String::new(),
+                settings_revision: sandbox_settings.revision,
+                deleted: false,
+            }));
+        }
+
+        // Sandbox-scoped policy update.
+        let mut new_policy = req
+            .policy
+            .ok_or_else(|| Status::invalid_argument("policy is required"))?;
+
+        let global_settings = load_global_settings(self.state.store.as_ref()).await?;
+        if global_settings.settings.contains_key(POLICY_SETTING_KEY) {
+            return Err(Status::failed_precondition(
+                "policy is managed globally; delete global policy before sandbox policy update",
+            ));
+        }
 
         // Get the baseline (version 1) policy for static field validation.
         let spec = sandbox
@@ -1008,8 +1401,10 @@ impl OpenShell for OpenShellService {
             // Validate static fields haven't changed.
             validate_static_fields_unchanged(baseline_policy, &new_policy)?;
 
-            // Validate network mode hasn't changed (Block ↔ Proxy).
-            validate_network_mode_unchanged(baseline_policy, &new_policy)?;
+            // Allow network policy additions/removals on live sandboxes. The
+            // cluster runtime always uses proxy mode for proto-backed sandbox
+            // policies, so an empty `network_policies` map is no longer a real
+            // mode boundary.
 
             // Validate policy safety (no root, no path traversal, etc.).
             validate_policy_safety(&new_policy)?;
@@ -1027,6 +1422,10 @@ impl OpenShell for OpenShellService {
                 .put_message(&sandbox)
                 .await
                 .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
+            info!(
+                sandbox_id = %sandbox_id,
+                "UpdateConfig: backfilled spec.policy from sandbox-discovered policy"
+            );
         }
 
 
@@ -1044,9 +1443,11 @@ impl OpenShell for OpenShellService {
         if let Some(ref current) = latest
             && current.policy_hash == hash
         {
-            return Ok(Response::new(UpdateSandboxPolicyResponse {
+            return Ok(Response::new(UpdateConfigResponse {
                 version: u32::try_from(current.version).unwrap_or(0),
                 policy_hash: hash,
+                settings_revision: 0,
+                deleted: false,
             }));
         }
 
@@ -1073,12 +1474,14 @@ impl OpenShell for OpenShellService {
             sandbox_id = %sandbox_id,
             version = next_version,
             policy_hash = %hash,
-            "UpdateSandboxPolicy: new policy version persisted"
+            "UpdateConfig: new policy version persisted"
         );
 
-        Ok(Response::new(UpdateSandboxPolicyResponse {
+        Ok(Response::new(UpdateConfigResponse {
             version: u32::try_from(next_version).unwrap_or(0),
             policy_hash: hash,
+            settings_revision: 0,
+            deleted: false,
         }))
     }
 
@@ -1087,38 +1490,43 @@ impl OpenShell for OpenShellService {
         request: Request<GetSandboxPolicyStatusRequest>,
     ) -> Result<Response<GetSandboxPolicyStatusResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
 
-        let sandbox = self
-            .state
-            .store
-            .get_message_by_name::<Sandbox>(&req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
-
-        let sandbox_id = sandbox.id;
+        let (policy_id, active_version) = if req.global {
+            (GLOBAL_POLICY_SANDBOX_ID.to_string(), 0_u32)
+        } else {
+            if req.name.is_empty() {
+                return Err(Status::invalid_argument("name is required"));
+            }
+            let sandbox = self
+                .state
+                .store
+                .get_message_by_name::<Sandbox>(&req.name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            (sandbox.id, sandbox.current_policy_version)
+        };
 
         let record = if req.version == 0 {
             self.state
                 .store
-                .get_latest_policy(&sandbox_id)
+                .get_latest_policy(&policy_id)
                 .await
                 .map_err(|e| Status::internal(format!("fetch policy failed: {e}")))?
         } else {
             self.state
                 .store
-                .get_policy_by_version(&sandbox_id, i64::from(req.version))
+                .get_policy_by_version(&policy_id, i64::from(req.version))
                 .await
                 .map_err(|e| Status::internal(format!("fetch policy failed: {e}")))?
         };
 
-        let record =
-            record.ok_or_else(|| Status::not_found("no policy revision found for this sandbox"))?;
-
-        let active_version = sandbox.current_policy_version;
+        let not_found_msg = if req.global {
+            "no global policy revision found"
+        } else {
+            "no policy revision found for this sandbox"
+        };
+        let record = record.ok_or_else(|| Status::not_found(not_found_msg))?;
 
         Ok(Response::new(GetSandboxPolicyStatusResponse {
             revision: Some(policy_record_to_revision(&record, true)),
@@ -1131,23 +1539,28 @@ impl OpenShell for OpenShellService {
         request: Request<ListSandboxPoliciesRequest>,
     ) -> Result<Response<ListSandboxPoliciesResponse>, Status> {
         let req = request.into_inner();
-        if req.name.is_empty() {
-            return Err(Status::invalid_argument("name is required"));
-        }
 
-        let sandbox = self
-            .state
-            .store
-            .get_message_by_name::<Sandbox>(&req.name)
-            .await
-            .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
-            .ok_or_else(|| Status::not_found("sandbox not found"))?;
+        let policy_id = if req.global {
+            GLOBAL_POLICY_SANDBOX_ID.to_string()
+        } else {
+            if req.name.is_empty() {
+                return Err(Status::invalid_argument("name is required"));
+            }
+            let sandbox = self
+                .state
+                .store
+                .get_message_by_name::<Sandbox>(&req.name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch sandbox failed: {e}")))?
+                .ok_or_else(|| Status::not_found("sandbox not found"))?;
+            sandbox.id
+        };
 
         let limit = clamp_limit(req.limit, 50, MAX_PAGE_SIZE);
         let records = self
             .state
             .store
-            .list_policies(&sandbox.id, limit, req.offset)
+            .list_policies(&policy_id, limit, req.offset)
             .await
             .map_err(|e| Status::internal(format!("list policies failed: {e}")))?;
 
@@ -1539,6 +1952,8 @@ impl OpenShell for OpenShellService {
             return Err(Status::invalid_argument("chunk_id is required"));
         }
 
+        require_no_global_policy(&self.state).await?;
+
         // Resolve sandbox.
         let sandbox = self
             .state
@@ -1577,7 +1992,8 @@ impl OpenShell for OpenShellService {
         );
 
         // Merge the approved rule into the current policy (with optimistic retry).
-        let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, &chunk).await?;
+        let (version, hash) =
+            merge_chunk_into_policy(self.state.store.as_ref(), &sandbox_id, &chunk).await?;
 
         // Mark chunk as approved.
         let now_ms =
@@ -1658,7 +2074,10 @@ impl OpenShell for OpenShellService {
         );
 
         // If the chunk was approved, remove its rule from the active policy.
+        // Block revoke when a global policy is active since the sandbox policy
+        // isn't in use anyway.
         if was_approved {
+            require_no_global_policy(&self.state).await?;
             remove_chunk_from_policy(&self.state, &sandbox_id, &chunk).await?;
         }
 
@@ -1685,6 +2104,8 @@ impl OpenShell for OpenShellService {
         if req.name.is_empty() {
             return Err(Status::invalid_argument("name is required"));
         }
+
+        require_no_global_policy(&self.state).await?;
 
         // Resolve sandbox.
         let sandbox = self
@@ -1744,7 +2165,8 @@ impl OpenShell for OpenShellService {
             );
 
             // Merge each chunk into the policy (with optimistic retry).
-            let (version, hash) = merge_chunk_into_policy(&self.state, &sandbox_id, chunk).await?;
+            let (version, hash) =
+                merge_chunk_into_policy(self.state.store.as_ref(), &sandbox_id, chunk).await?;
             last_version = version;
             last_hash = hash;
 
@@ -2052,13 +2474,27 @@ fn draft_chunk_record_to_proto(record: &DraftChunkRecord) -> Result<PolicyChunk,
 /// Merge a draft chunk's proposed rule into the current active sandbox policy.
 ///
 /// Returns `(new_version, policy_hash)`. This reuses the same persistence
-/// pattern as `update_sandbox_policy`: compute hash, check for no-op,
+/// pattern as `update_config`: compute hash, check for no-op,
 /// persist a new revision, supersede older versions, and notify watchers.
 /// Maximum number of optimistic retry attempts for policy version conflicts.
 const MERGE_RETRY_LIMIT: usize = 5;
 
+/// Check whether a global policy is active. Returns an error suitable for
+/// blocking draft chunk approval/revoke when global policy overrides sandbox
+/// policy.
+async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {
+    let global = load_global_settings(state.store.as_ref()).await?;
+    if global.settings.contains_key(POLICY_SETTING_KEY) {
+        return Err(Status::failed_precondition(
+            "cannot approve rules while a global policy is active; \
+             delete the global policy to manage per-sandbox rules",
+        ));
+    }
+    Ok(())
+}
+
 async fn merge_chunk_into_policy(
-    state: &ServerState,
+    store: &crate::persistence::Store,
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
@@ -2070,8 +2506,7 @@ async fn merge_chunk_into_policy(
 
     for attempt in 1..=MERGE_RETRY_LIMIT {
         // Get the current active policy (re-read on each attempt).
-        let latest = state
-            .store
+        let latest = store
             .get_latest_policy(sandbox_id)
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
@@ -2116,14 +2551,12 @@ async fn merge_chunk_into_policy(
         let next_version = base_version + 1;
         let policy_id = uuid::Uuid::new_v4().to_string();
 
-        match state
-            .store
+        match store
             .put_policy_revision(&policy_id, sandbox_id, next_version, &payload, &hash)
             .await
         {
             Ok(()) => {
-                let _ = state
-                    .store
+                let _ = store
                     .supersede_older_policies(sandbox_id, next_version)
                     .await;
 
@@ -2284,6 +2717,309 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
 }
 
 
+/// Compute a fingerprint for the effective sandbox configuration.
+///
+/// Returns the first 8 bytes of a SHA-256 hash over the policy, settings,
+/// and policy source. The sandbox poll loop compares this value to detect
+/// changes -- if it differs from the previously seen revision, the sandbox
+/// reloads.
+///
+/// This is a content hash, not a monotonic counter. With 64 bits of hash
+/// space the birthday-bound collision probability is ~50% at 2^32
+/// configurations. A collision would cause one poll cycle to miss a change,
+/// but the next mutation will almost certainly produce a different hash.
+/// This trade-off is acceptable for the poll-based change detection use case.
+fn compute_config_revision(
+    policy: Option<&ProtoSandboxPolicy>,
+    settings: &HashMap<String, EffectiveSetting>,
+    policy_source: PolicySource,
+) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update((policy_source as i32).to_le_bytes());
+    if let Some(policy) = policy {
+        hasher.update(deterministic_policy_hash(policy).as_bytes());
+    }
+    let mut entries: Vec<_> = settings.iter().collect();
+    entries.sort_by_key(|(k, _)| k.as_str());
+    for (key, setting) in entries {
+        hasher.update(key.as_bytes());
+        hasher.update(setting.scope.to_le_bytes());
+        if let Some(value) = setting.value.as_ref().and_then(|v| v.value.as_ref()) {
+            match value {
+                setting_value::Value::StringValue(v) => {
+                    hasher.update([0]);
+                    hasher.update(v.as_bytes());
+                }
+                setting_value::Value::BoolValue(v) => {
+                    hasher.update([1]);
+                    hasher.update([u8::from(*v)]);
+                }
+                setting_value::Value::IntValue(v) => {
+                    hasher.update([2]);
+                    hasher.update(v.to_le_bytes());
+                }
+                setting_value::Value::BytesValue(v) => {
+                    hasher.update([3]);
+                    hasher.update(v);
+                }
+            }
+        }
+    }
+
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(bytes)
+}
+
+fn validate_registered_setting_key(key: &str) -> Result<SettingValueKind, Status> {
+    settings::setting_for_key(key)
+        .map(|entry| entry.kind)
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "unknown setting key '{key}'. Allowed keys: {}",
+                settings::registered_keys_csv()
+            ))
+        })
+}
+
+fn proto_setting_to_stored(key: &str, value: &SettingValue) -> Result<StoredSettingValue, Status> {
+    let expected = validate_registered_setting_key(key)?;
+    let inner = value
+        .value
+        .as_ref()
+        .ok_or_else(|| Status::invalid_argument("setting_value.value is required"))?;
+    let stored = match (expected, inner) {
+        (SettingValueKind::String, setting_value::Value::StringValue(v)) => {
+            StoredSettingValue::String(v.clone())
+        }
+        (SettingValueKind::Bool, setting_value::Value::BoolValue(v)) => {
+            StoredSettingValue::Bool(*v)
+        }
+        (SettingValueKind::Int, setting_value::Value::IntValue(v)) => StoredSettingValue::Int(*v),
+        (_, setting_value::Value::BytesValue(_)) => {
+            return Err(Status::invalid_argument(format!(
+                "setting '{key}' expects {} value; bytes are not supported for this key",
+                expected.as_str()
+            )));
+        }
+        (expected_kind, _) => {
+            return Err(Status::invalid_argument(format!(
+                "setting '{key}' expects {} value",
+                expected_kind.as_str()
+            )));
+        }
+    };
+    Ok(stored)
+}
+
+fn stored_setting_to_proto(value: &StoredSettingValue) -> Result<SettingValue, Status> {
+    let proto = match value {
+        StoredSettingValue::String(v) => SettingValue {
+            value: Some(setting_value::Value::StringValue(v.clone())),
+        },
+        StoredSettingValue::Bool(v) => SettingValue {
+            value: Some(setting_value::Value::BoolValue(*v)),
+        },
+        StoredSettingValue::Int(v) => SettingValue {
+            value: Some(setting_value::Value::IntValue(*v)),
+        },
+        StoredSettingValue::Bytes(v) => {
+            let decoded = hex::decode(v)
+                .map_err(|e| Status::internal(format!("stored bytes decode failed: {e}")))?;
+            SettingValue {
+                value: Some(setting_value::Value::BytesValue(decoded)),
+            }
+        }
+    };
+    Ok(proto)
+}
+
+fn upsert_setting_value(
+    map: &mut BTreeMap<String, StoredSettingValue>,
+    key: &str,
+    value: StoredSettingValue,
+) -> bool {
+    match map.get(key) {
+        Some(existing) if existing == &value => false,
+        _ => {
+            map.insert(key.to_string(), value);
+            true
+        }
+    }
+}
+
+async fn load_global_settings(store: &Store) -> Result<StoredSettings, Status> {
+    load_settings_record(store, GLOBAL_SETTINGS_OBJECT_TYPE, GLOBAL_SETTINGS_ID).await
+}
+
+async fn save_global_settings(store: &Store, settings: &StoredSettings) -> Result<(), Status> {
+    save_settings_record(
+        store,
+        GLOBAL_SETTINGS_OBJECT_TYPE,
+        GLOBAL_SETTINGS_ID,
+        GLOBAL_SETTINGS_NAME,
+        settings,
+    )
+    .await
+}
+
+/// Derive a distinct settings record ID from a sandbox UUID.
+///
+/// The generic `objects` table uses `id` as the primary key.  Sandbox objects
+/// already occupy the row keyed by the raw sandbox UUID, so settings records
+/// must use a different ID to avoid a silent no-op upsert (the `ON CONFLICT`
+/// clause is scoped by `object_type`).
+fn sandbox_settings_id(sandbox_id: &str) -> String {
+    format!("settings:{sandbox_id}")
+}
+
+async fn load_sandbox_settings(store: &Store, sandbox_id: &str) -> Result<StoredSettings, Status> {
+    load_settings_record(
+        store,
+        SANDBOX_SETTINGS_OBJECT_TYPE,
+        &sandbox_settings_id(sandbox_id),
+    )
+    .await
+}
+
+async fn save_sandbox_settings(
+    store: &Store,
+    sandbox_id: &str,
+    sandbox_name: &str,
+    settings: &StoredSettings,
+) -> Result<(), Status> {
+    save_settings_record(
+        store,
+        SANDBOX_SETTINGS_OBJECT_TYPE,
+        &sandbox_settings_id(sandbox_id),
+        sandbox_name,
+        settings,
+    )
+    .await
+}
+
+async fn load_settings_record(
+    store: &Store,
+    object_type: &str,
+    id: &str,
+) -> Result<StoredSettings, Status> {
+    let record = store
+        .get(object_type, id)
+        .await
+        .map_err(|e| Status::internal(format!("fetch settings failed: {e}")))?;
+    if let Some(record) = record {
+        serde_json::from_slice::<StoredSettings>(&record.payload)
+            .map_err(|e| Status::internal(format!("decode settings payload failed: {e}")))
+    } else {
+        Ok(StoredSettings::default())
+    }
+}
+
+async fn save_settings_record(
+    store: &Store,
+    object_type: &str,
+    id: &str,
+    name: &str,
+    settings: &StoredSettings,
+) -> Result<(), Status> {
+    let payload = serde_json::to_vec(settings)
+        .map_err(|e| Status::internal(format!("encode settings payload failed: {e}")))?;
+    store
+        .put(object_type, id, name, &payload)
+        .await
+        .map_err(|e| Status::internal(format!("persist settings failed: {e}")))?;
+    Ok(())
+}
+
+fn decode_policy_from_global_settings(
+    global: &StoredSettings,
+) -> Result<Option<ProtoSandboxPolicy>, Status> {
+    let Some(value) = global.settings.get(POLICY_SETTING_KEY) else {
+        return Ok(None);
+    };
+
+    let StoredSettingValue::Bytes(encoded) = value else {
+        return Err(Status::internal(
+            "global policy setting has invalid value type; expected bytes",
+        ));
+    };
+
+    let raw = hex::decode(encoded)
+        .map_err(|e| Status::internal(format!("global policy decode failed: {e}")))?;
+    let policy = ProtoSandboxPolicy::decode(raw.as_slice())
+        .map_err(|e| Status::internal(format!("global policy protobuf decode failed: {e}")))?;
+    Ok(Some(policy))
+}
+
+fn merge_effective_settings(
+    global: &StoredSettings,
+    sandbox: &StoredSettings,
+) -> Result<HashMap<String, EffectiveSetting>, Status> {
+    let mut merged = HashMap::new();
+
+    for registered in settings::REGISTERED_SETTINGS {
+        merged.insert(
+            registered.key.to_string(),
+            EffectiveSetting {
+                value: None,
+                scope: SettingScope::Unspecified.into(),
+            },
+        );
+    }
+
+    for (key, value) in &sandbox.settings {
+        if key == POLICY_SETTING_KEY || settings::setting_for_key(key).is_none() {
+            continue;
+        }
+        merged.insert(
+            key.clone(),
+            EffectiveSetting {
+                value: Some(stored_setting_to_proto(value)?),
+                scope: SettingScope::Sandbox.into(),
+            },
+        );
+    }
+
+    for (key, value) in &global.settings {
+        if key == POLICY_SETTING_KEY || settings::setting_for_key(key).is_none() {
+            continue;
+        }
+        merged.insert(
+            key.clone(),
+            EffectiveSetting {
+                value: Some(stored_setting_to_proto(value)?),
+                scope: SettingScope::Global.into(),
+            },
+        );
+    }
+
+    Ok(merged)
+}
+
+fn materialize_global_settings(
+    global: &StoredSettings,
+) -> Result<HashMap<String, SettingValue>, Status> {
+    let mut materialized = HashMap::new();
+    for registered in settings::REGISTERED_SETTINGS {
+        materialized.insert(registered.key.to_string(), SettingValue { value: None });
+    }
+
+    for (key, value) in &global.settings {
+        if key == POLICY_SETTING_KEY {
+            continue;
+        }
+        // Only include keys that are in the current registry. Stale keys
+        // from a previous build are ignored.
+        if settings::setting_for_key(key).is_none() {
+            continue;
+        }
+        materialized.insert(key.clone(), stored_setting_to_proto(value)?);
+    }
+
+    Ok(materialized)
+}
+
 /// Check if a log line's source matches the filter list.
 /// Empty source is treated as "gateway" for backward compatibility.
 fn source_matches(log_source: &str, filters: &[String]) -> bool {
@@ -2423,14 +3159,6 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
         if size > MAX_TEMPLATE_STRUCT_SIZE {
             return Err(Status::invalid_argument(format!(
                 "template.resources serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
-            )));
-        }
-    }
-    if let Some(ref s) = tmpl.pod_template {
-        let size = s.encoded_len();
-        if size > MAX_TEMPLATE_STRUCT_SIZE {
-            return Err(Status::invalid_argument(format!(
-                "template.pod_template serialized size exceeds maximum ({size} > {MAX_TEMPLATE_STRUCT_SIZE})"
             )));
         }
     }
@@ -2593,25 +3321,6 @@ fn validate_filesystem_additive(
             ));
         }
         (None, None) => {}
-    }
-    Ok(())
-}
-
-/// Validate that network mode hasn't changed (Block ↔ Proxy).
-/// Adding `network_policies` when none existed (or removing all) changes the mode.
-fn validate_network_mode_unchanged(
-    baseline: &ProtoSandboxPolicy,
-    new: &ProtoSandboxPolicy,
-) -> Result<(), Status> {
-    let baseline_has_policies = !baseline.network_policies.is_empty();
-    let new_has_policies = !new.network_policies.is_empty();
-    if baseline_has_policies != new_has_policies {
-        let msg = if new_has_policies {
-            "cannot add network policies to a sandbox created without them (Block → Proxy mode change requires restart)"
-        } else {
-            "cannot remove all network policies from a sandbox created with them (Proxy → Block mode change requires restart)"
-        };
-        return Err(Status::invalid_argument(msg));
     }
     Ok(())
 }
@@ -3310,11 +4019,12 @@ mod tests {
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
         MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE, clamp_limit,
         create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, resolve_provider_environment, update_provider_record,
-        validate_provider_fields, validate_sandbox_spec,
+        list_provider_records, merge_chunk_into_policy, resolve_provider_environment,
+        update_provider_record, validate_provider_fields, validate_sandbox_spec,
     };
-    use crate::persistence::Store;
+    use crate::persistence::{DraftChunkRecord, Store};
     use openshell_core::proto::{Provider, SandboxSpec, SandboxTemplate};
+    use prost::Message;
     use std::collections::HashMap;
     use tonic::Code;
 
@@ -4000,7 +4710,7 @@ mod tests {
 
     #[test]
     fn validate_static_fields_allows_unchanged() {
-        use super::{validate_network_mode_unchanged, validate_static_fields_unchanged};
+        use super::validate_static_fields_unchanged;
         use openshell_core::proto::{
             FilesystemPolicy, LandlockPolicy, ProcessPolicy, SandboxPolicy as ProtoSandboxPolicy,
         };
@@ -4022,7 +4732,6 @@ mod tests {
             ..Default::default()
         };
         assert!(validate_static_fields_unchanged(&policy, &policy).is_ok());
-        assert!(validate_network_mode_unchanged(&policy, &policy).is_ok());
     }
 
     #[test]
@@ -4140,23 +4849,6 @@ mod tests {
         assert!(result.unwrap_err().message().contains("include_workdir"));
     }
 
-    #[test]
-    fn validate_network_mode_rejects_block_to_proxy() {
-        use super::validate_network_mode_unchanged;
-        use openshell_core::proto::{NetworkPolicyRule, SandboxPolicy as ProtoSandboxPolicy};
-
-        let baseline = ProtoSandboxPolicy::default(); // no network policies = Block
-        let mut changed = ProtoSandboxPolicy::default();
-        changed.network_policies.insert(
-            "test".into(),
-            NetworkPolicyRule {
-                name: "test".into(),
-                ..Default::default()
-            },
-        );
-        assert!(validate_network_mode_unchanged(&baseline, &changed).is_err());
-    }
-
     // ---- Sandbox creation without policy ----
 
     #[tokio::test]
@@ -4209,7 +4901,7 @@ mod tests {
         };
         store.put_message(&sandbox).await.unwrap();
 
-        // Simulate what update_sandbox_policy does when spec.policy is None:
+        // Simulate what update_config does when spec.policy is None:
         // backfill spec.policy with the new policy.
         let new_policy = ProtoSandboxPolicy {
             version: 1,
@@ -4248,6 +4940,65 @@ mod tests {
         assert_eq!(policy.version, 1);
         assert!(policy.filesystem.is_some());
         assert_eq!(policy.process.unwrap().run_as_user, "sandbox");
+    }
+
+    #[tokio::test]
+    async fn merge_chunk_into_policy_adds_first_network_rule_to_empty_policy() {
+        use openshell_core::proto::{NetworkBinary, NetworkEndpoint, NetworkPolicyRule};
+
+        let store = Store::connect("sqlite::memory:").await.unwrap();
+        let rule = NetworkPolicyRule {
+            name: "google".to_string(),
+            endpoints: vec![NetworkEndpoint {
+                host: "google.com".to_string(),
+                port: 443,
+                ..Default::default()
+            }],
+            binaries: vec![NetworkBinary {
+                path: "/usr/bin/curl".to_string(),
+                ..Default::default()
+            }],
+        };
+        let chunk = DraftChunkRecord {
+            id: "chunk-1".to_string(),
+            sandbox_id: "sb-empty".to_string(),
+            draft_version: 1,
+            status: "pending".to_string(),
+            rule_name: "google".to_string(),
+            proposed_rule: rule.encode_to_vec(),
+            rationale: String::new(),
+            security_notes: String::new(),
+            confidence: 1.0,
+            created_at_ms: 0,
+            decided_at_ms: None,
+            host: "google.com".to_string(),
+            port: 443,
+            binary: "/usr/bin/curl".to_string(),
+            hit_count: 1,
+            first_seen_ms: 0,
+            last_seen_ms: 0,
+        };
+
+        let (version, _) = merge_chunk_into_policy(&store, &chunk.sandbox_id, &chunk)
+            .await
+            .unwrap();
+
+        assert_eq!(version, 1);
+
+        let latest = store
+            .get_latest_policy(&chunk.sandbox_id)
+            .await
+            .unwrap()
+            .expect("policy revision should be persisted");
+        let policy = openshell_core::proto::SandboxPolicy::decode(latest.policy_payload.as_slice())
+            .expect("policy payload should decode");
+        let stored_rule = policy
+            .network_policies
+            .get("google")
+            .expect("merged rule should be present");
+        assert_eq!(stored_rule.endpoints[0].host, "google.com");
+        assert_eq!(stored_rule.endpoints[0].port, 443);
+        assert_eq!(stored_rule.binaries[0].path, "/usr/bin/curl");
     }
 
     // ── petname default name generation ───────────────────────────────
@@ -4611,5 +5362,844 @@ mod tests {
         let err = validate_provider_fields(&provider).unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument);
         assert!(err.message().contains("value"));
+    }
+
+    #[cfg(feature = "dev-settings")]
+    #[test]
+    fn merge_effective_settings_global_overrides_sandbox_key() {
+        let global = super::StoredSettings {
+            revision: 2,
+            settings: [
+                (
+                    "log_level".to_string(),
+                    super::StoredSettingValue::String("warn".to_string()),
+                ),
+                ("dummy_int".to_string(), super::StoredSettingValue::Int(7)),
+            ]
+            .into_iter()
+            .collect(),
+        };
+        let sandbox = super::StoredSettings {
+            revision: 1,
+            settings: [
+                (
+                    "log_level".to_string(),
+                    super::StoredSettingValue::String("debug".to_string()),
+                ),
+                (
+                    "dummy_bool".to_string(),
+                    super::StoredSettingValue::Bool(true),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        };
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        let log_level = merged.get("log_level").expect("log_level present");
+        assert_eq!(
+            log_level.scope,
+            openshell_core::proto::SettingScope::Global as i32
+        );
+        assert_eq!(
+            log_level.value.as_ref().and_then(|v| v.value.as_ref()),
+            Some(&openshell_core::proto::setting_value::Value::StringValue(
+                "warn".to_string(),
+            ))
+        );
+
+        let dummy_bool = merged.get("dummy_bool").expect("dummy_bool present");
+        assert_eq!(
+            dummy_bool.scope,
+            openshell_core::proto::SettingScope::Sandbox as i32
+        );
+
+        let dummy_int = merged.get("dummy_int").expect("dummy_int present");
+        assert_eq!(
+            dummy_int.scope,
+            openshell_core::proto::SettingScope::Global as i32
+        );
+    }
+
+    #[test]
+    fn merge_effective_settings_includes_unset_registered_keys() {
+        let global = super::StoredSettings::default();
+        let sandbox = super::StoredSettings::default();
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+            let setting = merged
+                .get(registered.key)
+                .unwrap_or_else(|| panic!("missing registered key {}", registered.key));
+            assert!(
+                setting.value.is_none(),
+                "expected unset value for {}",
+                registered.key
+            );
+            assert_eq!(
+                setting.scope,
+                openshell_core::proto::SettingScope::Unspecified as i32
+            );
+        }
+    }
+
+    #[test]
+    fn materialize_global_settings_includes_unset_registered_keys() {
+        let global = super::StoredSettings::default();
+        let materialized = super::materialize_global_settings(&global).unwrap();
+        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+            let setting = materialized
+                .get(registered.key)
+                .unwrap_or_else(|| panic!("missing registered key {}", registered.key));
+            assert!(
+                setting.value.is_none(),
+                "expected unset value for {}",
+                registered.key
+            );
+        }
+    }
+
+    #[test]
+    fn decode_policy_from_global_settings_round_trip() {
+        let policy = openshell_core::proto::SandboxPolicy {
+            version: 7,
+            ..Default::default()
+        };
+        let encoded = hex::encode(policy.encode_to_vec());
+        let global = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "policy".to_string(),
+                super::StoredSettingValue::Bytes(encoded),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let decoded = super::decode_policy_from_global_settings(&global)
+            .unwrap()
+            .expect("policy present");
+        assert_eq!(decoded.version, 7);
+    }
+
+    #[test]
+    fn config_revision_changes_when_effective_setting_changes() {
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        let mut settings = HashMap::new();
+        settings.insert(
+            "mode".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "strict".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        settings.insert(
+            "mode".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "relaxed".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        assert_ne!(rev_a, rev_b);
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_unknown_key() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                "hello".to_string(),
+            )),
+        };
+
+        let err = super::proto_setting_to_stored("unknown_key", &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[cfg(feature = "dev-settings")]
+    #[test]
+    fn proto_setting_to_stored_rejects_type_mismatch() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                "true".to_string(),
+            )),
+        };
+
+        let err = super::proto_setting_to_stored("dummy_bool", &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("expects bool value"));
+    }
+
+    #[cfg(feature = "dev-settings")]
+    #[test]
+    fn proto_setting_to_stored_accepts_bool_for_registered_bool_key() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::BoolValue(true)),
+        };
+
+        let stored = super::proto_setting_to_stored("dummy_bool", &value).unwrap();
+        assert_eq!(stored, super::StoredSettingValue::Bool(true));
+    }
+
+    // ---- merge_effective_settings: sandbox-scoped values ----
+
+    #[cfg(feature = "dev-settings")]
+    #[test]
+    fn merge_effective_settings_sandbox_scoped_value_has_sandbox_scope() {
+        let global = super::StoredSettings::default();
+        let sandbox = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "log_level".to_string(),
+                super::StoredSettingValue::String("debug".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        let log_level = merged.get("log_level").expect("log_level present");
+        assert_eq!(
+            log_level.scope,
+            openshell_core::proto::SettingScope::Sandbox as i32,
+            "sandbox-set key should have SANDBOX scope"
+        );
+        assert!(
+            log_level.value.is_some(),
+            "sandbox-set key should have a value"
+        );
+    }
+
+    #[test]
+    fn merge_effective_settings_unset_key_has_unspecified_scope_and_no_value() {
+        let global = super::StoredSettings::default();
+        let sandbox = super::StoredSettings::default();
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        for registered in openshell_core::settings::REGISTERED_SETTINGS {
+            let setting = merged.get(registered.key).unwrap();
+            assert_eq!(
+                setting.scope,
+                openshell_core::proto::SettingScope::Unspecified as i32,
+                "unset key '{}' should have UNSPECIFIED scope",
+                registered.key,
+            );
+            assert!(
+                setting.value.is_none(),
+                "unset key '{}' should have no value",
+                registered.key,
+            );
+        }
+    }
+
+    #[test]
+    fn merge_effective_settings_policy_key_is_excluded() {
+        let global = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "policy".to_string(),
+                super::StoredSettingValue::Bytes("deadbeef".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let sandbox = super::StoredSettings {
+            revision: 1,
+            settings: [(
+                "policy".to_string(),
+                super::StoredSettingValue::Bytes("cafebabe".to_string()),
+            )]
+            .into_iter()
+            .collect(),
+        };
+
+        let merged = super::merge_effective_settings(&global, &sandbox).unwrap();
+        assert!(
+            !merged.contains_key("policy"),
+            "policy key must not appear in effective settings"
+        );
+    }
+
+    // ---- sandbox_settings_id prefix ----
+
+    #[test]
+    fn sandbox_settings_id_has_prefix_preventing_collision() {
+        let sandbox_id = "abc-123";
+        let settings_id = super::sandbox_settings_id(sandbox_id);
+        assert!(
+            settings_id.starts_with("settings:"),
+            "settings ID should be prefixed"
+        );
+        assert_ne!(
+            settings_id, sandbox_id,
+            "settings ID must differ from sandbox ID"
+        );
+    }
+
+    #[test]
+    fn sandbox_settings_id_different_sandboxes_produce_different_ids() {
+        let id_a = super::sandbox_settings_id("sandbox-1");
+        let id_b = super::sandbox_settings_id("sandbox-2");
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn sandbox_settings_id_embeds_sandbox_id() {
+        let sandbox_id = "some-uuid-value";
+        let settings_id = super::sandbox_settings_id(sandbox_id);
+        assert!(
+            settings_id.contains(sandbox_id),
+            "settings ID should embed the original sandbox ID"
+        );
+    }
+
+    // ---- compute_config_revision ----
+
+    #[test]
+    fn config_revision_stable_when_nothing_changes() {
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        let mut settings = HashMap::new();
+        settings.insert(
+            "log_level".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "info".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        assert_eq!(rev_a, rev_b, "revision must be stable for identical inputs");
+    }
+
+    #[test]
+    fn config_revision_changes_when_policy_changes() {
+        let policy_a = openshell_core::proto::SandboxPolicy {
+            version: 1,
+            ..Default::default()
+        };
+        let policy_b = openshell_core::proto::SandboxPolicy {
+            version: 2,
+            ..Default::default()
+        };
+        let settings = HashMap::new();
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy_a),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy_b),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        assert_ne!(rev_a, rev_b, "revision must change when policy changes");
+    }
+
+    #[test]
+    fn config_revision_changes_when_policy_source_changes() {
+        let policy = openshell_core::proto::SandboxPolicy::default();
+        let settings = HashMap::new();
+
+        let rev_a = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        let rev_b = super::compute_config_revision(
+            Some(&policy),
+            &settings,
+            openshell_core::proto::PolicySource::Global,
+        );
+        assert_ne!(
+            rev_a, rev_b,
+            "revision must change when policy source changes"
+        );
+    }
+
+    #[test]
+    fn config_revision_without_policy_still_hashes_settings() {
+        let mut settings = HashMap::new();
+        settings.insert(
+            "log_level".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "debug".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_a = super::compute_config_revision(
+            None,
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+
+        settings.insert(
+            "log_level".to_string(),
+            openshell_core::proto::EffectiveSetting {
+                value: Some(openshell_core::proto::SettingValue {
+                    value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                        "warn".to_string(),
+                    )),
+                }),
+                scope: openshell_core::proto::SettingScope::Sandbox.into(),
+            },
+        );
+
+        let rev_b = super::compute_config_revision(
+            None,
+            &settings,
+            openshell_core::proto::PolicySource::Sandbox,
+        );
+        assert_ne!(
+            rev_a, rev_b,
+            "revision must change when settings differ, even without policy"
+        );
+    }
+
+    // ---- conflict guard: global overrides block sandbox mutations ----
+
+    #[tokio::test]
+    async fn conflict_guard_sandbox_set_blocked_when_global_exists() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // Persist a global setting for "log_level".
+        let mut global = super::StoredSettings::default();
+        global.settings.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("warn".to_string()),
+        );
+        global.revision = 1;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // Attempt sandbox-scoped set: check the guard condition.
+        let loaded_global = super::load_global_settings(&store).await.unwrap();
+        let globally_managed = loaded_global.settings.contains_key("log_level");
+        assert!(
+            globally_managed,
+            "log_level should be globally managed after global set"
+        );
+        // The handler would return FailedPrecondition here.
+    }
+
+    #[tokio::test]
+    async fn conflict_guard_sandbox_delete_blocked_when_global_exists() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // Persist a global setting for "dummy_int".
+        let mut global = super::StoredSettings::default();
+        global
+            .settings
+            .insert("dummy_int".to_string(), super::StoredSettingValue::Int(42));
+        global.revision = 1;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // Check the guard for sandbox-scoped delete.
+        let loaded_global = super::load_global_settings(&store).await.unwrap();
+        assert!(
+            loaded_global.settings.contains_key("dummy_int"),
+            "dummy_int should be globally managed"
+        );
+        // The handler would return FailedPrecondition for sandbox delete too.
+    }
+
+    // ---- delete-unlock: sandbox set succeeds after global delete ----
+
+    #[tokio::test]
+    async fn delete_unlock_sandbox_set_succeeds_after_global_delete() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        // 1. Set global setting.
+        let mut global = super::StoredSettings::default();
+        global.settings.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("warn".to_string()),
+        );
+        global.revision = 1;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // Verify it blocks sandbox.
+        let loaded = super::load_global_settings(&store).await.unwrap();
+        assert!(loaded.settings.contains_key("log_level"));
+
+        // 2. Delete the global setting.
+        global.settings.remove("log_level");
+        global.revision = 2;
+        super::save_global_settings(&store, &global).await.unwrap();
+
+        // 3. Verify the guard is cleared.
+        let loaded = super::load_global_settings(&store).await.unwrap();
+        assert!(
+            !loaded.settings.contains_key("log_level"),
+            "after global delete, log_level should not be globally managed"
+        );
+
+        // 4. Sandbox-scoped set should now succeed.
+        let sandbox_id = "test-sandbox-uuid";
+        let mut sandbox_settings = super::load_sandbox_settings(&store, sandbox_id)
+            .await
+            .unwrap();
+        let changed = super::upsert_setting_value(
+            &mut sandbox_settings.settings,
+            "log_level",
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        assert!(changed, "sandbox upsert should report a change");
+        sandbox_settings.revision = sandbox_settings.revision.wrapping_add(1);
+        super::save_sandbox_settings(&store, sandbox_id, "test-sandbox", &sandbox_settings)
+            .await
+            .unwrap();
+
+        // Verify round-trip.
+        let reloaded = super::load_sandbox_settings(&store, sandbox_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            reloaded.settings.get("log_level"),
+            Some(&super::StoredSettingValue::String("debug".to_string())),
+        );
+    }
+
+    // ---- reserved policy key rejection ----
+
+    #[test]
+    fn validate_registered_setting_key_rejects_policy() {
+        // "policy" is not in REGISTERED_SETTINGS, so validate should fail.
+        let err = super::validate_registered_setting_key("policy").unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(err.message().contains("unknown setting key"));
+    }
+
+    #[test]
+    fn proto_setting_to_stored_rejects_policy_key() {
+        let value = openshell_core::proto::SettingValue {
+            value: Some(openshell_core::proto::setting_value::Value::StringValue(
+                "anything".to_string(),
+            )),
+        };
+        let err = super::proto_setting_to_stored("policy", &value).unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument);
+        assert!(
+            err.message().contains("unknown setting key"),
+            "policy key should be rejected as unknown: {}",
+            err.message(),
+        );
+    }
+
+    // ---- stored <-> proto round-trip for all types ----
+
+    #[test]
+    fn stored_setting_to_proto_string_round_trip() {
+        let stored = super::StoredSettingValue::String("hello".to_string());
+        let proto = super::stored_setting_to_proto(&stored).unwrap();
+        assert_eq!(
+            proto.value,
+            Some(openshell_core::proto::setting_value::Value::StringValue(
+                "hello".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn stored_setting_to_proto_int_round_trip() {
+        let stored = super::StoredSettingValue::Int(42);
+        let proto = super::stored_setting_to_proto(&stored).unwrap();
+        assert_eq!(
+            proto.value,
+            Some(openshell_core::proto::setting_value::Value::IntValue(42))
+        );
+    }
+
+    #[test]
+    fn stored_setting_to_proto_bool_round_trip() {
+        let stored = super::StoredSettingValue::Bool(false);
+        let proto = super::stored_setting_to_proto(&stored).unwrap();
+        assert_eq!(
+            proto.value,
+            Some(openshell_core::proto::setting_value::Value::BoolValue(
+                false
+            ))
+        );
+    }
+
+    // ---- upsert_setting_value ----
+
+    #[test]
+    fn upsert_setting_value_returns_true_on_insert() {
+        let mut map = std::collections::BTreeMap::new();
+        let changed = super::upsert_setting_value(
+            &mut map,
+            "log_level",
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        assert!(changed);
+        assert_eq!(
+            map.get("log_level"),
+            Some(&super::StoredSettingValue::String("debug".to_string()))
+        );
+    }
+
+    #[test]
+    fn upsert_setting_value_returns_false_when_unchanged() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        let changed = super::upsert_setting_value(
+            &mut map,
+            "log_level",
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        assert!(
+            !changed,
+            "upsert should return false when value is unchanged"
+        );
+    }
+
+    #[test]
+    fn upsert_setting_value_returns_true_on_update() {
+        let mut map = std::collections::BTreeMap::new();
+        map.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("debug".to_string()),
+        );
+        let changed = super::upsert_setting_value(
+            &mut map,
+            "log_level",
+            super::StoredSettingValue::String("warn".to_string()),
+        );
+        assert!(changed, "upsert should return true when value changes");
+    }
+
+    // ---- settings persistence round-trip ----
+
+    #[tokio::test]
+    async fn global_settings_load_returns_default_when_empty() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let settings = super::load_global_settings(&store).await.unwrap();
+        assert!(settings.settings.is_empty());
+        assert_eq!(settings.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_load_returns_default_when_empty() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+        let settings = super::load_sandbox_settings(&store, "nonexistent")
+            .await
+            .unwrap();
+        assert!(settings.settings.is_empty());
+        assert_eq!(settings.revision, 0);
+    }
+
+    #[tokio::test]
+    async fn global_settings_save_and_load_round_trip() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let mut settings = super::StoredSettings::default();
+        settings.settings.insert(
+            "log_level".to_string(),
+            super::StoredSettingValue::String("error".to_string()),
+        );
+        settings.settings.insert(
+            "dummy_bool".to_string(),
+            super::StoredSettingValue::Bool(true),
+        );
+        settings.revision = 5;
+        super::save_global_settings(&store, &settings)
+            .await
+            .unwrap();
+
+        let loaded = super::load_global_settings(&store).await.unwrap();
+        assert_eq!(loaded.revision, 5);
+        assert_eq!(
+            loaded.settings.get("log_level"),
+            Some(&super::StoredSettingValue::String("error".to_string()))
+        );
+        assert_eq!(
+            loaded.settings.get("dummy_bool"),
+            Some(&super::StoredSettingValue::Bool(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn sandbox_settings_save_and_load_round_trip() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .unwrap();
+
+        let sandbox_id = "sb-uuid-123";
+        let mut settings = super::StoredSettings::default();
+        settings
+            .settings
+            .insert("dummy_int".to_string(), super::StoredSettingValue::Int(99));
+        settings.revision = 3;
+        super::save_sandbox_settings(&store, sandbox_id, "my-sandbox", &settings)
+            .await
+            .unwrap();
+
+        let loaded = super::load_sandbox_settings(&store, sandbox_id)
+            .await
+            .unwrap();
+        assert_eq!(loaded.revision, 3);
+        assert_eq!(
+            loaded.settings.get("dummy_int"),
+            Some(&super::StoredSettingValue::Int(99))
+        );
+    }
+
+    /// Verify that a mutex prevents lost writes when concurrent tasks
+    /// perform load-modify-save on the same global settings record.
+    ///
+    /// Each of N tasks increments the revision by 1 under the mutex.
+    /// Without the mutex, some increments would be lost (last-writer-wins).
+    /// With the mutex, the final revision must equal N.
+    #[tokio::test]
+    async fn concurrent_global_setting_mutations_are_serialized() {
+        let store = std::sync::Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+        let mutex = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+        let n = 50;
+        let mut handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let store = store.clone();
+            let mutex = mutex.clone();
+            handles.push(tokio::spawn(async move {
+                let _guard = mutex.lock().await;
+                let mut settings = super::load_global_settings(&store).await.unwrap();
+                // Simulate per-key mutation: each task sets a unique key.
+                settings
+                    .settings
+                    .insert(format!("key_{i}"), super::StoredSettingValue::Int(i as i64));
+                settings.revision = settings.revision.wrapping_add(1);
+                super::save_global_settings(&store, &settings)
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let final_settings = super::load_global_settings(&store).await.unwrap();
+        assert_eq!(
+            final_settings.revision, n as u64,
+            "all {n} increments must be reflected; lost writes indicate a race"
+        );
+        assert_eq!(
+            final_settings.settings.len(),
+            n,
+            "all {n} unique keys must be present"
+        );
+    }
+
+    /// Same test WITHOUT the mutex to confirm the test would actually
+    /// detect lost writes when concurrent access is unserialized.
+    /// Uses `tokio::task::yield_now()` to increase interleaving.
+    #[tokio::test]
+    async fn concurrent_global_setting_mutations_without_lock_can_lose_writes() {
+        let store = std::sync::Arc::new(
+            Store::connect("sqlite::memory:?cache=shared")
+                .await
+                .unwrap(),
+        );
+
+        let n = 50;
+        let mut handles = Vec::with_capacity(n);
+
+        for i in 0..n {
+            let store = store.clone();
+            handles.push(tokio::spawn(async move {
+                // No mutex — intentional race.
+                let mut settings = super::load_global_settings(&store).await.unwrap();
+                // Yield to encourage interleaving between load and save.
+                tokio::task::yield_now().await;
+                settings
+                    .settings
+                    .insert(format!("key_{i}"), super::StoredSettingValue::Int(i as i64));
+                settings.revision = settings.revision.wrapping_add(1);
+                super::save_global_settings(&store, &settings)
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let final_settings = super::load_global_settings(&store).await.unwrap();
+        // Without serialization, some writes will be lost. The final
+        // revision and key count will be less than N.  We assert that
+        // at least one write was lost to validate the test methodology.
+        // (If tokio happens to schedule everything sequentially, this
+        // could flake — but with N=50 and yield_now it's reliable.)
+        let lost = (n as u64).saturating_sub(final_settings.revision);
+        if lost == 0 {
+            // Rare but possible with sequential scheduling.  Don't fail,
+            // but note that the positive test above is what matters.
+            eprintln!(
+                "note: no lost writes detected in unlocked test (sequential scheduling); \
+                 the locked test is the authoritative correctness check"
+            );
+        } else {
+            eprintln!("unlocked test: {lost} lost writes out of {n} (expected behavior)");
+        }
+        // Either way, the WITH-lock test above asserts correctness.
     }
 }

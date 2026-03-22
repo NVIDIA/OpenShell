@@ -112,6 +112,24 @@ pub async fn run(
                     app.pending_provider_delete = false;
                     spawn_delete_provider(&app, events.sender());
                 }
+                // --- Global settings CRUD ---
+                if app.pending_setting_set {
+                    app.pending_setting_set = false;
+                    spawn_set_global_setting(&app, events.sender());
+                }
+                if app.pending_setting_delete {
+                    app.pending_setting_delete = false;
+                    spawn_delete_global_setting(&app, events.sender());
+                }
+                // --- Sandbox settings CRUD ---
+                if app.pending_sandbox_setting_set {
+                    app.pending_sandbox_setting_set = false;
+                    spawn_set_sandbox_setting(&app, events.sender());
+                }
+                if app.pending_sandbox_setting_delete {
+                    app.pending_sandbox_setting_delete = false;
+                    spawn_delete_sandbox_setting(&app, events.sender());
+                }
                 if app.pending_sandbox_detail {
                     app.pending_sandbox_detail = false;
                     fetch_sandbox_detail(&mut app).await;
@@ -222,6 +240,61 @@ pub async fn run(
                 refresh_draft_chunks(&mut app).await;
                 refresh_sandbox_draft_counts(&mut app).await;
             }
+            Some(Event::GlobalSettingsFetched(result)) => match result {
+                Ok((settings, revision)) => {
+                    app.apply_global_settings(settings, revision);
+                }
+                Err(msg) => {
+                    tracing::warn!("failed to fetch global settings: {msg}");
+                }
+            },
+            Some(Event::GlobalSettingSetResult(result)) => {
+                app.setting_edit = None;
+                match result {
+                    Ok(rev) => {
+                        app.global_settings_revision = rev;
+                        app.status_text = "Global setting updated.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("set setting failed: {msg}");
+                    }
+                }
+                refresh_global_settings(&mut app).await;
+            }
+            Some(Event::GlobalSettingDeleteResult(result)) => match result {
+                Ok(rev) => {
+                    app.global_settings_revision = rev;
+                    app.status_text = "Global setting deleted.".to_string();
+                    refresh_global_settings(&mut app).await;
+                }
+                Err(msg) => {
+                    app.status_text = format!("delete setting failed: {msg}");
+                }
+            },
+            Some(Event::SandboxSettingSetResult(result)) => {
+                app.sandbox_setting_edit = None;
+                match result {
+                    Ok(_rev) => {
+                        app.status_text = "Sandbox setting updated.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("set sandbox setting failed: {msg}");
+                    }
+                }
+                // Re-fetch sandbox settings to reflect the change.
+                fetch_sandbox_detail(&mut app).await;
+            }
+            Some(Event::SandboxSettingDeleteResult(result)) => {
+                match result {
+                    Ok(_rev) => {
+                        app.status_text = "Sandbox setting deleted.".to_string();
+                    }
+                    Err(msg) => {
+                        app.status_text = format!("delete sandbox setting failed: {msg}");
+                    }
+                }
+                fetch_sandbox_detail(&mut app).await;
+            }
             Some(Event::Mouse(mouse)) => match mouse.kind {
                 MouseEventKind::ScrollUp if app.focus == Focus::SandboxLogs => {
                     app.scroll_logs(-3);
@@ -253,19 +326,12 @@ pub async fn run(
                 // Refresh per-sandbox draft counts for badges (dashboard + detail).
                 refresh_sandbox_draft_counts(&mut app).await;
 
-                // Auto-refresh the policy view when a new version is detected.
+                // Auto-refresh sandbox detail (policy, settings, drafts) on
+                // every tick when viewing a sandbox.  The gRPC call is
+                // lightweight and ensures settings changes, global policy
+                // changes, and policy version bumps are reflected live.
                 if app.screen == Screen::Sandbox {
-                    let displayed = app.sandbox_policy.as_ref().map_or(0, |p| p.version);
-                    let listed = app
-                        .sandbox_policy_versions
-                        .get(app.sandbox_selected)
-                        .copied()
-                        .unwrap_or(0);
-                    if listed > 0 && listed != displayed {
-                        refresh_sandbox_policy(&mut app).await;
-                    }
-
-                    // Refresh draft chunks when on sandbox screen.
+                    refresh_sandbox_policy(&mut app).await;
                     refresh_draft_chunks(&mut app).await;
                 }
             }
@@ -632,7 +698,7 @@ async fn handle_sandbox_delete(app: &mut App) {
 
 /// Fetch sandbox details (policy + providers) when entering the sandbox screen.
 ///
-/// Uses `GetSandbox` for metadata/providers, then `GetSandboxPolicy` for the
+/// Uses `GetSandbox` for metadata/providers, then `GetSandboxConfig` for the
 /// current live policy (which may have been updated since creation).
 async fn fetch_sandbox_detail(app: &mut App) {
     let sandbox_name = match app.selected_sandbox_name() {
@@ -673,11 +739,11 @@ async fn fetch_sandbox_detail(app: &mut App) {
 
     // Step 2: Fetch the current live policy (includes updates since creation).
     if let Some(id) = sandbox_id {
-        let policy_req = openshell_core::proto::GetSandboxPolicyRequest { sandbox_id: id };
+        let policy_req = openshell_core::proto::GetSandboxConfigRequest { sandbox_id: id };
 
         match tokio::time::timeout(
             Duration::from_secs(5),
-            app.client.get_sandbox_policy(policy_req),
+            app.client.get_sandbox_config(policy_req),
         )
         .await
         {
@@ -690,10 +756,14 @@ async fn fetch_sandbox_detail(app: &mut App) {
                     app.policy_lines = render_policy_lines(&policy, &app.theme);
                     app.sandbox_policy = Some(policy);
                 }
+                // Populate sandbox settings and policy source from the same response.
+                app.sandbox_policy_is_global =
+                    inner.policy_source == openshell_core::proto::PolicySource::Global as i32;
+                app.sandbox_global_policy_version = inner.global_policy_version;
+                app.apply_sandbox_settings(inner.settings);
             }
             Ok(Err(e)) => {
-                let msg = e.message().to_string();
-                tracing::warn!("failed to fetch sandbox policy: {msg}");
+                tracing::warn!("failed to fetch sandbox policy: {}", e.message());
             }
             Err(_) => {
                 tracing::warn!("sandbox policy request timed out");
@@ -1756,6 +1826,7 @@ fn mask_secret(value: &str) -> String {
 async fn refresh_data(app: &mut App) {
     refresh_health(app).await;
     refresh_providers(app).await;
+    refresh_global_settings(app).await;
     refresh_sandboxes(app).await;
 }
 
@@ -1792,6 +1863,254 @@ async fn refresh_providers(app: &mut App) {
             }
         }
     }
+}
+
+async fn refresh_global_settings(app: &mut App) {
+    let req = openshell_core::proto::GetGatewayConfigRequest {};
+    let result =
+        tokio::time::timeout(Duration::from_secs(5), app.client.get_gateway_config(req)).await;
+    match result {
+        Ok(Err(e)) => {
+            tracing::warn!("failed to fetch global settings: {}", e.message());
+        }
+        Err(_) => {
+            tracing::warn!("get gateway settings timed out");
+        }
+        Ok(Ok(resp)) => {
+            let inner = resp.into_inner();
+            app.apply_global_settings(inner.settings, inner.settings_revision);
+        }
+    }
+
+    // Check for active global policy.
+    let policy_req = openshell_core::proto::ListSandboxPoliciesRequest {
+        name: String::new(),
+        limit: 1,
+        offset: 0,
+        global: true,
+    };
+    if let Ok(Ok(resp)) = tokio::time::timeout(
+        Duration::from_secs(5),
+        app.client.list_sandbox_policies(policy_req),
+    )
+    .await
+    {
+        let revisions = resp.into_inner().revisions;
+        if let Some(latest) = revisions.first() {
+            let status =
+                openshell_core::proto::PolicyStatus::try_from(latest.status).unwrap_or_default();
+            app.global_policy_active = status == openshell_core::proto::PolicyStatus::Loaded;
+            app.global_policy_version = latest.version;
+        } else {
+            app.global_policy_active = false;
+            app.global_policy_version = 0;
+        }
+    }
+}
+
+fn spawn_set_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(ref edit) = app.setting_edit else {
+        return;
+    };
+    let Some(entry) = app.global_settings.get(edit.index) else {
+        return;
+    };
+
+    let key = entry.key.clone();
+    let raw = edit.input.trim().to_string();
+    let kind = entry.kind;
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        // Build the typed SettingValue from the validated input.
+        use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
+
+        let value = match kind {
+            openshell_core::settings::SettingValueKind::Bool => {
+                match openshell_core::settings::parse_bool_like(&raw) {
+                    Some(v) => setting_value::Value::BoolValue(v),
+                    None => {
+                        let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                            "invalid bool value: {raw}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
+                Ok(v) => setting_value::Value::IntValue(v),
+                Err(_) => {
+                    let _ = tx.send(Event::GlobalSettingSetResult(Err(format!(
+                        "invalid int value: {raw}"
+                    ))));
+                    return;
+                }
+            },
+            openshell_core::settings::SettingValueKind::String => {
+                setting_value::Value::StringValue(raw)
+            }
+        };
+
+        let req = UpdateConfigRequest {
+            name: String::new(),
+            policy: None,
+            setting_key: key,
+            setting_value: Some(SettingValue { value: Some(value) }),
+            delete_setting: false,
+            global: true,
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => Event::GlobalSettingSetResult(Ok(resp.into_inner().settings_revision)),
+            Ok(Err(e)) => Event::GlobalSettingSetResult(Err(e.message().to_string())),
+            Err(_) => Event::GlobalSettingSetResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_delete_global_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let idx = app
+        .confirm_setting_delete
+        .unwrap_or(app.global_settings_selected);
+    let Some(entry) = app.global_settings.get(idx) else {
+        return;
+    };
+
+    let key = entry.key.clone();
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        use openshell_core::proto::UpdateConfigRequest;
+
+        let req = UpdateConfigRequest {
+            name: String::new(),
+            policy: None,
+            setting_key: key,
+            setting_value: None,
+            delete_setting: true,
+            global: true,
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => {
+                Event::GlobalSettingDeleteResult(Ok(resp.into_inner().settings_revision))
+            }
+            Ok(Err(e)) => Event::GlobalSettingDeleteResult(Err(e.message().to_string())),
+            Err(_) => Event::GlobalSettingDeleteResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_set_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let Some(ref edit) = app.sandbox_setting_edit else {
+        return;
+    };
+    let Some(entry) = app.sandbox_settings.get(edit.index) else {
+        return;
+    };
+    let Some(sandbox_name) = app.selected_sandbox_name() else {
+        return;
+    };
+
+    let name = sandbox_name.to_string();
+    let key = entry.key.clone();
+    let raw = edit.input.trim().to_string();
+    let kind = entry.kind;
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        use openshell_core::proto::{SettingValue, UpdateConfigRequest, setting_value};
+
+        let value = match kind {
+            openshell_core::settings::SettingValueKind::Bool => {
+                match openshell_core::settings::parse_bool_like(&raw) {
+                    Some(v) => setting_value::Value::BoolValue(v),
+                    None => {
+                        let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                            "invalid bool value: {raw}"
+                        ))));
+                        return;
+                    }
+                }
+            }
+            openshell_core::settings::SettingValueKind::Int => match raw.parse::<i64>() {
+                Ok(v) => setting_value::Value::IntValue(v),
+                Err(_) => {
+                    let _ = tx.send(Event::SandboxSettingSetResult(Err(format!(
+                        "invalid int value: {raw}"
+                    ))));
+                    return;
+                }
+            },
+            openshell_core::settings::SettingValueKind::String => {
+                setting_value::Value::StringValue(raw)
+            }
+        };
+
+        let req = UpdateConfigRequest {
+            name,
+            policy: None,
+            setting_key: key,
+            setting_value: Some(SettingValue { value: Some(value) }),
+            delete_setting: false,
+            global: false,
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => Event::SandboxSettingSetResult(Ok(resp.into_inner().settings_revision)),
+            Ok(Err(e)) => Event::SandboxSettingSetResult(Err(e.message().to_string())),
+            Err(_) => Event::SandboxSettingSetResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
+}
+
+fn spawn_delete_sandbox_setting(app: &App, tx: mpsc::UnboundedSender<Event>) {
+    let idx = app
+        .sandbox_confirm_setting_delete
+        .unwrap_or(app.sandbox_settings_selected);
+    let Some(entry) = app.sandbox_settings.get(idx) else {
+        return;
+    };
+    let Some(sandbox_name) = app.selected_sandbox_name() else {
+        return;
+    };
+
+    let name = sandbox_name.to_string();
+    let key = entry.key.clone();
+    let mut client = app.client.clone();
+
+    tokio::spawn(async move {
+        use openshell_core::proto::UpdateConfigRequest;
+
+        let req = UpdateConfigRequest {
+            name,
+            policy: None,
+            setting_key: key,
+            setting_value: None,
+            delete_setting: true,
+            global: false,
+        };
+
+        let result = tokio::time::timeout(Duration::from_secs(5), client.update_config(req)).await;
+
+        let event = match result {
+            Ok(Ok(resp)) => {
+                Event::SandboxSettingDeleteResult(Ok(resp.into_inner().settings_revision))
+            }
+            Ok(Err(e)) => Event::SandboxSettingDeleteResult(Err(e.message().to_string())),
+            Err(_) => Event::SandboxSettingDeleteResult(Err("timeout".to_string())),
+        };
+        let _ = tx.send(event);
+    });
 }
 
 async fn refresh_health(app: &mut App) {
@@ -1883,11 +2202,11 @@ async fn refresh_sandbox_policy(app: &mut App) {
         None => return,
     };
 
-    let policy_req = openshell_core::proto::GetSandboxPolicyRequest { sandbox_id };
+    let policy_req = openshell_core::proto::GetSandboxConfigRequest { sandbox_id };
 
     match tokio::time::timeout(
         Duration::from_secs(5),
-        app.client.get_sandbox_policy(policy_req),
+        app.client.get_sandbox_config(policy_req),
     )
     .await
     {
@@ -1900,6 +2219,10 @@ async fn refresh_sandbox_policy(app: &mut App) {
                 app.policy_lines = render_policy_lines(&policy, &app.theme);
                 app.sandbox_policy = Some(policy);
             }
+            // Refresh settings and policy source alongside the policy.
+            app.sandbox_policy_is_global =
+                inner.policy_source == openshell_core::proto::PolicySource::Global as i32;
+            app.apply_sandbox_settings(inner.settings);
         }
         Ok(Err(e)) => {
             tracing::warn!("failed to refresh sandbox policy: {}", e.message());

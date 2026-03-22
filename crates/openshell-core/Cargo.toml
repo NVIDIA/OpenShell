@@ -20,6 +20,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 url = { workspace = true }
 
+[features]
+## Include test-only settings (dummy_bool, dummy_int) in the registry.
+## Off by default so production builds have an empty registry.
+## Enabled by e2e tests and during development.
+dev-settings = []
+
 [build-dependencies]
 tonic-build = { workspace = true }
 protobuf-src = { workspace = true }

@@ -159,6 +159,11 @@ else
   exit 1
 fi
 
+FEATURE_ARGS=()
+if [[ -n "${EXTRA_CARGO_FEATURES:-}" ]]; then
+  FEATURE_ARGS=(--build-arg "EXTRA_CARGO_FEATURES=${EXTRA_CARGO_FEATURES}")
+fi
+
 docker buildx build \
   ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
   ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
@@ -167,6 +172,7 @@ docker buildx build \
   ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
   ${K3S_ARGS[@]+"${K3S_ARGS[@]}"} \
   ${CODEGEN_ARGS[@]+"${CODEGEN_ARGS[@]}"} \
+  ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} \
   --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
   -f "${DOCKERFILE}" \
   --target "${DOCKER_TARGET}" \

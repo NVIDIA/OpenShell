@@ -167,7 +167,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
             path: "/v1/chat/completions",
             protocol: "openai_chat_completions",
             body: bytes::Bytes::from_static(
-                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":1}"#,
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":32}"#,
             ),
         });
     }
@@ -181,7 +181,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
             path: "/v1/messages",
             protocol: "anthropic_messages",
             body: bytes::Bytes::from_static(
-                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":1}"#,
+                br#"{"messages":[{"role":"user","content":"ping"}],"max_tokens":32}"#,
             ),
         });
     }
@@ -194,7 +194,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         return Ok(ValidationProbe {
             path: "/v1/responses",
             protocol: "openai_responses",
-            body: bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":1}"#),
+            body: bytes::Bytes::from_static(br#"{"input":"ping","max_output_tokens":32}"#),
         });
     }
 
@@ -206,7 +206,7 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         return Ok(ValidationProbe {
             path: "/v1/completions",
             protocol: "openai_completions",
-            body: bytes::Bytes::from_static(br#"{"prompt":"ping","max_tokens":1}"#),
+            body: bytes::Bytes::from_static(br#"{"prompt":"ping","max_tokens":32}"#),
         });
     }
 
@@ -434,7 +434,7 @@ mod tests {
             .and(header("anthropic-version", "2023-06-01"))
             .and(body_partial_json(serde_json::json!({
                 "model": "test-model",
-                "max_tokens": 1,
+                "max_tokens": 32,
             })))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"id": "msg_1"})),

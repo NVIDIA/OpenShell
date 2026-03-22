@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use miette::{IntoDiagnostic, Result, WrapErr};
 use openshell_core::proto::{
-    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxPolicyRequest,
-    GetSandboxProviderEnvironmentRequest, PolicyStatus, ReportPolicyStatusRequest,
-    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateSandboxPolicyRequest,
+    DenialSummary, GetInferenceBundleRequest, GetInferenceBundleResponse, GetSandboxConfigRequest,
+    GetSandboxProviderEnvironmentRequest, PolicySource, PolicyStatus, ReportPolicyStatusRequest,
+    SandboxPolicy as ProtoSandboxPolicy, SubmitPolicyAnalysisRequest, UpdateConfigRequest,
     inference_client::InferenceClient, open_shell_client::OpenShellClient,
 };
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
@@ -101,7 +101,7 @@ async fn fetch_policy_with_client(
     sandbox_id: &str,
 ) -> Result<Option<ProtoSandboxPolicy>> {
     let response = client
-        .get_sandbox_policy(GetSandboxPolicyRequest {
+        .get_sandbox_config(GetSandboxConfigRequest {
             sandbox_id: sandbox_id.to_string(),
         })
         .await
@@ -126,9 +126,13 @@ async fn sync_policy_with_client(
     policy: &ProtoSandboxPolicy,
 ) -> Result<()> {
     client
-        .update_sandbox_policy(UpdateSandboxPolicyRequest {
+        .update_config(UpdateConfigRequest {
             name: sandbox.to_string(),
             policy: Some(policy.clone()),
+            setting_key: String::new(),
+            setting_value: None,
+            delete_setting: false,
+            global: false,
         })
         .await
         .into_diagnostic()
@@ -209,11 +213,17 @@ pub struct CachedOpenShellClient {
     client: OpenShellClient<Channel>,
 }
 
-/// Policy poll result returned by [`CachedOpenShellClient::poll_policy`].
-pub struct PolicyPollResult {
-    pub policy: ProtoSandboxPolicy,
+/// Settings poll result returned by [`CachedOpenShellClient::poll_settings`].
+pub struct SettingsPollResult {
+    pub policy: Option<ProtoSandboxPolicy>,
     pub version: u32,
     pub policy_hash: String,
+    pub config_revision: u64,
+    pub policy_source: PolicySource,
+    /// Effective settings keyed by name.
+    pub settings: std::collections::HashMap<String, openshell_core::proto::EffectiveSetting>,
+    /// When `policy_source` is `Global`, the version of the global policy revision.
+    pub global_policy_version: u32,
 }
 
 impl CachedOpenShellClient {
@@ -229,26 +239,28 @@ impl CachedOpenShellClient {
         self.client.clone()
     }
 
-    /// Poll for the current sandbox policy version.
-    pub async fn poll_policy(&self, sandbox_id: &str) -> Result<PolicyPollResult> {
+    /// Poll for current effective sandbox settings and policy metadata.
+    pub async fn poll_settings(&self, sandbox_id: &str) -> Result<SettingsPollResult> {
         let response = self
             .client
             .clone()
-            .get_sandbox_policy(GetSandboxPolicyRequest {
+            .get_sandbox_config(GetSandboxConfigRequest {
                 sandbox_id: sandbox_id.to_string(),
             })
             .await
             .into_diagnostic()?;
 
         let inner = response.into_inner();
-        let policy = inner
-            .policy
-            .ok_or_else(|| miette::miette!("Server returned empty policy"))?;
 
-        Ok(PolicyPollResult {
-            policy,
+        Ok(SettingsPollResult {
+            policy: inner.policy,
             version: inner.version,
             policy_hash: inner.policy_hash,
+            config_revision: inner.config_revision,
+            policy_source: PolicySource::try_from(inner.policy_source)
+                .unwrap_or(PolicySource::Unspecified),
+            settings: inner.settings,
+            global_policy_version: inner.global_policy_version,
         })
     }
 
