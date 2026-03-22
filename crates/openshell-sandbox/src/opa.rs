@@ -97,7 +97,6 @@ impl OpaEngine {
             .add_policy("policy.rego".into(), policy.into())
             .map_err(|e| miette::miette!("{e}"))?;
         let data_json = preprocess_yaml_data(data_yaml)?;
-        info!(data = %data_json.to_string(), "Loading OPA data");
         engine
             .add_data_json(&data_json)
             .map_err(|e| miette::miette!("{e}"))?;

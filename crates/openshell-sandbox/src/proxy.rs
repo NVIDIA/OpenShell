@@ -1574,9 +1574,8 @@ async fn handle_forward_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<&mpsc::UnboundedSender<DenialEvent>>,
-    sandbox_id: Option<String>,
+    _sandbox_id: Option<String>,
 ) -> Result<()> {
-    let _ = sandbox_id; // Added to avoid unused warning in this specific function if not used yet
     // 1. Parse the absolute-form URI
     let (scheme, host, port, path) = match parse_proxy_uri(target_uri) {
         Ok(parsed) => parsed,

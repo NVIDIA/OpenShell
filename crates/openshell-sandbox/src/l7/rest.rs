@@ -1120,6 +1120,8 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 resolver.as_ref(),
+                None,
+                "",
             ),
         )
         .await
@@ -1203,6 +1205,8 @@ mod tests {
                 &mut proxy_to_client,
                 &mut proxy_to_upstream,
                 None, // <-- No resolver, as in the L4 raw tunnel path
+                None,
+                "",
             ),
         )
         .await

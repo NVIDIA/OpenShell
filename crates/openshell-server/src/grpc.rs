@@ -725,13 +725,6 @@ impl OpenShell for OpenShellService {
         if let Some(record) = latest {
             let policy = ProtoSandboxPolicy::decode(record.policy_payload.as_slice())
                 .map_err(|e| Status::internal(format!("decode policy failed: {e}")))?;
-            let er_count = count_external_resolvers(&policy);
-            info!(
-                sandbox_id = %sandbox_id,
-                version = record.version,
-                er_count = er_count,
-                "GetSandboxPolicy served from policy history"
-            );
             return Ok(Response::new(GetSandboxPolicyResponse {
                 policy: Some(policy),
                 version: u32::try_from(record.version).unwrap_or(0),
@@ -782,10 +775,6 @@ impl OpenShell for OpenShellService {
             warn!(sandbox_id = %sandbox_id, error = %e, "Failed to mark backfilled policy as loaded");
         }
 
-        info!(
-            sandbox_id = %sandbox_id,
-            "GetSandboxPolicy served from spec (backfilled version 1)"
-        );
 
         Ok(Response::new(GetSandboxPolicyResponse {
             policy: Some(policy),
@@ -1038,17 +1027,8 @@ impl OpenShell for OpenShellService {
                 .put_message(&sandbox)
                 .await
                 .map_err(|e| Status::internal(format!("backfill spec.policy failed: {e}")))?;
-            info!(
-                sandbox_id = %sandbox_id,
-                "UpdateSandboxPolicy: backfilled spec.policy from sandbox-discovered policy"
-            );
         }
 
-        let er_count = count_external_resolvers(&new_policy);
-        info!(
-            er_count = er_count,
-            "UpdateSandboxPolicy: checking external_resolvers in new_policy"
-        );
 
         // Determine next version number.
         let latest = self
@@ -1058,16 +1038,7 @@ impl OpenShell for OpenShellService {
             .await
             .map_err(|e| Status::internal(format!("fetch latest policy failed: {e}")))?;
 
-        // Compute hash and check if the policy actually changed.
         let payload = new_policy.encode_to_vec();
-        let er_count_after_roundtrip = ProtoSandboxPolicy::decode(payload.as_slice())
-            .map(|p| count_external_resolvers(&p))
-            .unwrap_or(0);
-        info!(
-            er_count_before_encode = er_count,
-            er_count_after_encode_decode = er_count_after_roundtrip,
-            "UpdateSandboxPolicy: external_resolver count across server-side protobuf roundtrip"
-        );
         let hash = deterministic_policy_hash(&new_policy);
 
         if let Some(ref current) = latest
@@ -2312,18 +2283,6 @@ fn deterministic_policy_hash(policy: &ProtoSandboxPolicy) -> String {
     hex::encode(hasher.finalize())
 }
 
-fn count_external_resolvers(policy: &ProtoSandboxPolicy) -> usize {
-    policy
-        .network_policies
-        .values()
-        .map(|rule| {
-            rule.endpoints
-                .iter()
-                .filter(|endpoint| endpoint.external_resolver.is_some())
-                .count()
-        })
-        .sum()
-}
 
 /// Check if a log line's source matches the filter list.
 /// Empty source is treated as "gateway" for backward compatibility.
