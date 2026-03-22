@@ -117,6 +117,18 @@ pub fn parse_l7_config(val: &regorus::Value) -> Option<L7EndpointConfig> {
     })
 }
 
+/// Parse the `tls` field from an endpoint config, independent of L7 protocol.
+///
+/// Used to check for `tls: skip` even on L4-only endpoints (no `protocol`
+/// field) that explicitly opt out of TLS auto-detection.
+pub fn parse_tls_mode(val: &regorus::Value) -> TlsMode {
+    match get_object_str(val, "tls").as_deref() {
+        Some("skip") => TlsMode::Skip,
+        Some("terminate") | Some("passthrough") => TlsMode::Auto, // deprecation logged by parse_l7_config
+        _ => TlsMode::Auto,
+    }
+}
+
 /// Extract a string value from a regorus object.
 fn get_object_str(val: &regorus::Value, key: &str) -> Option<String> {
     let key_val = regorus::Value::String(key.into());

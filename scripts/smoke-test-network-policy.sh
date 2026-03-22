@@ -11,7 +11,7 @@
 #
 # Prerequisites:
 #   - A running OpenShell gateway (`openshell status` shows Healthy)
-#   - GITHUB_TOKEN env var set with a valid GitHub personal access token
+#   - GITHUB_TOKEN or GH_TOKEN env var set with a valid GitHub token
 #   - The `openshell` CLI on PATH
 #
 # Usage:
@@ -20,127 +20,63 @@
 # What it tests:
 #
 #   Phase 1 — L4 allow/deny (no L7 rules):
-#     - L4 allow: curl to api.github.com succeeds (TLS auto-terminated)
-#     - L4 deny: curl to httpbin.org is blocked (no matching endpoint)
+#     Creates a sandbox with L4-only policy for api.github.com.
+#     - curl api.github.com/zen  -> should succeed (TLS auto-terminated)
+#     - curl httpbin.org         -> should be blocked (implicit deny)
 #
 #   Phase 2 — L7 enforcement (method + path rules):
-#     - L7 allow: GET /user succeeds (read-only preset allows GET)
-#     - L7 deny: POST /user/repos is blocked (read-only preset blocks POST)
+#     Creates a sandbox with read-only L7 enforcement.
+#     - GET /zen                 -> should succeed
+#     - POST /user/repos         -> should be blocked (403)
 #
 #   Phase 3 — Credential injection:
-#     - GitHub provider attached, curl without explicit auth header
-#     - Proxy auto-injects GITHUB_TOKEN via TLS MITM + SecretResolver
-#     - Validates authenticated response (not 401)
+#     Creates a sandbox with provider attached and full L7 access.
+#     - curl /user (no auth header) -> should return authenticated response
+#       (proxy auto-injects GITHUB_TOKEN via TLS MITM)
 #
 #   Phase 4 — tls: skip escape hatch:
-#     - Policy with tls: skip bypasses auto-detection
-#     - Credential injection does NOT work (placeholder leaks)
-#     - Connection still succeeds at L4 (raw tunnel)
+#     Creates a sandbox with tls: skip.
+#     - curl /zen               -> should succeed (raw tunnel, no auth needed)
+#     - curl /user              -> should get 401 (no credential injection)
+#
+# After all tests, sandboxes are kept alive for log inspection.
+# The script prompts before cleanup.
 #
 # =============================================================================
 #
-# Embedded Policies (self-contained — no external files needed)
+# Embedded Policy YAMLs
 # =============================================================================
 #
-# --- POLICY_L4_ONLY ---
-# L4-only: allow api.github.com:443, deny everything else.
-# No protocol/rules/tls fields. TLS auto-terminated by proxy.
+# POLICY_L4_ONLY (L4 allow api.github.com:443, deny everything else):
+#   network_policies:
+#     github_api:
+#       endpoints: [{ host: api.github.com, port: 443 }]
+#       binaries:  [{ path: /usr/bin/curl }]
 #
-# version: 1
-# filesystem_policy:
-#   include_workdir: true
-#   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-#   read_write: [/sandbox, /tmp, /dev/null]
-# landlock:
-#   compatibility: best_effort
-# process:
-#   run_as_user: sandbox
-#   run_as_group: sandbox
-# network_policies:
-#   github_api:
-#     name: github-api-l4
-#     endpoints:
-#       - host: api.github.com
-#         port: 443
-#     binaries:
-#       - { path: /usr/bin/curl }
+# POLICY_L7_READONLY (L7 read-only enforcement):
+#   network_policies:
+#     github_api:
+#       endpoints:
+#         - host: api.github.com
+#           port: 443
+#           protocol: rest
+#           enforcement: enforce
+#           access: read-only
+#       binaries: [{ path: /usr/bin/curl }]
 #
-# --- POLICY_L7_READONLY ---
-# L7 with read-only enforcement: GET/HEAD/OPTIONS allowed, POST/PUT/DELETE denied.
+# POLICY_CRED_INJECT (L7 full access, provider credential injection):
+#   Same as L7 but with access: full
 #
-# version: 1
-# filesystem_policy:
-#   include_workdir: true
-#   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-#   read_write: [/sandbox, /tmp, /dev/null]
-# landlock:
-#   compatibility: best_effort
-# process:
-#   run_as_user: sandbox
-#   run_as_group: sandbox
-# network_policies:
-#   github_api:
-#     name: github-api-l7-readonly
-#     endpoints:
-#       - host: api.github.com
-#         port: 443
-#         protocol: rest
-#         enforcement: enforce
-#         access: read-only
-#     binaries:
-#       - { path: /usr/bin/curl }
-#
-# --- POLICY_L7_FULL_WITH_PROVIDER ---
-# L7 full access with provider credential injection.
-#
-# version: 1
-# filesystem_policy:
-#   include_workdir: true
-#   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-#   read_write: [/sandbox, /tmp, /dev/null]
-# landlock:
-#   compatibility: best_effort
-# process:
-#   run_as_user: sandbox
-#   run_as_group: sandbox
-# network_policies:
-#   github_api:
-#     name: github-api-cred-inject
-#     endpoints:
-#       - host: api.github.com
-#         port: 443
-#         protocol: rest
-#         enforcement: enforce
-#         access: full
-#     binaries:
-#       - { path: /usr/bin/curl }
-#
-# --- POLICY_TLS_SKIP ---
-# L4 with tls: skip — raw tunnel, no MITM, no credential injection.
-#
-# version: 1
-# filesystem_policy:
-#   include_workdir: true
-#   read_only: [/usr, /lib, /proc, /dev/urandom, /app, /etc, /var/log]
-#   read_write: [/sandbox, /tmp, /dev/null]
-# landlock:
-#   compatibility: best_effort
-# process:
-#   run_as_user: sandbox
-#   run_as_group: sandbox
-# network_policies:
-#   github_api:
-#     name: github-api-skip
-#     endpoints:
-#       - host: api.github.com
-#         port: 443
-#         tls: skip
-#     binaries:
-#       - { path: /usr/bin/curl }
+# POLICY_TLS_SKIP (L4 with tls: skip — raw tunnel):
+#   network_policies:
+#     github_api:
+#       endpoints: [{ host: api.github.com, port: 443, tls: skip }]
+#       binaries:  [{ path: /usr/bin/curl }]
 #
 # =============================================================================
 
-set -euo pipefail
+set -uo pipefail
+# Note: NOT using set -e so we can capture exit codes without exiting.
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -150,29 +86,17 @@ RESET='\033[0m'
 
 PASS_COUNT=0
 FAIL_COUNT=0
-SKIP_COUNT=0
 
 pass() { ((PASS_COUNT++)); echo -e "  ${GREEN}PASS${RESET} $1"; }
-fail() { ((FAIL_COUNT++)); echo -e "  ${RED}FAIL${RESET} $1"; echo "       $2"; }
-skip() { ((SKIP_COUNT++)); echo -e "  ${YELLOW}SKIP${RESET} $1"; }
+fail() { ((FAIL_COUNT++)); echo -e "  ${RED}FAIL${RESET} $1\n       $2"; }
 header() { echo -e "\n${BOLD}=== $1 ===${RESET}"; }
 
 PROVIDER_NAME="smoke-test-github"
-SANDBOX_NAME=""
+SANDBOXES=()
 POLICY_DIR=""
 
-cleanup() {
-    echo ""
-    header "Cleanup"
-    if [[ -n "$SANDBOX_NAME" ]]; then
-        openshell sandbox delete "$SANDBOX_NAME" 2>/dev/null && echo "  Deleted sandbox $SANDBOX_NAME" || true
-    fi
-    openshell provider delete "$PROVIDER_NAME" 2>/dev/null && echo "  Deleted provider $PROVIDER_NAME" || true
-    if [[ -n "$POLICY_DIR" ]]; then
-        rm -rf "$POLICY_DIR"
-    fi
-}
-trap cleanup EXIT
+# Resolve token from GITHUB_TOKEN or GH_TOKEN
+TOKEN="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
 
 # ---------------------------------------------------------------------------
 # Preflight
@@ -180,24 +104,23 @@ trap cleanup EXIT
 
 header "Preflight"
 
-if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-    echo -e "${RED}Error: GITHUB_TOKEN env var is required${RESET}"
-    echo "  export GITHUB_TOKEN=ghp_..."
+if [[ -z "$TOKEN" ]]; then
+    echo -e "${RED}Error: GITHUB_TOKEN or GH_TOKEN env var is required${RESET}"
     exit 1
 fi
-echo "  GITHUB_TOKEN is set"
+echo "  Token is set"
 
 if ! openshell status >/dev/null 2>&1; then
-    echo -e "${RED}Error: No healthy gateway found. Run: openshell gateway start${RESET}"
+    echo -e "${RED}Error: No healthy gateway. Run: openshell gateway start${RESET}"
     exit 1
 fi
 echo "  Gateway is healthy"
 
-# Create temp dir for policy files
 POLICY_DIR=$(mktemp -d)
+echo "  Policy dir: $POLICY_DIR"
 
 # ---------------------------------------------------------------------------
-# Helper: write a policy file from heredoc
+# Helpers
 # ---------------------------------------------------------------------------
 
 write_policy() {
@@ -207,168 +130,59 @@ write_policy() {
     echo "$file"
 }
 
-# ---------------------------------------------------------------------------
-# Helper: create sandbox, run a command, capture output + exit code
-# ---------------------------------------------------------------------------
-
-run_in_sandbox() {
-    local policy_file="$1"
+# Create a sandbox with --keep and a sleep, wait for Ready.
+create_sandbox() {
+    local name="$1"
     shift
-    local provider_flag=""
-    if [[ "${USE_PROVIDER:-}" == "1" ]]; then
-        provider_flag="--provider $PROVIDER_NAME"
-    fi
+    local provider_flag=("$@")
 
-    # Create sandbox with policy, run command, capture output
-    local sandbox_name
-    sandbox_name="smoke-$(date +%s)-$RANDOM"
-    SANDBOX_NAME="$sandbox_name"
+    echo "  Creating sandbox: $name"
+    openshell sandbox create --name "$name" --keep "${provider_flag[@]}" \
+        -- sh -c "echo Ready && sleep 3600" >/dev/null 2>&1 &
+    local pid=$!
 
-    # Set policy first, then create sandbox with command
-    # Actually: create sandbox with --keep, set policy, then run command via
-    # a second sandbox create with --no-keep reusing the same sandbox...
-    # Simpler: create with --no-keep and the command directly, set policy after
-    # creation via the API.
-    #
-    # Simplest approach: create a keep sandbox, set policy, run command via
-    # sandbox connect, then clean up.
-    #
-    # Actually the simplest: use sandbox create with --no-keep and a command.
-    # The policy is set on the sandbox after it's created but before the
-    # command runs... that's racey.
-    #
-    # Let's use: create --keep sandbox, wait for ready, set policy, wait for
-    # policy to propagate, then run command via a new sandbox create --no-keep
-    # using the same image... No, that creates a NEW sandbox.
-    #
-    # The right pattern for testing: create a persistent sandbox, set policy,
-    # then use SSH to run commands.
-
-    # Create persistent sandbox
-    openshell sandbox create --name "$sandbox_name" --keep \
-        ${provider_flag} \
-        -- sh -c "echo Ready && sleep 600" >/dev/null 2>&1 &
-    local create_pid=$!
-
-    # Wait for sandbox to be ready
     local attempts=0
-    while [[ $attempts -lt 30 ]]; do
-        if openshell sandbox list 2>/dev/null | grep -q "$sandbox_name.*Ready"; then
-            break
+    while [[ $attempts -lt 40 ]]; do
+        if openshell sandbox list 2>/dev/null | grep -q "$name.*Ready"; then
+            echo "  Sandbox $name is Ready"
+            SANDBOXES+=("$name")
+            # Kill the blocking create process (sandbox stays alive with --keep)
+            kill "$pid" 2>/dev/null || true
+            wait "$pid" 2>/dev/null || true
+            return 0
         fi
         sleep 2
         ((attempts++))
     done
 
-    if [[ $attempts -ge 30 ]]; then
-        echo "TIMEOUT waiting for sandbox $sandbox_name"
-        kill "$create_pid" 2>/dev/null || true
-        return 1
-    fi
+    echo -e "  ${RED}TIMEOUT waiting for $name${RESET}"
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+}
 
-    # Set policy
-    openshell policy set "$sandbox_name" --policy "$policy_file" 2>/dev/null
+# Run a command inside a sandbox via SSH.
+sandbox_exec() {
+    local name="$1"
+    shift
 
-    # Wait for policy to propagate (poll loop is 10s, give it 15s)
-    sleep 15
-
-    # Install SSH config and run command via SSH
     local ssh_config
-    ssh_config=$(openshell sandbox ssh-config "$sandbox_name" 2>/dev/null)
+    ssh_config=$(openshell sandbox ssh-config "$name" 2>/dev/null)
     local ssh_host
     ssh_host=$(echo "$ssh_config" | grep "^Host " | awk '{print $2}')
-
-    # Write SSH config to temp file
-    local ssh_config_file="$POLICY_DIR/ssh_config_${sandbox_name}"
+    local ssh_config_file="$POLICY_DIR/ssh_config_${name}"
     echo "$ssh_config" > "$ssh_config_file"
 
-    # Run command via SSH
-    local output exit_code
-    set +e
-    output=$(ssh -F "$ssh_config_file" -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-        "$ssh_host" "$@" 2>&1)
-    exit_code=$?
-    set -e
-
-    # Kill the background create process
-    kill "$create_pid" 2>/dev/null || true
-    wait "$create_pid" 2>/dev/null || true
-
-    # Return output and exit code
-    echo "$output"
-    return $exit_code
+    ssh -F "$ssh_config_file" \
+        -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null \
+        -o LogLevel=ERROR \
+        -o ConnectTimeout=15 \
+        "$ssh_host" "$@" 2>&1
 }
 
 # ---------------------------------------------------------------------------
-# Helper: quick sandbox run (create, run one command, delete)
-# ---------------------------------------------------------------------------
-
-quick_run() {
-    local policy_file="$1"
-    shift
-    local provider_flag=""
-    if [[ "${USE_PROVIDER:-}" == "1" ]]; then
-        provider_flag="--provider $PROVIDER_NAME"
-    fi
-
-    local sandbox_name="smoke-$(date +%s)-$RANDOM"
-    SANDBOX_NAME="$sandbox_name"
-
-    # Create sandbox with --keep, set policy, exec command
-    openshell sandbox create --name "$sandbox_name" --keep \
-        ${provider_flag} \
-        -- sh -c "echo Ready && sleep 600" >/dev/null 2>&1 &
-    local create_pid=$!
-
-    # Wait for ready
-    local attempts=0
-    while [[ $attempts -lt 30 ]]; do
-        if openshell sandbox list 2>/dev/null | grep -q "$sandbox_name.*Ready"; then
-            break
-        fi
-        sleep 2
-        ((attempts++))
-    done
-
-    if [[ $attempts -ge 30 ]]; then
-        echo "TIMEOUT"
-        kill "$create_pid" 2>/dev/null || true
-        return 1
-    fi
-
-    # Set policy and wait for propagation
-    openshell policy set "$sandbox_name" --policy "$policy_file" >/dev/null 2>&1
-    sleep 15
-
-    # Get SSH config
-    local ssh_config ssh_config_file ssh_host
-    ssh_config=$(openshell sandbox ssh-config "$sandbox_name" 2>/dev/null)
-    ssh_host=$(echo "$ssh_config" | grep "^Host " | awk '{print $2}')
-    ssh_config_file="$POLICY_DIR/ssh_config_${sandbox_name}"
-    echo "$ssh_config" > "$ssh_config_file"
-
-    # Run command
-    local output
-    set +e
-    output=$(ssh -F "$ssh_config_file" -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR \
-        "$ssh_host" "$@" 2>&1)
-    local exit_code=$?
-    set -e
-
-    # Cleanup sandbox
-    kill "$create_pid" 2>/dev/null || true
-    wait "$create_pid" 2>/dev/null || true
-    openshell sandbox delete "$sandbox_name" >/dev/null 2>&1 || true
-    SANDBOX_NAME=""
-
-    LAST_OUTPUT="$output"
-    LAST_EXIT="$exit_code"
-}
-
-# ---------------------------------------------------------------------------
-# Write all policy files
+# Write policies
 # ---------------------------------------------------------------------------
 
 POLICY_L4=$(write_policy l4-only <<'YAML'
@@ -472,15 +286,12 @@ YAML
 
 header "Phase 0: Provider Setup"
 
-# Delete provider if it exists from a previous run
 openshell provider delete "$PROVIDER_NAME" >/dev/null 2>&1 || true
 
-openshell provider create \
+if openshell provider create \
     --name "$PROVIDER_NAME" \
     --type github \
-    --credential "GITHUB_TOKEN=$GITHUB_TOKEN" >/dev/null 2>&1
-
-if openshell provider get "$PROVIDER_NAME" >/dev/null 2>&1; then
+    --credential "GITHUB_TOKEN=$TOKEN" >/dev/null 2>&1; then
     pass "Provider '$PROVIDER_NAME' created"
 else
     fail "Provider creation failed" ""
@@ -493,50 +304,68 @@ fi
 
 header "Phase 1: L4 Allow/Deny (no L7 rules, TLS auto-terminated)"
 
-echo "  Creating sandbox with L4-only policy..."
-USE_PROVIDER=0 quick_run "$POLICY_L4" \
-    "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com/zen"
+SB1="smoke-l4"
+if create_sandbox "$SB1"; then
+    echo "  Setting L4-only policy..."
+    openshell policy set "$SB1" --policy "$POLICY_L4" >/dev/null 2>&1
+    echo "  Waiting for policy propagation (15s)..."
+    sleep 15
 
-if [[ "$LAST_EXIT" -eq 0 && "$LAST_OUTPUT" == *"200"* ]]; then
-    pass "L4 allow: curl to api.github.com:443 succeeded (HTTP 200)"
+    # Test 1: L4 allow
+    echo "  Running: curl api.github.com/zen"
+    output=$(sandbox_exec "$SB1" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com/zen")
+    if [[ "$output" == *"200"* ]]; then
+        pass "L4 allow: curl to api.github.com succeeded (HTTP 200)"
+    else
+        fail "L4 allow: expected HTTP 200" "got: $output"
+    fi
+
+    # Test 2: L4 deny (implicit deny for httpbin.org)
+    echo "  Running: curl httpbin.org (should be blocked)"
+    output=$(sandbox_exec "$SB1" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://httpbin.org/get" || true)
+    if [[ "$output" == *"403"* || "$output" == *"000"* || -z "$output" ]]; then
+        pass "L4 deny: curl to httpbin.org blocked"
+    else
+        fail "L4 deny: expected connection failure" "got: $output"
+    fi
 else
-    fail "L4 allow: expected HTTP 200" "exit=$LAST_EXIT output=$LAST_OUTPUT"
-fi
-
-echo "  Creating sandbox for L4 deny test..."
-USE_PROVIDER=0 quick_run "$POLICY_L4" \
-    "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://httpbin.org/get"
-
-if [[ "$LAST_EXIT" -ne 0 || "$LAST_OUTPUT" == *"403"* || "$LAST_OUTPUT" == *"Connection refused"* || "$LAST_OUTPUT" == *"000"* ]]; then
-    pass "L4 deny: curl to httpbin.org blocked (not in policy)"
-else
-    fail "L4 deny: expected connection failure" "exit=$LAST_EXIT output=$LAST_OUTPUT"
+    fail "L4 sandbox creation failed" ""
+    fail "L4 deny test skipped" "sandbox not created"
 fi
 
 # ---------------------------------------------------------------------------
 # Phase 2: L7 enforcement
 # ---------------------------------------------------------------------------
 
-header "Phase 2: L7 Enforcement (read-only preset, TLS auto-terminated)"
+header "Phase 2: L7 Enforcement (read-only, TLS auto-terminated)"
 
-echo "  Creating sandbox with L7 read-only policy..."
-USE_PROVIDER=0 quick_run "$POLICY_L7_RO" \
-    "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com/zen"
+SB2="smoke-l7"
+if create_sandbox "$SB2"; then
+    echo "  Setting L7 read-only policy..."
+    openshell policy set "$SB2" --policy "$POLICY_L7_RO" >/dev/null 2>&1
+    echo "  Waiting for policy propagation (15s)..."
+    sleep 15
 
-if [[ "$LAST_EXIT" -eq 0 && "$LAST_OUTPUT" == *"200"* ]]; then
-    pass "L7 allow: GET /zen succeeded (read-only allows GET)"
+    # Test 3: L7 allow (GET)
+    echo "  Running: GET /zen"
+    output=$(sandbox_exec "$SB2" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com/zen")
+    if [[ "$output" == *"200"* ]]; then
+        pass "L7 allow: GET /zen succeeded (read-only allows GET)"
+    else
+        fail "L7 allow: expected HTTP 200 for GET" "got: $output"
+    fi
+
+    # Test 4: L7 deny (POST blocked by read-only)
+    echo "  Running: POST /user/repos (should be blocked)"
+    output=$(sandbox_exec "$SB2" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST https://api.github.com/user/repos -d '{\"name\":\"should-not-create\"}'" || true)
+    if [[ "$output" == *"403"* ]]; then
+        pass "L7 deny: POST blocked by read-only enforcement"
+    else
+        fail "L7 deny: expected HTTP 403 for POST" "got: $output"
+    fi
 else
-    fail "L7 allow: expected HTTP 200 for GET" "exit=$LAST_EXIT output=$LAST_OUTPUT"
-fi
-
-echo "  Testing L7 deny (POST blocked by read-only)..."
-USE_PROVIDER=0 quick_run "$POLICY_L7_RO" \
-    "curl -s -o /dev/null -w '%{http_code}' --max-time 10 -X POST https://api.github.com/user/repos -d '{\"name\":\"should-not-create\"}'"
-
-if [[ "$LAST_OUTPUT" == *"403"* ]]; then
-    pass "L7 deny: POST /user/repos blocked (read-only denies POST)"
-else
-    fail "L7 deny: expected HTTP 403 for POST" "exit=$LAST_EXIT output=$LAST_OUTPUT"
+    fail "L7 sandbox creation failed" ""
+    fail "L7 deny test skipped" "sandbox not created"
 fi
 
 # ---------------------------------------------------------------------------
@@ -545,60 +374,104 @@ fi
 
 header "Phase 3: Credential Injection (provider attached, TLS auto-terminated)"
 
-echo "  Creating sandbox with provider and L7 full policy..."
-USE_PROVIDER=1 quick_run "$POLICY_CRED" \
-    "curl -s --max-time 10 https://api.github.com/user | head -5"
+SB3="smoke-cred"
+if create_sandbox "$SB3" --provider "$PROVIDER_NAME"; then
+    echo "  Setting L7 full policy..."
+    openshell policy set "$SB3" --policy "$POLICY_CRED" >/dev/null 2>&1
+    echo "  Waiting for policy propagation (15s)..."
+    sleep 15
 
-if [[ "$LAST_EXIT" -eq 0 && "$LAST_OUTPUT" == *"login"* ]]; then
-    pass "Credential injection: /user returned authenticated response"
-elif [[ "$LAST_OUTPUT" == *"401"* || "$LAST_OUTPUT" == *"Unauthorized"* ]]; then
-    fail "Credential injection: got 401 (placeholder may have leaked)" "$LAST_OUTPUT"
+    # Test 5: Credential injection — curl /user using the placeholder env var.
+    # The sandbox process sees GITHUB_TOKEN=openshell:resolve:env:GITHUB_TOKEN
+    # in its environment. When curl sends this as an Authorization header,
+    # the proxy's SecretResolver rewrites the placeholder to the real token.
+    echo "  Running: curl /user -H 'Authorization: token \$GITHUB_TOKEN'"
+    output=$(sandbox_exec "$SB3" 'curl -s --max-time 10 -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user' || true)
+    if [[ "$output" == *"login"* ]]; then
+        pass "Credential injection: /user returned authenticated response"
+    elif [[ "$output" == *"401"* || "$output" == *"Unauthorized"* ]]; then
+        fail "Credential injection: got 401 (placeholder may have leaked)" "$output"
+    else
+        fail "Credential injection: unexpected response" "$output"
+    fi
 else
-    fail "Credential injection: unexpected response" "exit=$LAST_EXIT output=$LAST_OUTPUT"
+    fail "Credential injection sandbox creation failed" ""
 fi
 
 # ---------------------------------------------------------------------------
 # Phase 4: tls: skip escape hatch
 # ---------------------------------------------------------------------------
 
-header "Phase 4: tls: skip (raw tunnel, no MITM, no credential injection)"
+header "Phase 4: tls: skip (raw tunnel, no MITM)"
 
-echo "  Creating sandbox with tls: skip policy and provider..."
-USE_PROVIDER=1 quick_run "$POLICY_SKIP" \
-    "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com/zen"
+SB4="smoke-skip"
+if create_sandbox "$SB4" --provider "$PROVIDER_NAME"; then
+    echo "  Setting tls: skip policy..."
+    openshell policy set "$SB4" --policy "$POLICY_SKIP" >/dev/null 2>&1
+    echo "  Waiting for policy propagation (15s)..."
+    sleep 15
 
-# With tls: skip, the connection should succeed at L4 (raw tunnel).
-# The GITHUB_TOKEN placeholder will leak since no MITM rewriting happens.
-# But the /zen endpoint doesn't require auth, so it should return 200.
-if [[ "$LAST_EXIT" -eq 0 && "$LAST_OUTPUT" == *"200"* ]]; then
-    pass "tls: skip: L4 connection succeeded (raw tunnel)"
+    # Test 6: L4 connection succeeds (raw tunnel, /zen needs no auth)
+    echo "  Running: curl /zen (should succeed via raw tunnel)"
+    output=$(sandbox_exec "$SB4" "curl -s -o /dev/null -w '%{http_code}' --max-time 10 https://api.github.com/zen" || true)
+    if [[ "$output" == *"200"* ]]; then
+        pass "tls: skip: L4 connection succeeded (raw tunnel)"
+    else
+        fail "tls: skip: expected 200 for /zen" "got: $output"
+    fi
+
+    # Test 7: Credential injection does NOT work with tls: skip.
+    # The placeholder leaks verbatim since there's no MITM to rewrite it.
+    echo "  Running: curl /user with \$GITHUB_TOKEN (should fail, placeholder leaks)"
+    output=$(sandbox_exec "$SB4" 'curl -s --max-time 10 -H "Authorization: token $GITHUB_TOKEN" https://api.github.com/user' || true)
+    if [[ "$output" == *"401"* || "$output" == *"Unauthorized"* || "$output" == *"Bad credentials"* ]]; then
+        pass "tls: skip: /user returned 401 (credential injection bypassed)"
+    elif [[ "$output" == *"login"* ]]; then
+        fail "tls: skip: /user was authenticated (MITM should be disabled)" "$output"
+    else
+        pass "tls: skip: /user not authenticated (expected)"
+    fi
 else
-    fail "tls: skip: expected connection to succeed" "exit=$LAST_EXIT output=$LAST_OUTPUT"
-fi
-
-echo "  Verifying credential injection does NOT work with tls: skip..."
-USE_PROVIDER=1 quick_run "$POLICY_SKIP" \
-    "curl -s --max-time 10 https://api.github.com/user | head -5"
-
-if [[ "$LAST_OUTPUT" == *"401"* || "$LAST_OUTPUT" == *"Unauthorized"* || "$LAST_OUTPUT" == *"Bad credentials"* ]]; then
-    pass "tls: skip: /user returned 401 (credential injection bypassed as expected)"
-elif [[ "$LAST_OUTPUT" == *"login"* ]]; then
-    fail "tls: skip: /user returned authenticated response (MITM should be disabled)" "$LAST_OUTPUT"
-else
-    # Could be a different error, but the key thing is it's not authenticated
-    pass "tls: skip: /user did not return authenticated response"
+    fail "tls: skip sandbox creation failed" ""
 fi
 
 # ---------------------------------------------------------------------------
-# Summary
+# Results
 # ---------------------------------------------------------------------------
 
 header "Results"
 echo -e "  ${GREEN}Passed: ${PASS_COUNT}${RESET}"
 echo -e "  ${RED}Failed: ${FAIL_COUNT}${RESET}"
-echo -e "  ${YELLOW}Skipped: ${SKIP_COUNT}${RESET}"
 echo ""
 
+if [[ ${#SANDBOXES[@]} -gt 0 ]]; then
+    echo -e "${BOLD}Sandboxes kept for inspection:${RESET}"
+    for sb in "${SANDBOXES[@]}"; do
+        echo "  - $sb"
+    done
+    echo ""
+    echo "Inspect logs with:"
+    echo "  openshell logs <name> --source sandbox"
+    echo ""
+
+    read -r -p "Delete all smoke test sandboxes and provider? [y/N] " answer
+    if [[ "$answer" =~ ^[Yy]$ ]]; then
+        echo ""
+        for sb in "${SANDBOXES[@]}"; do
+            openshell sandbox delete "$sb" >/dev/null 2>&1 && echo "  Deleted $sb" || true
+        done
+        openshell provider delete "$PROVIDER_NAME" >/dev/null 2>&1 && echo "  Deleted provider $PROVIDER_NAME" || true
+    else
+        echo "  Sandboxes left running. Clean up manually:"
+        echo "  openshell sandbox delete --all"
+        echo "  openshell provider delete $PROVIDER_NAME"
+    fi
+fi
+
+# Clean up temp files
+rm -rf "$POLICY_DIR"
+
+echo ""
 if [[ $FAIL_COUNT -gt 0 ]]; then
     echo -e "${RED}${BOLD}SMOKE TEST FAILED${RESET}"
     exit 1

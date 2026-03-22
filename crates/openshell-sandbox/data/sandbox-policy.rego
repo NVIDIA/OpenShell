@@ -277,11 +277,16 @@ endpoint_matches_request(ep, network) if {
 	ep.ports[_] == network.port
 }
 
-# An endpoint has extended config if it specifies L7 protocol or allowed_ips.
+# An endpoint has extended config if it specifies L7 protocol, allowed_ips,
+# or an explicit tls mode (e.g. tls: skip).
 endpoint_has_extended_config(ep) if {
 	ep.protocol
 }
 
 endpoint_has_extended_config(ep) if {
 	count(object.get(ep, "allowed_ips", [])) > 0
+}
+
+endpoint_has_extended_config(ep) if {
+	ep.tls
 }

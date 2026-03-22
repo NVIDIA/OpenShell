@@ -526,11 +526,10 @@ async fn handle_tcp_connection(
         connect_msg,
     );
 
-    // Determine effective TLS mode. If an endpoint has L7 config with
-    // `tls: skip`, bypass auto-detection entirely. Otherwise auto-detect.
-    let effective_tls_skip = l7_config
-        .as_ref()
-        .is_some_and(|c| c.tls == crate::l7::TlsMode::Skip);
+    // Determine effective TLS mode. Check the raw endpoint config for
+    // `tls: skip` independently of L7 config (which requires `protocol`).
+    let effective_tls_skip =
+        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
 
     // Build L7 eval context (shared by TLS-terminated and plaintext paths).
     let ctx = crate::l7::relay::L7EvalContext {
@@ -1171,6 +1170,38 @@ fn query_l7_config(
             warn!(error = %e, "Failed to query L7 endpoint config");
             None
         }
+    }
+}
+
+/// Query the TLS mode for an endpoint, independent of L7 config.
+///
+/// This extracts `tls: skip` from the endpoint even when no `protocol` is set.
+fn query_tls_mode(
+    engine: &OpaEngine,
+    decision: &ConnectDecision,
+    host: &str,
+    port: u16,
+) -> crate::l7::TlsMode {
+    let has_policy = match &decision.action {
+        NetworkAction::Allow { matched_policy } => matched_policy.is_some(),
+        _ => false,
+    };
+    if !has_policy {
+        return crate::l7::TlsMode::Auto;
+    }
+
+    let input = crate::opa::NetworkInput {
+        host: host.to_string(),
+        port,
+        binary_path: decision.binary.clone().unwrap_or_default(),
+        binary_sha256: String::new(),
+        ancestors: decision.ancestors.clone(),
+        cmdline_paths: decision.cmdline_paths.clone(),
+    };
+
+    match engine.query_endpoint_config(&input) {
+        Ok(Some(val)) => crate::l7::parse_tls_mode(&val),
+        _ => crate::l7::TlsMode::Auto,
     }
 }
 
