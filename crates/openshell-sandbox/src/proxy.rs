@@ -523,7 +523,7 @@ async fn handle_tcp_connection(
         engine = "opa",
         policy = %policy_str,
         reason = "",
-        connect_msg,
+        "{connect_msg}",
     );
 
     // Determine effective TLS mode. Check the raw endpoint config for
