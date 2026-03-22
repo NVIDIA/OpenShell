@@ -4,8 +4,10 @@
 use crate::{
     discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
 };
+use std::path::PathBuf;
 
 pub struct GithubProvider;
+const OPENCODE_AUTH_JSON_CREDENTIAL_KEY: &str = "OPENCODE_AUTH_JSON";
 
 pub const SPEC: ProviderDiscoverySpec = ProviderDiscoverySpec {
     id: "github",
@@ -18,11 +20,37 @@ impl ProviderPlugin for GithubProvider {
     }
 
     fn discover_existing(&self) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
-        discover_with_spec(&SPEC, &RealDiscoveryContext)
+        discover_existing_with_context(&RealDiscoveryContext)
     }
 
     fn credential_env_vars(&self) -> &'static [&'static str] {
         SPEC.credential_env_vars
+    }
+}
+
+fn discover_existing_with_context(
+    context: &dyn crate::DiscoveryContext,
+) -> Result<Option<crate::DiscoveredProvider>, ProviderError> {
+    let mut discovered = discover_with_spec(&SPEC, context)?.unwrap_or_default();
+
+    let auth_path = context
+        .env_var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/"))
+        .join(".local/share/opencode/auth.json");
+
+    if let Some(contents) = context.read_file(&auth_path)
+        && !contents.trim().is_empty()
+    {
+        discovered
+            .credentials
+            .insert(OPENCODE_AUTH_JSON_CREDENTIAL_KEY.to_string(), contents);
+    }
+
+    if discovered.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(discovered))
     }
 }
 
@@ -73,6 +101,27 @@ mod tests {
                 ("GITHUB_TOKEN".to_string(), "github-token".to_string()),
                 ("GH_TOKEN".to_string(), "gh-token".to_string()),
             ])
+        );
+    }
+
+    #[test]
+    fn discovers_opencode_auth_json_as_additional_github_credential() {
+        let ctx = MockDiscoveryContext::new()
+            .with_env("HOME", "/home/alice")
+            .with_file(
+            "/home/alice/.local/share/opencode/auth.json",
+            r#"{"github-copilot":{"type":"oauth","access":"tok","refresh":"tok","expires":0}}"#,
+        );
+
+        let discovered = super::discover_existing_with_context(&ctx)
+            .expect("discovery")
+            .expect("provider");
+
+        assert_eq!(
+            discovered
+                .credentials
+                .get(super::OPENCODE_AUTH_JSON_CREDENTIAL_KEY),
+            Some(&r#"{"github-copilot":{"type":"oauth","access":"tok","refresh":"tok","expires":0}}"#.to_string())
         );
     }
 }

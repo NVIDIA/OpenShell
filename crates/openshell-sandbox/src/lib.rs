@@ -188,7 +188,7 @@ pub async fn run_sandbox(
     // Fetch provider environment variables from the server.
     // This is done after loading the policy so the sandbox can still start
     // even if provider env fetch fails (graceful degradation).
-    let provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
+    let raw_provider_env = if let (Some(id), Some(endpoint)) = (&sandbox_id, &openshell_endpoint) {
         match grpc_client::fetch_provider_environment(endpoint, id).await {
             Ok(env) => {
                 info!(env_count = env.len(), "Fetched provider environment");
@@ -203,7 +203,8 @@ pub async fn run_sandbox(
         std::collections::HashMap::new()
     };
 
-    let (provider_env, secret_resolver) = project_provider_env_for_command(&command, provider_env)?;
+    let (provider_env, secret_resolver) =
+        project_provider_env_for_command(&command, raw_provider_env.clone())?;
     let secret_resolver = secret_resolver.map(Arc::new);
 
     // Create identity cache for SHA256 TOFU when OPA is active
@@ -506,7 +507,7 @@ pub async fn run_sandbox(
         let proxy_url = ssh_proxy_url;
         let netns_fd = ssh_netns_fd;
         let ca_paths = ca_file_paths.clone();
-        let provider_env_clone = provider_env.clone();
+        let provider_env_clone = raw_provider_env.clone();
 
         let (ssh_ready_tx, ssh_ready_rx) = tokio::sync::oneshot::channel();
 
@@ -1178,7 +1179,7 @@ fn project_provider_env_for_command(
     }
 }
 
-fn stage_tool_auth_projection(
+pub(crate) fn stage_tool_auth_projection(
     command: &[String],
     host_home: &std::path::Path,
     sandbox_root: &std::path::Path,
@@ -1189,23 +1190,30 @@ fn stage_tool_auth_projection(
     use nix::unistd::{Group, User, chown};
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
+    const OPENCODE_AUTH_JSON_CREDENTIAL_KEY: &str = "OPENCODE_AUTH_JSON";
 
     let Some((source, destination)) = auth_file_projection(command, host_home, provider_env) else {
         return Ok(None);
     };
 
-    if !source.exists() {
+    let staged_bytes = if source.exists() {
+        if let Ok(metadata) = std::fs::symlink_metadata(&source)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(miette::miette!(
+                "tool auth projection source must not be a symlink: '{}'",
+                source.display()
+            ));
+        }
+        std::fs::read(&source).into_diagnostic()?
+    } else if detect_tool_adapter(command) == Some(crate::child_env::ToolAdapter::OpenCode) {
+        let Some(raw) = provider_env.get(OPENCODE_AUTH_JSON_CREDENTIAL_KEY) else {
+            return Ok(None);
+        };
+        raw.as_bytes().to_vec()
+    } else {
         return Ok(None);
-    }
-
-    if let Ok(metadata) = std::fs::symlink_metadata(&source)
-        && metadata.file_type().is_symlink()
-    {
-        return Err(miette::miette!(
-            "tool auth projection source must not be a symlink: '{}'",
-            source.display()
-        ));
-    }
+    };
 
     let relative_destination = destination
         .strip_prefix("/sandbox")
@@ -1232,7 +1240,56 @@ fn stage_tool_auth_projection(
 
     std::fs::create_dir_all(parent).into_diagnostic()?;
 
-    let staged_bytes = std::fs::read(&source).into_diagnostic()?;
+    #[cfg(unix)]
+    {
+        let user_name = match policy.process.run_as_user.as_deref() {
+            Some(name) if !name.is_empty() => Some(name),
+            _ => None,
+        };
+        let group_name = match policy.process.run_as_group.as_deref() {
+            Some(name) if !name.is_empty() => Some(name),
+            _ => None,
+        };
+
+        let uid = if let Some(name) = user_name {
+            Some(
+                User::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox user not found: {name}"))?
+                    .uid,
+            )
+        } else {
+            None
+        };
+        let gid = if let Some(name) = group_name {
+            Some(
+                Group::from_name(name)
+                    .into_diagnostic()?
+                    .ok_or_else(|| miette::miette!("Sandbox group not found: {name}"))?
+                    .gid,
+            )
+        } else {
+            None
+        };
+
+        let mut current = sandbox_root.to_path_buf();
+        for component in relative_destination.components() {
+            current.push(component.as_os_str());
+            if current == staged_destination {
+                break;
+            }
+
+            if let Ok(metadata) = std::fs::metadata(&current)
+                && metadata.is_dir()
+            {
+                chown(&current, uid, gid).into_diagnostic()?;
+                let mut permissions = metadata.permissions();
+                permissions.set_mode(0o700);
+                std::fs::set_permissions(&current, permissions).into_diagnostic()?;
+            }
+        }
+    }
+
     std::fs::write(&staged_destination, staged_bytes).into_diagnostic()?;
     #[cfg(unix)]
     std::fs::set_permissions(&staged_destination, std::fs::Permissions::from_mode(0o400))
@@ -1276,7 +1333,7 @@ fn stage_tool_auth_projection(
     Ok(Some(staged_destination))
 }
 
-fn resolve_host_home_dir() -> Result<Option<std::path::PathBuf>> {
+pub(crate) fn resolve_host_home_dir() -> Result<Option<std::path::PathBuf>> {
     #[cfg(unix)]
     {
         let user = nix::unistd::User::from_uid(nix::unistd::geteuid())
@@ -1733,6 +1790,101 @@ mod tests {
                 .expect("staging should not error for missing auth"),
             None
         );
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_uses_provider_carried_auth_json_when_file_is_missing() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        std::fs::create_dir_all(&host_home).expect("create host home");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: None,
+            run_as_group: None,
+        });
+
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = std::collections::HashMap::from([
+            ("GITHUB_TOKEN".to_string(), "ghu-test".to_string()),
+            (
+                "OPENCODE_AUTH_JSON".to_string(),
+                r#"{"github-copilot":{"type":"oauth","access":"tok","refresh":"tok","expires":0}}"#
+                    .to_string(),
+            ),
+        ]);
+
+        let staged = stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
+            .expect("staging should succeed")
+            .expect("provider-carried auth json should be staged");
+
+        assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
+        assert_eq!(
+            std::fs::read_to_string(staged).expect("read staged auth"),
+            r#"{"github-copilot":{"type":"oauth","access":"tok","refresh":"tok","expires":0}}"#
+        );
+    }
+
+    #[test]
+    fn stage_tool_auth_projection_repairs_parent_directory_permissions_for_runtime_user() {
+        let tempdir = tempfile::tempdir().expect("tempdir");
+        let host_home = tempdir.path().join("host-home");
+        let sandbox_root = tempdir.path().join("sandbox-root");
+        let source_dir = host_home.join(".local/share/opencode");
+        let staged_parent = sandbox_root.join(".local/share/opencode");
+        std::fs::create_dir_all(&source_dir).expect("create source dir");
+        std::fs::create_dir_all(&staged_parent).expect("create staged parent");
+        std::fs::write(source_dir.join("auth.json"), r#"{"token":"copilot"}"#)
+            .expect("write auth file");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&staged_parent)
+                .expect("parent metadata")
+                .permissions();
+            perms.set_mode(0o555);
+            std::fs::set_permissions(&staged_parent, perms).expect("restrict parent permissions");
+        }
+
+        let current_user = nix::unistd::User::from_uid(nix::unistd::geteuid())
+            .expect("get current user")
+            .expect("current user entry");
+        let current_group = nix::unistd::Group::from_gid(nix::unistd::getegid())
+            .expect("get current group")
+            .expect("current group entry");
+        let policy = policy_with_process(ProcessPolicy {
+            run_as_user: Some(current_user.name),
+            run_as_group: Some(current_group.name),
+        });
+
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
+            .collect();
+
+        let staged = stage_tool_auth_projection(
+            &command,
+            &host_home,
+            &sandbox_root,
+            &policy,
+            &provider_env,
+        )
+        .expect("staging should succeed")
+        .expect("opencode auth file should be staged");
+
+        assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&staged_parent)
+                .expect("parent metadata after staging")
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o700);
+        }
     }
 
     #[test]

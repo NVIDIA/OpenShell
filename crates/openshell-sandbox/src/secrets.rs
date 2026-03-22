@@ -84,6 +84,7 @@ fn allowed_env_keys(tool: ToolAdapter) -> &'static [&'static str] {
             "OPENAI_API_KEY",
             "GITHUB_TOKEN",
             "GH_TOKEN",
+            "OPENCODE_AUTH_JSON",
         ],
     }
 }
@@ -341,6 +342,30 @@ mod tests {
 
         assert_eq!(child_env.len(), 2);
         assert!(resolver.is_some());
+    }
+
+    #[test]
+    fn tool_projection_allows_provider_carried_opencode_auth_json() {
+        let (child_env, resolver) = SecretResolver::from_tool_provider_env(
+            ToolAdapter::OpenCode,
+            [(
+                "OPENCODE_AUTH_JSON".to_string(),
+                r#"{"github-copilot":{"type":"oauth"}}"#.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("opencode projection succeeds for provider-carried auth json");
+        let resolver = resolver.expect("resolver");
+
+        assert_eq!(
+            child_env.get("OPENCODE_AUTH_JSON"),
+            Some(&placeholder_for_env_key("OPENCODE_AUTH_JSON"))
+        );
+        assert_eq!(
+            resolver.resolve_placeholder(&placeholder_for_env_key("OPENCODE_AUTH_JSON")),
+            Some(r#"{"github-copilot":{"type":"oauth"}}"#)
+        );
     }
 
     #[test]

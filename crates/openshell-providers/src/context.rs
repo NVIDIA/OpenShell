@@ -3,6 +3,7 @@
 
 pub trait DiscoveryContext {
     fn env_var(&self, key: &str) -> Option<String>;
+    fn read_file(&self, path: &std::path::Path) -> Option<String>;
 }
 
 pub struct RealDiscoveryContext;
@@ -10,5 +11,9 @@ pub struct RealDiscoveryContext;
 impl DiscoveryContext for RealDiscoveryContext {
     fn env_var(&self, key: &str) -> Option<String> {
         std::env::var(key).ok()
+    }
+
+    fn read_file(&self, path: &std::path::Path) -> Option<String> {
+        std::fs::read_to_string(path).ok()
     }
 }

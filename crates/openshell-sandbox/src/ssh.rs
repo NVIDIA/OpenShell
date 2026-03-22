@@ -4,6 +4,7 @@
 //! Embedded SSH server for sandbox access.
 
 use crate::child_env;
+use crate::{resolve_host_home_dir, stage_tool_auth_projection};
 use crate::policy::SandboxPolicy;
 use crate::process::drop_privileges;
 use crate::sandbox;
@@ -651,6 +652,7 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
 
 fn apply_child_env(
     cmd: &mut Command,
+    command: &[String],
     session_home: &str,
     session_user: &str,
     term: &str,
@@ -681,8 +683,48 @@ fn apply_child_env(
     }
 
     for (key, value) in provider_env {
+        if child_env::suppressed_provider_env_keys(command, provider_env).contains(&key.as_str()) {
+            continue;
+        }
         cmd.env(key, value);
     }
+
+    if let Some(vars) = child_env::tool_runtime_env_vars(command, provider_env) {
+        for (key, value) in vars {
+            cmd.env(key, value);
+        }
+    }
+}
+
+fn tool_command_for_ssh_exec(command: Option<&str>) -> Option<Vec<String>> {
+    let command = command?;
+    let parts: Vec<String> = command.split_whitespace().map(str::to_string).collect();
+    if child_env::detect_tool_adapter(&parts).is_some() {
+        Some(parts)
+    } else {
+        None
+    }
+}
+
+fn stage_tool_auth_for_ssh_exec(
+    command: Option<&str>,
+    policy: &SandboxPolicy,
+    provider_env: &HashMap<String, String>,
+) -> Result<()> {
+    let Some(tool_command) = tool_command_for_ssh_exec(command) else {
+        return Ok(());
+    };
+    let Some(host_home) = resolve_host_home_dir()? else {
+        return Ok(());
+    };
+    stage_tool_auth_projection(
+        &tool_command,
+        &host_home,
+        std::path::Path::new("/sandbox"),
+        policy,
+        provider_env,
+    )?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -698,6 +740,11 @@ fn spawn_pty_shell(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<(std::fs::File, mpsc::Sender<Vec<u8>>)> {
+    stage_tool_auth_for_ssh_exec(command.as_deref(), policy, provider_env)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let child_command = tool_command_for_ssh_exec(command.as_deref())
+        .unwrap_or_else(|| vec!["/bin/bash".to_string(), "-i".to_string()]);
+
     let winsize = Winsize {
         ws_row: to_u16(pty.row_height.max(1)),
         ws_col: to_u16(pty.col_width.max(1)),
@@ -739,6 +786,7 @@ fn spawn_pty_shell(
     let (session_user, session_home) = session_user_and_home(policy);
     apply_child_env(
         &mut cmd,
+        &child_command,
         &session_home,
         &session_user,
         term,
@@ -850,6 +898,11 @@ fn spawn_pipe_exec(
     ca_file_paths: Option<Arc<(PathBuf, PathBuf)>>,
     provider_env: &HashMap<String, String>,
 ) -> anyhow::Result<mpsc::Sender<Vec<u8>>> {
+    stage_tool_auth_for_ssh_exec(command.as_deref(), policy, provider_env)
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    let child_command = tool_command_for_ssh_exec(command.as_deref())
+        .unwrap_or_else(|| vec!["/bin/bash".to_string(), "-lc".to_string()]);
+
     let mut cmd = command.map_or_else(
         || {
             // No command — read from stdin.  Do *not* pass `-i`; interactive
@@ -869,10 +922,10 @@ fn spawn_pipe_exec(
             c
         },
     );
-
     let (session_user, session_home) = session_user_and_home(policy);
     apply_child_env(
         &mut cmd,
+        &child_command,
         &session_home,
         &session_user,
         "dumb",
@@ -1077,6 +1130,18 @@ fn to_u16(value: u32) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
+    use temp_env::with_var;
+
+    fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
+        SandboxPolicy {
+            version: 1,
+            filesystem: FilesystemPolicy::default(),
+            network: NetworkPolicy::default(),
+            landlock: LandlockPolicy::default(),
+            process,
+        }
+    }
     use std::process::Stdio;
 
     /// Verify that dropping the input sender (the operation `channel_eof`
@@ -1297,6 +1362,7 @@ mod tests {
 
         apply_child_env(
             &mut cmd,
+            &["/bin/bash".to_string(), "-lc".to_string()],
             "/sandbox",
             "sandbox",
             "dumb",
@@ -1310,5 +1376,97 @@ mod tests {
 
         assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    #[test]
+    fn apply_child_env_suppresses_github_tokens_for_opencode_commands() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+
+        let provider_env = HashMap::from([
+            (
+                "GITHUB_TOKEN".to_string(),
+                "openshell:resolve:env:GITHUB_TOKEN".to_string(),
+            ),
+            (
+                "GH_TOKEN".to_string(),
+                "openshell:resolve:env:GH_TOKEN".to_string(),
+            ),
+        ]);
+
+        apply_child_env(
+            &mut cmd,
+            &["opencode".to_string(), "run".to_string()],
+            "/sandbox",
+            "sandbox",
+            "dumb",
+            None,
+            None,
+            &provider_env,
+        );
+
+        let output = cmd.output().expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+        assert!(!stdout.contains("GITHUB_TOKEN=openshell:resolve:env:GITHUB_TOKEN"));
+        assert!(!stdout.contains("GH_TOKEN=openshell:resolve:env:GH_TOKEN"));
+        assert!(stdout.contains("XDG_DATA_HOME=/sandbox/.local/share"));
+    }
+
+    #[test]
+    fn tool_command_for_ssh_exec_detects_opencode_invocation() {
+        assert_eq!(
+            tool_command_for_ssh_exec(Some("opencode auth list --print-logs")),
+            Some(vec![
+                "opencode".to_string(),
+                "auth".to_string(),
+                "list".to_string(),
+                "--print-logs".to_string(),
+            ])
+        );
+    }
+
+    #[test]
+    fn tool_command_for_ssh_exec_does_not_misclassify_arbitrary_exec_commands_as_opencode() {
+        assert_eq!(tool_command_for_ssh_exec(Some("python -c print(1)")), None);
+    }
+
+    #[test]
+    fn stage_tool_auth_for_ssh_exec_stages_opencode_auth_when_exec_command_targets_tool() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let sandbox_root = temp.path().join("sandbox");
+        let host_home = temp.path().join("home");
+        let auth_dir = host_home.join(".local/share/opencode");
+        std::fs::create_dir_all(&auth_dir).expect("create auth dir");
+        std::fs::create_dir_all(&sandbox_root).expect("create sandbox root");
+        std::fs::write(auth_dir.join("auth.json"), r#"{"token":"copilot"}"#)
+            .expect("write auth file");
+
+        let provider_env = HashMap::from([(
+            "GITHUB_TOKEN".to_string(),
+            "openshell:resolve:env:GITHUB_TOKEN".to_string(),
+        )]);
+
+        with_var("HOME", Some(host_home.as_os_str()), || {
+            let command = tool_command_for_ssh_exec(Some("opencode auth list --print-logs"))
+                .expect("detect opencode command");
+            let staged = stage_tool_auth_projection(
+                &command,
+                &host_home,
+                &sandbox_root,
+                &policy_with_process(ProcessPolicy::default()),
+                &provider_env,
+            )
+            .expect("staging should succeed")
+            .expect("auth file should be staged");
+
+            assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
+            assert_eq!(
+                std::fs::read_to_string(&staged).expect("read staged auth"),
+                r#"{"token":"copilot"}"#
+            );
+        });
     }
 }

@@ -35,6 +35,10 @@ fn inject_tool_runtime_env(
     command: &[String],
     provider_env: &HashMap<String, String>,
 ) {
+    for key in child_env::suppressed_provider_env_keys(command, provider_env) {
+        cmd.env_remove(key);
+    }
+
     if let Some(vars) = child_env::tool_runtime_env_vars(command, provider_env) {
         for (key, value) in vars {
             cmd.env(key, value);
@@ -721,6 +725,59 @@ mod tests {
         let output = cmd.output().await.expect("spawn env");
         let stdout = String::from_utf8(output.stdout).expect("utf8");
 
+        assert!(!stdout.contains("XDG_DATA_HOME=/sandbox/.local/share"));
+    }
+
+    #[tokio::test]
+    async fn inject_tool_runtime_env_suppresses_placeholder_github_tokens_for_opencode() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = HashMap::from([
+            (
+                "GITHUB_TOKEN".to_string(),
+                "openshell:resolve:env:GITHUB_TOKEN".to_string(),
+            ),
+            (
+                "GH_TOKEN".to_string(),
+                "openshell:resolve:env:GH_TOKEN".to_string(),
+            ),
+        ]);
+
+        inject_provider_env(&mut cmd, &provider_env);
+        inject_tool_runtime_env(&mut cmd, &command, &provider_env);
+
+        let output = cmd.output().await.expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+        assert!(stdout.contains("XDG_DATA_HOME=/sandbox/.local/share"));
+        assert!(!stdout.contains("GITHUB_TOKEN=openshell:resolve:env:GITHUB_TOKEN"));
+        assert!(!stdout.contains("GH_TOKEN=openshell:resolve:env:GH_TOKEN"));
+    }
+
+    #[tokio::test]
+    async fn inject_tool_runtime_env_keeps_provider_env_for_non_opencode_tools() {
+        let mut cmd = Command::new("/usr/bin/env");
+        cmd.stdin(StdStdio::null())
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::null());
+
+        let command = vec!["python".to_string(), "script.py".to_string()];
+        let provider_env = HashMap::from([(
+            "GITHUB_TOKEN".to_string(),
+            "openshell:resolve:env:GITHUB_TOKEN".to_string(),
+        )]);
+
+        inject_provider_env(&mut cmd, &provider_env);
+        inject_tool_runtime_env(&mut cmd, &command, &provider_env);
+
+        let output = cmd.output().await.expect("spawn env");
+        let stdout = String::from_utf8(output.stdout).expect("utf8");
+
+        assert!(stdout.contains("GITHUB_TOKEN=openshell:resolve:env:GITHUB_TOKEN"));
         assert!(!stdout.contains("XDG_DATA_HOME=/sandbox/.local/share"));
     }
 }

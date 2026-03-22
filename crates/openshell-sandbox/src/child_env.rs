@@ -8,6 +8,7 @@ const LOCAL_NO_PROXY: &str = "127.0.0.1,localhost,::1";
 const OPENCODE_AUTH_RELATIVE_PATH: &str = ".local/share/opencode/auth.json";
 const SANDBOX_XDG_DATA_HOME: &str = "/sandbox/.local/share";
 const SANDBOX_OPENCODE_AUTH_PATH: &str = "/sandbox/.local/share/opencode/auth.json";
+const OPENCODE_AUTH_JSON_CREDENTIAL_KEY: &str = "OPENCODE_AUTH_JSON";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ToolAdapter {
@@ -65,8 +66,22 @@ pub(crate) fn tool_runtime_env_vars(
     }
 }
 
+pub(crate) fn suppressed_provider_env_keys(
+    command: &[String],
+    provider_env: &std::collections::HashMap<String, String>,
+) -> &'static [&'static str] {
+    match detect_tool_adapter(command) {
+        Some(ToolAdapter::OpenCode) if is_github_copilot_targeted(provider_env) => {
+            &["GITHUB_TOKEN", "GH_TOKEN"]
+        }
+        _ => &[],
+    }
+}
+
 fn is_github_copilot_targeted(provider_env: &std::collections::HashMap<String, String>) -> bool {
-    provider_env.contains_key("GITHUB_TOKEN") || provider_env.contains_key("GH_TOKEN")
+    provider_env.contains_key("GITHUB_TOKEN")
+        || provider_env.contains_key("GH_TOKEN")
+        || provider_env.contains_key(OPENCODE_AUTH_JSON_CREDENTIAL_KEY)
 }
 
 pub(crate) fn proxy_env_vars(proxy_url: &str) -> [(&'static str, String); 9] {
@@ -230,6 +245,27 @@ mod tests {
     }
 
     #[test]
+    fn opencode_auth_json_only_requests_auth_projection_and_xdg_override() {
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env = std::collections::HashMap::from([(
+            "OPENCODE_AUTH_JSON".to_string(),
+            r#"{"github-copilot":{"type":"oauth"}}"#.to_string(),
+        )]);
+
+        assert_eq!(
+            auth_file_projection(&command, Path::new("/home/alice"), &provider_env),
+            Some((
+                PathBuf::from("/home/alice/.local/share/opencode/auth.json"),
+                PathBuf::from("/sandbox/.local/share/opencode/auth.json"),
+            ))
+        );
+        assert_eq!(
+            tool_runtime_env_vars(&command, &provider_env),
+            Some([("XDG_DATA_HOME", "/sandbox/.local/share".to_string())])
+        );
+    }
+
+    #[test]
     fn opencode_without_github_provider_does_not_request_auth_projection_or_xdg_override() {
         let command = vec!["opencode".to_string(), "run".to_string()];
         let provider_env = std::collections::HashMap::new();
@@ -239,5 +275,29 @@ mod tests {
             None
         );
         assert_eq!(tool_runtime_env_vars(&command, &provider_env), None);
+    }
+
+    #[test]
+    fn opencode_github_path_suppresses_placeholder_github_env_keys() {
+        let command = vec!["opencode".to_string(), "run".to_string()];
+        let provider_env =
+            std::collections::HashMap::from([("GITHUB_TOKEN".to_string(), "ghu-test".to_string())]);
+
+        assert_eq!(
+            suppressed_provider_env_keys(&command, &provider_env),
+            ["GITHUB_TOKEN", "GH_TOKEN"]
+        );
+    }
+
+    #[test]
+    fn unsupported_tools_do_not_suppress_provider_env_keys() {
+        let command = vec!["python".to_string(), "script.py".to_string()];
+        let provider_env =
+            std::collections::HashMap::from([("GITHUB_TOKEN".to_string(), "ghu-test".to_string())]);
+
+        assert_eq!(
+            suppressed_provider_env_keys(&command, &provider_env),
+            &[] as &[&str]
+        );
     }
 }
