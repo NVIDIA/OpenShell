@@ -191,7 +191,7 @@ where
         BodyLength::None => {}
     }
     upstream.flush().await.into_diagnostic()?;
-    let (reusable, _status) = relay_response(&req.action, upstream, client).await?;
+    let (reusable, _) = relay_response(&req.action, upstream, client).await?;
     Ok(reusable)
 }
 
@@ -419,17 +419,18 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 /// `false` if it was consumed (read-until-EOF or `Connection: close`).
 /// Relay an HTTP response from upstream back to the client.
 ///
-/// Returns `(keep_alive, status_code)`.
+/// Returns `true` if the connection should stay alive for further requests.
 pub(crate) async fn relay_response_to_client<U, C>(
     upstream: &mut U,
     client: &mut C,
     request_method: &str,
-) -> Result<(bool, u16)>
+) -> Result<bool>
 where
     U: AsyncRead + Unpin,
     C: AsyncWrite + Unpin,
 {
-    relay_response(request_method, upstream, client).await
+    let (reusable, _status) = relay_response(request_method, upstream, client).await?;
+    Ok(reusable)
 }
 
 async fn relay_response<U, C>(
