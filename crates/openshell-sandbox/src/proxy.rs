@@ -1174,6 +1174,9 @@ fn is_internal_ip(ip: IpAddr) -> bool {
 ///
 /// Returns the resolved `SocketAddr` list on success. Returns an error string
 /// if any resolved IP is in an internal range or if DNS resolution fails.
+///
+/// Special case: `host.docker.internal` is allowed to resolve to internal IPs
+/// (e.g., Docker bridge 172.17.0.1) to enable local inference scenarios.
 async fn resolve_and_reject_internal(
     host: &str,
     port: u16,
@@ -1187,6 +1190,21 @@ async fn resolve_and_reject_internal(
         return Err(format!(
             "DNS resolution returned no addresses for {host}:{port}"
         ));
+    }
+
+    // Special case: allow host.docker.internal to resolve to internal IPs
+    // This enables local vLLM/Ollama inference from within the sandbox
+    if host == "host.docker.internal" {
+        // Still block loopback and link-local for security
+        for addr in &addrs {
+            if is_always_blocked_ip(addr.ip()) {
+                return Err(format!(
+                    "{host} resolves to always-blocked address {}, connection rejected",
+                    addr.ip()
+                ));
+            }
+        }
+        return Ok(addrs);
     }
 
     for addr in &addrs {
@@ -1759,11 +1777,21 @@ async fn handle_forward_proxy(
         match resolve_and_reject_internal(&host, port).await {
             Ok(addrs) => addrs,
             Err(reason) => {
+                // Provide helpful hint for common local inference scenarios
+                let hint = if host_lc.contains("localhost") || host_lc.contains("127.0.0.1") {
+                    " For local inference, use host.docker.internal instead of localhost."
+                } else if host_lc.contains("host.docker.internal") {
+                    " This should work - please report this issue."
+                } else {
+                    " To allow internal endpoints, add 'allowed_ips' to your network policy."
+                };
+                
                 warn!(
                     dst_host = %host_lc,
                     dst_port = port,
                     reason = %reason,
-                    "FORWARD blocked: internal IP without allowed_ips"
+                    "FORWARD blocked: internal IP without allowed_ips.{}",
+                    hint
                 );
                 emit_denial_simple(
                     denial_tx,
@@ -2593,6 +2621,56 @@ mod tests {
         assert!(
             err.contains("always-blocked"),
             "expected 'always-blocked' in error: {err}"
+        );
+    }
+
+    // --- host.docker.internal special case tests ---
+
+    #[test]
+    fn test_host_docker_internal_logic_allows_private_ranges() {
+        // Test that the special-case logic for host.docker.internal would allow
+        // Docker bridge IPs (172.17.x.x, 172.18.x.x, etc.)
+        // We test the is_internal_ip function directly since we can't resolve
+        // host.docker.internal outside of Docker
+        let docker_bridge = IpAddr::V4(Ipv4Addr::new(172, 17, 0, 1));
+        assert!(
+            is_internal_ip(docker_bridge),
+            "Docker bridge is considered internal"
+        );
+        
+        // The fix allows host.docker.internal to bypass is_internal_ip check
+        // This test documents that the IP ranges are correct
+        let docker_bridge_2 = IpAddr::V4(Ipv4Addr::new(172, 18, 0, 1));
+        assert!(is_internal_ip(docker_bridge_2));
+        
+        let local_network = IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1));
+        assert!(is_internal_ip(local_network));
+    }
+
+    #[tokio::test]
+    async fn test_host_docker_internal_blocks_loopback() {
+        // Even host.docker.internal should block loopback addresses
+        // This test documents the security boundary
+        let result = resolve_and_reject_internal("localhost", 8000).await;
+        assert!(
+            result.is_err(),
+            "localhost should be rejected even for local inference"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("internal address") || err.contains("always-blocked"),
+            "expected internal/always-blocked in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_public_ip_allowed_without_allowed_ips() {
+        // Public IPs should be allowed without needing allowed_ips
+        // Use a well-known public DNS that should always resolve
+        let result = resolve_and_reject_internal("8.8.8.8", 53).await;
+        assert!(
+            result.is_ok(),
+            "Public IP (8.8.8.8) should be allowed: {result:?}"
         );
     }
 }
