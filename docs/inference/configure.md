@@ -85,7 +85,7 @@ Use `--config OPENAI_BASE_URL` to point to any OpenAI-compatible server running 
 For a self-contained setup, the Ollama community sandbox bundles Ollama inside the sandbox itself — no host-level provider needed. See {doc}`/tutorials/inference-ollama` for details.
 :::
 
-Ollama also supports cloud-hosted models using the `:cloud` tag suffix (e.g., `qwen3.5:cloud`). 
+Ollama also supports cloud-hosted models using the `:cloud` tag suffix (e.g., `qwen3.5:cloud`).
 
 ::::
 

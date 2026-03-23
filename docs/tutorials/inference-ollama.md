@@ -63,7 +63,7 @@ Chat with a local model
 $ ollama run qwen3.5
 ```
 
-Or a cloud model 
+Or a cloud model
 
 ```console
 $ ollama run kimi-k2.5:cloud
@@ -94,7 +94,7 @@ $ ollama launch claude --yes --model qwen3.5
 | No local GPU | `qwen3.5:cloud` | Runs on Ollama's cloud infrastructure, no `ollama pull` required |
 
 :::{note}
-Cloud models use the `:cloud` tag suffix and do not require local hardware. 
+Cloud models use the `:cloud` tag suffix and do not require local hardware.
 
 ```console
 $ openshell sandbox create --from ollama

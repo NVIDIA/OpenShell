@@ -186,7 +186,7 @@ stateDiagram-v2
     [*] --> NoGlobalPolicy
 
     NoGlobalPolicy --> v1_Loaded : policy set --global<br/>(creates v1, marks loaded)
-    
+
     v1_Loaded --> v1_Loaded : policy set --global<br/>(same hash, dedup no-op)
     v1_Loaded --> v2_Loaded : policy set --global<br/>(different hash)
     v1_Loaded --> AllSuperseded : policy delete --global
