@@ -330,12 +330,21 @@ impl russh::server::Handler for SshHandler {
         _originator_port: u32,
         _session: &mut Session,
     ) -> Result<bool, Self::Error> {
+        // Validate port range before truncating u32 -> u16.  The SSH protocol
+        // uses u32 for ports, but valid TCP ports are 0-65535.  Without this
+        // check, port 65537 truncates to port 1 (privileged).
+        if port_to_connect > u32::from(u16::MAX) {
+            warn!(
+                host = host_to_connect,
+                port = port_to_connect,
+                "direct-tcpip rejected: port exceeds valid TCP range (0-65535)"
+            );
+            return Ok(false);
+        }
+
         // Only allow forwarding to loopback destinations to prevent the
         // sandbox SSH server from being used as a generic proxy.
-        let is_loopback = host_to_connect == "127.0.0.1"
-            || host_to_connect == "localhost"
-            || host_to_connect == "::1";
-        if !is_loopback {
+        if !is_loopback_host(host_to_connect) {
             warn!(
                 host = host_to_connect,
                 port = port_to_connect,
@@ -345,7 +354,6 @@ impl russh::server::Handler for SshHandler {
         }
 
         let host = host_to_connect.to_string();
-        #[allow(clippy::cast_possible_truncation)]
         let port = port_to_connect as u16;
         let netns_fd = self.netns_fd;
 
@@ -1074,6 +1082,41 @@ fn to_u16(value: u32) -> u16 {
     u16::try_from(value.min(u32::from(u16::MAX))).unwrap_or(u16::MAX)
 }
 
+/// Check whether a host string refers to a loopback address.
+///
+/// Covers all representations that resolve to loopback:
+/// - `127.0.0.0/8` (the entire IPv4 loopback range, not just `127.0.0.1`)
+/// - `localhost`
+/// - `::1` and long-form IPv6 loopback (`0:0:0:0:0:0:0:1`)
+/// - `::ffff:127.x.x.x` (IPv4-mapped IPv6 loopback)
+/// - Bracketed forms like `[::1]`
+fn is_loopback_host(host: &str) -> bool {
+    // Strip brackets for IPv6 addresses like [::1]
+    let host = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => v4.is_loopback(), // covers all 127.x.x.x
+        Ok(std::net::IpAddr::V6(v6)) => {
+            if v6.is_loopback() {
+                return true; // covers ::1 and long form
+            }
+            // Check IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return v4.is_loopback();
+            }
+            false
+        }
+        Err(_) => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1310,5 +1353,55 @@ mod tests {
 
         assert!(!stdout.contains(SSH_HANDSHAKE_SECRET_ENV));
         assert!(stdout.contains("ANTHROPIC_API_KEY=openshell:resolve:env:ANTHROPIC_API_KEY"));
+    }
+
+    // -----------------------------------------------------------------------
+    // SEC-007: is_loopback_host tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn loopback_host_accepts_standard_ipv4() {
+        assert!(is_loopback_host("127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_host_accepts_full_ipv4_range() {
+        assert!(is_loopback_host("127.0.0.2"));
+        assert!(is_loopback_host("127.255.255.255"));
+    }
+
+    #[test]
+    fn loopback_host_accepts_localhost() {
+        assert!(is_loopback_host("localhost"));
+        assert!(is_loopback_host("LOCALHOST"));
+        assert!(is_loopback_host("Localhost"));
+    }
+
+    #[test]
+    fn loopback_host_accepts_ipv6_loopback() {
+        assert!(is_loopback_host("::1"));
+        assert!(is_loopback_host("[::1]"));
+        assert!(is_loopback_host("0:0:0:0:0:0:0:1"));
+    }
+
+    #[test]
+    fn loopback_host_accepts_ipv4_mapped_ipv6() {
+        assert!(is_loopback_host("::ffff:127.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_host_rejects_non_loopback() {
+        assert!(!is_loopback_host("10.0.0.1"));
+        assert!(!is_loopback_host("192.168.1.1"));
+        assert!(!is_loopback_host("8.8.8.8"));
+        assert!(!is_loopback_host("example.com"));
+        assert!(!is_loopback_host("::ffff:10.0.0.1"));
+    }
+
+    #[test]
+    fn loopback_host_rejects_empty_and_garbage() {
+        assert!(!is_loopback_host(""));
+        assert!(!is_loopback_host("not-an-ip"));
+        assert!(!is_loopback_host("[]"));
     }
 }
