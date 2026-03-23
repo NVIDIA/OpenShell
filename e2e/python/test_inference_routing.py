@@ -319,7 +319,7 @@ def test_unsupported_protocol_returns_400(
         assert result.exit_code == 0, f"stderr: {result.stderr}"
         output = result.stdout.strip()
         assert output.startswith("http_error_400"), output
-        assert "no compatible route" in output
+        assert "no compatible inference route" in output
 
 
 def test_non_inference_host_is_not_intercepted(
