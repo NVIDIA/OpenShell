@@ -20,6 +20,24 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
+fn perf_log(msg: &str) {
+    use std::io::Write;
+    for path in &["/var/log/openshell-perf.log", "/tmp/openshell-perf.log"] {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let _ = writeln!(f, "[{:.3}] {}", now.as_secs_f64(), msg);
+            return;
+        }
+    }
+    eprintln!("PERF_LOG_FALLBACK: {msg}");
+}
+
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
 
@@ -336,15 +354,32 @@ async fn handle_tcp_connection(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    // Evaluate OPA policy with process-identity binding
-    let decision = evaluate_opa_tcp(
-        peer_addr,
-        &opa_engine,
-        &identity_cache,
-        &entrypoint_pid,
-        &host_lc,
-        port,
-    );
+    let connect_start = std::time::Instant::now();
+    perf_log(&format!("handle_tcp_connection START host={host_lc} port={port}"));
+
+    // Evaluate OPA policy with process-identity binding.
+    // Wrapped in spawn_blocking because identity resolution does heavy sync I/O:
+    // /proc scanning + SHA256 hashing of binaries (e.g. node at 124MB).
+    let opa_clone = opa_engine.clone();
+    let cache_clone = identity_cache.clone();
+    let pid_clone = entrypoint_pid.clone();
+    let host_clone = host_lc.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        evaluate_opa_tcp(
+            peer_addr,
+            &opa_clone,
+            &cache_clone,
+            &pid_clone,
+            &host_clone,
+            port,
+        )
+    })
+    .await
+    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
+    perf_log(&format!(
+        "handle_tcp_connection evaluate_opa_tcp: {}ms",
+        connect_start.elapsed().as_millis()
+    ));
 
     // Extract action string and matched policy for logging
     let (matched_policy, deny_reason) = match &decision.action {
@@ -421,6 +456,7 @@ async fn handle_tcp_connection(
     let raw_allowed_ips = query_allowed_ips(&opa_engine, &decision, &host_lc, port);
 
     // Defense-in-depth: resolve DNS and reject connections to internal IPs.
+    let dns_connect_start = std::time::Instant::now();
     let mut upstream = if !raw_allowed_ips.is_empty() {
         // allowed_ips mode: validate resolved IPs against CIDR allowlist.
         // Loopback and link-local are still always blocked.
@@ -496,6 +532,11 @@ async fn handle_tcp_connection(
             }
         }
     };
+
+    perf_log(&format!(
+        "handle_tcp_connection dns_resolve_and_tcp_connect: {}ms host={host_lc}",
+        dns_connect_start.elapsed().as_millis()
+    ));
 
     respond(&mut client, b"HTTP/1.1 200 Connection Established\r\n\r\n").await?;
 
@@ -701,7 +742,11 @@ fn evaluate_opa_tcp(
         );
     }
 
+    let total_start = std::time::Instant::now();
     let peer_port = peer_addr.port();
+    perf_log(&format!("evaluate_opa_tcp START host={host} port={port}"));
+
+    let phase_start = std::time::Instant::now();
     let (bin_path, binary_pid) = match crate::procfs::resolve_tcp_peer_identity(pid, peer_port) {
         Ok(r) => r,
         Err(e) => {
@@ -714,8 +759,14 @@ fn evaluate_opa_tcp(
             );
         }
     };
+    perf_log(&format!(
+        "  resolve_tcp_peer_identity: {}ms binary={} pid={}",
+        phase_start.elapsed().as_millis(),
+        bin_path.display(),
+        binary_pid
+    ));
 
-    // TOFU verify the immediate binary
+    let phase_start = std::time::Instant::now();
     let bin_hash = match identity_cache.verify_or_cache(&bin_path) {
         Ok(h) => h,
         Err(e) => {
@@ -728,12 +779,23 @@ fn evaluate_opa_tcp(
             );
         }
     };
+    perf_log(&format!(
+        "  tofu_verify_binary: {}ms binary={}",
+        phase_start.elapsed().as_millis(),
+        bin_path.display()
+    ));
 
-    // Walk the process tree upward to collect ancestor binaries
+    let phase_start = std::time::Instant::now();
     let ancestors = crate::procfs::collect_ancestor_binaries(binary_pid, pid);
+    perf_log(&format!(
+        "  collect_ancestor_binaries: {}ms count={}",
+        phase_start.elapsed().as_millis(),
+        ancestors.len()
+    ));
 
-    // TOFU verify each ancestor binary
+    let phase_start = std::time::Instant::now();
     for ancestor in &ancestors {
+        let ancestor_start = std::time::Instant::now();
         if let Err(e) = identity_cache.verify_or_cache(ancestor) {
             return deny(
                 format!(
@@ -746,14 +808,27 @@ fn evaluate_opa_tcp(
                 vec![],
             );
         }
+        perf_log(&format!(
+            "    tofu_verify_ancestor: {}ms ancestor={}",
+            ancestor_start.elapsed().as_millis(),
+            ancestor.display()
+        ));
     }
+    perf_log(&format!(
+        "  tofu_verify_all_ancestors: {}ms",
+        phase_start.elapsed().as_millis()
+    ));
 
-    // Collect cmdline paths for script-based binary detection.
-    // Excludes exe paths already captured in bin_path/ancestors to avoid duplicates.
+    let phase_start = std::time::Instant::now();
     let mut exclude = ancestors.clone();
     exclude.push(bin_path.clone());
     let cmdline_paths = crate::procfs::collect_cmdline_paths(binary_pid, pid, &exclude);
+    perf_log(&format!(
+        "  collect_cmdline_paths: {}ms",
+        phase_start.elapsed().as_millis()
+    ));
 
+    let phase_start = std::time::Instant::now();
     let input = NetworkInput {
         host: host.to_string(),
         port,
@@ -763,7 +838,7 @@ fn evaluate_opa_tcp(
         cmdline_paths: cmdline_paths.clone(),
     };
 
-    match engine.evaluate_network_action(&input) {
+    let result = match engine.evaluate_network_action(&input) {
         Ok(action) => ConnectDecision {
             action,
             binary: Some(bin_path),
@@ -778,7 +853,16 @@ fn evaluate_opa_tcp(
             ancestors,
             cmdline_paths,
         ),
-    }
+    };
+    perf_log(&format!(
+        "  opa_evaluate_network_action: {}ms",
+        phase_start.elapsed().as_millis()
+    ));
+    perf_log(&format!(
+        "evaluate_opa_tcp TOTAL: {}ms host={host} port={port}",
+        total_start.elapsed().as_millis()
+    ));
+    result
 }
 
 /// Non-Linux stub: OPA identity binding requires /proc.
@@ -1600,14 +1684,22 @@ async fn handle_forward_proxy(
     let peer_addr = client.peer_addr().into_diagnostic()?;
     let local_addr = client.local_addr().into_diagnostic()?;
 
-    let decision = evaluate_opa_tcp(
-        peer_addr,
-        &opa_engine,
-        &identity_cache,
-        &entrypoint_pid,
-        &host_lc,
-        port,
-    );
+    let opa_clone = opa_engine.clone();
+    let cache_clone = identity_cache.clone();
+    let pid_clone = entrypoint_pid.clone();
+    let host_clone = host_lc.clone();
+    let decision = tokio::task::spawn_blocking(move || {
+        evaluate_opa_tcp(
+            peer_addr,
+            &opa_clone,
+            &cache_clone,
+            &pid_clone,
+            &host_clone,
+            port,
+        )
+    })
+    .await
+    .map_err(|e| miette::miette!("identity resolution task panicked: {e}"))?;
 
     // Build log context
     let binary_str = decision

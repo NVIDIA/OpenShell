@@ -17,6 +17,24 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+fn perf_log(msg: &str) {
+    use std::io::Write;
+    for path in &["/var/log/openshell-perf.log", "/tmp/openshell-perf.log"] {
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default();
+            let _ = writeln!(f, "[{:.3}] {}", now.as_secs_f64(), msg);
+            return;
+        }
+    }
+    eprintln!("PERF_LOG_FALLBACK: {msg}");
+}
+
 #[derive(Clone)]
 struct FileFingerprint {
     len: u64,
@@ -100,6 +118,7 @@ impl BinaryIdentityCache {
     where
         F: FnMut(&Path) -> Result<String>,
     {
+        let start = std::time::Instant::now();
         let metadata = std::fs::metadata(path)
             .map_err(|error| miette::miette!("Failed to stat {}: {error}", path.display()))?;
         let fingerprint = FileFingerprint::from_metadata(&metadata);
@@ -114,10 +133,24 @@ impl BinaryIdentityCache {
         if let Some(cached_binary) = &cached
             && cached_binary.fingerprint == fingerprint
         {
+            perf_log(&format!(
+                "      verify_or_cache: {}ms CACHE HIT path={}",
+                start.elapsed().as_millis(), path.display()
+            ));
             return Ok(cached_binary.hash.clone());
         }
 
+        perf_log(&format!(
+            "      verify_or_cache: CACHE MISS size={} path={}",
+            metadata.len(), path.display()
+        ));
+
+        let hash_start = std::time::Instant::now();
         let current_hash = hash_file(path)?;
+        perf_log(&format!(
+            "      verify_or_cache SHA256: {}ms path={}",
+            hash_start.elapsed().as_millis(), path.display()
+        ));
 
         let mut hashes = self
             .hashes
@@ -142,6 +175,11 @@ impl BinaryIdentityCache {
                 fingerprint,
             },
         );
+
+        perf_log(&format!(
+            "      verify_or_cache TOTAL (cold): {}ms path={}",
+            start.elapsed().as_millis(), path.display()
+        ));
 
         Ok(current_hash)
     }
