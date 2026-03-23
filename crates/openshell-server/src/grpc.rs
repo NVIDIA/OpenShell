@@ -148,14 +148,14 @@ pub fn clamp_limit(raw: u32, default: u32, max: u32) -> u32 {
     if raw == 0 { default } else { raw.min(max) }
 }
 
-/// OpenShell gRPC service implementation.
+/// `OpenShell` gRPC service implementation.
 #[derive(Debug, Clone)]
 pub struct OpenShellService {
     state: Arc<ServerState>,
 }
 
 impl OpenShellService {
-    /// Create a new OpenShell service.
+    /// Create a new `OpenShell` service.
     #[must_use]
     #[allow(clippy::missing_const_for_fn)]
     pub fn new(state: Arc<ServerState>) -> Self {
@@ -1244,19 +1244,19 @@ impl OpenShell for OpenShellService {
                 let removed = global_settings.settings.remove(key).is_some();
                 // When deleting the global policy key, supersede all global
                 // policy revisions so they no longer appear as "Loaded".
-                if removed && key == POLICY_SETTING_KEY {
-                    if let Ok(Some(latest)) = self
+                if removed
+                    && key == POLICY_SETTING_KEY
+                    && let Ok(Some(latest)) = self
                         .state
                         .store
                         .get_latest_policy(GLOBAL_POLICY_SANDBOX_ID)
                         .await
-                    {
-                        let _ = self
-                            .state
-                            .store
-                            .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
-                            .await;
-                    }
+                {
+                    let _ = self
+                        .state
+                        .store
+                        .supersede_older_policies(GLOBAL_POLICY_SANDBOX_ID, latest.version + 1)
+                        .await;
                 }
                 removed
             } else {
@@ -1806,7 +1806,7 @@ impl OpenShell for OpenShellService {
             let proposed_rule_bytes = chunk
                 .proposed_rule
                 .as_ref()
-                .map(|r| r.encode_to_vec())
+                .map(Message::encode_to_vec)
                 .unwrap_or_default();
 
             // Extract host:port and binary from the proposed rule for denormalized columns.
@@ -2494,7 +2494,7 @@ async fn require_no_global_policy(state: &ServerState) -> Result<(), Status> {
 }
 
 async fn merge_chunk_into_policy(
-    store: &crate::persistence::Store,
+    store: &Store,
     sandbox_id: &str,
     chunk: &DraftChunkRecord,
 ) -> Result<(i64, String), Status> {
@@ -3175,7 +3175,7 @@ fn validate_sandbox_template(tmpl: &SandboxTemplate) -> Result<(), Status> {
 
 /// Validate a `map<string, string>` field: entry count, key length, value length.
 fn validate_string_map(
-    map: &std::collections::HashMap<String, String>,
+    map: &HashMap<String, String>,
     max_entries: usize,
     max_key_len: usize,
     max_value_len: usize,
@@ -3444,14 +3444,14 @@ fn build_remote_exec_command(req: &ExecSandboxRequest) -> String {
 /// to inject into the sandbox. When duplicate keys appear across providers, the
 /// first provider's value wins.
 async fn resolve_provider_environment(
-    store: &crate::persistence::Store,
+    store: &Store,
     provider_names: &[String],
-) -> Result<std::collections::HashMap<String, String>, Status> {
+) -> Result<HashMap<String, String>, Status> {
     if provider_names.is_empty() {
-        return Ok(std::collections::HashMap::new());
+        return Ok(HashMap::new());
     }
 
-    let mut env = std::collections::HashMap::new();
+    let mut env = HashMap::new();
 
     for name in provider_names {
         let provider = store
@@ -3838,10 +3838,7 @@ fn redact_provider_credentials(mut provider: Provider) -> Provider {
     provider
 }
 
-async fn create_provider_record(
-    store: &crate::persistence::Store,
-    mut provider: Provider,
-) -> Result<Provider, Status> {
+async fn create_provider_record(store: &Store, mut provider: Provider) -> Result<Provider, Status> {
     if provider.name.is_empty() {
         provider.name = generate_name();
     }
@@ -3876,10 +3873,7 @@ async fn create_provider_record(
     Ok(redact_provider_credentials(provider))
 }
 
-async fn get_provider_record(
-    store: &crate::persistence::Store,
-    name: &str,
-) -> Result<Provider, Status> {
+async fn get_provider_record(store: &Store, name: &str) -> Result<Provider, Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -3893,7 +3887,7 @@ async fn get_provider_record(
 }
 
 async fn list_provider_records(
-    store: &crate::persistence::Store,
+    store: &Store,
     limit: u32,
     offset: u32,
 ) -> Result<Vec<Provider>, Status> {
@@ -3918,9 +3912,9 @@ async fn list_provider_records(
 /// - Otherwise, upsert all incoming entries into `existing`.
 /// - Entries with an empty-string value are removed (delete semantics).
 fn merge_map(
-    mut existing: std::collections::HashMap<String, String>,
-    incoming: std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
+    mut existing: HashMap<String, String>,
+    incoming: HashMap<String, String>,
+) -> HashMap<String, String> {
     if incoming.is_empty() {
         return existing;
     }
@@ -3934,10 +3928,7 @@ fn merge_map(
     existing
 }
 
-async fn update_provider_record(
-    store: &crate::persistence::Store,
-    provider: Provider,
-) -> Result<Provider, Status> {
+async fn update_provider_record(store: &Store, provider: Provider) -> Result<Provider, Status> {
     if provider.name.is_empty() {
         return Err(Status::invalid_argument("provider.name is required"));
     }
@@ -3978,10 +3969,7 @@ async fn update_provider_record(
     Ok(redact_provider_credentials(updated))
 }
 
-async fn delete_provider_record(
-    store: &crate::persistence::Store,
-    name: &str,
-) -> Result<bool, Status> {
+async fn delete_provider_record(store: &Store, name: &str) -> Result<bool, Status> {
     if name.is_empty() {
         return Err(Status::invalid_argument("name is required"));
     }
@@ -4290,7 +4278,7 @@ mod tests {
             updated.config.get("endpoint"),
             Some(&"https://example.com".to_string())
         );
-        assert!(updated.config.get("region").is_none());
+        assert!(!updated.config.contains_key("region"));
         // Verify the store has the correct credential state (SECONDARY deleted).
         let stored: Provider = store
             .get_message_by_name("delete-key-test")
@@ -4302,7 +4290,7 @@ mod tests {
             stored.credentials.get("API_TOKEN"),
             Some(&"token-123".to_string())
         );
-        assert!(stored.credentials.get("SECONDARY").is_none());
+        assert!(!stored.credentials.contains_key("SECONDARY"));
     }
 
     #[tokio::test]
@@ -5467,11 +5455,10 @@ mod tests {
         let encoded = hex::encode(policy.encode_to_vec());
         let global = super::StoredSettings {
             revision: 1,
-            settings: [(
+            settings: std::iter::once((
                 "policy".to_string(),
                 super::StoredSettingValue::Bytes(encoded),
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
 
@@ -5615,20 +5602,18 @@ mod tests {
     fn merge_effective_settings_policy_key_is_excluded() {
         let global = super::StoredSettings {
             revision: 1,
-            settings: [(
+            settings: std::iter::once((
                 "policy".to_string(),
                 super::StoredSettingValue::Bytes("deadbeef".to_string()),
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
         let sandbox = super::StoredSettings {
             revision: 1,
-            settings: [(
+            settings: std::iter::once((
                 "policy".to_string(),
                 super::StoredSettingValue::Bytes("cafebabe".to_string()),
-            )]
-            .into_iter()
+            ))
             .collect(),
         };
 

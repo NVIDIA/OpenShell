@@ -419,6 +419,16 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
             .ok_or_else(|| miette::miette!("Failed to resolve user primary group"))?
     };
 
+    let active_uid = nix::unistd::geteuid();
+    let active_group = nix::unistd::getegid();
+
+    // When already running as the requested non-root UID/GID, there is nothing
+    // left to drop. Re-running `initgroups` in this state fails with EPERM for
+    // unprivileged processes, and re-verifying the same IDs would be redundant.
+    if !active_uid.is_root() && active_uid == user.uid && active_group == group.gid {
+        return Ok(());
+    }
+
     if user_name.is_some() {
         let user_cstr =
             CString::new(user.name.clone()).map_err(|_| miette::miette!("Invalid user name"))?;
@@ -445,12 +455,12 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
     nix::unistd::setgid(group.gid).into_diagnostic()?;
 
     // Verify effective GID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
-    let effective_gid = nix::unistd::getegid();
-    if effective_gid != group.gid {
+    let actual_group = nix::unistd::getegid();
+    if actual_group != group.gid {
         return Err(miette::miette!(
             "Privilege drop verification failed: expected effective GID {}, got {}",
             group.gid,
-            effective_gid
+            actual_group
         ));
     }
 
@@ -458,12 +468,12 @@ pub fn drop_privileges(policy: &SandboxPolicy) -> Result<()> {
         nix::unistd::setuid(user.uid).into_diagnostic()?;
 
         // Verify effective UID actually changed (defense-in-depth, CWE-250 / CERT POS37-C)
-        let effective_uid = nix::unistd::geteuid();
-        if effective_uid != user.uid {
+        let actual_uid = nix::unistd::geteuid();
+        if actual_uid != user.uid {
             return Err(miette::miette!(
                 "Privilege drop verification failed: expected effective UID {}, got {}",
                 user.uid,
-                effective_uid
+                actual_uid
             ));
         }
 

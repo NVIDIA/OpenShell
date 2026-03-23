@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
+    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
 };
 
 pub struct ClaudeProvider;

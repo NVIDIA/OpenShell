@@ -145,10 +145,11 @@ fn auth_from_provider_type(provider_type: Option<&str>) -> (AuthHeader, Vec<(Str
 mod tests {
     use super::*;
     use std::io::Write;
+    use temp_env::with_var;
 
     #[test]
     fn load_from_file_valid_yaml_round_trip() {
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
@@ -160,7 +161,7 @@ routes:
     model: gpt-4o
     protocols: [openai_chat_completions, anthropic_messages]
     api_key: sk-prod-key
-"#;
+";
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
 
@@ -193,13 +194,13 @@ routes:
 
     #[test]
     fn load_from_file_missing_api_key_returns_error() {
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
-"#;
+";
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
 
@@ -217,24 +218,22 @@ routes:
 
     #[test]
     fn load_from_file_api_key_env_resolves_from_environment() {
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
     api_key_env: NAV_TEST_API_KEY_FOR_YAML_TEST
-"#;
-        // SAFETY: this test runs single-threaded; no other thread reads this var.
-        unsafe { std::env::set_var("NAV_TEST_API_KEY_FOR_YAML_TEST", "from-env") };
-        let mut f = tempfile::NamedTempFile::new().unwrap();
-        f.write_all(yaml.as_bytes()).unwrap();
+";
+        with_var("NAV_TEST_API_KEY_FOR_YAML_TEST", Some("from-env"), || {
+            let mut f = tempfile::NamedTempFile::new().unwrap();
+            f.write_all(yaml.as_bytes()).unwrap();
 
-        let config = RouterConfig::load_from_file(f.path()).unwrap();
-        let resolved = config.resolve_routes().unwrap();
-        assert_eq!(resolved[0].api_key, "from-env");
-
-        unsafe { std::env::remove_var("NAV_TEST_API_KEY_FOR_YAML_TEST") };
+            let config = RouterConfig::load_from_file(f.path()).unwrap();
+            let resolved = config.resolve_routes().unwrap();
+            assert_eq!(resolved[0].api_key, "from-env");
+        });
     }
 
     #[test]

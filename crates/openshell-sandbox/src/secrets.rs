@@ -8,12 +8,12 @@ use crate::child_env::ToolAdapter;
 const PLACEHOLDER_PREFIX: &str = "openshell:resolve:env:";
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SecretResolver {
+pub struct SecretResolver {
     by_placeholder: HashMap<String, String>,
 }
 
 impl SecretResolver {
-    pub(crate) fn from_provider_env(
+    pub fn from_provider_env(
         provider_env: HashMap<String, String>,
     ) -> (HashMap<String, String>, Option<Self>) {
         if provider_env.is_empty() {
@@ -57,11 +57,11 @@ impl SecretResolver {
         Ok(Self::from_provider_env(filtered))
     }
 
-    pub(crate) fn resolve_placeholder(&self, value: &str) -> Option<&str> {
+    pub fn resolve_placeholder(&self, value: &str) -> Option<&str> {
         self.by_placeholder.get(value).map(String::as_str)
     }
 
-    pub(crate) fn rewrite_header_value(&self, value: &str) -> Option<String> {
+    pub fn rewrite_header_value(&self, value: &str) -> Option<String> {
         if let Some(secret) = self.resolve_placeholder(value.trim()) {
             return Some(secret.to_string());
         }
@@ -89,11 +89,11 @@ fn allowed_env_keys(tool: ToolAdapter) -> &'static [&'static str] {
     }
 }
 
-pub(crate) fn placeholder_for_env_key(key: &str) -> String {
+pub fn placeholder_for_env_key(key: &str) -> String {
     format!("{PLACEHOLDER_PREFIX}{key}")
 }
 
-pub(crate) fn rewrite_http_header_block(raw: &[u8], resolver: Option<&SecretResolver>) -> Vec<u8> {
+pub fn rewrite_http_header_block(raw: &[u8], resolver: Option<&SecretResolver>) -> Vec<u8> {
     let Some(resolver) = resolver else {
         return raw.to_vec();
     };
@@ -126,15 +126,15 @@ pub(crate) fn rewrite_http_header_block(raw: &[u8], resolver: Option<&SecretReso
     output
 }
 
-pub(crate) fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
+pub fn rewrite_header_line(line: &str, resolver: &SecretResolver) -> String {
     let Some((name, value)) = line.split_once(':') else {
         return line.to_string();
     };
 
-    match resolver.rewrite_header_value(value.trim()) {
-        Some(rewritten) => format!("{name}: {rewritten}"),
-        None => line.to_string(),
-    }
+    resolver.rewrite_header_value(value.trim()).map_or_else(
+        || line.to_string(),
+        |rewritten| format!("{name}: {rewritten}"),
+    )
 }
 
 #[cfg(test)]
@@ -144,9 +144,7 @@ mod tests {
     #[test]
     fn provider_env_is_replaced_with_placeholders() {
         let (child_env, resolver) = SecretResolver::from_provider_env(
-            [("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
-                .into_iter()
-                .collect(),
+            std::iter::once(("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())).collect(),
         );
 
         assert_eq!(
@@ -165,9 +163,7 @@ mod tests {
     #[test]
     fn rewrites_exact_placeholder_header_values() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("CUSTOM_TOKEN".to_string(), "secret-token".to_string())]
-                .into_iter()
-                .collect(),
+            std::iter::once(("CUSTOM_TOKEN".to_string(), "secret-token".to_string())).collect(),
         );
         let resolver = resolver.expect("resolver");
 
@@ -180,9 +176,7 @@ mod tests {
     #[test]
     fn rewrites_bearer_placeholder_header_values() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())]
-                .into_iter()
-                .collect(),
+            std::iter::once(("ANTHROPIC_API_KEY".to_string(), "sk-test".to_string())).collect(),
         );
         let resolver = resolver.expect("resolver");
 
@@ -198,9 +192,7 @@ mod tests {
     #[test]
     fn rewrites_http_header_blocks_and_preserves_body() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("CUSTOM_TOKEN".to_string(), "secret-token".to_string())]
-                .into_iter()
-                .collect(),
+            std::iter::once(("CUSTOM_TOKEN".to_string(), "secret-token".to_string())).collect(),
         );
 
         let raw = b"POST /v1 HTTP/1.1\r\nAuthorization: Bearer openshell:resolve:env:CUSTOM_TOKEN\r\nContent-Length: 5\r\n\r\nhello";
@@ -275,9 +267,7 @@ mod tests {
     #[test]
     fn non_secret_headers_are_not_modified() {
         let (_, resolver) = SecretResolver::from_provider_env(
-            [("API_KEY".to_string(), "secret".to_string())]
-                .into_iter()
-                .collect(),
+            std::iter::once(("API_KEY".to_string(), "secret".to_string())).collect(),
         );
 
         let raw = b"GET / HTTP/1.1\r\nHost: example.com\r\nAccept: application/json\r\nContent-Type: text/plain\r\n\r\n";
@@ -323,8 +313,11 @@ mod tests {
         )
         .expect_err("unexpected github token must be rejected for claude tool adapter");
 
-        assert!(error
-            .contains("tool 'claude' does not allow projecting provider env key 'GITHUB_TOKEN'"));
+        assert!(
+            error.contains(
+                "tool 'claude' does not allow projecting provider env key 'GITHUB_TOKEN'"
+            )
+        );
     }
 
     #[test]
@@ -348,11 +341,10 @@ mod tests {
     fn tool_projection_allows_provider_carried_opencode_auth_json() {
         let (child_env, resolver) = SecretResolver::from_tool_provider_env(
             ToolAdapter::OpenCode,
-            [(
+            std::iter::once((
                 "OPENCODE_AUTH_JSON".to_string(),
                 r#"{"github-copilot":{"type":"oauth"}}"#.to_string(),
-            )]
-            .into_iter()
+            ))
             .collect(),
         )
         .expect("opencode projection succeeds for provider-carried auth json");

@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    discover_with_spec, ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext,
+    ProviderDiscoverySpec, ProviderError, ProviderPlugin, RealDiscoveryContext, discover_with_spec,
 };
 use std::path::PathBuf;
 
@@ -35,8 +35,7 @@ fn discover_existing_with_context(
 
     let auth_path = context
         .env_var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .map_or_else(|| PathBuf::from("/"), PathBuf::from)
         .join(".local/share/opencode/auth.json");
 
     if let Some(contents) = context.read_file(&auth_path)
@@ -109,9 +108,9 @@ mod tests {
         let ctx = MockDiscoveryContext::new()
             .with_env("HOME", "/home/alice")
             .with_file(
-            "/home/alice/.local/share/opencode/auth.json",
-            r#"{"github-copilot":{"type":"oauth","access":"tok","refresh":"tok","expires":0}}"#,
-        );
+                "/home/alice/.local/share/opencode/auth.json",
+                r#"{"github-copilot":{"type":"oauth","access":"tok","refresh":"tok","expires":0}}"#,
+            );
 
         let discovered = super::discover_existing_with_context(&ctx)
             .expect("discovery")

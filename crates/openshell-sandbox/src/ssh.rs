@@ -4,12 +4,12 @@
 //! Embedded SSH server for sandbox access.
 
 use crate::child_env;
-use crate::{resolve_host_home_dir, stage_tool_auth_projection};
 use crate::policy::SandboxPolicy;
 use crate::process::drop_privileges;
 use crate::sandbox;
 #[cfg(target_os = "linux")]
 use crate::{register_managed_child, unregister_managed_child};
+use crate::{resolve_host_home_dir, stage_tool_auth_projection};
 use miette::{IntoDiagnostic, Result};
 use nix::pty::{Winsize, openpty};
 use nix::unistd::setsid;
@@ -642,8 +642,10 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
             let home = nix::unistd::User::from_name(user)
                 .ok()
                 .flatten()
-                .map(|u| u.dir.to_string_lossy().into_owned())
-                .unwrap_or_else(|| format!("/home/{user}"));
+                .map_or_else(
+                    || format!("/home/{user}"),
+                    |u| u.dir.to_string_lossy().into_owned(),
+                );
             (user.to_string(), home)
         }
         _ => ("sandbox".to_string(), "/sandbox".to_string()),
@@ -653,30 +655,26 @@ fn session_user_and_home(policy: &SandboxPolicy) -> (String, String) {
 fn apply_child_env(
     cmd: &mut Command,
     command: &[String],
-    session_home: &str,
-    session_user: &str,
-    term: &str,
-    proxy_url: Option<&str>,
-    ca_file_paths: Option<&(PathBuf, PathBuf)>,
+    config: ChildEnvConfig<'_>,
     provider_env: &HashMap<String, String>,
 ) {
     let path = std::env::var("PATH").unwrap_or_else(|_| "/usr/local/bin:/usr/bin:/bin".into());
 
     cmd.env_clear()
         .env("OPENSHELL_SANDBOX", "1")
-        .env("HOME", session_home)
-        .env("USER", session_user)
+        .env("HOME", config.session_home)
+        .env("USER", config.session_user)
         .env("SHELL", "/bin/bash")
         .env("PATH", &path)
-        .env("TERM", term);
+        .env("TERM", config.term);
 
-    if let Some(url) = proxy_url {
+    if let Some(url) = config.proxy_url {
         for (key, value) in child_env::proxy_env_vars(url) {
             cmd.env(key, value);
         }
     }
 
-    if let Some((ca_cert_path, combined_bundle_path)) = ca_file_paths {
+    if let Some((ca_cert_path, combined_bundle_path)) = config.ca_file_paths {
         for (key, value) in child_env::tls_env_vars(ca_cert_path, combined_bundle_path) {
             cmd.env(key, value);
         }
@@ -694,6 +692,15 @@ fn apply_child_env(
             cmd.env(key, value);
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct ChildEnvConfig<'a> {
+    session_home: &'a str,
+    session_user: &'a str,
+    term: &'a str,
+    proxy_url: Option<&'a str>,
+    ca_file_paths: Option<&'a (PathBuf, PathBuf)>,
 }
 
 fn tool_command_for_ssh_exec(command: Option<&str>) -> Option<Vec<String>> {
@@ -787,11 +794,13 @@ fn spawn_pty_shell(
     apply_child_env(
         &mut cmd,
         &child_command,
-        &session_home,
-        &session_user,
-        term,
-        proxy_url.as_deref(),
-        ca_file_paths.as_deref(),
+        ChildEnvConfig {
+            session_home: &session_home,
+            session_user: &session_user,
+            term,
+            proxy_url: proxy_url.as_deref(),
+            ca_file_paths: ca_file_paths.as_deref(),
+        },
         provider_env,
     );
     cmd.stdin(stdin).stdout(stdout).stderr(stderr);
@@ -926,11 +935,13 @@ fn spawn_pipe_exec(
     apply_child_env(
         &mut cmd,
         &child_command,
-        &session_home,
-        &session_user,
-        "dumb",
-        proxy_url.as_deref(),
-        ca_file_paths.as_deref(),
+        ChildEnvConfig {
+            session_home: &session_home,
+            session_user: &session_user,
+            term: "dumb",
+            proxy_url: proxy_url.as_deref(),
+            ca_file_paths: ca_file_paths.as_deref(),
+        },
         provider_env,
     );
     cmd.stdin(Stdio::piped())
@@ -1053,7 +1064,7 @@ mod unsafe_pty {
 
     #[allow(unsafe_code)]
     fn set_controlling_tty(fd: RawFd) -> std::io::Result<()> {
-        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY.into(), 0) };
+        let rc = unsafe { libc::ioctl(fd, libc::TIOCSCTTY, 0) };
         if rc != 0 {
             return Err(std::io::Error::last_os_error());
         }
@@ -1196,7 +1207,7 @@ mod tests {
     }
 
     /// Verify that the stdin writer delivers all buffered data before exiting
-    /// when the sender is dropped.  This ensures channel_eof doesn't cause
+    /// when the sender is dropped.  This ensures `channel_eof` doesn't cause
     /// data loss — only signals "no more data after this".
     #[test]
     fn stdin_writer_delivers_buffered_data_before_eof() {
@@ -1363,11 +1374,13 @@ mod tests {
         apply_child_env(
             &mut cmd,
             &["/bin/bash".to_string(), "-lc".to_string()],
-            "/sandbox",
-            "sandbox",
-            "dumb",
-            None,
-            None,
+            ChildEnvConfig {
+                session_home: "/sandbox",
+                session_user: "sandbox",
+                term: "dumb",
+                proxy_url: None,
+                ca_file_paths: None,
+            },
             &provider_env,
         );
 
@@ -1399,11 +1412,13 @@ mod tests {
         apply_child_env(
             &mut cmd,
             &["opencode".to_string(), "run".to_string()],
-            "/sandbox",
-            "sandbox",
-            "dumb",
-            None,
-            None,
+            ChildEnvConfig {
+                session_home: "/sandbox",
+                session_user: "sandbox",
+                term: "dumb",
+                proxy_url: None,
+                ca_file_paths: None,
+            },
             &provider_env,
         );
 

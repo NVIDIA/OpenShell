@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! OpenShell Sandbox library.
+//! `OpenShell` Sandbox library.
 //!
 //! This crate provides process sandboxing and monitoring capabilities.
 
@@ -19,7 +19,7 @@ mod process;
 pub mod procfs;
 pub mod proxy;
 mod sandbox;
-mod secrets;
+pub(crate) mod secrets;
 mod ssh;
 
 use miette::{IntoDiagnostic, Result};
@@ -34,6 +34,7 @@ use std::time::Duration;
 use tokio::time::timeout;
 use tracing::{debug, error, info, trace, warn};
 
+use crate::child_env::{ToolAdapter, auth_file_projection, detect_tool_adapter};
 use crate::identity::BinaryIdentityCache;
 use crate::l7::tls::{
     CertCache, ProxyTlsState, SandboxCa, build_upstream_client_config, write_ca_files,
@@ -44,7 +45,6 @@ use crate::proxy::ProxyHandle;
 #[cfg(target_os = "linux")]
 use crate::sandbox::linux::netns::NetworkNamespace;
 use crate::secrets::SecretResolver;
-use crate::child_env::{auth_file_projection, detect_tool_adapter};
 pub use process::{ProcessHandle, ProcessStatus};
 
 /// Default interval (seconds) for re-fetching the inference route bundle from
@@ -80,8 +80,9 @@ fn disable_inference_on_empty_routes(source: InferenceRouteSource) -> bool {
 }
 
 fn route_refresh_interval_secs() -> u64 {
-    match std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS") {
-        Ok(value) => match value.parse::<u64>() {
+    std::env::var("OPENSHELL_ROUTE_REFRESH_INTERVAL_SECS").map_or(
+        DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
+        |value| match value.parse::<u64>() {
             Ok(interval) if interval > 0 => interval,
             Ok(_) => {
                 warn!(
@@ -100,8 +101,7 @@ fn route_refresh_interval_secs() -> u64 {
                 DEFAULT_ROUTE_REFRESH_INTERVAL_SECS
             }
         },
-        Err(_) => DEFAULT_ROUTE_REFRESH_INTERVAL_SECS,
-    }
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -373,15 +373,16 @@ pub async fn run_sandbox(
     // Reads /dev/kmsg for iptables LOG entries and emits structured
     // tracing events for direct connection attempts that bypass the proxy.
     #[cfg(target_os = "linux")]
-    let _bypass_monitor = if netns.is_some() {
-        bypass_monitor::spawn(
-            netns.as_ref().expect("netns is Some").name().to_string(),
-            entrypoint_pid.clone(),
-            bypass_denial_tx,
-        )
-    } else {
-        None
-    };
+    let _bypass_monitor = netns.as_ref().map_or_else(
+        || None,
+        |netns| {
+            bypass_monitor::spawn(
+                netns.name().to_string(),
+                entrypoint_pid.clone(),
+                bypass_denial_tx,
+            )
+        },
+    );
 
     // On non-Linux, bypass_denial_tx is unused (no /dev/kmsg).
     #[cfg(not(target_os = "linux"))]
@@ -478,11 +479,11 @@ pub async fn run_sandbox(
                 }
 
                 match waitpid(pid, Some(WaitPidFlag::WNOHANG)) {
-                    Ok(WaitStatus::StillAlive) | Err(nix::errno::Errno::ECHILD) => {}
+                    Ok(WaitStatus::StillAlive)
+                    | Err(nix::errno::Errno::ECHILD | nix::errno::Errno::EINTR) => {}
                     Ok(reaped) => {
                         tracing::debug!(?reaped, "Reaped orphaned child process");
                     }
-                    Err(nix::errno::Errno::EINTR) => {}
                     Err(e) => {
                         tracing::debug!(error = %e, "waitpid error during orphan reap");
                         break;
@@ -750,13 +751,13 @@ async fn build_inference_context(
     // Partition routes by name into user-facing and system caches.
     let (user_routes, system_routes) = partition_routes(routes);
 
-    let router =
+    let router_instance =
         Router::new().map_err(|e| miette::miette!("failed to initialize inference router: {e}"))?;
     let patterns = l7::inference::default_patterns();
 
     let ctx = Arc::new(proxy::InferenceContext::new(
         patterns,
-        router,
+        router_instance,
         user_routes,
         system_routes,
     ));
@@ -1007,45 +1008,41 @@ async fn load_policy(
         );
         let proto_policy = grpc_client::fetch_policy(endpoint, id).await?;
 
-        let mut proto_policy = match proto_policy {
-            Some(p) => p,
-            None => {
-                // No policy configured on the server. Discover from disk or
-                // fall back to the restrictive default, then sync to the
-                // gateway so it becomes the authoritative baseline.
-                info!("Server returned no policy; attempting local discovery");
-                let mut discovered = discover_policy_from_disk_or_default();
-                // Enrich before syncing so the gateway baseline includes
-                // baseline paths from the start.
-                enrich_proto_baseline_paths(&mut discovered);
-                let sandbox = sandbox.as_deref().ok_or_else(|| {
-                    miette::miette!(
-                        "Cannot sync discovered policy: sandbox not available.\n\
-                         Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
-                    )
-                })?;
+        let mut proto_policy = if let Some(p) = proto_policy {
+            p
+        } else {
+            // No policy configured on the server. Discover from disk or
+            // fall back to the restrictive default, then sync to the
+            // gateway so it becomes the authoritative baseline.
+            info!("Server returned no policy; attempting local discovery");
+            let mut discovered = discover_policy_from_disk_or_default();
+            // Enrich before syncing so the gateway baseline includes
+            // baseline paths from the start.
+            enrich_proto_baseline_paths(&mut discovered);
+            let sandbox = sandbox.as_deref().ok_or_else(|| {
+                miette::miette!(
+                    "Cannot sync discovered policy: sandbox not available.\n\
+                     Set OPENSHELL_SANDBOX or --sandbox to enable policy sync."
+                )
+            })?;
 
-                // Sync and re-fetch over a single connection to avoid extra
-                // TLS handshakes.
-                grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
-            }
+            // Sync and re-fetch over a single connection to avoid extra
+            // TLS handshakes.
+            grpc_client::discover_and_sync_policy(endpoint, id, sandbox, &discovered).await?
         };
 
         // Ensure baseline filesystem paths are present for proxy-mode
         // sandboxes.  If the policy was enriched, sync the updated version
         // back to the gateway so users can see the effective policy.
         let enriched = enrich_proto_baseline_paths(&mut proto_policy);
-        if enriched {
-            if let Some(sandbox_name) = sandbox.as_deref() {
-                if let Err(e) =
-                    grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
-                {
-                    warn!(
-                        error = %e,
-                        "Failed to sync enriched policy back to gateway (non-fatal)"
-                    );
-                }
-            }
+        if enriched
+            && let Some(sandbox_name) = sandbox.as_deref()
+            && let Err(e) = grpc_client::sync_policy(endpoint, sandbox_name, &proto_policy).await
+        {
+            warn!(
+                error = %e,
+                "Failed to sync enriched policy back to gateway (non-fatal)"
+            );
         }
 
         // Build OPA engine from baked-in rules + typed proto data.
@@ -1092,8 +1089,15 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
         parse_sandbox_policy, restrictive_default_policy, validate_sandbox_policy,
     };
 
-    match std::fs::read_to_string(path) {
-        Ok(yaml) => {
+    std::fs::read_to_string(path).map_or_else(
+        |_| {
+            info!(
+                path = %path.display(),
+                "No policy file on disk, using restrictive default"
+            );
+            restrictive_default_policy()
+        },
+        |yaml| {
             info!(
                 path = %path.display(),
                 "Loaded sandbox policy from container disk"
@@ -1109,9 +1113,10 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
                             violations = %messages.join("; "),
                             "Disk policy contains unsafe content, using restrictive default"
                         );
-                        return restrictive_default_policy();
+                        restrictive_default_policy()
+                    } else {
+                        policy
                     }
-                    policy
                 }
                 Err(e) => {
                     warn!(
@@ -1122,15 +1127,8 @@ fn discover_policy_from_path(path: &std::path::Path) -> openshell_core::proto::S
                     restrictive_default_policy()
                 }
             }
-        }
-        Err(_) => {
-            info!(
-                path = %path.display(),
-                "No policy file on disk, using restrictive default"
-            );
-            restrictive_default_policy()
-        }
-    }
+        },
+    )
 }
 
 /// Validate that the `sandbox` user exists in this image.
@@ -1206,7 +1204,7 @@ pub(crate) fn stage_tool_auth_projection(
             ));
         }
         std::fs::read(&source).into_diagnostic()?
-    } else if detect_tool_adapter(command) == Some(crate::child_env::ToolAdapter::OpenCode) {
+    } else if detect_tool_adapter(command) == Some(ToolAdapter::OpenCode) {
         let Some(raw) = provider_env.get(OPENCODE_AUTH_JSON_CREDENTIAL_KEY) else {
             return Ok(None);
         };
@@ -1339,7 +1337,7 @@ pub(crate) fn resolve_host_home_dir() -> Result<Option<std::path::PathBuf>> {
         let user = nix::unistd::User::from_uid(nix::unistd::geteuid())
             .into_diagnostic()?
             .map(|user| user.dir);
-        return Ok(user);
+        Ok(user)
     }
 
     #[cfg(not(unix))]
@@ -1449,7 +1447,7 @@ async fn flush_proposals_to_gateway(
         .map(|s| DenialSummary {
             sandbox_id: String::new(),
             host: s.host,
-            port: s.port as u32,
+            port: u32::from(s.port),
             binary: s.binary,
             ancestors: s.ancestors,
             deny_reason: s.deny_reason,
@@ -1584,13 +1582,13 @@ async fn run_policy_poll_loop(
                             "Policy reloaded successfully"
                         );
                     }
-                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                        if let Err(e) = client
+                    if result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                        && let Err(e) = client
                             .report_policy_status(sandbox_id, result.version, true, "")
                             .await
-                        {
-                            warn!(error = %e, "Failed to report policy load success");
-                        }
+                    {
+                        warn!(error = %e, "Failed to report policy load success");
                     }
                 }
                 Err(e) => {
@@ -1599,13 +1597,13 @@ async fn run_policy_poll_loop(
                         error = %e,
                         "Policy reload failed, keeping last-known-good policy"
                     );
-                    if result.version > 0 && result.policy_source == PolicySource::Sandbox {
-                        if let Err(report_err) = client
+                    if result.version > 0
+                        && result.policy_source == PolicySource::Sandbox
+                        && let Err(report_err) = client
                             .report_policy_status(sandbox_id, result.version, false, &e.to_string())
                             .await
-                        {
-                            warn!(error = %report_err, "Failed to report policy load failure");
-                        }
+                    {
+                        warn!(error = %report_err, "Failed to report policy load failure");
                     }
                 }
             }
@@ -1661,8 +1659,7 @@ mod tests {
     use crate::policy::{FilesystemPolicy, LandlockPolicy, NetworkPolicy, ProcessPolicy};
     use temp_env::with_vars;
 
-    static ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
-        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn policy_with_process(process: ProcessPolicy) -> SandboxPolicy {
         SandboxPolicy {
@@ -1824,20 +1821,18 @@ mod tests {
         });
 
         let command = vec!["opencode".to_string(), "run".to_string()];
-        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
-            .collect();
-        let staged = stage_tool_auth_projection(
-            &command,
-            &host_home,
-            &sandbox_root,
-            &policy,
-            &provider_env,
-        )
-            .expect("staging should succeed")
-            .expect("opencode auth file should be staged");
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+        let staged =
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
+                .expect("staging should succeed")
+                .expect("opencode auth file should be staged");
 
         assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
-        assert_eq!(std::fs::read_to_string(staged).expect("read staged auth"), r#"{"token":"copilot"}"#);
+        assert_eq!(
+            std::fs::read_to_string(staged).expect("read staged auth"),
+            r#"{"token":"copilot"}"#
+        );
 
         #[cfg(unix)]
         {
@@ -1867,8 +1862,14 @@ mod tests {
         let command = vec!["opencode".to_string(), "run".to_string()];
 
         assert_eq!(
-            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect())
-                .expect("staging should not error for missing auth"),
+            stage_tool_auth_projection(
+                &command,
+                &host_home,
+                &sandbox_root,
+                &policy,
+                &std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect()
+            )
+            .expect("staging should not error for missing auth"),
             None
         );
     }
@@ -1896,9 +1897,10 @@ mod tests {
             ),
         ]);
 
-        let staged = stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
-            .expect("staging should succeed")
-            .expect("provider-carried auth json should be staged");
+        let staged =
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
+                .expect("staging should succeed")
+                .expect("provider-carried auth json should be staged");
 
         assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
         assert_eq!(
@@ -1941,18 +1943,13 @@ mod tests {
         });
 
         let command = vec!["opencode".to_string(), "run".to_string()];
-        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
-            .collect();
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
 
-        let staged = stage_tool_auth_projection(
-            &command,
-            &host_home,
-            &sandbox_root,
-            &policy,
-            &provider_env,
-        )
-        .expect("staging should succeed")
-        .expect("opencode auth file should be staged");
+        let staged =
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
+                .expect("staging should succeed")
+                .expect("opencode auth file should be staged");
 
         assert_eq!(staged, sandbox_root.join(".local/share/opencode/auth.json"));
 
@@ -1984,8 +1981,14 @@ mod tests {
         let command = vec!["claude".to_string(), "code".to_string()];
 
         assert_eq!(
-            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect())
-                .expect("unsupported tool should not error"),
+            stage_tool_auth_projection(
+                &command,
+                &host_home,
+                &sandbox_root,
+                &policy,
+                &std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect()
+            )
+            .expect("unsupported tool should not error"),
             None
         );
     }
@@ -2013,16 +2016,11 @@ mod tests {
         });
         let command = vec!["opencode".to_string(), "run".to_string()];
 
-        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
-            .collect();
-        let error = stage_tool_auth_projection(
-            &command,
-            &host_home,
-            &sandbox_root,
-            &policy,
-            &provider_env,
-        )
-            .expect_err("symlinked destination path must be rejected");
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
+        let error =
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
+                .expect_err("symlinked destination path must be rejected");
 
         assert!(error.to_string().contains("symlink"));
     }
@@ -2045,17 +2043,12 @@ mod tests {
             run_as_group: None,
         });
         let command = vec!["opencode".to_string(), "run".to_string()];
-        let provider_env = std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string()))
-            .collect();
+        let provider_env =
+            std::iter::once(("GITHUB_TOKEN".to_string(), "ghu-test".to_string())).collect();
 
-        let error = stage_tool_auth_projection(
-            &command,
-            &host_home,
-            &sandbox_root,
-            &policy,
-            &provider_env,
-        )
-        .expect_err("symlinked source path must be rejected");
+        let error =
+            stage_tool_auth_projection(&command, &host_home, &sandbox_root, &policy, &provider_env)
+                .expect_err("symlinked source path must be rejected");
 
         assert!(error.to_string().contains("source must not be a symlink"));
     }
@@ -2078,14 +2071,14 @@ mod tests {
     async fn build_inference_context_route_file_loads_routes() {
         use std::io::Write;
 
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:8000/v1
     model: llama-3
     protocols: [openai_chat_completions]
     api_key: test-key
-"#;
+";
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
         let path = f.path().to_str().unwrap();
@@ -2133,14 +2126,14 @@ routes:
     async fn build_inference_context_route_file_overrides_cluster() {
         use std::io::Write;
 
-        let yaml = r#"
+        let yaml = r"
 routes:
   - name: inference.local
     endpoint: http://localhost:9999/v1
     model: file-model
     protocols: [openai_chat_completions]
     api_key: file-key
-"#;
+";
         let mut f = tempfile::NamedTempFile::new().unwrap();
         f.write_all(yaml.as_bytes()).unwrap();
         let path = f.path().to_str().unwrap();
@@ -2216,7 +2209,7 @@ routes:
         let path = dir.path().join("policy.yaml");
         std::fs::write(
             &path,
-            r#"
+            r"
 version: 1
 filesystem_policy:
   include_workdir: false
@@ -2231,7 +2224,7 @@ network_policies:
       - { host: example.com, port: 443 }
     binaries:
       - { path: /usr/bin/curl }
-"#,
+",
         )
         .unwrap();
 
@@ -2260,7 +2253,7 @@ network_policies:
         let path = dir.path().join("policy.yaml");
         std::fs::write(
             &path,
-            r#"
+            r"
 version: 1
 process:
   run_as_user: root
@@ -2271,7 +2264,7 @@ filesystem_policy:
     - /usr
   read_write:
     - /tmp
-"#,
+",
         )
         .unwrap();
 

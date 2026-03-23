@@ -304,22 +304,25 @@ pub async fn find_gateway_container(docker: &Docker, port: Option<u16>) -> Resul
 
     let matches: Vec<String> = containers
         .iter()
-        .filter(|c| is_gateway_image(c) && port.map_or(true, |p| has_port(c, p)))
+        .filter(|c| is_gateway_image(c) && port.is_none_or(|p| has_port(c, p)))
         .filter_map(container_name)
         .collect();
 
     match matches.len() {
         0 => {
-            let hint = if let Some(p) = port {
-                format!(
-                    "No openshell gateway container found listening on port {p}.\n\
+            let hint = port.map_or_else(
+                || {
+                    "No openshell gateway container found.\n\
                      Is the gateway running? Check with: docker ps"
-                )
-            } else {
-                "No openshell gateway container found.\n\
-                 Is the gateway running? Check with: docker ps"
-                    .to_string()
-            };
+                        .to_string()
+                },
+                |p| {
+                    format!(
+                        "No openshell gateway container found listening on port {p}.\n\
+                         Is the gateway running? Check with: docker ps"
+                    )
+                },
+            );
             Err(miette::miette!("{hint}"))
         }
         1 => Ok(matches.into_iter().next().unwrap()),
@@ -748,22 +751,22 @@ pub async fn check_port_conflicts(
 
         let ports = container.ports.as_deref().unwrap_or_default();
         for port in ports {
-            if let Some(public) = port.public_port {
-                if needed_ports.contains(&public) {
-                    let cname = names
-                        .first()
-                        .map(|n| n.trim_start_matches('/').to_string())
-                        .unwrap_or_else(|| {
-                            container
-                                .id
-                                .clone()
-                                .unwrap_or_else(|| "<unknown>".to_string())
-                        });
-                    conflicts.push(PortConflict {
-                        container_name: cname,
-                        host_port: public,
-                    });
-                }
+            if let Some(public) = port.public_port
+                && needed_ports.contains(&public)
+            {
+                let cname = names.first().map_or_else(
+                    || {
+                        container
+                            .id
+                            .clone()
+                            .unwrap_or_else(|| "<unknown>".to_string())
+                    },
+                    |n| n.trim_start_matches('/').to_string(),
+                );
+                conflicts.push(PortConflict {
+                    container_name: cname,
+                    host_port: public,
+                });
             }
         }
     }
@@ -1091,6 +1094,7 @@ fn is_port_conflict(err: &BollardError) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use temp_env::with_var;
 
     #[test]
     fn normalize_arch_x86_64() {
@@ -1152,36 +1156,22 @@ mod tests {
     #[test]
     fn docker_not_reachable_error_with_docker_host() {
         // Simulate: DOCKER_HOST is set but daemon unresponsive.
-        // We set the env var temporarily (this is test-only).
-        let prev_docker_host = std::env::var("DOCKER_HOST").ok();
-        // SAFETY: test-only, single-threaded test runner for this test
-        unsafe {
-            std::env::set_var("DOCKER_HOST", "unix:///tmp/fake-docker.sock");
-        }
+        with_var("DOCKER_HOST", Some("unix:///tmp/fake-docker.sock"), || {
+            let err = docker_not_reachable_error(
+                "daemon not responding",
+                "Docker socket exists but the daemon is not responding",
+            );
+            let msg = format!("{err:?}");
 
-        let err = docker_not_reachable_error(
-            "daemon not responding",
-            "Docker socket exists but the daemon is not responding",
-        );
-        let msg = format!("{err:?}");
-
-        // Restore env
-        // SAFETY: test-only, restoring previous state
-        unsafe {
-            match prev_docker_host {
-                Some(val) => std::env::set_var("DOCKER_HOST", val),
-                None => std::env::remove_var("DOCKER_HOST"),
-            }
-        }
-
-        assert!(
-            msg.contains("DOCKER_HOST"),
-            "should mention DOCKER_HOST when it is set"
-        );
-        assert!(
-            msg.contains("unix:///tmp/fake-docker.sock"),
-            "should show the current DOCKER_HOST value"
-        );
+            assert!(
+                msg.contains("DOCKER_HOST"),
+                "should mention DOCKER_HOST when it is set"
+            );
+            assert!(
+                msg.contains("unix:///tmp/fake-docker.sock"),
+                "should show the current DOCKER_HOST value"
+            );
+        });
     }
 
     #[test]

@@ -105,17 +105,17 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
 /// need the auth/header information (e.g. the sandbox bundle-to-route
 /// conversion).
 pub fn auth_for_provider_type(provider_type: &str) -> (AuthHeader, Vec<(String, String)>) {
-    match profile_for(provider_type) {
-        Some(profile) => {
+    profile_for(provider_type).map_or_else(
+        || (AuthHeader::Bearer, Vec::new()),
+        |profile| {
             let headers = profile
                 .default_headers
                 .iter()
                 .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                 .collect();
             (profile.auth.clone(), headers)
-        }
-        None => (AuthHeader::Bearer, Vec::new()),
-    }
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------
