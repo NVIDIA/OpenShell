@@ -1034,19 +1034,23 @@ async fn route_inference_request(
     }
 }
 
+/// Map router errors to HTTP status codes and sanitized messages.
+///
+/// Returns generic error messages instead of verbatim internal details.
+/// Full error context (upstream URLs, hostnames, TLS details) is logged
+/// server-side by the caller at `warn` level for debugging.
 fn router_error_to_http(err: &openshell_router::RouterError) -> (u16, String) {
     use openshell_router::RouterError;
     match err {
-        RouterError::RouteNotFound(hint) => {
-            (400, format!("no route configured for route '{hint}'"))
+        RouterError::RouteNotFound(_) => (400, "no inference route configured".to_string()),
+        RouterError::NoCompatibleRoute(_) => {
+            (400, "no compatible inference route available".to_string())
         }
-        RouterError::NoCompatibleRoute(protocol) => (
-            400,
-            format!("no compatible route for source protocol '{protocol}'"),
-        ),
-        RouterError::Unauthorized(msg) => (401, msg.clone()),
-        RouterError::UpstreamUnavailable(msg) => (503, msg.clone()),
-        RouterError::UpstreamProtocol(msg) | RouterError::Internal(msg) => (502, msg.clone()),
+        RouterError::Unauthorized(_) => (401, "unauthorized".to_string()),
+        RouterError::UpstreamUnavailable(_) => (503, "inference service unavailable".to_string()),
+        RouterError::UpstreamProtocol(_) | RouterError::Internal(_) => {
+            (502, "inference service error".to_string())
+        }
     }
 }
 
@@ -2070,10 +2074,9 @@ mod tests {
         let err = openshell_router::RouterError::RouteNotFound("local".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 400);
-        assert!(
-            msg.contains("local"),
-            "message should contain the hint: {msg}"
-        );
+        assert_eq!(msg, "no inference route configured");
+        // SEC-008: must NOT leak the route hint to sandboxed code
+        assert!(!msg.contains("local"));
     }
 
     #[test]
@@ -2081,42 +2084,56 @@ mod tests {
         let err = openshell_router::RouterError::NoCompatibleRoute("anthropic_messages".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 400);
-        assert!(
-            msg.contains("anthropic_messages"),
-            "message should contain the protocol: {msg}"
-        );
+        assert_eq!(msg, "no compatible inference route available");
+        // SEC-008: must NOT leak the protocol name to sandboxed code
+        assert!(!msg.contains("anthropic_messages"));
     }
 
     #[test]
     fn router_error_unauthorized_maps_to_401() {
-        let err = openshell_router::RouterError::Unauthorized("bad token".into());
+        let err =
+            openshell_router::RouterError::Unauthorized("bad token from 10.0.0.5:8080".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 401);
-        assert_eq!(msg, "bad token");
+        assert_eq!(msg, "unauthorized");
+        // SEC-008: must NOT leak upstream details to sandboxed code
+        assert!(!msg.contains("10.0.0.5"));
     }
 
     #[test]
     fn router_error_upstream_unavailable_maps_to_503() {
-        let err = openshell_router::RouterError::UpstreamUnavailable("connection refused".into());
+        let err = openshell_router::RouterError::UpstreamUnavailable(
+            "connection refused to 10.0.0.5:8080".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 503);
-        assert_eq!(msg, "connection refused");
+        assert_eq!(msg, "inference service unavailable");
+        // SEC-008: must NOT leak upstream address to sandboxed code
+        assert!(!msg.contains("10.0.0.5"));
     }
 
     #[test]
     fn router_error_upstream_protocol_maps_to_502() {
-        let err = openshell_router::RouterError::UpstreamProtocol("bad gateway".into());
+        let err = openshell_router::RouterError::UpstreamProtocol(
+            "TLS handshake failed for nim.internal.svc:443".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 502);
-        assert_eq!(msg, "bad gateway");
+        assert_eq!(msg, "inference service error");
+        // SEC-008: must NOT leak internal hostnames to sandboxed code
+        assert!(!msg.contains("nim.internal"));
     }
 
     #[test]
     fn router_error_internal_maps_to_502() {
-        let err = openshell_router::RouterError::Internal("unexpected".into());
+        let err = openshell_router::RouterError::Internal(
+            "failed to read /etc/openshell/routes.json".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 502);
-        assert_eq!(msg, "unexpected");
+        assert_eq!(msg, "inference service error");
+        // SEC-008: must NOT leak file paths to sandboxed code
+        assert!(!msg.contains("/etc/openshell"));
     }
 
     #[test]
