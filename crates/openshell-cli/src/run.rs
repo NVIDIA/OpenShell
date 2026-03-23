@@ -16,11 +16,10 @@ use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
-    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
-    extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
-    clear_last_sandbox_if_matches, remove_gateway_metadata, resolve_ssh_hostname,
-    save_active_gateway, save_last_sandbox,
-    store_gateway_metadata,
+    DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway,
+    clear_last_sandbox_if_matches, container_name, extract_host_from_ssh_destination,
+    get_gateway_metadata, list_gateways, load_active_gateway, remove_gateway_metadata,
+    resolve_ssh_hostname, save_active_gateway, save_last_sandbox, store_gateway_metadata,
 };
 use openshell_core::proto::{
     ApproveAllDraftChunksRequest, ApproveDraftChunkRequest, ClearDraftChunksRequest,
