@@ -3840,6 +3840,29 @@ async fn run_exec_with_russh(
     Ok(exit_code.unwrap_or(1))
 }
 
+/// Check whether an IP address is safe to use as an SSH proxy target.
+///
+/// Blocks loopback (prevents connecting back to the gateway server itself)
+/// and link-local addresses (prevents cloud metadata SSRF via 169.254.169.254).
+fn is_safe_ssh_proxy_target(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            !v4.is_loopback() // 127.0.0.0/8
+            && !v4.is_link_local() // 169.254.0.0/16 (cloud metadata)
+        }
+        std::net::IpAddr::V6(v6) => {
+            if v6.is_loopback() {
+                return false; // ::1
+            }
+            // Check IPv4-mapped IPv6 addresses like ::ffff:127.0.0.1
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return !v4.is_loopback() && !v4.is_link_local();
+            }
+            true
+        }
+    }
+}
+
 async fn start_single_use_ssh_proxy(
     target_host: &str,
     target_port: u16,
@@ -3855,9 +3878,45 @@ async fn start_single_use_ssh_proxy(
             warn!("SSH proxy: failed to accept local connection");
             return;
         };
-        let Ok(mut sandbox_conn) = TcpStream::connect((target_host.as_str(), target_port)).await
-        else {
-            warn!(target_host = %target_host, target_port, "SSH proxy: failed to connect to sandbox");
+
+        // Resolve DNS and validate the target IP before connecting.
+        // This prevents SSRF if the sandbox status record were poisoned
+        // to point at loopback, cloud metadata, or other internal services.
+        let addr_str = format!("{}:{}", target_host, target_port);
+        let resolved = match tokio::net::lookup_host(&addr_str).await {
+            Ok(mut addrs) => match addrs.next() {
+                Some(addr) => addr,
+                None => {
+                    warn!(target_host = %target_host, "SSH proxy: DNS resolution returned no addresses");
+                    return;
+                }
+            },
+            Err(e) => {
+                warn!(target_host = %target_host, error = %e, "SSH proxy: DNS resolution failed");
+                return;
+            }
+        };
+
+        if !is_safe_ssh_proxy_target(resolved.ip()) {
+            warn!(
+                target_host = %target_host,
+                resolved_ip = %resolved.ip(),
+                "SSH proxy: target resolved to blocked IP range (loopback or link-local)"
+            );
+            return;
+        }
+
+        debug!(
+            target_host = %target_host,
+            resolved_ip = %resolved.ip(),
+            target_port,
+            "SSH proxy: connecting to validated target"
+        );
+
+        // Connect to the resolved address directly (not the hostname) to
+        // prevent TOCTOU between validation and connection.
+        let Ok(mut sandbox_conn) = TcpStream::connect(resolved).await else {
+            warn!(target_host = %target_host, resolved_ip = %resolved.ip(), target_port, "SSH proxy: failed to connect to sandbox");
             return;
         };
         let Ok(preface) = build_preface(&uuid::Uuid::new_v4().to_string(), &handshake_secret)
@@ -4126,9 +4185,9 @@ mod tests {
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
         MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
         build_remote_exec_command, clamp_limit, create_provider_record, delete_provider_record,
-        get_provider_record, is_valid_env_key, list_provider_records, merge_chunk_into_policy,
-        reject_control_chars, resolve_provider_environment, shell_escape, update_provider_record,
-        validate_provider_fields, validate_sandbox_spec,
+        get_provider_record, is_safe_ssh_proxy_target, is_valid_env_key, list_provider_records,
+        merge_chunk_into_policy, reject_control_chars, resolve_provider_environment, shell_escape,
+        update_provider_record, validate_provider_fields, validate_sandbox_spec,
     };
     use crate::persistence::{DraftChunkRecord, Store};
     use openshell_core::proto::{Provider, SandboxSpec, SandboxTemplate};
@@ -4264,6 +4323,63 @@ mod tests {
             ..Default::default()
         };
         assert!(build_remote_exec_command(&req).is_err());
+    }
+
+    // ---- SEC-006: is_safe_ssh_proxy_target ----
+
+    #[test]
+    fn ssh_proxy_target_allows_pod_network_ips() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // Typical pod network IPs should be allowed
+        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            10, 0, 0, 5
+        ))));
+        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            172, 16, 0, 1
+        ))));
+        assert!(is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            192, 168, 1, 100
+        ))));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_loopback() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 1
+        ))));
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            127, 0, 0, 2
+        ))));
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_link_local() {
+        use std::net::{IpAddr, Ipv4Addr};
+        // 169.254.169.254 is the cloud metadata endpoint
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 169, 254
+        ))));
+        assert!(!is_safe_ssh_proxy_target(IpAddr::V4(Ipv4Addr::new(
+            169, 254, 0, 1
+        ))));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_ipv4_mapped_ipv6_loopback() {
+        use std::net::IpAddr;
+        // ::ffff:127.0.0.1
+        let ip: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
+        assert!(!is_safe_ssh_proxy_target(ip));
+    }
+
+    #[test]
+    fn ssh_proxy_target_blocks_ipv4_mapped_ipv6_link_local() {
+        use std::net::IpAddr;
+        // ::ffff:169.254.169.254
+        let ip: IpAddr = "::ffff:169.254.169.254".parse().unwrap();
+        assert!(!is_safe_ssh_proxy_target(ip));
     }
 
     // ---- clamp_limit tests ----
