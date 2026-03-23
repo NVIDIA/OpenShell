@@ -1010,6 +1010,7 @@ impl OpenShell for OpenShellService {
                 "environment keys must match ^[A-Za-z_][A-Za-z0-9_]*$",
             ));
         }
+        validate_exec_request_fields(&req)?;
 
         let sandbox = self
             .state
@@ -1024,7 +1025,8 @@ impl OpenShell for OpenShellService {
         }
 
         let (target_host, target_port) = resolve_sandbox_exec_target(&self.state, &sandbox).await?;
-        let command_str = build_remote_exec_command(&req);
+        let command_str = build_remote_exec_command(&req)
+            .map_err(|e| Status::invalid_argument(format!("command construction failed: {e}")))?;
         let stdin_payload = req.stdin;
         let timeout_seconds = req.timeout_seconds;
         let sandbox_id = sandbox.id;
@@ -3407,34 +3409,122 @@ async fn resolve_sandbox_exec_target(
     ))
 }
 
-fn shell_escape(value: &str) -> String {
+/// Maximum number of arguments in the command array.
+const MAX_EXEC_COMMAND_ARGS: usize = 1024;
+/// Maximum length of a single command argument or environment value (bytes).
+const MAX_EXEC_ARG_LEN: usize = 32 * 1024; // 32 KiB
+/// Maximum length of the workdir field (bytes).
+const MAX_EXEC_WORKDIR_LEN: usize = 4096;
+
+/// Validate fields of an ExecSandboxRequest for control characters and size
+/// limits before constructing a shell command string.
+fn validate_exec_request_fields(req: &ExecSandboxRequest) -> Result<(), Status> {
+    if req.command.len() > MAX_EXEC_COMMAND_ARGS {
+        return Err(Status::invalid_argument(format!(
+            "command array exceeds {} argument limit",
+            MAX_EXEC_COMMAND_ARGS
+        )));
+    }
+    for (i, arg) in req.command.iter().enumerate() {
+        if arg.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "command argument {i} exceeds {} byte limit",
+                MAX_EXEC_ARG_LEN
+            )));
+        }
+        reject_control_chars(arg, &format!("command argument {i}"))?;
+    }
+    for (key, value) in &req.environment {
+        if value.len() > MAX_EXEC_ARG_LEN {
+            return Err(Status::invalid_argument(format!(
+                "environment value for '{key}' exceeds {} byte limit",
+                MAX_EXEC_ARG_LEN
+            )));
+        }
+        reject_control_chars(value, &format!("environment value for '{key}'"))?;
+    }
+    if !req.workdir.is_empty() {
+        if req.workdir.len() > MAX_EXEC_WORKDIR_LEN {
+            return Err(Status::invalid_argument(format!(
+                "workdir exceeds {} byte limit",
+                MAX_EXEC_WORKDIR_LEN
+            )));
+        }
+        reject_control_chars(&req.workdir, "workdir")?;
+    }
+    Ok(())
+}
+
+/// Reject null bytes and newlines in a user-supplied value.
+fn reject_control_chars(value: &str, field_name: &str) -> Result<(), Status> {
+    if value.bytes().any(|b| b == 0) {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} contains null bytes"
+        )));
+    }
+    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
+        return Err(Status::invalid_argument(format!(
+            "{field_name} contains newline or carriage return characters"
+        )));
+    }
+    Ok(())
+}
+
+/// Shell-escape a value for embedding in a POSIX shell command.
+///
+/// Wraps unsafe values in single quotes with the standard `'\''` idiom for
+/// embedded single-quote characters. Rejects null bytes which can truncate
+/// shell parsing at the C level.
+fn shell_escape(value: &str) -> Result<String, String> {
+    // Reject null bytes — can truncate shell parsing at the C level.
+    if value.bytes().any(|b| b == 0) {
+        return Err("value contains null bytes".to_string());
+    }
+    // Reject newlines and carriage returns — safe within single quotes for
+    // one shell layer, but dangerous when the command string traverses
+    // multiple interpretation boundaries (SSH transport + bash -lc).
+    if value.bytes().any(|b| b == b'\n' || b == b'\r') {
+        return Err("value contains newline or carriage return".to_string());
+    }
     if value.is_empty() {
-        return "''".to_string();
+        return Ok("''".to_string());
     }
     let safe = value
         .bytes()
         .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'/' | b'-' | b'_'));
     if safe {
-        return value.to_string();
+        return Ok(value.to_string());
     }
     let escaped = value.replace('\'', "'\"'\"'");
-    format!("'{escaped}'")
+    Ok(format!("'{escaped}'"))
 }
 
-fn build_remote_exec_command(req: &ExecSandboxRequest) -> String {
+/// Maximum total length of the assembled shell command string.
+const MAX_COMMAND_STRING_LEN: usize = 256 * 1024; // 256 KiB
+
+fn build_remote_exec_command(req: &ExecSandboxRequest) -> Result<String, String> {
     let mut parts = Vec::new();
     let mut env_entries = req.environment.iter().collect::<Vec<_>>();
     env_entries.sort_by(|(a, _), (b, _)| a.cmp(b));
     for (key, value) in env_entries {
-        parts.push(format!("{key}={}", shell_escape(value)));
+        parts.push(format!("{key}={}", shell_escape(value)?));
     }
-    parts.extend(req.command.iter().map(|arg| shell_escape(arg)));
+    for arg in &req.command {
+        parts.push(shell_escape(arg)?);
+    }
     let command = parts.join(" ");
-    if req.workdir.is_empty() {
+    let result = if req.workdir.is_empty() {
         command
     } else {
-        format!("cd {} && {command}", shell_escape(&req.workdir))
+        format!("cd {} && {command}", shell_escape(&req.workdir)?)
+    };
+    if result.len() > MAX_COMMAND_STRING_LEN {
+        return Err(format!(
+            "assembled command string exceeds {} byte limit",
+            MAX_COMMAND_STRING_LEN
+        ));
     }
+    Ok(result)
 }
 
 /// Resolve provider credentials into environment variables.
@@ -4016,10 +4106,11 @@ mod tests {
         MAX_ENVIRONMENT_ENTRIES, MAX_LOG_LEVEL_LEN, MAX_MAP_KEY_LEN, MAX_MAP_VALUE_LEN,
         MAX_NAME_LEN, MAX_PAGE_SIZE, MAX_POLICY_SIZE, MAX_PROVIDER_CONFIG_ENTRIES,
         MAX_PROVIDER_CREDENTIALS_ENTRIES, MAX_PROVIDER_TYPE_LEN, MAX_PROVIDERS,
-        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE, clamp_limit,
-        create_provider_record, delete_provider_record, get_provider_record, is_valid_env_key,
-        list_provider_records, merge_chunk_into_policy, resolve_provider_environment,
-        update_provider_record, validate_provider_fields, validate_sandbox_spec,
+        MAX_TEMPLATE_MAP_ENTRIES, MAX_TEMPLATE_STRING_LEN, MAX_TEMPLATE_STRUCT_SIZE,
+        build_remote_exec_command, clamp_limit, create_provider_record, delete_provider_record,
+        get_provider_record, is_valid_env_key, list_provider_records, merge_chunk_into_policy,
+        reject_control_chars, resolve_provider_environment, shell_escape, update_provider_record,
+        validate_provider_fields, validate_sandbox_spec,
     };
     use crate::persistence::{DraftChunkRecord, Store};
     use openshell_core::proto::{Provider, SandboxSpec, SandboxTemplate};
@@ -4042,6 +4133,119 @@ mod tests {
         assert!(!is_valid_env_key("BAD KEY"));
         assert!(!is_valid_env_key("X=Y"));
         assert!(!is_valid_env_key("X;rm -rf /"));
+    }
+
+    // ---- SEC-002: shell_escape, reject_control_chars, build_remote_exec_command ----
+
+    #[test]
+    fn shell_escape_safe_chars_pass_through() {
+        assert_eq!(shell_escape("ls").unwrap(), "ls");
+        assert_eq!(shell_escape("/usr/bin/python").unwrap(), "/usr/bin/python");
+        assert_eq!(shell_escape("file.txt").unwrap(), "file.txt");
+        assert_eq!(shell_escape("my-cmd_v2").unwrap(), "my-cmd_v2");
+    }
+
+    #[test]
+    fn shell_escape_empty_string() {
+        assert_eq!(shell_escape("").unwrap(), "''");
+    }
+
+    #[test]
+    fn shell_escape_wraps_unsafe_chars() {
+        assert_eq!(shell_escape("hello world").unwrap(), "'hello world'");
+        assert_eq!(shell_escape("$(id)").unwrap(), "'$(id)'");
+        assert_eq!(shell_escape("; rm -rf /").unwrap(), "'; rm -rf /'");
+    }
+
+    #[test]
+    fn shell_escape_handles_single_quotes() {
+        assert_eq!(shell_escape("it's").unwrap(), "'it'\"'\"'s'");
+    }
+
+    #[test]
+    fn shell_escape_rejects_null_bytes() {
+        assert!(shell_escape("hello\x00world").is_err());
+    }
+
+    #[test]
+    fn shell_escape_rejects_newlines() {
+        assert!(shell_escape("line1\nline2").is_err());
+        assert!(shell_escape("line1\rline2").is_err());
+        assert!(shell_escape("line1\r\nline2").is_err());
+    }
+
+    #[test]
+    fn reject_control_chars_allows_normal_values() {
+        assert!(reject_control_chars("hello world", "test").is_ok());
+        assert!(reject_control_chars("$(cmd)", "test").is_ok());
+        assert!(reject_control_chars("", "test").is_ok());
+    }
+
+    #[test]
+    fn reject_control_chars_rejects_null_bytes() {
+        assert!(reject_control_chars("hello\x00world", "test").is_err());
+    }
+
+    #[test]
+    fn reject_control_chars_rejects_newlines() {
+        assert!(reject_control_chars("line1\nline2", "test").is_err());
+        assert!(reject_control_chars("line1\rline2", "test").is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_basic() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string(), "-la".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(build_remote_exec_command(&req).unwrap(), "ls -la");
+    }
+
+    #[test]
+    fn build_remote_exec_command_with_env_and_workdir() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec![
+                "python".to_string(),
+                "-c".to_string(),
+                "print('ok')".to_string(),
+            ],
+            environment: [("HOME".to_string(), "/home/user".to_string())]
+                .into_iter()
+                .collect(),
+            workdir: "/workspace".to_string(),
+            ..Default::default()
+        };
+        let cmd = build_remote_exec_command(&req).unwrap();
+        assert!(cmd.starts_with("cd /workspace && "));
+        assert!(cmd.contains("HOME=/home/user"));
+        assert!(cmd.contains("'print('\"'\"'ok'\"'\"')'"));
+    }
+
+    #[test]
+    fn build_remote_exec_command_rejects_null_bytes_in_args() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["echo".to_string(), "hello\x00world".to_string()],
+            ..Default::default()
+        };
+        assert!(build_remote_exec_command(&req).is_err());
+    }
+
+    #[test]
+    fn build_remote_exec_command_rejects_newlines_in_workdir() {
+        use openshell_core::proto::ExecSandboxRequest;
+        let req = ExecSandboxRequest {
+            sandbox_id: "test".to_string(),
+            command: vec!["ls".to_string()],
+            workdir: "/tmp\nmalicious".to_string(),
+            ..Default::default()
+        };
+        assert!(build_remote_exec_command(&req).is_err());
     }
 
     // ---- clamp_limit tests ----
