@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+# shellcheck source=_container-runtime.sh
+source "$(dirname "$0")/_container-runtime.sh"
+
 sha256_16() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print substr($1, 1, 16)}'
@@ -83,15 +86,17 @@ CACHE_PATH="${DOCKER_BUILD_CACHE_DIR}/images"
 mkdir -p "${CACHE_PATH}"
 
 BUILDER_ARGS=()
-if [[ -n "${DOCKER_BUILDER:-}" ]]; then
-  BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
-elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
-  _ctx=$(docker context inspect --format '{{.Name}}' 2>/dev/null || echo default)
-  BUILDER_ARGS=(--builder "${_ctx}")
+if [[ "${CONTAINER_CMD}" != "podman" ]]; then
+  if [[ -n "${DOCKER_BUILDER:-}" ]]; then
+    BUILDER_ARGS=(--builder "${DOCKER_BUILDER}")
+  elif [[ -z "${DOCKER_PLATFORM:-}" && -z "${CI:-}" ]]; then
+    _ctx=$(docker context inspect --format '{{.Name}}' 2>/dev/null || echo default)
+    BUILDER_ARGS=(--builder "${_ctx}")
+  fi
 fi
 
 CACHE_ARGS=()
-if [[ -z "${CI:-}" ]]; then
+if [[ -z "${CI:-}" && "${CONTAINER_CMD}" != "podman" ]]; then
   if docker buildx inspect ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} 2>/dev/null | grep -q "Driver: docker-container"; then
     CACHE_ARGS=(
       --cache-from "type=local,src=${CACHE_PATH}"
@@ -164,20 +169,40 @@ if [[ -n "${EXTRA_CARGO_FEATURES:-}" ]]; then
   FEATURE_ARGS=(--build-arg "EXTRA_CARGO_FEATURES=${EXTRA_CARGO_FEATURES}")
 fi
 
-docker buildx build \
-  ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
-  ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
-  ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
-  ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"} \
-  ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"} \
-  ${K3S_ARGS[@]+"${K3S_ARGS[@]}"} \
-  ${CODEGEN_ARGS[@]+"${CODEGEN_ARGS[@]}"} \
-  ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"} \
-  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}" \
-  -f "${DOCKERFILE}" \
-  --target "${DOCKER_TARGET}" \
-  ${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
-  --provenance=false \
-  "$@" \
-  ${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
-  .
+BUILD_ARGS=(
+  ${SCCACHE_ARGS[@]+"${SCCACHE_ARGS[@]}"}
+  ${VERSION_ARGS[@]+"${VERSION_ARGS[@]}"}
+  ${K3S_ARGS[@]+"${K3S_ARGS[@]}"}
+  ${CODEGEN_ARGS[@]+"${CODEGEN_ARGS[@]}"}
+  ${FEATURE_ARGS[@]+"${FEATURE_ARGS[@]}"}
+  --build-arg "CARGO_TARGET_CACHE_SCOPE=${CARGO_TARGET_CACHE_SCOPE}"
+)
+
+if [[ "${CONTAINER_CMD}" = "podman" ]]; then
+  # Podman uses podman build (buildah-backed). No buildx, no builder selection,
+  # no cache-from/to, no --provenance flag. Native arch only for MVP.
+  "${CONTAINER_CMD}" build \
+    ${DOCKER_PLATFORM:+--platform "${DOCKER_PLATFORM}"} \
+    --layers \
+    -f "${DOCKERFILE}" \
+    --target "${DOCKER_TARGET}" \
+    ${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
+    "${BUILD_ARGS[@]}" \
+    "$@" \
+    ${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
+    .
+else
+  # Docker buildx (existing logic)
+  docker buildx build \
+    ${BUILDER_ARGS[@]+"${BUILDER_ARGS[@]}"} \
+    ${DOCKER_PLATFORM:+--platform ${DOCKER_PLATFORM}} \
+    ${CACHE_ARGS[@]+"${CACHE_ARGS[@]}"} \
+    "${BUILD_ARGS[@]}" \
+    -f "${DOCKERFILE}" \
+    --target "${DOCKER_TARGET}" \
+    ${TAG_ARGS[@]+"${TAG_ARGS[@]}"} \
+    --provenance=false \
+    "$@" \
+    ${OUTPUT_ARGS[@]+"${OUTPUT_ARGS[@]}"} \
+    .
+fi

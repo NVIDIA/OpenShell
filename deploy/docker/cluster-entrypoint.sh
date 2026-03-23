@@ -69,7 +69,7 @@ wait_for_default_route() {
 #   3. Adding DNAT rules so traffic to <eth0_ip>:53 reaches Docker's DNS
 #   4. Writing that IP into the k3s resolv.conf
 
-setup_dns_proxy() {
+setup_dns_docker() {
     # Extract Docker's actual DNS listener ports from the DOCKER_OUTPUT chain.
     # Docker sets up rules like:
     #   -A DOCKER_OUTPUT -d 127.0.0.11/32 -p udp --dport 53 -j DNAT --to-destination 127.0.0.11:<port>
@@ -110,7 +110,38 @@ setup_dns_proxy() {
     echo "Configured k3s DNS to use ${CONTAINER_IP} (proxied to Docker DNS)"
 }
 
-if ! setup_dns_proxy; then
+setup_dns_podman() {
+    # On Podman, /etc/resolv.conf already has working nameservers from the
+    # Podman machine VM. Copy non-loopback nameservers into k3s resolv.conf.
+    local resolv_conf="$RESOLV_CONF"
+    mkdir -p "$(dirname "$resolv_conf")"
+
+    grep '^nameserver' /etc/resolv.conf \
+        | grep -v '^nameserver 127\.' \
+        > "$resolv_conf" 2>/dev/null || true
+
+    if [ ! -s "$resolv_conf" ]; then
+        # Fall back to default gateway as DNS forwarder (common in Podman machine setups)
+        local gw
+        gw=$(ip -4 route | awk '/default/ { print $3; exit }')
+        echo "nameserver $gw" > "$resolv_conf"
+    fi
+
+    echo "Configured k3s DNS for Podman runtime: $(cat "$resolv_conf")"
+}
+
+setup_dns() {
+    case "${CONTAINER_RUNTIME:-docker}" in
+        podman)
+            setup_dns_podman
+            ;;
+        docker|*)
+            setup_dns_docker
+            ;;
+    esac
+}
+
+if ! setup_dns; then
     echo "DNS proxy setup failed, falling back to public DNS servers"
     echo "Note: this may not work on Docker Desktop (Mac/Windows)"
     cat > "$RESOLV_CONF" <<EOF
@@ -338,16 +369,24 @@ fi
 # bridge default gateway, so prefer Docker's own resolution when available.
 # Fall back to the container default gateway on Linux engines where
 # host.docker.internal commonly maps to the bridge gateway anyway.
-HOST_GATEWAY_IP=$(getent ahostsv4 host.docker.internal 2>/dev/null | awk 'NR == 1 { print $1; exit }')
+case "${CONTAINER_RUNTIME:-docker}" in
+    podman)
+        HOST_GATEWAY_IP=$(getent ahostsv4 host.containers.internal 2>/dev/null | awk 'NR==1{print $1;exit}')
+        if [ -z "$HOST_GATEWAY_IP" ]; then
+            HOST_GATEWAY_IP=$(getent ahostsv4 host.docker.internal 2>/dev/null | awk 'NR==1{print $1;exit}')
+        fi
+        ;;
+    docker|*)
+        HOST_GATEWAY_IP=$(getent ahostsv4 host.docker.internal 2>/dev/null | awk 'NR==1{print $1;exit}')
+        ;;
+esac
+if [ -z "$HOST_GATEWAY_IP" ]; then
+    HOST_GATEWAY_IP=$(ip -4 route | awk '/default/{print $3;exit}')
+fi
 if [ -n "$HOST_GATEWAY_IP" ]; then
-    echo "Detected host gateway IP from host.docker.internal: $HOST_GATEWAY_IP"
+    echo "Detected host gateway IP: $HOST_GATEWAY_IP"
 else
-    HOST_GATEWAY_IP=$(ip -4 route | awk '/default/ { print $3; exit }')
-    if [ -n "$HOST_GATEWAY_IP" ]; then
-        echo "Detected host gateway IP from default route: $HOST_GATEWAY_IP"
-    else
-        echo "Warning: Could not detect host gateway IP from host.docker.internal or default route"
-    fi
+    echo "Warning: Could not detect host gateway IP from host resolution or default route"
 fi
 
 # ---------------------------------------------------------------------------

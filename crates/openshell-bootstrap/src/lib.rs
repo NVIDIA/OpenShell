@@ -45,7 +45,8 @@ use crate::runtime::{
 
 pub use crate::constants::container_name;
 pub use crate::docker::{
-    DockerPreflight, ExistingGatewayInfo, check_docker_available, create_ssh_docker_client,
+    ContainerRuntime, DockerPreflight, ExistingGatewayInfo, check_docker_available,
+    create_ssh_docker_client,
 };
 pub use crate::metadata::{
     GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
@@ -279,13 +280,13 @@ where
     // Create Docker client based on deployment mode.
     // For local deploys, run a preflight check to fail fast with actionable
     // guidance when Docker is not installed, not running, or unreachable.
-    let (target_docker, remote_opts) = if let Some(remote_opts) = &options.remote {
+    let (target_docker, remote_opts, runtime) = if let Some(remote_opts) = &options.remote {
         let remote = create_ssh_docker_client(remote_opts).await?;
-        (remote, Some(remote_opts.clone()))
+        (remote, Some(remote_opts.clone()), ContainerRuntime::Docker)
     } else {
         log("[status] Checking Docker".to_string());
         let preflight = check_docker_available().await?;
-        (preflight.docker, None)
+        (preflight.docker, None, preflight.runtime)
     };
 
     // If an existing gateway is found, either tear it down (when recreate is
@@ -417,6 +418,7 @@ where
             registry_username.as_deref(),
             registry_token.as_deref(),
             gpu,
+            runtime,
         )
         .await?;
         start_container(&target_docker, &name).await?;

@@ -36,6 +36,7 @@ spec:
         - ip: {{ .Values.server.hostGatewayIP | quote }}
           hostnames:
             - host.docker.internal
+            - host.containers.internal
             - host.openshell.internal
       {{- end }}
       securityContext:

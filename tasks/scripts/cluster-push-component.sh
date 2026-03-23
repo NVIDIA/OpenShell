@@ -5,6 +5,9 @@
 
 set -euo pipefail
 
+# shellcheck source=_container-runtime.sh
+source "$(dirname "$0")/_container-runtime.sh"
+
 component=${1:-}
 if [ -z "${component}" ]; then
   echo "usage: $0 <gateway>" >&2
@@ -41,7 +44,7 @@ source_candidates=(
 
 resolved_source_image=""
 for candidate in "${source_candidates[@]}"; do
-  if docker image inspect "${candidate}" >/dev/null 2>&1; then
+  if "${CONTAINER_CMD}" image inspect "${candidate}" >/dev/null 2>&1; then
     resolved_source_image="${candidate}"
     break
   fi
@@ -53,12 +56,12 @@ if [ -z "${resolved_source_image}" ]; then
   resolved_source_image="openshell/${component}:${IMAGE_TAG}"
 fi
 
-docker tag "${resolved_source_image}" "${TARGET_IMAGE}"
-docker push "${TARGET_IMAGE}"
+"${CONTAINER_CMD}" tag "${resolved_source_image}" "${TARGET_IMAGE}"
+"${CONTAINER_CMD}" push "${TARGET_IMAGE}"
 
 # Evict the stale image from k3s's containerd cache so new pods pull the
 # updated image. Without this, k3s uses its cached copy (imagePullPolicy
 # defaults to IfNotPresent for non-:latest tags) and pods run stale code.
-if docker ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
-  docker exec "${CONTAINER_NAME}" crictl rmi "${TARGET_IMAGE}" >/dev/null 2>&1 || true
+if "${CONTAINER_CMD}" ps -q --filter "name=${CONTAINER_NAME}" | grep -q .; then
+  "${CONTAINER_CMD}" exec "${CONTAINER_NAME}" crictl rmi "${TARGET_IMAGE}" >/dev/null 2>&1 || true
 fi

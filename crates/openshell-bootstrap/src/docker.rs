@@ -19,6 +19,23 @@ use bollard::query_parameters::{
 use futures::StreamExt;
 use miette::{IntoDiagnostic, Result, WrapErr};
 use std::collections::HashMap;
+use std::fmt;
+
+/// The container runtime backing the Docker-compatible API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerRuntime {
+    Docker,
+    Podman,
+}
+
+impl fmt::Display for ContainerRuntime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ContainerRuntime::Docker => write!(f, "docker"),
+            ContainerRuntime::Podman => write!(f, "podman"),
+        }
+    }
+}
 
 const REGISTRY_NAMESPACE_DEFAULT: &str = "openshell";
 
@@ -99,19 +116,27 @@ pub struct DockerPreflight {
     pub docker: Docker,
     /// Docker daemon version string (e.g., "28.1.1").
     pub version: Option<String>,
+    /// The detected container runtime (Docker or Podman).
+    pub runtime: ContainerRuntime,
 }
 
-/// Well-known Docker socket paths to probe when the default fails.
+/// Well-known Docker and Podman socket paths to probe when the default fails.
 ///
 /// These cover common container runtimes on macOS and Linux:
 /// - `/var/run/docker.sock` — default for Docker Desktop, `OrbStack`, Colima
 /// - `$HOME/.colima/docker.sock` — Colima (older installs)
 /// - `$HOME/.orbstack/run/docker.sock` — `OrbStack` (if symlink is missing)
+/// - `/run/podman/podman.sock` — Podman (Linux rootful)
 const WELL_KNOWN_SOCKET_PATHS: &[&str] = &[
     "/var/run/docker.sock",
-    // Expanded at runtime via home_dir():
+    "/run/podman/podman.sock",
+    // Expanded at runtime via home_dir() and XDG_RUNTIME_DIR:
     // ~/.colima/docker.sock
     // ~/.orbstack/run/docker.sock
+    // ~/.local/share/containers/podman/machine/podman.sock
+    // ~/.local/share/containers/podman/machine/qemu/podman.sock
+    // ~/.config/containers/podman/machine/podman.sock
+    // $XDG_RUNTIME_DIR/podman/podman.sock
 ];
 
 /// Check that a Docker-compatible runtime is installed, running, and reachable.
@@ -140,13 +165,47 @@ pub async fn check_docker_available() -> Result<DockerPreflight> {
         ));
     }
 
-    // Step 3: Query version info (best-effort — don't fail on this).
-    let version = match docker.version().await {
-        Ok(v) => v.version,
-        Err(_) => None,
+    // Step 3: Query version info and detect the runtime.
+    // Podman's version response includes a component with Name "Podman Engine".
+    let (version, runtime) = match docker.version().await {
+        Ok(v) => {
+            let is_podman = v
+                .components
+                .as_ref()
+                .map(|components| {
+                    components
+                        .iter()
+                        .any(|c| c.name == "Podman Engine")
+                })
+                .unwrap_or(false);
+            let rt = if is_podman {
+                ContainerRuntime::Podman
+            } else {
+                ContainerRuntime::Docker
+            };
+            (v.version, rt)
+        }
+        Err(_) => (None, ContainerRuntime::Docker),
     };
 
-    Ok(DockerPreflight { docker, version })
+    // For Podman connections, negotiate API version to handle differences.
+    // negotiate_version() consumes self and returns a new Docker with the
+    // negotiated version, so we must rebind rather than discard the result.
+    let docker = if runtime == ContainerRuntime::Podman {
+        docker
+            .negotiate_version()
+            .await
+            .into_diagnostic()
+            .wrap_err("failed to negotiate API version with Podman")?
+    } else {
+        docker
+    };
+
+    Ok(DockerPreflight {
+        docker,
+        version,
+        runtime,
+    })
 }
 
 /// Build a rich, user-friendly error when Docker is not reachable.
@@ -163,8 +222,8 @@ fn docker_not_reachable_error(raw_err: &str, summary: &str) -> miette::Report {
                 .to_string(),
         );
         hints.push(
-            "Install and start a Docker-compatible runtime. See the support matrix \
-             in the OpenShell docs for tested configurations."
+            "Install and start a Docker-compatible runtime (Docker or Podman). \
+             See the support matrix in the OpenShell docs for tested configurations."
                 .to_string(),
         );
 
@@ -216,16 +275,28 @@ fn find_alternative_sockets() -> Vec<String> {
         }
     }
 
-    // Check home-relative paths
+    // Check home-relative paths (Docker and Podman)
     if let Some(home) = home_dir() {
         let home_sockets = [
             format!("{home}/.colima/docker.sock"),
             format!("{home}/.orbstack/run/docker.sock"),
+            // Podman machine sockets (macOS)
+            format!("{home}/.local/share/containers/podman/machine/podman.sock"),
+            format!("{home}/.local/share/containers/podman/machine/qemu/podman.sock"),
+            format!("{home}/.config/containers/podman/machine/podman.sock"),
         ];
         for path in &home_sockets {
             if std::path::Path::new(path).exists() && !found.contains(path) {
                 found.push(path.clone());
             }
+        }
+    }
+
+    // Check XDG_RUNTIME_DIR for Podman rootless socket (Linux)
+    if let Ok(xdg_runtime) = std::env::var("XDG_RUNTIME_DIR") {
+        let podman_sock = format!("{xdg_runtime}/podman/podman.sock");
+        if std::path::Path::new(&podman_sock).exists() && !found.contains(&podman_sock) {
+            found.push(podman_sock);
         }
     }
 
@@ -455,6 +526,7 @@ pub async fn ensure_container(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: bool,
+    runtime: ContainerRuntime,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -535,10 +607,16 @@ pub async fn ensure_container(
         // Add host gateway aliases for DNS resolution.
         // This allows both the entrypoint script and the running gateway
         // process to reach services on the Docker host.
-        extra_hosts: Some(vec![
-            "host.docker.internal:host-gateway".to_string(),
-            "host.openshell.internal:host-gateway".to_string(),
-        ]),
+        extra_hosts: Some({
+            let mut hosts = vec![
+                "host.docker.internal:host-gateway".to_string(),
+                "host.openshell.internal:host-gateway".to_string(),
+            ];
+            if runtime == ContainerRuntime::Podman {
+                hosts.push("host.containers.internal:host-gateway".to_string());
+            }
+            hosts
+        }),
         ..Default::default()
     };
 
@@ -610,6 +688,7 @@ pub async fn ensure_container(
         format!("REGISTRY_HOST={registry_host}"),
         format!("REGISTRY_INSECURE={registry_insecure}"),
         format!("IMAGE_REPO_BASE={image_repo_base}"),
+        format!("CONTAINER_RUNTIME={runtime}"),
     ];
     if let Some(endpoint) = registry_endpoint {
         env_vars.push(format!("REGISTRY_ENDPOINT={endpoint}"));
@@ -1194,5 +1273,26 @@ mod tests {
             sockets.len() <= 10,
             "should return a reasonable number of sockets"
         );
+    }
+
+    /// Live integration test: verify that check_docker_available() detects the
+    /// correct runtime when a Podman or Docker socket is reachable.
+    /// Run with: cargo test -p openshell-bootstrap detect_runtime -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore]
+    async fn detect_runtime_live() {
+        let preflight = check_docker_available()
+            .await
+            .expect("container runtime should be reachable");
+        println!("Detected runtime : {}", preflight.runtime);
+        println!("Daemon version   : {:?}", preflight.version);
+        match preflight.runtime {
+            ContainerRuntime::Podman => {
+                println!("PASS: correctly identified Podman");
+            }
+            ContainerRuntime::Docker => {
+                println!("PASS: correctly identified Docker");
+            }
+        }
     }
 }

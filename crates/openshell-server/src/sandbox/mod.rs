@@ -50,7 +50,8 @@ pub struct SandboxClient {
     /// When non-empty, sandbox pods get this K8s secret mounted for mTLS to the server.
     client_tls_secret_name: String,
     /// When non-empty, sandbox pods get `hostAliases` entries mapping
-    /// `host.docker.internal` and `host.openshell.internal` to this IP.
+    /// `host.docker.internal`, `host.containers.internal`, and
+    /// `host.openshell.internal` to this IP.
     host_gateway_ip: String,
 }
 
@@ -968,7 +969,11 @@ fn sandbox_template_to_k8s(
             "hostAliases".to_string(),
             serde_json::json!([{
                 "ip": host_gateway_ip,
-                "hostnames": ["host.docker.internal", "host.openshell.internal"]
+                "hostnames": [
+                    "host.docker.internal",
+                    "host.containers.internal",
+                    "host.openshell.internal",
+                ]
             }]),
         );
     }

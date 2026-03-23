@@ -318,7 +318,7 @@ fn diagnose_oom_killed(_gateway_name: &str) -> GatewayFailureDiagnosis {
             The gateway requires at least 4GB of memory."
             .to_string(),
         recovery_steps: vec![
-            RecoveryStep::new("Increase Docker memory allocation to at least 4GB"),
+            RecoveryStep::new("Increase container runtime memory allocation to at least 4GB"),
             RecoveryStep::new("Close other memory-intensive applications"),
             RecoveryStep::new("Then retry: openshell gateway start"),
         ],
@@ -337,11 +337,11 @@ fn diagnose_node_pressure(gateway_name: &str) -> GatewayFailureDiagnosis {
         recovery_steps: vec![
             RecoveryStep::with_command("Check available disk space on the host", "df -h /"),
             RecoveryStep::with_command(
-                "Free disk space by pruning unused Docker resources",
+                "Free disk space by pruning unused container resources",
                 "docker system prune -a --volumes",
             ),
             RecoveryStep::with_command("Check available memory on the host", "free -h"),
-            RecoveryStep::new("Increase Docker resource allocation or free resources on the host"),
+            RecoveryStep::new("Increase container runtime resource allocation or free resources on the host"),
             RecoveryStep::with_command(
                 "Destroy and recreate the gateway after freeing resources",
                 format!(
@@ -400,11 +400,15 @@ fn diagnose_docker_not_running(_gateway_name: &str) -> GatewayFailureDiagnosis {
     GatewayFailureDiagnosis {
         summary: "Docker is not running".to_string(),
         explanation: "The Docker daemon is not running or not accessible. OpenShell requires \
-            a Docker-compatible container runtime to manage gateway clusters."
+            a Docker-compatible container runtime (Docker or Podman) to manage gateway clusters."
             .to_string(),
         recovery_steps: vec![
-            RecoveryStep::new("Start your Docker runtime"),
+            RecoveryStep::new("Start your container runtime (Docker Desktop, Podman, Colima, OrbStack, etc.)"),
             RecoveryStep::with_command("Verify Docker is accessible", "docker info"),
+            RecoveryStep::new(
+                "If using Podman, set DOCKER_HOST to the Podman socket:\n     \
+                 export DOCKER_HOST=unix://$XDG_RUNTIME_DIR/podman/podman.sock",
+            ),
             RecoveryStep::new(
                 "If using a non-default Docker socket, set DOCKER_HOST:\n     \
                  export DOCKER_HOST=unix:///var/run/docker.sock",
