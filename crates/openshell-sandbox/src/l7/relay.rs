@@ -279,8 +279,18 @@ where
                 .await?;
 
         // Relay response back to client.
-        let reusable =
+        let (reusable, status_code) =
             crate::l7::rest::relay_response_to_client(upstream, client, &req.action).await?;
+
+        info!(
+            host = %ctx.host,
+            port = ctx.port,
+            method = %req.action,
+            path = %req.target,
+            status = status_code,
+            request_num = request_count,
+            "HTTP response relayed"
+        );
 
         if !keep_alive || !reusable {
             break;
