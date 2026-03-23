@@ -193,6 +193,9 @@ mise.local.toml
 # Ignore plans for now
 architecture/plans
 
+# Nix build output
+result
+
 # Claude
 .claude/settings.local.json.claude/worktrees/
 .claude/worktrees/
