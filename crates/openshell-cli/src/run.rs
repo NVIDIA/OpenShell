@@ -1356,6 +1356,7 @@ pub async fn gateway_admin_deploy(
     registry_username: Option<&str>,
     registry_token: Option<&str>,
     gpu: bool,
+    memory_limit: Option<i64>,
 ) -> Result<()> {
     let location = if remote.is_some() { "remote" } else { "local" };
 
@@ -1421,6 +1422,9 @@ pub async fn gateway_admin_deploy(
         .with_disable_gateway_auth(disable_gateway_auth)
         .with_gpu(gpu)
         .with_recreate(should_recreate);
+    if let Some(mem) = memory_limit {
+        options = options.with_memory_limit(mem);
+    }
     if let Some(opts) = remote_opts {
         options = options.with_remote(opts);
     }

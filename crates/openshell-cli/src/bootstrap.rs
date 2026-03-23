@@ -179,6 +179,15 @@ pub async fn run_bootstrap(
         options = options.with_gateway_host(host);
     }
     options = options.with_gpu(gpu);
+    // Read memory limit override from environment. The explicit `--memory`
+    // flag is only on `gateway start`; this env var covers the auto-bootstrap
+    // path triggered by `sandbox create`.
+    if let Ok(mem_str) = std::env::var("OPENSHELL_MEMORY_LIMIT")
+        && !mem_str.trim().is_empty()
+    {
+        let limit = openshell_bootstrap::parse_memory_limit(&mem_str)?;
+        options = options.with_memory_limit(limit);
+    }
 
     let handle = deploy_gateway_with_panel(options, &gateway_name, location).await?;
     let server = handle.gateway_endpoint().to_string();

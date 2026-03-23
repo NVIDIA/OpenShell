@@ -809,6 +809,17 @@ enum GatewayCommands {
         /// NVIDIA Container Toolkit on the host.
         #[arg(long)]
         gpu: bool,
+
+        /// Memory limit for the gateway container.
+        ///
+        /// Accepts human-readable sizes: `80g`, `4096m`, `1073741824` (bytes).
+        /// When unset, defaults to 80% of available memory (auto-detected via
+        /// the Docker daemon). On macOS and Windows this reflects the Docker
+        /// Desktop VM's allocated memory, not the full host RAM. Docker
+        /// OOM-kills the container if it exceeds this limit, preventing
+        /// runaway sandbox growth from triggering the host kernel OOM killer.
+        #[arg(long, env = "OPENSHELL_MEMORY_LIMIT")]
+        memory: Option<String>,
     },
 
     /// Stop the gateway (preserves state).
@@ -1561,7 +1572,12 @@ async fn main() -> Result<()> {
                 registry_username,
                 registry_token,
                 gpu,
+                memory,
             } => {
+                let memory_limit = memory
+                    .as_deref()
+                    .map(openshell_bootstrap::parse_memory_limit)
+                    .transpose()?;
                 run::gateway_admin_deploy(
                     &name,
                     remote.as_deref(),
@@ -1574,6 +1590,7 @@ async fn main() -> Result<()> {
                     registry_username.as_deref(),
                     registry_token.as_deref(),
                     gpu,
+                    memory_limit,
                 )
                 .await?;
             }

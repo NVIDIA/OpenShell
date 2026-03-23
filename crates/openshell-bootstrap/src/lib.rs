@@ -46,6 +46,7 @@ use crate::runtime::{
 pub use crate::constants::container_name;
 pub use crate::docker::{
     DockerPreflight, ExistingGatewayInfo, check_docker_available, create_ssh_docker_client,
+    detect_memory_limit, parse_memory_limit,
 };
 pub use crate::metadata::{
     GatewayMetadata, clear_active_gateway, extract_host_from_ssh_destination, get_gateway_metadata,
@@ -119,6 +120,11 @@ pub struct DeployOptions {
     /// When false, an existing gateway is left as-is and deployment is
     /// skipped (the caller is responsible for prompting the user first).
     pub recreate: bool,
+    /// Memory limit for the gateway container in bytes. When set, Docker
+    /// enforces the ceiling and OOM-kills the container instead of the host
+    /// kernel OOM-killing unrelated processes. When `None`, auto-detected
+    /// as 80% of available memory via the Docker daemon.
+    pub memory_limit: Option<i64>,
 }
 
 impl DeployOptions {
@@ -135,6 +141,7 @@ impl DeployOptions {
             registry_token: None,
             gpu: false,
             recreate: false,
+            memory_limit: None,
         }
     }
 
@@ -198,6 +205,13 @@ impl DeployOptions {
     #[must_use]
     pub fn with_recreate(mut self, recreate: bool) -> Self {
         self.recreate = recreate;
+        self
+    }
+
+    /// Set the memory limit for the gateway container in bytes.
+    #[must_use]
+    pub fn with_memory_limit(mut self, limit: i64) -> Self {
+        self.memory_limit = Some(limit);
         self
     }
 }
@@ -264,6 +278,7 @@ where
     let registry_token = options.registry_token;
     let gpu = options.gpu;
     let recreate = options.recreate;
+    let explicit_memory_limit = options.memory_limit;
 
     // Wrap on_log in Arc<Mutex<>> so we can share it with pull_remote_image
     // which needs a 'static callback for the bollard streaming pull.
@@ -286,6 +301,14 @@ where
         log("[status] Checking Docker".to_string());
         let preflight = check_docker_available().await?;
         (preflight.docker, None)
+    };
+
+    // Resolve memory limit: explicit value from CLI, or auto-detect from the
+    // Docker daemon. On macOS / Windows this correctly reports the Docker
+    // Desktop VM's memory, not the full host RAM.
+    let memory_limit = match explicit_memory_limit {
+        Some(limit) => Some(limit),
+        None => detect_memory_limit(&target_docker).await,
     };
 
     // If an existing gateway is found, either tear it down (when recreate is
@@ -418,6 +441,7 @@ where
             registry_token.as_deref(),
             gpu,
             remote_opts.is_some(),
+            memory_limit,
         )
         .await?;
         start_container(&target_docker, &name).await?;

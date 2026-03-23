@@ -40,6 +40,76 @@ fn env_bool(key: &str) -> Option<bool> {
     })
 }
 
+/// Parse a human-readable memory size string into bytes.
+///
+/// Accepts integers (bytes) or values with `k`/`m`/`g`/`t` suffixes
+/// (case-insensitive, with or without a trailing `b`). Binary units
+/// (`ki`/`mi`/`gi`/`ti`) are also accepted. Examples: `80g`, `4096m`,
+/// `0.5g`, `1073741824`.
+///
+/// Returns an error if the value is empty, uses an unknown suffix, overflows
+/// `i64`, or is below the 4 MiB minimum required by Docker.
+pub fn parse_memory_limit(s: &str) -> Result<i64> {
+    let s = s.trim().to_ascii_lowercase();
+    if s.is_empty() {
+        miette::bail!("empty memory limit string");
+    }
+
+    // Split into numeric part and optional suffix.
+    let (num_str, suffix) = match s.find(|c: char| !c.is_ascii_digit() && c != '.') {
+        Some(idx) => (&s[..idx], s[idx..].trim_end_matches('b')),
+        None => (s.as_str(), ""),
+    };
+
+    let value: f64 = num_str
+        .parse()
+        .into_diagnostic()
+        .wrap_err_with(|| format!("invalid numeric part in memory limit: {num_str}"))?;
+
+    let multiplier: f64 = match suffix {
+        "" => 1.0,
+        "k" | "ki" => 1024.0,
+        "m" | "mi" => 1024.0 * 1024.0,
+        "g" | "gi" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "ti" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => miette::bail!("unknown memory suffix: {other}"),
+    };
+
+    let raw = value * multiplier;
+    if raw > i64::MAX as f64 {
+        miette::bail!("memory limit too large (exceeds i64::MAX): {s}");
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let bytes = raw as i64;
+
+    // Docker requires at least ~6 MiB; enforce a 4 MiB floor so users get a
+    // clear error instead of an opaque Docker API rejection.
+    const MIN_MEMORY_BYTES: i64 = 4 * 1024 * 1024;
+    if bytes < MIN_MEMORY_BYTES {
+        miette::bail!("memory limit must be at least 4 MiB, got: {s} ({bytes} bytes)");
+    }
+    Ok(bytes)
+}
+
+/// Detect a safe memory limit for the gateway container.
+///
+/// Queries the Docker daemon for `MemTotal` (via `docker info`) and returns
+/// 80% of that value. On macOS and Windows the daemon runs inside a Linux VM
+/// (Docker Desktop, colima, WSL2), so the reported total reflects the VM's
+/// allocated memory rather than the full host RAM.
+///
+/// Returns `None` if the daemon does not report memory information.
+pub async fn detect_memory_limit(docker: &Docker) -> Option<i64> {
+    let info = docker.info().await.ok()?;
+    let total_bytes = info.mem_total?;
+    if total_bytes <= 0 {
+        return None;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let limit = (total_bytes as f64 * 0.8) as i64;
+    Some(limit)
+}
+
 /// Platform information for a Docker daemon host.
 #[derive(Debug, Clone)]
 pub struct HostPlatform {
@@ -512,6 +582,7 @@ pub async fn ensure_container(
     registry_token: Option<&str>,
     gpu: bool,
     is_remote: bool,
+    memory_limit: Option<i64>,
 ) -> Result<()> {
     let container_name = container_name(name);
 
@@ -614,6 +685,15 @@ pub async fn ensure_container(
             ]]),
             ..Default::default()
         }]);
+    }
+
+    // Apply memory limit. When set, Docker OOM-kills the container instead of
+    // letting unchecked sandbox growth trigger the host kernel OOM killer.
+    // Setting memory_swap equal to memory disables swap inside the container.
+    if let Some(mem) = memory_limit {
+        host_config.memory = Some(mem);
+        host_config.memory_swap = Some(mem);
+        tracing::info!("Container memory limit: {} MiB", mem / (1024 * 1024),);
     }
 
     let mut cmd = vec![
@@ -1352,4 +1432,77 @@ mod tests {
         let input = "nameserver 8.8.8.8\r\nnameserver 1.1.1.1\r\n";
         assert_eq!(parse_resolv_conf(input), vec!["8.8.8.8", "1.1.1.1"]);
     }
+
+    #[test]
+    fn parse_memory_limit_gigabytes() {
+        assert_eq!(parse_memory_limit("80g").unwrap(), 80 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("80G").unwrap(), 80 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("80gb").unwrap(), 80 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_limit_megabytes() {
+        assert_eq!(parse_memory_limit("4096m").unwrap(), 4096 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("4096M").unwrap(), 4096 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_limit_bare_bytes() {
+        assert_eq!(parse_memory_limit("1073741824").unwrap(), 1073741824);
+    }
+
+    #[test]
+    fn parse_memory_limit_binary_suffixes() {
+        assert_eq!(parse_memory_limit("1gi").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_memory_limit("1gib").unwrap(), 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_empty() {
+        assert!(parse_memory_limit("").is_err());
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_unknown_suffix() {
+        assert!(parse_memory_limit("10x").is_err());
+    }
+
+    #[test]
+    fn parse_memory_limit_fractional() {
+        // 0.5g = 512 MiB
+        assert_eq!(parse_memory_limit("0.5g").unwrap(), 512 * 1024 * 1024);
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_zero() {
+        assert!(parse_memory_limit("0g").is_err());
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_negative() {
+        assert!(parse_memory_limit("-1g").is_err());
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_below_minimum() {
+        // 1 KiB is well below the 4 MiB floor
+        assert!(parse_memory_limit("1k").is_err());
+    }
+
+    #[test]
+    fn parse_memory_limit_rejects_overflow() {
+        // 99999999t exceeds i64::MAX (~9.2 exabytes)
+        assert!(parse_memory_limit("99999999t").is_err());
+    }
+
+    #[test]
+    fn parse_memory_limit_whitespace() {
+        assert_eq!(
+            parse_memory_limit("  80g  ").unwrap(),
+            80 * 1024 * 1024 * 1024
+        );
+    }
+
+    // detect_memory_limit is async and requires a Docker daemon connection,
+    // so it is tested via integration / e2e tests rather than unit tests.
 }
