@@ -1253,6 +1253,13 @@ async fn resolve_and_check_allowed_ips(
         ));
     }
 
+    // Block control-plane ports regardless of IP match.
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+
     for addr in &addrs {
         // Always block loopback and link-local
         if is_always_blocked_ip(addr.ip()) {
@@ -1275,11 +1282,27 @@ async fn resolve_and_check_allowed_ips(
     Ok(addrs)
 }
 
+/// Minimum CIDR prefix length before logging a breadth warning.
+/// CIDRs broader than /16 (65,536+ addresses) may unintentionally expose
+/// control-plane services on the same network.
+const MIN_SAFE_PREFIX_LEN: u8 = 16;
+
+/// Ports that are always blocked in `resolve_and_check_allowed_ips`, even
+/// when the resolved IP matches an `allowed_ips` entry.  These ports belong
+/// to control-plane services that should never be reachable from a sandbox.
+const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
+    2379,  // etcd client
+    2380,  // etcd peer
+    6443,  // Kubernetes API server
+    10250, // kubelet API
+    10255, // kubelet read-only
+];
+
 /// Parse CIDR/IP strings into `IpNet` values, rejecting invalid entries and
 /// entries that cover loopback or link-local ranges.
 ///
 /// Returns parsed networks on success, or an error describing which entries
-/// are invalid.
+/// are invalid. Logs a warning for overly broad CIDRs.
 fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, String> {
     let mut nets = Vec::with_capacity(raw.len());
     let mut errors = Vec::new();
@@ -1297,7 +1320,17 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
         });
 
         match parsed {
-            Ok(n) => nets.push(n),
+            Ok(n) => {
+                if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
+                    warn!(
+                        cidr = %n,
+                        prefix_len = n.prefix_len(),
+                        "allowed_ips entry has a very broad CIDR (< /{MIN_SAFE_PREFIX_LEN}); \
+                         this may expose control-plane services on the same network"
+                    );
+                }
+                nets.push(n);
+            }
             Err(_) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
@@ -2323,6 +2356,42 @@ mod tests {
             err.contains("not in allowed_ips"),
             "expected 'not in allowed_ips' in error: {err}"
         );
+    }
+
+    // --- SEC-005: CIDR breadth warning and control-plane port blocklist ---
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_blocks_control_plane_ports() {
+        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // K8s API server port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+
+        // etcd client port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 2379, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+
+        // kubelet API port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 10250, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_allows_non_control_plane_ports() {
+        // Port 443 should not be blocked by the control-plane port list
+        let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_broad_cidr_is_accepted() {
+        // Broad CIDRs are accepted (just warned about) -- design trade-off
+        let result = parse_allowed_ips(&["10.0.0.0/8".to_string()]);
+        assert!(result.is_ok());
     }
 
     // --- extract_host_from_uri tests ---
