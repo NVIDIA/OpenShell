@@ -3613,10 +3613,14 @@ async fn stream_exec_over_ssh(
     timeout_seconds: u32,
     handshake_secret: &str,
 ) -> Result<(), Status> {
+    let command_preview: String = command.chars().take(120).collect();
     info!(
         sandbox_id = %sandbox_id,
         target_host = %target_host,
         target_port,
+        command_len = command.len(),
+        stdin_len = stdin_payload.len(),
+        command_preview = %command_preview,
         "ExecSandbox command started"
     );
 
@@ -3736,6 +3740,20 @@ async fn run_exec_with_russh(
     stdin_payload: Vec<u8>,
     tx: mpsc::Sender<Result<ExecSandboxEvent, Status>>,
 ) -> Result<i32, Status> {
+    // Defense-in-depth: validate command at the transport boundary even though
+    // exec_sandbox and build_remote_exec_command already validate upstream.
+    if command.as_bytes().contains(&0) {
+        return Err(Status::invalid_argument(
+            "command contains null bytes at transport boundary",
+        ));
+    }
+    if command.len() > MAX_COMMAND_STRING_LEN {
+        return Err(Status::invalid_argument(format!(
+            "command exceeds {} byte limit at transport boundary",
+            MAX_COMMAND_STRING_LEN
+        )));
+    }
+
     let stream = TcpStream::connect(("127.0.0.1", local_proxy_port))
         .await
         .map_err(|e| Status::internal(format!("failed to connect to ssh proxy: {e}")))?;
