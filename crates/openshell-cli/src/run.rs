@@ -1904,13 +1904,14 @@ async fn finalize_sandbox_create_session(
     persist: bool,
     session_result: Result<()>,
     tls: &TlsOptions,
+    gateway: &str,
 ) -> Result<()> {
     if persist {
         return session_result;
     }
 
     let names = [sandbox_name.to_string()];
-    if let Err(err) = sandbox_delete(server, &names, false, tls).await {
+    if let Err(err) = sandbox_delete(server, &names, false, tls, gateway).await {
         if session_result.is_ok() {
             return Err(err);
         }
@@ -2380,6 +2381,7 @@ pub async fn sandbox_create(
                     persist,
                     connect_result,
                     &effective_tls,
+                    gateway_name,
                 )
                 .await;
             }
@@ -2415,6 +2417,7 @@ pub async fn sandbox_create(
                 persist,
                 exec_result,
                 &effective_tls,
+                gateway_name,
             )
             .await
         }
