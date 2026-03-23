@@ -243,6 +243,10 @@ fi
 
 DEPLOY_CMD=(openshell gateway start --name "${CLUSTER_NAME}" --port "${GATEWAY_PORT}")
 
+if [ "${CLUSTER_GPU:-0}" = "1" ]; then
+  DEPLOY_CMD+=(--gpu)
+fi
+
 if [ -n "${GATEWAY_HOST:-}" ]; then
   DEPLOY_CMD+=(--gateway-host "${GATEWAY_HOST}")
 

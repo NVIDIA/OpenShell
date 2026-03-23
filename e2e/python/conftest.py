@@ -96,10 +96,10 @@ def run_python() -> Callable[[Sandbox, str], tuple[int, str, str]]:
 
 @pytest.fixture(scope="session")
 def gpu_sandbox_spec() -> datamodel_pb2.SandboxSpec:
-    image = os.environ.get(
-        "OPENSHELL_E2E_GPU_IMAGE",
-        "ghcr.io/nvidia/openshell-community/sandboxes/nvidia-gpu:latest",
-    )
+    # Empty string defers image resolution to the server, which substitutes
+    # the configured default sandbox image.  Set OPENSHELL_E2E_GPU_IMAGE to
+    # override (e.g. a locally-built or registry-mirrored image).
+    image = os.environ.get("OPENSHELL_E2E_GPU_IMAGE", "")
     return datamodel_pb2.SandboxSpec(
         gpu=True,
         template=datamodel_pb2.SandboxTemplate(image=image),

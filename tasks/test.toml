@@ -43,6 +43,6 @@ run = "uv run pytest -o python_files='test_*.py' -m 'not gpu' -n ${E2E_PARALLEL:
 
 ["e2e:python:gpu"]
 description = "Run Python GPU e2e tests"
-depends = ["python:proto", "cluster"]
+depends = ["python:proto", "CLUSTER_GPU=1 cluster"]
 env = { UV_NO_SYNC = "1", PYTHONPATH = "python" }
 run = "uv run pytest -o python_files='test_*.py' -m gpu -n ${E2E_PARALLEL:-1} e2e/python"
