@@ -1034,19 +1034,23 @@ async fn route_inference_request(
     }
 }
 
+/// Map router errors to HTTP status codes and sanitized messages.
+///
+/// Returns generic error messages instead of verbatim internal details.
+/// Full error context (upstream URLs, hostnames, TLS details) is logged
+/// server-side by the caller at `warn` level for debugging.
 fn router_error_to_http(err: &openshell_router::RouterError) -> (u16, String) {
     use openshell_router::RouterError;
     match err {
-        RouterError::RouteNotFound(hint) => {
-            (400, format!("no route configured for route '{hint}'"))
+        RouterError::RouteNotFound(_) => (400, "no inference route configured".to_string()),
+        RouterError::NoCompatibleRoute(_) => {
+            (400, "no compatible inference route available".to_string())
         }
-        RouterError::NoCompatibleRoute(protocol) => (
-            400,
-            format!("no compatible route for source protocol '{protocol}'"),
-        ),
-        RouterError::Unauthorized(msg) => (401, msg.clone()),
-        RouterError::UpstreamUnavailable(msg) => (503, msg.clone()),
-        RouterError::UpstreamProtocol(msg) | RouterError::Internal(msg) => (502, msg.clone()),
+        RouterError::Unauthorized(_) => (401, "unauthorized".to_string()),
+        RouterError::UpstreamUnavailable(_) => (503, "inference service unavailable".to_string()),
+        RouterError::UpstreamProtocol(_) | RouterError::Internal(_) => {
+            (502, "inference service error".to_string())
+        }
     }
 }
 
@@ -1249,6 +1253,13 @@ async fn resolve_and_check_allowed_ips(
         ));
     }
 
+    // Block control-plane ports regardless of IP match.
+    if BLOCKED_CONTROL_PLANE_PORTS.contains(&port) {
+        return Err(format!(
+            "port {port} is a blocked control-plane port, connection rejected"
+        ));
+    }
+
     for addr in &addrs {
         // Always block loopback and link-local
         if is_always_blocked_ip(addr.ip()) {
@@ -1271,11 +1282,27 @@ async fn resolve_and_check_allowed_ips(
     Ok(addrs)
 }
 
+/// Minimum CIDR prefix length before logging a breadth warning.
+/// CIDRs broader than /16 (65,536+ addresses) may unintentionally expose
+/// control-plane services on the same network.
+const MIN_SAFE_PREFIX_LEN: u8 = 16;
+
+/// Ports that are always blocked in `resolve_and_check_allowed_ips`, even
+/// when the resolved IP matches an `allowed_ips` entry.  These ports belong
+/// to control-plane services that should never be reachable from a sandbox.
+const BLOCKED_CONTROL_PLANE_PORTS: &[u16] = &[
+    2379,  // etcd client
+    2380,  // etcd peer
+    6443,  // Kubernetes API server
+    10250, // kubelet API
+    10255, // kubelet read-only
+];
+
 /// Parse CIDR/IP strings into `IpNet` values, rejecting invalid entries and
 /// entries that cover loopback or link-local ranges.
 ///
 /// Returns parsed networks on success, or an error describing which entries
-/// are invalid.
+/// are invalid. Logs a warning for overly broad CIDRs.
 fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, String> {
     let mut nets = Vec::with_capacity(raw.len());
     let mut errors = Vec::new();
@@ -1293,7 +1320,17 @@ fn parse_allowed_ips(raw: &[String]) -> std::result::Result<Vec<ipnet::IpNet>, S
         });
 
         match parsed {
-            Ok(n) => nets.push(n),
+            Ok(n) => {
+                if n.prefix_len() < MIN_SAFE_PREFIX_LEN {
+                    warn!(
+                        cidr = %n,
+                        prefix_len = n.prefix_len(),
+                        "allowed_ips entry has a very broad CIDR (< /{MIN_SAFE_PREFIX_LEN}); \
+                         this may expose control-plane services on the same network"
+                    );
+                }
+                nets.push(n);
+            }
             Err(_) => errors.push(format!("invalid CIDR/IP in allowed_ips: {entry}")),
         }
     }
@@ -2070,10 +2107,9 @@ mod tests {
         let err = openshell_router::RouterError::RouteNotFound("local".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 400);
-        assert!(
-            msg.contains("local"),
-            "message should contain the hint: {msg}"
-        );
+        assert_eq!(msg, "no inference route configured");
+        // SEC-008: must NOT leak the route hint to sandboxed code
+        assert!(!msg.contains("local"));
     }
 
     #[test]
@@ -2081,42 +2117,56 @@ mod tests {
         let err = openshell_router::RouterError::NoCompatibleRoute("anthropic_messages".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 400);
-        assert!(
-            msg.contains("anthropic_messages"),
-            "message should contain the protocol: {msg}"
-        );
+        assert_eq!(msg, "no compatible inference route available");
+        // SEC-008: must NOT leak the protocol name to sandboxed code
+        assert!(!msg.contains("anthropic_messages"));
     }
 
     #[test]
     fn router_error_unauthorized_maps_to_401() {
-        let err = openshell_router::RouterError::Unauthorized("bad token".into());
+        let err =
+            openshell_router::RouterError::Unauthorized("bad token from 10.0.0.5:8080".into());
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 401);
-        assert_eq!(msg, "bad token");
+        assert_eq!(msg, "unauthorized");
+        // SEC-008: must NOT leak upstream details to sandboxed code
+        assert!(!msg.contains("10.0.0.5"));
     }
 
     #[test]
     fn router_error_upstream_unavailable_maps_to_503() {
-        let err = openshell_router::RouterError::UpstreamUnavailable("connection refused".into());
+        let err = openshell_router::RouterError::UpstreamUnavailable(
+            "connection refused to 10.0.0.5:8080".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 503);
-        assert_eq!(msg, "connection refused");
+        assert_eq!(msg, "inference service unavailable");
+        // SEC-008: must NOT leak upstream address to sandboxed code
+        assert!(!msg.contains("10.0.0.5"));
     }
 
     #[test]
     fn router_error_upstream_protocol_maps_to_502() {
-        let err = openshell_router::RouterError::UpstreamProtocol("bad gateway".into());
+        let err = openshell_router::RouterError::UpstreamProtocol(
+            "TLS handshake failed for nim.internal.svc:443".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 502);
-        assert_eq!(msg, "bad gateway");
+        assert_eq!(msg, "inference service error");
+        // SEC-008: must NOT leak internal hostnames to sandboxed code
+        assert!(!msg.contains("nim.internal"));
     }
 
     #[test]
     fn router_error_internal_maps_to_502() {
-        let err = openshell_router::RouterError::Internal("unexpected".into());
+        let err = openshell_router::RouterError::Internal(
+            "failed to read /etc/openshell/routes.json".into(),
+        );
         let (status, msg) = router_error_to_http(&err);
         assert_eq!(status, 502);
-        assert_eq!(msg, "unexpected");
+        assert_eq!(msg, "inference service error");
+        // SEC-008: must NOT leak file paths to sandboxed code
+        assert!(!msg.contains("/etc/openshell"));
     }
 
     #[test]
@@ -2306,6 +2356,42 @@ mod tests {
             err.contains("not in allowed_ips"),
             "expected 'not in allowed_ips' in error: {err}"
         );
+    }
+
+    // --- SEC-005: CIDR breadth warning and control-plane port blocklist ---
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_blocks_control_plane_ports() {
+        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        // K8s API server port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 6443, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+
+        // etcd client port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 2379, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+
+        // kubelet API port
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 10250, &nets).await;
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("blocked control-plane port"));
+    }
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_allows_non_control_plane_ports() {
+        // Port 443 should not be blocked by the control-plane port list
+        let nets = parse_allowed_ips(&["8.8.8.0/24".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("8.8.8.8", 443, &nets).await;
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_parse_allowed_ips_broad_cidr_is_accepted() {
+        // Broad CIDRs are accepted (just warned about) -- design trade-off
+        let result = parse_allowed_ips(&["10.0.0.0/8".to_string()]);
+        assert!(result.is_ok());
     }
 
     // --- extract_host_from_uri tests ---

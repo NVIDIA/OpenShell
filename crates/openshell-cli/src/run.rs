@@ -14,7 +14,7 @@ use hyper::{Request, StatusCode};
 use hyper_rustls::HttpsConnectorBuilder;
 use hyper_util::{client::legacy::Client, rt::TokioExecutor};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
-use miette::{IntoDiagnostic, Result, WrapErr};
+use miette::{IntoDiagnostic, Result, WrapErr, miette};
 use openshell_bootstrap::{
     DeployOptions, GatewayMetadata, RemoteOptions, clear_active_gateway, container_name,
     extract_host_from_ssh_destination, get_gateway_metadata, list_gateways, load_active_gateway,
@@ -1653,6 +1653,7 @@ pub fn doctor_exec(
     ssh_key: Option<&str>,
     command: &[String],
 ) -> Result<()> {
+    validate_gateway_name(name)?;
     let container = container_name(name);
     let is_tty = std::io::stdin().is_terminal();
 
@@ -1676,7 +1677,15 @@ pub fn doctor_exec(
     };
 
     let mut cmd = if let Some(ref host) = remote_host {
+        validate_ssh_host(host)?;
+
         // Remote: ssh <host> docker exec [-it] <container> sh -lc '<inner_cmd>'
+        //
+        // SSH concatenates all arguments after the hostname into a single
+        // string for the remote shell, so inner_cmd must be escaped twice:
+        // once for `sh -lc` (already done above) and once for the SSH
+        // remote shell (done here).
+        let ssh_escaped_cmd = shell_escape(&inner_cmd);
         let mut c = Command::new("ssh");
         if let Some(key) = ssh_key {
             c.args(["-i", key]);
@@ -1693,7 +1702,7 @@ pub fn doctor_exec(
         } else {
             c.arg("-i");
         }
-        c.args([&container, "sh", "-lc", &inner_cmd]);
+        c.args([&container, "sh", "-lc", &ssh_escaped_cmd]);
         c
     } else {
         // Local: docker exec [-it] <container> sh -lc '<inner_cmd>'
@@ -1788,6 +1797,42 @@ fn shell_escape(s: &str) -> String {
     }
     // Otherwise, single-quote it (escaping embedded single quotes)
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Validate that a gateway name is safe for use in container/volume/network
+/// names and shell commands. Rejects names with characters outside the set
+/// `[a-zA-Z0-9._-]`.
+fn validate_gateway_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(miette!("gateway name is empty"));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_'))
+    {
+        return Err(miette!(
+            "gateway name contains invalid characters (allowed: alphanumeric, '.', '-', '_')"
+        ));
+    }
+    Ok(())
+}
+
+/// Validate that an SSH host string is a reasonable hostname or IP address.
+/// Rejects values with shell metacharacters, spaces, or control characters
+/// that could be used for injection via a poisoned metadata.json.
+fn validate_ssh_host(host: &str) -> Result<()> {
+    if host.is_empty() {
+        return Err(miette!("SSH host is empty"));
+    }
+    // Allow: alphanumeric, dots, hyphens, colons (IPv6), square brackets ([::1]),
+    // and @ (user@host).
+    if !host
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']' | b'@'))
+    {
+        return Err(miette!("SSH host contains invalid characters: {host}"));
+    }
+    Ok(())
 }
 
 /// Create a sandbox when no gateway is configured.
@@ -4942,7 +4987,7 @@ mod tests {
         git_sync_files, http_health_check, image_requests_gpu, inferred_provider_type,
         parse_cli_setting_value, parse_credential_pairs, provisioning_timeout_message,
         ready_false_condition_message, resolve_gateway_control_target_from, sandbox_should_persist,
-        source_requests_gpu,
+        shell_escape, source_requests_gpu, validate_gateway_name, validate_ssh_host,
     };
     use crate::TEST_ENV_LOCK;
     use hyper::StatusCode;
@@ -5456,5 +5501,59 @@ mod tests {
 
         server.join().expect("server thread");
         assert_eq!(status, Some(StatusCode::OK));
+    }
+
+    // ---- SEC-004: validate_gateway_name, validate_ssh_host, shell_escape ----
+
+    #[test]
+    fn validate_gateway_name_accepts_valid_names() {
+        assert!(validate_gateway_name("openshell").is_ok());
+        assert!(validate_gateway_name("my-gateway").is_ok());
+        assert!(validate_gateway_name("gateway_v2").is_ok());
+        assert!(validate_gateway_name("gw.prod").is_ok());
+    }
+
+    #[test]
+    fn validate_gateway_name_rejects_invalid_names() {
+        assert!(validate_gateway_name("").is_err());
+        assert!(validate_gateway_name("gw;rm -rf /").is_err());
+        assert!(validate_gateway_name("gw name").is_err());
+        assert!(validate_gateway_name("gw$(id)").is_err());
+        assert!(validate_gateway_name("gw\nmalicious").is_err());
+    }
+
+    #[test]
+    fn validate_ssh_host_accepts_valid_hosts() {
+        assert!(validate_ssh_host("192.168.1.1").is_ok());
+        assert!(validate_ssh_host("example.com").is_ok());
+        assert!(validate_ssh_host("user@host.com").is_ok());
+        assert!(validate_ssh_host("[::1]").is_ok());
+        assert!(validate_ssh_host("2001:db8::1").is_ok());
+    }
+
+    #[test]
+    fn validate_ssh_host_rejects_invalid_hosts() {
+        assert!(validate_ssh_host("").is_err());
+        assert!(validate_ssh_host("host;rm -rf /").is_err());
+        assert!(validate_ssh_host("host$(id)").is_err());
+        assert!(validate_ssh_host("host name").is_err());
+        assert!(validate_ssh_host("host\nmalicious").is_err());
+    }
+
+    #[test]
+    fn shell_escape_double_escape_for_ssh() {
+        // Simulate the double-escape path for SSH:
+        // First escape for sh -lc, then escape again for SSH remote shell.
+        let inner_cmd = "KUBECONFIG=/etc/rancher/k3s/k3s.yaml echo 'hello world'";
+        let ssh_escaped = shell_escape(inner_cmd);
+        // The result should be single-quoted (wrapping the entire inner_cmd)
+        assert!(
+            ssh_escaped.starts_with('\''),
+            "should be single-quoted: {ssh_escaped}"
+        );
+        assert!(
+            ssh_escaped.ends_with('\''),
+            "should end with single-quote: {ssh_escaped}"
+        );
     }
 }

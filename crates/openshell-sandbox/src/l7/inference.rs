@@ -171,43 +171,69 @@ pub fn try_parse_http_request(buf: &[u8]) -> ParseResult {
     )
 }
 
+/// Maximum decoded body size from chunked transfer encoding (10 MiB).
+/// Matches the caller's `MAX_INFERENCE_BUF` limit.
+const MAX_CHUNKED_BODY: usize = 10 * 1024 * 1024;
+
+/// Maximum number of chunks to process.  Normal HTTP clients send the body
+/// in a handful of large chunks; thousands of tiny chunks indicate abuse.
+const MAX_CHUNK_COUNT: usize = 4096;
+
 /// Parse an HTTP chunked body from `buf[start..]`.
 ///
 /// Returns `(decoded_body, total_consumed_bytes_from_buf_start)` when complete,
-/// or `None` if more bytes are needed.
+/// or `None` if more bytes are needed or resource limits are exceeded.
 fn parse_chunked_body(buf: &[u8], start: usize) -> Option<(Vec<u8>, usize)> {
     let mut pos = start;
     let mut body = Vec::new();
+    let mut chunk_count: usize = 0;
 
     loop {
+        chunk_count += 1;
+        if chunk_count > MAX_CHUNK_COUNT {
+            return None;
+        }
+
         let size_line_end = find_crlf(buf, pos)?;
         let size_line = std::str::from_utf8(&buf[pos..size_line_end]).ok()?;
         let size_token = size_line.split(';').next()?.trim();
         let chunk_size = usize::from_str_radix(size_token, 16).ok()?;
-        pos = size_line_end + 2;
+        pos = size_line_end.checked_add(2)?;
 
         if chunk_size == 0 {
             // Parse trailers (if any). Terminates on empty trailer line.
             loop {
                 let trailer_end = find_crlf(buf, pos)?;
                 let trailer_line = &buf[pos..trailer_end];
-                pos = trailer_end + 2;
+                pos = trailer_end.checked_add(2)?;
                 if trailer_line.is_empty() {
                     return Some((body, pos));
                 }
             }
         }
 
-        let chunk_end = pos.checked_add(chunk_size)?;
-        if buf.len() < chunk_end + 2 {
+        // Early reject: chunk cannot possibly fit in remaining buffer.
+        let remaining = buf.len().saturating_sub(pos);
+        if chunk_size > remaining {
             return None;
         }
-        if &buf[chunk_end..chunk_end + 2] != b"\r\n" {
+
+        // Reject if decoded body would exceed size limit.
+        if body.len().saturating_add(chunk_size) > MAX_CHUNKED_BODY {
+            return None;
+        }
+
+        let chunk_end = pos.checked_add(chunk_size)?;
+        let chunk_crlf_end = chunk_end.checked_add(2)?;
+        if buf.len() < chunk_crlf_end {
+            return None;
+        }
+        if &buf[chunk_end..chunk_crlf_end] != b"\r\n" {
             return None;
         }
 
         body.extend_from_slice(&buf[pos..chunk_end]);
-        pos = chunk_end + 2;
+        pos = chunk_crlf_end;
     }
 }
 
@@ -483,5 +509,47 @@ mod tests {
         assert!(chunk.starts_with(b"100\r\n"));
         assert!(chunk.ends_with(b"\r\n"));
         assert_eq!(chunk.len(), 3 + 2 + 256 + 2); // "100" + \r\n + data + \r\n
+    }
+
+    // ---- SEC-010: parse_chunked_body resource limits ----
+
+    #[test]
+    fn parse_chunked_multi_chunk_body() {
+        // Two chunks: 5 bytes + 6 bytes
+        let request = b"POST /v1/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n";
+        let ParseResult::Complete(parsed, _) = try_parse_http_request(request) else {
+            panic!("expected Complete");
+        };
+        assert_eq!(parsed.body, b"hello world");
+    }
+
+    #[test]
+    fn parse_chunked_rejects_too_many_chunks() {
+        // Build a request with MAX_CHUNK_COUNT + 1 tiny chunks
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"POST /v1/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        for _ in 0..=MAX_CHUNK_COUNT {
+            buf.extend_from_slice(b"1\r\nX\r\n");
+        }
+        buf.extend_from_slice(b"0\r\n\r\n");
+        assert!(matches!(
+            try_parse_http_request(&buf),
+            ParseResult::Incomplete
+        ));
+    }
+
+    #[test]
+    fn parse_chunked_within_chunk_count_limit() {
+        // MAX_CHUNK_COUNT chunks should succeed
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"POST /v1/chat HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n");
+        for _ in 0..100 {
+            buf.extend_from_slice(b"1\r\nX\r\n");
+        }
+        buf.extend_from_slice(b"0\r\n\r\n");
+        let ParseResult::Complete(parsed, _) = try_parse_http_request(&buf) else {
+            panic!("expected Complete for 100 chunks");
+        };
+        assert_eq!(parsed.body.len(), 100);
     }
 }
