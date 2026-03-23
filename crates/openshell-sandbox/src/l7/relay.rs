@@ -264,13 +264,15 @@ where
         request_count += 1;
 
         // Log for observability.
+        let has_creds = resolver.is_some();
         info!(
             host = %ctx.host,
             port = ctx.port,
             method = %req.action,
             path = %req.target,
+            credentials_injected = has_creds,
             request_num = request_count,
-            "HTTP relay (credential injection)"
+            "HTTP_REQUEST",
         );
 
         // Forward request with credential rewriting.
