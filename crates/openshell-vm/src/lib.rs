@@ -161,13 +161,7 @@ impl VmConfig {
             ],
             workdir: "/".to_string(),
             port_map: vec![
-                // kube-apiserver — k3s runs the API server with host
-                // networking so it listens on VM:6443 directly.  The
-                // host-side readiness check (`wait_for_gateway_service`)
-                // and `recover_stale_pods` both use kubectl against
-                // 127.0.0.1:6443 via the copied kubeconfig.
-                "6443:6443".to_string(),
-                // Navigator server — with bridge CNI the pod listens on
+                // OpenShell server — with bridge CNI the pod listens on
                 // 8080 inside its own network namespace (10.42.0.x), not
                 // on the VM's root namespace. The NodePort service
                 // (kube-proxy nftables) forwards VM:30051 → pod:8080.
@@ -955,88 +949,27 @@ pub fn launch(config: &VmConfig) -> Result<i32, VmError> {
                 );
             }
 
-            // Wait for k3s kubeconfig to appear (virtio-fs makes it
-            // visible on the host). Only do this for the gateway preset
-            // (when exec_path is the default init script).
+            // Bootstrap the OpenShell control plane and wait for the
+            // service to be reachable. Only for the gateway preset.
             if config.exec_path == "/srv/gateway-init.sh" {
-                let kubeconfig_src = config.rootfs.join("etc/rancher/k3s/k3s.yaml");
-                let kc_start = Instant::now();
-                eprintln!("Waiting for kubeconfig...");
-
-                // Aggressive polling initially (100ms) then back off to 1s.
-                // Total budget: ~90s (enough for k3s cold start).
-                let mut found = false;
-                let deadline = Instant::now() + std::time::Duration::from_secs(90);
-                let mut interval = std::time::Duration::from_millis(100);
-                while Instant::now() < deadline {
-                    if kubeconfig_src.is_file()
-                        && std::fs::metadata(&kubeconfig_src)
-                            .map(|m| m.len() > 0)
-                            .unwrap_or(false)
-                    {
-                        found = true;
-                        break;
-                    }
-                    std::thread::sleep(interval);
-                    interval = (interval * 2).min(std::time::Duration::from_secs(1));
+                // Bootstrap stores host-side metadata and mTLS creds.
+                // With pre-baked rootfs (Path 1) this reads PKI directly
+                // from virtio-fs — no kubectl or port forwarding needed.
+                // Cold boot (Path 2) writes secret manifests into the
+                // k3s auto-deploy directory via virtio-fs.
+                if let Err(e) = bootstrap_gateway(&config.rootfs) {
+                    eprintln!("Bootstrap failed: {e}");
+                    eprintln!("  The VM is running but OpenShell may not be fully operational.");
                 }
 
-                if found {
-                    eprintln!(
-                        "Kubeconfig appeared [{:.1}s]",
-                        kc_start.elapsed().as_secs_f64()
-                    );
-                    // Copy kubeconfig to ~/.kube/gateway.yaml, rewriting
-                    // the server URL to point at the forwarded host port.
-                    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                    let kube_dir = PathBuf::from(&home).join(".kube");
-                    let _ = std::fs::create_dir_all(&kube_dir);
-                    let dest = kube_dir.join("gateway.yaml");
-
-                    match std::fs::read_to_string(&kubeconfig_src) {
-                        Ok(contents) => {
-                            if let Err(e) = std::fs::write(&dest, &contents) {
-                                eprintln!("  failed to write kubeconfig: {e}");
-                            } else {
-                                eprintln!("Kubeconfig: {}", dest.display());
-                                eprintln!("  export KUBECONFIG={}", dest.display());
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("  failed to read kubeconfig: {e}");
-                        }
-                    }
-
-                    // Bootstrap the OpenShell control plane: generate PKI,
-                    // create TLS secrets, and store cluster metadata so CLI
-                    // clients and e2e tests can connect.
-                    //
-                    // If the rootfs has pre-baked PKI (from build-rootfs.sh),
-                    // this skips the namespace wait and kubectl apply entirely.
-                    if let Err(e) = bootstrap_gateway(&dest, &config.rootfs) {
-                        eprintln!("Bootstrap failed: {e}");
-                        eprintln!(
-                            "  The VM is running but OpenShell may not be fully operational."
-                        );
-                    }
-                } else {
-                    eprintln!("  kubeconfig not found after 90s (k3s may still be starting)");
-                }
-
-                // On warm reboots (rootfs persists via virtio-fs), the k3s
-                // database may have stale pod records from the previous
-                // session. containerd v2 doesn't always recover these
-                // automatically. Force-delete any pods stuck in Unknown
-                // or failed state so the StatefulSet controller recreates
-                // them.
-                let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-                let kubeconfig_dest = PathBuf::from(&home).join(".kube/gateway.yaml");
-                recover_stale_pods(&kubeconfig_dest);
-
-                // Wait for the gRPC service to be reachable before
-                // declaring "Ready". The openshell pod needs a few
-                // seconds after k3s starts to bind its port.
+                // Wait for the gRPC service to be reachable via TCP
+                // probe on host:30051. This confirms the full path
+                // (gvproxy → kube-proxy nftables → pod:8080) is working.
                 wait_for_gateway_service();
+
+                // Best-effort: copy kubeconfig for manual debugging.
+                // Not blocking — the boot pipeline doesn't need it.
+                copy_kubeconfig_best_effort(&config.rootfs);
             }
 
             eprintln!("Ready [{:.1}s total]", boot_start.elapsed().as_secs_f64());
@@ -1092,18 +1025,25 @@ const GATEWAY_PORT: u16 = 30051;
 
 /// Bootstrap the OpenShell control plane after k3s is ready.
 ///
-/// Three paths, fastest first:
+/// All operations use the virtio-fs rootfs — no kubectl or API server
+/// port forwarding required. This avoids exposing port 6443 outside the
+/// VM.
 ///
-/// 1. **Pre-baked PKI** (from `build-rootfs.sh`): reads PEM files directly
-///    from the rootfs, stores creds + metadata on the host. No cluster
-///    interaction at all. Completes in <50ms.
+/// Three paths, in priority order:
+///
+/// 1. **Pre-baked rootfs** (from `build-rootfs.sh`): PKI files at
+///    `rootfs/opt/openshell/pki/`. TLS secrets already exist in the k3s
+///    database. Reads certs from the filesystem and stores metadata on the
+///    host.
 ///
 /// 2. **Warm boot**: host-side metadata + mTLS certs survive across VM
-///    restarts. Waits for the openshell namespace, then returns.
+///    restarts. Nothing to do — service readiness is confirmed by the TCP
+///    probe in `wait_for_gateway_service()`.
 ///
-/// 3. **Cold boot**: generates fresh PKI, waits for namespace, applies
-///    secrets via kubectl, stores everything on the host.
-fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
+/// 3. **Cold boot**: generates fresh PKI and writes TLS secret manifests
+///    into the k3s auto-deploy directory (`/var/lib/rancher/k3s/server/manifests/`)
+///    via virtio-fs. k3s picks them up automatically.
+fn bootstrap_gateway(rootfs: &Path) -> Result<(), VmError> {
     let bootstrap_start = Instant::now();
 
     // Build gateway metadata early — it only depends on knowing the port and
@@ -1167,15 +1107,10 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
     // ── Path 2: Warm boot ──────────────────────────────────────────
     //
     // Host-side metadata + mTLS certs survive from a previous boot.
-    // Just wait for the namespace to confirm k3s is ready.
-    let kc = kubeconfig
-        .to_str()
-        .ok_or_else(|| VmError::InvalidPath(kubeconfig.display().to_string()))?;
-
+    // Service readiness is confirmed by the TCP probe in
+    // `wait_for_gateway_service()` — no kubectl needed here.
     if is_warm_boot() {
         eprintln!("Warm boot detected — reusing existing PKI and metadata.");
-        eprintln!("Waiting for openshell namespace...");
-        wait_for_namespace(kc)?;
         eprintln!(
             "Warm boot ready [{:.1}s]",
             bootstrap_start.elapsed().as_secs_f64()
@@ -1187,6 +1122,10 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
     }
 
     // ── Path 3: Cold boot (no pre-baked state) ─────────────────────
+    //
+    // Generate fresh PKI and write TLS secret manifests into the k3s
+    // auto-deploy directory via virtio-fs. k3s watches this directory
+    // and applies any YAML files automatically.
     eprintln!("Generating TLS certificates...");
     let pki_bundle = openshell_bootstrap::pki::generate_pki(&[])
         .map_err(|e| VmError::Bootstrap(format!("PKI generation failed: {e}")))?;
@@ -1194,13 +1133,12 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
     openshell_bootstrap::store_gateway_metadata(GATEWAY_CLUSTER_NAME, &metadata)
         .map_err(|e| VmError::Bootstrap(format!("failed to store cluster metadata: {e}")))?;
 
-    let ns_start = Instant::now();
-    eprintln!("Waiting for openshell namespace...");
-    wait_for_namespace(kc)?;
-    eprintln!("Namespace ready [{:.1}s]", ns_start.elapsed().as_secs_f64());
-
-    eprintln!("Creating TLS secrets...");
-    apply_tls_secrets(kc, &pki_bundle)?;
+    // Write TLS secrets as k3s auto-deploy manifests via virtio-fs.
+    // k3s watches /var/lib/rancher/k3s/server/manifests/ and applies
+    // any YAML files dropped there, eliminating the need for kubectl
+    // or API server port forwarding.
+    eprintln!("Writing TLS secret manifests via virtio-fs...");
+    write_tls_secret_manifests(rootfs, &pki_bundle)?;
 
     openshell_bootstrap::mtls::store_pki_bundle(GATEWAY_CLUSTER_NAME, &pki_bundle)
         .map_err(|e| VmError::Bootstrap(format!("failed to store mTLS credentials: {e}")))?;
@@ -1225,9 +1163,10 @@ fn bootstrap_gateway(kubeconfig: &Path, rootfs: &Path) -> Result<(), VmError> {
 /// - Cluster metadata exists: `$XDG_CONFIG_HOME/openshell/gateways/gateway/metadata.json`
 /// - mTLS certs exist: `$XDG_CONFIG_HOME/openshell/gateways/gateway/mtls/{ca.crt,tls.crt,tls.key}`
 ///
-/// When true, the host-side bootstrap (PKI generation, kubectl apply, metadata
-/// storage) can be skipped because the virtio-fs rootfs persists k3s state
-/// (TLS certs, kine/sqlite, containerd images, helm releases) across VM restarts.
+/// When true, the host-side bootstrap (PKI generation, secret manifest writing,
+/// metadata storage) can be skipped because the virtio-fs rootfs persists k3s
+/// state (TLS certs, kine/sqlite, containerd images, helm releases) across VM
+/// restarts.
 fn is_warm_boot() -> bool {
     let Ok(home) = std::env::var("HOME") else {
         return false;
@@ -1267,50 +1206,24 @@ fn is_warm_boot() -> bool {
 /// across boots so the native snapshotter doesn't re-extract image layers.
 /// Runtime task state is cleaned by `gateway-init.sh` on each boot.
 ///
-/// We poll kubectl for `Ready=True`, then verify with a host-side TCP
-/// probe to `127.0.0.1:30051` to confirm the full gvproxy->VM->pod
-/// path works. gvproxy accepts TCP connections even when nothing listens
-/// in the guest, but those connections reset immediately. A connection
-/// that stays open (server waiting for TLS `ClientHello`) proves the pod
-/// is genuinely serving.
+/// Wait for the OpenShell gRPC service to be reachable from the host.
+///
+/// Polls `host_tcp_probe()` on `127.0.0.1:30051` with 1s intervals.
+/// The probe confirms the full networking path: gvproxy → kube-proxy
+/// nftables → pod:8080. A successful probe means the pod is running,
+/// the NodePort service is routing, and the server is accepting
+/// connections. No kubectl or API server access required.
 fn wait_for_gateway_service() {
     let start = Instant::now();
     let timeout = std::time::Duration::from_secs(90);
     let poll_interval = std::time::Duration::from_secs(1);
 
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let kubeconfig = PathBuf::from(&home).join(".kube/gateway.yaml");
-    let kc = kubeconfig.to_string_lossy();
-
     eprintln!("Waiting for gateway service...");
 
     loop {
-        // Check if the pod is Ready.
-        let is_ready = std::process::Command::new("kubectl")
-            .args(["--kubeconfig", &kc])
-            .args([
-                "-n",
-                "openshell",
-                "get",
-                "pod",
-                "openshell-0",
-                "-o",
-                "jsonpath={.status.conditions[?(@.type==\"Ready\")].status}",
-            ])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-            .is_some_and(|s| s == "True");
-
-        if is_ready {
-            // Pod reports Ready — verify with a host-side TCP probe to
-            // confirm the full gvproxy -> VM -> pod path works.
-            if host_tcp_probe() {
-                eprintln!("Service healthy [{:.1}s]", start.elapsed().as_secs_f64());
-                return;
-            }
-            eprintln!("  pod Ready but host TCP probe failed, retrying...");
+        if host_tcp_probe() {
+            eprintln!("Service healthy [{:.1}s]", start.elapsed().as_secs_f64());
+            return;
         }
 
         if start.elapsed() >= timeout {
@@ -1322,95 +1235,6 @@ fn wait_for_gateway_service() {
         }
 
         std::thread::sleep(poll_interval);
-    }
-}
-
-/// Force-delete pods stuck in `Unknown` or failed states (safety net).
-///
-/// On warm reboots (virtio-fs persists rootfs across VM restarts), the
-/// k3s database retains pod records from the previous session. Containerd
-/// runtime task state is cleaned but metadata (meta.db) is preserved to
-/// avoid re-extracting image layers. This function is a safety net for
-/// edge cases where reconciliation fails — it force-deletes pods in
-/// `Unknown` or `Failed` state so controllers can recreate them.
-fn recover_stale_pods(kubeconfig: &Path) {
-    let kc = kubeconfig.to_string_lossy();
-
-    // Wait briefly for the API server to be responsive.
-    let deadline = Instant::now() + std::time::Duration::from_secs(30);
-    let mut interval = std::time::Duration::from_millis(500);
-    loop {
-        if let Ok(output) = std::process::Command::new("kubectl")
-            .args(["--kubeconfig", &kc])
-            .args(["get", "nodes", "-o", "name"])
-            .output()
-        {
-            if output.status.success() {
-                break;
-            }
-        }
-        if Instant::now() >= deadline {
-            eprintln!("  API server not ready after 30s, skipping pod recovery");
-            return;
-        }
-        std::thread::sleep(interval);
-        interval = (interval * 2).min(std::time::Duration::from_secs(2));
-    }
-
-    // Get all pods in a parseable format: namespace/name status
-    let output = std::process::Command::new("kubectl")
-        .args(["--kubeconfig", &kc])
-        .args([
-            "get", "pods", "-A",
-            "-o", "jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name} {.status.phase}\\n{end}",
-        ])
-        .output();
-
-    let Ok(output) = output else { return };
-    if !output.status.success() {
-        return;
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let mut stale_count = 0u32;
-
-    for line in stdout.lines() {
-        let parts: Vec<&str> = line.trim().split_whitespace().collect();
-        if parts.len() != 2 {
-            continue;
-        }
-        let (ns_name, phase) = (parts[0], parts[1]);
-        // Delete pods in Unknown or Failed state — they can't recover
-        // from stale containerd sandbox state.
-        if phase == "Unknown" || phase == "Failed" {
-            let ns_and_name: Vec<&str> = ns_name.splitn(2, '/').collect();
-            if ns_and_name.len() != 2 {
-                continue;
-            }
-            let (ns, name) = (ns_and_name[0], ns_and_name[1]);
-            let result = std::process::Command::new("kubectl")
-                .args(["--kubeconfig", &kc])
-                .args([
-                    "-n",
-                    ns,
-                    "delete",
-                    "pod",
-                    name,
-                    "--force",
-                    "--grace-period=0",
-                ])
-                .output();
-
-            if let Ok(r) = result {
-                if r.status.success() {
-                    stale_count += 1;
-                }
-            }
-        }
-    }
-
-    if stale_count > 0 {
-        eprintln!("Recovered {stale_count} stale pod(s)");
     }
 }
 
@@ -1451,146 +1275,107 @@ fn host_tcp_probe() -> bool {
     }
 }
 
-/// Poll kubectl until the `openshell` namespace exists.
+/// Write TLS secret manifests into the k3s auto-deploy directory via virtio-fs.
 ///
-/// Uses exponential backoff (500ms → 3s) to minimize latency when the
-/// namespace appears quickly while avoiding kubectl spam.
-fn wait_for_namespace(kubeconfig: &str) -> Result<(), VmError> {
-    let start = Instant::now();
-    let timeout = std::time::Duration::from_secs(180);
-    let mut interval = std::time::Duration::from_millis(500);
-    let mut attempts = 0u32;
-
-    loop {
-        let output = std::process::Command::new("kubectl")
-            .args(["--kubeconfig", kubeconfig])
-            .args(["get", "namespace", "openshell", "-o", "name"])
-            .output();
-
-        if let Ok(output) = output
-            && output.status.success()
-        {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if stdout.contains("openshell") {
-                return Ok(());
-            }
-        }
-
-        if start.elapsed() >= timeout {
-            return Err(VmError::Bootstrap(
-                "timed out waiting for openshell namespace (180s). \
-                 Check console.log for k3s errors."
-                    .to_string(),
-            ));
-        }
-
-        attempts += 1;
-        if attempts.is_multiple_of(10) {
-            eprintln!(
-                "  still waiting for openshell namespace ({:.0}s elapsed)",
-                start.elapsed().as_secs_f64()
-            );
-        }
-
-        std::thread::sleep(interval);
-        interval = (interval * 2).min(std::time::Duration::from_secs(3));
-    }
-}
-
-/// Apply the three TLS K8s secrets required by the OpenShell server.
-///
-/// Uses `kubectl apply -f -` on the host, piping JSON manifests via stdin.
-fn apply_tls_secrets(
-    kubeconfig: &str,
+/// k3s watches `/var/lib/rancher/k3s/server/manifests/` and automatically
+/// applies any YAML files placed there. This avoids the need for kubectl
+/// or API server port forwarding from the host.
+fn write_tls_secret_manifests(
+    rootfs: &Path,
     bundle: &openshell_bootstrap::pki::PkiBundle,
 ) -> Result<(), VmError> {
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD;
 
-    let secrets = [
-        // 1. openshell-server-tls (kubernetes.io/tls)
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": openshell_bootstrap::constants::SERVER_TLS_SECRET_NAME,
-                "namespace": "openshell"
-            },
-            "type": "kubernetes.io/tls",
-            "data": {
-                "tls.crt": STANDARD.encode(&bundle.server_cert_pem),
-                "tls.key": STANDARD.encode(&bundle.server_key_pem)
-            }
-        }),
-        // 2. openshell-server-client-ca (Opaque)
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": openshell_bootstrap::constants::SERVER_CLIENT_CA_SECRET_NAME,
-                "namespace": "openshell"
-            },
-            "type": "Opaque",
-            "data": {
-                "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
-            }
-        }),
-        // 3. openshell-client-tls (Opaque) — shared by CLI and sandbox pods
-        serde_json::json!({
-            "apiVersion": "v1",
-            "kind": "Secret",
-            "metadata": {
-                "name": openshell_bootstrap::constants::CLIENT_TLS_SECRET_NAME,
-                "namespace": "openshell"
-            },
-            "type": "Opaque",
-            "data": {
-                "tls.crt": STANDARD.encode(&bundle.client_cert_pem),
-                "tls.key": STANDARD.encode(&bundle.client_key_pem),
-                "ca.crt": STANDARD.encode(&bundle.ca_cert_pem)
-            }
-        }),
-    ];
+    let manifests_dir = rootfs.join("var/lib/rancher/k3s/server/manifests");
+    std::fs::create_dir_all(&manifests_dir)
+        .map_err(|e| VmError::Bootstrap(format!("failed to create manifests dir: {e}")))?;
 
-    for secret in &secrets {
-        let name = secret["metadata"]["name"].as_str().unwrap_or("unknown");
-        kubectl_apply(kubeconfig, &secret.to_string())
-            .map_err(|e| VmError::Bootstrap(format!("failed to create secret {name}: {e}")))?;
-        eprintln!("  secret/{name} created");
-    }
+    let server_tls_name = openshell_bootstrap::constants::SERVER_TLS_SECRET_NAME;
+    let client_ca_name = openshell_bootstrap::constants::SERVER_CLIENT_CA_SECRET_NAME;
+    let client_tls_name = openshell_bootstrap::constants::CLIENT_TLS_SECRET_NAME;
 
+    // Combine all three secrets into a single multi-document YAML file.
+    // k3s applies the entire file atomically.
+    let manifest = format!(
+        r#"---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshell
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {server_tls_name}
+  namespace: openshell
+type: kubernetes.io/tls
+data:
+  tls.crt: {server_crt}
+  tls.key: {server_key}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {client_ca_name}
+  namespace: openshell
+type: Opaque
+data:
+  ca.crt: {ca_crt}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {client_tls_name}
+  namespace: openshell
+type: Opaque
+data:
+  tls.crt: {client_crt}
+  tls.key: {client_key}
+  ca.crt: {ca_crt}
+"#,
+        server_crt = STANDARD.encode(&bundle.server_cert_pem),
+        server_key = STANDARD.encode(&bundle.server_key_pem),
+        ca_crt = STANDARD.encode(&bundle.ca_cert_pem),
+        client_crt = STANDARD.encode(&bundle.client_cert_pem),
+        client_key = STANDARD.encode(&bundle.client_key_pem),
+    );
+
+    let dest = manifests_dir.join("openshell-tls-secrets.yaml");
+    std::fs::write(&dest, manifest)
+        .map_err(|e| VmError::Bootstrap(format!("failed to write TLS manifest: {e}")))?;
+
+    eprintln!("  TLS secret manifests written to {}", dest.display());
     Ok(())
 }
 
-/// Run `kubectl apply -f -` with the given manifest piped via stdin.
-fn kubectl_apply(kubeconfig: &str, manifest: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let mut child = Command::new("kubectl")
-        .args(["--kubeconfig", kubeconfig, "apply", "-f", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("failed to spawn kubectl: {e}"))?;
-
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(manifest.as_bytes())
-            .map_err(|e| format!("failed to write manifest to kubectl stdin: {e}"))?;
+/// Best-effort: copy the k3s kubeconfig to `~/.kube/gateway.yaml` for
+/// manual debugging. Not required for the boot pipeline — runs after
+/// the service is already confirmed healthy.
+fn copy_kubeconfig_best_effort(rootfs: &Path) {
+    let kubeconfig_src = rootfs.join("etc/rancher/k3s/k3s.yaml");
+    if !kubeconfig_src.is_file() {
+        return;
     }
 
-    let output = child
-        .wait_with_output()
-        .map_err(|e| format!("failed to wait for kubectl: {e}"))?;
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    let kube_dir = PathBuf::from(&home).join(".kube");
+    let _ = std::fs::create_dir_all(&kube_dir);
+    let dest = kube_dir.join("gateway.yaml");
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("kubectl apply failed: {stderr}"));
+    match std::fs::read_to_string(&kubeconfig_src) {
+        Ok(contents) => {
+            if let Err(e) = std::fs::write(&dest, &contents) {
+                eprintln!("  failed to write kubeconfig: {e}");
+            } else {
+                eprintln!("Kubeconfig: {}", dest.display());
+                eprintln!("  export KUBECONFIG={}", dest.display());
+            }
+        }
+        Err(e) => {
+            eprintln!("  failed to read kubeconfig: {e}");
+        }
     }
-
-    Ok(())
 }
 
 static CHILD_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
