@@ -280,8 +280,12 @@ def test_update_provider_preserves_unset_credentials_and_config(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        # Credentials are redacted in gRPC responses (security hardening).
-        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
+        # Credential keys are preserved but values are redacted.
+        assert len(p.credentials) > 0, "credential keys should be preserved"
+        for key, val in p.credentials.items():
+            assert val == "REDACTED", (
+                f"credential '{key}' should be REDACTED, got '{val}'"
+            )
         assert p.config["BASE_URL"] == "https://example.com", (
             "config should be preserved"
         )
@@ -320,8 +324,12 @@ def test_update_provider_empty_maps_preserves_all(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        # Credentials are redacted in gRPC responses (security hardening).
-        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
+        # Credential keys are preserved but values are redacted.
+        assert len(p.credentials) > 0, "credential keys should be preserved"
+        for key, val in p.credentials.items():
+            assert val == "REDACTED", (
+                f"credential '{key}' should be REDACTED, got '{val}'"
+            )
         assert p.config["URL"] == "https://api.example.com"
     finally:
         _delete_provider(stub, name)
@@ -359,8 +367,12 @@ def test_update_provider_merges_config_preserves_credentials(
 
         got = stub.GetProvider(openshell_pb2.GetProviderRequest(name=name))
         p = got.provider
-        # Credentials are redacted in gRPC responses (security hardening).
-        assert len(p.credentials) == 0, "credentials must be redacted in gRPC responses"
+        # Credential keys are preserved but values are redacted.
+        assert len(p.credentials) > 0, "credential keys should be preserved"
+        for key, val in p.credentials.items():
+            assert val == "REDACTED", (
+                f"credential '{key}' should be REDACTED, got '{val}'"
+            )
         assert p.config["ENDPOINT"] == "https://new.example.com"
     finally:
         _delete_provider(stub, name)
