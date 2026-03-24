@@ -67,6 +67,7 @@ async fn proxy_forwards_request_to_backend() {
             vec![("content-type".to_string(), "application/json".to_string())],
             bytes::Bytes::from(body),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -99,6 +100,7 @@ async fn proxy_upstream_401_returns_error() {
             vec![],
             bytes::Bytes::new(),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -129,6 +131,7 @@ async fn proxy_no_compatible_route_returns_error() {
             vec![],
             bytes::Bytes::new(),
             &candidates,
+            None,
         )
         .await
         .unwrap_err();
@@ -162,6 +165,7 @@ async fn proxy_strips_auth_header() {
             vec![("authorization".to_string(), "Bearer client-key".to_string())],
             bytes::Bytes::new(),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -197,6 +201,7 @@ async fn proxy_mock_route_returns_canned_response() {
             vec![("content-type".to_string(), "application/json".to_string())],
             bytes::Bytes::from(body),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -242,6 +247,7 @@ async fn proxy_overrides_model_in_request_body() {
             vec![("content-type".to_string(), "application/json".to_string())],
             bytes::Bytes::from(body),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -280,6 +286,7 @@ async fn proxy_inserts_model_when_absent_from_body() {
             vec![("content-type".to_string(), "application/json".to_string())],
             bytes::Bytes::from(body),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -336,6 +343,7 @@ async fn proxy_uses_x_api_key_for_anthropic_route() {
             ],
             bytes::Bytes::from(body),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -385,6 +393,7 @@ async fn proxy_anthropic_does_not_send_bearer_auth() {
             vec![("content-type".to_string(), "application/json".to_string())],
             bytes::Bytes::from(b"{}".to_vec()),
             &candidates,
+            None,
         )
         .await
         .unwrap();
@@ -442,6 +451,7 @@ async fn proxy_forwards_client_anthropic_version_header() {
             ],
             bytes::Bytes::from(body),
             &candidates,
+            None,
         )
         .await
         .unwrap();

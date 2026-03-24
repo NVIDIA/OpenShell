@@ -34,6 +34,28 @@ pub struct Router {
     client: reqwest::Client,
 }
 
+/// Select a route from `candidates` using alias-first, protocol-fallback strategy.
+///
+/// 1. If `model_hint` is provided, find a candidate whose `name` matches the hint
+///    **and** whose protocols include `protocol`.
+/// 2. Otherwise, return the first candidate whose protocols contain `protocol`.
+fn select_route<'a>(
+    candidates: &'a [ResolvedRoute],
+    protocol: &str,
+    model_hint: Option<&str>,
+) -> Option<&'a ResolvedRoute> {
+    if let Some(hint) = model_hint {
+        if let Some(r) = candidates.iter().find(|r| {
+            r.name == hint && r.protocols.iter().any(|p| p == protocol)
+        }) {
+            return Some(r);
+        }
+    }
+    candidates
+        .iter()
+        .find(|r| r.protocols.iter().any(|p| p == protocol))
+}
+
 impl Router {
     pub fn new() -> Result<Self, RouterError> {
         let client = reqwest::Client::builder()
@@ -54,8 +76,10 @@ impl Router {
 
     /// Proxy a raw HTTP request to the first compatible route from `candidates`.
     ///
-    /// Filters candidates by `source_protocol` compatibility (exact match against
-    /// one of the route's `protocols`), then forwards to the first match.
+    /// When `model_hint` is provided, the router first looks for a candidate whose
+    /// `name` (alias) matches the hint.  If no alias matches, it falls back to
+    /// protocol-based selection (first candidate whose `protocols` list contains
+    /// `source_protocol`).
     pub async fn proxy_with_candidates(
         &self,
         source_protocol: &str,
@@ -64,11 +88,10 @@ impl Router {
         headers: Vec<(String, String)>,
         body: bytes::Bytes,
         candidates: &[ResolvedRoute],
+        model_hint: Option<&str>,
     ) -> Result<ProxyResponse, RouterError> {
         let normalized_source = source_protocol.trim().to_ascii_lowercase();
-        let route = candidates
-            .iter()
-            .find(|r| r.protocols.iter().any(|p| p == &normalized_source))
+        let route = select_route(candidates, &normalized_source, model_hint)
             .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
 
         info!(
@@ -108,11 +131,10 @@ impl Router {
         headers: Vec<(String, String)>,
         body: bytes::Bytes,
         candidates: &[ResolvedRoute],
+        model_hint: Option<&str>,
     ) -> Result<StreamingProxyResponse, RouterError> {
         let normalized_source = source_protocol.trim().to_ascii_lowercase();
-        let route = candidates
-            .iter()
-            .find(|r| r.protocols.iter().any(|p| p == &normalized_source))
+        let route = select_route(candidates, &normalized_source, model_hint)
             .ok_or_else(|| RouterError::NoCompatibleRoute(source_protocol.to_string()))?;
 
         info!(
@@ -183,5 +205,58 @@ mod tests {
         };
         let err = Router::from_config(&config).unwrap_err();
         assert!(matches!(err, RouterError::Internal(_)));
+    }
+
+    fn make_route(name: &str, protocols: Vec<&str>) -> ResolvedRoute {
+        ResolvedRoute {
+            name: name.to_string(),
+            endpoint: "http://localhost".to_string(),
+            model: format!("{name}-model"),
+            api_key: "key".to_string(),
+            protocols: protocols.into_iter().map(String::from).collect(),
+            auth: config::AuthHeader::Bearer,
+            default_headers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn select_route_protocol_fallback_when_no_hint() {
+        let routes = vec![
+            make_route("ollama-local", vec!["openai_chat_completions"]),
+            make_route("anthropic-prod", vec!["anthropic_messages"]),
+        ];
+        let r = select_route(&routes, "anthropic_messages", None).unwrap();
+        assert_eq!(r.name, "anthropic-prod");
+    }
+
+    #[test]
+    fn select_route_alias_match_takes_priority() {
+        let routes = vec![
+            make_route("ollama-local", vec!["openai_chat_completions"]),
+            make_route("openai-prod", vec!["openai_chat_completions", "openai_responses"]),
+        ];
+        // Both support openai_chat_completions, but hint selects the second one.
+        let r = select_route(&routes, "openai_chat_completions", Some("openai-prod")).unwrap();
+        assert_eq!(r.name, "openai-prod");
+    }
+
+    #[test]
+    fn select_route_alias_must_also_match_protocol() {
+        let routes = vec![
+            make_route("ollama-local", vec!["openai_chat_completions"]),
+            make_route("anthropic-prod", vec!["anthropic_messages"]),
+        ];
+        // Hint says "anthropic-prod" but protocol is openai_chat_completions — can't use it.
+        // Falls back to protocol match → ollama-local.
+        let r = select_route(&routes, "openai_chat_completions", Some("anthropic-prod")).unwrap();
+        assert_eq!(r.name, "ollama-local");
+    }
+
+    #[test]
+    fn select_route_no_match_returns_none() {
+        let routes = vec![
+            make_route("ollama-local", vec!["openai_chat_completions"]),
+        ];
+        assert!(select_route(&routes, "anthropic_messages", None).is_none());
     }
 }

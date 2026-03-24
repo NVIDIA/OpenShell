@@ -28,12 +28,26 @@ service Inference {
 // Only `provider_name` and `model_id` are stored; endpoint, protocols,
 // credentials, and auth style are resolved from the provider at bundle time.
 message ClusterInferenceConfig {
-  // Provider record name backing this route.
+  // Provider record name backing this route (legacy single-model).
   string provider_name = 1;
-  // Model identifier to force on generation calls.
+  // Model identifier to force on generation calls (legacy single-model).
   string model_id = 2;
   // Per-route request timeout in seconds. 0 means use default (60s).
   uint64 timeout_secs = 3;
+  // Multi-model entries. When non-empty, takes precedence over the single
+  // provider_name/model_id fields above.
+  repeated InferenceModelEntry models = 4;
+}
+
+// A single model entry within a multi-model inference configuration.
+message InferenceModelEntry {
+  // Short alias used by agents in the "model" field (e.g. "qwen-coder").
+  // The proxy matches this against the model field in API request payloads.
+  string alias = 1;
+  // Provider record name (e.g. "ollama-local", "openai-dev").
+  string provider_name = 2;
+  // Backend model identifier (e.g. "qwen3-coder:30b", "gpt-5.4").
+  string model_id = 3;
 }
 
 // Storage envelope for the managed cluster inference route.
@@ -48,9 +62,9 @@ message InferenceRoute {
 }
 
 message SetClusterInferenceRequest {
-  // Provider record name to use for credentials + endpoint mapping.
+  // Provider record name to use for credentials + endpoint mapping (legacy single-model).
   string provider_name = 1;
-  // Model identifier to force on generation calls.
+  // Model identifier to force on generation calls (legacy single-model).
   string model_id = 2;
   // Route name to target. Empty string defaults to "inference.local" (user-facing).
   // Use "sandbox-system" for the sandbox system-level inference route.
@@ -61,6 +75,9 @@ message SetClusterInferenceRequest {
   bool no_verify = 5;
   // Per-route request timeout in seconds. 0 means use default (60s).
   uint64 timeout_secs = 6;
+  // Multi-model entries. When non-empty, takes precedence over single
+  // provider_name/model_id above.
+  repeated InferenceModelEntry models = 7;
 }
 
 message ValidatedEndpoint {
@@ -80,6 +97,8 @@ message SetClusterInferenceResponse {
   repeated ValidatedEndpoint validated_endpoints = 6;
   // Per-route request timeout in seconds that was persisted.
   uint64 timeout_secs = 7;
+  // Multi-model entries that were configured (echoed back).
+  repeated InferenceModelEntry models = 8;
 }
 
 message GetClusterInferenceRequest {
@@ -96,6 +115,8 @@ message GetClusterInferenceResponse {
   string route_name = 4;
   // Per-route request timeout in seconds. 0 means default (60s).
   uint64 timeout_secs = 5;
+  // Multi-model entries when configured.
+  repeated InferenceModelEntry models = 6;
 }
 
 message GetInferenceBundleRequest {}

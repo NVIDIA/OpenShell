@@ -3,9 +3,9 @@
 
 use openshell_core::proto::{
     ClusterInferenceConfig, GetClusterInferenceRequest, GetClusterInferenceResponse,
-    GetInferenceBundleRequest, GetInferenceBundleResponse, InferenceRoute, Provider, ResolvedRoute,
-    SetClusterInferenceRequest, SetClusterInferenceResponse, ValidatedEndpoint,
-    inference_server::Inference,
+    GetInferenceBundleRequest, GetInferenceBundleResponse, InferenceModelEntry, InferenceRoute,
+    Provider, ResolvedRoute, SetClusterInferenceRequest, SetClusterInferenceResponse,
+    ValidatedEndpoint, inference_server::Inference,
 };
 use openshell_router::config::ResolvedRoute as RouterResolvedRoute;
 use openshell_router::{ValidationFailureKind, verify_backend_endpoint};
@@ -81,6 +81,36 @@ impl Inference for InferenceService {
         let req = request.into_inner();
         let route_name = effective_route_name(&req.route_name)?;
         let verify = !req.no_verify;
+
+        // Multi-model path: when models list is non-empty, use it.
+        if !req.models.is_empty() {
+            let result = upsert_multi_model_route(
+                self.state.store.as_ref(),
+                route_name,
+                &req.models,
+                verify,
+            )
+            .await?;
+
+            let config = result
+                .route
+                .config
+                .as_ref()
+                .ok_or_else(|| Status::internal("managed route missing config"))?;
+
+            return Ok(Response::new(SetClusterInferenceResponse {
+                provider_name: config.provider_name.clone(),
+                model_id: config.model_id.clone(),
+                version: result.route.version,
+                route_name: route_name.to_string(),
+                validation_performed: !result.validation.is_empty(),
+                validated_endpoints: result.validation,
+                timeout_secs: config.timeout_secs,
+                models: config.models.clone(),
+            }));
+        }
+
+        // Legacy single-model path.
         let route = upsert_cluster_inference_route(
             self.state.store.as_ref(),
             route_name,
@@ -105,6 +135,7 @@ impl Inference for InferenceService {
             validation_performed: !route.validation.is_empty(),
             validated_endpoints: route.validation,
             timeout_secs: config.timeout_secs,
+            models: Vec::new(),
         }))
     }
 
@@ -143,6 +174,7 @@ impl Inference for InferenceService {
             version: route.version,
             route_name: route_name.to_string(),
             timeout_secs: config.timeout_secs,
+            models: config.models.clone(),
         }))
     }
 }
@@ -208,6 +240,110 @@ async fn upsert_cluster_inference_route(
     Ok(UpsertedInferenceRoute { route, validation })
 }
 
+/// Upsert a multi-model inference route.
+///
+/// Each entry in `models` is validated against its provider, then all entries
+/// are stored atomically in a single `ClusterInferenceConfig`.
+async fn upsert_multi_model_route(
+    store: &Store,
+    route_name: &str,
+    models: &[InferenceModelEntry],
+    verify: bool,
+) -> Result<UpsertedInferenceRoute, Status> {
+    if models.is_empty() {
+        return Err(Status::invalid_argument("models list is empty"));
+    }
+
+    // Validate aliases are unique.
+    let mut seen_aliases = std::collections::HashSet::new();
+    for entry in models {
+        if entry.alias.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "each model entry must have a non-empty alias",
+            ));
+        }
+        if entry.provider_name.trim().is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "model entry '{}' is missing provider_name",
+                entry.alias,
+            )));
+        }
+        if entry.model_id.trim().is_empty() {
+            return Err(Status::invalid_argument(format!(
+                "model entry '{}' is missing model_id",
+                entry.alias,
+            )));
+        }
+        let alias_key = entry.alias.trim().to_ascii_lowercase();
+        if !seen_aliases.insert(alias_key) {
+            return Err(Status::invalid_argument(format!(
+                "duplicate alias '{}'",
+                entry.alias,
+            )));
+        }
+    }
+
+    // Validate each entry's provider exists and is inference-capable.
+    let mut validation = Vec::new();
+    for entry in models {
+        let provider = store
+            .get_message_by_name::<Provider>(&entry.provider_name)
+            .await
+            .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+            .ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "provider '{}' (for alias '{}') not found",
+                    entry.provider_name, entry.alias,
+                ))
+            })?;
+
+        let resolved = resolve_provider_route(&provider)?;
+
+        if verify {
+            validation.push(
+                verify_provider_endpoint(&provider.name, &entry.model_id, &resolved).await?,
+            );
+        }
+    }
+
+    // Use the first entry's provider as the legacy single-model fields for
+    // backward compat (old clients reading the config see something useful).
+    let config = ClusterInferenceConfig {
+        provider_name: models[0].provider_name.clone(),
+        model_id: models[0].model_id.clone(),
+        timeout_secs: 0,
+        models: models.to_vec(),
+    };
+
+    let existing = store
+        .get_message_by_name::<InferenceRoute>(route_name)
+        .await
+        .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
+
+    let route = if let Some(existing) = existing {
+        InferenceRoute {
+            id: existing.id,
+            name: existing.name,
+            config: Some(config),
+            version: existing.version.saturating_add(1),
+        }
+    } else {
+        InferenceRoute {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: route_name.to_string(),
+            config: Some(config),
+            version: 1,
+        }
+    };
+
+    store
+        .put_message(&route)
+        .await
+        .map_err(|e| Status::internal(format!("persist route failed: {e}")))?;
+
+    Ok(UpsertedInferenceRoute { route, validation })
+}
+
 fn build_cluster_inference_config(
     provider: &Provider,
     model_id: &str,
@@ -217,6 +353,7 @@ fn build_cluster_inference_config(
         provider_name: provider.name.clone(),
         model_id: model_id.to_string(),
         timeout_secs,
+        models: Vec::new(),
     }
 }
 
@@ -381,12 +518,8 @@ fn find_provider_config_value(provider: &Provider, preferred_keys: &[&str]) -> O
 /// Resolve the inference bundle (all managed routes + revision hash).
 async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleResponse, Status> {
     let mut routes = Vec::new();
-    if let Some(r) = resolve_route_by_name(store, CLUSTER_INFERENCE_ROUTE_NAME).await? {
-        routes.push(r);
-    }
-    if let Some(r) = resolve_route_by_name(store, SANDBOX_SYSTEM_ROUTE_NAME).await? {
-        routes.push(r);
-    }
+    routes.extend(resolve_route_by_name(store, CLUSTER_INFERENCE_ROUTE_NAME).await?);
+    routes.extend(resolve_route_by_name(store, SANDBOX_SYSTEM_ROUTE_NAME).await?);
 
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -419,20 +552,49 @@ async fn resolve_inference_bundle(store: &Store) -> Result<GetInferenceBundleRes
 async fn resolve_route_by_name(
     store: &Store,
     route_name: &str,
-) -> Result<Option<ResolvedRoute>, Status> {
+) -> Result<Vec<ResolvedRoute>, Status> {
     let route = store
         .get_message_by_name::<InferenceRoute>(route_name)
         .await
         .map_err(|e| Status::internal(format!("fetch route failed: {e}")))?;
 
     let Some(route) = route else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
     let Some(config) = route.config.as_ref() else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
+    // Multi-model path: each model entry becomes a separate ResolvedRoute with name = alias.
+    if !config.models.is_empty() {
+        let mut results = Vec::with_capacity(config.models.len());
+        for entry in &config.models {
+            let provider = store
+                .get_message_by_name::<Provider>(&entry.provider_name)
+                .await
+                .map_err(|e| Status::internal(format!("fetch provider failed: {e}")))?
+                .ok_or_else(|| {
+                    Status::failed_precondition(format!(
+                        "configured provider '{}' was not found",
+                        entry.provider_name
+                    ))
+                })?;
+            let resolved = resolve_provider_route(&provider)?;
+            results.push(ResolvedRoute {
+                name: entry.alias.clone(),
+                base_url: resolved.route.endpoint,
+                model_id: entry.model_id.clone(),
+                api_key: resolved.route.api_key,
+                protocols: resolved.route.protocols,
+                provider_type: resolved.provider_type,
+                timeout_secs: config.timeout_secs,
+            });
+        }
+        return Ok(results);
+    }
+
+    // Legacy single-model path.
     if config.provider_name.trim().is_empty() {
         return Err(Status::failed_precondition(format!(
             "route '{route_name}' is missing provider_name"
@@ -458,7 +620,7 @@ async fn resolve_route_by_name(
 
     let resolved = resolve_provider_route(&provider)?;
 
-    Ok(Some(ResolvedRoute {
+    Ok(vec![ResolvedRoute {
         name: route_name.to_string(),
         base_url: resolved.route.endpoint,
         model_id: config.model_id.clone(),
@@ -466,7 +628,7 @@ async fn resolve_route_by_name(
         protocols: resolved.route.protocols,
         provider_type: resolved.provider_type,
         timeout_secs: config.timeout_secs,
-    }))
+    }])
 }
 
 #[cfg(test)]
@@ -483,6 +645,7 @@ mod tests {
                 provider_name: provider_name.to_string(),
                 model_id: model_id.to_string(),
                 timeout_secs: 0,
+                models: Vec::new(),
             }),
             version: 1,
         }
@@ -561,10 +724,10 @@ mod tests {
             .await
             .expect("store should connect");
 
-        let route = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
+        let routes = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("resolution should not fail");
-        assert!(route.is_none());
+        assert!(routes.is_empty());
     }
 
     #[tokio::test]
@@ -670,6 +833,7 @@ mod tests {
                 provider_name: "openai-dev".to_string(),
                 model_id: "test/model".to_string(),
                 timeout_secs: 0,
+                models: Vec::new(),
             }),
             version: 7,
         };
@@ -681,6 +845,8 @@ mod tests {
         let managed = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
+            .into_iter()
+            .next()
             .expect("managed route should exist");
 
         assert_eq!(managed.base_url, "https://station.example.com/v1");
@@ -718,6 +884,8 @@ mod tests {
         let first = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
+            .into_iter()
+            .next()
             .expect("managed route should exist");
         assert_eq!(first.api_key, "sk-initial");
 
@@ -737,6 +905,8 @@ mod tests {
         let second = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
             .await
             .expect("route should resolve")
+            .into_iter()
+            .next()
             .expect("managed route should exist");
         assert_eq!(second.api_key, "sk-rotated");
     }
@@ -1026,5 +1196,141 @@ mod tests {
     fn effective_route_name_rejects_unknown_name() {
         let err = effective_route_name("unknown-route").unwrap_err();
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn resolve_multi_model_route_returns_per_alias_routes() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-openai");
+        let anthropic = make_provider("anthropic-dev", "anthropic", "ANTHROPIC_API_KEY", "sk-ant");
+        store.put_message(&openai).await.expect("persist openai");
+        store
+            .put_message(&anthropic)
+            .await
+            .expect("persist anthropic");
+
+        let route = InferenceRoute {
+            id: "r-multi".to_string(),
+            name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
+            config: Some(ClusterInferenceConfig {
+                provider_name: "openai-dev".to_string(),
+                model_id: "gpt-4o".to_string(),
+                models: vec![
+                    InferenceModelEntry {
+                        alias: "my-gpt".to_string(),
+                        provider_name: "openai-dev".to_string(),
+                        model_id: "gpt-4o".to_string(),
+                    },
+                    InferenceModelEntry {
+                        alias: "my-claude".to_string(),
+                        provider_name: "anthropic-dev".to_string(),
+                        model_id: "claude-sonnet-4-20250514".to_string(),
+                    },
+                ],
+            }),
+            version: 1,
+        };
+        store.put_message(&route).await.expect("persist route");
+
+        let resolved = resolve_route_by_name(&store, CLUSTER_INFERENCE_ROUTE_NAME)
+            .await
+            .expect("should resolve");
+
+        assert_eq!(resolved.len(), 2);
+        assert_eq!(resolved[0].name, "my-gpt");
+        assert_eq!(resolved[0].model_id, "gpt-4o");
+        assert_eq!(resolved[0].provider_type, "openai");
+        assert_eq!(resolved[1].name, "my-claude");
+        assert_eq!(resolved[1].model_id, "claude-sonnet-4-20250514");
+        assert_eq!(resolved[1].provider_type, "anthropic");
+    }
+
+    #[tokio::test]
+    async fn bundle_with_multi_model_route_includes_all_aliases() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-openai");
+        let anthropic = make_provider("anthropic-dev", "anthropic", "ANTHROPIC_API_KEY", "sk-ant");
+        store.put_message(&openai).await.expect("persist openai");
+        store
+            .put_message(&anthropic)
+            .await
+            .expect("persist anthropic");
+
+        let route = InferenceRoute {
+            id: "r-multi".to_string(),
+            name: CLUSTER_INFERENCE_ROUTE_NAME.to_string(),
+            config: Some(ClusterInferenceConfig {
+                provider_name: "openai-dev".to_string(),
+                model_id: "gpt-4o".to_string(),
+                models: vec![
+                    InferenceModelEntry {
+                        alias: "my-gpt".to_string(),
+                        provider_name: "openai-dev".to_string(),
+                        model_id: "gpt-4o".to_string(),
+                    },
+                    InferenceModelEntry {
+                        alias: "my-claude".to_string(),
+                        provider_name: "anthropic-dev".to_string(),
+                        model_id: "claude-sonnet-4-20250514".to_string(),
+                    },
+                ],
+            }),
+            version: 1,
+        };
+        store.put_message(&route).await.expect("persist route");
+
+        let bundle = resolve_inference_bundle(&store)
+            .await
+            .expect("bundle should resolve");
+
+        assert_eq!(bundle.routes.len(), 2);
+        let names: Vec<&str> = bundle.routes.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"my-gpt"));
+        assert!(names.contains(&"my-claude"));
+    }
+
+    #[tokio::test]
+    async fn upsert_multi_model_route_stores_and_retrieves() {
+        let store = Store::connect("sqlite::memory:?cache=shared")
+            .await
+            .expect("store");
+
+        let openai = make_provider("openai-dev", "openai", "OPENAI_API_KEY", "sk-openai");
+        store.put_message(&openai).await.expect("persist");
+
+        let models = vec![InferenceModelEntry {
+            alias: "fast-gpt".to_string(),
+            provider_name: "openai-dev".to_string(),
+            model_id: "gpt-4o-mini".to_string(),
+        }];
+
+        let result = upsert_multi_model_route(
+            &store,
+            CLUSTER_INFERENCE_ROUTE_NAME,
+            &models,
+            false,
+        )
+        .await
+        .expect("upsert should succeed");
+
+        assert_eq!(result.route.version, 1);
+        assert_eq!(result.route.config.as_ref().unwrap().models.len(), 1);
+        assert_eq!(result.route.config.as_ref().unwrap().models[0].alias, "fast-gpt");
+
+        // Legacy fields should be populated from first entry
+        assert_eq!(
+            result.route.config.as_ref().unwrap().provider_name,
+            "openai-dev"
+        );
+        assert_eq!(
+            result.route.config.as_ref().unwrap().model_id,
+            "gpt-4o-mini"
+        );
     }
 }

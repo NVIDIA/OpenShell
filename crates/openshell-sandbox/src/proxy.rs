@@ -115,7 +115,7 @@ impl InferenceContext {
     ) -> Result<openshell_router::ProxyResponse, openshell_router::RouterError> {
         let routes = self.system_routes.read().await;
         self.router
-            .proxy_with_candidates(protocol, method, path, headers, body, &routes)
+            .proxy_with_candidates(protocol, method, path, headers, body, &routes, None)
             .await
     }
 }
@@ -1169,6 +1169,12 @@ async fn route_inference_request(
             return Ok(true);
         }
 
+        // Extract the model field from the JSON body as a routing hint.
+        // If parsing fails or model is absent, we fall back to protocol-only matching.
+        let model_hint = serde_json::from_slice::<serde_json::Value>(&request.body)
+            .ok()
+            .and_then(|v| v.get("model")?.as_str().map(String::from));
+
         match ctx
             .router
             .proxy_with_candidates_streaming(
@@ -1178,6 +1184,7 @@ async fn route_inference_request(
                 filtered_headers,
                 bytes::Bytes::from(request.body.clone()),
                 &routes,
+                model_hint.as_deref(),
             )
             .await
         {
