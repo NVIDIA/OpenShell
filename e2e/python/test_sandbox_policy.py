@@ -607,10 +607,14 @@ def test_ssrf_blocks_metadata_endpoint_despite_policy_allow(
         assert "403" in result.stdout
 
 
-def test_ssrf_log_shows_internal_address_block(
+def test_ssrf_log_shows_blocked_address(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-3: Proxy log includes 'internal address' reason when SSRF check fires."""
+    """SSRF-3: Proxy log includes block reason when SSRF check fires.
+
+    Loopback addresses are always-blocked even with implicit allowed_ips.
+    The log should show 'always-blocked' for 127.0.0.1.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(
@@ -629,8 +633,8 @@ def test_ssrf_log_shows_internal_address_block(
         log_result = sb.exec_python(_read_openshell_log())
         assert log_result.exit_code == 0, log_result.stderr
         log = log_result.stdout
-        assert "internal address" in log.lower(), (
-            f"Expected 'internal address' in proxy log, got:\n{log}"
+        assert "always-blocked" in log.lower(), (
+            f"Expected 'always-blocked' in proxy log, got:\n{log}"
         )
 
 
@@ -716,16 +720,21 @@ def test_ssrf_allowed_ips_hostless_permits_private_ip(
         )
 
 
-def test_ssrf_private_ip_blocked_without_allowed_ips(
+def test_ssrf_private_ip_allowed_with_literal_ip_host(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """SSRF-6: Private IP blocked when endpoint has no allowed_ips (default)."""
+    """SSRF-6: Private IP allowed when policy host is a literal IP address.
+
+    When the policy endpoint host is a literal IP, the user has explicitly
+    declared intent.  The proxy synthesizes an implicit allowed_ips entry,
+    so the CONNECT succeeds (200) even without explicit allowed_ips.
+    """
     policy = _base_policy(
         network_policies={
             "internal": sandbox_pb2.NetworkPolicyRule(
                 name="internal",
                 endpoints=[
-                    # No allowed_ips — private IP should be blocked
+                    # No allowed_ips — but host is a literal IP, so implicit
                     sandbox_pb2.NetworkEndpoint(host="10.200.0.1", port=19999),
                 ],
                 binaries=[sandbox_pb2.NetworkBinary(path="/**")],
@@ -736,8 +745,8 @@ def test_ssrf_private_ip_blocked_without_allowed_ips(
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(_proxy_connect(), args=("10.200.0.1", 19999))
         assert result.exit_code == 0, result.stderr
-        assert "403" in result.stdout, (
-            "Expected private IP to be blocked without allowed_ips"
+        assert "200" in result.stdout, (
+            f"Expected 200 for literal IP host, got: {result.stdout}"
         )
 
 
