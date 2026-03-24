@@ -44,6 +44,24 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             kind: "messages".to_string(),
         },
         InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/api/chat".to_string(),
+            protocol: "ollama_chat".to_string(),
+            kind: "ollama_chat".to_string(),
+        },
+        InferenceApiPattern {
+            method: "GET".to_string(),
+            path_glob: "/api/tags".to_string(),
+            protocol: "ollama_model_discovery".to_string(),
+            kind: "ollama_tags".to_string(),
+        },
+        InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/api/show".to_string(),
+            protocol: "ollama_model_discovery".to_string(),
+            kind: "ollama_show".to_string(),
+        },
+        InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/v1/models".to_string(),
             protocol: "model_discovery".to_string(),
@@ -392,6 +410,37 @@ mod tests {
     fn no_match_for_get() {
         let patterns = default_patterns();
         let result = detect_inference_pattern("GET", "/v1/chat/completions", &patterns);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn detect_ollama_chat() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("POST", "/api/chat", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "ollama_chat");
+    }
+
+    #[test]
+    fn detect_ollama_tags() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("GET", "/api/tags", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "ollama_model_discovery");
+    }
+
+    #[test]
+    fn detect_ollama_show() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("POST", "/api/show", &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().protocol, "ollama_model_discovery");
+    }
+
+    #[test]
+    fn no_match_ollama_chat_get() {
+        let patterns = default_patterns();
+        let result = detect_inference_pattern("GET", "/api/chat", &patterns);
         assert!(result.is_none());
     }
 

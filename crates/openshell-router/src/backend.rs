@@ -223,6 +223,20 @@ fn validation_probe(route: &ResolvedRoute) -> Result<ValidationProbe, Validation
         });
     }
 
+    if route
+        .protocols
+        .iter()
+        .any(|protocol| protocol == "ollama_chat")
+    {
+        return Ok(ValidationProbe {
+            path: "/api/chat",
+            protocol: "ollama_chat",
+            body: bytes::Bytes::from_static(
+                br#"{"model":"test","messages":[{"role":"user","content":"ping"}],"stream":false}"#,
+            ),
+        });
+    }
+
     Err(ValidationFailure {
         kind: ValidationFailureKind::RequestShape,
         details: format!(

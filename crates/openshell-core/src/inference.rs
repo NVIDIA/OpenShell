@@ -56,6 +56,14 @@ const OPENAI_PROTOCOLS: &[&str] = &[
 
 const ANTHROPIC_PROTOCOLS: &[&str] = &["anthropic_messages", "model_discovery"];
 
+const OLLAMA_PROTOCOLS: &[&str] = &[
+    "ollama_chat",
+    "ollama_model_discovery",
+    "openai_chat_completions",
+    "openai_completions",
+    "model_discovery",
+];
+
 static OPENAI_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     provider_type: "openai",
     default_base_url: "https://api.openai.com/v1",
@@ -86,6 +94,16 @@ static NVIDIA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
     default_headers: &[],
 };
 
+static OLLAMA_PROFILE: InferenceProviderProfile = InferenceProviderProfile {
+    provider_type: "ollama",
+    default_base_url: "http://host.openshell.internal:11434",
+    protocols: OLLAMA_PROTOCOLS,
+    credential_key_names: &["OLLAMA_API_KEY"],
+    base_url_config_keys: &["OLLAMA_BASE_URL", "OLLAMA_HOST"],
+    auth: AuthHeader::Bearer,
+    default_headers: &[],
+};
+
 /// Look up the inference provider profile for a given provider type.
 ///
 /// Returns `None` for provider types that don't support inference routing
@@ -95,6 +113,7 @@ pub fn profile_for(provider_type: &str) -> Option<&'static InferenceProviderProf
         "openai" => Some(&OPENAI_PROFILE),
         "anthropic" => Some(&ANTHROPIC_PROFILE),
         "nvidia" => Some(&NVIDIA_PROFILE),
+        "ollama" => Some(&OLLAMA_PROFILE),
         _ => None,
     }
 }
