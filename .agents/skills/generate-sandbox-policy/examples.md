@@ -4,9 +4,10 @@ Examples organized by detail tier — from minimal (just host + intent) to full 
 
 > **TLS note:** TLS termination is automatic. The proxy auto-detects TLS by
 > peeking the first bytes of each connection, so there is no need to specify
-> `tls: terminate` in policies. The `tls` field is deprecated. If you have an
-> edge case where auto-detection must be bypassed, you can set `tls: skip` to
-> disable TLS interception for that endpoint.
+> `tls: terminate` in policies. The `tls: terminate` and `tls: passthrough`
+> values are deprecated. If you have an edge case where auto-detection must
+> be bypassed, you can set `tls: skip` to disable TLS interception for that
+> endpoint.
 
 ---
 
