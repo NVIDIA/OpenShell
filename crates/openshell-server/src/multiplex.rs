@@ -27,6 +27,9 @@ use tower::ServiceExt;
 
 use crate::{OpenShellService, ServerState, http_router, inference::InferenceService};
 
+/// ALPN protocol identifier for HTTP/2.
+pub const ALPN_H2: &[u8] = b"h2";
+
 /// Maximum inbound gRPC message size (1 MB).
 ///
 /// Replaces tonic's implicit 4 MB default with a conservative limit to
@@ -49,6 +52,11 @@ impl MultiplexService {
     }
 
     /// Serve a connection, routing to gRPC or HTTP based on content-type.
+    ///
+    /// Uses hyper's auto-detection to determine whether the connection speaks
+    /// HTTP/1.1 or HTTP/2.  For TLS connections where ALPN already negotiated
+    /// the protocol, prefer [`serve_h2`](Self::serve_h2) to skip the
+    /// auto-detection round-trip.
     pub async fn serve<S>(&self, stream: S) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -64,6 +72,36 @@ impl MultiplexService {
 
         Builder::new(TokioExecutor::new())
             .serve_connection_with_upgrades(TokioIo::new(stream), service)
+            .await?;
+
+        Ok(())
+    }
+
+    /// Serve a connection that has already been identified as HTTP/2.
+    ///
+    /// This is the preferred path for TLS connections where ALPN negotiated
+    /// `h2`.  It avoids the byte-sniffing auto-detection in [`serve`](Self::serve)
+    /// and immediately starts the HTTP/2 state machine, which eliminates a
+    /// class of edge-case failures (partial reads, buffering delays) that can
+    /// cause the auto-detector to misidentify an h2 connection as HTTP/1.1.
+    pub async fn serve_h2<S>(
+        &self,
+        stream: S,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
+        let openshell = OpenShellServer::new(OpenShellService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let inference = InferenceServer::new(InferenceService::new(self.state.clone()))
+            .max_decoding_message_size(MAX_GRPC_DECODE_SIZE);
+        let grpc_service = GrpcRouter::new(openshell, inference);
+        let http_service = http_router(self.state.clone());
+
+        let service = MultiplexedService::new(grpc_service, http_service);
+
+        hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+            .serve_connection(TokioIo::new(stream), service)
             .await?;
 
         Ok(())

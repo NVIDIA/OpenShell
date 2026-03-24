@@ -33,6 +33,7 @@ use tracing::{debug, error, info};
 pub use grpc::OpenShellService;
 pub use http::{health_router, http_router};
 pub use multiplex::{MultiplexService, MultiplexedService};
+pub use multiplex::ALPN_H2;
 use persistence::Store;
 use sandbox::{SandboxClient, spawn_sandbox_watcher, spawn_store_reconciler};
 use sandbox_index::SandboxIndex;
@@ -180,12 +181,20 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
 
     // Build TLS acceptor when TLS is configured; otherwise serve plaintext.
     let tls_acceptor = if let Some(tls) = &config.tls {
-        Some(TlsAcceptor::from_files(
+        let acceptor = TlsAcceptor::from_files(
             &tls.cert_path,
             &tls.key_path,
             &tls.client_ca_path,
             tls.allow_unauthenticated,
-        )?)
+        )?;
+        info!(
+            cert = %tls.cert_path.display(),
+            key = %tls.key_path.display(),
+            client_ca = %tls.client_ca_path.display(),
+            allow_unauthenticated = tls.allow_unauthenticated,
+            "TLS enabled — ALPN advertises h2 + http/1.1",
+        );
+        Some(acceptor)
     } else {
         info!("TLS disabled — accepting plaintext connections");
         None
@@ -208,7 +217,24 @@ pub async fn run_server(config: Config, tracing_log_bus: TracingLogBus) -> Resul
             tokio::spawn(async move {
                 match tls_acceptor.inner().accept(stream).await {
                     Ok(tls_stream) => {
-                        if let Err(e) = service.serve(tls_stream).await {
+                        // Use ALPN-negotiated protocol when available.  This
+                        // avoids the byte-sniffing auto-detection in
+                        // `serve()`, which can misidentify h2 connections as
+                        // HTTP/1.1 when the first read returns a partial
+                        // preface.
+                        let alpn = tls_stream
+                            .get_ref()
+                            .1
+                            .alpn_protocol()
+                            .unwrap_or_default();
+                        let result = if alpn == ALPN_H2 {
+                            debug!(client = %addr, "ALPN negotiated h2 — serving HTTP/2");
+                            service.serve_h2(tls_stream).await
+                        } else {
+                            debug!(client = %addr, alpn = ?String::from_utf8_lossy(alpn), "ALPN fallback — auto-detecting protocol");
+                            service.serve(tls_stream).await
+                        };
+                        if let Err(e) = result {
                             error!(error = %e, client = %addr, "Connection error");
                         }
                     }
@@ -254,5 +280,10 @@ mod tests {
             let error = Error::new(kind, "real tls failure");
             assert!(!is_benign_tls_handshake_failure(&error));
         }
+    }
+
+    #[test]
+    fn alpn_h2_constant_matches_standard_protocol_id() {
+        assert_eq!(super::ALPN_H2, b"h2");
     }
 }

@@ -119,3 +119,32 @@ fn load_key(path: &Path) -> Result<PrivateKeyDer<'static>> {
 
     Err(Error::tls("no private key found in file"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn from_files_rejects_missing_cert() {
+        let result = TlsAcceptor::from_files(
+            Path::new("/nonexistent/cert.pem"),
+            Path::new("/nonexistent/key.pem"),
+            Path::new("/nonexistent/ca.pem"),
+            false,
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_certs_rejects_nonexistent_file() {
+        let result = load_certs(Path::new("/nonexistent/cert.pem"));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn load_key_rejects_nonexistent_file() {
+        let result = load_key(Path::new("/nonexistent/key.pem"));
+        assert!(result.is_err());
+    }
+}
