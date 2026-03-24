@@ -1393,20 +1393,21 @@ def test_forward_proxy_allows_private_ip_with_allowed_ips(
         )
 
 
-def test_forward_proxy_denied_without_allowed_ips(
+def test_forward_proxy_allows_private_ip_host_without_allowed_ips(
     sandbox: Callable[..., Sandbox],
 ) -> None:
-    """FWD-2: Forward proxy to private IP without allowed_ips -> 403.
+    """FWD-2: Forward proxy to literal IP host without allowed_ips -> 200.
 
-    Even though the endpoint matches, forward proxy requires explicit
-    allowed_ips on the endpoint.
+    When the policy host field is a literal IP address, the user has explicitly
+    declared intent to allow that destination.  The SSRF guard synthesizes an
+    implicit allowed_ips entry, so explicit allowed_ips is not required.
     """
     policy = _base_policy(
         network_policies={
             "internal_http": sandbox_pb2.NetworkPolicyRule(
                 name="internal_http",
                 endpoints=[
-                    # No allowed_ips — forward proxy should be denied
+                    # No allowed_ips — but host is a literal IP, so implicit
                     sandbox_pb2.NetworkEndpoint(
                         host=_SANDBOX_IP,
                         port=_FORWARD_PROXY_PORT,
@@ -1419,16 +1420,15 @@ def test_forward_proxy_denied_without_allowed_ips(
     spec = datamodel_pb2.SandboxSpec(policy=policy)
     with sandbox(spec=spec, delete_on_exit=True) as sb:
         result = sb.exec_python(
-            _forward_proxy_raw(),
-            args=(
-                _PROXY_HOST,
-                _PROXY_PORT,
-                f"http://{_SANDBOX_IP}:{_FORWARD_PROXY_PORT}/test",
-            ),
+            _forward_proxy_with_server(),
+            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
         )
         assert result.exit_code == 0, result.stderr
-        assert "403" in result.stdout, (
-            f"Expected 403 without allowed_ips, got: {result.stdout}"
+        assert "200" in result.stdout, (
+            f"Expected 200 for literal IP host, got: {result.stdout}"
+        )
+        assert "forward-proxy-ok" in result.stdout, (
+            f"Expected response body relayed, got: {result.stdout}"
         )
 
 
@@ -1917,4 +1917,105 @@ def test_host_wildcard_rejects_deep_subdomain(
         assert result.exit_code == 0, result.stderr
         assert "403" in result.stdout, (
             f"*.anthropic.com should NOT match deep.sub.anthropic.com: {result.stdout}"
+        )
+
+
+# =============================================================================
+# Overlapping policies (duplicate host:port) — regression tests
+# =============================================================================
+
+
+def test_overlapping_policies_do_not_crash_opa(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """OVL-1: Two policies covering the same host:port must not crash OPA.
+
+    After a draft rule approval, the merged policy can contain two entries
+    for the same (host, port).  The OPA engine must handle this without
+    a 'duplicated definition of local variable' error.  This test creates
+    the overlap directly to simulate the post-approval state.
+    """
+    policy = _base_policy(
+        network_policies={
+            "user_rule": sandbox_pb2.NetworkPolicyRule(
+                name="user_rule",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+            "approved_rule": sandbox_pb2.NetworkPolicyRule(
+                name="approved_rule",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host=_SANDBOX_IP,
+                        port=_FORWARD_PROXY_PORT,
+                        allowed_ips=["10.200.0.0/24"],
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        result = sb.exec_python(
+            _forward_proxy_with_server(),
+            args=(_PROXY_HOST, _PROXY_PORT, _SANDBOX_IP, _FORWARD_PROXY_PORT),
+        )
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Overlapping policies should not crash; expected 200, got: {result.stdout}"
+        )
+
+
+def test_overlapping_policies_l7_connect_does_not_crash(
+    sandbox: Callable[..., Sandbox],
+) -> None:
+    """OVL-2: CONNECT to overlapping L7 policies must not crash OPA.
+
+    Two policies with L7 rules (protocol: rest) covering the same host:port
+    must evaluate without a regorus variable collision error.
+    """
+    policy = _base_policy(
+        network_policies={
+            "user_api": sandbox_pb2.NetworkPolicyRule(
+                name="user_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+            "auto_approved_api": sandbox_pb2.NetworkPolicyRule(
+                name="auto_approved_api",
+                endpoints=[
+                    sandbox_pb2.NetworkEndpoint(
+                        host="api.anthropic.com",
+                        port=443,
+                        protocol="rest",
+                        enforcement="enforce",
+                        access="read-only",
+                    ),
+                ],
+                binaries=[sandbox_pb2.NetworkBinary(path="/**")],
+            ),
+        },
+    )
+    spec = datamodel_pb2.SandboxSpec(policy=policy)
+    with sandbox(spec=spec, delete_on_exit=True) as sb:
+        # CONNECT should succeed at the tunnel level (200 Connection Established)
+        # even with two overlapping L7 policies.
+        result = sb.exec_python(_proxy_connect(), args=("api.anthropic.com", 443))
+        assert result.exit_code == 0, result.stderr
+        assert "200" in result.stdout, (
+            f"Overlapping L7 policies should not crash; expected 200, got: {result.stdout}"
         )
