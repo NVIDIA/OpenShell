@@ -1210,18 +1210,20 @@ fn query_tls_mode(
     }
 }
 
-/// Check if an IP address is internal (loopback, private RFC1918, or link-local).
+/// Check if an IP address is internal (loopback, private RFC1918, link-local, or unspecified).
 ///
 /// This is a defense-in-depth check to prevent SSRF via the CONNECT proxy.
 /// It covers:
-/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16)
-/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`)
+/// - IPv4 loopback (127.0.0.0/8), private (10/8, 172.16/12, 192.168/16), link-local (169.254/16), unspecified (`0.0.0.0`)
+/// - IPv6 loopback (`::1`), link-local (`fe80::/10`), ULA (`fc00::/7`), unspecified (`::`)
 /// - IPv4-mapped IPv6 addresses (`::ffff:x.x.x.x`) are unwrapped and checked as IPv4
 fn is_internal_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_private() || v4.is_link_local(),
+        IpAddr::V4(v4) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
         IpAddr::V6(v6) => {
-            if v6.is_loopback() {
+            if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
             // fe80::/10 — IPv6 link-local
@@ -1234,7 +1236,10 @@ fn is_internal_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_private() || v4.is_link_local();
+                return v4.is_loopback()
+                    || v4.is_private()
+                    || v4.is_link_local()
+                    || v4.is_unspecified();
             }
             false
         }
@@ -1287,14 +1292,14 @@ async fn resolve_and_reject_internal(
 
 /// Check if an IP address is always blocked regardless of policy.
 ///
-/// Loopback and link-local addresses are never allowed even when an endpoint
+/// Loopback, link-local, and unspecified addresses are never allowed even when an endpoint
 /// has `allowed_ips` configured. This prevents proxy bypass (loopback) and
 /// cloud metadata SSRF (link-local 169.254.x.x).
 fn is_always_blocked_ip(ip: IpAddr) -> bool {
     match ip {
-        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local(),
+        IpAddr::V4(v4) => v4.is_loopback() || v4.is_link_local() || v4.is_unspecified(),
         IpAddr::V6(v6) => {
-            if v6.is_loopback() {
+            if v6.is_loopback() || v6.is_unspecified() {
                 return true;
             }
             // fe80::/10 — IPv6 link-local
@@ -1303,7 +1308,7 @@ fn is_always_blocked_ip(ip: IpAddr) -> bool {
             }
             // Check IPv4-mapped IPv6 (::ffff:x.x.x.x)
             if let Some(v4) = v6.to_ipv4_mapped() {
-                return v4.is_loopback() || v4.is_link_local();
+                return v4.is_loopback() || v4.is_link_local() || v4.is_unspecified();
             }
             false
         }
@@ -2024,6 +2029,11 @@ mod tests {
     }
 
     #[test]
+    fn test_rejects_ipv4_unspecified() {
+        assert!(is_internal_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
     fn test_allows_ipv4_public() {
         assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
         assert!(!is_internal_ip(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1))));
@@ -2041,6 +2051,11 @@ mod tests {
     #[test]
     fn test_rejects_ipv6_loopback() {
         assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::LOCALHOST)));
+    }
+
+    #[test]
+    fn test_rejects_ipv6_unspecified() {
+        assert!(is_internal_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
     }
 
     #[test]
@@ -2326,6 +2341,16 @@ mod tests {
     }
 
     #[test]
+    fn test_always_blocked_ipv4_unspecified() {
+        assert!(is_always_blocked_ip(IpAddr::V4(Ipv4Addr::UNSPECIFIED)));
+    }
+
+    #[test]
+    fn test_always_blocked_ipv6_unspecified() {
+        assert!(is_always_blocked_ip(IpAddr::V6(Ipv6Addr::UNSPECIFIED)));
+    }
+
+    #[test]
     fn test_always_blocked_ipv4_mapped_v6_loopback() {
         let v6 = Ipv4Addr::LOCALHOST.to_ipv6_mapped();
         assert!(is_always_blocked_ip(IpAddr::V6(v6)));
@@ -2422,6 +2447,18 @@ mod tests {
     async fn test_resolve_check_allowed_ips_blocks_metadata() {
         let nets = parse_allowed_ips(&["169.254.0.0/16".to_string()]).unwrap();
         let result = resolve_and_check_allowed_ips("169.254.169.254", 80, &nets).await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("always-blocked"),
+            "expected 'always-blocked' in error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_resolve_check_allowed_ips_blocks_unspecified() {
+        let nets = parse_allowed_ips(&["0.0.0.0/0".to_string()]).unwrap();
+        let result = resolve_and_check_allowed_ips("0.0.0.0", 80, &nets).await;
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(
